@@ -2,16 +2,19 @@ package io.github.hectorvent.floci.services.appconfig;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.appconfig.model.Application;
 import io.github.hectorvent.floci.services.appconfig.model.Deployment;
 import io.github.hectorvent.floci.services.appconfig.model.Environment;
 import io.github.hectorvent.floci.services.appconfig.model.DeploymentSummary;
+import io.github.hectorvent.floci.services.appconfig.model.Monitor;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -23,6 +26,9 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class AppConfigServiceTest {
@@ -109,6 +115,43 @@ class AppConfigServiceTest {
     @Test
     void listDeploymentsRejectsUnknownToken() {
         assertThrows(RuntimeException.class, () -> service.listDeployments("app", "env", 1, "unknown"));
+    }
+
+    @Test
+    void environmentRetainsAnImmutableMonitorSnapshot() {
+        Map<String, Object> monitor = new HashMap<>(Map.of(
+                "AlarmArn", "arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration",
+                "AlarmRoleArn", "arn:aws:iam::000000000000:role/configuration-monitor"));
+        List<Map<String, Object>> input = new ArrayList<>(List.of(monitor));
+        Environment created = service.createEnvironment("app", Map.of("Name", "configuration", "Monitors", input));
+        Monitor retained = created.getMonitors().getFirst();
+        input.clear();
+        monitor.put("AlarmArn", "changed");
+        assertEquals(List.of(retained), created.getMonitors());
+        assertEquals("arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration", retained.alarmArn());
+        assertThrows(UnsupportedOperationException.class, () -> created.getMonitors().clear());
+        assertEquals(List.of(), service.createEnvironment("app", Map.of("Name", "unmonitored")).getMonitors());
+    }
+
+    @Test
+    void invalidMonitorsRefuseBeforeWritingEnvironment() {
+        clearInvocations(environmentStore);
+        List<Object> invalid = List.of("not-a-list", List.of("not-a-monitor"), List.of(Map.of()),
+                List.of(Map.of("AlarmArn", "")), List.of(Map.of("AlarmArn", "alarm", "AlarmRoleArn", 1)),
+                List.of(Map.of("AlarmArn", "alarm"), Map.of("AlarmArn", "alarm"), Map.of("AlarmArn", "alarm"),
+                        Map.of("AlarmArn", "alarm"), Map.of("AlarmArn", "alarm"), Map.of("AlarmArn", "alarm")));
+        for (Object value : invalid) {
+            assertThrows(AwsException.class,
+                    () -> service.createEnvironment("app", Map.of("Name", "invalid", "Monitors", value)));
+        }
+        verify(environmentStore, never()).put(anyString(), any());
+    }
+
+    @Test
+    void environmentDeletionRefusesAnotherApplicationBeforeRemovingState() {
+        assertThrows(AwsException.class, () -> service.deleteEnvironment("other", "env"));
+        verify(environmentStore, never()).delete(anyString());
+        verify(deploymentStore, never()).delete(anyString());
     }
 
     private static Deployment deployment(String applicationId, String environmentId, int number) {

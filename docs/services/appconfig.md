@@ -6,6 +6,20 @@ Floci supports AWS AppConfig and AppConfigData for local configuration managemen
 
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
 
+Environment creation retains up to five monitor definitions, including the optional alarm role.
+These definitions are returned by environment reads; alarm evaluation and automatic rollback are not implemented.
+Deployment creation captures the selected profile's configuration name and location URI for subsequent deployment reads.
+Profiles whose `Type` is omitted default to `AWS.Freeform`.
+
+CloudFormation creates real `AWS::AppConfig::Application`, `AWS::AppConfig::Environment`,
+`AWS::AppConfig::ConfigurationProfile`, and `AWS::AppConfig::DeploymentStrategy` resources.
+Their `Ref` and ID `Fn::GetAtt` values resolve to the backing AppConfig IDs.
+Stack deletion removes these resources and their hosted configuration/deployment state.
+Unchanged reapplication preserves their identities. Property-changing updates are rejected.
+KMS encryption, profile validators and retrieval roles, environment deletion protection, and
+tags on child resources or deployment strategies are not supported by this provisioner;
+unsupported properties are rejected before creation.
+
 ### Supported Operations
 
 - `CreateApplication`

@@ -1,3 +1,4 @@
+AWS::AppConfig::ConfigurationProfile	KmsKeyArn	KMS-backed AppConfig profiles are not supported; KmsKeyIdentifier is rejected
 AWS::AppSync::GraphQLApi	GraphQLEndpointArn	the private-endpoint ARN of the GraphQL endpoint; Floci serves one public endpoint and has no private-endpoint model
 AWS::CodeBuild::Project	Id	schema gives no description; AWS's Id may differ from the project name Floci uses
 AWS::CodePipeline::CustomActionType	Id	schema gives no description; the custom action has no separate id in Floci

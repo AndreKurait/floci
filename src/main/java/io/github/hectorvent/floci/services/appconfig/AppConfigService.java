@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.appconfig.model.DeploymentSummary;
 import io.github.hectorvent.floci.services.appconfig.model.Environment;
 import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersion;
 import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersionSummary;
+import io.github.hectorvent.floci.services.appconfig.model.Monitor;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -89,6 +90,7 @@ public class AppConfigService {
         env.setName((String) request.get("Name"));
         env.setDescription((String) request.get("Description"));
         env.setState("READY");
+        env.setMonitors(monitors(request.get("Monitors")));
         environmentStore.put(env.getId(), env);
         return env;
     }
@@ -114,6 +116,42 @@ public class AppConfigService {
                 .toList();
     }
 
+    public void deleteEnvironment(String appId, String envId) {
+        environmentStore.get(envId).ifPresent(env -> {
+            if (!appId.equals(env.getApplicationId())) {
+                throw new AwsException("ResourceNotFoundException", "Environment not found in this application", 404);
+            }
+        });
+        deploymentStore.keys().stream().filter(key -> key.startsWith(appId + "::" + envId + "::"))
+                .toList().forEach(deploymentStore::delete);
+        activeConfigStore.keys().stream().filter(key -> key.startsWith(envId + "::"))
+                .toList().forEach(activeConfigStore::delete);
+        environmentStore.delete(envId);
+    }
+
+    private static List<Monitor> monitors(Object value) {
+        if (value == null) {
+            return List.of();
+        }
+        if (!(value instanceof List<?> entries) || entries.size() > 5) {
+            throw new AwsException("BadRequestException", "Monitors must contain at most five monitors", 400);
+        }
+        List<Monitor> result = new ArrayList<>();
+        for (Object entry : entries) {
+            if (!(entry instanceof Map<?, ?> monitor)
+                    || !(monitor.get("AlarmArn") instanceof String alarmArn)
+                    || alarmArn.isBlank() || alarmArn.length() > 2048) {
+                throw new AwsException("BadRequestException", "A monitor requires a nonempty AlarmArn", 400);
+            }
+            Object role = monitor.get("AlarmRoleArn");
+            if (role != null && (!(role instanceof String roleArn) || roleArn.isBlank() || roleArn.length() > 2048)) {
+                throw new AwsException("BadRequestException", "AlarmRoleArn must be a nonempty string", 400);
+            }
+            result.add(new Monitor(alarmArn, (String) role));
+        }
+        return result;
+    }
+
     // ──────────────────────────── Configuration Profile ────────────────────────────
 
     public ConfigurationProfile createConfigurationProfile(String appId, Map<String, Object> request) {
@@ -124,7 +162,7 @@ public class AppConfigService {
         profile.setName((String) request.get("Name"));
         profile.setDescription((String) request.get("Description"));
         profile.setLocationUri((String) request.get("LocationUri"));
-        profile.setType((String) request.get("Type"));
+        profile.setType((String) request.getOrDefault("Type", "AWS.Freeform"));
         profileStore.put(profile.getId(), profile);
         return profile;
     }
@@ -305,13 +343,15 @@ public class AppConfigService {
         String version = (String) request.get("ConfigurationVersion");
         String strategyId = (String) request.get("DeploymentStrategyId");
 
-        getConfigurationProfile(appId, profileId);
+        ConfigurationProfile profile = getConfigurationProfile(appId, profileId);
         getDeploymentStrategy(strategyId);
 
         Deployment deployment = new Deployment();
         deployment.setApplicationId(appId);
         deployment.setEnvironmentId(envId);
         deployment.setConfigurationProfileId(profileId);
+        deployment.setConfigurationName(profile.getName());
+        deployment.setConfigurationLocationUri(profile.getLocationUri());
         deployment.setConfigurationVersion(version);
         deployment.setDeploymentStrategyId(strategyId);
         deployment.setDeploymentNumber(deploymentStore.keys().size() + 1);

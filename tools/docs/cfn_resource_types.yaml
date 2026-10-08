@@ -10,6 +10,7 @@
 # Row order. Namespaces omitted here are appended alphabetically after these, so a forgotten
 # entry degrades to a sensible position rather than disappearing.
 order:
+  - AWS::AppConfig
   - AWS::S3
   - AWS::SQS
   - AWS::SNS
@@ -107,6 +108,7 @@ type_order:
 
 # Namespace -> the service name shown in the Service column.
 service_labels:
+  AWS::AppConfig: AppConfig
   AWS::ApiGateway: API Gateway (v1)
   AWS::ApiGatewayV2: API Gateway v2
   AWS::AppSync: AppSync
@@ -182,6 +184,10 @@ notes:
 # Trailing prose appended to a row after its type list, for behaviour that belongs to the service
 # rather than to one type.
 row_notes:
+  AWS::AppConfig: >-
+    Creates backing resources with ID Ref/GetAtt values and removes them on stack deletion.
+    Property-changing updates and unsupported properties are rejected; environment monitors
+    are retained as metadata, without alarm evaluation.
   AWS::Lambda: >-
     Inline `ZipFile` packages include the `cfn-response` (Node.js) / `cfnresponse` (Python) module
     AWS injects for that code path, so Solutions-style custom-resource handlers work.

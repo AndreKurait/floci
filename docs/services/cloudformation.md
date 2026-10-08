@@ -1,5 +1,9 @@
 # CloudFormation
 
+`CreateStack` and `UpdateStack` return the accepted stack ID after at most one second of waiting for initial execution progress.
+Longer operations continue in the existing background executor; use stack status and events to observe completion or failure.
+The initial wait does not cancel or resubmit an accepted operation. Existing synchronous request validation and concurrent-operation refusals are retained.
+
 **Protocol:** Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 **Endpoint:** `POST http://localhost:4566/`
 
@@ -124,6 +128,7 @@ cross-resource references.
 <!-- floci:cfn-types:start -->
 | Service | Resource types |
 |---|---|
+| AppConfig | `Application`, `ConfigurationProfile`, `DeploymentStrategy`, `Environment`. Creates backing resources with ID Ref/GetAtt values and removes them on stack deletion. Property-changing updates and unsupported properties are rejected; environment monitors are retained as metadata, without alarm evaluation. |
 | S3 | `Bucket`, `BucketPolicy` (document stored on the bucket; S3 does not evaluate it) |
 | SQS | `Queue`, `QueuePolicy` (accepted; policy not enforced) |
 | SNS | `Topic`, `Subscription`, `TopicPolicy` |

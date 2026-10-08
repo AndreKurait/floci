@@ -24,7 +24,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Handles CloudFormation Query-protocol API calls (form-encoded POST, XML response).
@@ -1092,9 +1095,14 @@ public class CloudFormationQueryHandler {
 
     private void awaitExecution(Future<?> future) {
         try {
-            future.get();
-        } catch (Exception e) {
-            LOG.warnv("Stack execution failed: {0}", e.getMessage());
+            future.get(1, TimeUnit.SECONDS);
+        } catch (TimeoutException expected) {
+            LOG.debug("Accepted stack operation continues asynchronously");
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            LOG.warn("Interrupted while awaiting initial stack progress; accepted operation continues");
+        } catch (ExecutionException error) {
+            LOG.warnv("Stack execution failed: {0}", error.getMessage());
         }
     }
 
