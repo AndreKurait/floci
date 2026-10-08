@@ -148,6 +148,7 @@ floci:
     lambda:
       enabled: true
       docker-flags: ""
+      # additional-docker-networks: []
       honour-architectures: false
       zip-max-entries: 100000
       async-retry-delay-seconds: 1

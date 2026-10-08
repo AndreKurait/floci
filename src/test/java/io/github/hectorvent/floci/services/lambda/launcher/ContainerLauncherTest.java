@@ -15,8 +15,12 @@ import io.github.hectorvent.floci.services.lambda.model.LambdaFileSystemConfig;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
+import io.smallrye.config.EnvConfigSource;
+import io.smallrye.config.SmallRyeConfig;
+import io.smallrye.config.SmallRyeConfigBuilder;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.ConnectToNetworkCmd;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
@@ -531,6 +535,105 @@ class ContainerLauncherTest {
 
         // createAndStart must NOT be called — Lambda uses the split path
         verify(lifecycleManager, never()).createAndStart(any());
+        verify(dockerClient, never()).connectToNetworkCmd();
+    }
+
+    @Test
+    void additionalNetworksAreConnectedBeforeTheFunctionStarts() {
+        LambdaFunction fn = networkFunction();
+        SmallRyeConfig mapped = new SmallRyeConfigBuilder()
+                .withSources(new EnvConfigSource(Map.of(
+                        "FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS",
+                        "primary-net,metadata-net,peer-net"), 300))
+                .withMapping(EmulatorConfig.class)
+                .build();
+        when(config.services().lambda().dockerNetwork()).thenReturn(Optional.of("primary-net"));
+        when(config.services().lambda().additionalDockerNetworks())
+                .thenReturn(mapped.getConfigMapping(EmulatorConfig.class).services().lambda().additionalDockerNetworks());
+        ConnectToNetworkCmd metadata = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        ConnectToNetworkCmd peer = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.connectToNetworkCmd()).thenReturn(metadata, peer);
+
+        launcher.launch(fn);
+
+        assertEquals("primary-net", captureRealContainerSpec().networkMode());
+        InOrder order = inOrder(lifecycleManager, metadata, peer);
+        order.verify(lifecycleManager).create(any());
+        order.verify(metadata).withNetworkId("metadata-net");
+        order.verify(metadata).withContainerId("container-123");
+        order.verify(metadata).exec();
+        order.verify(peer).withNetworkId("peer-net");
+        order.verify(peer).withContainerId("container-123");
+        order.verify(peer).exec();
+        order.verify(lifecycleManager).startCreated(eq("container-123"), any());
+        verify(dockerClient, times(2)).connectToNetworkCmd();
+    }
+
+    @Test
+    void absentAdditionalNetworksPreserveTheDefaultLaunch() {
+        SmallRyeConfig mapped = new SmallRyeConfigBuilder()
+                .withSources(new EnvConfigSource(Map.of(), 300))
+                .withMapping(EmulatorConfig.class)
+                .build();
+        Optional<List<String>> networks = mapped.getConfigMapping(EmulatorConfig.class)
+                .services().lambda().additionalDockerNetworks();
+        assertTrue(networks.isEmpty());
+        when(config.services().lambda().additionalDockerNetworks()).thenReturn(networks);
+
+        launcher.launch(networkFunction());
+
+        verify(lifecycleManager).create(any());
+        verify(lifecycleManager).startCreated(eq("container-123"), any());
+        verify(dockerClient, never()).connectToNetworkCmd();
+    }
+
+    @Test
+    void failedAdditionalNetworkAttachmentReleasesTheContainerAndRoleSession() {
+        LambdaFunction fn = networkFunction();
+        when(config.services().lambda().additionalDockerNetworks())
+                .thenReturn(Optional.of(List.of("metadata-net", "missing-net")));
+        when(executionRoleCredentials.forFunction(fn)).thenReturn(Optional.of(
+                new SessionCreds("ASIANETWORKFAIL", "role-secret", "role-token")));
+        ConnectToNetworkCmd metadata = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        ConnectToNetworkCmd missing = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.connectToNetworkCmd()).thenReturn(metadata, missing);
+        doThrow(new IllegalStateException("network disappeared")).when(missing).exec();
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> launcher.launch(fn));
+
+        assertEquals("network disappeared", failure.getMessage());
+        verify(metadata).exec();
+        verify(lifecycleManager, never()).startCreated(any(), any());
+        verify(lifecycleManager).stopAndRemove("container-123", null);
+        verify(executionRoleCredentials).unregister("222233334444", "ASIANETWORKFAIL");
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidAdditionalNetworks")
+    void invalidAdditionalNetworksFailBeforeContainerCreation(List<String> networks) {
+        when(config.services().lambda().additionalDockerNetworks()).thenReturn(Optional.of(networks));
+
+        assertThrows(IllegalArgumentException.class, () -> launcher.launch(networkFunction()));
+
+        verify(lifecycleManager, never()).create(any());
+        verify(lifecycleManager, never()).startCreated(any(), any());
+        verify(dockerClient, never()).connectToNetworkCmd();
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    private static Stream<List<String>> invalidAdditionalNetworks() {
+        return Stream.of(List.of(""), List.of("same", "same"), List.of("../outside"), List.of("two names"));
+    }
+
+    private static LambdaFunction networkFunction() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("network-function");
+        fn.setAccountId("222233334444");
+        fn.setFunctionArn("arn:aws:lambda:us-east-1:222233334444:function:network-function");
+        fn.setPackageType("Image");
+        fn.setImageUri("unit-lambda:latest");
+        return fn;
     }
 
     @Test

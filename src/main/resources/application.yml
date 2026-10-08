@@ -364,6 +364,7 @@ floci:
       ephemeral: false
       # Extra Docker create flags for Lambda containers, for example: --env KEY=VALUE --volume /host:/container:ro
       docker-flags: ""
+      # additional-docker-networks: []         # FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS: existing networks joined before start
       ecr-base-uri: public.ecr.aws            # FLOCI_SERVICES_LAMBDA_ECR_BASE_URI — registry for Lambda runtime images (legacy: floci.ecr-base-uri / FLOCI_ECR_BASE_URI)
       # runtime-images:                   # Optional full image references keyed by Lambda runtime
       #   "python3.12": "public.ecr.aws/lambda/python:3.12@sha256:<digest>"

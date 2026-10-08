@@ -46,10 +46,12 @@ import java.security.NoSuchAlgorithmException;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -279,6 +281,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         applyDockerFlags(specBuilder, dockerFlags);
 
         specBuilder.withEmbeddedDns();
+        List<String> additionalNetworks = configuredAdditionalDockerNetworks();
 
         // Inject extra hosts entries into the container if present. Split on the FIRST
         // colon, mirroring docker --add-host: hostnames cannot contain colons, but IPv6
@@ -372,6 +375,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Copy code into container via Docker API tar stream (works inside Docker too).
         // Hot-reload functions skip the tar-copy — the bind-mount already wires the host path.
         DockerClient dockerClient = lifecycleManager.getDockerClient();
+        for (String network : additionalNetworks) {
+            if (!network.equals(spec.networkMode())) {
+                dockerClient.connectToNetworkCmd()
+                        .withNetworkId(network)
+                        .withContainerId(containerId)
+                        .exec();
+            }
+        }
         if (!fn.isHotReload() && fn.getCodeLocalPath() != null) {
             Path codePath = Path.of(fn.getCodeLocalPath());
 
@@ -527,6 +538,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     + fn.getArchitectures() + " for function '" + fn.getFunctionName() + "'");
         }
         return lifecycleManager.create(spec, platform.get());
+    }
+
+    private List<String> configuredAdditionalDockerNetworks() {
+        List<String> networks = config.services().lambda().additionalDockerNetworks().orElse(List.of());
+        Set<String> distinct = new HashSet<>();
+        for (String network : networks) {
+            if (network == null || !network.matches("[A-Za-z0-9][A-Za-z0-9_.-]*")
+                    || !distinct.add(network)) {
+                throw new IllegalArgumentException(
+                        "Lambda additional Docker networks must contain distinct Docker network names or IDs");
+            }
+        }
+        return List.copyOf(networks);
     }
 
     private LambdaDockerFlags configuredDockerFlags() {
