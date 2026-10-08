@@ -209,6 +209,12 @@ local suffix such as `localhost.floci.io`; see [TLS](../configuration/tls.md).
 Templates can create domains and mappings with `AWS::ApiGateway::DomainName` and
 `AWS::ApiGateway::BasePathMapping`; see [CloudFormation](cloudformation.md).
 
+Custom-domain invocation resolves the domain's owner independently of the caller, then
+uses only that owner's mappings in the domain's region. If the same hostname is stored
+under multiple accounts or regions, invocation returns `409 ConflictException` instead
+of choosing one. Domain and mapping management remain scoped to the requesting account.
+This routing lookup does not add IAM identity or resource-policy evaluation.
+
 ### IAM Authorization (`AWS_IAM`) {#iam-authorization}
 
 A method (v1) or route (v2) whose `authorizationType` is `AWS_IAM` requires a SigV4-signed caller.

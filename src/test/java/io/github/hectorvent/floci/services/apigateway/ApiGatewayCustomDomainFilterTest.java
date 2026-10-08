@@ -1,7 +1,6 @@
 package io.github.hectorvent.floci.services.apigateway;
 
 import io.github.hectorvent.floci.services.apigateway.model.BasePathMapping;
-import io.github.hectorvent.floci.services.apigateway.model.CustomDomain;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.UriInfo;
@@ -74,8 +73,8 @@ class ApiGatewayCustomDomainFilterTest {
     @Test
     void leavesSignedPathUnsetWhenNoMappingMatches() {
         ApiGatewayService service = mock(ApiGatewayService.class);
-        CustomDomain domain = new CustomDomain();
-        domain.setDomainName(DOMAIN);
+        ApiGatewayService.CustomDomainRoute domain =
+                new ApiGatewayService.CustomDomainRoute("111122223333", "us-east-1", DOMAIN);
         when(service.findDomainByName(DOMAIN)).thenReturn(domain);
         RecordingRequest request = new RecordingRequest(
                 DOMAIN, URI.create("http://" + DOMAIN + "/unmapped"));
@@ -91,13 +90,13 @@ class ApiGatewayCustomDomainFilterTest {
 
     private static ApiGatewayService serviceWithMapping(String basePath, String stage) {
         ApiGatewayService service = mock(ApiGatewayService.class);
-        CustomDomain domain = new CustomDomain();
-        domain.setDomainName(DOMAIN);
+        ApiGatewayService.CustomDomainRoute domain =
+                new ApiGatewayService.CustomDomainRoute("111122223333", "us-east-1", DOMAIN);
         BasePathMapping mapping = new BasePathMapping(basePath, API_ID, stage);
         mapping.setApiType("REST");
         when(service.findDomainByRegionalHostname(DOMAIN + ".regional.local")).thenReturn(domain);
         when(service.findDomainByName(DOMAIN)).thenReturn(domain);
-        when(service.resolveBasePathMapping(anyString(), anyString())).thenReturn(mapping);
+        when(service.resolveBasePathMapping(eq(domain), anyString())).thenReturn(mapping);
         when(service.stripBasePath(anyString(), eq(mapping)))
                 .thenAnswer(invocation -> {
                     String path = invocation.getArgument(0);

@@ -106,8 +106,8 @@ public class ApiGatewayService implements ResourceProvider {
     private final StorageBackend<String, Model> modelStore;
     private final StorageBackend<String, VpcLink> vpcLinkStore;
     private final StorageBackend<String, Account> accountStore;
-    private final StorageBackend<String, CustomDomain> domainStore;
-    private final StorageBackend<String, BasePathMapping> basePathMappingStore;
+    private final AccountAwareStorageBackend<CustomDomain> domainStore;
+    private final AccountAwareStorageBackend<BasePathMapping> basePathMappingStore;
     /**
      * Guards every change to a custom domain or a base path mapping. The stores hand out live
      * objects, so a patch or a tag write is a read-modify-write; two of them on one domain at the
@@ -2393,13 +2393,15 @@ public class ApiGatewayService implements ResourceProvider {
 
     // ──────────────────────────── Custom Domain Resolution ────────────────────────────
 
+    public record CustomDomainRoute(String accountId, String region, String domainName) {}
+
     /**
      * Resolves a custom domain by its regionalDomainName (e.g., "my-domain.regional.local").
      * Derives the domain name from the regionalDomainName and performs a key-based lookup.
      *
-     * @return the CustomDomain if found, or null if no domain matches
+     * @return the domain's routing scope if found, or null if no domain matches
      */
-    public CustomDomain findDomainByRegionalHostname(String regionalDomainName) {
+    public CustomDomainRoute findDomainByRegionalHostname(String regionalDomainName) {
         if (!regionalDomainName.endsWith(".regional.local")) {
             return null;
         }
@@ -2409,27 +2411,41 @@ public class ApiGatewayService implements ResourceProvider {
     }
 
     /**
-     * Resolves a custom domain by its actual domain name (e.g., "api.example.com").
-     * Domain names are globally unique across regions.
+     * Resolves data-plane ownership before the caller's account context is initialized.
+     * Management reads keep their account-scoped lookup.
      *
-     * @return the CustomDomain if found, or null if no domain matches
+     * @return the domain's routing scope if found, or null if no domain matches
      */
-    public CustomDomain findDomainByName(String domainName) {
-        List<CustomDomain> results = domainStore.scan(k -> k.endsWith("::" + domainName));
-        return results.isEmpty() ? null : results.get(0);
+    public CustomDomainRoute findDomainByName(String domainName) {
+        List<AccountAwareStorageBackend.AccountEntry<CustomDomain>> matches =
+                domainStore.scanAllAccountEntries(key -> key.endsWith("::" + domainName));
+        if (matches.size() > 1) {
+            throw new AwsException("ConflictException",
+                    "Custom domain '" + domainName + "' is ambiguous across accounts or regions", 409);
+        }
+        if (matches.isEmpty()) {
+            return null;
+        }
+        AccountAwareStorageBackend.AccountEntry<CustomDomain> entry = matches.getFirst();
+        int delimiter = entry.key().indexOf("::");
+        if (delimiter <= 0) {
+            throw new IllegalStateException("Invalid custom domain storage key: " + entry.key());
+        }
+        return new CustomDomainRoute(entry.accountId(), entry.key().substring(0, delimiter), domainName);
     }
 
     /**
      * Resolves the base path mapping for a given domain and request path.
      * Uses longest-prefix matching on the base path.
      *
-     * @param domainName the custom domain name
+     * @param domain the exact custom domain owner and region
      * @param requestPath the incoming request path (e.g., "/v1/items/123")
      * @return the matching BasePathMapping, or null if none matches
      */
-    public BasePathMapping resolveBasePathMapping(String domainName, String requestPath) {
-        // Get all mappings across all regions for this domain
-        List<BasePathMapping> allMappings = basePathMappingStore.scan(k -> k.contains("::" + domainName + "::"));
+    public BasePathMapping resolveBasePathMapping(CustomDomainRoute domain, String requestPath) {
+        String mappingPrefix = domainKey(domain.region(), domain.domainName()) + "::";
+        List<BasePathMapping> allMappings =
+                basePathMappingStore.scanForAccount(domain.accountId(), key -> key.startsWith(mappingPrefix));
 
         if (allMappings.isEmpty()) {
             return null;
