@@ -415,16 +415,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 copyDirToContainer(dockerClient, containerId, codePath, TASK_DIR, fn.getFunctionName());
             }
 
-            // For provided runtimes, also copy the 'bootstrap' file to /var/runtime (RUNTIME_DIR)
-            if (isProvidedRuntime(fn.getRuntime())) {
-                Path bootstrapPath = codePath.resolve("bootstrap");
-                if (Files.exists(bootstrapPath)) {
-                    copyFileToContainer(dockerClient, containerId, bootstrapPath, RUNTIME_DIR, "bootstrap", fn.getFunctionName());
-                } else {
-                    LOG.warnv("Provided runtime function {0} is missing 'bootstrap' file in {1}",
-                            fn.getFunctionName(), fn.getCodeLocalPath());
-                }
-            }
         }
 
         // 3. Copy layer contents into /opt (layers are merged in order)
@@ -450,6 +440,15 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     LOG.warnv("Could not resolve layer ARN: {0} for function {1}", layerArn, fn.getFunctionName());
                 }
             }
+        }
+
+        // The base image invokes /var/runtime/bootstrap. Delegate to the original
+        // package bootstrap, or the merged layers when the package has none.
+        // This also works with hot-reload and read-only code-volume mounts.
+        if (isProvidedRuntime(fn.getRuntime()) && !"Image".equals(fn.getPackageType())) {
+            RetryingTarCopier.copyBytes(dockerClient, containerId, RUNTIME_DIR, "bootstrap",
+                    ProvidedRuntimeBootstrap.SCRIPT.getBytes(StandardCharsets.UTF_8), 0755,
+                    COPY_MAX_ATTEMPTS, COPY_RETRY_BACKOFF_MS);
         }
 
         // Now start the container with code in place

@@ -1155,6 +1155,11 @@ of `{}` or with an empty `Filters` array clears any existing filters.
 
 Any runtime that has an official AWS Lambda container image works with Floci (e.g. `nodejs22.x`, `python3.13`, `java21`, `go1.x`, `provided.al2023`).
 
+For ZIP-based `provided.*` runtimes, the image entrypoint delegates to the
+package's `/var/task/bootstrap`, falling back to `/opt/bootstrap` only when the
+package has no bootstrap. The supplied executable stays in place, so scripts
+that locate companion files relative to their own path continue to work.
+
 By default, Floci builds each runtime image reference from `floci.services.lambda.ecr-base-uri`
 and the runtime tag. To pin one runtime to a full image reference, set
 `floci.services.lambda.runtime-images` in the Floci configuration:

@@ -35,6 +35,7 @@ import com.github.dockerjava.api.model.StreamType;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -98,6 +99,7 @@ class ContainerLauncherTest {
     ContainerLauncher launcher;
     /** Collects remote paths passed to withRemotePath across all copy mocks. */
     final java.util.List<String> capturedRemotePaths = new java.util.ArrayList<>();
+    String capturedRuntimeBootstrap;
 
     @BeforeEach
     void setUp() {
@@ -168,11 +170,14 @@ class ContainerLauncherTest {
         // prevent the background PipedOutputStream writer thread from blocking
         // when the pipe buffer fills.
         capturedRemotePaths.clear();
+        capturedRuntimeBootstrap = null;
         lenient().when(dockerClient.copyArchiveToContainerCmd(any())).thenAnswer(inv -> {
             CopyArchiveToContainerCmd cmd = mock(CopyArchiveToContainerCmd.class);
             final java.io.InputStream[] captured = {null};
+            String[] remote = {null};
             when(cmd.withRemotePath(any())).thenAnswer(pathInv -> {
                 capturedRemotePaths.add(pathInv.getArgument(0));
+                remote[0] = pathInv.getArgument(0);
                 return cmd;
             });
             when(cmd.withTarInputStream(any())).thenAnswer(streamInv -> {
@@ -181,6 +186,13 @@ class ContainerLauncherTest {
             });
             doAnswer(execInv -> {
                 if (captured[0] != null) {
+                    if ("/var/runtime".equals(remote[0])) {
+                        try (TarArchiveInputStream tar = new TarArchiveInputStream(captured[0])) {
+                            assertEquals("bootstrap", tar.getNextEntry().getName());
+                            capturedRuntimeBootstrap = new String(tar.readAllBytes(), StandardCharsets.UTF_8);
+                        }
+                        return null;
+                    }
                     try { captured[0].transferTo(java.io.OutputStream.nullOutputStream()); }
                     catch (Exception ignored) {}
                 }
@@ -927,7 +939,7 @@ class ContainerLauncherTest {
     }
 
     @Test
-    void launchProvidedRuntime_copiesBootstrapBeforeStart() throws Exception {
+    void launchProvidedRuntime_delegatesToOriginalBootstrapBeforeStart() throws Exception {
         Path codePath = Files.createDirectory(tempDir.resolve("provided-code"));
         Files.writeString(codePath.resolve("bootstrap"), "#!/bin/sh\necho hello");
 
@@ -944,7 +956,7 @@ class ContainerLauncherTest {
         // path, so everything happens on the one real container (no populate helper).
         //
         // Ordering:
-        //   real: create -> copy /var/task + copy bootstrap to /var/runtime -> start
+        //   real: create -> copy /var/task + install runtime delegate -> start
         // (two copyArchiveToContainerCmd calls on the real container: code, then bootstrap).
         InOrder inOrder = inOrder(lifecycleManager, dockerClient);
         inOrder.verify(lifecycleManager).create(any());
@@ -956,12 +968,42 @@ class ContainerLauncherTest {
         assertTrue(capturedRemotePaths.contains("/var/task"),
                 "small code should be tar-copied directly to /var/task");
         assertTrue(capturedRemotePaths.contains("/var/runtime"),
-                "bootstrap should be copied to /var/runtime on the real container");
+                "runtime delegate should be copied to /var/runtime on the real container");
+        assertEquals(ProvidedRuntimeBootstrap.SCRIPT, capturedRuntimeBootstrap);
+        assertEquals("#!/bin/sh\necho hello", Files.readString(codePath.resolve("bootstrap")));
 
         // No populate helper for small code.
         verify(lifecycleManager, times(1)).create(any());
         verify(lifecycleManager, never()).stopAndRemove(any(), any());
         verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    @Test
+    void launchProvidedRuntimeWithoutPackageBootstrapStillInstallsLayerFallback() throws Exception {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("layer-runtime");
+        fn.setRuntime("provided.al2023");
+        fn.setHandler("bootstrap");
+        fn.setCodeLocalPath(Files.createDirectory(tempDir.resolve("without-bootstrap")).toString());
+
+        launcher.launch(fn);
+
+        assertEquals(ProvidedRuntimeBootstrap.SCRIPT, capturedRuntimeBootstrap);
+        assertTrue(capturedRemotePaths.contains("/var/task"));
+    }
+
+    @Test
+    void launchHotReloadProvidedRuntimeInstallsDelegateWithoutCopyingPackage() throws Exception {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("hot-runtime");
+        fn.setRuntime("provided.al2023");
+        fn.setHandler("bootstrap");
+        fn.setHotReloadHostPath(Files.createDirectory(tempDir.resolve("hot-runtime")).toString());
+
+        launcher.launch(fn);
+
+        assertEquals(ProvidedRuntimeBootstrap.SCRIPT, capturedRuntimeBootstrap);
+        assertFalse(capturedRemotePaths.contains("/var/task"));
     }
 
     @Test
