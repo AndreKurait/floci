@@ -4,11 +4,15 @@ import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 import static io.restassured.RestAssured.given;
@@ -103,7 +107,8 @@ class SamTransformIntegrationTest {
     }
 
     @Test
-    void samFunction_withAutoPublishAlias_createsVersionAndAlias() {
+    @Tag("docker")
+    void samFunction_withAutoPublishAlias_createsVersionAndAlias() throws Exception {
         String stackName = "sam-alias-stack";
         stacksToDelete.add(stackName);
 
@@ -143,15 +148,10 @@ class SamTransformIntegrationTest {
         .then()
             .statusCode(200)
             .body("Name", equalTo("production"))
-            // $LATEST rather than the published version real SAM targets — see #1987/#1988 and the
-            // comment in expandAutoPublishAlias. The invoke below is what actually matters.
-            .body("FunctionVersion", equalTo("$LATEST"))
+            .body("FunctionVersion", equalTo("1"))
             .body("AliasArn", containsString(":function:sam-alias-func:production"));
 
-        // The behavior the whole expansion exists for: an alias-qualified invoke runs the function.
-        // Asserting only that the alias *record* exists is not enough — an alias pointing at a
-        // published version satisfies that and still times out on invoke (#1987), which is how an
-        // earlier revision of this change shipped a broken alias past its own tests.
+        // Exercise the published code through the generated alias, not only its metadata.
         given()
             .contentType("application/json")
             .body("{}")
@@ -160,6 +160,44 @@ class SamTransformIntegrationTest {
         .then()
             .statusCode(200)
             .header("X-Amz-Function-Error", nullValue())
+            .header("X-Amz-Executed-Version", equalTo("1"))
+            .body("ok", equalTo(true));
+
+        ByteArrayOutputStream changedCode = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(changedCode)) {
+            zip.putNextEntry(new ZipEntry("index.js"));
+            zip.write("exports.handler = async () => ({ ok: false });".getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+        }
+        given()
+            .contentType("application/json")
+            .body("{\"ZipFile\":\"" + Base64.getEncoder().encodeToString(changedCode.toByteArray()) + "\"}")
+        .when()
+            .put("/2015-03-31/functions/sam-alias-func/code")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .body("{}")
+        .when()
+            .post("/2015-03-31/functions/sam-alias-func/invocations")
+        .then()
+            .statusCode(200)
+            .header("X-Amz-Function-Error", nullValue())
+            .header("X-Amz-Executed-Version", equalTo("$LATEST"))
+            .body("ok", equalTo(false));
+
+        // Updating $LATEST must neither repoint the SAM alias nor replace its published code.
+        given()
+            .contentType("application/json")
+            .body("{}")
+        .when()
+            .post("/2015-03-31/functions/sam-alias-func:production/invocations")
+        .then()
+            .statusCode(200)
+            .header("X-Amz-Function-Error", nullValue())
+            .header("X-Amz-Executed-Version", equalTo("1"))
             .body("ok", equalTo(true));
 
         given()
@@ -183,6 +221,54 @@ class SamTransformIntegrationTest {
         assertThat(resourcesXml, containsString("<ResourceType>AWS::Lambda::Version</ResourceType>"));
         assertThat(resourcesXml, containsString("<ResourceType>AWS::Lambda::Alias</ResourceType>"));
         assertThat(resourcesXml, containsString("<LogicalResourceId>AliasFunctionAliasProduction</LogicalResourceId>"));
+    }
+
+    @Test
+    void samAutoPublishAliasKeepsPublishedConfigurationAndQualifiesForProvisionedConcurrency() {
+        String stackName = "sam-published-config-stack";
+        String function = "sam-published-config-func";
+        stacksToDelete.add(stackName);
+        String template = """
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              Function:
+                Type: AWS::Serverless::Function
+                Properties:
+                  FunctionName: sam-published-config-func
+                  Handler: index.handler
+                  Runtime: nodejs20.x
+                  MemorySize: 128
+                  AutoPublishAlias: production
+                  Environment:
+                    Variables:
+                      MARKER: original
+                  InlineCode: exports.handler = async () => ({ ok:true });
+            """;
+        given().contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack").formParam("StackName", stackName)
+            .formParam("TemplateBody", template).formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when().post("/").then().statusCode(200);
+        waitForStackStatus(stackName, "CREATE_COMPLETE");
+
+        given().when().get("/2015-03-31/functions/" + function + "/aliases/production")
+            .then().statusCode(200).body("FunctionVersion", equalTo("1"));
+        given().contentType("application/json")
+            .body("{\"MemorySize\":256,\"Environment\":{\"Variables\":{\"MARKER\":\"changed\"}}}")
+        .when().put("/2015-03-31/functions/" + function + "/configuration")
+            .then().statusCode(200);
+        given().when().get("/2015-03-31/functions/" + function + "/configuration")
+            .then().statusCode(200).body("MemorySize", equalTo(256))
+            .body("Environment.Variables.MARKER", equalTo("changed"));
+        given().queryParam("Qualifier", "production")
+        .when().get("/2015-03-31/functions/" + function + "/configuration")
+            .then().statusCode(200).body("Version", equalTo("1"))
+            .body("MemorySize", equalTo(128)).body("Environment.Variables.MARKER", equalTo("original"));
+
+        // No allocation exists, but the generated alias is an eligible immutable target.
+        given().queryParam("Qualifier", "production")
+        .when().get("/2019-09-30/functions/" + function + "/provisioned-concurrency")
+            .then().statusCode(404)
+            .body("__type", equalTo("ProvisionedConcurrencyConfigNotFoundException"));
     }
 
     @Test

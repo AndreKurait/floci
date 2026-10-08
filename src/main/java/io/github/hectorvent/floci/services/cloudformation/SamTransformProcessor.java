@@ -953,11 +953,8 @@ class SamTransformProcessor {
      * template engine resolves it at provision time; only the generated logical id needs a
      * literal, and it drops the suffix when the value isn't textual.
      *
-     * <p>The {@code Ref}s on {@code FunctionName} give {@code topologicalSort} the edges it needs
-     * — function → version and function → alias — so no explicit {@code DependsOn} is needed.
-     * There is no version → alias edge while {@code FunctionVersion} is the literal
-     * {@code $LATEST}; none is required, since the alias does not reference the version. It
-     * returns with the {@code Fn::GetAtt} form once #1987 lands.
+     * <p>The function reference and version attribute establish function → version → alias
+     * dependencies, so the alias selects the immutable version published by this stack.
      */
     private void expandAutoPublishAlias(String functionLogicalId, JsonNode properties, ObjectNode resources) {
         JsonNode aliasName = properties.path("AutoPublishAlias");
@@ -984,14 +981,7 @@ class SamTransformProcessor {
         ObjectNode aliasProps = objectMapper.createObjectNode();
         aliasProps.set("FunctionName", ref(functionLogicalId));
         aliasProps.set("Name", aliasName.deepCopy());
-        // Real SAM points the alias at the published version (Fn::GetAtt <Version>.Version).
-        // Floci cannot invoke a published version: the snapshot carries no code path, so a
-        // version-qualified invoke times out on a cold start (#1987) and silently runs $LATEST's
-        // code when a warm container happens to exist (#1988). Aiming the alias there would break
-        // the alias-qualified invoke this expansion exists to enable, so point it at $LATEST — the
-        // alias resolves and runs the function's code, which is the behavior callers depend on.
-        // Switch to the GetAtt form once #1987 lands.
-        aliasProps.put("FunctionVersion", "$LATEST");
+        aliasProps.set("FunctionVersion", getAtt(versionId, "Version"));
         aliasDef.set("Properties", aliasProps);
         resources.set(aliasId, aliasDef);
     }
