@@ -3629,6 +3629,7 @@ public class ApiGatewayService implements ResourceProvider {
             }
         }
         methodRequest.put("authorizationType", authType);
+        methodRequest.put("apiKeyRequired", requiresImportedApiKey(secReqs, openAPI));
         if (authorizerId != null) {
             methodRequest.put("authorizerId", authorizerId);
         }
@@ -3712,6 +3713,27 @@ public class ApiGatewayService implements ResourceProvider {
         if (integrationExt != null) {
             applyIntegration(region, apiId, resourceId, httpMethod, integrationExt);
         }
+    }
+
+    private boolean requiresImportedApiKey(List<SecurityRequirement> requirements, OpenAPI openAPI) {
+        if (requirements == null || openAPI.getComponents() == null
+                || openAPI.getComponents().getSecuritySchemes() == null) {
+            return false;
+        }
+        for (SecurityRequirement requirement : requirements) {
+            for (String name : requirement.keySet()) {
+                SecurityScheme scheme = openAPI.getComponents().getSecuritySchemes().get(name);
+                if (scheme != null && scheme.getType() == SecurityScheme.Type.APIKEY
+                        && scheme.getIn() == SecurityScheme.In.HEADER
+                        && "x-api-key".equalsIgnoreCase(scheme.getName())
+                        && (scheme.getExtensions() == null
+                            || (!scheme.getExtensions().containsKey("x-amazon-apigateway-authorizer")
+                                && !scheme.getExtensions().containsKey("x-amazon-apigateway-authtype")))) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static final String PARAMETER_REF_PREFIX = "#/components/parameters/";

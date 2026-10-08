@@ -1231,12 +1231,6 @@ class SamTransformProcessor {
     }
 
     private void expandServerlessApi(String logicalId, JsonNode properties, ObjectNode resources) {
-        JsonNode auth = properties.path("Auth");
-        if (auth.isObject() && !auth.isEmpty()) {
-            throw new AwsException("ValidationError",
-                    "SAM AWS::Serverless::Api Auth is not supported for explicit REST APIs yet; "
-                            + "Floci refuses to drop the authorization configuration silently.", 400);
-        }
         resources.remove(logicalId);
 
         ObjectNode apiDef = objectMapper.createObjectNode();
@@ -1259,6 +1253,7 @@ class SamTransformProcessor {
         // no Body and no BodyS3Location for that case. The paths are empty either way, so the
         // runtime outcome (no method reachable) is the same, even though the stored Body differs.
         applyDefinitionSource(logicalId, properties, apiProps);
+        new SamRestApiAuth(objectMapper).apply(properties.path("Auth"), apiProps.path("Body"));
 
         apiDef.set("Properties", apiProps);
         resources.set(logicalId, apiDef);

@@ -132,6 +132,12 @@ likewise created, or updated, as disabled.
 
 #### `generateDistinctId`
 
+REST OpenAPI imports recognize a required `apiKey` security scheme in the `x-api-key` header
+as `apiKeyRequired`. The imported method uses the same enabled-key and usage-plan stage checks
+as an explicitly created method. An `awsSigv4` Authorization scheme remains a separate
+`AWS_IAM` requirement and is not treated as an API key. An operation's explicit `security: []`
+removes inherited requirements on overwrite.
+
 API key identifiers are generated independently from their secret values when `generateDistinctId`
 is absent, matching current AWS behavior, or explicitly set to `true`. The deprecated explicit
 `generateDistinctId=false` behavior is retained for compatibility and uses the key value as its
