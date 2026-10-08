@@ -886,6 +886,8 @@ class Ec2ContainerManagerTest {
         assertTrue(command[2].contains("iproute2"));
         assertTrue(command[2].contains("socat"));
         assertTrue(command[2].contains("curl"));
+        assertTrue(command[2].contains("command -v iptables"));
+        assertTrue(command[2].contains("ca-certificates iptables-nft >/dev/null"));
     }
 
     @Test
@@ -962,13 +964,16 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
-    void metadataProxyStartCommandBindsAwsLinkLocalMetadataAddress() {
+    void metadataProxyStartCommandRoutesAwsLinkLocalMetadataWithoutAListener() {
         String[] command = Ec2ContainerManager.metadataProxyStartCommand("floci", 9169);
 
         assertEquals("sh", command[0]);
         assertTrue(command[2].contains("169.254.169.254/32"));
-        assertTrue(command[2].contains("TCP-LISTEN:80,bind=169.254.169.254"));
-        assertTrue(command[2].contains("TCP:floci:9169"));
+        assertTrue(command[2].contains("-I OUTPUT 1 -d 169.254.169.254/32 -p tcp --dport 80"));
+        assertTrue(command[2].contains("'http://floci:9169/latest/meta-data/instance-id'"));
+        assertTrue(command[2].contains("--to-destination \"$target_ip:9169\""));
+        assertFalse(command[2].contains("TCP-LISTEN"));
+        assertFalse(command[2].contains("ip addr add"));
         assertTrue(command[2].contains("http://169.254.169.254/latest/meta-data/instance-id"));
     }
 

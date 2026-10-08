@@ -6014,6 +6014,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         // of falling through to the catalog default. This is also the fallback when the file
         // system cannot be captured below.
         image.setSourceImageId(resolveLaunchableImageId(region, source.getImageId()));
+        image.setCreationSourceImageId(source.getImageId());
+        image.setCreationSourceImageRegion(region);
+        image.setCreationSourceInstanceId(source.getInstanceId());
 
         // Capture the instance's file system. Without this the AMI is a metadata record that
         // launches the *base* image, so everything provisioned on the source instance is
@@ -6507,6 +6510,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
             // chain of CreateImage parents lives; it bottoms out at a catalog id, which is
             // region-agnostic.
             copy.setSourceImageId(resolveLaunchableImageId(sourceRegion, sourceImageId));
+            copy.setCreationSourceImageId(sourceImageId);
+            copy.setCreationSourceImageRegion(sourceRegion);
             // The captured file system is the point of a CreateImage AMI, and the ancestry the
             // copy inherits does not carry it: sourceImageId is flattened to a launchable catalog
             // id, and the chain in between lives in the source region where the copy cannot see

@@ -1692,11 +1692,11 @@ public class Ec2ContainerManager {
     }
 
     static String[] metadataProxyInstallCommand() {
-        return Ec2MetadataProxy.installCommand();
+        return Ec2MetadataProxy.ec2InstallCommand();
     }
 
     static String[] metadataProxyStartCommand(String flociHost, int imdsPort) {
-        return Ec2MetadataProxy.startCommand(flociHost, imdsPort);
+        return Ec2MetadataProxy.ec2RoutingCommand(flociHost, imdsPort);
     }
 
 

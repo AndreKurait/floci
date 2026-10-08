@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -86,6 +87,10 @@ class Ec2RegisteredImageRuntimeTest {
         Image registered = service.describeImages(EAST, List.of(id), List.of()).getFirst();
         assertEquals("arm64", registered.getArchitecture());
         assertEquals("ami-native-arm", registered.getSourceImageId());
+        String described = query("DescribeImages", EAST, "ImageId.1", id).getEntity().toString();
+        assertFalse(described.contains("<sourceImageId>"));
+        assertFalse(described.contains("<sourceImageRegion>"));
+        assertFalse(described.contains("<sourceInstanceId>"));
         assertEquals(new ResolvedAmiImage(ARM_IMAGE, ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"),
                 launchedImage(EAST, id, "t4g.micro"));
     }

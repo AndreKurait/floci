@@ -96,6 +96,19 @@ matches another registration binding. Names without a declared binding retain
 the existing metadata registration and default-image fallback behavior.
 The mapping does not import snapshot bytes or prove that a guest boots.
 
+### Image creation provenance
+
+`DescribeImages` reports `SourceImageId` and `SourceImageRegion` for images
+created with `CreateImage` or `CopyImage`. These identify the immediate source:
+copying a copy reports that copy's ID and region, not its original ancestor.
+`CreateImage` also reports `SourceInstanceId`; `CopyImage` does not inherit it.
+
+Catalog and `RegisterImage` results omit these fields, including registrations
+bound to a local catalog entry. Older persisted images without recorded creation
+provenance also omit them. Runtime ancestry and captured Docker images are stored
+separately and retain their existing launch behavior. This does not add
+`CreateRestoreImageTask` support.
+
 ### Cloud-image-derived AMI guests
 
 The `ami-ubuntu2404-cloud` entry is an experimental Ubuntu 24.04 guest image built from Canonical cloud-image artifacts, not from the Docker-library `ubuntu:24.04` image. It is intended for EC2 workflows that need packages such as `systemd` and `cloud-init` to match a real Ubuntu cloud image more closely.
@@ -185,7 +198,13 @@ curl -s -H "x-aws-ec2-metadata-token: $TOKEN" \
   http://169.254.169.254/latest/meta-data/instance-id
 ```
 
-As on AWS, the token TTL must be an integer from 1 to 21600 seconds, or the `PUT` returns `400`. A metadata request that presents an unknown or expired token returns `401`, which tells the SDK to fetch a new token. A token is valid only on the instance that requested it: presenting it from another instance returns `401`. A request without a token header still uses IMDSv1; Floci does not enforce `HttpTokens=required`.
+As on AWS, the token TTL must be an integer from 1 to 21600 seconds, or the `PUT` returns `400`. A metadata request that presents an unknown or expired token returns `401`, which tells the SDK to fetch a new token. A token is valid only on the instance that requested it: presenting it from another instance returns `401`.
+
+For an instance configured with `HttpTokens=required`, metadata and UserData
+requests without a valid token return `401`, including empty token headers.
+The token endpoint remains available so the caller can obtain a token.
+Instances with optional tokens retain IMDSv1 support. The check reads the
+registered instance's current token option on each request.
 
 ### Supported IMDS endpoints
 
@@ -211,6 +230,11 @@ As on AWS, the token TTL must be an integer from 1 to 21600 seconds, or the `PUT
 
 IAM credentials are served when the instance has an `IamInstanceProfile.Arn` that resolves to an existing instance profile with one role in the profile's account. The role list uses the role name, which can differ from the profile name. Missing profiles, missing roles, and requests for another role return `404`.
 
+The `/latest/meta-data/iam/info` response uses that same validated attachment.
+Its `InstanceProfileArn` and `InstanceProfileId` are the actual IAM profile
+values; an EC2 instance ID is not a profile ID. Missing, deleted or mismatched
+attachments return `404`.
+
 Each registered instance receives its own temporary IAM session. Credentials last one hour and refresh on retrieval during the final five minutes; the previous generation remains valid until expiration. Floci revokes tracked sessions when the instance is unregistered or IMDS shuts down, and discards persisted EC2 sessions when Floci restarts. Restored guests obtain fresh credentials after metadata registration is rebuilt.
 
 Guests with an instance profile receive endpoint and region settings without Floci's static `test` credentials, allowing the standard SDK credential chain to reach IMDS. Guests without an instance profile retain the existing local `test` credential environment. Custom images can still override the SDK chain with their own credentials. This does not add EKS access-entry authorization or change Floci's global IAM enforcement configuration.
@@ -218,6 +242,19 @@ Guests with an instance profile receive endpoint and region settings without Flo
 ### IMDS and SSM managed instances
 
 IMDS only knows about containers that Floci itself launched through `RunInstances`. That launch is what installs the link-local `169.254.169.254` proxy inside the container and maps the container's IP to its instance record.
+
+The EC2 IMDS helper routes guest-originated TCP requests for `169.254.169.254:80` with one
+comment-owned `nat OUTPUT` DNAT rule in the guest's network namespace. It does not
+bind port 80 or add a loopback address, so an application can keep its wildcard
+port 80 listener. The helper requires `NET_ADMIN` as before and installs the
+distribution's iptables package with its other tools. The parent target must
+resolve to a remote unicast IPv4 address inside the guest. Repeated setup reuses
+the exact rule and repeats bounded IMDSv2 token readiness; a different or duplicate
+owned rule is refused. A legacy local `169.254.169.254` address is also refused,
+requiring a fresh guest rather than changing its source routing silently. Other
+network rules and the separate pod-identity relay are unchanged. EKS keeps its
+existing node-local IMDS listener, which its forwarded pod-network routing needs.
+The EKS and pod-identity installer requirements and package lists are also unchanged.
 
 Registering a container with SSM is independent of this: an SSM agent that calls `UpdateInstanceInformation` becomes a managed instance, but that does not create an EC2 instance record, does not install the IMDS proxy, and does not register the container with IMDS. From such a container, `curl http://169.254.169.254/...` fails outright (no proxy), and a request sent straight to the host IMDS port returns `404` with a message explaining that no EC2 instance is registered for the source IP. Floci also logs a warning when an SSM agent registers from a container that is not backed by a Floci EC2 instance.
 

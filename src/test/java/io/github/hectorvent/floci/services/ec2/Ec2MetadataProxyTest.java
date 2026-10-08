@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -13,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -22,40 +24,51 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class Ec2MetadataProxyTest {
 
     @Test
-    void installCommandContainsSupportedPackageManagers() {
-        String[] command = Ec2MetadataProxy.installCommand();
+    void ec2InstallCommandContainsRoutingDependenciesForSupportedPackageManagers() {
+        String[] command = Ec2MetadataProxy.ec2InstallCommand();
         assertEquals(3, command.length);
         assertEquals("sh", command[0]);
         assertEquals("-c", command[1]);
 
         String script = command[2];
-        assertTrue(script.contains("command -v ip >/dev/null 2>&1 && command -v socat >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then exit 0; fi"));
-        assertTrue(script.contains("apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates"));
-        assertTrue(script.contains("dnf install -y --allowerasing iproute socat curl ca-certificates"));
-        assertTrue(script.contains("yum install -y iproute socat curl ca-certificates"));
-        assertTrue(script.contains("apk add --no-cache iproute2 socat curl ca-certificates"));
+        assertTrue(script.contains("command -v iptables >/dev/null 2>&1; then exit 0; fi"));
+        assertTrue(script.contains("apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates iptables"));
+        assertTrue(script.contains("dnf install -y --allowerasing iproute socat curl ca-certificates iptables-nft"));
+        assertTrue(script.contains("yum install -y iproute socat curl ca-certificates iptables"));
+        assertTrue(script.contains("apk add --no-cache iproute2 socat curl ca-certificates iptables"));
     }
 
     @Test
-    void startCommandAttachesAddressIdempotentlyAndTargetsHostAndPort() {
-        String[] command = Ec2MetadataProxy.startCommand("10.0.0.1", 9169);
+    void legacyInstallerKeepsItsExistingDependencyContract() {
+        String script = Ec2MetadataProxy.installCommand()[2];
+        assertFalse(script.contains("iptables"));
+        assertTrue(script.contains("command -v curl >/dev/null 2>&1; then exit 0; fi"));
+        assertTrue(script.contains("iproute2 socat curl ca-certificates >/dev/null"));
+        assertTrue(script.contains("dnf install -y --allowerasing iproute socat curl ca-certificates >/dev/null"));
+        assertTrue(script.contains("yum install -y iproute socat curl ca-certificates >/dev/null"));
+    }
+
+    @Test
+    void startCommandRoutesOnlyImdsWithoutBindingAListenerOrLocalAddress() {
+        String[] command = Ec2MetadataProxy.ec2RoutingCommand("10.0.0.1", 9169);
         assertEquals(3, command.length);
         assertEquals("sh", command[0]);
         assertEquals("-c", command[1]);
 
         String script = command[2];
-        // Attaches address if missing
-        assertTrue(script.contains("ip addr show dev lo | grep -q '169.254.169.254/32' || ip addr add 169.254.169.254/32 dev lo"));
-        // Idempotent when pid file exists and process is alive
-        assertTrue(script.contains("if [ -f /tmp/floci-imds-proxy.pid ] && kill -0 \"$(cat /tmp/floci-imds-proxy.pid)\" 2>/dev/null; then\n  exit 0\nfi"));
-        // Targets configured Floci host and IMDS port
-        assertTrue(script.contains("nohup socat TCP-LISTEN:80,bind=169.254.169.254,fork,reuseaddr TCP:10.0.0.1:9169 >/tmp/floci-imds-proxy.log 2>&1 &"));
-        // Verifies through an IMDSv2 token even when tokenless access is refused.
+        assertFalse(script.contains("ip addr add"));
+        assertFalse(script.contains("socat"));
+        assertFalse(script.contains("pid"));
+        assertFalse(script.contains(" -F "));
+        assertTrue(script.contains("target_ip='10.0.0.1'"));
+        assertTrue(script.contains("-I OUTPUT 1 -d 169.254.169.254/32 -p tcp --dport 80"));
+        assertTrue(script.contains("--comment floci-imds -j DNAT --to-destination \"$target_ip:9169\""));
         assertTrue(script.contains("-X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'"));
         assertTrue(script.contains("http://169.254.169.254/latest/api/token"));
         assertTrue(script.contains("-H \"X-aws-ec2-metadata-token: $token\" http://169.254.169.254/latest/meta-data/instance-id"));
@@ -112,13 +125,97 @@ class Ec2MetadataProxyTest {
         writeTool(bin, "dnf", checkedToolEnvironment()
                 + "printf '%s\\n' \"$*\" > \"$TEST_ARGUMENTS\"\n");
 
-        assertEquals(0, runShell(Ec2MetadataProxy.installCommand(), directory, Map.of(
+        assertEquals(0, runShell(Ec2MetadataProxy.ec2InstallCommand(), directory, Map.of(
                 "PATH", bin.toString(), "TEST_RECORD", record.toString(),
                 "TEST_ARGUMENTS", arguments.toString())));
 
         assertEquals("dnf\n", Files.readString(record));
-        assertEquals("install -y --allowerasing iproute socat curl ca-certificates\n",
+        assertEquals("install -y --allowerasing iproute socat curl ca-certificates iptables-nft\n",
                 Files.readString(arguments));
+    }
+
+    @Test
+    void imdsRoutingReusesOnlyItsExactRuleAndStillProbesOnEveryCall(@TempDir Path directory)
+            throws Exception {
+        Map<String, String> environment = routingTools(directory);
+        Path rules = Path.of(environment.get("TEST_RULES"));
+        Files.writeString(rules, "-A OUTPUT -d 192.0.2.1/32 -j ACCEPT\n");
+        String[] command = Ec2MetadataProxy.ec2RoutingCommand("10.0.0.1", 9169);
+        assertEquals(0, runShell(command, directory, environment), shellOutput(directory));
+        String first = Files.readString(rules);
+        assertEquals(0, runShell(command, directory, environment), shellOutput(directory));
+        assertEquals(first, Files.readString(rules));
+        assertTrue(first.contains("-A OUTPUT -d 192.0.2.1/32 -j ACCEPT\n"));
+        assertEquals(1, Files.readAllLines(Path.of(environment.get("TEST_CALLS"))).stream()
+                .filter(line -> line.contains("-I OUTPUT")).count());
+        assertEquals(List.of("token", "metadata", "token", "metadata"),
+                Files.readAllLines(Path.of(environment.get("TEST_REQUESTS"))));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"legacy-address", "own-address", "conflicting-rule", "duplicate-rule"})
+    void imdsRoutingRefusesConflictsWithoutChangingRules(String conflict, @TempDir Path directory)
+            throws Exception {
+        Map<String, String> environment = new HashMap<>(routingTools(directory));
+        Path rules = Path.of(environment.get("TEST_RULES"));
+        String rule = "-A OUTPUT -d 169.254.169.254/32 -p tcp --dport 80 -m comment --comment floci-imds"
+                + " -j DNAT --to-destination 10.0.0.1:9169\n";
+        switch (conflict) {
+            case "legacy-address" -> environment.put("TEST_ADDRESSES", "1: lo inet 169.254.169.254/32 scope global lo");
+            case "own-address" -> environment.put("TEST_ADDRESSES", "2: eth0 inet 10.0.0.1/24 scope global eth0");
+            case "conflicting-rule" -> Files.writeString(rules, rule.replace("10.0.0.1", "10.0.0.2"));
+            case "duplicate-rule" -> Files.writeString(rules, rule + rule);
+            default -> throw new IllegalArgumentException(conflict);
+        }
+        String before = Files.readString(rules);
+        assertEquals(1, runShell(Ec2MetadataProxy.ec2RoutingCommand("host.docker.internal", 9169),
+                directory, environment), shellOutput(directory));
+        assertEquals(before, Files.readString(rules));
+        assertEquals("", Files.readString(Path.of(environment.get("TEST_REQUESTS"))));
+        assertFalse(Files.readString(Path.of(environment.get("TEST_CALLS"))).contains("-I OUTPUT"));
+    }
+
+    @Test
+    void imdsRoutingResolvesInsideGuestAndRefusesFailedReadinessOnReuse(@TempDir Path directory)
+            throws Exception {
+        Map<String, String> environment = new HashMap<>(routingTools(directory));
+        String[] command = Ec2MetadataProxy.ec2RoutingCommand("host.docker.internal", 9169);
+        assertEquals(0, runShell(command, directory, environment), shellOutput(directory));
+        Path rules = Path.of(environment.get("TEST_RULES"));
+        String before = Files.readString(rules);
+        assertTrue(before.contains("--to-destination 10.0.0.1:9169"));
+        environment.put("TEST_REJECT_TOKEN", "true");
+        assertEquals(1, runShell(command, directory, environment), shellOutput(directory));
+        assertEquals(before, Files.readString(rules));
+        assertTrue(shellOutput(directory).contains("IMDSv2 routing readiness failed"));
+        assertEquals(1, Files.readAllLines(Path.of(environment.get("TEST_REQUESTS"))).stream()
+                .filter("metadata"::equals).count());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "::1", "127.0.0.1", "0.0.0.0", "169.254.169.254",
+            "224.0.0.1", "10.0.0.256", "10.0.00.1", "10.0.1", "10.0.0.1.1", "10.0.0.1.",
+            ".10.0.0.1", "10..0.1", "10.0.0.1\n10.0.0.2"})
+    void imdsRoutingRefusesInvalidResolvedTargetsBeforeWriting(String target, @TempDir Path directory)
+            throws Exception {
+        Map<String, String> environment = new HashMap<>(routingTools(directory));
+        environment.put("TEST_RESOLVED_IP", target);
+        assertEquals(1, runShell(Ec2MetadataProxy.ec2RoutingCommand("host.docker.internal", 9169),
+                directory, environment), shellOutput(directory));
+        assertEquals("", Files.readString(Path.of(environment.get("TEST_RULES"))));
+        assertEquals("", Files.readString(Path.of(environment.get("TEST_CALLS"))));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "::1", "-option", "host/path", "host;id", "host'quote", "host\nname"})
+    void imdsRoutingRejectsInvalidHostBeforeGeneratingShell(String host) {
+        assertThrows(IllegalArgumentException.class, () -> Ec2MetadataProxy.ec2RoutingCommand(host, 9169));
+    }
+
+    @Test
+    void imdsRoutingRejectsInvalidPortsBeforeGeneratingShell() {
+        assertThrows(IllegalArgumentException.class, () -> Ec2MetadataProxy.ec2RoutingCommand("10.0.0.1", 0));
+        assertThrows(IllegalArgumentException.class, () -> Ec2MetadataProxy.ec2RoutingCommand("10.0.0.1", 65536));
     }
 
     @Test
@@ -192,6 +289,44 @@ class Ec2MetadataProxyTest {
                 + "[ -z \"${PYTHONHOME+x}\" ] || exit 93\n"
                 + "[ \"$KEEP_SETTING\" = fixture-value ] || exit 94\n"
                 + "printf '%s\\n' \"${0##*/}\" >> \"$TEST_RECORD\"\n";
+    }
+
+    private static Map<String, String> routingTools(Path directory) throws IOException {
+        Path bin = Files.createDirectory(directory.resolve("bin"));
+        Path rules = Files.createFile(directory.resolve("rules"));
+        Path calls = Files.createFile(directory.resolve("calls"));
+        Path requests = Files.createFile(directory.resolve("requests"));
+        Path record = Files.createFile(directory.resolve("tools"));
+        writeTool(bin, "ip", checkedToolEnvironment() + "printf '%s\\n' \"${TEST_ADDRESSES-}\"\n");
+        writeTool(bin, "iptables", checkedToolEnvironment()
+                + "printf '%s\\n' \"$*\" >> \"$TEST_CALLS\"\n"
+                + "[ \"$1 $2 $3 $4\" = '-w 2 -t nat' ] || exit 81\n"
+                + "shift 4\n"
+                + "operation=$1; shift\n"
+                + "[ \"$1\" = OUTPUT ] || exit 82\n"
+                + "shift\n"
+                + "case \"$operation\" in\n"
+                + "  -S) /bin/cat \"$TEST_RULES\" ;;\n"
+                + "  -C) /bin/grep -Fx -- \"-A OUTPUT $*\" \"$TEST_RULES\" >/dev/null ;;\n"
+                + "  -I) [ \"$1\" = 1 ] || exit 83; shift; printf '%s\\n' \"-A OUTPUT $*\" >> \"$TEST_RULES\" ;;\n"
+                + "  *) exit 84 ;;\nesac\n");
+        writeTool(bin, "curl", checkedToolEnvironment()
+                + "case \"$*\" in\n"
+                + "  *'%{remote_ip}'*) printf '%s' \"${TEST_RESOLVED_IP-10.0.0.1}\" ;;\n"
+                + "  *'/latest/api/token'*) printf 'token\\n' >> \"$TEST_REQUESTS\";"
+                + " [ \"${TEST_REJECT_TOKEN-false}\" = false ] || exit 22; printf 'fixture-token' ;;\n"
+                + "  *'/latest/meta-data/instance-id'*) case \"$*\" in\n"
+                + "    *'X-aws-ec2-metadata-token: fixture-token'*) printf 'metadata\\n' >> \"$TEST_REQUESTS\" ;;\n"
+                + "    *) exit 85 ;;\nesac ;;\n"
+                + "  *) exit 86 ;;\nesac\n");
+        writeTool(bin, "sleep", "exit 0\n");
+        return Map.of("PATH", bin + ":" + System.getenv("PATH"), "TEST_RULES", rules.toString(),
+                "TEST_CALLS", calls.toString(), "TEST_REQUESTS", requests.toString(),
+                "TEST_RECORD", record.toString());
+    }
+
+    private static String shellOutput(Path directory) throws IOException {
+        return Files.readString(directory.resolve("shell-output"));
     }
 
     private static void writeTool(Path bin, String name, String script) throws IOException {
