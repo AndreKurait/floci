@@ -72,6 +72,30 @@ The normal EC2 networking, resource limits, metadata, SSH and UserData behavior
 still applies. Omitted `guestRuntime` and unknown AMI IDs retain the `minimal`
 runtime; selecting `image` on one entry does not change other entries.
 
+### Binding registered AMIs to local images
+
+An external catalog entry can declare `registrationNames`, an optional list of
+exact `RegisterImage` names:
+
+```yaml
+    guestRuntime: image
+    registrationNames:
+      - local-worker-release
+```
+
+Registering `Name=local-worker-release` then binds the generated AMI ID to that
+catalog entry. RunInstances uses its Docker image, guest runtime and Docker
+platform. An omitted architecture inherits the catalog architecture; an
+explicit mismatch returns `InvalidParameterValue` before registration.
+Duplicate or blank registration names make the catalog invalid. Names are
+case-sensitive, with no wildcard or prefix matching.
+
+CopyImage retains this binding across regions through its source ancestry.
+CreateImage and CopyImage use their explicit source, even when the output name
+matches another registration binding. Names without a declared binding retain
+the existing metadata registration and default-image fallback behavior.
+The mapping does not import snapshot bytes or prove that a guest boots.
+
 ### Cloud-image-derived AMI guests
 
 The `ami-ubuntu2404-cloud` entry is an experimental Ubuntu 24.04 guest image built from Canonical cloud-image artifacts, not from the Docker-library `ubuntu:24.04` image. It is intended for EC2 workflows that need packages such as `systemd` and `cloud-init` to match a real Ubuntu cloud image more closely.
