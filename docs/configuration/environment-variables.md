@@ -525,9 +525,24 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_EC2_ENABLED` | `true` | Enable the EC2 service |
 | `FLOCI_SERVICES_EC2_MOCK` | `false` | When `true`, instances are registered in state but no containers are spawned |
 | `FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH` | (unset) | Path to a complete YAML image catalog replacing the bundled EC2 catalog; mount the file at this path when running in Docker |
+| `FLOCI_SERVICES_EC2_EXTRA_ENV` | (unset) | Explicit guest `KEY=VALUE` entries, comma-separated (escape a literal comma as `\,`). Duplicate keys and reserved identity, credential, region, endpoint and IMDS settings are rejected |
+| `FLOCI_SERVICES_EC2_ULIMITS` | (unset) | Guest process limits as comma-separated `name=soft[:hard]`, for example `memlock=-1,nofile=1024000`. Omitted hard equals soft; `-1` means unlimited |
 | `FLOCI_SERVICES_EC2_IMDS_PORT` | `9169` | Port for the EC2 Instance Metadata Service (IMDS) endpoint |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START` | `2200` | First port in the SSH port range for EC2 instances |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END` | `2299` | Last port in the SSH port range |
+
+Guest environment values are explicit, never copied from the Floci host environment.
+They replace image defaults through Docker's normal environment merge. Floci's
+instance ID, region, credentials/provider selection, AWS service endpoints and IMDS
+settings remain authoritative; the corresponding `AWS_*` keys cannot be overridden.
+Other keys, such as `AWS_CA_BUNDLE`, are allowed. Invalid or duplicate entries refuse
+the guest launch before a workload or firewall namespace is created, without logging
+their values.
+
+Process limits apply only to EC2 workload containers, including image, minimal and
+systemd runtimes. They do not change helper containers or Docker daemon defaults.
+An absent setting keeps the existing defaults; CPU and memory limits remain controlled
+by the instance type and `FLOCI_SERVICES_EC2_INSTANCE_RESOURCE_LIMITS`.
 
 ### Athena
 
