@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.lambda.model.LambdaLayerVersion;
@@ -504,6 +505,36 @@ public class LambdaLayerService {
             return null;
         }
         return layerStore.get(region, layerName, version).orElse(null);
+    }
+
+    /**
+     * Resolves initialization input against the stored function's scope. Provisioned workers
+     * run outside a request; the ambient account must not select another account's layer.
+     * Cross-account sharing remains unsupported.
+     */
+    public LambdaLayerVersion resolveLayerByArnForAccount(
+            String layerVersionArn, String accountId, String functionRegion) {
+        AwsArnUtils.Arn arn = parseLayerVersionArn(layerVersionArn);
+        if (arn == null || accountId == null || accountId.isBlank()
+                || functionRegion == null || functionRegion.isBlank()
+                || !"lambda".equals(arn.service())
+                || AwsArnUtils.isForeignPartition(arn, AwsRegions.partitionFor(functionRegion))
+                || AwsArnUtils.isForeignAccount(arn, accountId)) {
+            return null;
+        }
+        String[] resourceParts = arn.resource().split(":");
+        if (resourceParts.length != 3) {
+            return null;
+        }
+        long version;
+        try {
+            version = Long.parseLong(resourceParts[2]);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        return layerStore.getForAccount(accountId, arn.region(), resourceParts[1], version)
+                .filter(layer -> layerVersionArn.equals(layer.getLayerVersionArn()))
+                .orElse(null);
     }
 
     /**

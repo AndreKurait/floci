@@ -418,6 +418,11 @@ Invoke for that exact alias or version uses an available initialized environment
 on-demand spillover when all its environments are busy. Other aliases, versions, accounts
 and regions do not borrow that allocation.
 
+Layer initialization uses the stored function's account and partition, including background
+workers without a request context. An unresolved configured layer or missing layer directory
+fails provisioned initialization; it is never silently omitted from a `READY` environment.
+Cross-account layer sharing remains unsupported.
+
 Provisioned environments are separate from ordinary idle eviction. Desired configurations
 are persisted; restarting Floci initializes new processes before reporting `READY`.
 Deleting the configuration, alias or function removes the owned environments. Changing an

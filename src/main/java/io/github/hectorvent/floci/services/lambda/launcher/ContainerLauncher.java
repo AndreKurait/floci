@@ -430,7 +430,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // 3. Copy layer contents into /opt (layers are merged in order)
         if (fn.getLayers() != null && !fn.getLayers().isEmpty()) {
             for (String layerArn : fn.getLayers()) {
-                LambdaLayerVersion layer = layerService.resolveLayerByArn(layerArn);
+                LambdaLayerVersion layer = provisioned
+                        ? layerService.resolveLayerByArnForAccount(layerArn, fn.getAccountId(), lambdaRegion)
+                        : layerService.resolveLayerByArn(layerArn);
+                if (provisioned && (layer == null || layer.getCodeLocalPath() == null
+                        || !Files.isDirectory(Path.of(layer.getCodeLocalPath())))) {
+                    throw new IllegalStateException("Configured layer is unavailable for provisioned initialization: "
+                            + layerArn);
+                }
                 if (layer != null && layer.getCodeLocalPath() != null) {
                     Path layerPath = Path.of(layer.getCodeLocalPath());
                     if (Files.exists(layerPath)) {

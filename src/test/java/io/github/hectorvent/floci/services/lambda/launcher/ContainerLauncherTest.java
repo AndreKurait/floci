@@ -11,8 +11,10 @@ import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
+import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFileSystemConfig;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.lambda.model.LambdaLayerVersion;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
 import io.smallrye.config.EnvConfigSource;
@@ -88,6 +90,7 @@ class ContainerLauncherTest {
     @Mock RuntimeApiServer runtimeApiServer;
     @Mock DockerClient dockerClient;
     @Mock LambdaExecutionRoleCredentials executionRoleCredentials;
+    @Mock LambdaLayerService layerService;
 
     @TempDir
     Path tempDir;
@@ -139,7 +142,7 @@ class ContainerLauncherTest {
         LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(reachableEndpoint);
         launcher = new ContainerLauncher(containerBuilder, lifecycleManager, logStreamer, imageResolver,
                 runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
-                mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class), awsEnv,
+                layerService, awsEnv,
                 executionRoleCredentials);
 
         when(runtimeApiServerFactory.create()).thenReturn(runtimeApiServer);
@@ -687,6 +690,72 @@ class ContainerLauncherTest {
         assertThrows(RuntimeException.class, () -> launcher.launchProvisioned(fn));
         verify(runtimeApiServerFactory).release(runtimeApiServer);
         verify(runtimeApiServer, never()).expectExtensions(0);
+    }
+
+    @Test
+    void provisionedLaunchCopiesTheStoredAccountsLayerWithoutAmbientLookup() throws Exception {
+        LambdaFunction fn = networkFunction();
+        fn.setAccountId("123456789012");
+        fn.setFunctionArn("arn:aws:lambda:eu-west-1:123456789012:function:layer-function");
+        fn.setVersion("1");
+        String arn = "arn:aws:lambda:eu-west-1:123456789012:layer:owned:1";
+        fn.setLayers(List.of(arn));
+        Path layerPath = Files.createDirectory(tempDir.resolve("owned-layer"));
+        Files.writeString(layerPath.resolve("dependency.txt"), "owned");
+        LambdaLayerVersion layer = new LambdaLayerVersion();
+        layer.setCodeLocalPath(layerPath.toString());
+        when(layerService.resolveLayerByArnForAccount(arn, "123456789012", "eu-west-1")).thenReturn(layer);
+        stubExtensionDiscovery();
+
+        launcher.launchProvisioned(fn);
+
+        assertTrue(capturedRemotePaths.contains("/opt"));
+        verify(layerService, never()).resolveLayerByArn(anyString());
+        verify(lifecycleManager).startCreated(eq("container-123"), any());
+        verify(runtimeApiServer).expectExtensions(0);
+    }
+
+    @ParameterizedTest
+    @MethodSource("unavailableLayerPaths")
+    void provisionedLaunchRefusesMissingLayerInputsAndCleansBeforeStart(String pathKind) throws Exception {
+        LambdaFunction fn = networkFunction();
+        fn.setAccountId("123456789012");
+        fn.setVersion("1");
+        String arn = "arn:aws:lambda:us-east-1:123456789012:layer:missing:1";
+        fn.setLayers(List.of(arn));
+        if (!"unresolved".equals(pathKind)) {
+            LambdaLayerVersion layer = new LambdaLayerVersion();
+            if ("absent".equals(pathKind)) {
+                layer.setCodeLocalPath(tempDir.resolve("absent").toString());
+            } else if ("regular-file".equals(pathKind)) {
+                layer.setCodeLocalPath(Files.writeString(tempDir.resolve("not-a-directory"), "data").toString());
+            }
+            when(layerService.resolveLayerByArnForAccount(eq(arn), eq("123456789012"), anyString()))
+                    .thenReturn(layer);
+        }
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> launcher.launchProvisioned(fn));
+        assertTrue(error.getMessage().startsWith("Configured layer is unavailable for provisioned initialization:"));
+        verify(lifecycleManager, never()).startCreated(anyString(), any());
+        verify(lifecycleManager).stopAndRemove("container-123", null);
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+        verify(runtimeApiServer, never()).expectExtensions(anyInt());
+        verify(runtimeApiServer, never()).enqueue(any());
+    }
+
+    private static Stream<String> unavailableLayerPaths() {
+        return Stream.of("unresolved", "null-path", "absent", "regular-file");
+    }
+
+    @Test
+    void ordinaryLaunchRetainsItsUnresolvedLayerBehavior() {
+        LambdaFunction fn = networkFunction();
+        String arn = "arn:aws:lambda:us-east-1:123456789012:layer:missing:1";
+        fn.setLayers(List.of(arn));
+        launcher.launch(fn);
+        verify(layerService).resolveLayerByArn(arn);
+        verify(layerService, never()).resolveLayerByArnForAccount(anyString(), anyString(), anyString());
+        verify(lifecycleManager).startCreated(eq("container-123"), any());
     }
 
     @Test
