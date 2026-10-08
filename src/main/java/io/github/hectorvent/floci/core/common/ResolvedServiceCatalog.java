@@ -80,6 +80,7 @@ import io.github.hectorvent.floci.services.marketplace.MarketplaceDiscoveryContr
 import io.github.hectorvent.floci.services.marketplace.MarketplaceReportingController;
 import io.github.hectorvent.floci.services.sagemaker.SageMakerRuntimeController;
 import io.github.hectorvent.floci.services.s3.S3Controller;
+import io.github.hectorvent.floci.services.swf.model.SwfConstants;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -291,7 +292,8 @@ public class ResolvedServiceCatalog {
                 descriptor("swf", "swf", config.services().swf().enabled(), true,
                         "swf", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
-                        Set.of("SimpleWorkflowService."), Set.of("swf"), Set.of(), Set.of()),
+                        Set.of("SimpleWorkflowService.", SwfConstants.LEGACY_TARGET_PREFIX),
+                        Set.of("swf"), Set.of(), Set.of()),
                 descriptor("cloudformation", "cloudformation", config.services().cloudformation().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY),

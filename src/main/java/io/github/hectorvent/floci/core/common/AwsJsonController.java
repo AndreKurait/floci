@@ -18,6 +18,7 @@ import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsJsonHandler;
 import io.github.hectorvent.floci.services.swf.SwfJsonHandler;
+import io.github.hectorvent.floci.services.swf.model.SwfConstants;
 import io.github.hectorvent.floci.services.timestreaminfluxdb.TimestreamInfluxDbJsonHandler;
 import io.github.hectorvent.floci.services.verifiedpermissions.VerifiedPermissionsJsonHandler;
 import jakarta.inject.Inject;
@@ -91,6 +92,25 @@ public class AwsJsonController {
         this.verifiedPermissionsJsonHandler = verifiedPermissionsJsonHandler;
         this.bcmPricingCalculatorJsonHandler = bcmPricingCalculatorJsonHandler;
         this.timestreamInfluxDbJsonHandler = timestreamInfluxDbJsonHandler;
+    }
+
+    /**
+     * SWF also accepts the documented JSON target used by Boto 2. Keep the wire
+     * headers intact and delegate the body, operation and faults to the same handler.
+     */
+    @POST
+    @Consumes("application/json")
+    @Produces("application/json")
+    public Response handleLegacySwfRequest(
+            @HeaderParam("X-Amz-Target") String target,
+            @Context HttpHeaders httpHeaders,
+            String body) {
+        if (target == null || !target.startsWith(SwfConstants.LEGACY_TARGET_PREFIX)) {
+            return JsonErrorResponseUtils.createUnknownOperationErrorResponse(target);
+        }
+        return Response.fromResponse(handleJsonRequest(target, httpHeaders, body))
+                .type("application/json")
+                .build();
     }
 
     @POST

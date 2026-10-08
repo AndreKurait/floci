@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.services.swf.model.SwfConstants;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -100,6 +101,10 @@ public class ProtocolClaimer {
                 }
                 if (CONTENT_TYPE_JSON_1_1.equals(mediaType)) {
                     return Optional.of(targetClaim(WireProtocol.AWS_JSON_1_1, target));
+                }
+                // SWF's documented pre-Smithy JSON wire format, still emitted by Boto 2.
+                if ("application/json".equals(mediaType) && target.startsWith(SwfConstants.LEGACY_TARGET_PREFIX)) {
+                    return Optional.of(targetClaim(WireProtocol.AWS_JSON_1_0, target));
                 }
                 if (isCbor(mediaType)) {
                     return Optional.of(targetClaim(WireProtocol.AWS_CBOR_TARGET, target));
