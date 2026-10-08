@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.services.ec2;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
+import com.github.dockerjava.api.command.CreateContainerCmd;
+import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
@@ -18,6 +20,7 @@ import com.github.dockerjava.api.model.ContainerConfig;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.StreamType;
 import java.nio.charset.StandardCharsets;
 import com.github.dockerjava.api.model.NetworkSettings;
@@ -37,6 +40,7 @@ import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
+import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
@@ -63,6 +67,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -71,6 +76,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.eq;
@@ -2102,6 +2108,67 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchProducesContainerSpecWithCatalogMemoryAndCpuLimits() throws Exception {
+        ContainerSpec spec = launchWithRealBuilder(ResolvedAmiImage.minimal("ubuntu:24.04"));
+
+        assertEquals(1024L * 1024 * 1024, spec.memoryBytes());
+        assertEquals(2_000_000_000L, spec.nanoCpus());
+        assertEquals(List.of("tail", "-f", "/dev/null"), spec.cmd());
+        assertNull(spec.entrypoint());
+    }
+
+    @Test
+    void launchImageRuntimePreservesImageStartupThroughDockerCreate() throws Exception {
+        ContainerSpec spec = launchWithRealBuilder(new ResolvedAmiImage(
+                "example/worker:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"));
+
+        assertNull(spec.cmd());
+        assertNull(spec.entrypoint());
+        assertNull(spec.cgroupnsMode());
+        assertTrue(spec.mounts().isEmpty());
+        assertTrue(spec.binds().isEmpty());
+        assertEquals(1024L * 1024 * 1024, spec.memoryBytes());
+        assertEquals(2_000_000_000L, spec.nanoCpus());
+        assertEquals("ec2", spec.labels().get(Ec2ContainerManager.LABEL_SERVICE));
+        assertTrue(spec.env().contains("AWS_EC2_INSTANCE_ID=i-spec-limits"));
+
+        DockerClient dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        when(dockerClient.infoCmd().exec().getNCPU()).thenReturn(8);
+        CreateContainerCmd createCmd = mock(CreateContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.createContainerCmd(spec.image())).thenReturn(createCmd);
+        CreateContainerResponse response = mock(CreateContainerResponse.class);
+        when(response.getId()).thenReturn(TEST_CONTAINER_ID);
+        when(createCmd.exec()).thenReturn(response);
+        ImageCacheService imageCache = mock(ImageCacheService.class);
+        when(imageCache.ensureImageExists(spec.image(), "linux/arm64")).thenReturn(spec.image());
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        ContainerLifecycleManager lifecycle = new ContainerLifecycleManager(
+                dockerClient, imageCache, mock(ContainerDetector.class), mock(PortAllocator.class), config);
+
+        assertEquals(TEST_CONTAINER_ID, lifecycle.create(spec, "linux/arm64"));
+
+        verify(createCmd).withPlatform("linux/arm64");
+        verify(createCmd, never()).withCmd(anyList());
+        verify(createCmd, never()).withCmd(any(String[].class));
+        verify(createCmd, never()).withEntrypoint(anyList());
+        verify(createCmd, never()).withEntrypoint(any(String[].class));
+        verify(createCmd).exec();
+    }
+
+    @Test
+    void launchSystemdRuntimeRetainsInitAndMountsInContainerSpec() throws Exception {
+        ContainerSpec spec = launchWithRealBuilder(new ResolvedAmiImage(
+                "example/cloud:1", ResolvedAmiImage.SYSTEMD_RUNTIME, true, "linux/arm64"));
+
+        assertEquals(List.of("/sbin/init"), spec.cmd());
+        assertNull(spec.entrypoint());
+        assertEquals("host", spec.cgroupnsMode());
+        assertEquals(Set.of("/run", "/run/lock"),
+                spec.mounts().stream().map(Mount::getTarget).collect(Collectors.toSet()));
+        assertEquals(1, spec.binds().size());
+        assertEquals("/sys/fs/cgroup", spec.binds().getFirst().getPath());
+    }
+
+    private static ContainerSpec launchWithRealBuilder(ResolvedAmiImage image) throws Exception {
         Ec2ContainerManager.containerBridgeIpAttempts = 1;
         Ec2ContainerManager.containerBridgeIpPollMillis = 1;
 
@@ -2138,6 +2205,7 @@ class Ec2ContainerManagerTest {
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
         ArgumentCaptor<ContainerSpec> specCaptor = ArgumentCaptor.forClass(ContainerSpec.class);
         when(lifecycleManager.create(specCaptor.capture())).thenReturn(TEST_CONTAINER_ID);
+        when(lifecycleManager.create(specCaptor.capture(), anyString())).thenReturn(TEST_CONTAINER_ID);
         when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
 
         DockerClient dockerClient = mock(DockerClient.class);
@@ -2174,12 +2242,13 @@ class Ec2ContainerManagerTest {
         Instance instance = instance("i-spec-limits");
         instance.setInstanceType("t3.micro");
 
-        manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
-        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
-
-        ContainerSpec capturedSpec = specCaptor.getValue();
-        assertEquals(1024L * 1024 * 1024, capturedSpec.memoryBytes());
-        assertEquals(2_000_000_000L, capturedSpec.nanoCpus());
+        try {
+            manager.launch(instance, image, null, "us-west-2");
+            awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+            return specCaptor.getValue();
+        } finally {
+            manager.stop();
+        }
     }
 
     /** Stubs the daemon reachability probe every launch makes before touching Docker. */

@@ -43,4 +43,35 @@ class Ec2ExternalImageCatalogTest {
         Files.writeString(invalid, "images: [not-valid");
         assertThrows(IllegalStateException.class, () -> new Ec2ImageCatalog(invalid).images());
     }
+
+    @Test
+    void externalImageRuntimeSurvivesResolutionWithoutChangingDefaultRuntime() throws Exception {
+        Path catalog = directory.resolve("image-runtime.yaml");
+        Files.writeString(catalog, """
+                defaultDockerImage: example/base:1
+                images:
+                  - imageId: ami-local-worker
+                    aliases: [ami-worker-alias]
+                    dockerImage: example/worker:1
+                    name: local-worker
+                    description: local worker
+                    architecture: arm64
+                    creationDate: '2025-11-05T00:00:00.000Z'
+                    guestRuntime: image
+                """);
+        AmiImageResolver resolver = new AmiImageResolver(new Ec2ImageCatalog(catalog));
+
+        ResolvedAmiImage image = resolver.resolveImage("ami-worker-alias");
+        assertEquals("example/worker:1", image.dockerImage());
+        assertEquals(ResolvedAmiImage.IMAGE_RUNTIME, image.guestRuntime());
+        assertEquals("linux/arm64", image.dockerPlatform());
+        assertTrue(image.imageRuntime());
+        assertFalse(image.systemd());
+        assertFalse(image.cloudInit());
+
+        ResolvedAmiImage fallback = resolver.resolveImage("ami-unknown");
+        assertEquals("example/base:1", fallback.dockerImage());
+        assertEquals(ResolvedAmiImage.DEFAULT_RUNTIME, fallback.guestRuntime());
+        assertFalse(fallback.imageRuntime());
+    }
 }

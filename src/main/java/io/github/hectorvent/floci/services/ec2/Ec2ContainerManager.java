@@ -683,7 +683,7 @@ public class Ec2ContainerManager {
                                              String serviceEndpoint, String imdsEndpoint, String instanceId,
                                              int sshHostPort, SecurityGroupFirewallManager.Namespace namespace,
                                              boolean hasInstanceProfile, String instanceType) {
-        // Minimal images keep the historic tail command, while cloud-image AMI guests can boot their init.
+        // Image runtime keeps the image's startup contract; minimal and systemd retain their commands.
         ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image.dockerImage())
                 .withName(containerName)
                 .withEmbeddedDns()
@@ -700,8 +700,10 @@ public class Ec2ContainerManager {
                 .withLabels(Map.of(LABEL_OWNER, ownerIdentity()))
                 // EC2 instances expose IMDS on 169.254.169.254. Floci needs network administration
                 // privileges in the local container to attach that link-local address.
-                .withPrivileged(namespace == null)
-                .withCmd(image.systemd() ? List.of("/sbin/init") : List.of("tail", "-f", "/dev/null"));
+                .withPrivileged(namespace == null);
+        if (!image.imageRuntime()) {
+            specBuilder.withCmd(image.systemd() ? List.of("/sbin/init") : List.of("tail", "-f", "/dev/null"));
+        }
         if (config.services().ec2().instanceResourceLimits() && instanceType != null && !instanceType.isBlank()) {
             Optional<CatalogInstanceType> catalogType = instanceTypeCatalog.find(instanceType);
             if (catalogType.isPresent()) {
