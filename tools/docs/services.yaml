@@ -277,6 +277,10 @@ services:
       - { path: src/main/java/io/github/hectorvent/floci/services/securityadmin/SecurityAdminController.java, mode: rest }
     rename_actions:
       ListAdmin: ListOrganizationAdminAccounts
+  - service: resource-groups
+    doc: docs/services/resource-groups.md
+    sources:
+      - { path: src/main/java/io/github/hectorvent/floci/services/resourcegroups/ResourceGroupsController.java, mode: rest }
   - service: inspector2
     doc: docs/services/inspector2.md
     sources:

@@ -36,7 +36,7 @@ class PartitionCrossServiceSmokeIntegrationTest {
 
     static final Set<String> COVERED_PACKAGES = Set.of(
             "acm", "apigatewayv2", "batch", "codebuild", "efs", "elbv2", "firehose", "glue", "iot",
-            "kinesis", "sns");
+            "kinesis", "resourcegroups", "sns");
 
     private static final String JSON_1_1 = "application/x-amz-json-1.1";
     private static final String JSON = "application/json";
@@ -51,6 +51,22 @@ class PartitionCrossServiceSmokeIntegrationTest {
 
     static Stream<PartitionCase> nonCommercialCases() {
         return PartitionMatrix.cases().filter(c -> !"aws".equals(c.partition()));
+    }
+
+    @ParameterizedTest
+    @MethodSource("nonCommercialCases")
+    void resourceGroupArn(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "resource-groups");
+        String name = unique("smoke-pool", partitionCase);
+        String body = "{\"Name\":\"" + name + "\",\"Configuration\":["
+                + "{\"Type\":\"AWS::EC2::CapacityReservationPool\"},"
+                + "{\"Type\":\"AWS::ResourceGroups::Generic\",\"Parameters\":["
+                + "{\"Name\":\"allowed-resource-types\",\"Values\":[\"AWS::EC2::CapacityReservation\"]}]}]}";
+        String arn = signed(region, "resource-groups").contentType(JSON).body(body)
+                .when().post("/groups").then().statusCode(200).extract().path("Group.GroupArn");
+        cleanup.register(() -> signed(region, "resource-groups").contentType(JSON)
+                .body("{\"Group\":\"" + arn + "\"}").when().post("/delete-group"));
+        PartitionMatrix.assertArnIn(partitionCase, arn);
     }
 
     @ParameterizedTest

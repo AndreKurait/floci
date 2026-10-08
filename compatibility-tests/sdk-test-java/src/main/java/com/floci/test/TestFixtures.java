@@ -89,6 +89,7 @@ import software.amazon.awssdk.services.athena.model.QueryExecutionState;
 import software.amazon.awssdk.services.athena.model.QueryExecutionStatus;
 import software.amazon.awssdk.services.glue.GlueClient;
 import software.amazon.awssdk.services.firehose.FirehoseClient;
+import software.amazon.awssdk.services.resourcegroups.ResourceGroupsClient;
 import software.amazon.awssdk.services.resourcegroupstaggingapi.ResourceGroupsTaggingApiClient;
 import software.amazon.awssdk.services.apigateway.ApiGatewayClient;
 import software.amazon.awssdk.services.apigatewayv2.ApiGatewayV2Client;
@@ -810,6 +811,14 @@ public final class TestFixtures {
 
     public static GlueClient glueClient() {
         return GlueClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static ResourceGroupsClient resourceGroupsClient() {
+        return ResourceGroupsClient.builder()
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
                 .credentialsProvider(CREDENTIALS)

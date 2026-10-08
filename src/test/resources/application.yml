@@ -72,6 +72,9 @@ floci:
         flush-interval-ms: 60000
       codedeploy:
         flush-interval-ms: 60000
+      resource-groups:
+        mode: ${FLOCI_STORAGE_SERVICES_RESOURCE_GROUPS_MODE:}
+        flush-interval-ms: ${FLOCI_STORAGE_SERVICES_RESOURCE_GROUPS_FLUSH_INTERVAL_MS:5000}
       tagging:
         flush-interval-ms: 60000
       elasticbeanstalk:
@@ -520,6 +523,8 @@ floci:
       enabled: true
     lakeformation:
       enabled: true
+    resource-groups:
+      enabled: ${FLOCI_SERVICES_RESOURCE_GROUPS_ENABLED:true}
     tagging:
       enabled: true
     configservice:

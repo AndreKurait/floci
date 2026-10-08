@@ -390,6 +390,7 @@ public interface EmulatorConfig {
         CodeDeployStorageConfig codedeploy();
         TranscribeStorageConfig transcribe();
         TaggingStorageConfig tagging();
+        ResourceGroupsStorageConfig resourceGroups();
         ElasticBeanstalkStorageConfig elasticbeanstalk();
         CloudTrailStorageConfig cloudtrail();
         RumStorageConfig rum();
@@ -623,6 +624,13 @@ public interface EmulatorConfig {
         long flushIntervalMs();
     }
 
+    interface ResourceGroupsStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
     interface TaggingStorageConfig {
         Optional<String> mode();
 
@@ -763,6 +771,7 @@ public interface EmulatorConfig {
         AppConfigDataServiceConfig appconfigdata();
         EcrServiceConfig ecr();
         ResourceGroupsTaggingServiceConfig tagging();
+        ResourceGroupsServiceConfig resourceGroups();
         BedrockServiceConfig bedrock();
         BedrockRuntimeServiceConfig bedrockRuntime();
         EksServiceConfig eks();
@@ -2197,6 +2206,11 @@ public interface EmulatorConfig {
          */
         @WithDefault("floci/network-helper:local")
         String proxyImage();
+    }
+
+    interface ResourceGroupsServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
     }
 
     interface ResourceGroupsTaggingServiceConfig {

@@ -190,6 +190,10 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>resourcegroups</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>resourcegroupstaggingapi</artifactId>
         </dependency>
         <dependency>

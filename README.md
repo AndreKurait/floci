@@ -383,6 +383,7 @@ For operation-level compatibility, see the [Services Overview](https://floci.io/
 | CloudTrail | In-process | Trails, event selectors (S3 data events with bucket/prefix matching), `StartLogging`/`StopLogging`, scheduled gzipped log file emission to the destination bucket at AWS-shaped key paths, IAM-deny path emits `AccessDenied` records |
 | CloudFront | In-process | Distributions, origins, cache behaviors, invalidations, tagging |
 | WAF v2 | In-process | Web ACLs, IP sets, regex pattern sets, rule groups, logging configs, resource associations, tagging (REGIONAL and CLOUDFRONT scopes) |
+| AWS Resource Groups | In-process | Five capacity-pool operations: stored groups, verified EC2 reservation membership, scoped pagination and group deletion; no dynamic queries or capacity allocation |
 | Resource Explorer 2 | In-process | All 32 management APIs: index and view lifecycle, multi-Region setup tasks, the full search query grammar, and tagging; 30 services expose their resources for search, gathered live rather than from an index |
 | Route53 | In-process | Hosted zones, SOA and NS records, resource record sets, change tracking, tagging |
 | Cloud Map | In-process | HTTP and DNS namespaces, services, instance registration, discovery queries, operations, tagging |
