@@ -20,6 +20,7 @@ import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.Ports;
+import com.github.dockerjava.api.model.Ulimit;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.ContainerCaBundle;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -1125,6 +1126,12 @@ public class ContainerLifecycleManager {
         // Memory limit
         if (spec.hasMemoryLimit()) {
             hostConfig.withMemory(spec.memoryBytes());
+        }
+        if (!spec.ulimits().isEmpty()) {
+            hostConfig.withUlimits(spec.ulimits().entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .map(entry -> new Ulimit(entry.getKey(), entry.getValue().soft(), entry.getValue().hard()))
+                    .toArray(Ulimit[]::new));
         }
 
         // CPU quota and weight

@@ -45,6 +45,7 @@ import java.util.regex.Pattern;
  * @param linkLocalIps Link-local IPv4 addresses assigned to the container's endpoint on the configured network
  * @param portBindingHostIps Host interface each published port binds to, keyed by container port.
  *        A port with no entry here, and not in {@code loopbackPortBindings}, binds every interface
+ * @param ulimits Explicit process resource limits by name (empty = daemon defaults)
  */
 public record ContainerSpec(
         String image,
@@ -74,17 +75,70 @@ public record ContainerSpec(
         Integer cpuShares,
         boolean readonlyRootfs,
         List<String> linkLocalIps,
-        Map<Integer, String> portBindingHostIps
+        Map<Integer, String> portBindingHostIps,
+        Map<String, ResourceLimit> ulimits
 ) {
     private static final Pattern LINK_LOCAL_IPV4 = Pattern.compile("^169\\.254\\.(\\d{1,3})\\.(\\d{1,3})$");
     private static final Set<String> NETWORKS_WITHOUT_ENDPOINT_IPAM = Set.of("bridge", "default", "host", "none");
     private static final Set<String> NAMESPACE_NETWORK_MODES = Set.of("host", "none");
 
     public ContainerSpec {
+        ulimits = Map.copyOf(ulimits);
+        for (String limitName : ulimits.keySet()) {
+            if (!limitName.matches("[a-z][a-z0-9]*")) {
+                throw new IllegalArgumentException("Invalid container resource limit name: " + limitName);
+            }
+        }
         if (linkLocalIps != null && !linkLocalIps.isEmpty()) {
             requireUserDefinedNetwork(networkMode);
             linkLocalIps.forEach(ContainerSpec::requireLinkLocalIpv4);
         }
+    }
+
+    /** Soft and hard process limits; -1 means unlimited. */
+    public record ResourceLimit(long soft, long hard) {
+        public ResourceLimit {
+            if (soft < -1 || hard < -1 || (hard != -1 && (soft == -1 || soft > hard))) {
+                throw new IllegalArgumentException("Invalid container resource limit: " + soft + ":" + hard);
+            }
+        }
+    }
+
+    /** Keeps callers without explicit process resource limits on daemon defaults. */
+    public ContainerSpec(
+            String image,
+            String name,
+            List<String> env,
+            List<String> cmd,
+            List<String> entrypoint,
+            Long memoryBytes,
+            Map<Integer, Integer> portBindings,
+            List<Integer> loopbackPortBindings,
+            List<Integer> exposedPorts,
+            String networkMode,
+            List<Mount> mounts,
+            List<Bind> binds,
+            List<VolumesFrom> volumesFrom,
+            List<String> extraHosts,
+            Map<String, String> labels,
+            LogConfig logConfig,
+            boolean privileged,
+            String cgroupnsMode,
+            List<String> dnsServers,
+            String workingDir,
+            String user,
+            List<String> groupAdd,
+            List<DeviceRequest> deviceRequests,
+            Long nanoCpus,
+            Integer cpuShares,
+            boolean readonlyRootfs,
+            List<String> linkLocalIps,
+            Map<Integer, String> portBindingHostIps
+    ) {
+        this(image, name, env, cmd, entrypoint, memoryBytes, portBindings, loopbackPortBindings,
+                exposedPorts, networkMode, mounts, binds, volumesFrom, extraHosts, labels, logConfig,
+                privileged, cgroupnsMode, dnsServers, workingDir, user, groupAdd, deviceRequests,
+                nanoCpus, cpuShares, readonlyRootfs, linkLocalIps, portBindingHostIps, Map.of());
     }
 
     /**
