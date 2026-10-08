@@ -66,6 +66,10 @@ public class RegisteredExtension {
      * @return true only on the first call, so the caller counts the readiness barrier down once
      *         per extension no matter how many times it polls.
      */
+    public boolean hasReceivedFirstNext() {
+        return firstNextReceived;
+    }
+
     public boolean markFirstNextReceived() {
         if (firstNextReceived) {
             return false;

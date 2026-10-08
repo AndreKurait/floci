@@ -49,6 +49,9 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `PutFunctionConcurrency` | Set reserved concurrent executions |
 | `GetFunctionConcurrency` | Get reserved concurrent executions |
 | `DeleteFunctionConcurrency` | Clear reserved concurrent executions |
+| `PutProvisionedConcurrencyConfig` | Initialize Docker environments for a published version or simple alias |
+| `GetProvisionedConcurrencyConfig` | Read the allocation's actual initialization status and capacity |
+| `DeleteProvisionedConcurrencyConfig` | Remove an allocation and stop its environments |
 | `GetAccountSettings` | Account limits plus usage derived from the caller's stored functions |
 | `PutFunctionEventInvokeConfig` | Set the asynchronous invocation settings of a function, version or alias (retries, event age, destinations) |
 | `UpdateFunctionEventInvokeConfig` | Change some of those settings, leaving the rest as they are |
@@ -335,8 +338,7 @@ disabled fails with Lambda's error as the resource status reason.
     applies independently to each region. `PutFunctionConcurrency` validates
     that the requested value leaves at least
     `floci.services.lambda.unreserved-concurrency-min` (default 100) available
-    for unreserved functions in that region. `PutProvisionedConcurrencyConfig`
-    and related provisioned-concurrency operations remain unimplemented.
+    for unreserved functions in that region.
 
     Reducing or clearing a function's reserved value does not kill
     invocations that are already in flight. This matches AWS, which
@@ -400,12 +402,44 @@ A layer ARN outside the `aws` partition is refused whatever that setting says. P
 isolated, so no resource policy can ever make such a layer readable, and `GetLayerVersionByArn`
 rejects one outright with `InvalidParameterValueException: Invalid layer version ...`.
 
+## Provisioned concurrency
+
+Put, Get and Delete use `/2019-09-30/functions/{FunctionName}/provisioned-concurrency`
+with a required `Qualifier` query parameter. Put accepts a positive integer
+`ProvisionedConcurrentExecutions` and returns HTTP 202 with `IN_PROGRESS`. An existing
+function without a configuration returns `ProvisionedConcurrencyConfigNotFoundException`
+from Get.
+
+Each environment runs the real function initialization. `READY` requires the runtime and
+every discovered extension to send their first Runtime API `Next` request. Provisioning
+does not enqueue a handler event. Initialization failures become `FAILED`; the initialization
+deadline is the greater of 130 seconds and the configured function timeout. A later ordinary
+Invoke for that exact alias or version uses an available initialized environment, with
+on-demand spillover when all its environments are busy. Other aliases, versions, accounts
+and regions do not borrow that allocation.
+
+Provisioned environments are separate from ordinary idle eviction. Desired configurations
+are persisted; restarting Floci initializes new processes before reporting `READY`.
+Deleting the configuration, alias or function removes the owned environments. Changing an
+alias's version invalidates the old allocation; a new Put is required to initialize its new
+target. An identical Put preserves the existing healthy allocation.
+
+This implementation supports the non-ephemeral Docker executor with immutable published
+versions and simple aliases. It refuses `$LATEST`, weighted aliases, hot reload, durable
+functions and other executors. Allocations share the configured `warm-pool-max-per-function`
+ceiling across a function's qualifiers, and the optional `warm-pool-max-total` ceiling across
+provisioned allocations. A function's reserved concurrency is also a ceiling. These local
+resource bounds do not implement AWS's complete regional provisioned-concurrency quota
+accounting, automatic scaling, or weighted-alias allocation. Provisioned runtimes receive
+their numeric `AWS_LAMBDA_FUNCTION_VERSION` and
+`AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency`.
+
 ## Not Implemented
 
 These AWS Lambda operations have no handler in Floci. Calls will return `404` or an error:
 
 - Layer permissions (`AddLayerVersionPermission`, `RemoveLayerVersionPermission`, `GetLayerVersionPolicy`)
-- Provisioned concurrency (`PutProvisionedConcurrencyConfig`, `GetProvisionedConcurrencyConfig`, `ListProvisionedConcurrencyConfigs`, `DeleteProvisionedConcurrencyConfig`)
+- Listing provisioned concurrency (`ListProvisionedConcurrencyConfigs`)
 - `InvokeWithResponseStream`
 - Code signing enforcement. A configuration is created, read, updated, deleted and listed, and
   nothing verifies a signature against it, so it never gates a deployment. Attaching one to a

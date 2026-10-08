@@ -220,7 +220,7 @@ public class LambdaExecutorService implements Resettable {
         }
 
         try {
-            return executeSync(fn, payload, requestId, clientContext);
+            return executeSync(fn, payload, requestId, clientContext, invokedQualifier);
         } finally {
             permit.close();
         }
@@ -276,7 +276,7 @@ public class LambdaExecutorService implements Resettable {
         }
         InvokeResult result;
         try (permit) {
-            result = executeSync(event.fn(), event.payload(), event.requestId(), null);
+            result = executeSync(event.fn(), event.payload(), event.requestId(), null, event.invokedQualifier());
         } catch (RuntimeException e) {
             LOG.warnv("Error in async Lambda execution for {0}: {1}", event.fn().getFunctionName(), e.getMessage());
             // Stops retrying, as upstream did: routes the previous attempt's result, or UnknownError when
@@ -318,10 +318,13 @@ public class LambdaExecutorService implements Resettable {
     }
 
     private InvokeResult executeSync(LambdaFunction fn, byte[] payload, String requestId,
-                                     String clientContext) {
+                                     String clientContext, String invokedQualifier) {
         ContainerHandle handle;
         try {
-            handle = warmPool.acquire(fn);
+            handle = warmPool.acquireProvisioned(fn, invokedQualifier);
+            if (handle == null) {
+                handle = warmPool.acquire(fn);
+            }
         } catch (Exception e) {
             LOG.warnv("Failed to acquire container for function {0}: {1}", fn.getFunctionName(), e.getMessage());
             return new InvokeResult(200, "Unhandled",

@@ -658,6 +658,38 @@ class ContainerLauncherTest {
     }
 
     @Test
+    void provisionedLaunchUsesTheImmutableVersionAndPlatformInitializationType() throws Exception {
+        stubExtensionDiscovery("example-extension");
+        when(logStreamer.execLogCallbackForAccount(anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(new ResultCallback.Adapter<>());
+        LambdaFunction fn = networkFunction();
+        fn.setVersion("7");
+        fn.setEnvironment(Map.of("AWS_LAMBDA_INITIALIZATION_TYPE", "on-demand",
+                "AWS_LAMBDA_FUNCTION_VERSION", "$LATEST"));
+        launcher.launchProvisioned(fn);
+        List<String> env = captureRealContainerSpec().env();
+        assertEquals(List.of("AWS_LAMBDA_FUNCTION_VERSION=7"),
+                env.stream().filter(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION=")).toList());
+        assertEquals(List.of("AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency"),
+                env.stream().filter(value -> value.startsWith("AWS_LAMBDA_INITIALIZATION_TYPE=")).toList());
+        verify(runtimeApiServer).expectExtensions(1);
+        verify(runtimeApiServer, never()).awaitExtensionsReady(anyLong());
+        verify(runtimeApiServer, never()).enqueue(any());
+    }
+
+    @Test
+    void provisionedLaunchRefusesFailedExtensionDiscoveryAndCleansTheCreatedRuntime() {
+        LambdaFunction fn = networkFunction();
+        fn.setVersion("1");
+        CopyArchiveFromContainerCmd archive = mock(CopyArchiveFromContainerCmd.class);
+        when(dockerClient.copyArchiveFromContainerCmd("container-123", "/opt/extensions")).thenReturn(archive);
+        when(archive.exec()).thenThrow(new IllegalStateException("controlled archive failure"));
+        assertThrows(RuntimeException.class, () -> launcher.launchProvisioned(fn));
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+        verify(runtimeApiServer, never()).expectExtensions(0);
+    }
+
+    @Test
     void launchFunction_injectsOwningAccountAsAccessKeyAndFallsBackForTheRest() throws Exception {
         // The access key identifies the container's owning account to AccountResolver, so it is
         // the function's resolved account (here the configured default, since this function has

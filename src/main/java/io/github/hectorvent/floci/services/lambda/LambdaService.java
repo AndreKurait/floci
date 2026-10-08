@@ -1066,6 +1066,7 @@ public class LambdaService implements ResourceProvider {
             return;
         }
         synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
+            warmPool.deleteProvisionedQualifier(fn, qualifier);
             warmPool.drainEnvironment(version.get());
             functionStore.deleteVersion(region, name, qualifier);
             reclaimVersionCodeDirectory(region, fn, qualifier, version.get());
@@ -1094,6 +1095,7 @@ public class LambdaService implements ResourceProvider {
         // object, letting a follow-up request allocate a fresh lock and run
         // in parallel — the very serialization this map exists to prevent.
         synchronized (lockForConcurrencyOp(arn)) {
+            warmPool.deleteProvisionedFunction(fn);
             if (concurrencyLimiter != null) {
                 concurrencyLimiter.reset(arn);
             }
@@ -2889,6 +2891,7 @@ public class LambdaService implements ResourceProvider {
                     "Version must be a published version number, got: " + version, 400);
         }
         LambdaFunction fn = getFunction(region, functionName); // throws 404 if not found
+        warmPool.deleteProvisionedQualifier(fn, version);
         functionStore.deleteVersion(region, fn.getFunctionName(), version);
         LOG.infov("Deleted version {0} of function {1}", version, fn.getFunctionName());
     }
@@ -2974,6 +2977,7 @@ public class LambdaService implements ResourceProvider {
         validatePattern(aliasName, "name", ALIAS_NAME_PATTERN);
         String canonical = canonicalFunctionName(region, functionName);
         getAlias(region, canonical, aliasName); // verify it exists
+        warmPool.deleteProvisionedQualifier(getFunction(region, canonical), aliasName);
         if (aliasStore != null) aliasStore.delete(region, canonical, aliasName);
         LOG.infov("Deleted alias {0} for function {1}", aliasName, canonical);
     }
@@ -3157,6 +3161,7 @@ public class LambdaService implements ResourceProvider {
         // concurrent Puts cannot leave the limiter and persisted state out of
         // sync, regardless of which call acquires the reservedLock first.
         synchronized (lockForConcurrencyOp(arn)) {
+            warmPool.validateProvisionedReservation(fn, reservedConcurrentExecutions);
             Integer previousReserved = null;
             boolean limiterUpdated = false;
             if (concurrencyLimiter != null) {

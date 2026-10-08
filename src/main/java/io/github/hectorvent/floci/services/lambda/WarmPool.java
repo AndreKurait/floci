@@ -47,6 +47,7 @@ public class WarmPool implements ContainerTeardown {
     private static final int DEFAULT_MAX_POOL_SIZE = Math.max(4, Runtime.getRuntime().availableProcessors());
 
     private final LambdaRuntimeLauncher lambdaRuntimeLauncher;
+    private final ProvisionedConcurrencyPool provisioned;
     private final EmulatorConfig config;
     private final Clock clock;
     private final int maxPoolSizePerFunction;
@@ -76,17 +77,24 @@ public class WarmPool implements ContainerTeardown {
     }
 
     @Inject
-    public WarmPool(LambdaRuntimeLauncher lambdaRuntimeLauncher, EmulatorConfig config, Clock clock) {
+    public WarmPool(LambdaRuntimeLauncher lambdaRuntimeLauncher, EmulatorConfig config, Clock clock,
+                    ProvisionedConcurrencyPool provisioned) {
         this.lambdaRuntimeLauncher = lambdaRuntimeLauncher;
+        this.provisioned = provisioned;
         this.config = config;
         this.clock = clock;
         this.maxPoolSizePerFunction = resolveMaxPerFunction(config);
         this.maxIdleTotal = resolveMaxTotal(config);
     }
 
+    public WarmPool(LambdaRuntimeLauncher launcher, EmulatorConfig config, Clock clock) {
+        this(launcher, config, clock, null);
+    }
+
     /** Package-private constructor for testing (empty pool, no containers to drain). */
     WarmPool() {
         this.lambdaRuntimeLauncher = null;
+        this.provisioned = null;
         this.config = null;
         this.clock = Clock.systemUTC();
         this.maxPoolSizePerFunction = DEFAULT_MAX_POOL_SIZE;
@@ -221,6 +229,9 @@ public class WarmPool implements ContainerTeardown {
      * Otherwise it is returned to the warm pool.
      */
     public void release(ContainerHandle handle) {
+        if (provisioned != null && provisioned.release(handle, false)) {
+            return;
+        }
         Lease lease = activeLeases.remove(handle);
         boolean ephemeral = config != null && config.services().lambda().ephemeral();
         // An extension reporting an init/exit error is fatal to the execution environment in real
@@ -337,10 +348,35 @@ public class WarmPool implements ContainerTeardown {
      * stop is needed — no pool bookkeeping required.
      */
     public void destroyHandle(ContainerHandle handle) {
+        if (provisioned != null && provisioned.release(handle, true)) {
+            return;
+        }
         activeLeases.remove(handle);
         LOG.debugv("Destroying timed-out container {0} for function {1}",
                 handle.getContainerId(), handle.getFunctionName());
         stopQuietly(handle);
+    }
+
+    ContainerHandle acquireProvisioned(LambdaFunction fn, String qualifier) {
+        return provisioned == null ? null : provisioned.acquire(fn, qualifier);
+    }
+
+    void deleteProvisionedFunction(LambdaFunction fn) {
+        if (provisioned != null) {
+            provisioned.deleteFunction(fn);
+        }
+    }
+
+    void deleteProvisionedQualifier(LambdaFunction fn, String qualifier) {
+        if (provisioned != null) {
+            provisioned.deleteQualifier(fn, qualifier);
+        }
+    }
+
+    void validateProvisionedReservation(LambdaFunction fn, Integer reserved) {
+        if (provisioned != null) {
+            provisioned.validateReservation(fn, reserved);
+        }
     }
 
     /**
