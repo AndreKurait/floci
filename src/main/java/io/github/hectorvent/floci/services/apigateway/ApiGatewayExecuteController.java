@@ -1156,7 +1156,9 @@ public class ApiGatewayExecuteController {
                         ? headers.getMediaType().getType() + "/" + headers.getMediaType().getSubtype()
                         : "application/json";
                 String modelName = requestModels.get(contentType);
-                if (modelName == null) modelName = requestModels.get("application/json");
+                if (modelName == null) {
+                    modelName = requestModels.get("$default");
+                }
 
                 if (modelName != null) {
                     try {
