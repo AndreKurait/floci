@@ -186,6 +186,14 @@ The readiness probe requests an IMDSv2 token with a 60-second lifetime, then
 uses it to read the instance ID. A failed or empty token response does not
 fall back to a tokenless request.
 
+EC2 link-local routing uses a host route and an OUTPUT DNAT rule inside the
+guest network namespace. The host route selects the same existing interface
+and source address as a direct request to the metadata server. This preserves
+instance identity when the guest's default route uses a different Docker
+bridge. Conflicting metadata host routes and Floci-owned DNAT rules are refused.
+No listener or local address is installed on port 80, so applications may
+continue to use that port.
+
 Both IMDSv1 (no token) and IMDSv2 (token-based) flows are supported:
 
 ```bash

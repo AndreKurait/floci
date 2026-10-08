@@ -150,6 +150,35 @@ class Ec2MetadataProxyTest {
                 .filter(line -> line.contains("-I OUTPUT")).count());
         assertEquals(List.of("token", "metadata", "token", "metadata"),
                 Files.readAllLines(Path.of(environment.get("TEST_REQUESTS"))));
+        assertEquals("169.254.169.254 dev eth2 scope link src 10.0.0.2\n",
+                Files.readString(Path.of(environment.get("TEST_ROUTE"))));
+        assertEquals(1, Files.readAllLines(Path.of(environment.get("TEST_ROUTE_CALLS"))).stream()
+                .filter(line -> line.startsWith("-4 route add ")).count());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"device", "source", "gateway", "duplicate", "missing-source", "foreign-source"})
+    void imdsRoutingRefusesForeignRoutesBeforeChangingEitherTable(
+            String conflict, @TempDir Path directory) throws Exception {
+        Map<String, String> environment = new HashMap<>(routingTools(directory));
+        Path route = Path.of(environment.get("TEST_ROUTE"));
+        String expected = "169.254.169.254 dev eth2 scope link src 10.0.0.2\n";
+        switch (conflict) {
+            case "device" -> Files.writeString(route, expected.replace("eth2", "eth0"));
+            case "source" -> Files.writeString(route, expected.replace("10.0.0.2", "10.2.0.2"));
+            case "gateway" -> Files.writeString(route, "169.254.169.254 via 10.2.0.1 dev eth0\n");
+            case "duplicate" -> Files.writeString(route, expected + expected);
+            case "missing-source" -> environment.put("TEST_TARGET_ROUTE", "10.0.0.1 dev eth2");
+            case "foreign-source" -> environment.put("TEST_TARGET_ROUTE", "10.0.0.1 dev eth2 src 10.2.0.2");
+            default -> throw new IllegalArgumentException(conflict);
+        }
+        String before = Files.readString(route);
+        assertEquals(1, runShell(Ec2MetadataProxy.ec2RoutingCommand("10.0.0.1", 9169),
+                directory, environment), shellOutput(directory));
+        assertEquals(before, Files.readString(route));
+        assertEquals("", Files.readString(Path.of(environment.get("TEST_RULES"))));
+        assertEquals("", Files.readString(Path.of(environment.get("TEST_REQUESTS"))));
+        assertFalse(Files.readString(Path.of(environment.get("TEST_ROUTE_CALLS"))).contains("route add"));
     }
 
     @ParameterizedTest
@@ -297,7 +326,17 @@ class Ec2MetadataProxyTest {
         Path calls = Files.createFile(directory.resolve("calls"));
         Path requests = Files.createFile(directory.resolve("requests"));
         Path record = Files.createFile(directory.resolve("tools"));
-        writeTool(bin, "ip", checkedToolEnvironment() + "printf '%s\\n' \"${TEST_ADDRESSES-}\"\n");
+        Path route = Files.createFile(directory.resolve("route"));
+        Path routeCalls = Files.createFile(directory.resolve("route-calls"));
+        writeTool(bin, "ip", checkedToolEnvironment()
+                + "printf '%s\\n' \"$*\" >> \"$TEST_ROUTE_CALLS\"\n"
+                + "case \"$*\" in\n"
+                + "  '-4 -o addr show'*) printf '%s\\n' \"${TEST_ADDRESSES-2: eth2 inet 10.0.0.2/24 scope global eth2}\" ;;\n"
+                + "  '-4 route get 10.0.0.1') printf '%s\\n' \"${TEST_TARGET_ROUTE-10.0.0.1 dev eth2 src 10.0.0.2 uid 0}\" ;;\n"
+                + "  '-4 route show table main exact 169.254.169.254/32') /bin/cat \"$TEST_ROUTE\" ;;\n"
+                + "  '-4 route add 169.254.169.254/32 dev eth2 scope link src 10.0.0.2')"
+                + " printf '169.254.169.254 dev eth2 scope link src 10.0.0.2\\n' > \"$TEST_ROUTE\" ;;\n"
+                + "  *) exit 87 ;;\nesac\n");
         writeTool(bin, "iptables", checkedToolEnvironment()
                 + "printf '%s\\n' \"$*\" >> \"$TEST_CALLS\"\n"
                 + "[ \"$1 $2 $3 $4\" = '-w 2 -t nat' ] || exit 81\n"
@@ -322,7 +361,8 @@ class Ec2MetadataProxyTest {
         writeTool(bin, "sleep", "exit 0\n");
         return Map.of("PATH", bin + ":" + System.getenv("PATH"), "TEST_RULES", rules.toString(),
                 "TEST_CALLS", calls.toString(), "TEST_REQUESTS", requests.toString(),
-                "TEST_RECORD", record.toString());
+                "TEST_RECORD", record.toString(), "TEST_ROUTE", route.toString(),
+                "TEST_ROUTE_CALLS", routeCalls.toString());
     }
 
     private static String shellOutput(Path directory) throws IOException {
