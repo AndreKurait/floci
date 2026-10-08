@@ -10,6 +10,8 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsPartition;
+import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.CookieHeaders;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
@@ -352,6 +354,15 @@ public class ApiGatewayExecuteController {
         // fell back to defaultRegion in both cases, so the resolved region is a guess.
         boolean regionUnresolved = regionResolver.resolveRegionFromAuthOrNull(
                 headers == null ? null : headers.getHeaderString("Authorization")) == null;
+        Optional<ApiGatewayService.ApiOwner> restOwner = apiGatewayService.findRestApiOwner(apiId);
+        if (restOwner.isPresent()) {
+            requestContext.setAccountId(restOwner.get().accountId());
+            if (regionUnresolved) {
+                region = restOwner.get().region();
+                requestContext.setRegion(region);
+                requestContext.setPartition(AwsPartitions.forRegion(region).map(AwsPartition::id).orElse(null));
+            }
+        }
         if (regionUnresolved) {
             region = apiGatewayService.resolveRestApiRegion(region, apiId);
         }

@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.apigateway.model.Account;
@@ -92,7 +93,7 @@ public class ApiGatewayService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(ApiGatewayService.class);
 
-    private final StorageBackend<String, RestApi> apiStore;
+    private final AccountAwareStorageBackend<RestApi> apiStore;
     private final StorageBackend<String, ApiGatewayResource> resourceStore;
     private final StorageBackend<String, Deployment> deploymentStore;
     private final StorageBackend<String, Stage> stageStore;
@@ -348,6 +349,25 @@ public class ApiGatewayService implements ResourceProvider {
 
     public boolean hasRestApi(String apiId) {
         return apiStore.keys().stream().anyMatch(key -> key.endsWith("::" + apiId));
+    }
+
+    public record ApiOwner(String accountId, String region) {}
+
+    /** Resolve resource ownership for data-plane URLs without changing management isolation. */
+    public Optional<ApiOwner> findRestApiOwner(String apiId) {
+        List<AccountAwareStorageBackend.AccountEntry<RestApi>> matches =
+                apiStore.scanAllAccountEntries(key -> key.endsWith("::" + apiId));
+        if (matches.size() > 1) {
+            throw new AwsException("ConflictException",
+                    "REST API id '" + apiId + "' is ambiguous across accounts", 409);
+        }
+        return matches.stream().findFirst().map(entry -> {
+            int delimiter = entry.key().indexOf("::");
+            if (delimiter <= 0) {
+                throw new IllegalStateException("Invalid REST API storage key: " + entry.key());
+            }
+            return new ApiOwner(entry.accountId(), entry.key().substring(0, delimiter));
+        });
     }
 
 

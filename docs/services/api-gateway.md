@@ -206,6 +206,14 @@ Templates can create domains and mappings with `AWS::ApiGateway::DomainName` and
 ### IAM Authorization (`AWS_IAM`) {#iam-authorization}
 
 A method (v1) or route (v2) whose `authorizationType` is `AWS_IAM` requires a SigV4-signed caller.
+
+REST invocation URLs identify the API owner independently of the caller's account.
+An unsigned request can therefore reach a public method, or receive the method's
+authentication error, when the API belongs to a nondefault account. Signed callers
+from another account use the same resource lookup and still undergo signature
+verification. Management requests remain scoped to the requesting account.
+Ambiguous REST API IDs across accounts are rejected instead of selecting an owner.
+This lookup does not add IAM identity or resource-policy evaluation.
 Before the integration runs, the signature is verified against the request as it arrived (method,
 path, query string, the headers named in `SignedHeaders`, and the SHA-256 of the body). A request
 that reaches the API through a [custom domain](#custom-domain-names) or an `execute-api` virtual

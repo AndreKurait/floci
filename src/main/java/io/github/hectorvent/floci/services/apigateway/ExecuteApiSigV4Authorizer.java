@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.apigateway;
 
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.auth.CredentialScope;
 import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
@@ -264,16 +265,16 @@ public class ExecuteApiSigV4Authorizer {
         if (LEGACY_ACCESS_KEY_ID.equals(accessKeyId)) {
             return LEGACY_SECRET_KEY;
         }
-        String secretKey = iamService.findSecretKey(accessKeyId).orElse(null);
-        if (secretKey == null) {
-            return null;
-        }
-        if (iamService.resolveAccountId(accessKeyId).isEmpty()) {
+        String callerAccount = iamService.resolveAccountId(accessKeyId).orElse(null);
+        if (callerAccount == null) {
             LOG.debugv("execute-api request uses an expired or inactive credential: accessKey={0}",
                     SigV4RequestValidator.sanitizeForLog(accessKeyId));
             return null;
         }
-        return secretKey;
+        // Dispatch reads integrations in the API owner's account. Credentials remain owned by
+        // the caller, who may belong to another account; only this lookup adopts that account.
+        return RequestScopes.callAs(callerAccount,
+                () -> iamService.findSecretKey(accessKeyId).orElse(null));
     }
 
     /**
@@ -331,14 +332,16 @@ public class ExecuteApiSigV4Authorizer {
     private CallerIdentity resolveIdentity(String accessKeyId) {
         String accountId = iamService.resolveAccountId(accessKeyId)
                 .orElseGet(regionResolver::getAccountId);
-        String userArn = iamService.resolveCallerArn(accessKeyId)
-                .orElseGet(() -> regionResolver.buildGlobalArn("iam", accountId, "root"));
-        String userId = iamService.findAccessKey(accessKeyId)
-                .map(AccessKey::getUserName)
-                .flatMap(iamService::findUser)
-                .map(IamUser::getUserId)
-                .orElse(accessKeyId);
-        return new CallerIdentity(accessKeyId, accountId, userArn, userId);
+        return RequestScopes.callAs(accountId, () -> {
+            String userArn = iamService.resolveCallerArn(accessKeyId)
+                    .orElseGet(() -> regionResolver.buildGlobalArn("iam", accountId, "root"));
+            String userId = iamService.findAccessKey(accessKeyId)
+                    .map(AccessKey::getUserName)
+                    .flatMap(iamService::findUser)
+                    .map(IamUser::getUserId)
+                    .orElse(accessKeyId);
+            return new CallerIdentity(accessKeyId, accountId, userArn, userId);
+        });
     }
 
     // ──────────────────────────── Signed-request parsing ────────────────────────────
