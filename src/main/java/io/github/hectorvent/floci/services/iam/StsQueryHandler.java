@@ -142,9 +142,10 @@ public class StsQueryHandler {
         // role's own ARN, path included: it is the session's aws:PrincipalArn, and it keeps naming
         // the role that issued the session even if a role of the same name replaces it later.
         String sessionPolicy = getParam(params, "Policy");
-        iamService.registerSession(
+        iamService.registerAssumeRoleSession(
                 accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy, callerAccountId,
-                sessionName, assumedRoleId);
+                sessionName, assumedRoleId,
+                params.keySet().stream().anyMatch(key -> key.startsWith("PolicyArns.member.")));
 
         String result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))

@@ -81,6 +81,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -3974,6 +3975,35 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                                 String originAccountId) {
         registerSession(sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, expiration,
                 sessionPolicyDocument, originAccountId, null, null);
+    }
+
+    /** Records provenance only for the normal AssumeRole operation, without persisting it. */
+    void registerAssumeRoleSession(String accessKeyId, String secret, String token, String roleArn,
+                                  Instant expiration, String policy, String originAccountId,
+                                  String sessionName, String principalId, boolean managedPolicyPresent) {
+        SessionCredential session = new SessionCredential(accessKeyId, secret, token,
+                roleArn, expiration, policy, originAccountId);
+        session.setRoleSessionName(sessionName);
+        session.setAssumedRoleId(principalId);
+        session.setAssumeRoleIssued(true);
+        session.setManagedSessionPolicyPresent(managedPolicyPresent);
+        sessions.put(accessKeyId, session);
+    }
+
+    /** Bounded private registry view; callers never serialize credential records. */
+    List<SessionCredential> issuedSessionCandidates(String accessKeyId) {
+        int[] visited = {0};
+        Predicate<String> selector = key -> {
+            if (++visited[0] > 4096) {
+                throw new IllegalStateException("Issued-session registry limit exceeded");
+            }
+            return accessKeyId == null || accessKeyId.equals(key);
+        };
+        if (sessions instanceof AccountAwareStorageBackend<SessionCredential> aware) {
+            return aware.scanAllAccountEntries(selector).stream()
+                    .map(AccountAwareStorageBackend.AccountEntry::value).toList();
+        }
+        return sessions.scan(selector);
     }
 
     /** Stores the identity returned to the caller when STS creates an assumed-role session. */

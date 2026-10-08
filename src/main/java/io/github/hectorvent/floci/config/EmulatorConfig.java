@@ -1445,6 +1445,10 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean enforcementEnabled();
 
+        /** Enables bounded metadata lookup and proof verification for current AssumeRole sessions. */
+        @WithDefault("false")
+        boolean issuedSessionVerificationEnabled();
+
         @WithDefault("false")
         boolean seedDeployerPrincipal();
 

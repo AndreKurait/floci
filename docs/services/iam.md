@@ -1330,3 +1330,45 @@ aws iam create-access-key --user-name alice --endpoint-url $AWS_ENDPOINT_URL
 # List roles
 aws iam list-roles --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+## Local issued-session management
+
+`FLOCI_SERVICES_IAM_ISSUED_SESSION_VERIFICATION_ENABLED=true` enables two local
+management operations. They are disabled by default and are not AWS API operations.
+Keep this management interface on a trusted local network: exact-selector lookup
+returns issuer metadata without authenticating the selector's holder. Neither
+operation grants authorization or evaluates IAM policies.
+
+Both accept JSON over POST, reject unknown/duplicate fields, and return
+`Cache-Control: no-store`. Request bodies are limited to 16,384 bytes.
+
+* `/_floci/iam/issued-sessions/verify` requires `correlationId`, `accessKeyId`,
+  `sessionToken`, `stringToSign` and `signature`. It checks the original four-line
+  `AWS4-HMAC-SHA256` string to sign, token, HMAC, current issuer role and finite
+  expiry. Timestamps may be at most 900 seconds old or 300 seconds ahead.
+* `/_floci/iam/issued-sessions/lookup` requires `correlationId` and exactly one of
+  `accessKeyId`, `principalArn` or `principalId`. There is no listing, account-only
+  selector or wildcard. Matching issuances must agree on identity, origin account
+  and restriction presence; the earliest current expiry is returned.
+
+Success returns `correlationId`, `operation` (`Verify` or `Lookup`),
+`kind` (`ASSUMED_ROLE`), `accountId`, `originAccountId`, `roleArn`, `roleId`,
+`roleSessionName`, `principalArn`, `principalId`, `expiresAt` and the explicit
+boolean `sessionPolicyPresent`. No access key, token, secret or signing key is
+returned. Inline `Policy` or any supplied managed `PolicyArns` marks restrictions
+present; this flag does not claim those policies were evaluated. Consumers must
+apply their own authorization and inspect current public IAM policies and
+permissions boundaries.
+
+Only normal AssumeRole sessions issued in this process qualify. Their provenance
+marker is not persisted; restored sessions, WebIdentity, SAML, workload credentials,
+GetSessionToken, federation and long-term credentials refuse. Removing or replacing
+the issuer role invalidates admission. The role and registry are checked again
+before returning. Registry scans are bounded to 4,096 entries and 128 matches.
+
+Errors contain only `{"code":"..."}`: disabled operations return HTTP 404 with
+`IssuedSessionVerificationDisabled`; malformed requests return HTTP 400 with
+`InvalidIssuedSessionRequest`; unknown/stale credentials or failed proofs return
+HTTP 403 with `IssuedSessionVerificationFailed`. Tokens and proof inputs are not
+logged or echoed. Posting `{}` distinguishes an enabled handler from an older or
+disabled implementation without sending any credential material.
