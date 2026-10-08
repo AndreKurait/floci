@@ -164,6 +164,15 @@ EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT` for IMDS and `AWS_END
 
 Floci runs an IMDS-compatible HTTP server on port `9169` of the host. Each launched container receives the environment variable `AWS_EC2_METADATA_SERVICE_ENDPOINT` pointing to this server.
 
+The proxy installation and startup helper shells clear `LD_LIBRARY_PATH`,
+`PYTHONPATH` and `PYTHONHOME` before running system tools. This prevents an
+application's bundled libraries or Python installation from replacing the
+system dependencies used by the package manager, proxy and HTTP probe. The
+container configuration and application process environment remain unchanged.
+The readiness probe requests an IMDSv2 token with a 60-second lifetime, then
+uses it to read the instance ID. A failed or empty token response does not
+fall back to a tokenless request.
+
 Both IMDSv1 (no token) and IMDSv2 (token-based) flows are supported:
 
 ```bash
