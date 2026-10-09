@@ -3240,6 +3240,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDescribeKeyPairs(MultivaluedMap<String, String> p, String region) {
+        boolean includePublicKey = Boolean.parseBoolean(p.getFirst("IncludePublicKey"));
         List<String> keyNames = getList(p, "KeyName");
         List<String> keyPairIds = getList(p, "KeyPairId");
         List<KeyPair> kps = service.describeKeyPairs(region, keyNames, keyPairIds);
@@ -3251,9 +3252,11 @@ public class Ec2QueryHandler {
             xml.start("item")
                     .elem("keyPairId", kp.getKeyPairId())
                     .elem("keyName", kp.getKeyName())
-                    .elem("keyFingerprint", kp.getKeyFingerprint())
-                    .raw(tagSetXml(kp.getTags()))
-                    .end("item");
+                    .elem("keyFingerprint", kp.getKeyFingerprint());
+            if (includePublicKey) {
+                xml.elem("publicKey", kp.getPublicKey());
+            }
+            xml.raw(tagSetXml(kp.getTags())).end("item");
         }
         xml.end("keySet").end("DescribeKeyPairsResponse");
         return xmlResponse(xml.build());
