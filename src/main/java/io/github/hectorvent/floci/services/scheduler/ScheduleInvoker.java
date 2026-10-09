@@ -31,7 +31,6 @@ import org.jboss.logging.Logger;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -531,19 +530,15 @@ public class ScheduleInvoker {
             JsonNode valueNode = entry.getValue();
             String dataType = valueNode.path("DataType").asText(null);
             String stringValue = valueNode.path("StringValue").asText(null);
-            String binaryValueBase64 = valueNode.path("BinaryValue").asText(null);
+            String binaryValueText = valueNode.path("BinaryValue").asText(null);
             if (dataType == null) {
                 return;
             }
-            if (binaryValueBase64 != null) {
-                byte[] binaryValue;
-                try {
-                    binaryValue = Base64.getDecoder().decode(binaryValueBase64);
-                } catch (IllegalArgumentException e) {
-                    throw new AwsException("InvalidParameterValue",
-                            "Invalid binary value for message attribute '" + entry.getKey()
-                                    + "': not valid base64.", 400);
-                }
+            if (binaryValueText != null) {
+                // Unlike the SQS JSON protocol, AWS does not base64-decode BinaryValue in a universal
+                // target Input: the attribute bytes are the UTF-8 encoding of the JSON string, and a
+                // base64 string is delivered as its own text.
+                byte[] binaryValue = binaryValueText.getBytes(StandardCharsets.UTF_8);
                 attributes.put(entry.getKey(), new MessageAttributeValue(binaryValue, dataType));
             } else if (stringValue != null) {
                 attributes.put(entry.getKey(), new MessageAttributeValue(

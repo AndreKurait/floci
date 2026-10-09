@@ -336,8 +336,9 @@ class ScheduleInvokerTest {
     }
 
     @Test
-    void universalSqsSendMessageForwardsStringAndBase64BinaryMessageAttributes() {
+    void universalSqsSendMessageForwardsStringAndBinaryMessageAttributesWithoutBase64Decoding() {
         String queueUrl = "http://localhost:4566/000000000000/q.fifo";
+        // AWS delivers a base64-looking BinaryValue as its own text, it does not decode it
         String binaryValueBase64 = "aGVsbG8=";
         Target target = new Target();
         target.setArn("arn:aws:scheduler:::aws-sdk:sqs:sendMessage");
@@ -369,7 +370,7 @@ class ScheduleInvokerTest {
         MessageAttributeValue binaryAttribute = attributes.get("BinaryAttr");
         assertNotNull(binaryAttribute);
         assertEquals("Binary.Custom", binaryAttribute.getDataType());
-        assertArrayEquals("hello".getBytes(StandardCharsets.UTF_8), binaryAttribute.getBinaryValue());
+        assertArrayEquals(binaryValueBase64.getBytes(StandardCharsets.UTF_8), binaryAttribute.getBinaryValue());
         assertNull(binaryAttribute.getStringValue());
     }
 
@@ -502,6 +503,29 @@ class ScheduleInvokerTest {
 
         assertThrows(UnsupportedOperationException.class, () -> invoke(target, "us-east-1"));
         verifyNoInteractions(redshiftDataService);
+    }
+
+    @Test
+    void universalSqsSendMessageUsesUtf8BytesOfRawBinaryValue() {
+        String queueUrl = "http://localhost:4566/000000000000/q";
+        Target target = new Target();
+        target.setArn("arn:aws:scheduler:::aws-sdk:sqs:sendMessage");
+        target.setRoleArn("arn:aws:iam::000000000000:role/x");
+        // Protobuf-like payload with control characters plus U+0080 and U+00FF, as JSON escapes
+        target.setInput("{\"QueueUrl\":\"" + queueUrl + "\","
+                + "\"MessageBody\":\"hi\","
+                + "\"MessageAttributes\":{"
+                + "\"BinaryAttr\":{\"DataType\":\"Binary\",\"BinaryValue\":\"\\nA\\u0080\\u0001\\u00ff\\u0000B\"}}}");
+
+        invoke(target, "us-east-1");
+
+        ArgumentCaptor<Map<String, MessageAttributeValue>> attributesCaptor = ArgumentCaptor.captor();
+        verify(sqsService).sendMessage(eq(queueUrl), eq("hi"), eq(0), isNull(), isNull(),
+                attributesCaptor.capture(), eq("us-east-1"));
+
+        // Same bytes real AWS delivers for this Input: the UTF-8 encoding of the decoded JSON string
+        byte[] expected = {0x0a, 0x41, (byte) 0xc2, (byte) 0x80, 0x01, (byte) 0xc3, (byte) 0xbf, 0x00, 0x42};
+        assertArrayEquals(expected, attributesCaptor.getValue().get("BinaryAttr").getBinaryValue());
     }
 
     @Test
