@@ -136,6 +136,63 @@ class Ec2ServicePersistenceTest {
     }
 
     @Test
+    void volumeSnapshotMetadataSurvivesSourceDeletionAndRestart(@TempDir Path dir) {
+        Ec2Service first = newService(dir);
+        Volume volume = first.createVolume(REGION, REGION + "a", "gp2", 10, true,
+                0, null, null, List.of(new Tag("SourceOnly", "volume")));
+        Snapshot created = first.createSnapshot(REGION, volume.getVolumeId(), "persisted snapshot",
+                List.of(new Tag("Purpose", "backup")), false);
+        first.deleteVolume(REGION, volume.getVolumeId());
+
+        Ec2Service restarted = newService(dir);
+        Snapshot restored = restarted.describeSnapshots(REGION, List.of(created.getSnapshotId()),
+                List.of("self"), Map.of("tag:Purpose", List.of("backup"))).getFirst();
+
+        assertEquals(volume.getVolumeId(), restored.getVolumeId());
+        assertEquals(10, restored.getVolumeSize());
+        assertEquals("000000000000", restored.getOwnerId());
+        assertEquals(REGION, restored.getRegion());
+        assertEquals("completed", restored.getState());
+        assertEquals("100%", restored.getProgress());
+        assertEquals("persisted snapshot", restored.getDescription());
+        assertEquals(created.getStartTime(), restored.getStartTime());
+        assertTrue(restored.isEncrypted());
+        assertEquals(1, restored.getTags().size());
+        assertEquals("Purpose", restored.getTags().getFirst().getKey());
+        assertEquals("backup", restored.getTags().getFirst().getValue());
+        assertEquals("InvalidVolume.NotFound", assertThrows(AwsException.class,
+                () -> restarted.describeVolumes(REGION, List.of(volume.getVolumeId()), Map.of())).getErrorCode());
+    }
+
+    @Test
+    void imageAndSnapshotPermissionChangesSurviveRestart(@TempDir Path dir) {
+        Ec2Service first = newService(dir);
+        Volume volume = first.createVolume(REGION, REGION + "a", "gp2", 10, false,
+                0, null, null, List.of());
+        Snapshot snapshot = first.createSnapshot(REGION, volume.getVolumeId(), null, List.of(), false);
+        Image image = first.registerImage(REGION, "shared-persisted-image", null, "x86_64",
+                "/dev/sda1", List.of(blockDeviceMapping(snapshot.getSnapshotId(), 10)));
+        first.modifyImageLaunchPermissions(REGION, image.getImageId(),
+                List.of("333344445555"), List.of(), false);
+        first.modifySnapshotCreateVolumePermissions(REGION, snapshot.getSnapshotId(),
+                List.of("333344445555"), List.of(), false);
+
+        Ec2Service restarted = newService(dir);
+        assertEquals(List.of("333344445555"),
+                restarted.describeImageLaunchPermissions(REGION, image.getImageId(), false));
+        assertEquals(List.of("333344445555"),
+                restarted.describeSnapshotCreateVolumePermissions(REGION, snapshot.getSnapshotId(), false));
+        restarted.modifyImageLaunchPermissions(REGION, image.getImageId(),
+                List.of(), List.of("333344445555"), false);
+        restarted.modifySnapshotCreateVolumePermissions(REGION, snapshot.getSnapshotId(),
+                List.of(), List.of("333344445555"), false);
+
+        Ec2Service afterRemoval = newService(dir);
+        assertTrue(afterRemoval.describeImageLaunchPermissions(REGION, image.getImageId(), false).isEmpty());
+        assertTrue(afterRemoval.describeSnapshotCreateVolumePermissions(REGION, snapshot.getSnapshotId(), false).isEmpty());
+    }
+
+    @Test
     void managedPrefixListAndItsVersionHistorySurviveRestart(@TempDir Path dir) {
         Ec2Service first = newService(dir);
         ManagedPrefixList created = first.createManagedPrefixList(REGION, "persisted-list", "IPv4", 5,

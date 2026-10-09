@@ -4,7 +4,9 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -50,6 +52,7 @@ public class Image {
     private String dockerImage;
     private List<BlockDeviceMapping> blockDeviceMappings = new ArrayList<>();
     private List<Tag> tags = new ArrayList<>();
+    private Set<String> launchPermissionUserIds = new LinkedHashSet<>();
 
     public Image() {}
 
@@ -118,4 +121,9 @@ public class Image {
 
     public List<Tag> getTags() { return tags; }
     public void setTags(List<Tag> tags) { this.tags = tags; }
+
+    public Set<String> getLaunchPermissionUserIds() { return launchPermissionUserIds; }
+    public void setLaunchPermissionUserIds(Set<String> userIds) {
+        this.launchPermissionUserIds = userIds == null ? new LinkedHashSet<>() : new LinkedHashSet<>(userIds);
+    }
 }

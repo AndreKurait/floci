@@ -109,6 +109,61 @@ provenance also omit them. Runtime ancestry and captured Docker images are store
 separately and retain their existing launch behavior. This does not add
 `CreateRestoreImageTask` support.
 
+### Volume snapshot metadata
+
+`CreateSnapshot` records a snapshot of an existing volume's metadata in the
+caller's account and region. The volume must be `available` or `in-use`.
+The response includes its volume ID, size, encryption flag, owner, creation
+time, description and requested snapshot tags. Source volume tags are not
+inherited. Metadata completes immediately with `status=completed` and
+`progress=100%`; this does not copy EBS block data or provide data restoration.
+
+`DescribeSnapshots` returns the stored metadata and supports `tag:<key>` and
+`tag-key` filters alongside its existing ID, owner and metadata filters.
+Deleting the source volume leaves its snapshots intact. Registering an AMI
+with an existing snapshot retains that snapshot's original metadata.
+Configured persistent storage retains snapshots across restarts.
+
+`DryRun=true` validates the source without storing a snapshot. Only regional
+placement is supported; Local Zone and Outpost placement are refused.
+Standalone `CopySnapshot` and `DeleteSnapshot` remain unsupported.
+
+### Account permissions and shared AMI copies
+
+An owner can read and modify an AMI's `launchPermission` and a snapshot's
+`createVolumePermission`. Mutations support nested `Add.N.UserId` or
+`Remove.N.UserId` entries containing 12-digit account IDs. `Attribute` may
+be omitted on mutations, or must match the nested permission field.
+Attribute reads require the exact attribute name. Permission sets persist
+with their resources, and dry runs validate without changing permissions.
+Snapshot requests cannot combine additions and removals and are limited to
+500 entries per call. Invalid later entries refuse the whole request.
+
+Cross-account `CopyImage` resolves an exact stored source ID, region and
+owner. It requires the recipient's AMI launch permission and read permission
+for every backing snapshot before creating any destination records.
+The source must have completed, unencrypted EBS snapshot metadata and
+explicit runtime ancestry ending at an existing local catalog entry.
+The copy has a distinct AMI ID and distinct destination-owned snapshots,
+retains the source size and catalog runtime ancestry, and does not inherit
+permission sets or ordinary owner tags. The source remains independent.
+This is metadata and local catalog behavior, not EBS block-data copying.
+
+This subset supports copying by known source ID; it does not expose shared
+source descriptions or enumeration. Explicit `DescribeImages` of a stored
+foreign ID is refused rather than returning a synthetic fallback.
+Permission reads and mutations remain owner-scoped. IAM policy evaluation,
+public/group/organization grants, legacy `OperationType`/`UserId.N` mutation
+forms, encrypted shared copies and KMS are unsupported.
+
+Foreign sources with unbound runtime ancestry or captured Docker layers are
+refused, including captures in their source ancestry. Same-account captured
+copies retain their existing behavior. `CopyImageTags`, tag specifications,
+encryption and placement options
+are refused. AWS's special `ec2:SharedTag/` visibility and copy behavior is not
+implemented; foreign AMIs with those tags are explicitly refused instead of
+silently dropping or exposing them.
+
 ### Cloud-image-derived AMI guests
 
 The `ami-ubuntu2404-cloud` entry is an experimental Ubuntu 24.04 guest image built from Canonical cloud-image artifacts, not from the Docker-library `ubuntu:24.04` image. It is intended for EC2 workflows that need packages such as `systemd` and `cloud-init` to match a real Ubuntu cloud image more closely.
@@ -836,7 +891,12 @@ Validation matches AWS behavior:
 
 | Action | Description |
 |--------|-------------|
-| DescribeSnapshots | Lists or returns stored snapshots, filterable by id and owner. |
+| CreateSnapshot | Creates completed, volume-derived snapshot metadata with requested tags in the caller's account and region. |
+| DescribeSnapshots | Lists or returns stored snapshots, filterable by id, owner, metadata and tags. |
+| DescribeImageAttribute | Returns an owned image's launch permission account IDs. |
+| ModifyImageAttribute | Adds or removes nested launch permission account IDs on an owned image. |
+| DescribeSnapshotAttribute | Returns an owned snapshot's create-volume permission account IDs. |
+| ModifySnapshotAttribute | Adds or removes nested create-volume permission account IDs on an owned snapshot. |
 
 ### Flow Logs
 
