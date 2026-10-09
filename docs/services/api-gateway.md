@@ -76,6 +76,11 @@ throughout the definition before parsing it. Values come from the request region
 account, so the same definition can be imported across regions and partitions. This
 includes mapping templates and applies to both `ImportRestApi` and `PutRestApi`.
 
+OpenAPI integration types `aws`, `aws_proxy`, `http`, `http_proxy`, and `mock` are
+stored as the public Integration values `AWS`, `AWS_PROXY`, `HTTP`, `HTTP_PROXY`,
+and `MOCK`. Both `GetIntegration` and `GetMethod.methodIntegration` return these
+canonical values after import, merge, or overwrite.
+
 ### Supported Operations
 
 | Category | Operations |

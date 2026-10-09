@@ -3835,7 +3835,18 @@ public class ApiGatewayService implements ResourceProvider {
     private void applyIntegration(String region, String apiId, String resourceId,
                                   String httpMethod, Map<String, Object> integrationExt) {
         Map<String, Object> integrationRequest = new HashMap<>();
-        integrationRequest.put("type", integrationExt.get("type"));
+        Object integrationType = integrationExt.get("type");
+        if (integrationType instanceof String type) {
+            integrationType = switch (type) {
+                case "aws" -> "AWS"; // partition-literal: OpenAPI integration type, not an AWS partition
+                case "aws_proxy" -> "AWS_PROXY";
+                case "http" -> "HTTP";
+                case "http_proxy" -> "HTTP_PROXY";
+                case "mock" -> "MOCK";
+                default -> type;
+            };
+        }
+        integrationRequest.put("type", integrationType);
         integrationRequest.put("httpMethod", integrationExt.get("httpMethod"));
         integrationRequest.put("uri", integrationExt.get("uri"));
         integrationRequest.put("passthroughBehavior", integrationExt.get("passthroughBehavior"));
