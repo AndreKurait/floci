@@ -6,11 +6,13 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.ServiceRegistry;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.services.redshiftdata.RedshiftDataService;
 import io.github.hectorvent.floci.services.scheduler.model.AwsVpcConfiguration;
 import io.github.hectorvent.floci.services.scheduler.model.EcsParameters;
 import io.github.hectorvent.floci.services.scheduler.model.EventBridgeParameters;
@@ -21,6 +23,7 @@ import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -34,12 +37,17 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Supplier;
 
 /**
  * Delivers an EventBridge Scheduler target invocation to the underlying service.
  * Supports templated SQS, Lambda, SNS, Step Functions, and EventBridge PutEvents targets, plus
  * universal targets ({@code arn:aws:scheduler:::aws-sdk:<service>:<action>}) for
- * {@code sns:publish} and {@code sqs:sendMessage}. Mirrors the subset handled by
+ * {@code sns:publish}, {@code sqs:sendMessage}, {@code redshiftdata:executeStatement} and
+ * {@code redshiftdata:batchExecuteStatement}. Mirrors the subset handled by
  * {@code EventBridgeInvoker} but using Scheduler's {@link Target} model (raw
  * {@code input} string, no JSONPath/template).
  */
@@ -59,9 +67,12 @@ public class ScheduleInvoker {
     private final EventBridgeService eventBridgeService;
     private final EcsService ecsService;
     private final StepFunctionsService stepFunctionsService;
+    private final RedshiftDataService redshiftDataService;
     private final ObjectMapper objectMapper;
     private final String baseUrl;
     private final String defaultRegion;
+    private final ServiceRegistry serviceRegistry;
+    private final Executor redshiftDataExecutor;
 
     @Inject
     public ScheduleInvoker(SqsService sqsService,
@@ -70,17 +81,52 @@ public class ScheduleInvoker {
                            EventBridgeService eventBridgeService,
                            EcsService ecsService,
                            StepFunctionsService stepFunctionsService,
+                           RedshiftDataService redshiftDataService,
                            ObjectMapper objectMapper,
-                           EmulatorConfig config) {
+                           EmulatorConfig config,
+                           ServiceRegistry serviceRegistry) {
+        this(sqsService, lambdaService, snsService, eventBridgeService, ecsService, stepFunctionsService,
+                redshiftDataService, objectMapper, config, serviceRegistry, newRedshiftDataExecutor());
+    }
+
+    ScheduleInvoker(SqsService sqsService,
+                    LambdaService lambdaService,
+                    SnsService snsService,
+                    EventBridgeService eventBridgeService,
+                    EcsService ecsService,
+                    StepFunctionsService stepFunctionsService,
+                    RedshiftDataService redshiftDataService,
+                    ObjectMapper objectMapper,
+                    EmulatorConfig config,
+                    ServiceRegistry serviceRegistry,
+                    Executor redshiftDataExecutor) {
         this.sqsService = sqsService;
         this.lambdaService = lambdaService;
         this.snsService = snsService;
         this.eventBridgeService = eventBridgeService;
         this.ecsService = ecsService;
         this.stepFunctionsService = stepFunctionsService;
+        this.redshiftDataService = redshiftDataService;
         this.objectMapper = objectMapper;
         this.baseUrl = config.baseUrl();
         this.defaultRegion = config.defaultRegion();
+        this.serviceRegistry = serviceRegistry;
+        this.redshiftDataExecutor = redshiftDataExecutor;
+    }
+
+    private static ExecutorService newRedshiftDataExecutor() {
+        return Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "scheduler-redshift-data");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    @PreDestroy
+    void shutdown() {
+        if (redshiftDataExecutor instanceof ExecutorService service) {
+            service.shutdownNow();
+        }
     }
 
     /**
@@ -107,7 +153,7 @@ public class ScheduleInvoker {
         String input = contextualInput(schedule, scheduledAt, executionId, attemptNumber);
         if (isUniversalTarget(arn)) {
             invokeUniversalTarget(arn.substring(arn.indexOf(":aws-sdk:") + ":aws-sdk:".length()),
-                    input, region);
+                    input, region, schedule.getAccountId());
             return universalTargetRequest(input);
         }
 
@@ -401,9 +447,11 @@ public class ScheduleInvoker {
      * Dispatches an EventBridge Scheduler universal target ({@code aws-sdk:<service>:<action>}),
      * reading the call parameters from the target's {@code Input} payload. Supports the
      * common {@code sns:publish} and {@code sqs:sendMessage} actions; other actions fail
-     * as unsupported.
+     * as unsupported. {@code scheduleAccountId} scopes the Redshift Data calls, whose cluster and
+     * statement storage is account-aware and the dispatcher thread carries no request account.
      */
-    private void invokeUniversalTarget(String serviceAction, String input, String region) {
+    private void invokeUniversalTarget(String serviceAction, String input, String region,
+                                       String scheduleAccountId) {
         JsonNode params;
         try {
             params = objectMapper.readTree(input == null || input.isBlank() ? "{}" : input);
@@ -436,9 +484,42 @@ public class ScheduleInvoker {
                         messageAttributes, region);
                 LOG.debugv("Scheduler delivered to SQS (universal target): {0}", queueUrl);
             }
+            case "redshiftdata:executeStatement" -> {
+                requireRedshiftData();
+                submitRedshiftData(scheduleAccountId, region, () -> redshiftDataService.submitStatement(params, region));
+                LOG.debugv("Scheduler submitted to the Redshift Data API (universal target): {0}", serviceAction);
+            }
+            case "redshiftdata:batchExecuteStatement" -> {
+                requireRedshiftData();
+                submitRedshiftData(scheduleAccountId, region, () -> redshiftDataService.submitBatch(params, region));
+                LOG.debugv("Scheduler submitted to the Redshift Data API (universal target): {0}", serviceAction);
+            }
             default -> throw new UnsupportedOperationException(
                     "Scheduler: unsupported universal target action: " + serviceAction);
         }
+    }
+
+    private void requireRedshiftData() {
+        if (!serviceRegistry.isServiceEnabled("redshift-data")) {
+            throw new AwsException("ServiceNotAvailableException", "Service redshift-data is not enabled.", 400);
+        }
+    }
+
+    /**
+     * The Data API is asynchronous: AWS returns once the statement is submitted. The request check
+     * runs here, so a rejected request still fails the occurrence and is retried, while the SQL runs
+     * on its own thread so a slow statement cannot hold up the single dispatcher thread. Both halves
+     * run as the schedule's account, which neither thread carries.
+     */
+    private void submitRedshiftData(String scheduleAccountId, String region, Supplier<Runnable> submit) {
+        Runnable statement = RequestScopes.callAs(scheduleAccountId, region, submit);
+        redshiftDataExecutor.execute(() -> {
+            try {
+                RequestScopes.runAs(scheduleAccountId, region, statement);
+            } catch (RuntimeException e) {
+                LOG.warnv("Scheduled Redshift Data statement failed: {0}", e.getMessage());
+            }
+        });
     }
 
     private static Map<String, MessageAttributeValue> parseUniversalSqsMessageAttributes(JsonNode attrsNode) {
