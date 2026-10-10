@@ -60,7 +60,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, MapRun> mapRunStore;
     private final Map<String, ExecutionHistory> historyCache = new ConcurrentHashMap<>();
     private final Map<String, BlockingQueue<ActivityTask>> activityQueues = new ConcurrentHashMap<>();
-    private final Map<String, CompletableFuture<JsonNode>> pendingTaskTokens = new ConcurrentHashMap<>();
+    private final Map<String, PendingTask> pendingTaskTokens = new ConcurrentHashMap<>();
+    // Only recent closures are classified as TaskTimedOut: five minutes, at most 1,024 tokens.
+    // Evicted/older and foreign tokens remain InvalidToken. No task payloads are retained.
+    private final Map<String, ClosedTask> closedTaskTokens = new LinkedHashMap<>();
+    private static final long CLOSED_TOKEN_RETENTION_NANOS = TimeUnit.MINUTES.toNanos(5);
+    private static final int MAX_CLOSED_TOKENS = 1024;
+
+    private record PendingTask(String accountId, CompletableFuture<JsonNode> future) {}
+    private record ClosedTask(String accountId, long closedAtNanos) {}
     // When each pending token last showed progress, so a Task's HeartbeatSeconds can bound the gap
     // between heartbeats instead of the whole wait.
     private final Map<String, Long> taskHeartbeatNanos = new ConcurrentHashMap<>();
@@ -146,8 +154,11 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     public void clear() {
         historyCache.clear();
         activityQueues.clear();
-        pendingTaskTokens.values().forEach(f -> f.completeExceptionally(new RuntimeException("StepFunctionsService cleared")));
+        pendingTaskTokens.values().forEach(f -> f.future().completeExceptionally(new RuntimeException("StepFunctionsService cleared")));
         pendingTaskTokens.clear();
+        synchronized (this) {
+            closedTaskTokens.clear();
+        }
         taskHeartbeatNanos.clear();
     }
 
@@ -1159,9 +1170,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         queue.add(new ActivityTask(taskToken, input));
     }
 
-    public CompletableFuture<JsonNode> registerPendingToken(String token) {
+    public synchronized CompletableFuture<JsonNode> registerPendingToken(String token, String accountId) {
         CompletableFuture<JsonNode> future = new CompletableFuture<>();
-        pendingTaskTokens.put(token, future);
+        pendingTaskTokens.put(token, new PendingTask(Objects.requireNonNull(accountId), future));
         taskHeartbeatNanos.put(token, System.nanoTime());
         return future;
     }
@@ -1176,31 +1187,55 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         return reportedAt != null ? reportedAt : System.nanoTime();
     }
 
-    /**
-     * Forgets a token the waiting task has stopped listening for, so a later SendTaskSuccess,
-     * SendTaskFailure or SendTaskHeartbeat naming it reports no pending task.
-     */
-    public void discardPendingToken(String taskToken) {
-        if (taskToken == null) {
-            return;
+    /** Retires a token when its task stops waiting, including timeout and resource failure. */
+    public synchronized void discardPendingToken(String taskToken) {
+        if (taskToken != null) {
+            PendingTask pending = pendingTaskTokens.remove(taskToken);
+            taskHeartbeatNanos.remove(taskToken);
+            if (pending != null) {
+                rememberClosed(taskToken, pending.accountId());
+            }
         }
-        pendingTaskTokens.remove(taskToken);
-        taskHeartbeatNanos.remove(taskToken);
     }
 
-    // ──────────────────────────── Tasks ────────────────────────────
-
-    /**
-     * @return whether the token named a task that was waiting for it. The
-     *         {@code aws-sdk:sfn:sendTaskSuccess} Task integration fails the calling state when it
-     *         did not, the way AWS answers an unknown token with {@code InvalidToken}.
-     */
-    public boolean sendTaskSuccess(String taskToken, String output) {
-        CompletableFuture<JsonNode> future = taskToken != null ? pendingTaskTokens.remove(taskToken) : null;
-        if (future == null) {
-            LOG.warnv("SendTaskSuccess: no pending task for token {0}", taskToken);
-            return false;
+    private void rememberClosed(String token, String accountId) {
+        long now = System.nanoTime();
+        closedTaskTokens.entrySet().removeIf(entry -> now - entry.getValue().closedAtNanos()
+                >= CLOSED_TOKEN_RETENTION_NANOS);
+        closedTaskTokens.put(token, new ClosedTask(accountId, now));
+        while (closedTaskTokens.size() > MAX_CLOSED_TOKENS) {
+            closedTaskTokens.remove(closedTaskTokens.keySet().iterator().next());
         }
+    }
+
+    private PendingTask requirePendingTask(String token) {
+        String accountId = regionResolver.getAccountId();
+        PendingTask pending = token == null ? null : pendingTaskTokens.get(token);
+        if (pending != null && pending.accountId().equals(accountId)) {
+            return pending;
+        }
+        ClosedTask closed = token == null ? null : closedTaskTokens.get(token);
+        if (closed != null && System.nanoTime() - closed.closedAtNanos() >= CLOSED_TOKEN_RETENTION_NANOS) {
+            closedTaskTokens.remove(token);
+            closed = null;
+        }
+        if (closed != null && closed.accountId().equals(accountId)) {
+            throw new AwsException("TaskTimedOut", "The associated task has already been closed.", 400);
+        }
+        throw new AwsException("InvalidToken", "Invalid Token: 'Invalid token'", 400);
+    }
+
+    private synchronized CompletableFuture<JsonNode> claimPendingTask(String token) {
+        PendingTask pending = requirePendingTask(token);
+        pendingTaskTokens.remove(token);
+        taskHeartbeatNanos.remove(token);
+        rememberClosed(token, pending.accountId());
+        return pending.future();
+    }
+
+    /** Claims an owned callback exactly once; completion runs outside the token lock. */
+    public boolean sendTaskSuccess(String taskToken, String output) {
+        CompletableFuture<JsonNode> future = claimPendingTask(taskToken);
         try {
             future.complete(objectMapper.readTree(output));
         } catch (Exception e) {
@@ -1209,29 +1244,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         return true;
     }
 
-    /**
-     * @return whether the token named a task that was waiting for it, as in
-     *         {@link #sendTaskSuccess(String, String)}.
-     */
     public boolean sendTaskFailure(String taskToken, String cause, String error) {
-        CompletableFuture<JsonNode> future = taskToken != null ? pendingTaskTokens.remove(taskToken) : null;
-        if (future == null) {
-            LOG.warnv("SendTaskFailure: no pending task for token {0}", taskToken);
-            return false;
-        }
+        CompletableFuture<JsonNode> future = claimPendingTask(taskToken);
         future.completeExceptionally(new AslExecutor.FailStateException(error, cause));
         return true;
     }
 
-    /**
-     * Resets the gap a Task's {@code HeartbeatSeconds} allows. A heartbeat for a token nobody is
-     * waiting for is logged and changes nothing, as in {@link #sendTaskSuccess(String, String)}.
-     */
-    public void sendTaskHeartbeat(String taskToken) {
-        if (taskToken == null || !pendingTaskTokens.containsKey(taskToken)) {
-            LOG.warnv("SendTaskHeartbeat: no pending task for token {0}", taskToken);
-            return;
-        }
+    /** A foreign, closed or unknown token cannot refresh a task's heartbeat. */
+    public synchronized void sendTaskHeartbeat(String taskToken) {
+        requirePendingTask(taskToken);
         taskHeartbeatNanos.put(taskToken, System.nanoTime());
     }
 
