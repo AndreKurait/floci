@@ -25,11 +25,11 @@ import java.util.Set;
  *
  * <p>Covered on {@code AWS::S3::Bucket}: {@code BucketName}, {@code CorsConfiguration},
  * {@code VersioningConfiguration}, {@code PublicAccessBlockConfiguration},
- * {@code BucketEncryption}, {@code LifecycleConfiguration} and {@code Tags}.
+ * {@code BucketEncryption}, {@code LifecycleConfiguration}, {@code OwnershipControls} and {@code Tags}.
  *
  * <p><b>Silently dropped</b>, each of which has a service method waiting for it:
  * {@code NotificationConfiguration}, {@code WebsiteConfiguration}, {@code LoggingConfiguration},
- * {@code ObjectLockConfiguration}, {@code OwnershipControls}, {@code ReplicationConfiguration},
+ * {@code ObjectLockConfiguration}, {@code ReplicationConfiguration},
  * {@code AccelerateConfiguration}, {@code AccessControl}, and the four numbered configuration
  * lists ({@code AnalyticsConfigurations}, {@code IntelligentTieringConfigurations},
  * {@code InventoryConfigurations}, {@code MetricsConfigurations}). Declaring one of these still
@@ -85,6 +85,7 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
         applyPublicAccessBlockConfiguration(bucketName, props, ctx);
         applyBucketEncryption(bucketName, props, ctx);
         applyLifecycleConfiguration(bucketName, props, ctx);
+        applyOwnershipControls(bucketName, props, ctx);
         applyBucketTags(bucketName, props, ctx);
         r.setPhysicalId(bucketName);
         r.getAttributes().put("Arn",
@@ -202,6 +203,25 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
             return;
         }
         s3Service.putBucketTagging(bucketName, ctx.resolveTags(props, "Tags"));
+    }
+
+    private void applyOwnershipControls(String bucketName, JsonNode props, ProvisionContext ctx) {
+        JsonNode controls = declared(props, "OwnershipControls");
+        if (controls == null) {
+            return;
+        }
+        JsonNode rules = controls.get("Rules");
+        if (rules == null || !rules.isArray() || rules.size() != 1) {
+            throw new AwsException("InvalidRequest", "OwnershipControls requires exactly one rule", 400);
+        }
+        String ownership = ctx.resolveOptional(rules.get(0), "ObjectOwnership");
+        if (ownership == null
+                || !Set.of("BucketOwnerEnforced", "BucketOwnerPreferred", "ObjectWriter").contains(ownership)) {
+            throw new AwsException("InvalidRequest", "Invalid ObjectOwnership", 400);
+        }
+        String xml = new XmlBuilder().start("OwnershipControls", AwsNamespaces.S3)
+                .start("Rule").elem("ObjectOwnership", ownership).end("Rule").end("OwnershipControls").build();
+        s3Service.putBucketOwnershipControls(bucketName, xml);
     }
 
     /** CloudFormation's lifecycle rule property names, spelled as the S3 API's XML. */

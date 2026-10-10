@@ -70,6 +70,27 @@ class S3CfnProvisionerTest {
     }
 
     @Test
+    void ownershipControlsUseTheSameBucketConfigurationAsTheS3Api() {
+        provisionBucket("""
+                {"BucketName":"my-bucket","OwnershipControls":{"Rules":[
+                  {"ObjectOwnership":"BucketOwnerEnforced"}]}}
+                """);
+        verify(s3).putBucketOwnershipControls("my-bucket",
+                "<OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+                + "<Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>");
+    }
+
+    @Test
+    void malformedOwnershipCannotReceiveSuccessfulConfiguration() {
+        for (String controls : new String[]{"{}", "{\"Rules\":[]}", "{\"Rules\":[{}]}",
+                "{\"Rules\":[{\"ObjectOwnership\":\"public\"}]}"}) {
+            assertThrows(AwsException.class, () -> provisionBucket(
+                    "{\"BucketName\":\"my-bucket\",\"OwnershipControls\":" + controls + "}"));
+        }
+        verify(s3, never()).putBucketOwnershipControls(anyString(), anyString());
+    }
+
+    @Test
     void refIsTheBucketNameAndGetAttExposesTheDocumentedAttributes() {
         StackResource r = provisionBucket("""
                 {"BucketName": "my-bucket"}
