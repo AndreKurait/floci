@@ -126,7 +126,23 @@ Configured persistent storage retains snapshots across restarts.
 
 `DryRun=true` validates the source without storing a snapshot. Only regional
 placement is supported; Local Zone and Outpost placement are refused.
-Standalone `CopySnapshot` and `DeleteSnapshot` remain unsupported.
+`DeleteSnapshot` removes caller-owned regional metadata while preserving its
+source volume. A registered AMI's root snapshot cannot be deleted until every
+referencing AMI is deregistered. Dry-run and invalid requests preserve the
+snapshot. Standalone `CopySnapshot` remains unsupported.
+
+### Public addresses in metadata mode
+
+With `FLOCI_SERVICES_EC2_MOCK=true`, a running instance receives a synthetic public
+IPv4 address when its launch settings request one. Explicit true or false takes
+precedence over the subnet default. Direct launches and Auto Scaling use the
+selected launch-template version's primary-interface setting.
+
+Repeated reads retain the address; stopping releases an automatic address and
+starting assigns a new one without changing the private address. These are API
+identities, not host routes or published ports. An external executor must supply
+networking. Public DNS is represented by the address itself; AWS public-hostname
+synthesis and Elastic IP lifecycle parity are not qualified by these checks.
 
 ### EBS launch mappings
 

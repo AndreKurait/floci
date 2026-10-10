@@ -3897,7 +3897,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             instances.scan(k -> true).stream()
                     .filter(i -> i.getRegion().equals(region) && "pending".equals(i.getState().getName()))
                     .forEach(i -> {
-                        i.setState(InstanceState.running());
+                        completeMockLaunch(i);
                         instances.put(key(i.getRegion(), i.getInstanceId()), i);
                     });
         }
@@ -3925,6 +3925,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             reservationMap.put(inst.getInstanceId(), res);
         }
         return new ArrayList<>(reservationMap.values());
+    }
+
+    private void completeMockLaunch(Instance instance) {
+        synchronized (instance) {
+            if (instance.isAssociatePublicIp() && instance.getPublicIpAddress() == null) {
+                Random random = new Random();
+                String publicIp = "54." + random.nextInt(256) + "."
+                        + random.nextInt(256) + "." + random.nextInt(256);
+                instance.setPublicIpAddress(publicIp);
+                instance.setPublicDnsName(publicIp);
+            }
+            instance.setState(InstanceState.running());
+        }
+    }
+
+    private void releaseMockPublicAddress(String region, Instance instance) {
+        boolean elastic = addresses.scan(k -> true).stream()
+                .anyMatch(address -> region.equals(address.getRegion())
+                        && instance.getInstanceId().equals(address.getInstanceId()));
+        if (!elastic) {
+            instance.setPublicIpAddress(null);
+            instance.setPublicDnsName(null);
+        }
     }
 
     public String platformDetailsForInstance(Instance instance) {
@@ -4063,6 +4086,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             InstanceState prev = inst.getState();
             if (config.services().ec2().mock()) {
                 inst.setState(InstanceState.terminated());
+                releaseMockPublicAddress(region, inst);
                 inst.setTerminatedAt(System.currentTimeMillis());
             } else {
                 // Also attempt the reclaim once this container is really gone. The synchronous
@@ -4161,6 +4185,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             InstanceState prev = inst.getState();
             if (config.services().ec2().mock()) {
                 inst.setState(InstanceState.stopped());
+                releaseMockPublicAddress(region, inst);
             } else {
                 containerManager.stop(inst);
             }
@@ -4192,7 +4217,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             InstanceState prev = inst.getState();
             if (config.services().ec2().mock()) {
-                inst.setState(InstanceState.running());
+                completeMockLaunch(inst);
             } else {
                 restoreInstanceFirewall(inst);
                 String accountId = callerAccountId();
@@ -7246,6 +7271,37 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             snapshots.put(key(region, snapshot.getSnapshotId()), snapshot);
             return snapshot;
         });
+    }
+
+    public void deleteSnapshot(String region, String snapshotId, boolean dryRun) {
+        if (snapshotId == null || snapshotId.isBlank()) {
+            throw new AwsException("MissingParameter", "The parameter SnapshotId is missing.", 400);
+        }
+        if (!snapshotId.matches("snap-(?:[0-9a-f]{8}|[0-9a-f]{17})")) {
+            throw new AwsException("InvalidSnapshotID.Malformed", "Invalid snapshot id: " + snapshotId, 400);
+        }
+        synchronized (imageRegistryLock) {
+            if (snapshots.get(key(region, snapshotId)).isEmpty()) {
+                throw new AwsException("InvalidSnapshot.NotFound",
+                        "The snapshot '" + snapshotId + "' does not exist.", 400);
+            }
+            if (registeredImages.scan(k -> true).stream()
+                    .filter(image -> region.equals(image.getRegion()))
+                    .filter(image -> !DEREGISTERED_STATE.equals(image.getState()))
+                    .anyMatch(image -> image.getBlockDeviceMappings().stream()
+                            .filter(mapping -> Objects.equals(image.getRootDeviceName(), mapping.getDeviceName()))
+                            .map(BlockDeviceMapping::getEbs)
+                            .filter(Objects::nonNull)
+                            .anyMatch(ebs -> snapshotId.equals(ebs.getSnapshotId())))) {
+                throw new AwsException("InvalidSnapshot.InUse",
+                        "The snapshot '" + snapshotId + "' is used by a registered image.", 400);
+            }
+            if (dryRun) {
+                throw new AwsException("DryRunOperation",
+                        "Request would have succeeded, but DryRun flag is set.", 412);
+            }
+            snapshots.delete(key(region, snapshotId));
+        }
     }
 
     public List<Snapshot> describeSnapshots(String region, List<String> snapshotIds,

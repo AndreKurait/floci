@@ -205,6 +205,7 @@ public class Ec2QueryHandler {
                 case "DescribeSnapshotAttribute" -> handleDescribeSnapshotAttribute(params, region);
                 case "ModifySnapshotAttribute" -> handleModifySnapshotAttribute(params, region);
                 case "CreateSnapshot" -> handleCreateSnapshot(params, region);
+                case "DeleteSnapshot" -> handleDeleteSnapshot(params, region);
                 case "DescribeSnapshots" -> handleDescribeSnapshots(params, region);
                 // Tags
                 case "CreateTags" -> handleCreateTags(params, region);
@@ -802,6 +803,10 @@ public class Ec2QueryHandler {
         LaunchTemplateData launchTemplateData = resolveRunInstancesLaunchTemplateData(
                 p, region, userDataEncoded == null || userDataEncoded.isBlank());
         if (launchTemplateData != null) {
+            if (associatePublicIp == null && networkInterfaceId == null
+                    && p.keySet().stream().noneMatch(name -> name.startsWith("NetworkInterface."))) {
+                associatePublicIp = launchTemplateData.effectiveAssociatePublicIpAddress();
+            }
             blockDevices = Ec2BlockDevices.merge(launchTemplateData.getBlockDeviceMappings(), blockDevices);
             if (launchTemplateData.getMetadataOptions() != null) {
                 metadataOptions = LaunchTemplateData.MetadataOptions.merge(
@@ -3770,6 +3775,11 @@ public class Ec2QueryHandler {
                 .raw(snapshotXml(snapshot))
                 .end("CreateSnapshotResponse")
                 .build());
+    }
+
+    private Response handleDeleteSnapshot(MultivaluedMap<String, String> p, String region) {
+        service.deleteSnapshot(region, p.getFirst("SnapshotId"), Boolean.parseBoolean(p.getFirst("DryRun")));
+        return booleanResponse("DeleteSnapshot");
     }
 
     private Response handleDescribeSnapshots(MultivaluedMap<String, String> p, String region) {
