@@ -136,12 +136,24 @@ public class EksPodIdentityCredentialsController {
 
         String sessionName = podIdentitySessionName(cluster.getName(), association.serviceAccount());
         String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : roleArn;
-        Optional<IamRole> role = iamService.findRole(roleAccountId, roleName);
+        // EKS Auth assumes the association's role through STS, so a role that is gone gets no
+        // credentials. The lookup is by name only, and enforcement loads a session's policies the
+        // same way, so a role recreated under another path is refused too: it is not the role the
+        // association names.
+        Optional<IamRole> role = iamService.findRole(roleAccountId, roleName)
+                .filter(found -> IamService.roleArnMatches(roleArn, found));
+        if (role.isEmpty()) {
+            return error(400, "AccessDeniedException: The role of the association cannot be assumed: "
+                    + roleArn + "\n");
+        }
         String assumedRoleId = role.map(IamRole::getRoleId).filter(id -> !id.isBlank())
                 .map(id -> id + ":" + sessionName)
                 .orElse(null);
 
-        iamService.registerSession(accessKeyId, secretAccessKey, sessionToken, roleArn,
+        // Like STS AssumeRole, the session names the stored role, so it lives in the role's
+        // partition even when the association was made with the role's ARN in another partition.
+        String sessionRoleArn = role.map(IamRole::getArn).filter(AwsArnUtils::isArn).orElse(roleArn);
+        iamService.registerSession(accessKeyId, secretAccessKey, sessionToken, sessionRoleArn,
                 expiration, association.policy(), callerAccountId, sessionName, assumedRoleId);
 
         EksPodIdentityCredentialsResponse response = new EksPodIdentityCredentialsResponse(
