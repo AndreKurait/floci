@@ -3243,6 +3243,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                     LaunchTemplateData.MetadataOptions metadataOptions,
                                     String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
                                     String hostId, String tenancy) {
+        return runInstances(region, imageId, instanceType, minCount, maxCount, keyName,
+                securityGroupIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone,
+                metadataOptions, creditSpecificationCpuCredits, encodedUserData, dryRun, hostId, tenancy, List.of());
+    }
+
+    public Reservation runInstances(String region, String imageId, String instanceType,
+                                    int minCount, int maxCount, String keyName,
+                                    List<String> securityGroupIds, String subnetId,
+                                    String clientToken, List<Tag> instanceTags,
+                                    String userData, String iamInstanceProfileArn,
+                                    Boolean associatePublicIp, String networkInterfaceId,
+                                    int networkInterfaceDeviceIndex, String availabilityZone,
+                                    LaunchTemplateData.MetadataOptions metadataOptions,
+                                    String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
+                                    String hostId, String tenancy,
+                                    List<LaunchTemplateData.BlockDeviceMapping> blockDevices) {
         if (hostId != null && !hostId.isBlank()) {
             Host host = getRequiredAvailableHost(region, hostId);
             if ((availabilityZone == null || availabilityZone.isBlank())
@@ -3357,6 +3374,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ResolvedAmiImage dockerImage = null;
         synchronized (imageRegistryLock) {
             requireNotDeregistered(region, imageId);
+            LaunchVolumes launchVolumes = planLaunchVolumes(region, imageId, blockDevices);
             if (!config.services().ec2().mock()) {
                 // A CreateImage AMI is not in the catalog, so resolve through its source. The
                 // ancestor supplies the guest runtime (systemd vs minimal, cloud-init), which a
@@ -3467,26 +3485,34 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             networkInterfaces.put(key(region, suppliedEni.getNetworkInterfaceId()), suppliedEni);
                         }
 
-                        // Root EBS volume
-                        String rootVolId = "vol-" + randomHex(17);
-                        inst.setRootVolumeId(rootVolId);
-                        Volume rootVol = new Volume();
-                        rootVol.setVolumeId(rootVolId);
-                        rootVol.setAvailabilityZone(az);
-                        rootVol.setVolumeType(DEFAULT_ROOT_VOLUME_TYPE);
-                        rootVol.setSize(DEFAULT_ROOT_VOLUME_SIZE_GIB);
-                        rootVol.setState("in-use");
-                        rootVol.setRegion(region);
-                        rootVol.setCreateTime(Instant.now());
-                        VolumeAttachment att = new VolumeAttachment();
-                        att.setVolumeId(rootVolId);
-                        att.setInstanceId(instanceId);
-                        att.setDevice(inst.getRootDeviceName());
-                        att.setState("attached");
-                        att.setDeleteOnTermination(true);
-                        att.setAttachTime(Instant.now());
-                        rootVol.getAttachments().add(att);
-                        volumes.put(key(region, rootVolId), rootVol);
+                        inst.setRootDeviceName(launchVolumes.rootDevice());
+                        for (LaunchVolume device : launchVolumes.volumes()) {
+                            String volumeId = "vol-" + randomHex(17);
+                            if (device.device().equals(launchVolumes.rootDevice())) {
+                                inst.setRootVolumeId(volumeId);
+                            }
+                            Volume volume = new Volume();
+                            volume.setVolumeId(volumeId);
+                            volume.setAvailabilityZone(az);
+                            volume.setVolumeType(device.type());
+                            volume.setSize(device.size());
+                            volume.setSnapshotId(device.snapshot());
+                            volume.setEncrypted(device.encrypted());
+                            volume.setIops(device.iops());
+                            volume.setThroughput(device.throughput());
+                            volume.setState("in-use");
+                            volume.setRegion(region);
+                            volume.setCreateTime(inst.getLaunchTime());
+                            VolumeAttachment attachment = new VolumeAttachment();
+                            attachment.setVolumeId(volumeId);
+                            attachment.setInstanceId(instanceId);
+                            attachment.setDevice(device.device());
+                            attachment.setState("attached");
+                            attachment.setDeleteOnTermination(device.deleteOnTermination());
+                            attachment.setAttachTime(inst.getLaunchTime());
+                            volume.getAttachments().add(attachment);
+                            volumes.put(key(region, volumeId), volume);
+                        }
 
                         instances.put(key(region, instanceId), inst);
                         launched.add(inst);
@@ -3907,6 +3933,112 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 ? "Windows" : "Linux/UNIX";
     }
 
+    private record LaunchVolume(String device, String snapshot, int size, String type,
+                                int iops, Integer throughput, boolean encrypted, boolean deleteOnTermination) {}
+    private record LaunchVolumes(String rootDevice, List<LaunchVolume> volumes) {}
+
+    private LaunchVolumes planLaunchVolumes(String region, String imageId,
+                                             List<LaunchTemplateData.BlockDeviceMapping> overrides) {
+        Image image = imageForCaller(region, imageId).orElseGet(() -> sharedImageForCaller(region, imageId).orElse(null));
+        String root = image != null && image.getRootDeviceName() != null ? image.getRootDeviceName() : "/dev/xvda";
+        List<LaunchTemplateData.BlockDeviceMapping> inherited = new ArrayList<>();
+        Set<String> inheritedSnapshots = new HashSet<>();
+        if (image != null && image.getBlockDeviceMappings() != null) {
+            for (BlockDeviceMapping source : image.getBlockDeviceMappings()) {
+                LaunchTemplateData.BlockDeviceMapping mapping = new LaunchTemplateData.BlockDeviceMapping();
+                mapping.setDeviceName(source.getDeviceName());
+                EbsBlockDevice sourceEbs = source.getEbs();
+                if (sourceEbs == null) {
+                    throw new AwsException("UnsupportedOperation", "Only EBS AMI launch mappings are supported.", 400);
+                }
+                LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
+                ebs.setSnapshotId(sourceEbs.getSnapshotId());
+                ebs.setVolumeSize(sourceEbs.getVolumeSize());
+                ebs.setVolumeType(sourceEbs.getVolumeType());
+                ebs.setIops(sourceEbs.getIops());
+                ebs.setThroughput(sourceEbs.getThroughput());
+                ebs.setEncrypted(sourceEbs.getEncrypted());
+                ebs.setDeleteOnTermination(sourceEbs.getDeleteOnTermination());
+                mapping.setEbs(ebs);
+                inherited.add(mapping);
+                if (ebs.getSnapshotId() != null) {
+                    inheritedSnapshots.add(ebs.getSnapshotId());
+                }
+            }
+        }
+        if (inherited.isEmpty()) {
+            LaunchTemplateData.BlockDeviceMapping mapping = new LaunchTemplateData.BlockDeviceMapping();
+            mapping.setDeviceName(root);
+            LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
+            ebs.setVolumeSize(DEFAULT_ROOT_VOLUME_SIZE_GIB);
+            ebs.setVolumeType(DEFAULT_ROOT_VOLUME_TYPE);
+            ebs.setDeleteOnTermination(true);
+            mapping.setEbs(ebs);
+            inherited.add(mapping);
+        }
+        List<LaunchVolume> planned = new ArrayList<>();
+        for (LaunchTemplateData.BlockDeviceMapping mapping : Ec2BlockDevices.merge(inherited, overrides)) {
+            if (mapping.getNoDevice() != null) {
+                continue;
+            }
+            LaunchTemplateData.Ebs ebs = mapping.getEbs();
+            String snapshotId = ebs.getSnapshotId();
+            Snapshot snapshot = null;
+            if (snapshotId != null) {
+                // Launch permission includes the AMI's backing snapshots, but only here. Direct
+                // CreateVolume and CopyImage retain their independent snapshot permission checks.
+                if (image != null && inheritedSnapshots.contains(snapshotId)
+                        && !callerAccountId().equals(image.getOwnerId())
+                        && snapshots instanceof AccountAwareStorageBackend<Snapshot> aware) {
+                    snapshot = aware.getForAccount(image.getOwnerId(), key(region, snapshotId)).orElse(null);
+                    if (snapshot == null || !image.getOwnerId().equals(snapshot.getOwnerId())
+                            || !snapshotId.equals(snapshot.getSnapshotId()) || !region.equals(snapshot.getRegion())) {
+                        throw new AwsException("InvalidSnapshot.NotFound", "AMI backing snapshot is unavailable.", 400);
+                    }
+                    if (snapshot.isEncrypted()) {
+                        throw new AwsException("UnsupportedOperation", "Encrypted shared launch requires KMS authorization.", 400);
+                    }
+                    if (!"completed".equals(snapshot.getState())) {
+                        throw new AwsException("IncorrectState", "AMI backing snapshot is not completed.", 400);
+                    }
+                } else {
+                    snapshot = volumeSnapshot(region, snapshotId);
+                }
+            }
+            int size = ebs.getVolumeSize() != null ? ebs.getVolumeSize()
+                    : snapshot != null && snapshot.getVolumeSize() != null ? snapshot.getVolumeSize() : 0;
+            String type = ebs.getVolumeType() == null ? "gp2" : ebs.getVolumeType();
+            int iops = ebs.getIops() == null ? ("gp3".equals(type) ? 3000 : 0) : ebs.getIops();
+            Integer throughput = ebs.getThroughput() == null && "gp3".equals(type) ? Integer.valueOf(125) : ebs.getThroughput();
+            if (size <= 0 || (snapshot != null && (snapshot.getVolumeSize() == null
+                    || snapshot.getVolumeSize() <= 0 || size < snapshot.getVolumeSize()))
+                    || !Set.of("standard", "gp2", "gp3", "io1", "io2", "st1", "sc1").contains(type)
+                    || (ebs.getIops() != null && (iops <= 0 || !Set.of("gp3", "io1", "io2").contains(type)))
+                    || (throughput != null && (!"gp3".equals(type) || throughput <= 0))) {
+                throw new AwsException("InvalidBlockDeviceMapping", "Invalid EBS size, type or performance settings.", 400);
+            }
+            if (ebs.getKmsKeyId() != null) {
+                throw new AwsException("UnsupportedOperation", "Launch-time KMS key selection is not supported.", 400);
+            }
+            if (snapshot != null && snapshot.isEncrypted() && Boolean.FALSE.equals(ebs.getEncrypted())) {
+                throw new AwsException("InvalidBlockDeviceMapping", "An encrypted snapshot cannot be decrypted at launch.", 400);
+            }
+            planned.add(new LaunchVolume(mapping.getDeviceName(), snapshotId, size, type, iops, throughput,
+                    Boolean.TRUE.equals(ebs.getEncrypted()) || snapshot != null && snapshot.isEncrypted(),
+                    ebs.getDeleteOnTermination() == null || ebs.getDeleteOnTermination()));
+        }
+        if (planned.stream().noneMatch(volume -> volume.device().equals(root))) {
+            throw new AwsException("InvalidBlockDeviceMapping", "An EBS root device is required.", 400);
+        }
+        return new LaunchVolumes(root, List.copyOf(planned));
+    }
+
+    public List<VolumeAttachment> instanceVolumeAttachments(String region, String instanceId) {
+        return volumes.scan(k -> true).stream().filter(v -> region.equals(v.getRegion()))
+                .flatMap(v -> v.getAttachments().stream())
+                .filter(a -> instanceId.equals(a.getInstanceId())).toList();
+    }
+
     public List<Map<String, String>> terminateInstances(String region, List<String> instanceIds) {
         ensureDefaultResources(region);
         List<Map<String, String>> result = new ArrayList<>();
@@ -3939,20 +4071,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 // daemon and, without this, nothing would try again.
                 containerManager.terminate(inst, () ->
                         RequestScopes.runAs(owner, () -> reclaimCapturesPinnedBy(region, inst, terminating)));
-            }
-            // Delete root volume if deleteOnTermination (matches real AWS behavior)
-            if (inst.getRootVolumeId() != null) {
-                Volume rootVol = volumes.get(key(region, inst.getRootVolumeId())).orElse(null);
-                if (rootVol != null) {
-                    boolean attachedElsewhere = rootVol.getAttachments().stream()
-                            .anyMatch(a -> !inst.getInstanceId().equals(a.getInstanceId()));
-                    if (!attachedElsewhere) {
-                        if (volumeBlockDeviceManager != null) {
-                            volumeBlockDeviceManager.deleteVolume(inst.getRootVolumeId());
-                        }
-                        volumes.delete(key(region, inst.getRootVolumeId()));
-                    }
-                }
             }
             detachAttachedVolumesOnTermination(region, inst);
             releaseStandaloneInterfacesOnTermination(region, inst);
@@ -6382,6 +6500,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         EbsBlockDevice ebs = new EbsBlockDevice();
         ebs.setSnapshotId("snap-" + randomHex(17));
         ebs.setVolumeSize(volume.getSize());
+        if (volume.getIops() > 0) {
+            ebs.setIops(volume.getIops());
+        }
+        ebs.setThroughput(volume.getThroughput());
         ebs.setVolumeType(volume.getVolumeType());
         ebs.setDeleteOnTermination(attachment.isDeleteOnTermination());
         ebs.setEncrypted(volume.isEncrypted());
@@ -6433,6 +6555,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         EbsBlockDevice ebs = new EbsBlockDevice();
         ebs.setSnapshotId(sourceEbs.getSnapshotId() != null ? "snap-" + randomHex(17) : null);
         ebs.setVolumeSize(sourceEbs.getVolumeSize());
+        ebs.setIops(sourceEbs.getIops());
+        ebs.setThroughput(sourceEbs.getThroughput());
         ebs.setVolumeType(sourceEbs.getVolumeType());
         ebs.setDeleteOnTermination(sourceEbs.getDeleteOnTermination());
         ebs.setEncrypted(sourceEbs.getEncrypted());
@@ -10877,7 +11001,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     if (volumeBlockDeviceManager != null) {
                         volumeBlockDeviceManager.detachVolume(vol, inst, att.getDevice());
                     }
-                    if (att.isDeleteOnTermination()) {
+                    if (att.isDeleteOnTermination() && vol.getAttachments().stream()
+                            .noneMatch(other -> !inst.getInstanceId().equals(other.getInstanceId()))) {
                         if (volumeBlockDeviceManager != null) {
                             volumeBlockDeviceManager.deleteVolume(vol.getVolumeId());
                         }

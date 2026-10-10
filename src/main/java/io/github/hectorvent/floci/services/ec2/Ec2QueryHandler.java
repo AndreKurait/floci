@@ -432,6 +432,8 @@ public class Ec2QueryHandler {
             mapping.setDeviceName(deviceName);
             EbsBlockDevice ebs = new EbsBlockDevice();
             ebs.setSnapshotId(snapshotId);
+            ebs.setIops(parseOptionalInt(p.getFirst(prefix + ".Ebs.Iops"), prefix + ".Ebs.Iops"));
+            ebs.setThroughput(parseOptionalInt(p.getFirst(prefix + ".Ebs.Throughput"), prefix + ".Ebs.Throughput"));
             ebs.setVolumeSize(parseOptionalInt(volumeSize, prefix + ".Ebs.VolumeSize"));
             ebs.setVolumeType(volumeType);
             ebs.setDeleteOnTermination(parseOptionalBoolean(deleteOnTermination,
@@ -796,9 +798,11 @@ public class Ec2QueryHandler {
         LaunchTemplateData.MetadataOptions metadataOptions = parseMetadataOptions(p, "MetadataOptions.");
         String creditSpecificationCpuCredits = p.getFirst("CreditSpecification.CpuCredits");
 
+        List<LaunchTemplateData.BlockDeviceMapping> blockDevices = parseLaunchTemplateBlockDeviceMappings(p, "");
         LaunchTemplateData launchTemplateData = resolveRunInstancesLaunchTemplateData(
                 p, region, userDataEncoded == null || userDataEncoded.isBlank());
         if (launchTemplateData != null) {
+            blockDevices = Ec2BlockDevices.merge(launchTemplateData.getBlockDeviceMappings(), blockDevices);
             if (launchTemplateData.getMetadataOptions() != null) {
                 metadataOptions = LaunchTemplateData.MetadataOptions.merge(
                         launchTemplateData.getMetadataOptions(), metadataOptions);
@@ -832,7 +836,7 @@ public class Ec2QueryHandler {
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
                 associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, null, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, Boolean.parseBoolean(p.getFirst("DryRun")),
-                p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"));
+                p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDevices);
 
         if (!networkInterfaceTags.isEmpty()) {
             List<String> eniIds = new ArrayList<>();
@@ -5003,19 +5007,15 @@ public class Ec2QueryHandler {
                 .start("capacityReservationSpecification")
                 .elem("capacityReservationPreference", "open")
                 .end("capacityReservationSpecification");
-        if (inst.getRootVolumeId() != null) {
-            xml.start("blockDeviceMapping")
-                    .start("item")
-                    .elem("deviceName", inst.getRootDeviceName())
-                    .start("ebs")
-                    .elem("volumeId", inst.getRootVolumeId())
-                    .elem("status", "attached")
-                    .elem("deleteOnTermination", "true")
-                    .elem("attachTime", inst.getLaunchTime() != null ? ISO_FMT.format(inst.getLaunchTime()) : "")
-                    .end("ebs")
-                    .end("item")
-                    .end("blockDeviceMapping");
+        xml.start("blockDeviceMapping");
+        for (VolumeAttachment attachment : service.instanceVolumeAttachments(inst.getRegion(), inst.getInstanceId())) {
+            xml.start("item").elem("deviceName", attachment.getDevice()).start("ebs")
+                    .elem("volumeId", attachment.getVolumeId()).elem("status", attachment.getState())
+                    .elem("deleteOnTermination", String.valueOf(attachment.isDeleteOnTermination()))
+                    .elem("attachTime", attachment.getAttachTime() == null ? "" : ISO_FMT.format(attachment.getAttachTime()))
+                    .end("ebs").end("item");
         }
+        xml.end("blockDeviceMapping");
         if (inst.getIamInstanceProfileArn() != null) {
             xml.start("iamInstanceProfile")
                     .elem("arn", inst.getIamInstanceProfileArn())
@@ -5837,7 +5837,7 @@ public class Ec2QueryHandler {
             MultivaluedMap<String, String> p, String prefix) {
         List<LaunchTemplateData.BlockDeviceMapping> mappings = new ArrayList<>();
         for (int i = 1; ; i++) {
-            String base = prefix + ".BlockDeviceMapping." + i;
+            String base = (prefix.isEmpty() ? "" : prefix + ".") + "BlockDeviceMapping." + i;
             if (!anyParamStartsWith(p, base + ".")) {
                 break;
             }
@@ -6076,6 +6076,12 @@ public class Ec2QueryHandler {
                 }
                 if (ebs.getEncrypted() != null) {
                     xml.elem("encrypted", String.valueOf(ebs.getEncrypted()));
+                }
+                if (ebs.getIops() != null) {
+                    xml.elem("iops", String.valueOf(ebs.getIops()));
+                }
+                if (ebs.getThroughput() != null) {
+                    xml.elem("throughput", String.valueOf(ebs.getThroughput()));
                 }
                 xml.end("ebs");
             }

@@ -232,8 +232,9 @@ class Ec2ImageSnapshotPermissionIntegrationTest {
             copy(source.imageId()).formParam("DryRun", true).post("/").then().statusCode(412)
                     .body("Response.Errors.Error.Code", equalTo("DryRunOperation"));
             request("DescribeImages", RECIPIENT, SOURCE_REGION).formParam("ImageId.1", source.imageId())
-                    .post("/").then().statusCode(400)
-                    .body("Response.Errors.Error.Code", equalTo("InvalidAMIID.NotFound"));
+                    .post("/").then().statusCode(200)
+                    .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo(source.imageId()))
+                    .body("DescribeImagesResponse.imagesSet.item.imageOwnerId", equalTo(OWNER));
             assertEquals(beforeImages, ownedImages(RECIPIENT, DESTINATION_REGION));
             assertEquals(beforeSnapshots, ownedSnapshots(RECIPIENT, DESTINATION_REGION));
             assertEquals(0, ownedImages(RECIPIENT, SOURCE_REGION));

@@ -128,6 +128,29 @@ Configured persistent storage retains snapshots across restarts.
 placement is supported; Local Zone and Outpost placement are refused.
 Standalone `CopySnapshot` and `DeleteSnapshot` remain unsupported.
 
+### EBS launch mappings
+
+`RunInstances` inherits the AMI's EBS mappings. Launch-template settings override
+those mappings by device name, and explicit request fields override the template.
+Auto Scaling launch templates and launch configurations use the same EC2 volume
+allocation path. Volume size, type, snapshot, IOPS, gp3 throughput and
+`DeleteOnTermination` are retained; `DescribeInstances` reports every attached
+launch volume. Termination deletes volumes whose attachment requests deletion
+and detaches retained volumes.
+
+The complete mapping is validated before allocating launch resources. Duplicate
+devices, conflicting `NoDevice`/EBS settings, missing root devices, unavailable
+snapshots, and volumes smaller than their snapshots are refused. `NoDevice`
+suppresses an inherited non-root device. Instance-store mappings and explicit
+launch-time KMS key selection are unsupported and fail explicitly.
+
+A shared AMI's launch permission permits snapshot IDs already present in that
+AMI's unencrypted backing mappings in this launch path only, including when an
+override places the same backing snapshot on another device. It does not grant direct `CreateVolume` or `CopyImage`
+access to those snapshots. These are metadata volumes; launching does not copy
+snapshot block data. Container-backed shared-image launch retains its existing
+caller-owned-copy requirement.
+
 ### Account permissions and shared AMI copies
 
 An owner can read and modify an AMI's `launchPermission` and a snapshot's

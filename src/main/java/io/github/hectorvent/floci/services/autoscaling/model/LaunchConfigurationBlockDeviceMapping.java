@@ -5,8 +5,8 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 /**
  * One entry of a launch configuration's {@code BlockDeviceMappings}. The shape follows the
- * Auto Scaling API rather than EC2's, which has no {@code Throughput}, {@code Iops},
- * {@code VirtualName} or {@code NoDevice} on its launch-time mapping.
+ * Auto Scaling API, including its Boolean {@code NoDevice}; EC2 uses a string
+ * marker for the equivalent launch-time suppression.
  */
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)

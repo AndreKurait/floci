@@ -5,12 +5,14 @@ import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
+import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfigurationBlockDeviceMapping;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import io.github.hectorvent.floci.services.autoscaling.model.ScalingActivity;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.Ec2UserDataDecoder;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
@@ -363,7 +365,8 @@ public class AutoScalingReconciler {
                     propagatedInstanceTags(asg, launchSource),
                     launchSource.userData(),
                     launchSource.iamInstanceProfile(),
-                    launchSource.associatePublicIpAddress());
+                    launchSource.associatePublicIpAddress(), null, 0, null, null, null, null, false,
+                    null, null, launchSource.blockDevices());
 
             List<String> launchedInstanceIds = new ArrayList<>();
             for (Instance ec2Inst : reservation.getInstances()) {
@@ -573,7 +576,7 @@ public class AutoScalingReconciler {
                     // Forwarded as-is: an explicit false has to beat a public
                     // subnet's MapPublicIpOnLaunch, and only null means
                     // "fall back to the subnet default".
-                    lc.getAssociatePublicIpAddress());
+                    lc.getAssociatePublicIpAddress(), launchConfigurationBlockDevices(lc));
         }
 
         LaunchTemplate launchTemplate = resolveLaunchTemplate(asg);
@@ -600,7 +603,7 @@ public class AutoScalingReconciler {
                     asg.getLaunchTemplateId(),
                     asg.getLaunchTemplateName(),
                     resolvedVersion,
-                    null);
+                    null, version.getData().getBlockDeviceMappings());
         }
 
         MixedInstancesPolicy.LaunchTemplateSpecification specification =
@@ -633,7 +636,7 @@ public class AutoScalingReconciler {
                                 : specification.getLaunchTemplateId(),
                         specification.getLaunchTemplateName(),
                         resolvedVersion,
-                        null);
+                        null, version.getData().getBlockDeviceMappings());
             }
         }
 
@@ -727,6 +730,30 @@ public class AutoScalingReconciler {
         return version.getData().getInstanceType();
     }
 
+    private static List<LaunchTemplateData.BlockDeviceMapping>
+            launchConfigurationBlockDevices(LaunchConfiguration configuration) {
+        List<LaunchTemplateData.BlockDeviceMapping> result = new ArrayList<>();
+        for (LaunchConfigurationBlockDeviceMapping source : configuration.getBlockDeviceMappings()) {
+            LaunchTemplateData.BlockDeviceMapping mapping = new LaunchTemplateData.BlockDeviceMapping();
+            mapping.setDeviceName(source.getDeviceName());
+            mapping.setVirtualName(source.getVirtualName());
+            mapping.setNoDevice(Boolean.TRUE.equals(source.getNoDevice()) ? "" : null);
+            if (source.getEbs() != null) {
+                LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
+                ebs.setSnapshotId(source.getEbs().getSnapshotId());
+                ebs.setVolumeSize(source.getEbs().getVolumeSize());
+                ebs.setVolumeType(source.getEbs().getVolumeType());
+                ebs.setIops(source.getEbs().getIops());
+                ebs.setThroughput(source.getEbs().getThroughput());
+                ebs.setDeleteOnTermination(source.getEbs().getDeleteOnTermination());
+                ebs.setEncrypted(source.getEbs().getEncrypted());
+                mapping.setEbs(ebs);
+            }
+            result.add(mapping);
+        }
+        return result;
+    }
+
     private record LaunchSource(
             String launchConfigurationName,
             String imageId,
@@ -739,7 +766,8 @@ public class AutoScalingReconciler {
             String launchTemplateId,
             String launchTemplateName,
             String launchTemplateVersion,
-            Boolean associatePublicIpAddress) {}
+            Boolean associatePublicIpAddress,
+            List<LaunchTemplateData.BlockDeviceMapping> blockDevices) {}
 
     // Override for describeAutoScalingGroups with null region (all regions)
     // The service only filters by region when non-null; null means all.
