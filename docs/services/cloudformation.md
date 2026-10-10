@@ -49,6 +49,15 @@ The initial wait does not cancel or resubmit an accepted operation. Existing syn
 | `ListStackSetAutoDeploymentTargets` | - |
 <!-- floci:actions:end -->
 
+## SSM parameter updates
+
+`AWS::SSM::Parameter` updates restore the prior value and the affected template tags when a later
+resource fails. Rollback writes a new SSM version with the prior value; it does not rewind version
+history. Tags unrelated to the template are preserved. Changing `Name` creates a replacement and
+keeps the prior parameter until the update commits. `UpdateReplacePolicy: Retain` preserves that
+prior parameter. A name already occupied by an unmanaged parameter is rejected without overwriting
+or adopting it. Failed replacement cleanup remains visible and retryable through stack deletion.
+
 ## StackSets compatibility
 
 StackSets support both `SELF_MANAGED` and the Cloud Launchpad `SERVICE_MANAGED` workflow. `ActivateOrganizationsAccess` requires an Organizations management account with all features enabled and enables trusted access for `stacksets.cloudformation.amazonaws.com`. Service-managed organizational-unit deployment targets are resolved from the caller's actual Organizations state rather than converted into synthetic account IDs. Targeting an OU includes eligible accounts directly in that OU and in all descendant OUs, while excluding the organization management account, matching AWS StackSets targeting semantics.
