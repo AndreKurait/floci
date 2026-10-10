@@ -184,6 +184,9 @@ notes:
 # Trailing prose appended to a row after its type list, for behaviour that belongs to the service
 # rather than to one type.
 row_notes:
+  AWS::CloudWatch: >-
+    Composite alarms have backing definitions with name Ref and Arn GetAtt, rollback, and
+    replacement cleanup. Composite actions are stored only; suppression properties are rejected.
   AWS::AppConfig: >-
     Creates backing resources with ID Ref/GetAtt values and removes them on stack deletion.
     Property-changing updates and unsupported properties are rejected; environment monitors

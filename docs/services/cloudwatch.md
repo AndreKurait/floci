@@ -330,7 +330,7 @@ aws logs put-retention-policy \
 
 ## CloudWatch Metrics {#metrics}
 
-**Protocol:** Query (XML) and JSON 1.1 (both supported)
+**Protocol:** Query (XML) and JSON 1.0 (both supported)
 **Endpoint:** `POST http://localhost:4566/`
 
 ### Supported Actions
@@ -342,6 +342,7 @@ aws logs put-retention-policy \
 | `GetMetricStatistics` | Get metric statistics (Average, Sum, etc.) |
 | `GetMetricData` | Query metrics with math expressions |
 | `PutMetricAlarm` | Create a metric alarm |
+| `PutCompositeAlarm` | Create or update a boolean rule over metric and composite alarm states |
 | `DescribeAlarms` | List alarms |
 | `DeleteAlarms` | Delete alarms |
 | `SetAlarmState` | Manually set alarm state |
@@ -373,6 +374,30 @@ metric does not retain the previous definition.
 
 This is management-plane support: the alarm evaluator currently evaluates only single-metric
 alarms, not metric-math expressions. `SetAlarmState` remains available for manual transitions.
+
+### Composite alarms
+
+`PutCompositeAlarm` supports alarm names and ARNs, `ALARM`, `OK`, `INSUFFICIENT_DATA`,
+`AND`, `OR`, `NOT`, parentheses, `TRUE` and `FALSE`. Rules are validated before writes,
+including the 100-child, 150-parent and 500-element limits. A new alarm evaluates its rule;
+child state changes propagate through dependent composites. An update preserves the current
+state until another evaluation. Cyclic dependencies stop evaluation and must be broken before
+deletion. `DeleteAlarms` accepts at most one composite per call.
+
+`DescribeAlarms` defaults to metric alarms. Include `AlarmTypes=["CompositeAlarm"]` to read
+composites, or both types to read both. Definitions and tags survive storage reloads, including
+older files that contain only metric alarms. As with metric alarms, a Put update does not
+replace tags; use the tag APIs.
+
+CloudFormation `AWS::CloudWatch::CompositeAlarm` creates a backing alarm: `Ref` returns its
+name and `Fn::GetAtt Arn` returns its ARN. Updates preserve externally added tags, failed
+updates restore prior definitions and template-owned tags, and name replacements honor
+`UpdateReplacePolicy`.
+
+Composite alarm actions are retained as metadata; SNS/Lambda delivery and action suppression
+are not implemented. Suppressor properties are rejected rather than silently enabled. Rule
+evaluation is driven by alarm creation and state changes, not a separate composite scheduler.
+This does not qualify notification delivery or CloudWatch evaluation timing.
 
 ### Examples
 

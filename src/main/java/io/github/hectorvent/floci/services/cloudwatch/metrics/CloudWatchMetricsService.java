@@ -1,11 +1,14 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Alarm;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.CompositeAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
@@ -14,11 +17,16 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -28,7 +36,7 @@ public class CloudWatchMetricsService {
     private static final Logger LOG = Logger.getLogger(CloudWatchMetricsService.class);
 
     private final StorageBackend<String, MetricDatum> metricStore;
-    private final StorageBackend<String, MetricAlarm> alarmStore;
+    private final StorageBackend<String, Alarm> alarmStore;
     private final RegionResolver regionResolver;
 
     @Inject
@@ -36,12 +44,12 @@ public class CloudWatchMetricsService {
         this.metricStore = storageFactory.create("cloudwatchmetrics", "cwmetrics.json",
                 new TypeReference<Map<String, MetricDatum>>() {});
         this.alarmStore = storageFactory.create("cloudwatchmetrics", "cwalarms.json",
-                new TypeReference<Map<String, MetricAlarm>>() {});
+                new TypeReference<Map<String, Alarm>>() {});
         this.regionResolver = regionResolver;
     }
 
     CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
-                             StorageBackend<String, MetricAlarm> alarmStore,
+                             StorageBackend<String, Alarm> alarmStore,
                              RegionResolver regionResolver) {
         this.metricStore = metricStore;
         this.alarmStore = alarmStore;
@@ -282,45 +290,196 @@ public class CloudWatchMetricsService {
         };
     }
 
-    public void putMetricAlarm(MetricAlarm alarm, String region) {
+    public synchronized void putMetricAlarm(MetricAlarm alarm, String region) {
+        putAlarm(alarm, region);
+        evaluateComposites(region, null);
+    }
+
+    public void putCompositeAlarm(CompositeAlarm alarm, String region) {
+        putCompositeAlarm(alarm, region, true);
+    }
+
+    public synchronized void putCompositeAlarm(CompositeAlarm alarm, String region, boolean replaceExisting) {
+        if (!replaceExisting && alarmStore.get(region + "::" + alarm.getAlarmName()).isPresent()) {
+            throw new AwsException("AlreadyExists", "Alarm already exists: " + alarm.getAlarmName(), 400);
+        }
+        Set<String> references = alarmReferences(alarm, region);
+        if (references.size() > 100) {
+            throw new AwsException("LimitExceeded", "AlarmRule references more than 100 child alarms", 400);
+        }
+        List<CompositeAlarm> existing = describeCompositeAlarms(null, null, region);
+        for (String reference : references) {
+            long parents = existing.stream().filter(parent -> !parent.getAlarmName().equals(alarm.getAlarmName()))
+                    .filter(parent -> alarmReferences(parent, region).contains(reference))
+                    .count();
+            if (parents >= 150) {
+                throw new AwsException("LimitExceeded", "An alarm can be referenced by at most 150 composite alarms", 400);
+            }
+        }
+        boolean created = alarmStore.get(region + "::" + alarm.getAlarmName()).isEmpty();
+        putAlarm(alarm, region);
+        if (created) {
+            evaluateComposites(region, null);
+        }
+    }
+
+    private Set<String> alarmReferences(CompositeAlarm alarm, String region) {
+        return CompositeAlarmRule.parse(alarm.getAlarmRule()).references().stream()
+                .map(reference -> AwsArnUtils.isArn(reference) ? reference
+                        : regionResolver.buildArn("cloudwatch", region, "alarm:" + reference))
+                .collect(Collectors.toSet());
+    }
+
+    private void putAlarm(Alarm alarm, String region) {
+        String name = alarm.getAlarmName();
+        if (name == null || name.isBlank() || name.length() > 255) {
+            throw new AwsException("ValidationError", "AlarmName must contain between 1 and 255 characters", 400);
+        }
+        Alarm previous = alarmStore.get(region + "::" + name).orElse(null);
+        if (previous != null) {
+            if (!previous.getClass().equals(alarm.getClass())) {
+                throw new AwsException("ValidationError", "An alarm of another type already has this name", 400);
+            }
+            alarm.setStateValue(previous.getStateValue());
+            alarm.setStateReason(previous.getStateReason());
+            alarm.setStateReasonData(previous.getStateReasonData());
+            alarm.setStateUpdatedTimestamp(previous.getStateUpdatedTimestamp());
+            alarm.setTags(new HashMap<>(previous.getTags()));
+        }
         if (alarm.getAlarmArn() == null) {
-            alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + alarm.getAlarmName()));
+            alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + name));
         }
         alarm.setRegion(region);
         alarm.setAlarmConfigurationUpdatedTimestamp(Instant.now().getEpochSecond());
-        alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
-        LOG.infov("PutMetricAlarm: {0} in {1}", alarm.getAlarmName(), region);
+        alarmStore.put(region + "::" + name, alarm);
+        LOG.infov("Put {0}: {1} in {2}", alarm.getClass().getSimpleName(), name, region);
     }
 
-    /** Every stored alarm, across all regions. Used by the background {@link AlarmEvaluator}
-     * tick, which has no per-request region to scope a lookup to. */
+    /** Metric alarms evaluated by the existing metric evaluator. */
     public List<MetricAlarm> allAlarms() {
-        return alarmStore.scan(k -> true);
+        return alarmStore.scan(k -> true).stream().filter(MetricAlarm.class::isInstance)
+                .map(MetricAlarm.class::cast).toList();
     }
 
-    public List<MetricAlarm> describeAlarms(List<String> alarmNames, String alarmNamePrefix, String region) {
-        String prefix = region + "::";
-        List<MetricAlarm> all = alarmStore.scan(k -> k.startsWith(prefix));
-
-        if (alarmNames != null && !alarmNames.isEmpty()) {
-            return all.stream().filter(a -> alarmNames.contains(a.getAlarmName())).toList();
-        }
-        if (alarmNamePrefix != null && !alarmNamePrefix.isBlank()) {
-            return all.stream().filter(a -> a.getAlarmName().startsWith(alarmNamePrefix)).toList();
-        }
-        return all;
+    public List<MetricAlarm> describeAlarms(List<String> names, String prefix, String region) {
+        return matchingAlarms(names, prefix, region).stream().filter(MetricAlarm.class::isInstance)
+                .map(MetricAlarm.class::cast).toList();
     }
 
-    public void deleteAlarms(List<String> alarmNames, String region) {
+    public void validateAlarmTypes(List<String> types) {
+        if (!Set.of("MetricAlarm", "CompositeAlarm").containsAll(types)) {
+            throw new AwsException("ValidationError", "Unknown alarm type", 400);
+        }
+    }
+
+    public List<CompositeAlarm> describeCompositeAlarms(List<String> names, String prefix, String region) {
+        return matchingAlarms(names, prefix, region).stream().filter(CompositeAlarm.class::isInstance)
+                .map(CompositeAlarm.class::cast).toList();
+    }
+
+    private List<Alarm> matchingAlarms(List<String> names, String prefix, String region) {
+        return alarmStore.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(a -> names == null || names.isEmpty() || names.contains(a.getAlarmName()))
+                .filter(a -> prefix == null || a.getAlarmName().startsWith(prefix)).toList();
+    }
+
+    private Map<String, Alarm> alarmIndex(String region) {
+        Map<String, Alarm> alarms = new HashMap<>();
+        for (Alarm alarm : alarmStore.scan(k -> k.startsWith(region + "::"))) {
+            alarms.put(alarm.getAlarmName(), alarm);
+            alarms.put(alarm.getAlarmArn(), alarm);
+        }
+        return alarms;
+    }
+
+    private void evaluateComposites(String region, String manualAlarm) {
+        Map<String, Alarm> alarms = alarmIndex(region);
+        Map<String, CompositeAlarmRule.Rule> pending = new HashMap<>();
+        for (Alarm alarm : new HashSet<>(alarms.values())) {
+            if (alarm instanceof CompositeAlarm composite && !alarm.getAlarmName().equals(manualAlarm)) {
+                pending.put(alarm.getAlarmName(), CompositeAlarmRule.parse(composite.getAlarmRule()));
+            }
+        }
+        Set<String> cycles = pending.keySet().stream()
+                .filter(name -> isCyclic(name, alarms)).collect(Collectors.toSet());
+        boolean progress;
+        do {
+            progress = false;
+            Iterator<Map.Entry<String, CompositeAlarmRule.Rule>> iterator = pending.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<String, CompositeAlarmRule.Rule> next = iterator.next();
+                boolean blocked = next.getValue().references().stream().map(alarms::get)
+                        .anyMatch(child -> child != null && pending.containsKey(child.getAlarmName()));
+                if (blocked || cycles.contains(next.getKey())) {
+                    continue;
+                }
+                Alarm alarm = alarms.get(next.getKey());
+                boolean triggered = next.getValue().evaluate(reference -> {
+                    Alarm child = alarms.get(reference);
+                    return child == null ? null : child.getStateValue();
+                });
+                String state = triggered ? "ALARM" : "OK";
+                if (!state.equals(alarm.getStateValue())) {
+                    alarm.setStateValue(state);
+                    alarm.setStateReason("AlarmRule evaluated to " + state);
+                    alarm.setStateReasonData(null);
+                    alarm.setStateUpdatedTimestamp(Instant.now().getEpochSecond());
+                    alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
+                }
+                iterator.remove();
+                progress = true;
+            }
+        } while (progress && !pending.isEmpty());
+        if (!pending.isEmpty()) {
+            LOG.debugv("Composite alarm evaluation stopped at cyclic dependencies: {0}", pending.keySet());
+        }
+    }
+
+    public synchronized void deleteAlarms(List<String> alarmNames, String region) {
+        Map<String, Alarm> alarms = alarmIndex(region);
+        long composites = alarmNames.stream().map(alarms::get).filter(CompositeAlarm.class::isInstance).count();
+        if (composites > 1) {
+            throw new AwsException("ValidationError", "DeleteAlarms accepts at most one composite alarm", 400);
+        }
+        for (String name : alarmNames) {
+            if (isCyclic(name, alarms)) {
+                throw new AwsException("ValidationError", "Break the composite alarm cycle before deleting " + name, 400);
+            }
+        }
         for (String name : alarmNames) {
             alarmStore.delete(region + "::" + name);
         }
+        evaluateComposites(region, null);
         LOG.infov("Deleted alarms: {0} in {1}", alarmNames, region);
     }
 
-    public void setAlarmState(String alarmName, String stateValue, String stateReason, String stateReasonData, String region) {
+    private boolean isCyclic(String name, Map<String, Alarm> alarms) {
+        Set<String> visited = new HashSet<>();
+        ArrayDeque<String> pending = new ArrayDeque<>();
+        pending.add(name);
+        while (!pending.isEmpty()) {
+            Alarm next = alarms.get(pending.remove());
+            if (next instanceof CompositeAlarm composite && visited.add(next.getAlarmName())) {
+                for (String reference : CompositeAlarmRule.parse(composite.getAlarmRule()).references()) {
+                    Alarm child = alarms.get(reference);
+                    if (child != null && child.getAlarmName().equals(name)) {
+                        return true;
+                    }
+                    if (child != null) {
+                        pending.add(child.getAlarmName());
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    public synchronized void setAlarmState(String alarmName, String stateValue, String stateReason, String stateReasonData, String region) {
+        if (stateValue == null || !Set.of("OK", "ALARM", "INSUFFICIENT_DATA").contains(stateValue)) {
+            throw new AwsException("ValidationError", "Invalid alarm state", 400);
+        }
         String key = region + "::" + alarmName;
-        MetricAlarm alarm = alarmStore.get(key)
+        Alarm alarm = alarmStore.get(key)
                 .orElseThrow(() -> new AwsException("ResourceNotFound", "Alarm not found: " + alarmName, 404));
 
         alarm.setStateValue(stateValue);
@@ -329,6 +488,7 @@ public class CloudWatchMetricsService {
         alarm.setStateUpdatedTimestamp(Instant.now().getEpochSecond());
 
         alarmStore.put(key, alarm);
+        evaluateComposites(region, alarmName);
         LOG.infov("SetAlarmState: {0} -> {1}", alarmName, stateValue);
     }
 
@@ -346,7 +506,7 @@ public class CloudWatchMetricsService {
      * {@code insight-rule/} ARN being the one AWS documents; reporting that no resource
      * matches the ARN is true of those, where "alarm not found" would not be.
      */
-    private MetricAlarm requireAlarm(String resourceArn, String region) {
+    private Alarm requireAlarm(String resourceArn, String region) {
         return alarmStore.scan(k -> k.startsWith(region + "::"))
                 .stream()
                 .filter(a -> a.getAlarmArn() != null && a.getAlarmArn().equals(resourceArn))
@@ -360,13 +520,13 @@ public class CloudWatchMetricsService {
     }
 
     public void tagResource(String resourceArn, Map<String, String> tags, String region) {
-        MetricAlarm alarm = requireAlarm(resourceArn, region);
+        Alarm alarm = requireAlarm(resourceArn, region);
         alarm.getTags().putAll(tags);
         alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
     }
 
     public void untagResource(String resourceArn, List<String> tagKeys, String region) {
-        MetricAlarm alarm = requireAlarm(resourceArn, region);
+        Alarm alarm = requireAlarm(resourceArn, region);
         tagKeys.forEach(alarm.getTags()::remove);
         alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
     }

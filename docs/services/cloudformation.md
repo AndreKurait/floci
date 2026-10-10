@@ -177,7 +177,7 @@ cross-resource references.
 | Kinesis Data Firehose | `DeliveryStream` |
 | IoT Core | `Authorizer`, `DomainConfiguration` (`ServerCertificates` resolves to a JSON string), `Policy` (deleted after detaching it from its principals; on AWS the delete fails with `DeleteConflictException` while the policy is attached), `Thing`, `TopicRule` |
 | CloudFront | `CachePolicy`, `Distribution`, `OriginAccessControl`, `OriginRequestPolicy`, `ResponseHeadersPolicy` |
-| CloudWatch | `Alarm`, `Dashboard` |
+| CloudWatch | `Alarm`, `CompositeAlarm`, `Dashboard`. Composite alarms have backing definitions with name Ref and Arn GetAtt, rollback, and replacement cleanup. Composite actions are stored only; suppression properties are rejected. |
 | CloudWatch Logs | `LogGroup`, `LogStream`, `MetricFilter` |
 | WAFv2 | `WebACL`, `WebACLAssociation` |
 | Config | `ConfigRule` |
