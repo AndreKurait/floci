@@ -4,6 +4,8 @@ import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 
@@ -35,6 +37,235 @@ class CloudFormationRoute53RecordSetIntegrationTest {
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    @Test
+    void recordGroupCreatesUpdatesAndDeletesItsBackingRecordsWithStableRef() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stack = "record-group-" + suffix;
+        String zoneName = suffix + ".group.example.com";
+        String zone = createHostedZone(zoneName, stack);
+        String unmanaged = "unmanaged." + zoneName;
+        changeRecordSet(zone, "CREATE", unmanaged, "192.0.2.9");
+        createStack(stack, groupTemplate(zone,
+                record("first." + zoneName, "192.0.2.1") + "," + record("second." + zoneName, "192.0.2.2")));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        String reference = stackOutput(stack, "GroupRef");
+        assertEquals("Group", reference);
+        assertChangeExists(stackOutput(stack, "GroupChange"));
+        String created = listResourceRecordSets(zone);
+        assertTrue(created.contains("first." + zoneName));
+        assertTrue(created.contains("second." + zoneName));
+        createOrUpdateGroup("UpdateStack", stack, groupTemplate(zone,
+                record("first." + zoneName, "192.0.2.3") + "," + record("third." + zoneName, "192.0.2.4")));
+        assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        assertEquals(reference, stackOutput(stack, "GroupRef"));
+        assertChangeExists(stackOutput(stack, "GroupChange"));
+        String updated = listResourceRecordSets(zone);
+        assertTrue(updated.contains("192.0.2.3"), updated);
+        assertTrue(updated.contains("third." + zoneName), updated);
+        assertFalse(updated.contains("second." + zoneName), updated);
+        deleteStack(stack);
+        CfnStackWaits.awaitStackDeleted(stack);
+        String deleted = listResourceRecordSets(zone);
+        assertFalse(deleted.contains("first." + zoneName), deleted);
+        assertFalse(deleted.contains("third." + zoneName), deleted);
+        assertTrue(deleted.contains(unmanaged), deleted);
+        changeRecordSet(zone, "DELETE", unmanaged, "192.0.2.9");
+        deleteHostedZone(zone);
+    }
+
+    @Test
+    void recordGroupZoneReplacementMovesRecordsAndDeletesOnlyTheOldGroup() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stack = "record-group-move-" + suffix;
+        String zoneName = suffix + ".group.example.com";
+        String oldZone = createHostedZone(zoneName, stack + "-old");
+        String newZone = createHostedZone(zoneName, stack + "-new");
+        String name = "test." + zoneName;
+        createStack(stack, groupTemplate(oldZone, record(name, "192.0.2.1")));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        createOrUpdateGroup("UpdateStack", stack, groupTemplate(newZone, record(name, "192.0.2.2")));
+        assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        assertFalse(listResourceRecordSets(oldZone).contains(name));
+        assertTrue(listResourceRecordSets(newZone).contains("192.0.2.2"));
+        deleteStack(stack);
+        CfnStackWaits.awaitStackDeleted(stack);
+        assertFalse(listResourceRecordSets(newZone).contains(name));
+        deleteHostedZone(oldZone);
+        deleteHostedZone(newZone);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void recordGroupRestoresPriorRecordsWhenALaterResourceFails(boolean replaceZone) {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stack = "record-group-rollback-" + suffix;
+        String zoneName = suffix + ".group.example.com";
+        String oldZone = createHostedZone(zoneName, stack + "-old");
+        String targetZone = replaceZone ? createHostedZone(zoneName, stack + "-new") : oldZone;
+        String name = "test." + zoneName;
+        createStack(stack, groupTemplate(oldZone, record(name, "192.0.2.1")));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        String template = groupTemplate(targetZone, record(name, "192.0.2.2"))
+                .replace("\"Group\":", """
+                        "Fail":{"Type":"AWS::Route53::RecordSet","DependsOn":"Group",
+                          "Properties":{"HostedZoneId":"%s","Name":"invalid.%s"}},
+                        "Group":
+                        """.formatted(targetZone, zoneName));
+        createOrUpdateGroup("UpdateStack", stack, template);
+        assertEquals("UPDATE_ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        String restored = listResourceRecordSets(oldZone);
+        assertTrue(restored.contains("192.0.2.1"), restored);
+        assertFalse(restored.contains("192.0.2.2"), restored);
+        if (replaceZone) {
+            assertFalse(listResourceRecordSets(targetZone).contains(name));
+        }
+        deleteStack(stack);
+        CfnStackWaits.awaitStackDeleted(stack);
+        deleteHostedZone(oldZone);
+        if (replaceZone) {
+            deleteHostedZone(targetZone);
+        }
+    }
+
+    @Test
+    void recordGroupZoneReplacementHonorsRetainForTheOldGroup() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stack = "record-group-retain-" + suffix;
+        String zoneName = suffix + ".group.example.com";
+        String oldZone = createHostedZone(zoneName, stack + "-old");
+        String newZone = createHostedZone(zoneName, stack + "-new");
+        String name = "test." + zoneName;
+        createStack(stack, groupTemplate(oldZone, record(name, "192.0.2.1")));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        String template = groupTemplate(newZone, record(name, "192.0.2.2"))
+                .replace("\"Group\":{\"Type\":", "\"Group\":{\"UpdateReplacePolicy\":\"Retain\",\"Type\":");
+        createOrUpdateGroup("UpdateStack", stack, template);
+        assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        assertTrue(listResourceRecordSets(oldZone).contains("192.0.2.1"));
+        deleteStack(stack);
+        CfnStackWaits.awaitStackDeleted(stack);
+        assertFalse(listResourceRecordSets(newZone).contains(name));
+        assertTrue(listResourceRecordSets(oldZone).contains("192.0.2.1"));
+        changeRecordSet(oldZone, "DELETE", name, "192.0.2.1");
+        deleteHostedZone(oldZone);
+        deleteHostedZone(newZone);
+    }
+
+    @Test
+    void failedReplacementCleanupStaysTrackedForStackDeletion() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stack = "record-group-cleanup-" + suffix;
+        String zoneName = suffix + ".group.example.com";
+        String oldZone = createHostedZone(zoneName, stack + "-old");
+        String newZone = createHostedZone(zoneName, stack + "-new");
+        String name = "test." + zoneName;
+        createStack(stack, groupTemplate(oldZone, record(name, "192.0.2.1")));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        changeRecordSet(oldZone, "UPSERT", name, "192.0.2.9");
+        createOrUpdateGroup("UpdateStack", stack, groupTemplate(newZone, record(name, "192.0.2.2")));
+        CfnStackWaits.StackState state = CfnStackWaits.awaitTerminal(stack);
+        assertEquals("UPDATE_COMPLETE", state.status(), state.reason());
+        assertTrue(listResourceRecordSets(oldZone).contains("192.0.2.9"));
+        assertTrue(listResourceRecordSets(newZone).contains("192.0.2.2"));
+        changeRecordSet(oldZone, "UPSERT", name, "192.0.2.1");
+        deleteStack(stack);
+        CfnStackWaits.awaitStackDeleted(stack);
+        assertFalse(listResourceRecordSets(oldZone).contains(name));
+        assertFalse(listResourceRecordSets(newZone).contains(name));
+        deleteHostedZone(oldZone);
+        deleteHostedZone(newZone);
+    }
+
+    @Test
+    void recordGroupCollisionCommitsNoPartialRecordsAndPreservesTheOtherOwner() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stack = "record-group-conflict-" + suffix;
+        String zoneName = suffix + ".group.example.com";
+        String zone = createHostedZone(zoneName, stack);
+        String existing = "taken." + zoneName;
+        changeRecordSet(zone, "CREATE", existing, "192.0.2.9");
+        createStack(stack, groupTemplate(zone,
+                record("new." + zoneName, "192.0.2.1") + "," + record(existing, "192.0.2.2")));
+        assertEquals("ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        String current = listResourceRecordSets(zone);
+        assertFalse(current.contains("new." + zoneName), current);
+        assertTrue(current.contains("192.0.2.9"), current);
+        assertFalse(current.contains("192.0.2.2"), current);
+        deleteStack(stack);
+        CfnStackWaits.awaitStackDeleted(stack);
+        changeRecordSet(zone, "DELETE", existing, "192.0.2.9");
+        deleteHostedZone(zone);
+    }
+
+    @Test
+    void recordGroupDeleteRefusesChangedValuesAndCanRetryAfterDriftIsRepaired() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stack = "record-group-drift-" + suffix;
+        String zoneName = suffix + ".group.example.com";
+        String zone = createHostedZone(zoneName, stack);
+        String name = "test." + zoneName;
+        createStack(stack, groupTemplate(zone, record(name, "192.0.2.1")));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        changeRecordSet(zone, "UPSERT", name, "192.0.2.2");
+        deleteStack(stack);
+        assertEquals("DELETE_FAILED", CfnStackWaits.awaitTerminal(stack).status());
+        assertTrue(listResourceRecordSets(zone).contains("192.0.2.2"));
+        changeRecordSet(zone, "UPSERT", name, "192.0.2.1");
+        deleteStack(stack);
+        CfnStackWaits.awaitStackDeleted(stack);
+        assertFalse(listResourceRecordSets(zone).contains(name));
+        deleteHostedZone(zone);
+    }
+
+    private String record(String name, String value) {
+        return """
+                {"Name":"%s","Type":"A","TTL":"300","ResourceRecords":["%s"]}
+                """.formatted(name, value);
+    }
+
+    private String groupTemplate(String zone, String records) {
+        return """
+                {"Resources":{
+                  "Group":{"Type":"AWS::Route53::RecordSetGroup",
+                    "Properties":{"HostedZoneId":"%s","RecordSets":[%s]}}
+                },"Outputs":{
+                  "GroupRef":{"Value":{"Ref":"Group"}},
+                  "GroupChange":{"Value":{"Fn::GetAtt":["Group","Id"]}}
+                }}
+                """.formatted(zone, records);
+    }
+
+    private String stackOutput(String stack, String key) {
+        return given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
+                .formParam("Action", "DescribeStacks").formParam("StackName", stack)
+                .when().post("/").then().statusCode(200).extract().xmlPath()
+                .getString("DescribeStacksResponse.DescribeStacksResult.Stacks.member.Outputs.member"
+                        + ".find { it.OutputKey == '" + key + "' }.OutputValue");
+    }
+
+    private void assertChangeExists(String change) {
+        String id = change.substring(change.lastIndexOf('/') + 1);
+        given().header("Authorization", ROUTE53_AUTH)
+        .when().get("/2013-04-01/change/" + id)
+        .then().statusCode(200).body(containsString("<Status>INSYNC</Status>"));
+    }
+
+    private void createOrUpdateGroup(String action, String stack, String template) {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", action)
+            .formParam("StackName", stack)
+            .formParam("TemplateBody", template)
+        .when().post("/").then().statusCode(200);
+    }
+
+    private void deleteHostedZone(String zone) {
+        given().header("Authorization", ROUTE53_AUTH)
+        .when().delete("/2013-04-01/hostedzone/" + zone)
+        .then().statusCode(200);
     }
 
     @Test
