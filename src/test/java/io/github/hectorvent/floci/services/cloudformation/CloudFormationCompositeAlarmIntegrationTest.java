@@ -83,6 +83,26 @@ class CloudFormationCompositeAlarmIntegrationTest {
     }
 
     @Test
+    void committedInPlaceUpdatesAllowAnotherUpdateAndReplacement() throws Exception {
+        String stack = unique("composite-sequence");
+        String name = stack + "-alarm";
+        String replacement = name + "-new";
+        deploy("CreateStack", stack, template(name, "TRUE", Map.of("team", "initial"), false, false));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        for (String rule : List.of("FALSE", "TRUE")) {
+            deploy("UpdateStack", stack, template(name, rule, Map.of("team", rule), false, false));
+            assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+            assertEquals(rule, alarm(name).get("AlarmRule"));
+        }
+        deploy("UpdateStack", stack, template(replacement, "FALSE", Map.of(), false, false));
+        assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+        assertMissing(name);
+        assertEquals("FALSE", alarm(replacement).get("AlarmRule"));
+        deleteStack(stack);
+        assertMissing(replacement);
+    }
+
+    @Test
     void createCollisionCannotOverwriteOrDeleteAnUnmanagedAlarm() throws Exception {
         String stack = unique("composite-foreign");
         String name = stack + "-alarm";
