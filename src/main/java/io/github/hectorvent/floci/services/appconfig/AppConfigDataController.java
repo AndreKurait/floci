@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.appconfig;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataService.ConfigurationData;
+import io.github.hectorvent.floci.services.appconfig.AppConfigDataService.LegacyConfiguration;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.MediaType;
@@ -33,6 +34,21 @@ public class AppConfigDataController {
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
         String token = service.startConfigurationSession(request);
         return Response.status(201).entity(Map.of("InitialConfigurationToken", token)).build();
+    }
+
+    @GET
+    @Path("/applications/{application}/environments/{environment}/configurations/{configuration}")
+    public Response getConfiguration(@PathParam("application") String application,
+                                     @PathParam("environment") String environment,
+                                     @PathParam("configuration") String configuration,
+                                     @QueryParam("client_id") String clientId,
+                                     @QueryParam("client_configuration_version") String clientVersion,
+                                     @HeaderParam("Accept") String accept) {
+        LegacyConfiguration data = service.getConfiguration(
+                application, environment, configuration, clientId, clientVersion, accept);
+        return Response.status(data.configurationVersion().equals(clientVersion) ? 204 : 200)
+                .entity(data.content()).type(data.contentType())
+                .header("Configuration-Version", data.configurationVersion()).build();
     }
 
     // Bound to an internal path rather than the public "/configuration" so that

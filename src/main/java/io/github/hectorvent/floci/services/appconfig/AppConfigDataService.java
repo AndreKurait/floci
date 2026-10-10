@@ -129,7 +129,8 @@ public class AppConfigDataService {
         byte[] content = new byte[0];
         String contentType = "application/octet-stream";
         if (version != null) {
-            ResolvedContent resolved = resolveContent(session, version, accept);
+            ResolvedContent resolved = resolveContent(session.getApplicationId(),
+                    session.getConfigurationProfileId(), version, accept);
             content = resolved.bytes();
             contentType = resolved.contentType();
         }
@@ -139,10 +140,37 @@ public class AppConfigDataService {
                 pollInterval);
     }
 
-    private ResolvedContent resolveContent(ConfigurationSession session, HostedConfigurationVersion version,
+    public LegacyConfiguration getConfiguration(String application, String environment, String configuration,
+                                                 String clientId, String clientVersion, String accept) {
+        for (String identifier : new String[]{application, environment, configuration, clientId}) {
+            requireIdentifier(identifier, "Configuration identifier or client_id");
+            if (identifier.length() > 64) {
+                throw new AwsException("BadRequestException", "Identifiers must not exceed 64 characters", 400);
+            }
+        }
+        if (clientVersion != null && (clientVersion.isEmpty() || clientVersion.length() > 1024)) {
+            throw new AwsException("BadRequestException", "Invalid client_configuration_version", 400);
+        }
+        Application app = appConfigService.resolveApplication(application);
+        Environment env = appConfigService.resolveEnvironment(app.getId(), environment);
+        ConfigurationProfile profile = appConfigService.resolveConfigurationProfile(app.getId(), configuration);
+        String active = appConfigService.getActiveVersion(env.getId(), profile.getId());
+        if (active == null) {
+            throw new AwsException("ResourceNotFoundException", "No configuration is deployed", 404);
+        }
+        HostedConfigurationVersion version = appConfigService.getHostedConfigurationVersion(
+                app.getId(), profile.getId(), Integer.parseInt(active));
+        if (active.equals(clientVersion)) {
+            return new LegacyConfiguration(new byte[0], version.getContentType(), active);
+        }
+        ResolvedContent content = resolveContent(app.getId(), profile.getId(), version, accept);
+        return new LegacyConfiguration(content.bytes(), content.contentType(), active);
+    }
+
+    private ResolvedContent resolveContent(String appId, String profileId, HostedConfigurationVersion version,
                                            String accept) {
         ConfigurationProfile profile = appConfigService.getConfigurationProfile(
-                session.getApplicationId(), session.getConfigurationProfileId());
+                appId, profileId);
         if (!"AWS.AppConfig.FeatureFlags".equals(profile.getType())) {
             return new ResolvedContent(version.getContent(), version.getContentType());
         }
@@ -249,6 +277,8 @@ public class AppConfigDataService {
     }
 
     private record ResolvedContent(byte[] bytes, String contentType) {}
+
+    public record LegacyConfiguration(byte[] content, String contentType, String configurationVersion) {}
 
     public record ConfigurationData(byte[] content, String contentType, String configurationVersion,
                                     String nextPollConfigurationToken, int nextPollIntervalInSeconds) {}
