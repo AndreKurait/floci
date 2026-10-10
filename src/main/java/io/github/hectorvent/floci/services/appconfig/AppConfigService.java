@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.core.storage.StorageOperations;
 import io.github.hectorvent.floci.services.appconfig.model.Application;
 import io.github.hectorvent.floci.services.appconfig.model.ConfigurationProfile;
 import io.github.hectorvent.floci.services.appconfig.model.Deployment;
@@ -99,6 +100,20 @@ public class AppConfigService {
         return env;
     }
 
+    public synchronized void deleteEnvironment(String applicationIdentifier, String environmentIdentifier) {
+        Application application = resolveApplication(applicationIdentifier);
+        Environment environment = resolveEnvironment(application.getId(), environmentIdentifier);
+        String appId = application.getId();
+        String envId = environment.getId();
+
+        StorageOperations.deleteByPrefix(deploymentStore, appId + "::" + envId + "::");
+        StorageOperations.deleteByPrefix(activeConfigStore, envId + "::");
+
+        String deploymentScope = appId + "::" + envId;
+        deploymentPageTokens.entrySet().removeIf(entry -> entry.getValue().scope().equals(deploymentScope));
+        environmentStore.delete(envId);
+    }
+
     /** The environment of {@code appId} whose ID or name is {@code idOrName}. */
     public Environment resolveEnvironment(String appId, String idOrName) {
         // An exact ID always wins over another environment's name, and a direct lookup skips the scan.
@@ -163,11 +178,7 @@ public class AppConfigService {
         // A hosted configuration version isn't independently addressable outside its profile's
         // lifecycle - cascade the delete so a caller can't still fetch versions for a profile
         // that's supposedly gone.
-        String versionPrefix = appId + "::" + profileId + "::";
-        versionStore.keys().stream()
-                .filter(k -> k.startsWith(versionPrefix))
-                .toList()
-                .forEach(versionStore::delete);
+        StorageOperations.deleteByPrefix(versionStore, appId + "::" + profileId + "::");
         profileStore.delete(profileId);
     }
 
@@ -299,7 +310,7 @@ public class AppConfigService {
 
     // ──────────────────────────── Deployment ────────────────────────────
 
-    public Deployment startDeployment(String appId, String envId, Map<String, Object> request) {
+    public synchronized Deployment startDeployment(String appId, String envId, Map<String, Object> request) {
         getEnvironment(appId, envId);
         String profileId = (String) request.get("ConfigurationProfileId");
         String version = (String) request.get("ConfigurationVersion");
@@ -314,7 +325,11 @@ public class AppConfigService {
         deployment.setConfigurationProfileId(profileId);
         deployment.setConfigurationVersion(version);
         deployment.setDeploymentStrategyId(strategyId);
-        deployment.setDeploymentNumber(deploymentStore.keys().size() + 1);
+        int nextDeploymentNumber = deploymentStore.scan(key -> true).stream()
+                .mapToInt(Deployment::getDeploymentNumber)
+                .max()
+                .orElse(0) + 1;
+        deployment.setDeploymentNumber(nextDeploymentNumber);
         deployment.setState("COMPLETE"); // Synchronous immediate deployment
         deployment.setDescription((String) request.get("Description"));
 
@@ -328,6 +343,7 @@ public class AppConfigService {
     }
 
     public Deployment getDeployment(String appId, String envId, int deploymentNumber) {
+        getEnvironment(appId, envId);
         return deploymentStore.get(appId + "::" + envId + "::" + deploymentNumber)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Deployment not found", 404));
     }
