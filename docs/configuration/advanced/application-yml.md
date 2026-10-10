@@ -254,6 +254,11 @@ floci:
     cloudformation:
       enabled: true
 
+    cloudcontrol:
+      enabled: true
+      create-worker-threads: 4                # Threads that run CreateResource provisioning
+      create-queue-capacity: 64               # Creates that may wait for a thread before ThrottlingException
+
     acm:
       enabled: true
       validation-wait-seconds: 0              # Seconds before transitioning PENDING_VALIDATION → ISSUED
