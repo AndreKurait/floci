@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
+import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
@@ -28,6 +29,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -348,44 +350,50 @@ public class AutoScalingReconciler {
             return;
         }
         LOG.infov("ASG {0}: scaling out by {1}", asg.getAutoScalingGroupName(), count);
-        String az = asg.getAvailabilityZones().isEmpty()
-                ? asg.getRegion() + "a"
-                : asg.getAvailabilityZones().get(0);
-        String subnetId = asg.getSubnetIds().isEmpty() ? null : asg.getSubnetIds().get(0);
+        List<String> launchedInstanceIds = new ArrayList<>();
         try {
-            Reservation reservation = ec2Service.runInstances(
-                    asg.getRegion(),
-                    launchSource.imageId(),
-                    launchSource.instanceType(),
-                    count, count,
-                    launchSource.keyName(),
-                    launchSource.securityGroupIds(),
-                    subnetId,
-                    null,
-                    propagatedInstanceTags(asg, launchSource),
-                    launchSource.userData(),
-                    launchSource.iamInstanceProfile(),
-                    launchSource.associatePublicIpAddress(), null, 0, null, null, null, null, false,
-                    null, null, launchSource.blockDevices());
+            List<LaunchPlacement> placements = launchPlacements(asg);
+            for (int index = 0; index < count; index++) {
+                LaunchPlacement placement = leastPopulatedPlacement(asg, placements);
+                Reservation reservation = ec2Service.runInstances(
+                        asg.getRegion(),
+                        launchSource.imageId(),
+                        launchSource.instanceType(),
+                        1, 1,
+                        launchSource.keyName(),
+                        launchSource.securityGroupIds(),
+                        placement.subnetId(),
+                        null,
+                        propagatedInstanceTags(asg, launchSource),
+                        launchSource.userData(),
+                        launchSource.iamInstanceProfile(),
+                        launchSource.associatePublicIpAddress(), null, 0, placement.availabilityZone(),
+                        null, null, null, false, null, null, launchSource.blockDevices());
 
-            List<String> launchedInstanceIds = new ArrayList<>();
-            for (Instance ec2Inst : reservation.getInstances()) {
-                AsgInstance asgInst = new AsgInstance();
-                asgInst.setInstanceId(ec2Inst.getInstanceId());
-                asgInst.setAvailabilityZone(az);
-                asgInst.setLifecycleState("Pending");
-                asgInst.setHealthStatus("Healthy");
-                asgInst.setLaunchConfigurationName(launchSource.launchConfigurationName());
-                asgInst.setLaunchTemplateId(launchSource.launchTemplateId());
-                asgInst.setLaunchTemplateName(launchSource.launchTemplateName());
-                asgInst.setLaunchTemplateVersion(launchSource.launchTemplateVersion());
-                asgInst.setInstanceType(launchSource.instanceType());
-                asg.getInstances().add(asgInst);
-                launchedInstanceIds.add(ec2Inst.getInstanceId());
-                LOG.infov("ASG {0}: launched instance {1} (Pending)",
-                        asg.getAutoScalingGroupName(), ec2Inst.getInstanceId());
+                for (Instance ec2Inst : reservation.getInstances()) {
+                    AsgInstance asgInst = new AsgInstance();
+                    asgInst.setInstanceId(ec2Inst.getInstanceId());
+                    asgInst.setAvailabilityZone(ec2Inst.getPlacement() != null
+                            ? ec2Inst.getPlacement().getAvailabilityZone() : placement.availabilityZone());
+                    asgInst.setLifecycleState("Pending");
+                    asgInst.setHealthStatus("Healthy");
+                    asgInst.setLaunchConfigurationName(launchSource.launchConfigurationName());
+                    asgInst.setLaunchTemplateId(launchSource.launchTemplateId());
+                    asgInst.setLaunchTemplateName(launchSource.launchTemplateName());
+                    asgInst.setLaunchTemplateVersion(launchSource.launchTemplateVersion());
+                    asgInst.setInstanceType(launchSource.instanceType());
+                    asg.getInstances().add(asgInst);
+                    launchedInstanceIds.add(ec2Inst.getInstanceId());
+                    LOG.infov("ASG {0}: launched instance {1} (Pending)",
+                            asg.getAutoScalingGroupName(), ec2Inst.getInstanceId());
+                }
             }
-            if (!asgService.saveAutoScalingGroupIfPresent(asg) && !launchedInstanceIds.isEmpty()) {
+        } catch (Exception e) {
+            LOG.warnv("ASG {0}: failed to launch instances: {1}",
+                    asg.getAutoScalingGroupName(), e.getMessage());
+        } finally {
+            // Preserve successful allocations even if a later single-instance launch fails.
+            if (!launchedInstanceIds.isEmpty() && !asgService.saveAutoScalingGroupIfPresent(asg)) {
                 try {
                     ec2Service.terminateInstances(asg.getRegion(), launchedInstanceIds);
                 } catch (Exception e) {
@@ -393,11 +401,56 @@ public class AutoScalingReconciler {
                             asg.getAutoScalingGroupName(), launchedInstanceIds, e.getMessage());
                 }
             }
-        } catch (Exception e) {
-            LOG.warnv("ASG {0}: failed to launch instances: {1}",
-                    asg.getAutoScalingGroupName(), e.getMessage());
         }
     }
+
+    private List<LaunchPlacement> launchPlacements(AutoScalingGroup asg) {
+        if (!asg.getSubnetIds().isEmpty()) {
+            Map<String, Subnet> subnets = ec2Service.describeSubnets(asg.getRegion(), asg.getSubnetIds(), Map.of())
+                    .stream().collect(Collectors.toMap(Subnet::getSubnetId, subnet -> subnet));
+            List<LaunchPlacement> placements = new ArrayList<>();
+            for (String id : asg.getSubnetIds()) {
+                Subnet subnet = subnets.get(id);
+                if (subnet == null) {
+                    throw new AwsException("InvalidSubnetID.NotFound", "The subnet ID '" + id + "' does not exist", 400);
+                }
+                if (asg.getAvailabilityZones().isEmpty()
+                        || asg.getAvailabilityZones().contains(subnet.getAvailabilityZone())) {
+                    placements.add(new LaunchPlacement(id, subnet.getAvailabilityZone()));
+                }
+            }
+            if (placements.isEmpty()) {
+                throw new AwsException("ValidationError", "No declared subnet is in a configured availability zone", 400);
+            }
+            return placements;
+        }
+        if (!asg.getAvailabilityZones().isEmpty()) {
+            return asg.getAvailabilityZones().stream().map(zone -> new LaunchPlacement(null, zone)).toList();
+        }
+        return List.of(new LaunchPlacement(null, null));
+    }
+
+    private LaunchPlacement leastPopulatedPlacement(AutoScalingGroup asg, List<LaunchPlacement> placements) {
+        Map<String, Long> zoneCounts = new LinkedHashMap<>();
+        for (LaunchPlacement placement : placements) {
+            zoneCounts.putIfAbsent(placement.availabilityZone(), 0L);
+        }
+        for (AsgInstance instance : asg.getInstances()) {
+            if (!isActiveLifecycleState(instance.getLifecycleState())) {
+                continue;
+            }
+            Instance actual = ec2Service.getInstance(asg.getRegion(), instance.getInstanceId()).orElse(null);
+            String zone = actual != null && actual.getPlacement() != null
+                    ? actual.getPlacement().getAvailabilityZone() : instance.getAvailabilityZone();
+            if (zoneCounts.containsKey(zone)) {
+                zoneCounts.compute(zone, (ignored, count) -> count + 1);
+            }
+        }
+        return placements.stream().min(Comparator.comparingLong(
+                placement -> zoneCounts.get(placement.availabilityZone()))).orElseThrow();
+    }
+
+    private record LaunchPlacement(String subnetId, String availabilityZone) {}
 
     private static List<io.github.hectorvent.floci.services.ec2.model.Tag> propagatedInstanceTags(
             AutoScalingGroup asg,

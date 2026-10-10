@@ -119,6 +119,15 @@ Floci runs a background reconciler (10 s fixed rate) that keeps each group's InS
 - **Scale-in**: selects InService instances not protected from scale-in, deregisters them from target groups, then calls `TerminateInstances`.
 - Activity records are written on each scale-out and scale-in event.
 
+Scale-out places each new instance in the least-populated declared availability zone,
+counting existing Pending and InService members using their current EC2 placement.
+Subnet lists are resolved through EC2, so declaring more subnets in one zone does not
+increase that zone's share. Repeated capacity increases retain this balance, and
+instance rows report the zone returned by EC2. The existing launch-template version,
+instance-profile and public-IP settings continue through the normal EC2 launch path.
+This placement rule applies to new allocations; it does not migrate existing instances
+solely because the declared zone list changes.
+
 ## Launch Source Compatibility
 
 Auto Scaling groups preserve either a launch configuration, a top-level launch template, or a `MixedInstancesPolicy`. These launch sources are mutually exclusive in create/update requests. When a mixed instances policy is supplied, Floci stores and returns:
