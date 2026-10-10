@@ -33,5 +33,9 @@
             <property name="query" value="//TYPE[IDENT[@text='var']][not(parent::PATTERN_VARIABLE_DEF)]"/>
             <message key="matchxpath.match" value="Do not use var. Write the explicit type."/>
         </module>
+        <!-- A qualified name stays allowed when another type with the same simple name is used in the file. -->
+        <module name="UnnecessaryFullyQualifiedType">
+            <property name="id" value="NoFqcn"/>
+        </module>
     </module>
 </module>
