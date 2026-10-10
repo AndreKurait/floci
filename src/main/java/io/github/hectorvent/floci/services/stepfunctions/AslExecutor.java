@@ -261,6 +261,8 @@ public class AslExecutor {
     private final JsonataEvaluator jsonataEvaluator;
     private final Instance<StepFunctionsService> sfnService;
     private final WebClient webClient;
+    @Inject
+    ApiGatewayTaskInvoker apiGatewayTaskInvoker;
     private final EmulatorConfig config;
     private final CustomResourceLiveness customResourceLiveness;
     private final Clock clock;
@@ -1238,6 +1240,14 @@ public class AslExecutor {
 
         if (integration == null) {
             return invokeNonIntegrationResource(resource, input, taskToken);
+        }
+
+        if (integration.is("apigateway", "invoke") && integration.suffix().isEmpty()) {
+            try {
+                return apiGatewayTaskInvoker.invoke(input, sm);
+            } catch (AwsException error) {
+                throw new FailStateException("ApiGateway." + error.getHttpStatus(), error.getMessage());
+            }
         }
 
         // DynamoDB optimized integrations (4 actions)

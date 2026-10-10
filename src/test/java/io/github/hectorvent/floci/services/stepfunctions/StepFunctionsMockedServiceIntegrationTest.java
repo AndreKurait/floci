@@ -30,7 +30,7 @@ class StepFunctionsMockedServiceIntegrationTest {
     private static final String DDB_CONTENT_TYPE = "application/x-amz-json-1.0";
     private static final String ROLE_ARN = "arn:aws:iam::000000000000:role/test-role";
     private static final String TABLE_NAME = "sfn-mock-items";
-    private static final String UNSUPPORTED_RESOURCE = "arn:aws:states:::apigateway:invoke";
+    private static final String UNSUPPORTED_RESOURCE = "arn:aws:states:::unsupported:invoke";
     private static final ObjectMapper mapper = new ObjectMapper();
 
     private static String mockSmArn;

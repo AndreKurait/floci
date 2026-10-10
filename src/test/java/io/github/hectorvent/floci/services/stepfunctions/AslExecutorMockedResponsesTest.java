@@ -38,7 +38,7 @@ class AslExecutorMockedResponsesTest {
 
     private static final String REGION = "us-east-2";
     private static final String ACCOUNT = "000000000000";
-    private static final String UNSUPPORTED_RESOURCE = "arn:aws:states:::apigateway:invoke";
+    private static final String UNSUPPORTED_RESOURCE = "arn:aws:states:::unsupported:invoke";
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private LambdaExecutorService lambdaExecutor;

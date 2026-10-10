@@ -46,6 +46,30 @@
 definition, role, logging, tracing, encryption, and tags without replacing the state machine;
 changes to `StateMachineName` or `StateMachineType` use replacement semantics.
 
+## API Gateway optimized tasks
+
+`arn:aws:states:::apigateway:invoke` supports regional REST APIs in the state machine's
+account and region, with `Method: POST`, `AuthType: IAM_ROLE`, a named `Stage` and `Path`,
+and a JSON-object `RequestBody` without null values. `Headers` accepts string arrays
+containing one value each. Caller-supplied signing, host, forwarding and connection headers
+are refused.
+
+The execution role must exist, trust Step Functions, and permit `execute-api:Invoke` on the
+actual stage/method/path. The existing IAM policy evaluator checks that permission and the
+role's permissions boundary even when global opt-in IAM enforcement is disabled. The task
+then uses a short-lived role session and a real SigV4 request through the normal REST API
+execution path; the session is revoked when the request completes or fails.
+
+Success returns `StatusCode`, `StatusText`, `Headers` and `ResponseBody` (parsed JSON when
+possible). Non-2xx responses fail with `ApiGateway.<status>`, available to `Retry` and `Catch`.
+Transport failures without an HTTP response use `ApiGateway.<Exception>`. The integration
+does not follow redirects or contact external hosts.
+
+Other methods/authentication modes, HTTP APIs, custom domains, private APIs, API resource
+policies, query parameters, `AllowNullValues`, multi-value headers and callback suffixes
+remain unsupported. Unsupported requests fail explicitly; they do not bypass authorization
+or return fabricated API responses.
+
 ## Execution history events
 
 `GetExecutionHistory` emits an event family around a Task state's `TaskStateEntered` and
