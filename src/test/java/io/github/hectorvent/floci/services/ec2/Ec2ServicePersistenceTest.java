@@ -399,7 +399,7 @@ class Ec2ServicePersistenceTest {
                 .getFirst()
                 .getData();
         assertEquals("arn:aws:iam::000000000000:instance-profile/legacy-profile",
-                restarted.iamInstanceProfileArn(versioned),
+                versioned.getIamInstanceProfile().getArn(),
                 "IAM instance profile on a legacy versions-map entry must survive restart");
         assertEquals(List.of("legacy-versioned"),
                 versioned.getInstanceTags().stream().map(Tag::getValue).toList(),
@@ -410,7 +410,7 @@ class Ec2ServicePersistenceTest {
                 .getFirst()
                 .getData();
         assertEquals("arn:aws:iam::000000000000:instance-profile/legacy-profile",
-                restarted.iamInstanceProfileArn(noVersions),
+                noVersions.getIamInstanceProfile().getArn(),
                 "IAM instance profile on a legacy template with no versions map must survive restart");
         assertEquals(List.of("legacy-no-versions"),
                 noVersions.getInstanceTags().stream().map(Tag::getValue).toList(),

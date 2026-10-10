@@ -3282,6 +3282,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         requireNotDeregistered(region, imageId);
         validateMetadataOptions(metadataOptions);
         validateCreditSpecification(creditSpecificationCpuCredits);
+        InstanceProfile launchProfile = resolveIamInstanceProfile(null, iamInstanceProfileArn);
         LaunchTemplateData.MetadataOptions launchMetadataOptions = LaunchTemplateData.MetadataOptions.merge(
                 LaunchTemplateData.MetadataOptions.launchDefaults(), metadataOptions);
         ensureDefaultResources(region);
@@ -3434,7 +3435,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         inst.setUserData(userData);
                         inst.setEncodedUserData(encodedUserData);
                         inst.setIamInstanceProfileArn(iamInstanceProfileArn);
-                        if (iamInstanceProfileArn != null) {
+                        if (launchProfile != null) {
+                            inst.setIamInstanceProfileId(launchProfile.getInstanceProfileId());
                             inst.setIamInstanceProfileAssociationTime(inst.getLaunchTime());
                         }
                         inst.setMetadataOptions(LaunchTemplateData.MetadataOptions.merge(launchMetadataOptions, null));
@@ -4437,13 +4439,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     /**
-     * Deterministic instance-profile id derived from the instance id so repeated describes are stable.
-     */
-    public static String iamInstanceProfileId(String instanceId) {
-        return "AIPA" + stableSuffix(instanceId, 17).toUpperCase();
-    }
-
-    /**
      * Deterministic association id derived from the instance id so repeated describes are stable.
      */
     public static String iamInstanceProfileAssociationId(String instanceId) {
@@ -4476,7 +4471,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             throw new AwsException("IncorrectState",
                     "There is an existing association for instance " + instanceId, 400);
         }
+        InstanceProfile profile = resolveIamInstanceProfile(null, profileArn);
         inst.setIamInstanceProfileArn(profileArn);
+        inst.setIamInstanceProfileId(profile.getInstanceProfileId());
         inst.setIamInstanceProfileAssociationTime(Instant.now());
         instances.put(key(region, instanceId), inst);
         return association(inst, profileArn, "associating");
@@ -4487,7 +4484,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                                                               String profileArn) {
         ensureDefaultResources(region);
         Instance inst = getRequiredAssociatedInstance(region, associationId);
+        InstanceProfile profile = resolveIamInstanceProfile(null, profileArn);
         inst.setIamInstanceProfileArn(profileArn);
+        inst.setIamInstanceProfileId(profile.getInstanceProfileId());
         inst.setIamInstanceProfileAssociationTime(Instant.now());
         instances.put(key(region, inst.getInstanceId()), inst);
         return association(inst, profileArn, "associating");
@@ -4498,12 +4497,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ensureDefaultResources(region);
         Instance inst = getRequiredAssociatedInstance(region, associationId);
         String detached = inst.getIamInstanceProfileArn();
+        String detachedId = inst.getIamInstanceProfileId();
         Instant associatedAt = inst.getIamInstanceProfileAssociationTime();
         inst.setIamInstanceProfileArn(null);
+        inst.setIamInstanceProfileId(null);
         inst.setIamInstanceProfileAssociationTime(null);
         instances.put(key(region, inst.getInstanceId()), inst);
         return new IamInstanceProfileAssociation(associationId, inst.getInstanceId(), detached,
-                iamInstanceProfileId(inst.getInstanceId()), "disassociating", associatedAt);
+                detachedId, "disassociating", associatedAt);
     }
 
     private Instance getRequiredAssociatedInstance(String region, String associationId) {
@@ -4517,9 +4518,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 "An invalid association-id of '" + associationId + "' was given", 400);
     }
 
-    private static IamInstanceProfileAssociation association(Instance inst, String profileArn, String state) {
+    private IamInstanceProfileAssociation association(Instance inst, String profileArn, String state) {
         return new IamInstanceProfileAssociation(iamInstanceProfileAssociationId(inst.getInstanceId()),
-                inst.getInstanceId(), profileArn, iamInstanceProfileId(inst.getInstanceId()), state,
+                inst.getInstanceId(), profileArn, inst.getIamInstanceProfileId(), state,
                 inst.getIamInstanceProfileAssociationTime());
     }
 
@@ -7592,23 +7593,35 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             return null;
         }
         LaunchTemplateData.IamInstanceProfile profile = data.getIamInstanceProfile();
-        if (profile.getArn() != null && !profile.getArn().isBlank()) {
-            return profile.getArn();
-        }
-        if (profile.getName() == null || profile.getName().isBlank()) {
-            return null;
-        }
-        return resolveIamInstanceProfileName(profile.getName());
+        return resolveIamInstanceProfileArn(profile.getName(), profile.getArn());
     }
 
     public String resolveIamInstanceProfileName(String name) {
-        if (iamService == null) {
-            throw new IllegalStateException("IAM service is required to resolve instance profile names");
+        return resolveIamInstanceProfileArn(name, null);
+    }
+
+    public String resolveIamInstanceProfileArn(String name, String arn) {
+        InstanceProfile profile = resolveIamInstanceProfile(name, arn);
+        return profile == null ? null : profile.getArn();
+    }
+
+    private InstanceProfile resolveIamInstanceProfile(String name, String arn) {
+        boolean hasName = name != null && !name.isBlank();
+        boolean hasArn = arn != null && !arn.isBlank();
+        if (!hasName && !hasArn) {
+            return null;
         }
-        return iamService.findInstanceProfile(callerAccountId(), name)
-                .map(InstanceProfile::getArn)
+        if (iamService == null) {
+            throw new IllegalStateException("IAM service is required to resolve instance profiles");
+        }
+        String lookupName = name;
+        if (!hasName) {
+            lookupName = arn.substring(arn.lastIndexOf('/') + 1);
+        }
+        return iamService.findInstanceProfile(callerAccountId(), lookupName)
+                .filter(profile -> !hasArn || arn.equals(profile.getArn()))
                 .orElseThrow(() -> new AwsException("InvalidParameterValue",
-                        "Invalid IAM Instance Profile name: " + name, 400));
+                        "Invalid IAM Instance Profile: " + (hasArn ? arn : name), 400));
     }
 
     public LaunchTemplateData resolveLaunchTemplateData(String region, String id, String name, String version) {
@@ -9873,6 +9886,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (resource instanceof Instance inst) {
             return switch (filterName) {
                 case "instance-id" -> matchesValue(values, inst.getInstanceId());
+                case "client-token" -> matchesValue(values, inst.getClientToken());
                 case "instance-state-name" -> matchesValue(values, inst.getState().getName());
                 case "instance-type" -> matchesValue(values, inst.getInstanceType());
                 case "vpc-id" -> matchesValue(values, inst.getVpcId());
