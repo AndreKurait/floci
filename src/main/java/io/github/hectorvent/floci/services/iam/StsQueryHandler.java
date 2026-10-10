@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.common.IamConditionContextResolver;
 import io.github.hectorvent.floci.core.common.IamEnforcementFilter;
 import io.github.hectorvent.floci.core.common.OidcIssuerKeyLookup;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.WebIdentityToken;
 import io.github.hectorvent.floci.core.common.WebIdentityTokenVerifier;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
@@ -58,6 +59,9 @@ public class StsQueryHandler {
 
     /** CSPRNG for session secret keys and session tokens; ordinary IDs keep using {@link ThreadLocalRandom}. */
     private final SecureRandom secureRandom = new SecureRandom();
+
+    @Inject
+    RequestContext verifiedRequest;
 
     @Context
     HttpHeaders headers;
@@ -145,7 +149,8 @@ public class StsQueryHandler {
         iamService.registerAssumeRoleSession(
                 accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy, callerAccountId,
                 sessionName, assumedRoleId,
-                params.keySet().stream().anyMatch(key -> key.startsWith("PolicyArns.member.")));
+                params.keySet().stream().anyMatch(key -> key.startsWith("PolicyArns.member.")),
+                verifiedRequest == null ? null : verifiedRequest.getVerifiedSession());
 
         String result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))

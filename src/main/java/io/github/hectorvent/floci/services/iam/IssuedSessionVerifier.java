@@ -53,7 +53,7 @@ public class IssuedSessionVerifier {
                            String originAccountId, String roleArn, String roleId, String roleSessionName,
                            String principalArn, String principalId, String expiresAt, boolean sessionPolicyPresent) {}
 
-    private record Snapshot(String accessKey, String secret, String token, String account, String origin,
+    record Snapshot(String accessKey, String secret, String token, String account, String origin,
                             String roleArn, String roleId, String sessionName, String principalArn,
                             String principalId, Instant expiry, boolean policyPresent) {
         @Override
@@ -68,10 +68,17 @@ public class IssuedSessionVerifier {
     }
 
     Identity verify(Map<String, String> request) {
-        String[] scope = validateStringToSign(request.get("stringToSign"));
         List<Snapshot> initial = snapshots("accessKeyId", request.get("accessKeyId"));
         require(initial.size() == 1);
         Snapshot session = initial.getFirst();
+        verifyProof(session, request, clock, 900, 300);
+        require(initial.equals(snapshots("accessKeyId", request.get("accessKeyId"))));
+        return session.identity(request.get("correlationId"), "Verify", session.expiry());
+    }
+
+    static Instant verifyProof(Snapshot session, Map<String, String> request, Clock clock,
+                               long maxAgeSeconds, long futureSkewSeconds) {
+        String[] scope = validateStringToSign(request.get("stringToSign"), clock, maxAgeSeconds, futureSkewSeconds);
         require(constantEquals(session.token(), request.get("sessionToken")));
         try {
             byte[] signingKey = SigV4RequestValidator.deriveSigningKey(session.secret(), scope[0], scope[1], scope[2]);
@@ -82,11 +89,11 @@ public class IssuedSessionVerifier {
                 Arrays.fill(signingKey, (byte) 0);
             }
             require(MessageDigest.isEqual(expected, HexFormat.of().parseHex(request.get("signature"))));
+            return LocalDateTime.parse(request.get("stringToSign").split("\n", -1)[1], SIGNED_TIME)
+                    .toInstant(ZoneOffset.UTC);
         } catch (Exception error) {
             throw refused();
         }
-        require(initial.equals(snapshots("accessKeyId", request.get("accessKeyId"))));
-        return session.identity(request.get("correlationId"), "Verify", session.expiry());
     }
 
     Identity lookup(Map<String, String> request) {
@@ -137,10 +144,18 @@ public class IssuedSessionVerifier {
     }
 
     private Snapshot snapshot(SessionCredential session) {
-        if (!session.isAssumeRoleIssued() || session.isLambdaExecutionRole()
-                || session.getEc2InstanceId() != null || session.getEcsTaskArn() != null
+        return snapshot(session, false);
+    }
+
+    Snapshot snapshot(SessionCredential session, boolean lambdaRoot) {
+        if (lambdaRoot ? !session.isLambdaExecutionRole() || session.getLambdaExecution() == null
+                : !session.isAssumeRoleIssued() || session.isLambdaExecutionRole()) {
+            return null;
+        }
+        if (session.getEc2InstanceId() != null || session.getEcsTaskArn() != null
                 || session.getPresignedAction() != null || session.getIssuerArn() != null
-                || session.getExpiration() == null || !session.getExpiration().isAfter(clock.instant())
+                || (!lambdaRoot && session.getExpiration() == null)
+                || (session.getExpiration() != null && !session.getExpiration().isAfter(clock.instant()))
                 || !nonempty(session.getSecretAccessKey()) || !nonempty(session.getSessionToken())
                 || !nonempty(session.getRoleArn()) || !nonempty(session.getRoleSessionName())
                 || !nonempty(session.getAssumedRoleId()) || !nonempty(session.getOriginAccountId())
@@ -169,18 +184,20 @@ public class IssuedSessionVerifier {
                 "assumed-role/" + roleName + "/" + session.getRoleSessionName()).toString();
         return new Snapshot(session.getAccessKeyId(), session.getSecretAccessKey(), session.getSessionToken(),
                 arn.accountId(), session.getOriginAccountId(), role.getArn(), role.getRoleId(),
-                session.getRoleSessionName(), principalArn, session.getAssumedRoleId(), session.getExpiration(),
+                session.getRoleSessionName(), principalArn, session.getAssumedRoleId(),
+                session.getExpiration() == null ? Instant.MAX : session.getExpiration(),
                 session.getSessionPolicyDocument() != null || session.isManagedSessionPolicyPresent());
     }
 
-    private String[] validateStringToSign(String value) {
+    private static String[] validateStringToSign(String value, Clock clock, long maxAgeSeconds,
+                                                 long futureSkewSeconds) {
         try {
             String[] lines = value.split("\n", -1);
             require(lines.length == 4 && lines[0].equals("AWS4-HMAC-SHA256")
                     && lines[3].matches("[a-fA-F0-9]{64}"));
             Instant signed = LocalDateTime.parse(lines[1], SIGNED_TIME).toInstant(ZoneOffset.UTC);
             Instant now = clock.instant();
-            require(!signed.isBefore(now.minusSeconds(900)) && !signed.isAfter(now.plusSeconds(300)));
+            require(!signed.isBefore(now.minusSeconds(maxAgeSeconds)) && !signed.isAfter(now.plusSeconds(futureSkewSeconds)));
             String[] scope = lines[2].split("/", -1);
             require(scope.length == 4 && scope[0].equals(lines[1].substring(0, 8))
                     && scope[1].matches("[a-z][a-z0-9-]{0,62}")

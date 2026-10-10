@@ -36,6 +36,7 @@ import io.github.hectorvent.floci.services.iam.model.IamPolicy;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
+import io.github.hectorvent.floci.services.iam.model.LambdaExecutionBinding;
 import io.github.hectorvent.floci.services.iam.model.LoginProfile;
 import io.github.hectorvent.floci.services.iam.model.OpenIDConnectProvider;
 import io.github.hectorvent.floci.services.iam.model.OrganizationRootFeatures;
@@ -4056,13 +4057,42 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     void registerAssumeRoleSession(String accessKeyId, String secret, String token, String roleArn,
                                   Instant expiration, String policy, String originAccountId,
                                   String sessionName, String principalId, boolean managedPolicyPresent) {
+        registerAssumeRoleSession(accessKeyId, secret, token, roleArn, expiration, policy, originAccountId,
+                sessionName, principalId, managedPolicyPresent, null);
+    }
+
+    void registerAssumeRoleSession(String accessKeyId, String secret, String token, String roleArn,
+                                  Instant expiration, String policy, String originAccountId,
+                                  String sessionName, String principalId, boolean managedPolicyPresent,
+                                  SessionCredential verifiedParentSession) {
         SessionCredential session = new SessionCredential(accessKeyId, secret, token,
                 roleArn, expiration, policy, originAccountId);
+        if (verifiedParentSession != null) {
+            List<SessionCredential> parents = issuedSessionCandidates(verifiedParentSession.getAccessKeyId());
+            if (parents.size() == 1 && parents.getFirst() == verifiedParentSession
+                    && parents.getFirst().isLambdaExecutionRole()
+                    && parents.getFirst().getLambdaExecution() != null
+                    && parents.getFirst().getLambdaParentSession() == null) {
+                session.setLambdaParentSession(parents.getFirst());
+            }
+        }
         session.setRoleSessionName(sessionName);
         session.setAssumedRoleId(principalId);
         session.setAssumeRoleIssued(true);
         session.setManagedSessionPolicyPresent(managedPolicyPresent);
         sessions.put(accessKeyId, session);
+    }
+
+    /** Selects native execution/one-hop records for authentication, never claims their identity is current. */
+    public Optional<SessionCredential> lambdaIdentitySession(String accessKeyId) {
+        List<SessionCredential> candidates = issuedSessionCandidates(accessKeyId);
+        if (candidates.size() != 1) {
+            return Optional.empty();
+        }
+        SessionCredential session = candidates.getFirst();
+        return (session.isLambdaExecutionRole() && session.getLambdaExecution() != null
+                || session.isAssumeRoleIssued() && session.getLambdaParentSession() != null)
+                ? Optional.of(session) : Optional.empty();
     }
 
     /** Bounded private registry view; callers never serialize credential records. */
@@ -4211,6 +4241,25 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         }
         LOG.debugv("Registered Lambda execution-role session {0} under account {1} for {2}",
                 sessionAccessKeyId, accountId, roleArn);
+    }
+
+    /** Attaches only native launch metadata to the exact current execution-role session. */
+    public void bindLambdaExecution(String accountId, String accessKeyId,
+                                    LambdaExecutionBinding binding) {
+        List<SessionCredential> candidates = issuedSessionCandidates(accessKeyId);
+        if (candidates.size() != 1) {
+            return;
+        }
+        SessionCredential session = candidates.getFirst();
+        if (session.isLambdaExecutionRole() && accountId.equals(session.getOriginAccountId())
+                && binding.roleArn().equals(session.getRoleArn())) {
+            LambdaExecutionBinding previous = session.getLambdaExecution();
+            if (previous == null ? binding.containerId() == null && binding.containerStartedAt() == null
+                    : previous.containerId() == null && previous.equals(binding.withContainer(null))
+                    || previous.containerStartedAt() == null && previous.equals(binding.withStartedAt(null))) {
+                session.setLambdaExecution(binding);
+            }
+        }
     }
 
     /** Registers an IMDS session in the profile's account, outside request scope. */

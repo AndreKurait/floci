@@ -171,6 +171,7 @@ floci:
       enabled: true
       enforcement-enabled: false
       issued-session-verification-enabled: false
+      lambda-identity-verification-enabled: false
       seed-deployer-principal: false
     msk:
       enabled: true

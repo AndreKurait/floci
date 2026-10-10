@@ -451,7 +451,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
 
         // Now start the container with code in place
+        if (config.services().iam().lambdaIdentityVerificationEnabled() && roleCredentials.isPresent()) {
+            executionRoleCredentials.bindContainer(fn, roleCredentials.get().accessKeyId(), containerId);
+        }
         lifecycleManager.startCreated(containerId, spec);
+        if (config.services().iam().lambdaIdentityVerificationEnabled() && roleCredentials.isPresent()) {
+            try {
+                executionRoleCredentials.bindStartedContainer(fn, roleCredentials.get().accessKeyId(), containerId,
+                        dockerClient.inspectContainerCmd(containerId).exec().getState().getStartedAt());
+            } catch (RuntimeException unavailable) {
+                // Normal execution remains available; identity verification fails closed without this seal.
+                LOG.debug("Could not seal Lambda execution start time");
+            }
+        }
         watchForUnexpectedExit(dockerClient, containerId, runtimeApiServer);
 
         // Extensions can log as soon as they start, which is before the container's own log stream

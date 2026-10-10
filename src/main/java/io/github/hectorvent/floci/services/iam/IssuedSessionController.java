@@ -75,7 +75,7 @@ public class IssuedSessionController {
         }
     }
 
-    private static Map<String, String> parse(InputStream body, boolean verify) throws IOException {
+    static Map<String, String> parse(InputStream body, boolean verify) throws IOException {
         if (body == null) {
             throw new IllegalArgumentException();
         }

@@ -1419,3 +1419,47 @@ Errors contain only `{"code":"..."}`: disabled operations return HTTP 404 with
 HTTP 403 with `IssuedSessionVerificationFailed`. Tokens and proof inputs are not
 logged or echoed. Posting `{}` distinguishes an enabled handler from an older or
 disabled implementation without sending any credential material.
+
+## Local Lambda execution identity
+
+`FLOCI_SERVICES_IAM_LAMBDA_IDENTITY_VERIFICATION_ENABLED=true` enables
+`POST /_floci/lambda/issued-identities/lookup` and `/verify`. The existing IAM
+issued-session endpoints retain their original contract. These observations
+are identity evidence, not IAM authorization decisions, and never contain
+credentials. Both operations use the same strict request fields as the IAM
+issued-session protocol above.
+
+The response contains `correlationId`, `operation`, `kind`, `accountId`, `roleArn`,
+`roleId`, `principalArn`, `principalId`, `sessionPolicyPresent`, and `expiresAt`.
+`kind` is `LAMBDA_EXECUTION` for the native execution-role session and
+`LAMBDA_ASSUMED_ROLE` for one directly derived STS session. The nested `lambda`
+object always identifies the original execution: `accountId`, `functionArn`,
+`functionVersion`, `roleArn`, `principalArn`, `principalId`, `codeSha256`,
+`containerId`, and `containerStartedAt`.
+
+The issuer binds its generated credential to its native launch record. Every
+observation checks the current role ID, function version/code/revision, exact
+credential record, and running container/start time before and after proof
+verification. A stopped or restarted container, retired credential, replaced
+role, changed function, or ambiguous principal lookup is refused. A lookup
+selects records but does not authenticate the caller or confer lineage.
+
+`Verify` checks the session token and SigV4 `StringToSign` signature. Its signing
+time must be at most 60 seconds old and at most 5 seconds in the future. Its
+observation expires at the earliest of observation time plus 60 seconds, signed
+time plus 60 seconds, and the current/root credential expiry. Replaying an old
+proof cannot renew that deadline; retries inside the original window are not
+single-use nonce enforcement. `Lookup` returns a fresh observation lasting at
+most 60 seconds and still requires the current execution to be running.
+
+One-hop lineage is recorded only by normal `AssumeRole` after the native SigV4
+request verifier authenticates the parent key, token and complete request.
+The Lambda identity flag activates the existing signature verifier for native
+execution-role and one-hop credentials; it does not require globally enabling
+`FLOCI_AUTH_VALIDATE_SIGNATURES`. Other credentials retain their existing
+behavior, and no unknown-key secret fallback is added. Enabling the global flag
+still requires valid known credentials for all other signed AWS requests. Header-only calls, manually registered/restored sessions,
+second-hop sessions, Kubernetes executions, hot reload, external AWS credential
+mounts, and executions without a complete native start/code seal are not
+supported by this identity facility. Generic STS issuance retains its normal
+behavior even when no Lambda lineage can be established.

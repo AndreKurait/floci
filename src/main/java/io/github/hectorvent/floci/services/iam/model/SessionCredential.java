@@ -15,6 +15,15 @@ public class SessionCredential {
     private boolean assumeRoleIssued;
     @JsonIgnore
     private boolean managedSessionPolicyPresent;
+    @JsonIgnore
+    private LambdaExecutionBinding lambdaExecution;
+    @JsonIgnore
+    private SessionCredential lambdaParentSession;
+
+    public LambdaExecutionBinding getLambdaExecution() { return lambdaExecution; }
+    public void setLambdaExecution(LambdaExecutionBinding value) { lambdaExecution = value; }
+    public SessionCredential getLambdaParentSession() { return lambdaParentSession; }
+    public void setLambdaParentSession(SessionCredential value) { lambdaParentSession = value; }
 
     private String accessKeyId;
     private String secretAccessKey;
