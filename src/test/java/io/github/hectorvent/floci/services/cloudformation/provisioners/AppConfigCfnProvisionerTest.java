@@ -11,9 +11,11 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -70,6 +72,23 @@ class AppConfigCfnProvisionerTest {
                 "Name", "invalid", "DeploymentDurationInMinutes", 1, "GrowthFactor", 0, "ReplicateTo", "NONE")),
                 context(null)));
         verifyNoInteractions(service);
+    }
+
+    @Test
+    void environmentAlreadyDeletedIsSafeButOtherDeleteFailuresPropagate() {
+        AppConfigService service = mock(AppConfigService.class);
+        AppConfigCfnProvisioner provisioner = new AppConfigCfnProvisioner(service);
+        StackResource resource = new StackResource();
+        resource.setResourceType("AWS::AppConfig::Environment");
+        resource.setPhysicalId("env1234");
+        resource.getAttributes().put("_floci_appconfig_application", "app1234");
+        doThrow(new AwsException("ResourceNotFoundException", "Environment not found", 404))
+                .when(service).deleteEnvironment("app1234", "env1234");
+        assertDoesNotThrow(() -> provisioner.delete(resource, "us-east-1"));
+        doThrow(new AwsException("InternalServerException", "storage failed", 500))
+                .when(service).deleteEnvironment("app1234", "env1234");
+        AwsException failure = assertThrows(AwsException.class, () -> provisioner.delete(resource, "us-east-1"));
+        assertEquals("InternalServerException", failure.getErrorCode());
     }
 
     private static ProvisionContext context(String prior) {

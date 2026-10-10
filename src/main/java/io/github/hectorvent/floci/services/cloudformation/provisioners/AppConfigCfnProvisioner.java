@@ -150,7 +150,8 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         String id = resource.getPhysicalId();
         switch (resource.getResourceType()) {
             case "AWS::AppConfig::Application" -> service.deleteApplication(id);
-            case "AWS::AppConfig::Environment" -> service.deleteEnvironment(application(resource), id);
+            case "AWS::AppConfig::Environment" -> CfnDeletes.safeDelete("AppConfig environment", id,
+                    () -> service.deleteEnvironment(application(resource), id), "ResourceNotFoundException");
             case "AWS::AppConfig::ConfigurationProfile" -> service.deleteConfigurationProfile(application(resource), id);
             case "AWS::AppConfig::DeploymentStrategy" -> service.deleteDeploymentStrategy(id);
             default -> throw new IllegalStateException("Unsupported AppConfig resource type");

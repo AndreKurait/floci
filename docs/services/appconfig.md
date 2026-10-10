@@ -33,6 +33,7 @@ It returns only the deployed version, its content type and `Configuration-Versio
 - `CreateEnvironment`
 - `GetEnvironment`
 - `ListEnvironments`
+- `DeleteEnvironment`
 - `CreateConfigurationProfile`
 - `GetConfigurationProfile`
 - `ListConfigurationProfiles`

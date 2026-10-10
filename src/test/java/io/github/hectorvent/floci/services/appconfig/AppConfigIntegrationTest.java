@@ -1084,4 +1084,32 @@ class AppConfigIntegrationTest {
                 .extract().asByteArray();
         assertArrayEquals(stored, body);
     }
+
+    @Test @Order(51)
+    void deleteEnvironmentRemovesIt() {
+        String token = given()
+                .contentType(ContentType.JSON)
+                .body("{\"ApplicationIdentifier\":\"" + appId + "\",\"EnvironmentIdentifier\":\""
+                        + envId + "\",\"ConfigurationProfileIdentifier\":\"" + profileId + "\"}")
+                .when().post("/configurationsessions")
+                .then().statusCode(201)
+                .extract().path("InitialConfigurationToken");
+
+        given()
+                .when().delete("/applications/test-app/environments/test-env")
+                .then().statusCode(204);
+
+        given()
+                .when().get("/applications/" + appId + "/environments/" + envId)
+                .then().statusCode(404);
+
+        given()
+                .when().get("/applications/" + appId + "/environments/" + envId + "/deployments/1")
+                .then().statusCode(404);
+
+        given()
+                .queryParam("configuration_token", token)
+                .when().get("/configuration")
+                .then().statusCode(404);
+    }
 }
