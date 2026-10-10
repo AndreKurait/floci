@@ -142,22 +142,27 @@ Snapshot requests cannot combine additions and removals and are limited to
 Cross-account `CopyImage` resolves an exact stored source ID, region and
 owner. It requires the recipient's AMI launch permission and read permission
 for every backing snapshot before creating any destination records.
-The source must have completed, unencrypted EBS snapshot metadata and
-explicit runtime ancestry ending at an existing local catalog entry.
+The source must have completed, unencrypted EBS snapshot metadata.
+Container mode additionally requires explicit runtime ancestry ending at an existing local catalog entry;
+metadata mode (`mock=true`) does not invent a runtime ancestor for an unbound image.
 The copy has a distinct AMI ID and distinct destination-owned snapshots,
 retains the source size and catalog runtime ancestry, and does not inherit
 permission sets or ordinary owner tags. The source remains independent.
 This is metadata and local catalog behavior, not EBS block-data copying.
 
-This subset supports copying by known source ID; it does not expose shared
-source descriptions or enumeration. Explicit `DescribeImages` of a stored
-foreign ID is refused rather than returning a synthetic fallback.
+`DescribeImages` includes explicitly shared images in the selected region, preserving the source owner.
+Owner and tag filters apply to that view; only `ec2:SharedTag/` tags cross the account boundary.
+Reads neither create recipient-owned aliases nor change source tags or mappings. Revocation removes visibility.
+Direct `CreateVolume` from a shared snapshot requires its create-volume grant and uses the snapshot size
+when size is omitted. Smaller sizes, missing grants, wrong regions and encrypted shared snapshots are refused.
+No snapshot bytes are copied by metadata mode.
 Permission reads and mutations remain owner-scoped. IAM policy evaluation,
 public/group/organization grants, legacy `OperationType`/`UserId.N` mutation
 forms, encrypted shared copies and KMS are unsupported.
 
-Foreign sources with unbound runtime ancestry or captured Docker layers are
-refused, including captures in their source ancestry. Same-account captured
+Container mode refuses foreign sources with unbound runtime ancestry. Captured Docker layers are
+refused in both modes, including captures in source ancestry. Direct shared-image container launches
+require a caller-owned copy. Same-account captured
 copies retain their existing behavior. `CopyImageTags`, tag specifications,
 encryption and placement options
 are refused. AWS's special `ec2:SharedTag/` visibility and copy behavior is not

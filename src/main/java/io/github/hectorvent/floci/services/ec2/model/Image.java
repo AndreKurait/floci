@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -55,6 +56,46 @@ public class Image {
     private Set<String> launchPermissionUserIds = new LinkedHashSet<>();
 
     public Image() {}
+
+    public Image(Image source) {
+        this.imageId = source.imageId;
+        this.name = source.name;
+        this.description = source.description;
+        this.state = source.state;
+        this.ownerId = source.ownerId;
+        this.isPublic = source.isPublic;
+        this.architecture = source.architecture;
+        this.rootDeviceType = source.rootDeviceType;
+        this.rootDeviceName = source.rootDeviceName;
+        this.virtualizationType = source.virtualizationType;
+        this.hypervisor = source.hypervisor;
+        this.platform = source.platform;
+        this.imageOwnerAlias = source.imageOwnerAlias;
+        this.creationDate = source.creationDate;
+        this.region = source.region;
+        this.sourceImageId = source.sourceImageId;
+        this.creationSourceImageId = source.creationSourceImageId;
+        this.creationSourceImageRegion = source.creationSourceImageRegion;
+        this.creationSourceInstanceId = source.creationSourceInstanceId;
+        this.dockerImage = source.dockerImage;
+        this.blockDeviceMappings = source.blockDeviceMappings.stream().map(mapping -> {
+            BlockDeviceMapping copy = new BlockDeviceMapping();
+            copy.setDeviceName(mapping.getDeviceName());
+            if (mapping.getEbs() != null) {
+                EbsBlockDevice ebs = new EbsBlockDevice();
+                ebs.setSnapshotId(mapping.getEbs().getSnapshotId());
+                ebs.setVolumeSize(mapping.getEbs().getVolumeSize());
+                ebs.setVolumeType(mapping.getEbs().getVolumeType());
+                ebs.setDeleteOnTermination(mapping.getEbs().getDeleteOnTermination());
+                ebs.setEncrypted(mapping.getEbs().getEncrypted());
+                copy.setEbs(ebs);
+            }
+            return copy;
+        }).collect(Collectors.toCollection(ArrayList::new));
+        this.tags = source.tags.stream().map(tag -> new Tag(tag.getKey(), tag.getValue()))
+                .collect(Collectors.toCollection(ArrayList::new));
+        this.launchPermissionUserIds = new LinkedHashSet<>(source.launchPermissionUserIds);
+    }
 
     public String getImageId() { return imageId; }
     public void setImageId(String imageId) { this.imageId = imageId; }

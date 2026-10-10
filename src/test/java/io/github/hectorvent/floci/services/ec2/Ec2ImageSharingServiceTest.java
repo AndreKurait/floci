@@ -105,12 +105,19 @@ class Ec2ImageSharingServiceTest {
     }
 
     @Test
-    void unboundForeignImageRefusesWithoutDestinationWrites() {
+    void unboundForeignImageCopiesInMetadataModeWithoutInventingRuntimeAncestry() {
         Image source = source();
         grant(source);
         source.setSourceImageId(null);
 
-        assertRefusedWithoutWrites(source, "UnsupportedOperation");
+        Image copy = recipient.copyImage(DESTINATION, REGION, source.getImageId(), "metadata-copy", null);
+        assertEquals(source.getImageId(), copy.getCreationSourceImageId());
+        assertEquals(null, copy.getSourceImageId());
+        assertEquals(RECIPIENT, copy.getOwnerId());
+        assertNotEquals(snapshotId(source), snapshotId(copy));
+        assertEquals("UnsupportedOperation", assertThrows(AwsException.class,
+                () -> service(RECIPIENT, false).copyImage(DESTINATION, REGION,
+                        source.getImageId(), "container-copy", null)).getErrorCode());
     }
 
     @Test
@@ -187,14 +194,68 @@ class Ec2ImageSharingServiceTest {
         grant(source);
         source.setTags(List.of(new Tag("Private", "owner")));
         Set<String> before = Set.copyOf(store("ec2-registered-images.json").keys());
-        assertEquals("InvalidAMIID.NotFound", assertThrows(AwsException.class,
-                () -> recipient.describeImages(REGION, List.of(source.getImageId()), List.of(), Map.of()))
-                .getErrorCode());
+        Image described = recipient.describeImages(REGION, List.of(source.getImageId()), List.of(), Map.of()).getFirst();
+        assertEquals(OWNER, described.getOwnerId());
+        assertTrue(described.getTags().isEmpty());
+        described.getBlockDeviceMappings().getFirst().getEbs().setSnapshotId("snap-changed");
+        assertNotEquals("snap-changed", snapshotId(source));
         assertEquals(before, store("ec2-registered-images.json").keys());
         assertEquals("owner", source.getTags().getFirst().getValue());
         assertFalse(store("ec2-tags.json").keys().stream().anyMatch(key -> key.startsWith(RECIPIENT + "/")));
         assertEquals("ami-0123456789abcdef0", recipient.describeImages(REGION,
                 List.of("ami-0123456789abcdef0"), List.of(), Map.of()).getFirst().getImageId());
+    }
+
+    @Test
+    void sharedImageReadsHonorOwnersFiltersRevocationAndSharedTagVisibility() {
+        Image source = source();
+        grant(source);
+        source.setTags(List.of(new Tag("Private", "owner"), new Tag("ec2:SharedTag/purpose", "worker")));
+        assertTrue(recipient.describeImages(REGION, List.of(source.getImageId()), List.of("self"), Map.of()).isEmpty());
+        assertTrue(recipient.describeImages(REGION, List.of(source.getImageId()), List.of(),
+                Map.of("tag:Private", List.of("owner"))).isEmpty());
+        Image visible = recipient.describeImages(REGION, List.of(), List.of(OWNER),
+                Map.of("tag:ec2:SharedTag/purpose", List.of("worker"))).getFirst();
+        assertEquals(source.getImageId(), visible.getImageId());
+        assertEquals(1, visible.getTags().size());
+        owner.modifyImageLaunchPermissions(REGION, source.getImageId(), List.of(), List.of(RECIPIENT), false);
+        assertTrue(recipient.describeImages(REGION, List.of(), List.of(OWNER), Map.of()).isEmpty());
+        assertEquals("InvalidAMIID.NotFound", assertThrows(AwsException.class,
+                () -> recipient.describeImages(REGION, List.of(source.getImageId()), List.of(), Map.of())).getErrorCode());
+        assertEquals("InvalidAMIID.NotFound", assertThrows(AwsException.class,
+                () -> recipient.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
+                        null, List.of(), null, null, List.of(), null, null)).getErrorCode());
+    }
+
+    @Test
+    void createVolumeFromSharedSnapshotUsesNativeSizeAndDoesNotMutateTheSource() {
+        Image source = source();
+        grant(source);
+        String id = snapshotId(source);
+        Volume volume = recipient.createVolume(REGION, REGION + "a", "gp3", 0, false,
+                3000, 125, id, List.of(new Tag("Recipient", "volume")));
+        assertEquals(10, volume.getSize());
+        assertEquals(id, volume.getSnapshotId());
+        assertEquals(125, volume.getThroughput());
+        Snapshot original = owner.describeSnapshots(REGION, List.of(id), List.of("self"), Map.of()).getFirst();
+        assertEquals(OWNER, original.getOwnerId());
+        assertEquals("Private", original.getTags().getFirst().getKey());
+        assertTrue(recipient.describeSnapshots(REGION, List.of(), List.of("self"), Map.of()).isEmpty());
+        Set<String> before = Set.copyOf(store("ec2-volumes.json").keys());
+        assertEquals("InvalidParameterValue", assertThrows(AwsException.class,
+                () -> recipient.createVolume(REGION, REGION + "a", "gp3", 9, false,
+                        3000, 125, id, List.of())).getErrorCode());
+        assertEquals("InvalidSnapshot.NotFound", assertThrows(AwsException.class,
+                () -> service(OTHER).createVolume(REGION, REGION + "a", "gp3", 10, false,
+                        3000, 125, id, List.of())).getErrorCode());
+        assertEquals("InvalidSnapshot.NotFound", assertThrows(AwsException.class,
+                () -> recipient.createVolume(DESTINATION, DESTINATION + "a", "gp3", 10, false,
+                        3000, 125, id, List.of())).getErrorCode());
+        owner.modifySnapshotCreateVolumePermissions(REGION, id, List.of(), List.of(RECIPIENT), false);
+        assertEquals("InvalidSnapshot.NotFound", assertThrows(AwsException.class,
+                () -> recipient.createVolume(REGION, REGION + "a", "gp3", 10, false,
+                        3000, 125, id, List.of())).getErrorCode());
+        assertEquals(before, store("ec2-volumes.json").keys());
     }
 
     @Test
@@ -254,13 +315,17 @@ class Ec2ImageSharingServiceTest {
     }
 
     private Ec2Service service(String account) {
+        return service(account, true);
+    }
+
+    private Ec2Service service(String account, boolean mockMode) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
         when(config.defaultAccountId()).thenReturn(account);
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
-        when(ec2.mock()).thenReturn(true);
+        when(ec2.mock()).thenReturn(mockMode);
         StorageFactory storage = new StorageFactory(null, null) {
             @Override
             public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,

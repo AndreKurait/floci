@@ -6112,7 +6112,7 @@ public class Ec2QueryHandler {
         String availabilityZone = p.getFirst("AvailabilityZone");
         String volumeType = p.getFirst("VolumeType");
         String sizeStr = p.getFirst("Size");
-        int size = sizeStr != null ? Integer.parseInt(sizeStr) : 8;
+        int size = sizeStr != null ? Integer.parseInt(sizeStr) : 0;
         String encryptedStr = p.getFirst("Encrypted");
         boolean encrypted = "true".equalsIgnoreCase(encryptedStr);
         String iopsStr = p.getFirst("Iops");
