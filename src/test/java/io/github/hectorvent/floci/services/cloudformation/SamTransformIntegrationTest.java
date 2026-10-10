@@ -9,8 +9,8 @@ import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.Base64;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -23,8 +23,8 @@ import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasItems;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
-import static org.hamcrest.Matchers.startsWith;
 import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.startsWith;
 
 @QuarkusTest
 class SamTransformIntegrationTest {

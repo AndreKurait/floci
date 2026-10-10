@@ -152,7 +152,7 @@ cross-resource references.
 | Cloud Map | `HttpNamespace`, `PrivateDnsNamespace`, `PublicDnsNamespace`, `Service` |
 | API Gateway (v1) | `RestApi`, `Resource`, `Authorizer`, `Method`, `Deployment`, `Stage`, `Account`, `DomainName`, `BasePathMapping`, `GatewayResponse`, `ApiKey`, `UsagePlan`, `UsagePlanKey` |
 | API Gateway v2 | `Api`, `Authorizer`, `Route`, `Integration`, `Stage`, `Deployment`, `VpcLink` |
-| AppSync | `GraphQLApi`, `GraphQLSchema`, `DataSource`, `FunctionConfiguration`, `Resolver`, `ApiKey` |
+| AppSync | `GraphQLApi`, `GraphQLSchema`, `DataSource`, `FunctionConfiguration`, `Resolver`, `ApiKey`. `Ref` on `GraphQLApi` and `ApiKey` returns the id where AWS returns the ARN. See [AppSync](appsync.md#cloudformation) for `Ref` and `Fn::GetAtt` compared with AWS. |
 | Step Functions | `StateMachine` |
 | CodePipeline | `Pipeline`, `CustomActionType`, `Webhook` |
 | CodeBuild | `Project` |
@@ -432,6 +432,9 @@ Lambda. floci supports two shapes:
   event and waits for it to `PUT` its `SUCCESS`/`FAILED` result to the response URL. Inline `ZipFile`
   handlers get the `cfn-response` / `cfnresponse` module bundled in (see the Lambda row in
   [Supported Resource Types](#supported-resource-types)), so Solutions-style handlers work unmodified.
+  The event's `StackId` is the id of the stack that contains the resource, the value
+  `Ref AWS::StackId` returns and `DescribeStacks` reports, on `Create`, `Update` and `Delete` alike.
+  In a nested stack it is the nested stack's own id.
 - **CDK Provider framework** — when the `ServiceToken` points at a CDK `framework.onEvent` function,
   floci drives the asynchronous provider protocol: `onEvent` starts the work and `framework.isComplete`
   is polled (via Step Functions [`Retry`](step-functions.md)) until it reports done, at which point the

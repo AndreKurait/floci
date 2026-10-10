@@ -34,7 +34,13 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import static io.github.hectorvent.floci.services.iam.InlinePolicyTestHelper.policyWithNonWhitespaceLength;
 import static org.junit.jupiter.api.Assertions.*;
 
 class IamServiceTest {
@@ -73,6 +79,66 @@ class IamServiceTest {
                 regionResolver,
                 seedDeployerPrincipal
         );
+    }
+
+    @Test
+    void roleInlinePolicyQuotaIgnoresWhitespaceAndPreservesRejectedReplacement() {
+        iamService.createRole("R", "/", "{}", null, 0, null);
+        String exactLimit = policyWithNonWhitespaceLength(10_240);
+        String padded = exactLimit.substring(0, 1) + " \n\t\r ".repeat(1_000) + exactLimit.substring(1);
+        iamService.putRolePolicy("R", "inline-exec", padded);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.putRolePolicy("R", "inline-exec", policyWithNonWhitespaceLength(10_241)));
+
+        assertEquals("LimitExceeded", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        assertEquals(padded, iamService.getRolePolicy("R", "inline-exec"));
+    }
+
+    @Test
+    void roleInlinePolicyQuotaCountsAllPolicies() {
+        iamService.createRole("R", "/", "{}", null, 0, null);
+        iamService.putRolePolicy("R", "first", policyWithNonWhitespaceLength(6_000));
+        iamService.putRolePolicy("R", "second", policyWithNonWhitespaceLength(4_041));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.putRolePolicy("R", "third", policyWithNonWhitespaceLength(200)));
+
+        assertEquals("LimitExceeded", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        assertEquals(List.of("first", "second"), iamService.listRolePolicies("R").stream().sorted().toList());
+    }
+
+    @Test
+    void roleInlinePolicyQuotaIsAtomicAcrossConcurrentWrites() throws Exception {
+        iamService.createRole("R", "/", "{}", null, 0, null);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger accepted = new AtomicInteger();
+        AtomicInteger rejected = new AtomicInteger();
+
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            for (String policyName : List.of("first", "second")) {
+                executor.submit(() -> {
+                    start.await();
+                    try {
+                        iamService.putRolePolicy("R", policyName, policyWithNonWhitespaceLength(6_000));
+                        accepted.incrementAndGet();
+                    } catch (AwsException error) {
+                        assertEquals("LimitExceeded", error.getErrorCode());
+                        rejected.incrementAndGet();
+                    }
+                    return null;
+                });
+            }
+            start.countDown();
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+
+        assertEquals(1, accepted.get());
+        assertEquals(1, rejected.get());
+        assertEquals(1, iamService.listRolePolicies("R").size());
     }
 
     /** The STS global endpoint, and so the token version it reports, exists only in the commercial partition. */
@@ -1520,6 +1586,80 @@ class IamServiceTest {
         IamService service = iamService(false, accessKeys, new InMemoryStorage<>());
 
         assertTrue(service.resolveAccountId(accessKey.getAccessKeyId()).isEmpty());
+    }
+
+    @Test
+    void anInactiveAccessKeyIsReportedWhicheverAccountHoldsIt() {
+        AccountAwareStorageBackend<AccessKey> accessKeys = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        AccessKey inactive = new AccessKey("AKIAINACTIVEEXAMPLE", "secret", "worker");
+        inactive.setStatus("Inactive");
+        accessKeys.putForAccount("111122223333", inactive.getAccessKeyId(), inactive);
+        AccessKey active = new AccessKey("AKIAACTIVEEXAMPLE", "secret", "worker");
+        accessKeys.putForAccount("111122223333", active.getAccessKeyId(), active);
+
+        IamService service = iamService(false, accessKeys, new InMemoryStorage<>());
+
+        // Routing skips the inactive key, so a request lands in another account than the one holding it.
+        assertTrue(service.isInactiveAccessKey(inactive.getAccessKeyId()));
+        assertFalse(service.isInactiveAccessKey(active.getAccessKeyId()));
+        assertFalse(service.isInactiveAccessKey("AKIADOESNOTEXIST0000"));
+        assertFalse(service.isInactiveAccessKey("ASIATEMPORARYEXAMPLE"));
+        assertFalse(service.isInactiveAccessKey(null));
+    }
+
+    @Test
+    void anExpiredSessionIsReportedWhicheverAccountStoresItAndIsNotDeletedByAsking() {
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        service.registerSessionForAccount("111122223333", "ASIAEXPIREDEXAMPLE", "secret",
+                "arn:aws:iam::111122223333:role/worker", Instant.parse("2020-01-01T00:00:00Z"), null);
+        service.registerSessionForAccount("111122223333", "ASIALIVEEXAMPLE", "secret",
+                "arn:aws:iam::111122223333:role/worker", Instant.parse("2999-01-01T00:00:00Z"), null);
+
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+
+        assertTrue(service.isExpiredSession("ASIAEXPIREDEXAMPLE", now));
+        // Still stored, so a second request is answered the same way.
+        assertTrue(service.isExpiredSession("ASIAEXPIREDEXAMPLE", now));
+        assertFalse(service.isExpiredSession("ASIALIVEEXAMPLE", now));
+        assertFalse(service.isExpiredSession("ASIADOESNOTEXIST0000", now));
+        assertFalse(service.isExpiredSession("AKIAEXPIREDEXAMPLE", now));
+        assertFalse(service.isExpiredSession(null, now));
+    }
+
+    @Test
+    void aSessionLiveAtTheMomentEnforcementAsksAboutIsResolvedAndKept() {
+        // Enforcement asks both questions about one moment. A lookup reading its own, later clock
+        // could find the session expired, delete it and leave it to be answered as unknown.
+        IamService service = iamService(false, new InMemoryStorage<>(), new InMemoryStorage<>());
+        Instant expiration = Instant.parse("2026-01-01T00:00:00Z");
+        service.registerSessionForAccount("000000000000", "ASIAEXPIRINGEXAMPLE", "secret",
+                "arn:aws:iam::000000000000:role/worker", expiration, null);
+        Instant asked = expiration.minusNanos(1);
+
+        assertFalse(service.isExpiredSession("ASIAEXPIRINGEXAMPLE", asked));
+        assertNotNull(service.resolveCallerContext("ASIAEXPIRINGEXAMPLE", asked));
+        // Not deleted, so the next request finds it expired rather than unknown.
+        assertTrue(service.isExpiredSession("ASIAEXPIRINGEXAMPLE", expiration.plusNanos(1)));
+    }
+
+    @Test
+    void anAccessKeyOfTheRequestAccountIsCheckedWithoutScanningOtherAccounts() {
+        AccountAwareStorageBackend<AccessKey> accessKeys = Mockito.spy(new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000"));
+        AccessKey active = new AccessKey("AKIAOWNACTIVEKEY", "secret", "dev");
+        accessKeys.putForAccount("000000000000", active.getAccessKeyId(), active);
+        AccessKey inactive = new AccessKey("AKIAOWNINACTIVEKEY", "secret", "dev");
+        inactive.setStatus("Inactive");
+        accessKeys.putForAccount("000000000000", inactive.getAccessKeyId(), inactive);
+
+        IamService service = iamService(false, accessKeys, new InMemoryStorage<>());
+
+        assertFalse(service.isInactiveAccessKey(active.getAccessKeyId()));
+        assertTrue(service.isInactiveAccessKey(inactive.getAccessKeyId()));
+        Mockito.verify(accessKeys, Mockito.never()).scanAllAccountEntries(Mockito.any());
     }
 
     @Test

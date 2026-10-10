@@ -188,6 +188,9 @@ row_notes:
     Creates backing resources with ID Ref/GetAtt values and removes them on stack deletion.
     Property-changing updates and unsupported properties are rejected; environment monitors
     are retained as metadata, without alarm evaluation.
+  AWS::AppSync: >-
+    `Ref` on `GraphQLApi` and `ApiKey` returns the id where AWS returns the ARN. See
+    [AppSync](appsync.md#cloudformation) for `Ref` and `Fn::GetAtt` compared with AWS.
   AWS::Lambda: >-
     Inline `ZipFile` packages include the `cfn-response` (Node.js) / `cfnresponse` (Python) module
     AWS injects for that code path, so Solutions-style custom-resource handlers work.

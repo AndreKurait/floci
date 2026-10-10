@@ -1,5 +1,19 @@
 package io.github.hectorvent.floci.services.lambda.launcher;
 
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.ConnectToNetworkCmd;
+import com.github.dockerjava.api.command.CopyArchiveFromContainerCmd;
+import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
+import com.github.dockerjava.api.command.ExecCreateCmd;
+import com.github.dockerjava.api.command.ExecCreateCmdResponse;
+import com.github.dockerjava.api.command.ExecStartCmd;
+import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.AccessMode;
+import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.Mount;
+import com.github.dockerjava.api.model.MountType;
+import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -9,6 +23,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
@@ -20,20 +35,6 @@ import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactor
 import io.smallrye.config.EnvConfigSource;
 import io.smallrye.config.SmallRyeConfig;
 import io.smallrye.config.SmallRyeConfigBuilder;
-import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.async.ResultCallback;
-import com.github.dockerjava.api.command.ConnectToNetworkCmd;
-import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
-import com.github.dockerjava.api.command.ExecCreateCmd;
-import com.github.dockerjava.api.command.ExecCreateCmdResponse;
-import com.github.dockerjava.api.command.ExecStartCmd;
-import com.github.dockerjava.api.command.CopyArchiveFromContainerCmd;
-import com.github.dockerjava.api.exception.NotFoundException;
-import com.github.dockerjava.api.model.AccessMode;
-import com.github.dockerjava.api.model.Frame;
-import com.github.dockerjava.api.model.StreamType;
-import com.github.dockerjava.api.model.Mount;
-import com.github.dockerjava.api.model.MountType;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
@@ -47,8 +48,6 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-
-import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;

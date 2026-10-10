@@ -1,5 +1,8 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -8,6 +11,9 @@ import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudformation.model.ChangeSet;
@@ -22,9 +28,6 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.UpdateCle
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.ssm.SsmService;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -35,23 +38,20 @@ import java.net.URI;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import io.github.hectorvent.floci.core.resource.ExplorerResource;
-import io.github.hectorvent.floci.core.resource.ResourceProvider;
-import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -1863,6 +1863,10 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private List<UpdateCleanupFailure> finishCommittedResourceCleanup(Stack stack, String region) {
+        return finishCommittedResourceCleanup(stack, region, false);
+    }
+
+    private List<UpdateCleanupFailure> finishCommittedResourceCleanup(Stack stack, String region, boolean deleting) {
         List<UpdateCleanupFailure> failures = new ArrayList<>();
         // Dependents go before what they depend on, as when the stack is deleted: a displaced
         // listener has to go before the displaced target group it still forwards to, or that
@@ -1883,7 +1887,8 @@ public class CloudFormationService implements ResourceProvider {
                         null);
             }
             while (true) {
-                UpdateCleanupResult result = dispatcher.completeUpdate(resource);
+                UpdateCleanupResult result = deleting ? dispatcher.completeDeleteCleanup(resource)
+                        : dispatcher.completeUpdate(resource);
                 if (!result.applicable()) {
                     break;
                 }
@@ -1897,7 +1902,11 @@ public class CloudFormationService implements ResourceProvider {
                                 "DELETE_COMPLETE",
                                 null);
                     }
-                    dispatcher.clearUpdate(resource);
+                    if (deleting) {
+                        dispatcher.clearDeleteCleanup(resource);
+                    } else {
+                        dispatcher.clearUpdate(resource);
+                    }
                     break;
                 }
                 if (result.attempts() < 3) {
@@ -1916,7 +1925,11 @@ public class CloudFormationService implements ResourceProvider {
                         resource.getResourceType(),
                         "DELETE_FAILED",
                         reason);
-                dispatcher.clearUpdate(resource);
+                if (deleting) {
+                    dispatcher.clearDeleteCleanup(resource);
+                } else {
+                    dispatcher.clearUpdate(resource);
+                }
                 break;
             }
         }
@@ -2350,7 +2363,7 @@ public class CloudFormationService implements ResourceProvider {
             // last update left in place. An entity displaced by a replacement whose cleanup phase
             // never ended is named only by the cleanup the resource still carries, so the stack
             // deletes that one too: nothing else ever will.
-            for (UpdateCleanupFailure displacedFailure : finishCommittedResourceCleanup(stack, region)) {
+            for (UpdateCleanupFailure displacedFailure : finishCommittedResourceCleanup(stack, region, true)) {
                 failedResources.add(displacedFailure.logicalId());
             }
             for (StackResource resource : resources) {

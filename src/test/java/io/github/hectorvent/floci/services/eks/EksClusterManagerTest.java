@@ -1,34 +1,5 @@
 package io.github.hectorvent.floci.services.eks;
 
-import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.config.FlociCertificateAuthority;
-import io.github.hectorvent.floci.core.common.AwsRegions;
-import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
-import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
-import io.github.hectorvent.floci.core.common.dns.DnsForwardingRule;
-import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
-import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
-import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
-import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
-import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
-import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
-import io.github.hectorvent.floci.core.common.docker.PortAllocator;
-import io.github.hectorvent.floci.core.storage.InMemoryStorage;
-import io.github.hectorvent.floci.core.storage.StorageBackend;
-import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
-import io.github.hectorvent.floci.services.eks.model.CertificateAuthority;
-import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
-import io.github.hectorvent.floci.services.eks.model.Cluster;
-import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
-import io.github.hectorvent.floci.services.eks.model.ClusterOidcKey;
-import io.github.hectorvent.floci.services.eks.model.LogSetup;
-import io.github.hectorvent.floci.services.eks.model.Logging;
-import io.github.hectorvent.floci.services.eks.model.Nodegroup;
-import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
-import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
-import io.github.hectorvent.floci.testutil.LogCapture;
-
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
@@ -46,20 +17,48 @@ import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Info;
 import com.github.dockerjava.api.model.NetworkSettings;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
+import io.github.hectorvent.floci.core.common.dns.DnsForwardingRule;
+import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
+import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.PortAllocator;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.ec2.Ec2InstanceTypeCatalog;
 import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
+import io.github.hectorvent.floci.services.eks.model.CertificateAuthority;
+import io.github.hectorvent.floci.services.eks.model.Cluster;
+import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
+import io.github.hectorvent.floci.services.eks.model.ClusterOidcKey;
+import io.github.hectorvent.floci.services.eks.model.LogSetup;
+import io.github.hectorvent.floci.services.eks.model.Logging;
+import io.github.hectorvent.floci.services.eks.model.Nodegroup;
+import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
+import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
+import io.github.hectorvent.floci.testutil.LogCapture;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
@@ -1060,7 +1059,7 @@ class EksClusterManagerTest {
             when(dockerClient.copyArchiveToContainerCmd(anyString())).thenReturn(copyCmd);
 
             registryManager = Mockito.mock(EcrRegistryManager.class);
-
+            when(registryManager.advertisedPort()).thenReturn(4566);
             config = Mockito.mock(EmulatorConfig.class);
             eks = Mockito.mock(EmulatorConfig.EksServiceConfig.class);
             ecr = Mockito.mock(EmulatorConfig.EcrServiceConfig.class);
@@ -1093,6 +1092,22 @@ class EksClusterManagerTest {
             verify(config, never()).tls();
             String yaml = Files.readString(tempDir.resolve("registries/demo/registries.yaml"));
             assertFalse(yaml.contains("localhost.floci.io"));
+        }
+
+        @Test
+        void mirrorsTheAdvertisedRegistryPortToTheInNetworkDataPlane() throws Exception {
+            // Floci published as -p 54321:4566: pods name the advertised repository URI, while
+            // k3s still reaches Floci on its own port inside the Docker network.
+            when(registryManager.advertisedPort()).thenReturn(54321);
+
+            manager.injectEcrRegistryMirror("container-1", "demo");
+
+            String yaml = Files.readString(tempDir.resolve("registries/demo/registries.yaml"));
+            assertTrue(yaml.contains("\"000000000000.dkr.ecr.us-east-1.localhost:54321\":"));
+            assertTrue(yaml.contains("\"localhost:54321\":"));
+            assertFalse(yaml.contains("localhost:4566\":"));
+            assertTrue(yaml.contains("- \"http://floci:4566\""));
+            verify(copyCmd).exec();
         }
 
         @Test

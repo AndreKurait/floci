@@ -82,6 +82,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -100,6 +101,7 @@ import java.util.stream.Stream;
 @ApplicationScoped
 public class IamService implements SessionAccountLookup, ResourceProvider {
 
+    private static final int ROLE_INLINE_POLICY_SIZE_LIMIT = 10_240;
     private static final Logger LOG = Logger.getLogger(IamService.class);
     private static final String CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final String TEMPORARY_ACCESS_KEY_PREFIX = "ASIA";
@@ -166,6 +168,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     /** CustomSuffix as AWS constrains it: 1-64 characters of {@code [\w+=,.@-]}. */
     private static final Pattern CUSTOM_SUFFIX_PATTERN = Pattern.compile("[\\w+=,.@-]{1,64}");
     private static final int ROLE_NAME_MAX_LENGTH = 64;
+    /** roleNameType's character set. Excluding {@code :} is what reserves names such as {@code aws:ec2-instance} for AWS. */
+    private static final Pattern ROLE_NAME_PATTERN = Pattern.compile("[\\w+=,.@-]+");
     /** groupNameType / instanceProfileNameType: 1-128 characters of {@code [\w+=,.@-]}. */
     private static final Pattern IAM_RESOURCE_NAME_PATTERN = Pattern.compile("[\\w+=,.@-]{1,128}");
     /**
@@ -1010,6 +1014,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public IamRole createRole(String roleName, String path, String assumeRolePolicyDocument,
                               String description, int maxSessionDuration, Map<String, String> tags,
                               String permissionsBoundaryArn) {
+        validateRoleName(roleName);
         if (permissionsBoundaryArn != null) {
             requirePolicy(permissionsBoundaryArn); // validate before anything is created
         }
@@ -1053,6 +1058,25 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             return aware.getForAccount(accountId, roleName);
         }
         return roles.get(roleName);
+    }
+
+    /** roleNameType: 1-64 characters of {@code [\w+=,.@-]}, reported the way AWS reports a model constraint. */
+    private static void validateRoleName(String roleName) {
+        String constraint;
+        if (roleName == null) {
+            constraint = "Member must not be null";
+        } else if (roleName.isEmpty()) {
+            constraint = "Member must have length greater than or equal to 1";
+        } else if (roleName.length() > ROLE_NAME_MAX_LENGTH) {
+            constraint = "Member must have length less than or equal to " + ROLE_NAME_MAX_LENGTH;
+        } else if (!ROLE_NAME_PATTERN.matcher(roleName).matches()) {
+            constraint = "Member must satisfy regular expression pattern: " + ROLE_NAME_PATTERN.pattern();
+        } else {
+            return;
+        }
+        String value = roleName == null ? "null" : "'" + roleName + "'";
+        throw new AwsException("ValidationError", "1 validation error detected: Value " + value
+                + " at 'roleName' failed to satisfy constraint: " + constraint, 400);
     }
 
     /**
@@ -1419,8 +1443,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 && !"AWS".equalsIgnoreCase(scope)
                 && !"Local".equalsIgnoreCase(scope)) {
             throw new AwsException("ValidationError",
-                    "Value '" + scope + "' at 'scope' failed to satisfy constraint: "
-                            + "Member must satisfy enum value set: [All, AWS, Local]", 400);
+                    "1 validation error detected: Value '" + scope + "' at 'scope' failed to "
+                            + "satisfy constraint: Member must satisfy enum value set: "
+                            + "[All, AWS, Local]", 400);
         }
         String prefix = pathPrefix != null ? pathPrefix : "/";
         boolean blankScope = scope == null || scope.isBlank();
@@ -1807,8 +1832,30 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void putRolePolicy(String roleName, String policyName, String policyDocument) {
         IamRole role = getRole(roleName);
         requireNotServiceLinked(role, roleName);
-        role.getInlinePolicies().put(policyName, policyDocument);
-        roles.put(roleName, role);
+        Map<String, String> inlinePolicies = role.getInlinePolicies();
+        synchronized (inlinePolicies) {
+            long aggregateSize = inlinePolicies.entrySet().stream()
+                    .filter(entry -> !entry.getKey().equals(policyName))
+                    .mapToLong(entry -> nonWhitespaceLength(entry.getValue()))
+                    .sum() + nonWhitespaceLength(policyDocument);
+            if (aggregateSize > ROLE_INLINE_POLICY_SIZE_LIMIT) {
+                throw new AwsException("LimitExceeded",
+                        "Maximum policy size of 10240 bytes exceeded for role " + roleName, 409);
+            }
+            inlinePolicies.put(policyName, policyDocument);
+            roles.put(roleName, role);
+        }
+    }
+
+    private static int nonWhitespaceLength(String policyDocument) {
+        int size = 0;
+        for (int i = 0; i < policyDocument.length(); i++) {
+            char character = policyDocument.charAt(i);
+            if (character != ' ' && character != '\t' && character != '\n' && character != '\r') {
+                size++;
+            }
+        }
+        return size;
     }
 
     public String getRolePolicy(String roleName, String policyName) {
@@ -2305,8 +2352,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void putAccountProperties(Map<String, String> properties) {
         if (properties == null || properties.isEmpty()) {
             throw new AwsException("ValidationError",
-                    "Value null at 'properties' failed to satisfy constraint: Member must not be "
-                            + "null", 400);
+                    "1 validation error detected: Value null at 'properties' failed to "
+                            + "satisfy constraint: Member must not be null", 400);
         }
         String namespace = null;
         for (Map.Entry<String, String> entry : properties.entrySet()) {
@@ -2343,7 +2390,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         if (key == null || key.isEmpty() || key.length() > MAX_ACCOUNT_PROPERTY_KEY_LENGTH
                 || !ACCOUNT_PROPERTY_KEY_PATTERN.matcher(key).matches()) {
             throw new AwsException("ValidationError",
-                    "Value '" + key + "' at 'properties' failed to satisfy constraint: Map keys "
+                    "1 validation error detected: Value '" + key + "' at 'properties' failed "
+                            + "to satisfy constraint: Map keys "
                             + "must satisfy constraint: [Member must have length less than or "
                             + "equal to " + MAX_ACCOUNT_PROPERTY_KEY_LENGTH + ", Member must "
                             + "satisfy regular expression pattern: "
@@ -2363,9 +2411,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         if (value == null || value.isEmpty()
                 || value.length() > MAX_ACCOUNT_PROPERTY_VALUE_LENGTH) {
             throw new AwsException("ValidationError",
-                    "Value at 'properties." + key + "' failed to satisfy constraint: Member must "
-                            + "have length between 1 and " + MAX_ACCOUNT_PROPERTY_VALUE_LENGTH,
-                    400);
+                    "1 validation error detected: Value at 'properties." + key + "' failed to "
+                            + "satisfy constraint: Member must have length between 1 and "
+                            + MAX_ACCOUNT_PROPERTY_VALUE_LENGTH, 400);
         }
     }
 
@@ -2374,8 +2422,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         if (globalEndpointTokenVersion == null
                 || !GLOBAL_ENDPOINT_TOKEN_VERSIONS.contains(globalEndpointTokenVersion)) {
             throw new AwsException("ValidationError",
-                    "Value '" + globalEndpointTokenVersion + "' at 'globalEndpointTokenVersion' "
-                            + "failed to satisfy constraint: Member must satisfy enum value set: ["
+                    "1 validation error detected: Value '" + globalEndpointTokenVersion
+                            + "' at 'globalEndpointTokenVersion' failed to satisfy constraint: "
+                            + "Member must satisfy enum value set: ["
                             + String.join(", ", GLOBAL_ENDPOINT_TOKEN_VERSIONS) + "]", 400);
         }
         stsPreferences.put(STS_PREFERENCES_KEY, globalEndpointTokenVersion);
@@ -2671,6 +2720,32 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
     public void deleteServerCertificate(String name) {
         deleteServerCertificate(name, List.of());
+    }
+
+    /**
+     * Runs an action that checks a server certificate and then records a reference to it, holding
+     * the lock {@link #deleteServerCertificate} takes so the certificate cannot be deleted in
+     * between. Without it the check and the write straddle the delete: the delete sees no
+     * reference because the referring resource is not saved yet, removes the certificate, and the
+     * resource is then saved pointing at something that is gone.
+     *
+     * <p>Safe to call from inside a provider's own monitor, because the ordering only ever runs
+     * one way. {@code deleteServerCertificate} holds this lock while calling
+     * {@link ServerCertificateReferenceProvider#serverCertificateReferences()} on each provider,
+     * and those are plain reads over the provider's own store that take no provider monitor, so
+     * IAM never waits on a provider while a provider waits on IAM.
+     */
+    public <T> T supplyWithServerCertificatesHeld(Supplier<T> action) {
+        synchronized (serverCertificateLock) {
+            return action.get();
+        }
+    }
+
+    /** {@link #supplyWithServerCertificatesHeld} for an action with no result. */
+    public void runWithServerCertificatesHeld(Runnable action) {
+        synchronized (serverCertificateLock) {
+            action.run();
+        }
     }
 
     /**
@@ -3073,10 +3148,10 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             if (credentialAgeDays < MIN_CREDENTIAL_AGE_DAYS
                     || credentialAgeDays > MAX_CREDENTIAL_AGE_DAYS) {
                 throw new AwsException("ValidationError",
-                        "Value '" + credentialAgeDays + "' at 'credentialAgeDays' failed to "
-                                + "satisfy constraint: Member must be between "
-                                + MIN_CREDENTIAL_AGE_DAYS + " and " + MAX_CREDENTIAL_AGE_DAYS,
-                        400);
+                        "1 validation error detected: Value '" + credentialAgeDays
+                                + "' at 'credentialAgeDays' failed to satisfy constraint: "
+                                + "Member must be between " + MIN_CREDENTIAL_AGE_DAYS + " and "
+                                + MAX_CREDENTIAL_AGE_DAYS, 400);
             }
         }
         synchronized (serviceCredentialLock) {
@@ -4420,6 +4495,15 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * <p>Returns {@code null} if the access key is unknown (bypass — backward-compatible).
      */
     public CallerContext resolveCallerContext(String accessKeyId) {
+        return resolveCallerContext(accessKeyId, Instant.now());
+    }
+
+    /**
+     * {@link #resolveCallerContext(String)} as of {@code now}. Enforcement passes the moment it
+     * asked {@link #isExpiredSession} about, so a session that expires between the two calls is
+     * neither deleted here nor then answered as a key that exists nowhere.
+     */
+    public CallerContext resolveCallerContext(String accessKeyId, Instant now) {
         // Check user access keys
         Optional<AccessKey> akOpt = accessKeys.get(accessKeyId);
         if (akOpt.isPresent()) {
@@ -4434,7 +4518,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         Optional<SessionCredential> sessionOpt = findSessionForCallerContext(accessKeyId);
         if (sessionOpt.isPresent()) {
             SessionCredential session = sessionOpt.get();
-            if (session.getExpiration() != null && session.getExpiration().isBefore(Instant.now())) {
+            if (session.getExpiration() != null && session.getExpiration().isBefore(now)) {
                 deleteSession(accessKeyId, session);
                 return null; // expired — unknown key → bypass
             }
@@ -4469,6 +4553,10 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * an unauthenticated caller, so enforcement needs to tell them apart. The lookup spans every
      * account deliberately: a key belonging to another account is a real credential, and denying
      * it here would be a false rejection rather than a closed hole.
+     *
+     * <p>An inactive key counts too. {@link #registerIssuedSession} relies on that, so a session
+     * minted with an inactive key has no issuer rather than acting as the account root, and
+     * enforcement refuses the key itself through {@link #isInactiveAccessKey}.
      */
     public boolean isKnownAccessKey(String accessKeyId) {
         if (accessKeyId == null || accessKeyId.isBlank()) {
@@ -4482,6 +4570,43 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         }
         return accessKeys instanceof AccountAwareStorageBackend<AccessKey> aware
                 && !aware.scanAllAccountEntries(accessKeyId::equals).isEmpty();
+    }
+
+    /**
+     * True when this is an IAM user's long-term access key, in any account, that is not Active. An
+     * inactive key can't be used for API calls (IAM User Guide, "Manage access keys for IAM
+     * users"), so enforcement refuses it as it refuses a key that exists nowhere, rather than
+     * letting {@link #isKnownAccessKey}, which counts it as a credential, wave it through.
+     */
+    public boolean isInactiveAccessKey(String accessKeyId) {
+        if (accessKeyId == null || accessKeyId.isBlank() || isTemporaryAccessKey(accessKeyId)) {
+            return false;
+        }
+        // Routing sends an active key to its own account, so the usual case is answered here
+        // without scanning the others. An inactive key lands in the default account instead.
+        Optional<AccessKey> routed = accessKeys.get(accessKeyId);
+        if (routed.isPresent()) {
+            return !"Active".equals(routed.get().getStatus());
+        }
+        return accessKeys instanceof AccountAwareStorageBackend<AccessKey> aware
+                && aware.scanAllAccountEntries(accessKeyId::equals).stream()
+                        .anyMatch(entry -> !"Active".equals(entry.value().getStatus()));
+    }
+
+    /**
+     * True when this temporary access key belongs to a session that had expired by {@code now} but
+     * is still stored. AWS answers its use with {@code ExpiredTokenException} rather than as a key
+     * it does not know, so enforcement asks before {@link #resolveCallerContext(String, Instant)},
+     * which deletes such a session and leaves nothing to tell the two apart.
+     */
+    public boolean isExpiredSession(String accessKeyId, Instant now) {
+        if (!isTemporaryAccessKey(accessKeyId)) {
+            return false;
+        }
+        return findSessionForCallerContext(accessKeyId)
+                .map(SessionCredential::getExpiration)
+                .filter(expiration -> expiration.isBefore(now))
+                .isPresent();
     }
 
     private Optional<SessionCredential> findSessionForCallerContext(String accessKeyId) {
