@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.VpcDependencyProvider;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elbv2.model.*;
 import io.github.hectorvent.floci.services.iam.ServerCertificateReferenceProvider;
@@ -33,7 +34,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @ApplicationScoped
-public class ElbV2Service implements ResourceProvider, ServerCertificateReferenceProvider {
+public class ElbV2Service implements ResourceProvider, ServerCertificateReferenceProvider, VpcDependencyProvider {
 
     @Inject
     ElbV2DataPlane dataPlane;
@@ -190,46 +191,61 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                            String type, String ipAddressType,
                                            List<String> subnets, List<String> securityGroups,
                                            Map<String, String> initialTags) {
-        validateName(name, "load balancer");
-        Map<String, LoadBalancer> regionLbs = loadBalancers.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
-        boolean duplicate = regionLbs.values().stream()
-                .anyMatch(lb -> lb.getLoadBalancerName().equals(name));
-        if (duplicate) {
-            throw new AwsException("DuplicateLoadBalancerName",
-                    "A load balancer with name '" + name + "' already exists.", 400);
+        synchronized (ec2Service.attachmentTopologyLock(region)) {
+            validateName(name, "load balancer");
+            Map<String, LoadBalancer> regionLbs = loadBalancers.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
+            boolean duplicate = regionLbs.values().stream()
+                    .anyMatch(lb -> lb.getLoadBalancerName().equals(name));
+            if (duplicate) {
+                throw new AwsException("DuplicateLoadBalancerName",
+                        "A load balancer with name '" + name + "' already exists.", 400);
+            }
+
+            String lbType = type != null ? type : "application";
+            String lbScheme = scheme != null ? scheme : "internet-facing";
+            String ipType = ipAddressType != null ? ipAddressType : "ipv4";
+            String typePrefix = lbTypePrefix(lbType);
+            String id = randomHex16();
+            String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "loadbalancer/" + typePrefix + "/" + name + "/" + id).toString();
+            String dnsName = name + "-" + id + ".elb." + loadBalancerDnsSuffix();
+            String vpcId = resolveSubnetVpcId(region, lbType, subnets);
+
+            LoadBalancer lb = new LoadBalancer();
+            lb.setLoadBalancerArn(arn);
+            lb.setDnsName(dnsName);
+            lb.setCanonicalHostedZoneId(canonicalHostedZoneId(lbType, region));
+            lb.setCreatedTime(Instant.now());
+            lb.setLoadBalancerName(name);
+            lb.setScheme(lbScheme);
+            lb.setVpcId(vpcId);
+            lb.setState("active");
+            lb.setType(lbType);
+            lb.setIpAddressType(ipType);
+            lb.setRegion(region);
+            if (subnets != null) lb.setAvailabilityZones(resolveAvailabilityZones(region, subnets));
+            if (securityGroups != null) lb.setSecurityGroups(new ArrayList<>(securityGroups));
+
+            regionLbs.put(arn, lb);
+            loadBalancers.put(region, regionLbs);
+            lbToListeners.put(arn, new ArrayList<>());
+            if (!initialTags.isEmpty()) {
+                tags.put(arn, new LinkedHashMap<>(initialTags));
+            }
+            return lb;
         }
+    }
 
-        String lbType = type != null ? type : "application";
-        String lbScheme = scheme != null ? scheme : "internet-facing";
-        String ipType = ipAddressType != null ? ipAddressType : "ipv4";
-        String typePrefix = lbTypePrefix(lbType);
-        String id = randomHex16();
-        String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "loadbalancer/" + typePrefix + "/" + name + "/" + id).toString();
-        String dnsName = name + "-" + id + ".elb." + loadBalancerDnsSuffix();
-        String vpcId = resolveSubnetVpcId(region, lbType, subnets);
+    @Override
+    public boolean hasSubnetDependency(String region, String subnetId) {
+        return loadBalancers.getOrDefault(region, Map.of()).values().stream()
+                .anyMatch(lb -> lb.getAvailabilityZones().stream()
+                        .anyMatch(zone -> subnetId.equals(zone.getSubnetId())));
+    }
 
-        LoadBalancer lb = new LoadBalancer();
-        lb.setLoadBalancerArn(arn);
-        lb.setDnsName(dnsName);
-        lb.setCanonicalHostedZoneId(canonicalHostedZoneId(lbType, region));
-        lb.setCreatedTime(Instant.now());
-        lb.setLoadBalancerName(name);
-        lb.setScheme(lbScheme);
-        lb.setVpcId(vpcId);
-        lb.setState("active");
-        lb.setType(lbType);
-        lb.setIpAddressType(ipType);
-        lb.setRegion(region);
-        if (subnets != null) lb.setAvailabilityZones(resolveAvailabilityZones(region, subnets));
-        if (securityGroups != null) lb.setSecurityGroups(new ArrayList<>(securityGroups));
-
-        regionLbs.put(arn, lb);
-        loadBalancers.put(region, regionLbs);
-        lbToListeners.put(arn, new ArrayList<>());
-        if (!initialTags.isEmpty()) {
-            tags.put(arn, new LinkedHashMap<>(initialTags));
-        }
-        return lb;
+    @Override
+    public boolean hasVpcDependency(String region, String vpcId) {
+        return loadBalancers.getOrDefault(region, Map.of()).values().stream()
+                .anyMatch(lb -> vpcId.equals(lb.getVpcId()));
     }
 
     private String loadBalancerDnsSuffix() {
@@ -264,34 +280,36 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     }
 
     public void deleteLoadBalancer(String region, String arn) {
-        Map<String, LoadBalancer> regionLbs = loadBalancers.get(region);
-        if (regionLbs == null) {
-            return; // AWS silently ignores non-existent LBs on delete
-        }
-        LoadBalancer lb = regionLbs.remove(arn);
-        if (lb == null) {
-            return;
-        }
-        // cascade: listeners → rules
-        List<String> listenerArns = lbToListeners.remove(arn);
-        if (listenerArns != null) {
-            Map<String, Listener> regionListeners = listeners.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
-            Map<String, Rule> regionRules = rules.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
-            for (String listenerArn : listenerArns) {
-                dataPlane.stopListener(listenerArn);
-                regionListeners.remove(listenerArn);
-                List<String> ruleArns = listenerToRules.remove(listenerArn);
-                if (ruleArns != null) {
-                    ruleArns.forEach(regionRules::remove);
-                }
+        synchronized (ec2Service.attachmentTopologyLock(region)) {
+            Map<String, LoadBalancer> regionLbs = loadBalancers.get(region);
+            if (regionLbs == null) {
+                return; // AWS silently ignores non-existent LBs on delete
             }
-            listeners.put(region, regionListeners);
-            rules.put(region, regionRules);
+            LoadBalancer lb = regionLbs.remove(arn);
+            if (lb == null) {
+                return;
+            }
+            // cascade: listeners → rules
+            List<String> listenerArns = lbToListeners.remove(arn);
+            if (listenerArns != null) {
+                Map<String, Listener> regionListeners = listeners.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
+                Map<String, Rule> regionRules = rules.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
+                for (String listenerArn : listenerArns) {
+                    dataPlane.stopListener(listenerArn);
+                    regionListeners.remove(listenerArn);
+                    List<String> ruleArns = listenerToRules.remove(listenerArn);
+                    if (ruleArns != null) {
+                        ruleArns.forEach(regionRules::remove);
+                    }
+                }
+                listeners.put(region, regionListeners);
+                rules.put(region, regionRules);
+            }
+            // remove from TG index
+            tgToLbs.values().forEach(lbSet -> lbSet.remove(arn));
+            tags.remove(arn);
+            loadBalancers.put(region, regionLbs);
         }
-        // remove from TG index
-        tgToLbs.values().forEach(lbSet -> lbSet.remove(arn));
-        tags.remove(arn);
-        loadBalancers.put(region, regionLbs);
     }
 
     public Map<String, String> describeLoadBalancerAttributes(String region, String arn) {
@@ -328,17 +346,19 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     }
 
     public void setSubnets(String region, String arn, List<String> subnets) {
-        LoadBalancer lb = requireLoadBalancer(region, arn);
-        String vpcId = resolveSubnetVpcId(region, lb.getType(), subnets);
-        if (vpcId != null && lb.getVpcId() != null && !lb.getVpcId().equals(vpcId)) {
-            throw new AwsException("InvalidConfigurationRequest",
-                    "All subnets must belong to the load balancer VPC.", 400);
+        synchronized (ec2Service.attachmentTopologyLock(region)) {
+            LoadBalancer lb = requireLoadBalancer(region, arn);
+            String vpcId = resolveSubnetVpcId(region, lb.getType(), subnets);
+            if (vpcId != null && lb.getVpcId() != null && !lb.getVpcId().equals(vpcId)) {
+                throw new AwsException("InvalidConfigurationRequest",
+                        "All subnets must belong to the load balancer VPC.", 400);
+            }
+            lb.setAvailabilityZones(resolveAvailabilityZones(region, subnets));
+            if (vpcId != null) {
+                lb.setVpcId(vpcId);
+            }
+            persistRegion(loadBalancers, region);
         }
-        lb.setAvailabilityZones(resolveAvailabilityZones(region, subnets));
-        if (vpcId != null) {
-            lb.setVpcId(vpcId);
-        }
-        persistRegion(loadBalancers, region);
     }
 
     public void setIpAddressType(String region, String arn, String ipAddressType) {
