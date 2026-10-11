@@ -1027,6 +1027,8 @@ class Ec2Tests {
                             .securityGroupIds(ownGroupId)
                             .build());
             endpointId = created.vpcEndpoint().vpcEndpointId();
+            assertThat(created.vpcEndpoint().ipAddressType()).isEqualTo(IpAddressType.IPV4);
+            assertThat(created.vpcEndpoint().stateAsString()).isEqualTo("available");
 
             // Asserted on the CREATE response and again on DESCRIBE, because Terraform
             // reads the ids from one and then re-reads them from the other between plan
@@ -1039,6 +1041,14 @@ class Ec2Tests {
             DescribeVpcEndpointsResponse described = ec2.describeVpcEndpoints(
                     DescribeVpcEndpointsRequest.builder().vpcEndpointIds(endpointId).build());
             VpcEndpoint ep = described.vpcEndpoints().get(0);
+            assertThat(ep.ipAddressType()).isEqualTo(IpAddressType.IPV4);
+            assertThat(ep.stateAsString()).isEqualTo("available");
+            ec2.modifyVpcEndpoint(ModifyVpcEndpointRequest.builder().vpcEndpointId(endpointId)
+                    .ipAddressType(IpAddressType.DUALSTACK).build());
+            assertThat(ec2.describeVpcEndpoints(DescribeVpcEndpointsRequest.builder()
+                    .vpcEndpointIds(endpointId).build()).vpcEndpoints().get(0).ipAddressType())
+                    .isEqualTo(IpAddressType.DUALSTACK);
+
 
             assertThat(ep.networkInterfaceIds())
                     .as("DescribeVpcEndpoints response")

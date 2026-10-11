@@ -2549,4 +2549,164 @@ class LambdaServiceTest {
 
         assertEquals(100, esm.getBatchSize());
     }
+
+    @Test
+    void addPermission_keepsSourceAccountAlongsideSourceArn() {
+        // Catches: SourceAccount is silently dropped from the statement when SourceArn is also given
+        service.createFunction(REGION, baseRequest("perm-conditions-fn"));
+
+        Map<String, Object> statement = service.addPermission(REGION, "perm-conditions-fn", null, Map.of(
+                "StatementId", "s3-invoke",
+                "Action", "lambda:InvokeFunction",
+                "Principal", "s3.amazonaws.com",
+                "SourceArn", "arn:aws:s3:::test-bucket",
+                "SourceAccount", "111111111111"));
+
+        assertEquals(Map.of(
+                "ArnLike", Map.of("AWS:SourceArn", "arn:aws:s3:::test-bucket"),
+                "StringEquals", Map.of("AWS:SourceAccount", "111111111111")), statement.get("Condition"));
+    }
+
+    @Test
+    void addPermission_storesAnAccountIdPrincipalAsItsRootArn() {
+        // Catches: a bare 12-digit account ID principal is stored raw instead of as an AWS root ARN
+        service.createFunction(REGION, baseRequest("perm-principal-fn"));
+
+        Map<String, Object> statement = service.addPermission(REGION, "perm-principal-fn", null, Map.of(
+                "StatementId", "cross-account",
+                "Action", "lambda:InvokeFunction",
+                "Principal", "111122223333"));
+
+        assertEquals(Map.of("AWS", "arn:aws:iam::111122223333:root"), statement.get("Principal"));
+    }
+
+    @Test
+    void addPermission_keepsEveryStringConditionInOneStatement() {
+        // Catches: PrincipalOrgID or FunctionUrlAuthType dropped, or split from SourceArn/SourceAccount
+        service.createFunction(REGION, baseRequest("perm-all-fields-fn"));
+
+        Map<String, Object> statement = service.addPermission(REGION, "perm-all-fields-fn", null, Map.of(
+                "StatementId", "urlPermission",
+                "Action", "lambda:InvokeFunctionUrl",
+                "Principal", "*",
+                "SourceArn", "arn:aws:s3:::test-bucket",
+                "SourceAccount", "111111111111",
+                "PrincipalOrgID", "o-1234567890",
+                "FunctionUrlAuthType", "NONE"));
+
+        assertEquals("*", statement.get("Principal"));
+        assertEquals(Map.of(
+                "StringEquals", Map.of(
+                        "AWS:SourceAccount", "111111111111",
+                        "lambda:FunctionUrlAuthType", "NONE",
+                        "aws:PrincipalOrgID", "o-1234567890"),
+                "ArnLike", Map.of("AWS:SourceArn", "arn:aws:s3:::test-bucket")), statement.get("Condition"));
+    }
+
+    @Test
+    void addPermission_storesAnEventSourceTokenAsAStringEqualsCondition() {
+        // Catches: EventSourceToken dropped, which leaves an Alexa skill grant open to every caller
+        service.createFunction(REGION, baseRequest("perm-alexa-fn"));
+
+        Map<String, Object> statement = service.addPermission(REGION, "perm-alexa-fn", null, Map.of(
+                "StatementId", "alexaSkill",
+                "Action", "lambda:InvokeFunction",
+                "Principal", "*",
+                "EventSourceToken", "amzn1.ask.skill.12345678-1234-1234-1234-123456789012"));
+
+        assertEquals(Map.of("StringEquals", Map.of(
+                "lambda:EventSourceToken", "amzn1.ask.skill.12345678-1234-1234-1234-123456789012")),
+                statement.get("Condition"));
+    }
+
+    @Test
+    void addPermission_invokedViaFunctionUrl_isABoolConditionWithAStringValue() {
+        // Catches: InvokedViaFunctionUrl dropped, which turns the public function URL grant into an
+        // unconditioned "*" grant on InvokeFunction; and a JSON boolean, which clients parsing the
+        // condition values as strings cannot read
+        service.createFunction(REGION, baseRequest("perm-url-invoke-fn"));
+
+        Map<String, Object> statement = service.addPermission(REGION, "perm-url-invoke-fn", null, Map.of(
+                "StatementId", "FunctionURLInvokeAllowPublicAccess",
+                "Action", "lambda:InvokeFunction",
+                "Principal", "*",
+                "InvokedViaFunctionUrl", true));
+
+        assertEquals(Map.of("Bool", Map.of("lambda:InvokedViaFunctionUrl", "true")), statement.get("Condition"));
+    }
+
+    @Test
+    void addPermission_roleArnWithADotInItsName_staysAnAwsPrincipal() {
+        // Catches: the dot check running before the ARN check, which stores an IAM ARN as a Service
+        service.createFunction(REGION, baseRequest("perm-dotted-role-fn"));
+
+        Map<String, Object> statement = service.addPermission(REGION, "perm-dotted-role-fn", null, Map.of(
+                "StatementId", "dotted-role",
+                "Action", "lambda:InvokeFunction",
+                "Principal", "arn:aws:iam::111122223333:role/my.role"));
+
+        assertEquals(Map.of("AWS", "arn:aws:iam::111122223333:role/my.role"), statement.get("Principal"));
+    }
+
+    @Test
+    void addPermission_accountIdInAChinaRegion_isTheRootArnInTheAwsCnPartition() {
+        // Catches: an account principal minted in the commercial partition for a function outside it
+        Map<String, Object> request = baseRequest("perm-cn-principal-fn");
+        request.put("Role", "arn:aws-cn:iam::000000000000:role/test-role");
+        service.createFunction("cn-north-1", request);
+
+        Map<String, Object> statement = service.addPermission("cn-north-1", "perm-cn-principal-fn", null, Map.of(
+                "StatementId", "cross-account",
+                "Action", "lambda:InvokeFunction",
+                "Principal", "111122223333"));
+
+        assertEquals(Map.of("AWS", "arn:aws-cn:iam::111122223333:root"), statement.get("Principal"));
+    }
+
+    @Test
+    void addPermission_functionUrlAuthTypeOutsideTheEnum_isRejectedAndLeavesNoStatement() {
+        // Catches: an unknown FunctionUrlAuthType stored as a condition no function URL can ever match
+        service.createFunction(REGION, baseRequest("perm-auth-type-fn"));
+
+        AwsException error = assertThrows(AwsException.class, () ->
+                service.addPermission(REGION, "perm-auth-type-fn", null, Map.of(
+                        "StatementId", "url",
+                        "Action", "lambda:InvokeFunctionUrl",
+                        "Principal", "*",
+                        "FunctionUrlAuthType", "PUBLIC")));
+
+        assertEquals("ValidationException", error.getErrorCode());
+        assertEquals("1 validation error detected: Value 'PUBLIC' at 'functionUrlAuthType' failed to satisfy "
+                + "constraint: Member must satisfy enum value set: [NONE, AWS_IAM]", error.getMessage());
+        AwsException missing = assertThrows(AwsException.class,
+                () -> service.getPolicy(REGION, "perm-auth-type-fn", null));
+        assertEquals("ResourceNotFoundException", missing.getErrorCode());
+    }
+
+    @Test
+    void addPermission_conditionValuesOutsideTheModelPatterns_areRejected() {
+        // Catches: a SourceAccount, PrincipalOrgID or EventSourceToken the model's pattern refuses being stored
+        service.createFunction(REGION, baseRequest("perm-patterns-fn"));
+
+        AwsException sourceAccount = assertThrows(AwsException.class, () ->
+                service.addPermission(REGION, "perm-patterns-fn", null, Map.of(
+                        "StatementId", "s3", "Action", "lambda:InvokeFunction", "Principal", "s3.amazonaws.com",
+                        "SourceAccount", "arn:aws:iam::111111111111:root")));
+        AwsException principalOrgId = assertThrows(AwsException.class, () ->
+                service.addPermission(REGION, "perm-patterns-fn", null, Map.of(
+                        "StatementId", "org", "Action", "lambda:InvokeFunction", "Principal", "*",
+                        "PrincipalOrgID", "my-org")));
+        AwsException eventSourceToken = assertThrows(AwsException.class, () ->
+                service.addPermission(REGION, "perm-patterns-fn", null, Map.of(
+                        "StatementId", "alexa", "Action", "lambda:InvokeFunction", "Principal", "*",
+                        "EventSourceToken", "not a token")));
+
+        assertEquals("1 validation error detected: Value 'arn:aws:iam::111111111111:root' at 'sourceAccount' "
+                + "failed to satisfy constraint: Member must satisfy regular expression pattern: \\d{12}",
+                sourceAccount.getMessage());
+        assertEquals("1 validation error detected: Value 'my-org' at 'principalOrgID' failed to satisfy "
+                + "constraint: Member must satisfy regular expression pattern: o-[a-z0-9]{10,32}",
+                principalOrgId.getMessage());
+        assertEquals("ValidationException", eventSourceToken.getErrorCode());
+    }
 }

@@ -1,28 +1,17 @@
 package io.github.hectorvent.floci.services.ec2;
 
-import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
-import io.github.hectorvent.floci.testing.MutableClock;
-import io.vertx.core.Vertx;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import java.net.ServerSocket;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
-import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 /**
  * IMDSv2 session tokens, as documented in the EC2 User Guide: the PUT must carry a TTL between
@@ -31,58 +20,39 @@ import static org.mockito.Mockito.when;
  */
 class Ec2MetadataTokenTest {
 
-    private static final String TTL_HEADER = "X-aws-ec2-metadata-token-ttl-seconds";
-    private static final String TOKEN_HEADER = "X-aws-ec2-metadata-token";
-    private static final String CALLER_IP = "127.0.0.1";
-
-    private final MutableClock clock = new MutableClock();
-    private final HttpClient client = HttpClient.newHttpClient();
-    private Vertx vertx;
+    private Ec2MetadataTestFixture fixture;
     private Instance instance;
-    private Ec2MetadataServer server;
-    private String endpoint;
 
     @BeforeEach
     void startServer() throws Exception {
-        int port;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            port = socket.getLocalPort();
-        }
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        when(config.services().ec2().imdsPort()).thenReturn(port);
-        vertx = Vertx.vertx();
-        server = new Ec2MetadataServer(vertx, config, null, clock);
-        server.start().get(10, TimeUnit.SECONDS);
-        endpoint = "http://127.0.0.1:" + port;
-
-        instance = instance("i-0123456789abcdef0");
-        server.registerContainer(CALLER_IP, instance.getInstanceId(), instance);
+        fixture = new Ec2MetadataTestFixture();
+        fixture.start();
+        instance = fixture.instance();
     }
 
     @AfterEach
     void stopServer() throws Exception {
-        server.stop();
-        vertx.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        fixture.close();
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"0", "21601", "-1", "sixty", ""})
     void tokenRequestWithTtlOutsideOneToSixHoursIsRejected(String ttl) throws Exception {
-        assertEquals(400, putToken(ttl).statusCode());
+        assertEquals(400, fixture.putToken(ttl).statusCode());
     }
 
     @Test
     void tokenWithTheMaximumTtlIsIssued() throws Exception {
-        HttpResponse<String> token = putToken("21600");
+        HttpResponse<String> token = fixture.putToken("21600");
 
         assertEquals(200, token.statusCode());
-        assertEquals("21600", token.headers().firstValue(TTL_HEADER).orElseThrow());
+        assertEquals("21600", token.headers().firstValue(Ec2MetadataTestFixture.TTL_HEADER).orElseThrow());
     }
 
     @Test
     void tokenIsAcceptedUntilItsTtlElapses() throws Exception {
-        String token = putToken("60").body();
-        clock.advance(Duration.ofSeconds(59));
+        String token = fixture.putToken("60").body();
+        fixture.clock().advance(Duration.ofSeconds(59));
 
         HttpResponse<String> response = getInstanceId(token);
 
@@ -92,8 +62,8 @@ class Ec2MetadataTokenTest {
 
     @Test
     void expiredTokenIsRejectedAsUnauthorized() throws Exception {
-        String token = putToken("60").body();
-        clock.advance(Duration.ofSeconds(60));
+        String token = fixture.putToken("60").body();
+        fixture.clock().advance(Duration.ofSeconds(60));
 
         assertEquals(401, getInstanceId(token).statusCode());
     }
@@ -105,18 +75,18 @@ class Ec2MetadataTokenTest {
 
     @Test
     void tokenPresentedFromAnotherInstanceIsRejectedAsUnauthorized() throws Exception {
-        String token = putToken("60").body();
-        Instance other = instance("i-0fedcba9876543210");
-        server.unregisterContainer(CALLER_IP, instance);
-        server.registerContainer(CALLER_IP, other.getInstanceId(), other);
+        String token = fixture.putToken("60").body();
+        Instance other = Ec2MetadataTestFixture.instance("i-0fedcba9876543210");
+        fixture.server().unregisterContainer(Ec2MetadataTestFixture.CALLER_IP, instance);
+        fixture.server().registerContainer(Ec2MetadataTestFixture.CALLER_IP, other.getInstanceId(), other);
 
         assertEquals(401, getInstanceId(token).statusCode());
     }
 
     @Test
     void tokenIdentifiesItsInstanceWhenTheCallerIpIsNotRegistered() throws Exception {
-        String token = putToken("60").body();
-        server.unregisterContainer(CALLER_IP, instance);
+        String token = fixture.putToken("60").body();
+        fixture.server().unregisterContainer(Ec2MetadataTestFixture.CALLER_IP, instance);
 
         HttpResponse<String> response = getInstanceId(token);
 
@@ -126,9 +96,7 @@ class Ec2MetadataTokenTest {
 
     @Test
     void requestWithoutTokenStillUsesImdsV1() throws Exception {
-        HttpResponse<String> response = client.send(
-                HttpRequest.newBuilder(URI.create(endpoint + "/latest/meta-data/instance-id")).GET().build(),
-                HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = getInstanceId(null);
 
         assertEquals(200, response.statusCode());
     }
@@ -163,7 +131,7 @@ class Ec2MetadataTokenTest {
     @Test
     void requiredTokenPreservesIssuanceValidationAndExpiry() throws Exception {
         setTokenRequirement("required");
-        HttpResponse<String> issued = putToken("60");
+        HttpResponse<String> issued = fixture.putToken("60");
         assertEquals(200, issued.statusCode());
 
         HttpResponse<String> accepted = getInstanceId(issued.body());
@@ -171,7 +139,7 @@ class Ec2MetadataTokenTest {
         assertEquals(instance.getInstanceId(), accepted.body());
         assertEquals(401, getInstanceId("invalid-token").statusCode());
 
-        clock.advance(Duration.ofSeconds(60));
+        fixture.clock().advance(Duration.ofSeconds(60));
         assertEquals(401, getInstanceId(issued.body()).statusCode());
     }
 
@@ -194,25 +162,10 @@ class Ec2MetadataTokenTest {
     }
 
     private HttpResponse<String> getWithoutToken(String path) throws Exception {
-        return client.send(HttpRequest.newBuilder(URI.create(endpoint + path)).GET().build(),
-                HttpResponse.BodyHandlers.ofString());
-    }
-
-    private static Instance instance(String instanceId) {
-        Instance instance = new Instance();
-        instance.setInstanceId(instanceId);
-        return instance;
-    }
-
-    private HttpResponse<String> putToken(String ttl) throws Exception {
-        return client.send(HttpRequest.newBuilder(URI.create(endpoint + "/latest/api/token"))
-                        .header(TTL_HEADER, ttl).PUT(HttpRequest.BodyPublishers.noBody()).build(),
-                HttpResponse.BodyHandlers.ofString());
+        return fixture.get(path, null, HttpResponse.BodyHandlers.ofString());
     }
 
     private HttpResponse<String> getInstanceId(String token) throws Exception {
-        return client.send(HttpRequest.newBuilder(URI.create(endpoint + "/latest/meta-data/instance-id"))
-                        .header(TOKEN_HEADER, token).GET().build(),
-                HttpResponse.BodyHandlers.ofString());
+        return fixture.get("/latest/meta-data/instance-id", token, HttpResponse.BodyHandlers.ofString());
     }
 }

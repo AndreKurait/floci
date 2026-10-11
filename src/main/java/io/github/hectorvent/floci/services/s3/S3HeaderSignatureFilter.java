@@ -43,7 +43,8 @@ import java.util.Optional;
  * <p>Error codes, statuses and ordering follow real S3: a structurally bad header is
  * {@code 400 AuthorizationHeaderMalformed}; a request with no date is {@code 403 AccessDenied};
  * a missing {@code x-amz-content-sha256} is {@code 400 InvalidRequest}; an unregistered key is
- * {@code 403 InvalidAccessKeyId}; a request more than fifteen minutes from server time is
+ * {@code 403 InvalidAccessKeyId}, and a session past its expiry, sent with its own token,
+ * {@code 400 ExpiredToken}; a request more than fifteen minutes from server time is
  * {@code 403 RequestTimeTooSkewed}; a signature that does not verify is
  * {@code 403 SignatureDoesNotMatch}; and a body that does not match its declared hash is
  * {@code 400 XAmzContentSHA256Mismatch}.
@@ -169,9 +170,13 @@ public class S3HeaderSignatureFilter implements ContainerRequestFilter {
         }
         declaredHash = declaredHash.trim();
 
-        Optional<String> secretKey = S3PostPolicySigner.resolveSecretKey(
-                iamService, accessKeyId, ctx.getHeaderString("X-Amz-Security-Token"));
+        String sessionToken = ctx.getHeaderString("X-Amz-Security-Token");
+        Optional<String> secretKey = S3PostPolicySigner.resolveSecretKey(iamService, accessKeyId, sessionToken);
         if (secretKey.isEmpty()) {
+            if (S3PostPolicySigner.isExpiredSession(iamService, accessKeyId, sessionToken)) {
+                abort(ctx, 400, "ExpiredToken", S3PostPolicySigner.EXPIRED_TOKEN_MESSAGE);
+                return;
+            }
             abort(ctx, 403, "InvalidAccessKeyId",
                     "The AWS Access Key Id you provided does not exist in our records.");
             return;

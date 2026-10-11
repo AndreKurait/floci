@@ -33,6 +33,7 @@ import java.util.stream.Collectors;
  * session token is given, {@code x-amz-security-token}; the content hash is the SHA-256 of the
  * body the request carries. The {@code with*} methods return a copy that deliberately deviates
  * (a stale timestamp, a forged signature, a wrong content hash) for the rejection cases.
+ * {@link #presignedQuery} signs the same credential into a presigned URL's query string instead.
  */
 public final class S3RequestSigner implements Filter {
 
@@ -132,13 +133,10 @@ public final class S3RequestSigner implements Filter {
         String contentSha256 = contentSha256Override != null
                 ? contentSha256Override
                 : sha256Hex(body);
-        String host = uri.getPort() > 0 && uri.getPort() != 80 && uri.getPort() != 443
-                ? uri.getHost() + ":" + uri.getPort()
-                : uri.getHost();
 
         List<String[]> headers = new ArrayList<>();
         if (signHost) {
-            headers.add(new String[]{"host", host});
+            headers.add(new String[]{"host", host(uri)});
         }
         headers.add(new String[]{"x-amz-content-sha256", contentSha256});
         headers.add(new String[]{"x-amz-date", amzDate});
@@ -177,6 +175,55 @@ public final class S3RequestSigner implements Filter {
                 + ", SignedHeaders=" + signedHeaders
                 + ", Signature=" + signature);
         return result;
+    }
+
+    /**
+     * The query string of a presigned URL for {@code method} on {@code uri}, written the way an AWS
+     * SDK presigner writes it: the {@code X-Amz-*} parameters, {@code X-Amz-Security-Token} when a
+     * session token is given, {@code host} as the only signed header, an unsigned payload, and the
+     * signature last. Send it with URL encoding off, since it is already encoded.
+     */
+    public String presignedQuery(String method, URI uri, int expiresSeconds) throws Exception {
+        Instant at = signedAt != null ? signedAt : Instant.now();
+        String amzDate = AMZ_DATE.format(at);
+        String scopeDate = amzDate.substring(0, 8);
+        String credentialScope = scopeDate + "/" + region + "/" + SERVICE + "/aws4_request";
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("X-Amz-Algorithm", ALGORITHM);
+        params.put("X-Amz-Credential", accessKeyId + "/" + credentialScope);
+        params.put("X-Amz-Date", amzDate);
+        params.put("X-Amz-Expires", Integer.toString(expiresSeconds));
+        if (sessionToken != null) {
+            params.put("X-Amz-Security-Token", sessionToken);
+        }
+        params.put("X-Amz-SignedHeaders", "host");
+        String query = params.entrySet().stream()
+                .map(param -> uriEncode(param.getKey()) + "=" + uriEncode(param.getValue()))
+                .collect(Collectors.joining("&"));
+
+        String rawPath = uri.getRawPath() == null || uri.getRawPath().isEmpty() ? "/" : uri.getRawPath();
+        String canonicalRequest = method + "\n"
+                + rawPath + "\n"
+                + canonicalQueryString(query) + "\n"
+                + "host:" + host(uri) + "\n"
+                + "\n"
+                + "host" + "\n"
+                + "UNSIGNED-PAYLOAD";
+        String stringToSign = ALGORITHM + "\n"
+                + amzDate + "\n"
+                + credentialScope + "\n"
+                + sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
+        String signature = signatureOverride != null
+                ? signatureOverride
+                : hexEncode(hmacSha256(signingKey(scopeDate), stringToSign));
+        return query + "&X-Amz-Signature=" + signature;
+    }
+
+    private static String host(URI uri) {
+        return uri.getPort() > 0 && uri.getPort() != 80 && uri.getPort() != 443
+                ? uri.getHost() + ":" + uri.getPort()
+                : uri.getHost();
     }
 
     private byte[] signingKey(String scopeDate) throws Exception {

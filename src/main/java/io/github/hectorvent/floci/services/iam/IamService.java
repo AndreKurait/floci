@@ -61,6 +61,7 @@ import java.security.SecureRandom;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPublicKey;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -163,7 +164,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     /** CSPRNG for long-term secret access keys; ordinary resource IDs keep using {@link ThreadLocalRandom}. */
     private final SecureRandom secureRandom = new SecureRandom();
 
-    private static final String SERVICE_LINKED_ROLE_PATH = "/aws-service-role/";
     /** AWSServiceName as AWS constrains it: 1-128 characters of {@code [\w+=,.@-]}. */
     private static final Pattern SERVICE_PRINCIPAL_PATTERN = Pattern.compile("[\\w+=,.@-]{1,128}");
     /** CustomSuffix as AWS constrains it: 1-64 characters of {@code [\w+=,.@-]}. */
@@ -384,6 +384,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     private final Object mfaDeviceLock = new Object();
     private final RegionResolver regionResolver;
+    private final Clock clock;
     private final boolean seedDeployerPrincipal;
     private final String seededAccountAlias;
     /** Guards case-insensitive IAM name uniqueness checks and their corresponding writes. */
@@ -399,7 +400,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private final Map<String, Map<String, IamPolicy>> awsManagedPoliciesByPartition = new ConcurrentHashMap<>();
 
     @Inject
-    public IamService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver) {
+    public IamService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver,
+                      Clock clock) {
         this(
             storageFactory.create("iam", "iam-users.json", new TypeReference<>() {}),
             storageFactory.create("iam", "iam-groups.json", new TypeReference<>() {}),
@@ -425,7 +427,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             storageFactory.create("iam", "iam-outbound-federation.json", new TypeReference<>() {}),
             regionResolver,
             config.services().iam().seedDeployerPrincipal(),
-            config.services().iam().accountAlias().orElse(null)
+            config.services().iam().accountAlias().orElse(null),
+            clock
         );
     }
 
@@ -449,6 +452,20 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                StorageBackend<String, SessionCredential> sessions,
                RegionResolver regionResolver,
                boolean seedDeployerPrincipal) {
+        this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions, regionResolver,
+                seedDeployerPrincipal, Clock.systemUTC());
+    }
+
+    IamService(StorageBackend<String, IamUser> users,
+               StorageBackend<String, IamGroup> groups,
+               StorageBackend<String, IamRole> roles,
+               StorageBackend<String, IamPolicy> policies,
+               StorageBackend<String, AccessKey> accessKeys,
+               StorageBackend<String, InstanceProfile> instanceProfiles,
+               StorageBackend<String, SessionCredential> sessions,
+               RegionResolver regionResolver,
+               boolean seedDeployerPrincipal,
+               Clock clock) {
         this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions,
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
@@ -457,7 +474,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
-                regionResolver, seedDeployerPrincipal, null);
+                regionResolver, seedDeployerPrincipal, null, clock);
     }
 
     // 8-backend constructor (no org-root-features): kept for existing callers/tests;
@@ -535,6 +552,39 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                RegionResolver regionResolver,
                boolean seedDeployerPrincipal,
                String seededAccountAlias) {
+        this(users, groups, roles, policies, accessKeys, instanceProfiles, sessions, accountAliases,
+                passwordPolicies, loginProfiles, oidcProviders, serviceLinkedRoleDeletions, orgRootFeatures,
+                credentialReports, virtualMfaDevices, serverCertificates, signingCertificates, sshPublicKeys,
+                serviceCredentials, accountProperties, stsPreferences, outboundFederation,
+                regionResolver, seedDeployerPrincipal, seededAccountAlias, Clock.systemUTC());
+    }
+
+    IamService(StorageBackend<String, IamUser> users,
+               StorageBackend<String, IamGroup> groups,
+               StorageBackend<String, IamRole> roles,
+               StorageBackend<String, IamPolicy> policies,
+               StorageBackend<String, AccessKey> accessKeys,
+               StorageBackend<String, InstanceProfile> instanceProfiles,
+               StorageBackend<String, SessionCredential> sessions,
+               StorageBackend<String, String> accountAliases,
+               StorageBackend<String, AccountPasswordPolicy> passwordPolicies,
+               StorageBackend<String, LoginProfile> loginProfiles,
+               StorageBackend<String, OpenIDConnectProvider> oidcProviders,
+               StorageBackend<String, String> serviceLinkedRoleDeletions,
+               StorageBackend<String, OrganizationRootFeatures> orgRootFeatures,
+               StorageBackend<String, CredentialReport> credentialReports,
+               StorageBackend<String, VirtualMfaDevice> virtualMfaDevices,
+               StorageBackend<String, ServerCertificate> serverCertificates,
+               StorageBackend<String, SigningCertificate> signingCertificates,
+               StorageBackend<String, SshPublicKey> sshPublicKeys,
+               StorageBackend<String, ServiceSpecificCredential> serviceCredentials,
+               StorageBackend<String, String> accountProperties,
+               StorageBackend<String, String> stsPreferences,
+               StorageBackend<String, OutboundWebIdentityFederation> outboundFederation,
+               RegionResolver regionResolver,
+               boolean seedDeployerPrincipal,
+               String seededAccountAlias,
+               Clock clock) {
         this.users = users;
         this.groups = groups;
         this.roles = roles;
@@ -560,6 +610,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         this.regionResolver = regionResolver;
         this.seedDeployerPrincipal = seedDeployerPrincipal;
         this.seededAccountAlias = seededAccountAlias;
+        this.clock = clock;
     }
 
     @PostConstruct
@@ -911,6 +962,19 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                         "The group with name " + groupName + " cannot be found.", 404));
     }
 
+    /**
+     * Looks up a group by name in a specific account's namespace, without throwing when absent.
+     * Mirrors {@link #findUser(String, String)}, and exists for the same reason: a caller
+     * resolving a group's ARN has only the name, and the path that completes that ARN is held by
+     * the stored group.
+     */
+    public Optional<IamGroup> findGroup(String accountId, String groupName) {
+        if (groups instanceof AccountAwareStorageBackend<IamGroup> aware) {
+            return aware.getForAccount(accountId, groupName);
+        }
+        return groups.get(groupName);
+    }
+
     public void updateGroup(String groupName, String newGroupName, String newPath) {
         validateIamResourceName(groupName, "GroupName");
         if (newGroupName != null) {
@@ -1131,7 +1195,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     /** The linked service, recovered from the {@code /aws-service-role/<principal>/} path. */
     private static String linkedServicePrincipal(IamRole role) {
         String path = role.getPath();
-        return path.substring(SERVICE_LINKED_ROLE_PATH.length(), path.length() - 1);
+        return path.substring(ServiceLinkedRoles.PATH.length(), path.length() - 1);
     }
 
     public void deleteRole(String roleName) {
@@ -1208,7 +1272,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             String principal = ServicePrincipals.canonical(awsServiceName);
             String trustPolicy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
                     + "\"Principal\":{\"Service\":\"" + principal + "\"},\"Action\":\"sts:AssumeRole\"}]}";
-            IamRole role = createRole(roleName, SERVICE_LINKED_ROLE_PATH + principal + "/",
+            IamRole role = createRole(roleName, ServiceLinkedRoles.PATH + principal + "/",
                     trustPolicy, description, 0, Map.of());
             role.setServiceLinkedRole(true);
             roles.put(roleName, role);
@@ -1239,7 +1303,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         roles.delete(roleName);
         LOG.infov("Deleted service-linked IAM role: {0}", roleName);
 
-        String deletionTaskId = "task" + SERVICE_LINKED_ROLE_PATH + servicePrincipal + "/"
+        String deletionTaskId = "task" + ServiceLinkedRoles.PATH + servicePrincipal + "/"
                 + roleName + "/" + UUID.randomUUID();
         serviceLinkedRoleDeletions.put(deletionTaskId, roleName);
         return deletionTaskId;
@@ -3226,7 +3290,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             credential.setServiceSpecificCredentialId(
                     "ACCA" + randomId(SERVICE_CREDENTIAL_ID_SUFFIX_LENGTH));
             credential.setStatus(CREDENTIAL_STATUS_ACTIVE);
-            credential.setCreateDate(Instant.now());
+            credential.setCreateDate(clock.instant());
             int version = freeCredentialVersion(
                     all, userName, longTermKey, credential.getCreateDate());
             if (longTermKey) {
@@ -3341,7 +3405,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     public String reportedStatus(ServiceSpecificCredential credential) {
         Instant expiry = credential.getExpirationDate();
-        if (expiry != null && !expiry.isAfter(Instant.now())) {
+        if (expiry != null && !expiry.isAfter(clock.instant())) {
             return CREDENTIAL_STATUS_EXPIRED;
         }
         return credential.getStatus();
@@ -3941,6 +4005,19 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     /**
+     * Whether this temporary access key and session token are those of a session that has expired
+     * on the injected clock but is still stored, which {@link #findSecretKey(String, String)} finds
+     * no secret for. AWS answers such a credential as expired, not as a key it does not know. The
+     * token has to match, so a caller that does not hold the credential learns nothing about it.
+     */
+    public boolean isExpiredSessionToken(String accessKeyId, String sessionToken) {
+        return findSessionAnyAccount(accessKeyId)
+                .filter(session -> isExpired(session, clock.instant()))
+                .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .isPresent();
+    }
+
+    /**
      * The session token issued alongside a temporary credential, for callers that must tell a
      * missing token apart from one that does not match.
      *
@@ -4011,8 +4088,15 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     private Optional<SessionCredential> currentSession(String accessKeyId) {
-        return findSessionAnyAccount(accessKeyId)
-                .filter(session -> session.getExpiration() == null || Instant.now().isBefore(session.getExpiration()));
+        return findSessionAnyAccount(accessKeyId).filter(session -> !isExpired(session, clock.instant()));
+    }
+
+    /**
+     * Whether {@code session} has expired as of {@code now}: from the instant its expiration names.
+     * Every lookup, the enforcement check and the sweep share this boundary.
+     */
+    private static boolean isExpired(SessionCredential session, Instant now) {
+        return session.getExpiration() != null && !session.getExpiration().isAfter(now);
     }
 
     private static boolean hasMatchingSessionToken(SessionCredential session, String sessionToken) {
@@ -4397,16 +4481,23 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return removed;
     }
 
-    /** Removes expired temporary sessions, including those left in persistent storage after a restart. */
-    public int sweepExpiredSessions(Instant now) {
+    /**
+     * Removes temporary sessions expired on the injected clock, including those left in persistent
+     * storage after a restart.
+     */
+    public int sweepExpiredSessions() {
+        return sweepExpiredSessions(clock.instant());
+    }
+
+    /** {@link #sweepExpiredSessions()} as of {@code now}. */
+    int sweepExpiredSessions(Instant now) {
         if (sessions instanceof AccountAwareStorageBackend<SessionCredential> aware) {
-            return aware.deleteAllAccountsMatching(session ->
-                    session.getExpiration() != null && !session.getExpiration().isAfter(now));
+            return aware.deleteAllAccountsMatching(session -> isExpired(session, now));
         }
         List<SessionCredential> storedSessions = sessions.scan(key -> true);
         int removed = 0;
         for (SessionCredential session : storedSessions) {
-            if (session.getExpiration() == null || session.getExpiration().isAfter(now)) {
+            if (!isExpired(session, now)) {
                 continue;
             }
             deleteSession(session.getAccessKeyId(), session);
@@ -4431,7 +4522,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             return Optional.empty();
         }
         SessionCredential session = sessionOpt.get();
-        if (session.getExpiration() != null && session.getExpiration().isBefore(Instant.now())) {
+        if (isExpired(session, clock.instant())) {
             return Optional.empty();
         }
         String account = AwsArnUtils.accountOrDefault(session.getRoleArn(), session.getOriginAccountId());
@@ -4592,7 +4683,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * <p>Returns {@code null} if the access key is unknown (bypass — backward-compatible).
      */
     public CallerContext resolveCallerContext(String accessKeyId) {
-        return resolveCallerContext(accessKeyId, Instant.now());
+        return resolveCallerContext(accessKeyId, clock.instant());
     }
 
     /**
@@ -4615,7 +4706,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         Optional<SessionCredential> sessionOpt = findSessionForCallerContext(accessKeyId);
         if (sessionOpt.isPresent()) {
             SessionCredential session = sessionOpt.get();
-            if (session.getExpiration() != null && session.getExpiration().isBefore(now)) {
+            if (isExpired(session, now)) {
                 deleteSession(accessKeyId, session);
                 return null; // expired — unknown key → bypass
             }
@@ -4701,8 +4792,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             return false;
         }
         return findSessionForCallerContext(accessKeyId)
-                .map(SessionCredential::getExpiration)
-                .filter(expiration -> expiration.isBefore(now))
+                .filter(session -> isExpired(session, now))
                 .isPresent();
     }
 
@@ -4766,7 +4856,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         Optional<SessionCredential> sessionOpt = findSessionForCallerContext(accessKeyId);
         if (sessionOpt.isPresent()) {
             SessionCredential session = sessionOpt.get();
-            if (session.getExpiration() != null && session.getExpiration().isBefore(Instant.now())) {
+            if (isExpired(session, clock.instant())) {
                 deleteSession(accessKeyId, session);
                 return Optional.empty();
             }
@@ -4829,7 +4919,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         Optional<SessionCredential> sessionOpt = findSessionForCallerContext(accessKeyId);
         if (sessionOpt.isPresent()) {
             SessionCredential session = sessionOpt.get();
-            if (session.getExpiration() != null && session.getExpiration().isBefore(Instant.now())) {
+            if (isExpired(session, clock.instant())) {
                 deleteSession(accessKeyId, session);
                 return Optional.empty();
             }

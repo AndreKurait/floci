@@ -62,6 +62,7 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
             Set.of("s3", "mediastore", "mediapackagev2", "lambda");
     private static final Set<String> OAC_SIGNING_BEHAVIORS =
             Set.of("always", "never", "no-override");
+    private static final Set<String> FUNCTION_RUNTIMES = Set.of("cloudfront-js-1.0", "cloudfront-js-2.0");
     private static final int MAX_ORIGIN_CUSTOM_HEADERS = 30;
     private static final int MAX_CUSTOM_HEADER_NAME_LENGTH = 256;
     private static final int MAX_CUSTOM_HEADER_VALUE_LENGTH = 1_783;
@@ -1293,6 +1294,14 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
     // ── CloudFront Functions ──────────────────────────────────────────────────
 
     public synchronized CloudFrontFunction createFunction(CloudFrontFunction fn) {
+        validateFunctionRuntime(fn.getRuntime());
+        // The bare name holds the DEVELOPMENT stage, and the LIVE stage of releases before
+        // stage-aware keys.
+        if (functionStore.get(fn.getName()).isPresent()
+                || functionStore.get(functionKey(fn.getName(), "LIVE")).isPresent()) {
+            throw new AwsException("FunctionAlreadyExists",
+                    "A function with the same name already exists in this AWS account.", 409);
+        }
         fn.setStage("DEVELOPMENT");
         fn.setStatus("UNPUBLISHED");
         fn.setEtag(UUID.randomUUID().toString());
@@ -1317,6 +1326,7 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
 
     public synchronized CloudFrontFunction updateFunction(String name, String ifMatch,
                                                           CloudFrontFunction updated) {
+        validateFunctionRuntime(updated.getRuntime());
         CloudFrontFunction existing = describeFunction(name, null);
         if (!existing.getEtag().equals(ifMatch)) {
             throw new AwsException("InvalidIfMatchVersion",
@@ -1387,6 +1397,13 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
             throw invalidFunctionStage(effectiveStage);
         }
         return effectiveStage;
+    }
+
+    private static void validateFunctionRuntime(String runtime) {
+        if (runtime != null && !FUNCTION_RUNTIMES.contains(runtime)) {
+            throw new AwsException("InvalidArgument",
+                    "The parameter Runtime must be cloudfront-js-1.0 or cloudfront-js-2.0.", 400);
+        }
     }
 
     private static AwsException invalidFunctionStage(String stage) {

@@ -172,4 +172,23 @@ class ApplicationDefaultsTest {
         assertEquals("30", fallback.value(),
                 "the @WithDefault must match application.yml, which wins over it");
     }
+
+    // Catches: api-timeout-seconds missing from the shipped application.yml, or a yml value that
+    // silently disagrees with the @WithDefault fallback.
+    @Test
+    void productionConfigDeclaresTheDockerApiTimeoutAtItsDefault() throws IOException, NoSuchMethodException {
+        JsonNode apiTimeout = new YAMLMapper()
+                .readTree(Path.of("src/main/resources/application.yml").toFile())
+                .path("floci").path("docker").path("api-timeout-seconds");
+
+        assertFalse(apiTimeout.isMissingNode(), "api-timeout-seconds should be declared in application.yml");
+        assertEquals(300, apiTimeout.asInt());
+
+        WithDefault fallback = EmulatorConfig.DockerConfig.class
+                .getMethod("apiTimeoutSeconds")
+                .getAnnotation(WithDefault.class);
+        assertNotNull(fallback, "apiTimeoutSeconds should declare a fallback default");
+        assertEquals("300", fallback.value(),
+                "the @WithDefault must match application.yml, which wins over it");
+    }
 }

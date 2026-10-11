@@ -54,6 +54,12 @@ public class Ec2VpcEndpointCfnProvisioner implements CfnResourceProvisioner {
         Boolean privateDnsEnabled = privateDns != null && !privateDns.isBlank()
                 ? Boolean.parseBoolean(privateDns)
                 : null;
+        JsonNode addressTypeNode = ctx.engine().resolveNodeOmittingNoValue(props.get("IpAddressType"));
+        String ipAddressType = addressTypeNode == null || addressTypeNode.isNull() || addressTypeNode.isMissingNode()
+                ? null : addressTypeNode.asText();
+        if ("not-specified".equals(ipAddressType)) {
+            ipAddressType = null;
+        }
         String previousEndpointId = r.getPhysicalId();
         VpcEndpoint endpoint = ec2Service.createVpcEndpoint(ctx.region(), vpcId, serviceName,
                 endpointType != null ? endpointType : "Gateway",
@@ -62,7 +68,7 @@ public class Ec2VpcEndpointCfnProvisioner implements CfnResourceProvisioner {
                 resolveIdList(props, "SecurityGroupIds", ctx),
                 privateDnsEnabled,
                 policyDocument(props, ctx),
-                List.of());
+                List.of(), List.of(), ipAddressType);
         r.setPhysicalId(endpoint.getVpcEndpointId());
         r.getAttributes().put("Id", endpoint.getVpcEndpointId());
         // An unset attribute resolves to the literal "LogicalId.CreationTimestamp" rather than

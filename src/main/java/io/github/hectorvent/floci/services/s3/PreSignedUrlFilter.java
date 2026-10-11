@@ -186,7 +186,13 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
                 }
             } else {
                 String accessKeyId = credParts[0];
-                String secretKey = resolveSecretKey(accessKeyId, queryParams.getFirst("X-Amz-Security-Token"));
+                String sessionToken = queryParams.getFirst("X-Amz-Security-Token");
+                String secretKey = resolveSecretKey(accessKeyId, sessionToken);
+                if (secretKey == null && S3PostPolicySigner.isExpiredSession(iamService, accessKeyId, sessionToken)) {
+                    requestContext.abortWith(errorResponse(400, "ExpiredToken",
+                            S3PostPolicySigner.EXPIRED_TOKEN_MESSAGE));
+                    return;
+                }
                 if (secretKey != null) {
                     if (!verifySigV4Signature(requestContext, signature, secretKey)) {
                         requestContext.abortWith(errorResponse(403, "SignatureDoesNotMatch",
@@ -360,7 +366,9 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
 
         return requestHeaderNames.stream()
                 .map(name -> name.toLowerCase(Locale.ROOT))
-                .filter(name -> CHECKSUM_HEADERS_REQUIRING_SIGNATURE.contains(name) || name.startsWith("x-amz-meta-"))
+                .filter(name -> CHECKSUM_HEADERS_REQUIRING_SIGNATURE.contains(name) || name.startsWith("x-amz-meta-")
+                        // A signed Range makes S3 require the If-Range that qualifies it to be signed too.
+                        || ("if-range".equals(name) && normalizedSignedHeaders.contains("range")))
                 .filter(name -> !normalizedSignedHeaders.contains(name))
                 .distinct()
                 .sorted()

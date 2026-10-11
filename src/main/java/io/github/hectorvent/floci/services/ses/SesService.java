@@ -423,11 +423,9 @@ public class SesService {
     private String sendRawEmail(SendEmailRequest request, EmailContent.Raw raw) {
         String source = request.source();
         String region = request.region();
-        List<String> destinations = request.recipients();
         if (raw.data() == null || raw.data().isBlank()) {
             throw new AwsException("InvalidParameterValue", "RawMessage.Data is required.", 400);
         }
-        boolean hasExplicitDestinations = destinations != null && !destinations.isEmpty();
         boolean sourceOmitted = source == null || source.isBlank();
         // The MIME headers are always parsed: X-SES-CONFIGURATION-SET can name the configuration
         // set that decides whether events are published at all, so the configuration set cannot be
@@ -465,12 +463,11 @@ public class SesService {
             effectiveConfigSet = resolveDefaultConfigurationSet(requestedConfigSet, effectiveSource, region);
             configSetService.validateForSending(effectiveConfigSet, region);
         }
-        List<String> effectiveDestinations = hasExplicitDestinations
-                ? destinations
+        List<String> effectiveDestinations = request.hasRecipients()
+                ? request.recipients()
                 : SendEmailRequest.recipients(headers.to(), headers.cc(), headers.bcc());
         if (effectiveDestinations.isEmpty()) {
-            throw new AwsException("InvalidParameterValue",
-                    "At least one destination address is required.", 400);
+            throw new AwsException("InvalidParameterValue", "Missing required header 'To'.", 400);
         }
         // Resolve suppression before recording the message so a bad ListManagementOptions (e.g. an
         // unknown contact list) fails the whole send without leaving an orphaned SentEmail record.
@@ -1066,16 +1063,24 @@ public class SesService {
 
     /**
      * The raw-content variant of the tenant send gate: when {@code FromEmailAddress} is omitted,
-     * the effective sender comes from the MIME {@code From} header — the same derivation
-     * {@code sendRawEmail} applies — so the gate must resolve it the same way before checking.
+     * the effective sender comes from the MIME {@code From} header, the same derivation
+     * {@code sendRawEmail} applies, so the gate must resolve it the same way before checking.
+     * {@code hasDestination} says whether the request named any recipient; when it did not and the
+     * MIME To, Cc and Bcc headers are empty too, only the tenant's existence is checked.
      */
     public void checkTenantRawSendAccess(String tenantName, String fromEmailAddress,
-                                         String rawMessage, String configurationSetName,
-                                         String accountId, String region) {
+                                         String rawMessage, boolean hasDestination,
+                                         String configurationSetName, String accountId, String region) {
         if (tenantName == null) {
             return;
         }
         SmtpRelay.RawMessageHeaders headers = SmtpRelay.parseRawHeaders(rawMessage);
+        // AWS checks that the tenant exists, then reports a message with no recipients anywhere
+        // ahead of the association gate (probe-confirmed), so that error is left to sendRawEmail.
+        if (!hasDestination && SendEmailRequest.recipients(headers.to(), headers.cc(), headers.bcc()).isEmpty()) {
+            tenantService.tenantForSending(tenantName, region, accountId);
+            return;
+        }
         String effectiveSource = fromEmailAddress;
         if (effectiveSource == null || effectiveSource.isBlank()) {
             effectiveSource = headers.from().isBlank() ? null : headers.from();

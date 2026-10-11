@@ -39,10 +39,12 @@ import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 import static io.github.hectorvent.floci.services.ses.SesV2Json.remapV1Exception;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.requireJsonObject;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.requireObjectOrAbsent;
+import static io.github.hectorvent.floci.services.ses.SesV2Json.stringArrayOrAbsent;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.stringMemberOrAbsent;
 
 /**
@@ -101,9 +103,9 @@ public class SesSendController {
             String fromEmailAddress = request.path("FromEmailAddress").asText(null);
 
             JsonNode destination = requireObjectOrAbsent(request, "Destination");
-            List<String> toAddresses = jsonArrayToList(destination.path("ToAddresses"));
-            List<String> ccAddresses = jsonArrayToList(destination.path("CcAddresses"));
-            List<String> bccAddresses = jsonArrayToList(destination.path("BccAddresses"));
+            List<String> toAddresses = destinationAddresses(destination, "ToAddresses");
+            List<String> ccAddresses = destinationAddresses(destination, "CcAddresses");
+            List<String> bccAddresses = destinationAddresses(destination, "BccAddresses");
             List<String> replyToAddresses = jsonArrayToList(request.path("ReplyToAddresses"));
             String feedbackForwardingAddress =
                     request.path("FeedbackForwardingEmailAddress").asText(null);
@@ -134,13 +136,10 @@ public class SesSendController {
                     throw new AwsException("BadRequestException",
                             "Content.Raw.Data is required.", 400);
                 }
-                if (toAddresses.isEmpty() && ccAddresses.isEmpty() && bccAddresses.isEmpty()) {
-                    throw new AwsException("BadRequestException",
-                            "At least one destination address is required.", 400);
-                }
+                SendEmailRequest rawRequest = sendRequest.content(new EmailContent.Raw(rawData)).build();
                 sesService.checkTenantRawSendAccess(tenantName, fromEmailAddress, rawData,
-                        configurationSetName, regionResolver.getAccountId(), region);
-                messageId = sesService.sendEmail(sendRequest.content(new EmailContent.Raw(rawData)).build());
+                        rawRequest.hasRecipients(), configurationSetName, regionResolver.getAccountId(), region);
+                messageId = sesService.sendEmail(rawRequest);
             } else if (content.has("Simple")) {
                 if (fromEmailAddress == null || fromEmailAddress.isBlank()) {
                     // AWS returns BadRequestException with a null message body here.
@@ -405,6 +404,12 @@ public class SesSendController {
     }
 
     // ──────────────────────────── Helpers ────────────────────────────
+
+    // A Raw send falls back to the MIME recipients when no destination is given, so a present member
+    // of the wrong JSON type must be rejected rather than read as an omitted one.
+    private static List<String> destinationAddresses(JsonNode destination, String field) {
+        return Objects.requireNonNullElse(stringArrayOrAbsent(destination, field), List.of());
+    }
 
     private List<String> jsonArrayToList(JsonNode arrayNode) {
         if (arrayNode == null || arrayNode.isMissingNode() || !arrayNode.isArray()) {

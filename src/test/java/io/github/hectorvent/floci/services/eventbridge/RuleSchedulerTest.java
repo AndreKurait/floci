@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
@@ -111,6 +112,62 @@ class RuleSchedulerTest {
 
         verify(vertx).cancelTimer(2L);
         assertFalse(scheduler.isRunning(RULE_ARN), "a stop racing the re-arm must not leave the new timer recorded");
+    }
+
+    @Test
+    void ruleGoneWithoutDeleteRuleStopsItsTimerOnTheNextTick() {
+        Vertx vertx = mock(Vertx.class);
+        ArgumentCaptor<Handler<Long>> fire = timerHandlerCaptor();
+        when(vertx.setPeriodic(anyLong(), fire.capture())).thenReturn(1L);
+
+        // A storage reset or restore removes the rule without going through DeleteRule, so the
+        // scheduler only learns about it when its timer next fires.
+        AtomicReference<Rule> currentRule = new AtomicReference<>(enabledRule());
+        RuleScheduler scheduler = newScheduler(vertx, new StoppingInvoker(() -> { }));
+        scheduler.startScheduler(RULE_ARN, "rate(1 minute)", () -> toScheduleData(currentRule.get()));
+        currentRule.set(null);
+
+        fire.getValue().handle(1L);
+
+        verify(vertx).cancelTimer(1L);
+        assertFalse(scheduler.isRunning(RULE_ARN), "a rule that no longer exists must not keep its timer");
+    }
+
+    @Test
+    void ruleAlreadyGoneWhenItsRateSchedulerStartsLeavesNoTimer() {
+        Vertx vertx = mock(Vertx.class);
+        when(vertx.setPeriodic(anyLong(), any())).thenReturn(1L);
+        RuleScheduler scheduler = newScheduler(vertx, new StoppingInvoker(() -> { }));
+
+        // DeleteRule landed between the rule being stored and its scheduler starting.
+        scheduler.startScheduler(RULE_ARN, "rate(1 minute)", () -> toScheduleData(null));
+
+        assertFalse(scheduler.isRunning(RULE_ARN), "a rule that no longer exists must not get a timer");
+    }
+
+    @Test
+    void oldTickFindingItsRuleGoneLeavesTheRecreatedRulesTimerRunning() {
+        Vertx vertx = mock(Vertx.class);
+        ArgumentCaptor<Handler<Long>> fire = timerHandlerCaptor();
+        when(vertx.setPeriodic(anyLong(), fire.capture())).thenReturn(1L, 2L);
+        RuleScheduler scheduler = newScheduler(vertx, new StoppingInvoker(() -> { }));
+
+        AtomicReference<Rule> oldRule = new AtomicReference<>(enabledRule());
+        // The old timer looks its rule up and finds it deleted; before it acts on that, PutRule
+        // recreates a rule with the same ARN, which stops the old scheduler and starts a new one.
+        scheduler.startScheduler(RULE_ARN, "rate(1 minute)", () -> {
+            Rule current = oldRule.get();
+            if (current == null) {
+                scheduler.stopScheduler(RULE_ARN);
+                scheduler.startScheduler(RULE_ARN, "rate(1 minute)", () -> toScheduleData(enabledRule()));
+            }
+            return toScheduleData(current);
+        });
+        oldRule.set(null);
+
+        fire.getAllValues().get(0).handle(1L);
+
+        assertTrue(scheduler.isRunning(RULE_ARN), "the recreated rule must keep its timer");
     }
 
     @SuppressWarnings("unchecked")

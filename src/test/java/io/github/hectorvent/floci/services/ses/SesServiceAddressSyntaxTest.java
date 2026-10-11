@@ -141,10 +141,17 @@ class SesServiceAddressSyntaxTest {
     }
 
     @Test
+    void rawSend_ccAndBccHeadersAreChecked() {
+        assertRejects(LOCAL_CONTROL, () -> service.sendEmail(request(SENDER)
+                .content(raw(SENDER, TO, "Cc: " + NON_ASCII_LOCAL + "\r\n")).build()));
+        assertRejects(MISSING_FINAL_DOMAIN, () -> service.sendEmail(request(SENDER)
+                .content(raw(SENDER, TO, "Bcc: " + NO_AT + "\r\n")).build()));
+    }
+
+    @Test
     void rawSend_unprobedAddressHeadersAreNotChecked() {
         assertDoesNotThrow(() -> service.sendEmail(request(SENDER).content(raw(SENDER, TO,
-                "Cc: " + NO_AT + "\r\nBcc: " + NON_ASCII_LOCAL + "\r\nReply-To: " + NO_AT
-                        + "\r\nReturn-Path: <>\r\n")).build()));
+                "Reply-To: " + NO_AT + "\r\nReturn-Path: <>\r\n")).build()));
     }
 
     @Test

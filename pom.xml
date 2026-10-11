@@ -470,6 +470,8 @@
                     <argLine>@{argLine} -Xmx6g</argLine>
                     <systemPropertyVariables>
                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                        <!-- An ARN minted with a blank region fails the test that reached it (BlankRegionGuard). -->
+                        <io.github.hectorvent.floci.arn.fail-on-blank-region>true</io.github.hectorvent.floci.arn.fail-on-blank-region>
                     </systemPropertyVariables>
                     <!-- Abort a hung test with a thread dump instead of letting CI's job timeout kill
                          the shard silently. Set here rather than in junit-platform.properties, which

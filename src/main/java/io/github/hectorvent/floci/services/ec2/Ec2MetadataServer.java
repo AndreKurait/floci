@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import io.vertx.core.Vertx;
+import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
@@ -24,6 +25,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -412,14 +414,25 @@ public class Ec2MetadataServer {
         if (inst == null) {
             return;
         }
-        String userData = inst.getUserData();
-        if (userData == null || userData.isBlank()) {
+        String encoded = inst.getEncodedUserData();
+        byte[] userData;
+        if (encoded != null) {
+            try {
+                userData = encoded.isBlank() ? null : Base64.getDecoder().decode(encoded);
+            } catch (IllegalArgumentException e) {
+                LOG.warnv("Ignoring malformed saved user-data encoding for instance {0}", inst.getInstanceId());
+                userData = inst.getUserData() == null ? null : inst.getUserData().getBytes(StandardCharsets.UTF_8);
+            }
+        } else {
+            userData = inst.getUserData() == null ? null : inst.getUserData().getBytes(StandardCharsets.UTF_8);
+        }
+        if (userData == null || userData.length == 0) {
             ctx.response().setStatusCode(404).end();
             return;
         }
         ctx.response().setStatusCode(200)
-                .putHeader("content-type", "text/plain")
-                .end(userData);
+                .putHeader("content-type", "application/octet-stream")
+                .end(Buffer.buffer(userData));
     }
 
     private void handleIdentityDocument(RoutingContext ctx) {

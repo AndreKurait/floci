@@ -82,7 +82,15 @@ floci:
 
 Environment variable: `FLOCI_DOCKER_CONNECTION_REQUEST_TIMEOUT_SECONDS`
 
-A Docker call that gets no response within 5 minutes fails, on Unix-socket and TCP hosts alike. Requests that follow a container for as long as it runs (container waits, exec and attach output, followed logs, streamed stats, daemon events, image pulls and builds) have no such limit, since they can stay silent while healthy.
+A Docker call that gets no response within `api-timeout-seconds` fails, on Unix-socket and TCP hosts alike, so a hung daemon cannot block a request indefinitely. The limit applies to each attempt: a control-plane request that is safe to repeat is tried up to six times, so against a silent daemon it can take about six times the limit, plus backoff, to fail. It defaults to 300 seconds (5 minutes) for both pools and must be at least 1, since httpclient5 reads 0 as no limit. Requests that follow a container for as long as it runs (container waits, exec and attach output, followed logs, streamed stats, daemon events, image pulls and builds) have no such limit, since they can stay silent while healthy:
+
+```yaml
+floci:
+  docker:
+    api-timeout-seconds: 300
+```
+
+Environment variable: `FLOCI_DOCKER_API_TIMEOUT_SECONDS`
 
 ## Private Registry Authentication
 

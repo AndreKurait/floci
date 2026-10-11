@@ -2797,6 +2797,7 @@ class Ec2IntegrationTest {
             .formParam("VpcId", vpcId)
             .formParam("ServiceName", "com.amazonaws.us-east-1.s3")
             .formParam("VpcEndpointType", "Gateway")
+            .formParam("IpAddressType", "ipv4")
             .formParam("RouteTableId.1", routeTableId)
             .formParam("TagSpecification.1.ResourceType", "vpc-endpoint")
             .formParam("TagSpecification.1.Tag.1.Key", "Name")
@@ -2808,6 +2809,7 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .body("CreateVpcEndpointResponse.vpcEndpoint.vpcEndpointId", startsWith("vpce-"))
             .body("CreateVpcEndpointResponse.vpcEndpoint.vpcId", equalTo(vpcId))
+            .body("CreateVpcEndpointResponse.vpcEndpoint.ipAddressType", equalTo("ipv4"))
             .body("CreateVpcEndpointResponse.vpcEndpoint.routeTableIdSet.item",
                     equalTo(routeTableId))
             .extract().path("CreateVpcEndpointResponse.vpcEndpoint.vpcEndpointId");
@@ -2827,7 +2829,9 @@ class Ec2IntegrationTest {
             .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.vpcEndpointId",
                     equalTo(vpcEndpointId))
             .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.serviceName",
-                    equalTo("com.amazonaws.us-east-1.s3"));
+                    equalTo("com.amazonaws.us-east-1.s3"))
+            .body("DescribeVpcEndpointsResponse.vpcEndpointSet.item.ipAddressType",
+                    equalTo("ipv4"));
     }
 
     @Test

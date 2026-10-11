@@ -110,6 +110,38 @@ class CloudFrontManagementProtocolTest {
     }
 
     @Test
+    void createFunctionRejectsAnUnknownRuntime() {
+        String name = "runtime-test-" + UUID.randomUUID();
+        String createBody = """
+                <CreateFunctionRequest xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/">
+                  <Name>%s</Name>
+                  <FunctionConfig>
+                    <Comment>routing function</Comment>
+                    <Runtime>python3</Runtime>
+                  </FunctionConfig>
+                  <FunctionCode>function handler(event) { return event.request; }</FunctionCode>
+                </CreateFunctionRequest>
+                """.formatted(name);
+
+        given()
+            .contentType("application/xml")
+            .body(createBody)
+        .when()
+            .post(API + "function")
+        .then()
+            .statusCode(400)
+            .body(hasXPath(
+                    "//*[local-name()='Code']/text()",
+                    equalTo("InvalidArgument")));
+
+        given()
+        .when()
+            .get(API + "function/" + name + "/describe")
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
     void describeAndPublishFunctionPreserveBothStages() {
         String name = "describe-test-" + UUID.randomUUID();
         String createBody = """

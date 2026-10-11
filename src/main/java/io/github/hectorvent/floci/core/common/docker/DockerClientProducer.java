@@ -419,6 +419,10 @@ public class DockerClientProducer {
                 "FLOCI_DOCKER_CONNECTION_REQUEST_TIMEOUT_SECONDS");
     }
 
+    static int validateApiTimeoutSeconds(int seconds) {
+        return requireAtLeastOne(seconds, "floci.docker.api-timeout-seconds", "FLOCI_DOCKER_API_TIMEOUT_SECONDS");
+    }
+
     private static int requireAtLeastOne(int value, String setting, String envVar) {
         if (value < 1) {
             throw new IllegalArgumentException(setting + " (" + envVar + ") must be at least 1, got: " + value);
@@ -497,18 +501,19 @@ public class DockerClientProducer {
                 role, maxConnections, clientConfig.getDockerHost());
 
         return DockerClientImpl.getInstance(clientConfig, wrapForRole(newHttpClient(clientConfig, maxConnections,
+                Duration.ofSeconds(validateApiTimeoutSeconds(config.docker().apiTimeoutSeconds())),
                 Duration.ofSeconds(validateConnectionRequestTimeoutSeconds(
                         config.docker().connectionRequestTimeoutSeconds()))), role));
     }
 
     static FlociDockerHttpClient newHttpClient(DefaultDockerClientConfig clientConfig, int maxConnections,
-                                               Duration connectionRequestTimeout) {
+                                               Duration apiTimeout, Duration connectionRequestTimeout) {
         return new FlociDockerHttpClient.Builder()
                 .dockerHost(clientConfig.getDockerHost())
                 .sslConfig(clientConfig.getSSLConfig())
                 .maxConnections(maxConnections)
                 .connectionTimeout(Duration.ofSeconds(30))
-                .responseTimeout(Duration.ofMinutes(5))
+                .responseTimeout(apiTimeout)
                 .connectionRequestTimeout(connectionRequestTimeout)
                 .build();
     }

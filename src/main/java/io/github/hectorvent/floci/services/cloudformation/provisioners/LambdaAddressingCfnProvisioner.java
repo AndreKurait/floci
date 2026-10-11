@@ -42,6 +42,10 @@ public class LambdaAddressingCfnProvisioner implements CfnResourceProvisioner {
 
     private static final String PERMISSION = "AWS::Lambda::Permission";
     private static final String URL = "AWS::Lambda::Url";
+    // The optional AWS::Lambda::Permission string properties, which share their names with the
+    // AddPermission members that become the statement's conditions.
+    private static final List<String> PERMISSION_CONDITION_PROPERTIES = List.of(
+            "SourceArn", "SourceAccount", "PrincipalOrgID", "FunctionUrlAuthType", "EventSourceToken");
 
     private final LambdaService lambdaService;
 
@@ -113,10 +117,16 @@ public class LambdaAddressingCfnProvisioner implements CfnResourceProvisioner {
         request.put("StatementId", statementId);
         request.put("Action", ctx.resolveOptional(props, "Action"));
         request.put("Principal", ctx.resolveOptional(props, "Principal"));
-        String sourceArn = ctx.resolveOptional(props, "SourceArn");
-        if (sourceArn != null && !sourceArn.isBlank()) request.put("SourceArn", sourceArn);
-        String sourceAccount = ctx.resolveOptional(props, "SourceAccount");
-        if (sourceAccount != null && !sourceAccount.isBlank()) request.put("SourceAccount", sourceAccount);
+        for (String property : PERMISSION_CONDITION_PROPERTIES) {
+            String value = ctx.resolveOptional(props, property);
+            if (value != null && !value.isBlank()) {
+                request.put(property, value);
+            }
+        }
+        String invokedViaFunctionUrl = ctx.resolveOptional(props, "InvokedViaFunctionUrl");
+        if (invokedViaFunctionUrl != null && !invokedViaFunctionUrl.isBlank()) {
+            request.put("InvokedViaFunctionUrl", Boolean.parseBoolean(invokedViaFunctionUrl));
+        }
         try {
             lambdaService.addPermission(ctx.region(), functionName, null, request);
         } catch (RuntimeException failure) {

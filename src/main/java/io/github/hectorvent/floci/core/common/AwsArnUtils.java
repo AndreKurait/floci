@@ -31,9 +31,11 @@ public final class AwsArnUtils {
          * <p>A blank region says nothing about the partition, so it falls back to {@code aws}.
          * A regionless ARN is minted through {@link #global} or
          * {@link RegionResolver#buildGlobalArn} instead; {@code make partition-check} fails a call
-         * that passes a literal blank region here.
+         * that passes a literal blank region here, and {@link BlankRegionGuard} one whose blank
+         * region arrives at run time.
          */
         public static Arn of(String service, String region, String accountId, String resource) {
+            BlankRegionGuard.check(region, service, resource);
             return new Arn(AwsRegions.partitionFor(region), service, region, accountId, resource);
         }
 

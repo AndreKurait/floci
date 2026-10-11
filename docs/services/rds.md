@@ -177,6 +177,20 @@ checked against the instance's other window. Modifications apply immediately —
     `arn:aws:rds:<region>:<account>:cluster-snapshot:<name>`. RDS reserved instances aren't
     modeled (there's no reserved-instance API), so tagging doesn't apply to them.
 
+## Boolean parameters
+
+The following parameters accept `true` or `false` (case-insensitive). Other values,
+including empty strings, return `InvalidParameterValue` before changing resources.
+
+| Actions | Parameters | When omitted |
+|---|---|---|
+| `CreateDBProxy` | `RequireTLS`, `DebugLogging` | Defaults to `false` |
+| `ModifyDBProxy` | `RequireTLS`, `DebugLogging` | Preserves the current value |
+| `ResetDBParameterGroup`, `ResetDBClusterParameterGroup` | `ResetAllParameters` | Defaults to `false`; named parameter resets keep their existing behavior |
+
+Malformed reset flags leave saved parameter overrides unchanged.
+
+
 ## Event notification subscriptions
 
 The four subscription actions manage the resource itself. **Nothing is published to the topic.**
