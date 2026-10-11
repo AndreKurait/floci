@@ -173,8 +173,33 @@ class IssuedSessionVerifierTest {
         assertEquals("Lookup", first.operation());
         for (String selector : List.of("principalArn", "principalId")) {
             String value = selector.equals("principalArn") ? first.principalArn() : first.principalId();
-            assertEquals(first, verifier.lookup(Map.of("correlationId", "cold", selector, value)));
+            Map<String, Object> expected = json.convertValue(first, Map.class);
+            expected.remove("accessKeyId");
+            Map<String, Object> actual = json.convertValue(
+                    verifier.lookup(Map.of("correlationId", "cold", selector, value)), Map.class);
+            assertEquals(expected, actual);
+            assertFalse(actual.containsKey("accessKeyId"));
         }
+    }
+
+    @Test
+    void exactLookupBindsCurrentStoredKeyAndRefusesMismatchedOrRevokedCandidates() {
+        issue(SECOND_KEY, null, false, ACCOUNT, NOW.plusSeconds(1800));
+        for (String key : List.of(KEY, SECOND_KEY)) {
+            Map<String, Object> response = json.convertValue(
+                    verifier.lookup(Map.of("correlationId", "binding", "accessKeyId", key)), Map.class);
+            assertEquals(key, response.get("accessKeyId"));
+            assertFalse(response.containsValue("dummy-secret"));
+            assertFalse(response.containsValue("dummy-token"));
+        }
+        IamService mismatched = spy(iam);
+        doReturn(iam.issuedSessionCandidates(SECOND_KEY)).when(mismatched).issuedSessionCandidates(KEY);
+        IssuedSessionVerifier selected = new IssuedSessionVerifier(mismatched, Clock.fixed(NOW, ZoneOffset.UTC));
+        assertThrows(IllegalArgumentException.class,
+                () -> selected.lookup(Map.of("correlationId", "binding", "accessKeyId", KEY)));
+        sessions.delete(KEY);
+        assertThrows(IllegalArgumentException.class,
+                () -> verifier.lookup(Map.of("correlationId", "binding", "accessKeyId", KEY)));
     }
 
     @Test
