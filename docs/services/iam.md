@@ -1401,8 +1401,9 @@ Both accept JSON over POST, reject unknown/duplicate fields, and return
 Success returns `correlationId`, `operation` (`Verify` or `Lookup`),
 `kind` (`ASSUMED_ROLE`), `accountId`, `originAccountId`, `roleArn`, `roleId`,
 `roleSessionName`, `principalArn`, `principalId`, `expiresAt` and the explicit
-boolean `sessionPolicyPresent`. No access key, token, secret or signing key is
-returned. Inline `Policy` or any supplied managed `PolicyArns` marks restrictions
+boolean `sessionPolicyPresent`. Only `Lookup` selected by `accessKeyId` also returns
+that field, bound to the current selected issuer record. `Verify` and principal
+lookups omit it. Tokens, secrets and signing keys are never returned. Inline `Policy` or any supplied managed `PolicyArns` marks restrictions
 present; this flag does not claim those policies were evaluated. Consumers must
 apply their own authorization and inspect current public IAM policies and
 permissions boundaries.
@@ -1442,7 +1443,9 @@ observation checks the current role ID, function version/code/revision, exact
 credential record, and running container/start time before and after proof
 verification. A stopped or restarted container, retired credential, replaced
 role, changed function, or ambiguous principal lookup is refused. A lookup
-selects records but does not authenticate the caller or confer lineage.
+selects records but does not authenticate the caller or confer lineage. Only an
+`accessKeyId`-selected `Lookup` returns `accessKeyId`, taken from the selected
+current root or derived session; principal lookups and `Verify` omit the field.
 
 `Verify` checks the session token and SigV4 `StringToSign` signature. Its signing
 time must be at most 60 seconds old and at most 5 seconds in the future. Its

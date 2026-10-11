@@ -26,12 +26,14 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
@@ -107,6 +109,34 @@ class LambdaIssuedIdentityIntegrationTest {
         assertTrue(Instant.parse(expiry).isBefore(Instant.now().plusSeconds(61)));
         issuer.unregister(ACCOUNT, credentials.accessKeyId());
         verify(derived, Instant.now()).statusCode(403);
+    }
+
+    @Test
+    void exactLookupReturnsSelectedRootOrDerivedKeyOnlyAndRefusesRevocation() throws Exception {
+        SessionCreds derived = assume(credentials, true);
+        for (SessionCreds selected : List.of(credentials, derived)) {
+            Map<String, Object> verified = verify(selected, Instant.now()).statusCode(200).extract().as(Map.class);
+            assertFalse(verified.containsKey("accessKeyId"));
+            for (String selector : List.of("accessKeyId", "principalId", "principalArn")) {
+                String value = selector.equals("accessKeyId") ? selected.accessKeyId() : (String) verified.get(selector);
+                Map<String, Object> identity = given().contentType("application/json")
+                        .body(Map.of("correlationId", "binding", selector, value)).post(BASE + "lookup")
+                        .then().statusCode(200).extract().as(Map.class);
+                if (selector.equals("accessKeyId")) {
+                    assertEquals(selected.accessKeyId(), identity.get("accessKeyId"));
+                } else {
+                    assertFalse(identity.containsKey("accessKeyId"));
+                }
+                assertFalse(identity.containsValue(selected.secretAccessKey()));
+                assertFalse(identity.containsValue(selected.sessionToken()));
+            }
+        }
+        issuer.unregister(ACCOUNT, credentials.accessKeyId());
+        for (SessionCreds selected : List.of(credentials, derived)) {
+            given().contentType("application/json")
+                    .body(Map.of("correlationId", "revoked", "accessKeyId", selected.accessKeyId()))
+                    .post(BASE + "lookup").then().statusCode(403);
+        }
     }
 
     @Test

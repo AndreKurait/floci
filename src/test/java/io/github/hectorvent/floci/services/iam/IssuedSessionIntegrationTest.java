@@ -67,10 +67,15 @@ class IssuedSessionIntegrationTest {
         assertFalse(response.contains(token));
         assertFalse(response.contains(secret));
         for (Map.Entry<String, String> selector : Map.of("accessKeyId", key, "principalArn", arn, "principalId", principal).entrySet()) {
-            given().contentType("application/json").body(Map.of("correlationId", "cold",
+            Map<String, Object> identity = given().contentType("application/json").body(Map.of("correlationId", "cold",
                     selector.getKey(), selector.getValue())).post(BASE + "lookup")
                     .then().statusCode(200).body("operation", equalTo("Lookup"))
-                    .body("principalArn", equalTo(arn)).body("principalId", equalTo(principal));
+                    .body("principalArn", equalTo(arn)).body("principalId", equalTo(principal)).extract().as(Map.class);
+            if (selector.getKey().equals("accessKeyId")) {
+                assertEquals(key, identity.get("accessKeyId"));
+            } else {
+                assertFalse(identity.containsKey("accessKeyId"));
+            }
         }
         given().formParam("Action", "GetCallerIdentity")
                 .header("Authorization", authorization("sts", key))

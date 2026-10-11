@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.iam;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
@@ -50,7 +51,8 @@ public class LambdaIssuedIdentityVerifier {
     @RegisterForReflection
     public record Identity(String correlationId, String operation, String kind, String accountId,
                            String roleArn, String roleId, String principalArn, String principalId,
-                           boolean sessionPolicyPresent, String expiresAt, LambdaIdentity lambda) {}
+                           boolean sessionPolicyPresent, String expiresAt, LambdaIdentity lambda,
+                           @JsonInclude(JsonInclude.Include.NON_NULL) String accessKeyId) {}
 
     private record Observation(SessionCredential session, SessionCredential root,
                                IssuedSessionVerifier.Snapshot current, IssuedSessionVerifier.Snapshot original,
@@ -76,7 +78,8 @@ public class LambdaIssuedIdentityVerifier {
                 current.account(), current.roleArn(), current.roleId(), current.principalArn(), current.principalId(),
                 current.policyPresent(), expires.toString(), new LambdaIdentity(binding.accountId(), binding.functionArn(),
                 binding.version(), root.roleArn(), root.principalArn(), root.principalId(), binding.codeSha256(),
-                binding.containerId(), binding.containerStartedAt()));
+                binding.containerId(), binding.containerStartedAt()),
+                !verify && selector.equals("accessKeyId") ? current.accessKey() : null);
     }
 
     private Observation unique(String selector, String value) {

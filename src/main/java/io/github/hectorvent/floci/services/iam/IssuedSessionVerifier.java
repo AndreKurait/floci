@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.iam;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
@@ -51,7 +52,8 @@ public class IssuedSessionVerifier {
     @RegisterForReflection
     public record Identity(String correlationId, String operation, String kind, String accountId,
                            String originAccountId, String roleArn, String roleId, String roleSessionName,
-                           String principalArn, String principalId, String expiresAt, boolean sessionPolicyPresent) {}
+                           String principalArn, String principalId, String expiresAt, boolean sessionPolicyPresent,
+                           @JsonInclude(JsonInclude.Include.NON_NULL) String accessKeyId) {}
 
     record Snapshot(String accessKey, String secret, String token, String account, String origin,
                             String roleArn, String roleId, String sessionName, String principalArn,
@@ -61,9 +63,10 @@ public class IssuedSessionVerifier {
             return "IssuedSessionSnapshot[redacted]";
         }
 
-        Identity identity(String correlation, String operation, Instant expiration) {
+        Identity identity(String correlation, String operation, Instant expiration, boolean includeAccessKey) {
             return new Identity(correlation, operation, "ASSUMED_ROLE", account, origin, roleArn, roleId,
-                    sessionName, principalArn, principalId, expiration.toString(), policyPresent);
+                    sessionName, principalArn, principalId, expiration.toString(), policyPresent,
+                    includeAccessKey ? accessKey : null);
         }
     }
 
@@ -73,7 +76,7 @@ public class IssuedSessionVerifier {
         Snapshot session = initial.getFirst();
         verifyProof(session, request, clock, 900, 300);
         require(initial.equals(snapshots("accessKeyId", request.get("accessKeyId"))));
-        return session.identity(request.get("correlationId"), "Verify", session.expiry());
+        return session.identity(request.get("correlationId"), "Verify", session.expiry(), false);
     }
 
     static Instant verifyProof(Snapshot session, Map<String, String> request, Clock clock,
@@ -102,13 +105,13 @@ public class IssuedSessionVerifier {
         List<Snapshot> initial = snapshots(selector, request.get(selector));
         require(!initial.isEmpty() && initial.size() <= 128);
         Snapshot first = initial.getFirst();
-        Identity reference = first.identity("", "Lookup", Instant.EPOCH);
+        Identity reference = first.identity("", "Lookup", Instant.EPOCH, false);
         for (Snapshot candidate : initial) {
-            require(reference.equals(candidate.identity("", "Lookup", Instant.EPOCH)));
+            require(reference.equals(candidate.identity("", "Lookup", Instant.EPOCH, false)));
         }
         Instant expiry = initial.stream().map(Snapshot::expiry).min(Comparator.naturalOrder()).orElseThrow();
         require(initial.equals(snapshots(selector, request.get(selector))));
-        return first.identity(request.get("correlationId"), "Lookup", expiry);
+        return first.identity(request.get("correlationId"), "Lookup", expiry, selector.equals("accessKeyId"));
     }
 
     static boolean validSelector(String selector, String value) {
