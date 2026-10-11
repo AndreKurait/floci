@@ -40,6 +40,32 @@ class Ec2Tests {
     }
 
     @Test
+    @Order(-1)
+    void spotRequestsPreserveOriginalUserData() {
+        String encoded = "/w";
+        SpotInstanceRequest request = ec2.requestSpotInstances(RequestSpotInstancesRequest.builder()
+                .instanceCount(1)
+                .launchSpecification(RequestSpotLaunchSpecification.builder()
+                        .imageId("ami-0abcdef1234567890")
+                        .instanceType(InstanceType.T3_MICRO)
+                        .userData(encoded).build())
+                .build()).spotInstanceRequests().get(0);
+        try {
+            assertThat(request.launchSpecification().userData()).isEqualTo(encoded);
+            assertThat(ec2.describeSpotInstanceRequests(DescribeSpotInstanceRequestsRequest.builder()
+                    .spotInstanceRequestIds(request.spotInstanceRequestId()).build())
+                    .spotInstanceRequests().get(0).launchSpecification().userData()).isEqualTo(encoded);
+            assertThat(ec2.describeInstanceAttribute(DescribeInstanceAttributeRequest.builder()
+                    .instanceId(request.instanceId()).attribute(InstanceAttributeName.USER_DATA).build())
+                    .userData().value()).isEqualTo(encoded);
+        } finally {
+            ec2.terminateInstances(TerminateInstancesRequest.builder().instanceIds(request.instanceId()).build());
+            ec2.cancelSpotInstanceRequests(CancelSpotInstanceRequestsRequest.builder()
+                    .spotInstanceRequestIds(request.spotInstanceRequestId()).build());
+        }
+    }
+
+    @Test
     @Order(0)
     @DisplayName("DescribeVpnGateways - empty when none exist")
     void describeVpnGatewaysEmpty() {

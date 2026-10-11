@@ -6401,10 +6401,10 @@ public class Ec2QueryHandler {
         String subnetId = p.getFirst("LaunchSpecification.SubnetId");
         List<String> securityGroupIds = getList(p, "LaunchSpecification.SecurityGroupId");
         String userDataEncoded = p.getFirst("LaunchSpecification.UserData");
-        String userData = null;
-        if (userDataEncoded != null && !userDataEncoded.isBlank()) {
-            userData = new String(Base64.getDecoder().decode(userDataEncoded), StandardCharsets.UTF_8);
+        if (userDataEncoded != null && !userDataEncoded.isEmpty() && userDataEncoded.isBlank()) {
+            userDataEncoded = null;
         }
+        String userData = Ec2UserDataDecoder.decode(userDataEncoded);
         String iamInstanceProfileArn = p.getFirst("LaunchSpecification.IamInstanceProfile.Arn");
 
         // Parse TagSpecifications
@@ -6432,7 +6432,7 @@ public class Ec2QueryHandler {
 
         List<SpotInstanceRequest> requests = service.requestSpotInstances(region, spotPrice, instanceCount,
                 type, productDescription, imageId, instanceType, keyName, subnetId, securityGroupIds, userData, iamInstanceProfileArn,
-                spotRequestTags, instanceTags);
+                spotRequestTags, instanceTags, userDataEncoded);
 
         XmlBuilder xml = new XmlBuilder()
                 .start("RequestSpotInstancesResponse", AwsNamespaces.EC2)
@@ -6578,8 +6578,9 @@ public class Ec2QueryHandler {
             }
             xml.end("groupSet");
 
-            if (spec.getUserData() != null) {
-                String encodedUserData = Base64.getEncoder().encodeToString(spec.getUserData().getBytes(StandardCharsets.UTF_8));
+            if (spec.getEncodedUserData() != null || spec.getUserData() != null) {
+                String encodedUserData = spec.getEncodedUserData() != null ? spec.getEncodedUserData()
+                        : Base64.getEncoder().encodeToString(spec.getUserData().getBytes(StandardCharsets.UTF_8));
                 xml.elem("userData", encodedUserData);
             }
             if (spec.getIamInstanceProfileArn() != null) {

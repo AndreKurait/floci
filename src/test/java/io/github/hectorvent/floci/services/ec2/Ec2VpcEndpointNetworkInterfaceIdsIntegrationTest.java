@@ -72,6 +72,18 @@ class Ec2VpcEndpointNetworkInterfaceIdsIntegrationTest {
                 "VpcId", vpcId, "CidrBlock", cidr, "AvailabilityZone", availabilityZone);
     }
 
+    private String associateIpv6Block(String vpcId) {
+        return ec2Value("AssociateVpcCidrBlock", "AssociateVpcCidrBlockResponse.ipv6CidrBlockAssociation.ipv6CidrBlock",
+                "VpcId", vpcId, "AmazonProvidedIpv6CidrBlock", "true");
+    }
+
+    private String ipv6SubnetCidr(String block, int offset) {
+        String network = block.substring(0, block.indexOf("::"));
+        int separator = network.lastIndexOf(':');
+        int subnet = Integer.parseInt(network.substring(separator + 1), 16) + offset;
+        return network.substring(0, separator + 1) + Integer.toHexString(subnet) + "::/64";
+    }
+
     private XmlPath describeEndpoint(String endpointId) {
         return given()
             .formParam("Action", "DescribeVpcEndpoints")
@@ -157,17 +169,12 @@ class Ec2VpcEndpointNetworkInterfaceIdsIntegrationTest {
 
     @Test
     void anEndpointOnASubnetWithoutIpv4StillAnswers() {
-        // REGRESSION GUARD for the request path this change created. Deriving the
-        // interfaces now happens while rendering CreateVpcEndpoint and
-        // DescribeVpcEndpoints, and that derivation computes a private IP by splitting
-        // the subnet's CidrBlock on dots. CreateSubnet stores whatever CidrBlock it is
-        // given without validating the family, so the value is not guaranteed to be
-        // dotted IPv4 -- and before the guard, parts[1] threw, turning an odd subnet into
-        // a FAILED EC2 response instead of a degraded address. Previously the same
-        // calculation ran only on the flow-log scheduler, where a throw was contained.
+        // Endpoint rendering must also work for IPv6-only subnets, whose IPv4 CIDR is absent.
+        // Use the IPv6 API field rather than placing an IPv6 value in the IPv4 CidrBlock field.
         String vpcId = createVpc("10.78.0.0/16");
+        String ipv6Block = associateIpv6Block(vpcId);
         String subnetId = ec2Value("CreateSubnet", "CreateSubnetResponse.subnet.subnetId",
-                "VpcId", vpcId, "CidrBlock", "2001:db8::/56",
+                "VpcId", vpcId, "Ipv6CidrBlock", ipv6SubnetCidr(ipv6Block, 0), "Ipv6Native", "true",
                 "AvailabilityZone", "us-east-1a");
 
         String endpointId = ec2Value("CreateVpcEndpoint",
@@ -193,11 +200,12 @@ class Ec2VpcEndpointNetworkInterfaceIdsIntegrationTest {
         // Caught in review, not by the test above, which uses a single subnet and so
         // cannot see a collision at all.
         String vpcId = createVpc("10.79.0.0/16");
+        String ipv6Block = associateIpv6Block(vpcId);
         String subnetA = ec2Value("CreateSubnet", "CreateSubnetResponse.subnet.subnetId",
-                "VpcId", vpcId, "CidrBlock", "2001:db8:1::/64",
+                "VpcId", vpcId, "Ipv6CidrBlock", ipv6SubnetCidr(ipv6Block, 0), "Ipv6Native", "true",
                 "AvailabilityZone", "us-east-1a");
         String subnetB = ec2Value("CreateSubnet", "CreateSubnetResponse.subnet.subnetId",
-                "VpcId", vpcId, "CidrBlock", "2001:db8:2::/64",
+                "VpcId", vpcId, "Ipv6CidrBlock", ipv6SubnetCidr(ipv6Block, 1), "Ipv6Native", "true",
                 "AvailabilityZone", "us-east-1b");
 
         String endpointId = ec2Value("CreateVpcEndpoint",

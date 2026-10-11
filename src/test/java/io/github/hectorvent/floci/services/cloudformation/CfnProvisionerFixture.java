@@ -49,6 +49,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.CustomRes
 import io.github.hectorvent.floci.services.cloudformation.provisioners.DynamoDbCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2FlowLogCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2InstanceCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2KeyPairCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2LaunchTemplateCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2NetworkAclCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2NetworkCfnProvisioner;
@@ -436,6 +437,9 @@ final class CfnProvisionerFixture {
             }
             if (wafV2Service != null) {
                 discovered.add(new WafV2CfnProvisioner(wafV2Service));
+            }
+            if (ec2Service != null && ssmService != null) {
+                discovered.add(new Ec2KeyPairCfnProvisioner(ec2Service, ssmService));
             }
             if (ec2Service != null) {
                 discovered.add(new Ec2VpcCfnProvisioner(ec2Service));

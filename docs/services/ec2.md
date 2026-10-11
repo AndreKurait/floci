@@ -996,6 +996,13 @@ Validation matches AWS behavior:
 | CancelSpotInstanceRequests | Cancels the named spot instance requests, returning each id with its new state. |
 | DescribeSpotPriceHistory | Returns synthetic spot price history for known instance types across modeled availability zones. |
 
+`RequestSpotInstances` preserves the original base64 user data in the Spot request
+and launched instance. Binary and gzip payloads remain intact when described or
+retrieved through IMDS; script execution uses the same bounded decoder as
+`RunInstances`. Invalid base64, oversized payloads and malformed gzip return
+`InvalidParameterValue` before launch. Older stored Spot requests without the
+original encoding return base64 derived from their saved UTF-8 text.
+
 Spot prices returned by `DescribeSpotPriceHistory` are synthetic and derived deterministically from instance type specifications: `((vcpu * 0.0016) + (memoryGiB * 0.0012)) * (1.0 + (azOffset * 0.03))`, formatted to six decimal places. They bear no relation to real AWS spot prices and are intended for testing cost-aware schedulers rather than spend estimation. Supported filters are `availability-zone`, `availability-zone-id`, `instance-type`, `product-description`, `spot-price`, and `timestamp`. Pagination is supported via `MaxResults` and `NextToken`.
 
 ### VPN Gateways
