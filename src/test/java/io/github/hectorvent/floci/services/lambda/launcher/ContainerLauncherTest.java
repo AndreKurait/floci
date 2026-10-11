@@ -44,6 +44,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -672,6 +673,20 @@ class ContainerLauncherTest {
                 "AWS_SECRET_ACCESS_KEY should be injected when awsConfigPath is absent");
         assertTrue(env.stream().anyMatch(e -> e.startsWith("AWS_SESSION_TOKEN=")),
                 "AWS_SESSION_TOKEN should be injected when awsConfigPath is absent");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"$LATEST", "1", "7"})
+    void onDemandLaunchUsesTheSelectedVersion(String version) {
+        LambdaFunction fn = networkFunction();
+        fn.setVersion(version);
+        fn.setEnvironment(Map.of("AWS_LAMBDA_FUNCTION_VERSION", "user-override"));
+
+        launcher.launch(fn);
+
+        assertEquals(List.of("AWS_LAMBDA_FUNCTION_VERSION=" + version),
+                captureRealContainerSpec().env().stream()
+                        .filter(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION=")).toList());
     }
 
     @Test
