@@ -10020,6 +10020,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 case "requester-managed" -> matchesValue(values, String.valueOf(ni.isRequesterManaged()));
                 case "attachment.instance-id" -> ni.getAttachment() != null
                         && matchesValue(values, ni.getAttachment().getInstanceId());
+                case "association.ip-owner-id" -> ni.getPrivateIpAddresses().stream()
+                        .anyMatch(ip -> ip.isPrimary() && ip.getAssociation() != null
+                                && ip.getAssociation().getIpOwnerId() != null
+                                && matchesValue(values, ip.getAssociation().getIpOwnerId()));
+                case "association.public-ip" -> ni.getPrivateIpAddresses().stream()
+                        .anyMatch(ip -> ip.isPrimary() && ip.getAssociation() != null
+                                && ip.getAssociation().getPublicIp() != null
+                                && matchesValue(values, ip.getAssociation().getPublicIp()));
                 case "private-ip-address" ->
                     matchesValue(values, ni.getPrivateIpAddress()) ||
                     ni.getPrivateIpAddresses().stream()
