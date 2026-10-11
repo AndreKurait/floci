@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -307,7 +308,7 @@ class ProvisionedConcurrencyPoolTest {
 
     private static final class Launcher implements LambdaRuntimeLauncher {
         final BlockingQueue<Environment> launched = new LinkedBlockingQueue<>();
-        final Map<ContainerHandle, Environment> environments = new java.util.concurrent.ConcurrentHashMap<>();
+        final Map<ContainerHandle, Environment> environments = new ConcurrentHashMap<>();
         final AtomicInteger starts = new AtomicInteger();
         final AtomicInteger stopFailures = new AtomicInteger();
         volatile CompletableFuture<Void> launchGate = CompletableFuture.completedFuture(null);

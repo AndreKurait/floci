@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.BackupWindows;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.docker.ContainerLiveness;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
@@ -724,6 +725,8 @@ public class RdsService implements Resettable, ResourceProvider {
         if (manageMasterUserPassword && (masterPassword == null || masterPassword.isBlank())) {
             masterPassword = generatedMasterPassword();
         }
+        String effectiveSecretKmsKeyId = manageMasterUserPassword
+                ? resolveManagedSecretKmsKeyId(masterUserSecretKmsKeyId, effectiveRegion) : null;
         // Always reserve a unique port (even in mock) so endpoints stay distinct and usedPorts
         // is consistent; mock mode only skips starting the container and auth proxy.
         int proxyPort = reserveProxyPort(requestedPort);
@@ -826,7 +829,7 @@ public class RdsService implements Resettable, ResourceProvider {
         instance.setDbiResourceId(dbiResourceId);
         instance.setDbInstanceArn(dbInstanceArn);
         if (manageMasterUserPassword) {
-            attachManagedMasterUserSecret(instance, effectiveRegion, masterUserSecretKmsKeyId);
+            attachManagedMasterUserSecret(instance, effectiveRegion, masterUserSecretKmsKeyId, effectiveSecretKmsKeyId);
         }
 
         String accountId = accountIdFromArn(instance.getDbInstanceArn());
@@ -2283,6 +2286,9 @@ public class RdsService implements Resettable, ResourceProvider {
             if (!"rds".equals(arn.service())) {
                 throw new AwsException("InvalidParameterValue", "Invalid resource name: " + resourceName, 400);
             }
+            if (!regionResolver.partitionForRegion(effectiveRegion).equals(arn.partition())) {
+                throw new AwsException("InvalidParameterValue", "Invalid resource name: " + resourceName, 400);
+            }
             if (!effectiveRegion.equals(arn.region())) {
                 throw new AwsException("InvalidParameterValue",
                         "ResourceName is not in region " + effectiveRegion + ": " + resourceName, 400);
@@ -2467,6 +2473,7 @@ public class RdsService implements Resettable, ResourceProvider {
                     // The secret's ARN names its own account and region, neither of which a
                     // startup backfill has a request context to infer.
                     secretsManagerService.markOwnedByService(secretArn, MANAGED_SECRET_OWNING_SERVICE);
+                    backfillManagedSecretKey(instance, regionFromArn(instance.getDbInstanceArn()));
                 } catch (RuntimeException e) {
                     LOG.debugv(e, "Could not mark master user secret {0} as service-managed", secretArn);
                 }
@@ -2478,6 +2485,7 @@ public class RdsService implements Resettable, ResourceProvider {
                 }
                 try {
                     secretsManagerService.markOwnedByService(secretArn, MANAGED_SECRET_OWNING_SERVICE);
+                    backfillManagedSecretKey(cluster, regionFromArn(cluster.getDbClusterArn()));
                 } catch (RuntimeException e) {
                     LOG.debugv(e, "Could not mark master user secret {0} as service-managed", secretArn);
                 }
@@ -2528,7 +2536,55 @@ public class RdsService implements Resettable, ResourceProvider {
         }
     }
 
-    private void attachManagedMasterUserSecret(DbInstance instance, String region, String kmsKeyId) {
+    private void backfillManagedSecretKey(DbInstance instance, String region) {
+        if (instance.getMasterUserSecretArn() != null && instance.getMasterUserSecretKmsKeyId() == null) {
+            String keyId = recoverManagedSecretKey(instance.getMasterUserSecretArn(), region);
+            if (keyId != null) {
+                instance.setMasterUserSecretKmsKeyId(keyId);
+                putInstanceForScope(accountIdFromArn(instance.getDbInstanceArn()), region,
+                        instance.getDbInstanceIdentifier(), instance);
+            }
+        }
+    }
+
+    private void backfillManagedSecretKey(DbCluster cluster, String region) {
+        if (cluster.getMasterUserSecretArn() != null && cluster.getMasterUserSecretKmsKeyId() == null) {
+            String keyId = recoverManagedSecretKey(cluster.getMasterUserSecretArn(), region);
+            if (keyId != null) {
+                cluster.setMasterUserSecretKmsKeyId(keyId);
+                putClusterForScope(accountIdFromArn(cluster.getDbClusterArn()), region,
+                        cluster.getDbClusterIdentifier(), cluster);
+            }
+        }
+    }
+
+    private String recoverManagedSecretKey(String secretArn, String region) {
+        if (secretsManagerService == null || kmsService == null) {
+            return null;
+        }
+        try {
+            Secret secret = secretsManagerService.describeSecret(secretArn, region);
+            String keyId = secret.getKmsKeyId();
+            return keyId != null ? keyId : RequestScopes.callAs(accountIdFromArn(secretArn), region,
+                    () -> kmsService.describeKey("alias/aws/secretsmanager", region).getArn());
+        } catch (RuntimeException e) {
+            // Old metadata remains readable if its secret or key is temporarily unavailable.
+            LOG.debugv(e, "Could not recover the managed key for secret {0}", secretArn);
+            return null;
+        }
+    }
+
+    private String resolveManagedSecretKmsKeyId(String kmsKeyId, String region) {
+        if (secretsManagerService == null) {
+            throw new AwsException("InvalidParameterCombination",
+                    "ManageMasterUserPassword requires Secrets Manager support.", 400);
+        }
+        return kmsKeyId != null ? kmsKeyId
+                : kmsService.describeKey("alias/aws/secretsmanager", region).getArn();
+    }
+
+    private void attachManagedMasterUserSecret(DbInstance instance, String region, String kmsKeyId,
+                                               String effectiveKmsKeyId) {
         if (secretsManagerService == null) {
             throw new AwsException("InvalidParameterCombination",
                     "ManageMasterUserPassword requires Secrets Manager support.", 400);
@@ -2550,7 +2606,7 @@ public class RdsService implements Resettable, ResourceProvider {
                 region);
         instance.setMasterUserSecretArn(secret.getArn());
         instance.setMasterUserSecretStatus("active");
-        instance.setMasterUserSecretKmsKeyId(kmsKeyId);
+        instance.setMasterUserSecretKmsKeyId(effectiveKmsKeyId);
     }
 
     private static String managedMasterSecretString(DbInstance instance) {
@@ -2570,7 +2626,8 @@ public class RdsService implements Resettable, ResourceProvider {
         }
     }
 
-    private void attachManagedMasterUserSecret(DbCluster cluster, String region, String kmsKeyId) {
+    private void attachManagedMasterUserSecret(DbCluster cluster, String region, String kmsKeyId,
+                                               String effectiveKmsKeyId) {
         if (secretsManagerService == null) {
             throw new AwsException("InvalidParameterCombination",
                     "ManageMasterUserPassword requires Secrets Manager support.", 400);
@@ -2592,7 +2649,7 @@ public class RdsService implements Resettable, ResourceProvider {
                 region);
         cluster.setMasterUserSecretArn(secret.getArn());
         cluster.setMasterUserSecretStatus("active");
-        cluster.setMasterUserSecretKmsKeyId(kmsKeyId);
+        cluster.setMasterUserSecretKmsKeyId(effectiveKmsKeyId);
     }
 
     /**
@@ -2663,7 +2720,8 @@ public class RdsService implements Resettable, ResourceProvider {
     public DbInstance getDbInstance(String id, String region) {
         String effectiveRegion = effectiveRegion(region);
         return Optional.ofNullable(findInstanceForScope(
-                currentAccountId(), effectiveRegion, id)).orElseThrow(() ->
+                currentAccountId(), effectiveRegion, id))
+                .orElseThrow(() ->
                 new AwsException("DBInstanceNotFound",
                         "DB instance " + id + " not found.", 404));
     }
@@ -3969,6 +4027,8 @@ public class RdsService implements Resettable, ResourceProvider {
         PlacementResolution placement = resolvePlacement(dbSubnetGroupName, availabilityZone, multiAz, effectiveRegion);
 
         boolean mock = config.services().rds().mock();
+        String effectiveSecretKmsKeyId = manageMasterUserPassword
+                ? resolveManagedSecretKmsKeyId(masterUserSecretKmsKeyId, effectiveRegion) : null;
         // Always reserve a unique port (even in mock) so endpoints stay distinct and usedPorts
         // is consistent; mock mode only skips starting the container and auth proxy.
         int proxyPort = reserveProxyPort(requestedPort);
@@ -4014,7 +4074,7 @@ public class RdsService implements Resettable, ResourceProvider {
         cluster.setDbClusterArn(clusterArn);
 
         if (manageMasterUserPassword) {
-            attachManagedMasterUserSecret(cluster, effectiveRegion, masterUserSecretKmsKeyId);
+            attachManagedMasterUserSecret(cluster, effectiveRegion, masterUserSecretKmsKeyId, effectiveSecretKmsKeyId);
         }
 
         try {
@@ -4321,7 +4381,8 @@ public class RdsService implements Resettable, ResourceProvider {
     public DbCluster getDbCluster(String id, String region) {
         String effectiveRegion = effectiveRegion(region);
         return Optional.ofNullable(findClusterForScope(
-                currentAccountId(), effectiveRegion, id)).orElseThrow(() ->
+                currentAccountId(), effectiveRegion, id))
+                .orElseThrow(() ->
                 new AwsException("DBClusterNotFoundFault",
                         "DB cluster " + id + " not found.", 404));
     }
@@ -4409,6 +4470,9 @@ public class RdsService implements Resettable, ResourceProvider {
             effectiveAutoPauseSeconds = validateServerlessV2ScalingConfiguration(
                     effectiveMinCapacity, effectiveMaxCapacity, requestedOrExistingAutoPause);
         }
+        String effectiveSecretKmsKeyId = Boolean.TRUE.equals(manageMasterUserPassword)
+                && cluster.getMasterUserSecretArn() == null
+                ? resolveManagedSecretKmsKeyId(masterUserSecretKmsKeyId, effectiveRegion) : null;
         boolean passwordRotated = false;
         if (newPassword != null && !newPassword.isBlank()) {
             String oldPassword = cluster.getMasterPassword();
@@ -4432,7 +4496,7 @@ public class RdsService implements Resettable, ResourceProvider {
             if (cluster.getMasterPassword() == null || cluster.getMasterPassword().isBlank()) {
                 cluster.setMasterPassword(generatedMasterPassword());
             }
-            attachManagedMasterUserSecret(cluster, effectiveRegion, masterUserSecretKmsKeyId);
+            attachManagedMasterUserSecret(cluster, effectiveRegion, masterUserSecretKmsKeyId, effectiveSecretKmsKeyId);
         } else if (Boolean.FALSE.equals(manageMasterUserPassword) && cluster.getMasterUserSecretArn() != null) {
             detachManagedMasterUserSecret(cluster, effectiveRegion);
         } else if (cluster.getMasterUserSecretArn() != null
@@ -7103,7 +7167,7 @@ public class RdsService implements Resettable, ResourceProvider {
         }
         try {
             AwsArnUtils.Arn arn = AwsArnUtils.parse(targetGroup.getTargetGroupArn());
-            return AwsRegions.partitionFor(region).equals(arn.partition())
+            return regionResolver.partitionForRegion(region).equals(arn.partition())
                     && "rds".equals(arn.service())
                     && Objects.equals(accountId, arn.accountId())
                     && Objects.equals(region, arn.region())
@@ -8017,9 +8081,8 @@ public class RdsService implements Resettable, ResourceProvider {
         targetGroup = new DbProxyTargetGroup();
         targetGroup.setDbProxyName(proxy.getDbProxyName());
         targetGroup.setTargetGroupName("default");
-        targetGroup.setTargetGroupArn(AwsArnUtils.Arn.of("rds",
-                region,
-                accountId, "target-group:prx-tg-" + randomResourceSuffix()).toString());
+        targetGroup.setTargetGroupArn(regionResolver.buildArn("rds", region,
+                accountId, "target-group:prx-tg-" + randomResourceSuffix()));
         targetGroup.setDefaultTargetGroup(true);
         targetGroup.setCreatedAt(now);
         targetGroup.setUpdatedAt(now);
@@ -8587,7 +8650,7 @@ public class RdsService implements Resettable, ResourceProvider {
             String resourceType, String resourceId) {
         try {
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
-            return AwsRegions.partitionFor(region).equals(parsed.partition())
+            return regionResolver.partitionForRegion(region).equals(parsed.partition())
                     && "rds".equals(parsed.service())
                     && Objects.equals(accountId, parsed.accountId())
                     && Objects.equals(region, parsed.region())
@@ -9184,8 +9247,8 @@ public class RdsService implements Resettable, ResourceProvider {
         // The model documents the subscription as created but inactive when Enabled is false, and
         // says nothing about a default, so an omitted Enabled activates it as the console does.
         subscription.setEnabled(enabled == null || enabled);
-        subscription.setEventSubscriptionArn(AwsArnUtils.Arn.of("rds", region, accountId,
-                "es:" + subscriptionName).toString());
+        subscription.setEventSubscriptionArn(regionResolver.buildArn("rds", region,
+                "es:" + subscriptionName));
         subscription.setTags(tags == null ? new LinkedHashMap<>() : new LinkedHashMap<>(tags));
         eventSubscriptions.put(key, subscription);
         return subscription;
@@ -9297,6 +9360,7 @@ public class RdsService implements Resettable, ResourceProvider {
         }
         String prefix = eventSubscriptionKey(region, "");
         List<EventSubscription> all = eventSubscriptions.scan(k -> k.startsWith(prefix)).stream()
+                .map(subscription -> normalizeEventSubscriptionArn(region, subscription))
                 .sorted(Comparator.comparing(EventSubscription::getCustSubscriptionId))
                 .toList();
         // The marker is the last name of the previous page and the next page starts after it.
@@ -9319,8 +9383,27 @@ public class RdsService implements Resettable, ResourceProvider {
 
     private EventSubscription requireEventSubscription(String region, String subscriptionName) {
         return eventSubscriptions.get(eventSubscriptionKey(region, subscriptionName))
+                .map(subscription -> normalizeEventSubscriptionArn(region, subscription))
                 .orElseThrow(() -> new AwsException("SubscriptionNotFound",
                         "Subscription " + subscriptionName + " not found.", 404));
+    }
+
+    private EventSubscription normalizeEventSubscriptionArn(String region, EventSubscription subscription) {
+        String accountId = subscription.getCustomerAwsId();
+        String name = subscription.getCustSubscriptionId();
+        if (accountId == null || name == null) {
+            return subscription;
+        }
+        String resource = "es:" + name;
+        String legacyArn = AwsArnUtils.Arn.of("rds", region, accountId, resource).toString();
+        String expectedArn = regionResolver.buildArn("rds", region, accountId, resource);
+        // Earlier versions minted custom-region subscriptions with the catalog's fallback
+        // partition. Repair only that exact legacy identity, preserving its stored owner.
+        if (legacyArn.equals(subscription.getEventSubscriptionArn()) && !legacyArn.equals(expectedArn)) {
+            subscription.setEventSubscriptionArn(expectedArn);
+            eventSubscriptions.put(eventSubscriptionKey(region, name), subscription);
+        }
+        return subscription;
     }
 
     // ── Cluster endpoints ─────────────────────────────────────────────────────

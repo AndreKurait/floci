@@ -112,8 +112,8 @@ back to `aws` for a label no partition publishes.
   distinct from the Application/Classic one. The CloudFront hosted zone is published for `aws`
   and `aws-cn`; the SAML sign-on URL for five partitions. The ISO and EUSC regions have no load
   balancer hosted zones, and only the two ISO-F regions have an S3 website zone; where a table has
-  no row the field is omitted rather than guessed. An `EDGE` API Gateway custom domain is refused
-  outside the commercial partition (`BadRequestException`): GovCloud and ISO have no CloudFront,
+  no row the field is omitted rather than guessed. An `EDGE` API Gateway REST API or custom domain is
+  refused outside the commercial partition (`BadRequestException`): GovCloud and ISO have no CloudFront,
   and China has no edge-optimized API Gateway
   ([China API Gateway](https://docs.amazonaws.cn/en_us/aws/latest/userguide/api-gateway.html)).
 - **VPC endpoint service names**: interface endpoints (as `DescribeVpcEndpointServices` lists them)
@@ -211,7 +211,9 @@ partition.
   namespace, and `ListBuckets` lists buckets created from every partition; IAM, Organizations,
   Route 53, CloudFront and the IAM Identity Center instance keep one set of resources per account,
   whichever partition a request is signed for. AWS keeps them per partition. A deployment that serves one partition is
-  unaffected.
+  unaffected. For the same reason, STS `AssumeRole`, EKS Pod Identity and EKS add-ons accept a role ARN from
+  any partition and resolve it to the account's role of that path and name; the session is named
+  with the role's own ARN.
 - **AWS managed policies** are the commercial catalog in every partition, with their ARNs and
   regional hosts rewritten; AWS publishes no per-partition list.
 - **Client tooling** that computes partition values itself (CDK bootstrap and

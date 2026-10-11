@@ -89,7 +89,7 @@ class IamQueryHandlerTest {
         role.setCreateDate(Instant.parse(stored));
         IamService service = mock(IamService.class);
         when(service.createRole(ROLE_NAME, "/", "{}", null, 3600, Map.of(), null)).thenReturn(role);
-        when(service.getRole(ROLE_NAME)).thenReturn(role);
+        when(service.getValidatedRole(ROLE_NAME)).thenReturn(role);
         IamQueryHandler handler = new IamQueryHandler(service, null, null, null, null, null, null);
 
         MultivaluedMap<String, String> params = new MultivaluedHashMap<>();

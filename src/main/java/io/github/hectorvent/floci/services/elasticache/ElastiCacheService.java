@@ -1246,7 +1246,7 @@ public class ElastiCacheService implements ResourceProvider {
         if (request.preferredMaintenanceWindow() != null && !request.preferredMaintenanceWindow().isBlank()) {
             BackupWindows.parseMaintenanceWindow(request.preferredMaintenanceWindow());
         }
-        requireCacheSubnetGroup(request.cacheSubnetGroupName());
+        requireCacheSubnetGroup(subnetGroups, request.cacheSubnetGroupName());
         String parameterGroupReservation = reserveParameterGroup(request.cacheParameterGroupName());
         try {
             if (cacheClusterIdTaken(clusterId)) {
@@ -1285,7 +1285,7 @@ public class ElastiCacheService implements ResourceProvider {
      * <p>{@code CreateReplicationGroup} does not make this check, so a replication group can
      * still be created against a subnet group that is not there.
      */
-    private void requireCacheSubnetGroup(String name) {
+    static void requireCacheSubnetGroup(StorageBackend<String, CacheSubnetGroup> subnetGroups, String name) {
         if (name == null || name.isBlank()) {
             return;
         }
@@ -2185,6 +2185,12 @@ public class ElastiCacheService implements ResourceProvider {
 
     /** Replaces the description and, when subnets are given, the whole subnet set. */
     public CacheSubnetGroup modifyCacheSubnetGroup(String name, String description, List<String> subnetIds) {
+        return modifyCacheSubnetGroup(name, description, subnetIds, null);
+    }
+
+    /** As above; a non-null {@code tags} replaces the stored tag map, an empty one clears it. */
+    public CacheSubnetGroup modifyCacheSubnetGroup(String name, String description, List<String> subnetIds,
+                                                   Map<String, String> tags) {
         validateSubnetGroupName(name);
         synchronized (lockFor("sng:" + name)) {
             CacheSubnetGroup existing = subnetGroups.get(name)
@@ -2201,7 +2207,7 @@ public class ElastiCacheService implements ResourceProvider {
             } else {
                 updated = buildSubnetGroup(name, effectiveDescription, subnetIds);
             }
-            updated.setTags(existing.getTags());
+            updated.setTags(tags != null ? tags : existing.getTags());
             subnetGroups.put(name, updated);
             return updated;
         }
@@ -2213,6 +2219,16 @@ public class ElastiCacheService implements ResourceProvider {
             if (subnetGroups.get(name).isEmpty()) {
                 throw new AwsException("CacheSubnetGroupNotFoundFault",
                         "Cache Subnet Group " + name + " does not exist.", 400);
+            }
+            boolean inUse = cacheClusters.scan(k -> true).stream()
+                            .anyMatch(c -> name.equals(c.getCacheSubnetGroupName()))
+                    || memcachedClusters.scan(k -> true).stream()
+                            .anyMatch(c -> name.equals(c.getCacheSubnetGroupName()))
+                    || groups.scan(k -> true).stream()
+                            .anyMatch(g -> name.equals(g.getCacheSubnetGroupName()));
+            if (inUse) {
+                throw new AwsException("CacheSubnetGroupInUse",
+                        "The requested cache subnet group is currently in use.", 400);
             }
             subnetGroups.delete(name);
         }

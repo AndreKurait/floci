@@ -45,6 +45,8 @@ import java.util.concurrent.ConcurrentHashMap;
 @ApplicationScoped
 public class SesIdentityService implements SesTaggable {
 
+    static final String DKIM_SIGNING_HOSTED_ZONE = "dkim.amazonses.com";
+
     private static final Logger LOG = Logger.getLogger(SesIdentityService.class);
 
     private static final Duration DKIM_LOOKUP_CACHE_TTL = Duration.ofSeconds(5);
@@ -714,7 +716,7 @@ public class SesIdentityService implements SesTaggable {
 
     private boolean hasExpectedDkimRecord(String domain, String token) {
         String expectedName = normalizeDnsName(token + "._domainkey." + domain);
-        String expectedValue = normalizeDnsName(token + ".dkim.amazonses.com");
+        String expectedValue = normalizeDnsName(token + "." + DKIM_SIGNING_HOSTED_ZONE);
         for (HostedZone zone : route53Service.listHostedZones(null, Integer.MAX_VALUE)) {
             for (ResourceRecordSet recordSet : route53Service.listResourceRecordSets(zone.getId(), null, null,
                     Integer.MAX_VALUE)) {

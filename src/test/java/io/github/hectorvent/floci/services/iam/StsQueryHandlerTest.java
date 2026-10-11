@@ -194,22 +194,40 @@ class StsQueryHandlerTest {
     }
 
     @Test
+    void assumeRoleOnARoleArnFromAnotherPartitionRegistersTheAccountsOneRole() {
+        String storedArn = "arn:aws:iam::000000000000:role/TestRole";
+        IamService iamService = mock(IamService.class);
+        when(iamService.findRole("000000000000", "TestRole"))
+                .thenReturn(Optional.of(new IamRole("AROA-test", "TestRole", "/", storedArn, "{}")));
+        StsQueryHandler handler = newHandler(iamService, new RegionResolver(REGION, "000000000000"));
+
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("RoleArn", "arn:aws-cn:iam::000000000000:role/TestRole");
+        params.putSingle("RoleSessionName", "test-session");
+        Response response = handler.handle("AssumeRole", params);
+
+        assertEquals(200, response.getStatus(), (String) response.getEntity());
+        verify(iamService).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(storedArn), any(),
+                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"), eq(false), isNull());
+    }
+
+    @Test
     void roleArnMatchesValidatesPartitionsAndPaths() {
         IamRole role = new IamRole();
         role.setRoleName("TestRole");
         role.setPath("/team/");
         role.setArn("arn:aws:iam::000000000000:role/team/TestRole");
 
-        assertTrue(StsQueryHandler.roleArnMatches("arn:aws:iam::000000000000:role/team/TestRole", role));
-        assertTrue(StsQueryHandler.roleArnMatches("arn:aws-cn:iam::000000000000:role/team/TestRole", role));
-        assertTrue(StsQueryHandler.roleArnMatches("arn:aws-us-gov:iam::000000000000:role/team/TestRole", role));
+        assertTrue(IamService.roleArnMatches("arn:aws:iam::000000000000:role/team/TestRole", role));
+        assertTrue(IamService.roleArnMatches("arn:aws-cn:iam::000000000000:role/team/TestRole", role));
+        assertTrue(IamService.roleArnMatches("arn:aws-us-gov:iam::000000000000:role/team/TestRole", role));
 
-        assertFalse(StsQueryHandler.roleArnMatches("arn:aws:iam::000000000000:role/other/TestRole", role));
-        assertFalse(StsQueryHandler.roleArnMatches("arn:aws:iam::111111111111:role/team/TestRole", role));
-        assertFalse(StsQueryHandler.roleArnMatches("arn:aws:iam:us-east-1:000000000000:role/team/TestRole", role));
-        assertFalse(StsQueryHandler.roleArnMatches("arn:aws:s3:::bucket", role));
-        assertFalse(StsQueryHandler.roleArnMatches("not-an-arn", role));
-        assertFalse(StsQueryHandler.roleArnMatches(null, role));
+        assertFalse(IamService.roleArnMatches("arn:aws:iam::000000000000:role/other/TestRole", role));
+        assertFalse(IamService.roleArnMatches("arn:aws:iam::111111111111:role/team/TestRole", role));
+        assertFalse(IamService.roleArnMatches("arn:aws:iam:us-east-1:000000000000:role/team/TestRole", role));
+        assertFalse(IamService.roleArnMatches("arn:aws:s3:::bucket", role));
+        assertFalse(IamService.roleArnMatches("not-an-arn", role));
+        assertFalse(IamService.roleArnMatches(null, role));
     }
 
     @ParameterizedTest

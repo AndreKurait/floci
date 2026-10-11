@@ -116,7 +116,8 @@ The credentials endpoint performs the following validations:
 2. Identifies the matching EKS cluster by comparing the token issuer URL to cluster OIDC issuer URLs.
 3. Validates the token signature against the cluster OIDC public key, confirming the token is unexpired and carries audience `pods.eks.amazonaws.com`.
 4. Extracts the subject claim (`system:serviceaccount:<namespace>:<serviceAccount>`) and looks up the pod identity association for the cluster, namespace, and service account.
-5. Issues temporary session credentials (`ASIA...`) for the associated IAM role and returns them in standard AWS container credentials format (`AccessKeyId`, `SecretAccessKey`, `Token`, `AccountId`, `Expiration`).
+5. Confirms the associated IAM role still exists under the ARN the association names. A role that was deleted, or recreated under another path, gets `400 AccessDeniedException` and no credentials.
+6. Issues temporary session credentials (`ASIA...`) for the associated IAM role and returns them in standard AWS container credentials format (`AccessKeyId`, `SecretAccessKey`, `Token`, `AccountId`, `Expiration`).
 
 #### TLS is required
 
@@ -654,8 +655,9 @@ on HTTPS for anything it doesn't recognize as loopback: so, out of the box, k3s 
 pull from the registry even though `docker push` from the host works.
 
 Floci solves this at cluster creation: each new k3s container gets a generated
-`/etc/rancher/k3s/registries.yaml` that mirrors every repository hostname the emulator
-can mint: the default account across the full region catalog, plus the path-style
+`/etc/rancher/k3s/registries.yaml` that mirrors every repository hostname the cluster
+can pull: the cluster's own account and the default account, across every region of the
+cluster's partition, plus the path-style
 `localhost:<port>` form used by `FLOCI_SERVICES_ECR_URI_STYLE=path`, to Floci's
 in-network data plane. The same image
 reference then works for the host-side push and the in-cluster pull, with no retagging

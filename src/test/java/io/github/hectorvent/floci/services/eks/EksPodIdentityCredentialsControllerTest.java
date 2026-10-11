@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.EksPodIdentityCredentialsResponse;
 import io.github.hectorvent.floci.services.eks.model.PodIdentityAssociation;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.IamRole;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -29,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -92,6 +94,8 @@ class EksPodIdentityCredentialsControllerTest {
         );
         when(associationService.findAssociation(cluster, NAMESPACE, SERVICE_ACCOUNT))
                 .thenReturn(Optional.of(association));
+        when(iamService.findRole(ACCOUNT_ID, "app-role"))
+                .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, "{}")));
     }
 
     private static KeyPair newKeyPair() throws GeneralSecurityException {
@@ -143,6 +147,48 @@ class EksPodIdentityCredentialsControllerTest {
                 sessionNameCaptor.capture(), any());
         assertEquals(creds.accessKeyId(), akidCaptor.getValue());
         assertTrue(sessionNameCaptor.getValue().startsWith("eks-" + CLUSTER_NAME + "-" + SERVICE_ACCOUNT + "-"));
+    }
+
+    @Test
+    void aSessionOnARoleArnFromAnotherPartitionNamesTheStoredRoleLikeSts() throws Exception {
+        String chinaRoleArn = "arn:aws-cn:iam::123456789012:role/app-role";
+        PodIdentityAssociation association = new PodIdentityAssociation(CLUSTER_NAME, NAMESPACE, SERVICE_ACCOUNT,
+                chinaRoleArn, "arn:aws:eks:us-east-1:" + ACCOUNT_ID + ":podidentityassociation/" + CLUSTER_NAME
+                + "/assoc-1", "assoc-1", null, 1000.0, 1000.0, null, null, false, null, null);
+        when(associationService.findAssociation(cluster, NAMESPACE, SERVICE_ACCOUNT))
+                .thenReturn(Optional.of(association));
+        when(iamService.findRole(ACCOUNT_ID, "app-role"))
+                .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, "{}")));
+
+        Response response = controller.getCredentials("Bearer " + validToken());
+
+        assertEquals(200, response.getStatus());
+        verify(iamService).registerSession(any(), any(), any(), eq(ROLE_ARN), any(Instant.class), eq(null),
+                eq(ACCOUNT_ID), any(), any());
+    }
+
+    @Test
+    void aRoleRecreatedUnderAnotherPathGetsNoCredentials() throws Exception {
+        String replacementArn = "arn:aws:iam::" + ACCOUNT_ID + ":role/team/app-role";
+        when(iamService.findRole(ACCOUNT_ID, "app-role"))
+                .thenReturn(Optional.of(new IamRole("AROA-replacement", "app-role", "/team/", replacementArn, "{}")));
+
+        Response response = controller.getCredentials("Bearer " + validToken());
+
+        assertEquals(400, response.getStatus());
+        assertTrue(response.getEntity().toString().startsWith("AccessDeniedException"));
+        verify(iamService, never()).registerSession(any(), any(), any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void aDeletedRoleGetsNoCredentials() throws Exception {
+        when(iamService.findRole(ACCOUNT_ID, "app-role")).thenReturn(Optional.empty());
+
+        Response response = controller.getCredentials("Bearer " + validToken());
+
+        assertEquals(400, response.getStatus());
+        assertTrue(response.getEntity().toString().startsWith("AccessDeniedException"));
+        verify(iamService, never()).registerSession(any(), any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test

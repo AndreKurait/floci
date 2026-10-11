@@ -786,11 +786,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void updateUser(String userName, String newUserName, String newPath, String expectedUserId) {
         synchronized (resourceNameLock) {
             IamUser user = getUser(userName);
-            if (expectedUserId != null && !expectedUserId.equals(user.getUserId())) {
-                throw new AwsException("EntityAlreadyExists",
-                        "User " + userName + " was replaced by a different user of the same name; "
-                                + "refusing to apply an update meant for the original user.", 409);
-            }
+            requireSameUser(user, userName, expectedUserId);
             if (newUserName != null && !newUserName.equals(userName)) {
                 boolean nameTaken = resourcesInCurrentAccount(users)
                         .filter(existing -> !existing.getUserId().equals(user.getUserId()))
@@ -1051,6 +1047,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                         "The role with name " + roleName + " cannot be found.", 404));
     }
 
+    public IamRole getValidatedRole(String roleName) {
+        validateRoleName(roleName);
+        return getRole(roleName);
+    }
+
     /**
      * Looks up a role by name in a specific account's namespace, without throwing when absent.
      *
@@ -1084,6 +1085,34 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     /**
+     * Whether {@code requestedRoleArn} names {@code role}: same account, same path and name, no region.
+     *
+     * <p>The ARN's partition only has to be well formed. One process serves several partitions but
+     * keeps one IAM namespace per account, so a role ARN from another partition resolves to the
+     * account's one role (see the partitions guide). STS AssumeRole and EKS Pod Identity both match
+     * role ARNs through here so they accept the same ARNs.
+     */
+    public static boolean roleArnMatches(String requestedRoleArn, IamRole role) {
+        if (requestedRoleArn == null || role == null || !AwsArnUtils.isArn(requestedRoleArn)) {
+            return false;
+        }
+        AwsArnUtils.Arn requested = AwsArnUtils.parse(requestedRoleArn);
+        if (!"iam".equals(requested.service())
+                || !requested.partition().matches(AwsArnUtils.PARTITION_REGEX)) {
+            return false;
+        }
+        String storedArn = role.getArn();
+        if (storedArn != null && AwsArnUtils.isArn(storedArn)) {
+            AwsArnUtils.Arn stored = AwsArnUtils.parse(storedArn);
+            return requested.accountId().equals(stored.accountId())
+                    && requested.region().equals(stored.region())
+                    && requested.resource().equals(stored.resource());
+        }
+        String expectedResource = "role" + normalizePath(role.getPath()) + role.getRoleName();
+        return requested.region().isEmpty() && requested.resource().equals(expectedResource);
+    }
+
+    /**
      * AWS publishes UnmodifiableEntity on twelve role actions, and its message names the linked
      * service the caller has to go through instead. This guards the eleven of them the emulator
      * implements; UpdateRoleDescription is the twelfth and has no handler here. TagRole and
@@ -1106,6 +1135,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void deleteRole(String roleName) {
+        validateRoleName(roleName);
         IamRole role = getRole(roleName);
         requireNotServiceLinked(role, roleName);
         if (!role.getAttachedPolicyArns().isEmpty() || !role.getInlinePolicies().isEmpty()) {
@@ -1194,6 +1224,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         if (roleName == null) {
             throw new AwsException("NoSuchEntity", "The request must include RoleName.", 404);
         }
+        validateRoleName(roleName);
         IamRole role = getRole(roleName);
         // The path cannot classify a role — CreateRole will put an ordinary one under the
         // service-role prefix — so only roles minted here are deletable through this action. The
@@ -1230,6 +1261,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void updateRole(String roleName, String description, int maxSessionDuration) {
+        validateRoleName(roleName);
         IamRole role = getRole(roleName);
         requireNotServiceLinked(role, roleName);
         if (description != null) role.setDescription(description);
@@ -1238,6 +1270,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void updateAssumeRolePolicy(String roleName, String policyDocument) {
+        validateRoleName(roleName);
         IamRole role = getRole(roleName);
         requireNotServiceLinked(role, roleName);
         role.setAssumeRolePolicyDocument(policyDocument);
@@ -1252,17 +1285,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * that check and this call would silently receive the update meant for the original role.
      */
     public void updateAssumeRolePolicy(String roleName, String policyDocument, String expectedRoleId) {
-        IamRole role = getRole(roleName);
-        if (expectedRoleId != null && !expectedRoleId.equals(role.getRoleId())) {
-            throw new AwsException("EntityAlreadyExists",
-                    "Role " + roleName + " was replaced by a different role of the same name; "
-                            + "refusing to apply an update meant for the original role.", 409);
+        validateRoleName(roleName);
+        synchronized (resourceNameLock) {
+            IamRole role = getRole(roleName);
+            requireSameRole(role, roleName, expectedRoleId);
+            role.setAssumeRolePolicyDocument(policyDocument);
+            roles.put(roleName, role);
         }
-        role.setAssumeRolePolicyDocument(policyDocument);
-        roles.put(roleName, role);
     }
 
     public void tagRole(String roleName, Map<String, String> newTags) {
+        validateRoleName(roleName);
         synchronized (tagLock) {
             IamRole role = getRole(roleName);
             role.setTags(mergeTagsWithinQuota(role.getTags(), newTags, "TagsPerRole", true));
@@ -1271,6 +1304,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void untagRole(String roleName, List<String> tagKeys) {
+        validateRoleName(roleName);
         synchronized (tagLock) {
             IamRole role = getRole(roleName);
             removeTagsCaseInsensitive(role.getTags(), tagKeys);
@@ -1279,6 +1313,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public Map<String, String> listRoleTags(String roleName) {
+        validateRoleName(roleName);
         return getRole(roleName).getTags();
     }
 
@@ -1735,6 +1770,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // =========================================================================
 
     public void attachRolePolicy(String roleName, String policyArn) {
+        validateRoleName(roleName);
         IamRole role = getRole(roleName);
         requireNotServiceLinked(role, roleName);
         IamPolicy policy = requirePolicy(policyArn);
@@ -1746,6 +1782,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void detachRolePolicy(String roleName, String policyArn) {
+        validateRoleName(roleName);
         IamRole role = getRole(roleName);
         requireNotServiceLinked(role, roleName);
         if (!role.getAttachedPolicyArns().remove(policyArn)) {
@@ -1757,6 +1794,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public List<IamPolicy> listAttachedRolePolicies(String roleName, String pathPrefix) {
+        validateRoleName(roleName);
         return getRole(roleName).getAttachedPolicyArns().stream()
                 .flatMap(arn -> resolvePolicy(arn).stream())
                 .filter(p -> pathPrefix == null || p.getPath().startsWith(pathPrefix))
@@ -1834,6 +1872,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // =========================================================================
 
     public void putRolePolicy(String roleName, String policyName, String policyDocument) {
+        validateRoleName(roleName);
         IamRole role = getRole(roleName);
         requireNotServiceLinked(role, roleName);
         Map<String, String> inlinePolicies = role.getInlinePolicies();
@@ -1863,6 +1902,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public String getRolePolicy(String roleName, String policyName) {
+        validateRoleName(roleName);
         IamRole role = getRole(roleName);
         String doc = role.getInlinePolicies().get(policyName);
         if (doc == null) {
@@ -1873,6 +1913,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void deleteRolePolicy(String roleName, String policyName) {
+        validateRoleName(roleName);
         IamRole role = getRole(roleName);
         requireNotServiceLinked(role, roleName);
         if (role.getInlinePolicies().remove(policyName) == null) {
@@ -1883,6 +1924,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public List<String> listRolePolicies(String roleName) {
+        validateRoleName(roleName);
         return new ArrayList<>(getRole(roleName).getInlinePolicies().keySet());
     }
 
@@ -2041,6 +2083,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void addRoleToInstanceProfile(String instanceProfileName, String roleName) {
+        validateRoleName(roleName);
         InstanceProfile profile = getInstanceProfile(instanceProfileName);
         requireNotServiceLinked(getRole(roleName), roleName);
         List<String> roleNames = profile.getRoleNames();
@@ -2057,6 +2100,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void removeRoleFromInstanceProfile(String instanceProfileName, String roleName) {
+        validateRoleName(roleName);
         InstanceProfile profile = getInstanceProfile(instanceProfileName);
         // Tolerates an already-deleted role, so guard only what is still there.
         roles.get(roleName).ifPresent(role -> requireNotServiceLinked(role, roleName));
@@ -2065,6 +2109,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public List<InstanceProfile> listInstanceProfilesForRole(String roleName) {
+        validateRoleName(roleName);
         getRole(roleName); // validates existence
         return instanceProfiles.scan(k -> true).stream()
                 .filter(p -> p.getRoleNames().contains(roleName))
@@ -4897,43 +4942,101 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // =========================================================================
 
     public void putUserPermissionsBoundary(String userName, String permissionsBoundaryArn) {
+        putUserPermissionsBoundary(userName, permissionsBoundaryArn, null);
+    }
+
+    /**
+     * Same as {@link #putUserPermissionsBoundary(String, String)}, but refuses the write if the user
+     * named here is no longer the one with {@code expectedUserId}, like
+     * {@link #updateUser(String, String, String, String)}. A null ID skips the check.
+     */
+    public void putUserPermissionsBoundary(String userName, String permissionsBoundaryArn, String expectedUserId) {
         requirePolicy(permissionsBoundaryArn); // validate policy exists
-        IamUser user = getUser(userName);
-        user.setPermissionsBoundaryArn(permissionsBoundaryArn);
-        users.put(userName, user);
+        synchronized (resourceNameLock) {
+            IamUser user = getUser(userName);
+            requireSameUser(user, userName, expectedUserId);
+            user.setPermissionsBoundaryArn(permissionsBoundaryArn);
+            users.put(userName, user);
+        }
         LOG.infov("Set permissions boundary for user {0}: {1}", userName, permissionsBoundaryArn);
     }
 
     public void deleteUserPermissionsBoundary(String userName) {
-        IamUser user = getUser(userName);
-        if (user.getPermissionsBoundaryArn() == null) {
-            throw new AwsException("NoSuchEntity",
-                    "User " + userName + " does not have a permissions boundary.", 404);
+        deleteUserPermissionsBoundary(userName, null);
+    }
+
+    /** ID-verified like {@link #putUserPermissionsBoundary(String, String, String)}. */
+    public void deleteUserPermissionsBoundary(String userName, String expectedUserId) {
+        synchronized (resourceNameLock) {
+            IamUser user = getUser(userName);
+            requireSameUser(user, userName, expectedUserId);
+            if (user.getPermissionsBoundaryArn() == null) {
+                throw new AwsException("NoSuchEntity",
+                        "User " + userName + " does not have a permissions boundary.", 404);
+            }
+            user.setPermissionsBoundaryArn(null);
+            users.put(userName, user);
         }
-        user.setPermissionsBoundaryArn(null);
-        users.put(userName, user);
         LOG.infov("Deleted permissions boundary for user: {0}", userName);
     }
 
     public void putRolePermissionsBoundary(String roleName, String permissionsBoundaryArn) {
-        IamRole role = getRole(roleName);
-        requireNotServiceLinked(role, roleName);
-        requirePolicy(permissionsBoundaryArn); // validate policy exists
-        role.setPermissionsBoundaryArn(permissionsBoundaryArn);
-        roles.put(roleName, role);
+        putRolePermissionsBoundary(roleName, permissionsBoundaryArn, null);
+    }
+
+    /**
+     * Same as {@link #putRolePermissionsBoundary(String, String)}, but refuses the write if the role
+     * named here is no longer the one with {@code expectedRoleId}, like
+     * {@link #updateAssumeRolePolicy(String, String, String)}. A null ID skips the check.
+     */
+    public void putRolePermissionsBoundary(String roleName, String permissionsBoundaryArn, String expectedRoleId) {
+        validateRoleName(roleName);
+        synchronized (resourceNameLock) {
+            IamRole role = getRole(roleName);
+            requireSameRole(role, roleName, expectedRoleId);
+            requireNotServiceLinked(role, roleName);
+            requirePolicy(permissionsBoundaryArn); // validate policy exists
+            role.setPermissionsBoundaryArn(permissionsBoundaryArn);
+            roles.put(roleName, role);
+        }
         LOG.infov("Set permissions boundary for role {0}: {1}", roleName, permissionsBoundaryArn);
     }
 
     public void deleteRolePermissionsBoundary(String roleName) {
-        IamRole role = getRole(roleName);
-        requireNotServiceLinked(role, roleName);
-        if (role.getPermissionsBoundaryArn() == null) {
-            throw new AwsException("NoSuchEntity",
-                    "Role " + roleName + " does not have a permissions boundary.", 404);
+        deleteRolePermissionsBoundary(roleName, null);
+    }
+
+    /** ID-verified like {@link #putRolePermissionsBoundary(String, String, String)}. */
+    public void deleteRolePermissionsBoundary(String roleName, String expectedRoleId) {
+        validateRoleName(roleName);
+        synchronized (resourceNameLock) {
+            IamRole role = getRole(roleName);
+            requireSameRole(role, roleName, expectedRoleId);
+            requireNotServiceLinked(role, roleName);
+            if (role.getPermissionsBoundaryArn() == null) {
+                throw new AwsException("NoSuchEntity",
+                        "Role " + roleName + " does not have a permissions boundary.", 404);
+            }
+            role.setPermissionsBoundaryArn(null);
+            roles.put(roleName, role);
         }
-        role.setPermissionsBoundaryArn(null);
-        roles.put(roleName, role);
         LOG.infov("Deleted permissions boundary for role: {0}", roleName);
+    }
+
+    private static void requireSameUser(IamUser user, String userName, String expectedUserId) {
+        if (expectedUserId != null && !expectedUserId.equals(user.getUserId())) {
+            throw new AwsException("EntityAlreadyExists",
+                    "User " + userName + " was replaced by a different user of the same name; "
+                            + "refusing to apply an update meant for the original user.", 409);
+        }
+    }
+
+    private static void requireSameRole(IamRole role, String roleName, String expectedRoleId) {
+        if (expectedRoleId != null && !expectedRoleId.equals(role.getRoleId())) {
+            throw new AwsException("EntityAlreadyExists",
+                    "Role " + roleName + " was replaced by a different role of the same name; "
+                            + "refusing to apply an update meant for the original role.", 409);
+        }
     }
 
     /**
