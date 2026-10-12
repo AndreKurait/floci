@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.testing;
 
+import io.restassured.path.xml.XmlPath;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 
@@ -7,7 +8,8 @@ import static io.restassured.RestAssured.given;
 
 /**
  * Takes an IAM user or an S3 bucket that an enforcement test created back out of the shared
- * application. A {@code @QuarkusTest} shares one application with every other test class, so a
+ * application, and makes the users such a test signs as ({@link #createUser}, {@link #auth}),
+ * registering each one's removal as it goes. A {@code @QuarkusTest} shares one application with every other test class, so a
  * fixture left behind outlives the class that made it and is visible to the next class that lists
  * users or buckets unscoped. Registered with {@link PartitionCleanup} as each fixture is made.
  *
@@ -70,6 +72,39 @@ public final class EnforcementFixtures {
                     "PolicyArn", policyArn).statusCode(200);
         }
         iam(port, authorization, "DeleteUser", "UserName", userName).statusCode(200);
+    }
+
+    /** The access key {@link #createUser} issued, with the secret a request signer needs. */
+    public record UserCredentials(String accessKeyId, String secretAccessKey) {
+    }
+
+    /**
+     * Creates an IAM user holding one access key, registering its {@link #removeUser} with
+     * {@code cleanup} before the create runs, so the user and its key go after the test whatever
+     * the test does with them.
+     *
+     * @param authorization an IAM-scoped header for the account the user belongs to, as for
+     *                      {@link #removeUser}, which is handed the same one
+     */
+    public static UserCredentials createUser(PartitionCleanup cleanup, int port, String authorization,
+                                             String userName) {
+        cleanup.register(() -> removeUser(port, authorization, userName));
+        iam(port, authorization, "CreateUser", "UserName", userName).statusCode(200);
+        XmlPath key = iam(port, authorization, "CreateAccessKey", "UserName", userName)
+                .statusCode(200).extract().xmlPath();
+        return new UserCredentials(
+                key.getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId"),
+                key.getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.SecretAccessKey"));
+    }
+
+    /**
+     * A SigV4 {@code Authorization} header naming {@code accessKeyId}, scoped to {@code service} in
+     * {@code us-east-1}. The signature is a placeholder, so under a profile that verifies signatures
+     * the request has to be signed for real instead.
+     */
+    public static String auth(String accessKeyId, String service) {
+        return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260629/us-east-1/" + service
+                + "/aws4_request, SignedHeaders=host, Signature=abc";
     }
 
     /**

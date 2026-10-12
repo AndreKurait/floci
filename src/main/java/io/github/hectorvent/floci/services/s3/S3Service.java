@@ -2083,10 +2083,19 @@ public class S3Service implements Resettable, ResourceProvider {
      */
     public boolean isGovernanceRetentionActive(String bucketName, String key, String versionId) {
         ensureBucketExists(bucketName);
-        S3Object object = (versionId != null
-                ? objectStore.get(versionedKey(bucketName, key, versionId))
-                : objectStore.get(objectKey(bucketName, key)))
-                .orElse(null);
+        S3Object object;
+        if ("null".equals(versionId)) {
+            // Resolved as deleteObjectLocked resolves it: the null version is the unversioned object
+            // at the plain key, so a versioned key named "null" would miss a retained one.
+            object = objectStore.get(objectKey(bucketName, key))
+                    .filter(existing -> existing.getVersionId() == null)
+                    .orElse(null);
+        } else {
+            object = (versionId != null
+                    ? objectStore.get(versionedKey(bucketName, key, versionId))
+                    : objectStore.get(objectKey(bucketName, key)))
+                    .orElse(null);
+        }
         return object != null
                 && !object.isDeleteMarker()
                 && "GOVERNANCE".equals(object.getObjectLockMode())
@@ -2608,7 +2617,7 @@ public class S3Service implements Resettable, ResourceProvider {
     public record DeleteResult(String key, String versionId, boolean deleteMarker, String deleteMarkerVersionId) {
     }
 
-    public record DeleteError(String key, String code, String message) {
+    public record DeleteError(String key, String versionId, String code, String message) {
     }
 
     public record DeleteObjectsResult(List<DeleteResult> deleted, List<DeleteError> errors) {
@@ -2633,9 +2642,9 @@ public class S3Service implements Resettable, ResourceProvider {
                     deleted.add(new DeleteResult(entry.key(), entry.versionId(), false, null));
                 }
             } catch (AwsException e) {
-                errors.add(new DeleteError(entry.key(), e.getErrorCode(), e.getMessage()));
+                errors.add(new DeleteError(entry.key(), entry.versionId(), e.getErrorCode(), e.getMessage()));
             } catch (Exception e) {
-                errors.add(new DeleteError(entry.key(), "InternalError", e.getMessage()));
+                errors.add(new DeleteError(entry.key(), entry.versionId(), "InternalError", e.getMessage()));
             }
         }
         return new DeleteObjectsResult(deleted, errors);

@@ -1607,20 +1607,33 @@ public class S3Controller {
         S3Service.RequestAuthorization authorization = S3RequestAuthorizationParser.parseIfRequired(
                 s3Service.isAuthEnforced(), httpHeaders, uriInfo);
         s3Service.authorizeSignedRequest(authorization);
+        // A blank header counts as absent, as it does in IamEnforcementFilter.filter(), so a presigned
+        // request cannot shed its query credential, and with it every per-key check, by adding one.
+        String authorizationHeader = httpHeaders.getHeaderString("Authorization");
+        if (authorizationHeader != null && authorizationHeader.isBlank()) {
+            authorizationHeader = null;
+        }
+        String iamCredential = IamEnforcementFilter.requestAuthorization(
+                authorizationHeader, uriInfo.getQueryParameters());
         List<XmlParser.KeyVersion> authorizedEntries = new ArrayList<>();
         List<S3Service.DeleteError> authorizationErrors = new ArrayList<>();
         for (XmlParser.KeyVersion entry : entries) {
             try {
+                authorizeDeleteEntryIdentity(iamCredential, bucket, entry);
                 s3Service.authorizeDeleteObject(bucket, entry.key(), entry.versionId(), authorization);
                 authorizeDeleteETagRead(bucket, entry.key(), entry.eTag(), authorization);
                 if (bypass && s3Service.isGovernanceRetentionActive(
                         bucket, entry.key(), entry.versionId())) {
+                    // The bypass is a permission of its own, so IAM evaluates it against the caller's
+                    // policies as it does the delete, not only the bucket-policy check that follows.
+                    authorizeEntryIdentity(iamCredential, "s3:BypassGovernanceRetention", bucket, entry.key());
                     s3Service.authorizeObjectWrite(bucket, entry.key(),
                             "s3:BypassGovernanceRetention", authorization);
                 }
                 authorizedEntries.add(entry);
             } catch (AwsException e) {
-                authorizationErrors.add(new S3Service.DeleteError(entry.key(), e.getErrorCode(), e.getMessage()));
+                authorizationErrors.add(new S3Service.DeleteError(
+                        entry.key(), entry.versionId(), e.getErrorCode(), e.getMessage()));
             }
         }
 
@@ -1645,35 +1658,75 @@ public class S3Controller {
             }
         }
         for (S3Service.DeleteError e : authorizationErrors) {
-            builder.start("Error")
-                   .elem("Key", e.key())
-                   .elem("Code", e.code())
-                   .elem("Message", e.message())
-                   .end("Error");
+            appendDeleteError(builder, e);
         }
         for (S3Service.DeleteError e : result.errors()) {
-            builder.start("Error")
-                   .elem("Key", e.key())
-                   .elem("Code", e.code())
-                   .elem("Message", e.message())
-                   .end("Error");
+            appendDeleteError(builder, e);
         }
         builder.end("DeleteResult");
         return Response.ok(builder.build()).type(MediaType.APPLICATION_XML).build();
+    }
+
+    // An entry naming a version reports it back, so a batch naming several versions of one key
+    // says which of them failed.
+    private static void appendDeleteError(XmlBuilder builder, S3Service.DeleteError error) {
+        builder.start("Error").elem("Key", error.key());
+        if (error.versionId() != null) {
+            builder.elem("VersionId", error.versionId());
+        }
+        builder.elem("Code", error.code())
+               .elem("Message", error.message())
+               .end("Error");
     }
 
     // A conditional delete against an ETag reveals whether the object still has it, so S3 requires
     // s3:GetObject as well as s3:DeleteObject. The existence check (If-Match: *) needs only the delete.
     private void authorizeDeleteETagRead(String bucket, String key, String ifMatch,
                                          S3Service.RequestAuthorization authorization) {
-        if (ifMatch == null) {
-            return;
-        }
-        String value = ifMatch.trim();
-        if (value.equals("*") || value.equals("\"*\"")) {
+        if (!isETagCondition(ifMatch)) {
             return;
         }
         s3Service.authorizeGetObject(bucket, key, null, authorization);
+    }
+
+    private static boolean isETagCondition(String ifMatch) {
+        if (ifMatch == null) {
+            return false;
+        }
+        String value = ifMatch.trim();
+        return !value.equals("*") && !value.equals("\"*\"");
+    }
+
+    /**
+     * Evaluates the caller's identity policies for one DeleteObjects entry, which IamEnforcementFilter
+     * cannot do: S3 has no s3:DeleteObjects action, the keys arrive only in the request body, and a
+     * denial answers that one key with an {@code <Error>} rather than refusing the whole request.
+     * Each entry needs s3:DeleteObject, or s3:DeleteObjectVersion when it names a version, plus
+     * s3:GetObject when it carries an ETag condition.
+     *
+     * <p>No resource-policy decision is passed, so the filter resolves the bucket policy itself, with
+     * its own global condition keys, as it does for a single-key delete. S3's error for a denied entry
+     * reads "Access Denied", not the filter's message for a whole-request denial.
+     */
+    private void authorizeDeleteEntryIdentity(String iamCredential, String bucket, XmlParser.KeyVersion entry) {
+        String action = entry.versionId() == null ? "s3:DeleteObject" : "s3:DeleteObjectVersion";
+        authorizeEntryIdentity(iamCredential, action, bucket, entry.key());
+        if (isETagCondition(entry.eTag())) {
+            authorizeEntryIdentity(iamCredential, "s3:GetObject", bucket, entry.key());
+        }
+    }
+
+    /** Evaluates one action on one DeleteObjects entry's object, answering a denial as S3 does per key. */
+    private void authorizeEntryIdentity(String iamCredential, String action, String bucket, String key) {
+        String resource = S3PublicAccessEvaluator.objectArn(s3Service.bucketPartition(bucket), bucket, key);
+        try {
+            iamEnforcementFilter.authorizeAdditionalResource(iamCredential, action, resource);
+        } catch (AwsException e) {
+            if ("AccessDenied".equals(e.getErrorCode())) {
+                throw new AwsException("AccessDenied", "Access Denied", 403);
+            }
+            throw e;
+        }
     }
 
     private Response handleListParts(String bucket, String key, String uploadId,

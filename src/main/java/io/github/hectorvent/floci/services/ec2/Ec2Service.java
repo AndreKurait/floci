@@ -294,6 +294,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private jakarta.enterprise.inject.Instance<ClusterNodeInstanceProvider> clusterNodeInstanceProviders;
     private ClusterNodeInstanceProvider testClusterNodeInstanceProvider;
     private final Ec2VolumeBlockDeviceManager volumeBlockDeviceManager;
+    // Only the CDI constructor receives it; null on the hand-built constructors, which reads as
+    // "encryption by default is off".
+    private Ec2EbsEncryptionService ebsEncryptionService;
     private jakarta.enterprise.inject.Instance<VpcRouteTableListener> routeTableListenersInstance;
     private final List<VpcRouteTableListener> routeTableListeners = new CopyOnWriteArrayList<>();
     private jakarta.enterprise.inject.Instance<Ec2InstanceLaunchListener> instanceLaunchListenersInstance;
@@ -431,13 +434,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                       jakarta.enterprise.inject.Instance<ClusterNodeInstanceProvider> clusterNodeInstanceProviders,
                       Ec2VolumeBlockDeviceManager volumeBlockDeviceManager,
                       jakarta.enterprise.inject.Instance<VpcRouteTableListener> routeTableListenersInstance,
-                      jakarta.enterprise.inject.Instance<Ec2InstanceLaunchListener> instanceLaunchListenersInstance) {
+                      jakarta.enterprise.inject.Instance<Ec2InstanceLaunchListener> instanceLaunchListenersInstance,
+                      Ec2EbsEncryptionService ebsEncryptionService) {
         this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog,
                 instanceTypeCatalog, storageFactory, requestContextInstance, iamService, volumeBlockDeviceManager);
         this.vpcNetworkManager = vpcNetworkManager;
         this.clusterNodeInstanceProviders = clusterNodeInstanceProviders;
         this.routeTableListenersInstance = routeTableListenersInstance;
         this.instanceLaunchListenersInstance = instanceLaunchListenersInstance;
+        this.ebsEncryptionService = ebsEncryptionService;
     }
 
     public Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
@@ -3508,7 +3513,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             volume.setVolumeType(device.type());
                             volume.setSize(device.size());
                             volume.setSnapshotId(device.snapshot());
-                            volume.setEncrypted(device.encrypted());
+                            volume.setEncrypted(device.encrypted() || ebsEncryptionByDefault(region));
                             volume.setIops(device.iops());
                             volume.setThroughput(device.throughput());
                             volume.setState("in-use");
@@ -10381,6 +10386,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return snapshot;
     }
 
+    private boolean ebsEncryptionByDefault(String region) {
+        return ebsEncryptionService != null && ebsEncryptionService.getEbsEncryptionByDefault(region);
+    }
+
     public Volume createVolume(String region, String availabilityZone, String volumeType,
                                int size, boolean encrypted, int iops, Integer throughput,
                                String snapshotId, List<Tag> volumeTags) {
@@ -10403,7 +10412,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         vol.setAvailabilityZone(availabilityZone != null ? availabilityZone : region + "a");
         vol.setVolumeType(effectiveType);
         vol.setSize(size > 0 ? size : 8);
-        vol.setEncrypted(encrypted);
+        // With encryption by default on, AWS encrypts every new volume and the Encrypted parameter
+        // cannot opt out of it.
+        vol.setEncrypted(encrypted || ebsEncryptionByDefault(region));
         vol.setIops(iops > 0 ? iops : (volumeType != null && volumeType.startsWith("io") ? iops : 0));
         // Throughput is a gp3-only attribute; AWS reports 125 MiB/s by default for gp3.
         if ("gp3".equals(effectiveType)) {
