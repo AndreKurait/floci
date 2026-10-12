@@ -6,6 +6,8 @@ from collections import Counter
 from contextlib import ExitStack, closing
 
 import boto3
+import pytest
+from botocore.exceptions import ClientError
 
 
 def _members_at_capacity(autoscaling, name, desired):
@@ -97,3 +99,75 @@ def test_scale_out_balances_zones_and_prefers_more_subnet_addresses(
                 for subnet in ec2_client.describe_subnets(SubnetIds=subnets)["Subnets"]
             }
             assert free_ips == {subnets[0]: 11, subnets[1]: 249, subnets[2]: 249}
+
+
+def test_zone_only_groups_reject_unknown_zones_and_scale_in_advertised_zones(
+    ec2_client, aws_config, client_config
+):
+    name = "zone-validation-" + uuid.uuid4().hex[:12]
+    zones = [
+        zone["ZoneName"]
+        for zone in ec2_client.describe_availability_zones()["AvailabilityZones"]
+    ]
+    unknown_zone = aws_config["region_name"] + "z"
+    assert unknown_zone not in zones
+    with closing(boto3.client("autoscaling", config=client_config, **aws_config)) as autoscaling:
+        with ExitStack() as cleanup:
+            image = ec2_client.register_image(
+                Name=name, Architecture="x86_64", RootDeviceName="/dev/sda1"
+            )["ImageId"]
+            cleanup.callback(ec2_client.deregister_image, ImageId=image)
+            template = ec2_client.create_launch_template(
+                LaunchTemplateName=name,
+                LaunchTemplateData={"ImageId": image, "InstanceType": "t3.nano"},
+            )["LaunchTemplate"]["LaunchTemplateId"]
+            cleanup.callback(ec2_client.delete_launch_template, LaunchTemplateId=template)
+            for requested in [[unknown_zone], [zones[0], unknown_zone]]:
+                with pytest.raises(ClientError) as error:
+                    autoscaling.create_auto_scaling_group(
+                        AutoScalingGroupName=name,
+                        MinSize=0, MaxSize=0, DesiredCapacity=0,
+                        LaunchTemplate={"LaunchTemplateId": template},
+                        AvailabilityZones=requested,
+                    )
+                assert error.value.response["Error"]["Code"] == "ValidationError"
+                assert unknown_zone in error.value.response["Error"]["Message"]
+                assert autoscaling.describe_auto_scaling_groups(
+                    AutoScalingGroupNames=[name]
+                )["AutoScalingGroups"] == []
+            autoscaling.create_auto_scaling_group(
+                AutoScalingGroupName=name,
+                MinSize=0, MaxSize=0, DesiredCapacity=0,
+                LaunchTemplate={"LaunchTemplateId": template},
+                AvailabilityZones=zones[:2],
+            )
+            cleanup.callback(
+                autoscaling.delete_auto_scaling_group,
+                AutoScalingGroupName=name, ForceDelete=True,
+            )
+            with pytest.raises(ClientError) as error:
+                autoscaling.update_auto_scaling_group(
+                    AutoScalingGroupName=name, MaxSize=3,
+                    AvailabilityZones=[zones[0], unknown_zone],
+                )
+            assert error.value.response["Error"]["Code"] == "ValidationError"
+            group = autoscaling.describe_auto_scaling_groups(
+                AutoScalingGroupNames=[name]
+            )["AutoScalingGroups"][0]
+            assert group["AvailabilityZones"] == zones[:2]
+            assert group["MaxSize"] == 0
+            autoscaling.update_auto_scaling_group(
+                AutoScalingGroupName=name, MaxSize=2, DesiredCapacity=2,
+            )
+            members = _members_at_capacity(autoscaling, name, 2)
+            assert Counter(member["AvailabilityZone"] for member in members) == Counter(zones[:2])
+            instances = [
+                instance
+                for reservation in ec2_client.describe_instances(
+                    InstanceIds=[member["InstanceId"] for member in members]
+                )["Reservations"]
+                for instance in reservation["Instances"]
+            ]
+            assert Counter(
+                instance["Placement"]["AvailabilityZone"] for instance in instances
+            ) == Counter(zones[:2])

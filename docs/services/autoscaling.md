@@ -50,6 +50,15 @@ This covers successful scale-out; retrying another zone after an EC2 launch erro
 and rebalancing existing instances without a desired-capacity increase are not
 implemented here.
 
+Create and update reject explicitly supplied Availability Zones outside the EC2
+zone catalog with `ValidationError`, before changing the group. This prevents
+zone-only groups from repeatedly attempting launches in an unmodelled zone. A live
+AWS check in `us-east-2` on October 12, 2026 at 20:43 UTC rejected both an unknown
+zone alone and a mix of valid and unknown zones; an invalid update left the
+existing zones and maximum size unchanged. Floci currently advertises zones
+`a`, `b` and `c` in each region; this validation uses that catalog rather than
+assuming AWS advertises the same zones in every region.
+
 ### Instance Management
 
 | Operation | Notes |
