@@ -1,6 +1,6 @@
 package io.github.hectorvent.floci.services.s3;
 
-import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
+import io.github.hectorvent.floci.core.common.Digests;
 
 import java.util.function.Function;
 
@@ -24,6 +24,6 @@ final class S3PresignedCanonicalRequest {
 
     static String stringToSign(String amzDate, String credentialScope, String canonicalRequest) throws Exception {
         return "AWS4-HMAC-SHA256\n" + amzDate + "\n" + credentialScope + "\n"
-                + SigV4RequestValidator.sha256Hex(canonicalRequest);
+                + Digests.sha256Hex(canonicalRequest);
     }
 }

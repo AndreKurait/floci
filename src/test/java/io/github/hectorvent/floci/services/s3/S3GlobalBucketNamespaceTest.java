@@ -53,6 +53,28 @@ class S3GlobalBucketNamespaceTest {
         return inst;
     }
 
+    /**
+     * CreateBucket only sees the caller's own buckets, so a caller that wants to know whether it
+     * just created one asks ownsBucket, which stays owner-scoped where bucketExists spans accounts.
+     */
+    @Test
+    void ownsBucketIsOwnerScopedWhereBucketExistsSpansAccounts() {
+        Instance<RequestContext> ctx = mutableContext();
+        AccountAwareStorageBackend<Bucket> buckets =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), ctx, DEFAULT_ACCT);
+        AccountAwareStorageBackend<S3Object> objects =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), ctx, DEFAULT_ACCT);
+        S3Service globalNs = new S3Service(buckets, objects, Path.of("s3-gns-test"), true, true);
+
+        caller.set(ACCOUNT_A);
+        globalNs.createBucket("owned-by-a", "us-west-2");
+        assertTrue(globalNs.ownsBucket("owned-by-a"));
+
+        caller.set(ACCOUNT_B);
+        assertTrue(globalNs.bucketExists("owned-by-a"));
+        assertFalse(globalNs.ownsBucket("owned-by-a"));
+    }
+
     @Test
     void bucketOwnedByOneAccountIsResolvableCrossAccountButNotListed() {
         Instance<RequestContext> ctx = mutableContext();

@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.JsonNodeType;
 import com.fasterxml.jackson.databind.node.MissingNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.iot.model.IotIndexingConfiguration;
@@ -267,8 +268,7 @@ public class IotFleetIndexingService {
     }
 
     private static String pageToken(String parameters, String thingName) {
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(
-                (parameters + pageCheck(parameters, thingName) + thingName).getBytes(StandardCharsets.UTF_8));
+        return Base64Url.encode(parameters + pageCheck(parameters, thingName) + thingName);
     }
 
     /** A checksum of a token's parameters and cursor, so an edited or truncated token is invalid, as on AWS. */

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -1281,8 +1282,83 @@ public class CloudFormationService implements ResourceProvider {
     // ── DescribeStackResources ────────────────────────────────────────────────
 
     public List<StackResource> describeStackResources(String stackName, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
-        return new ArrayList<>(stack.resourcesSnapshot().values());
+        return describeStackResources(stackName, null, null, region);
+    }
+
+    /**
+     * The stack's resources, narrowed by the two filters {@code DescribeStackResources} accepts.
+     *
+     * <p>AWS takes either {@code StackName} or {@code PhysicalResourceId}, never both: given a
+     * physical id it answers with the whole stack that resource belongs to, rather than that one
+     * resource. {@code LogicalResourceId} is only a filter on the result, so naming one the stack
+     * does not have is an empty answer; {@code DescribeStackResource}, the singular action where
+     * the resource is required rather than optional, is the one that raises for a miss.
+     *
+     * <p>Both filters being silently ignored is worse than it sounds for a caller that filters and
+     * then reads the first member: it gets whichever resource the stack happens to list first.
+     * Serverless Framework resolves an AppSync API id exactly that way.
+     */
+    public List<StackResource> describeStackResources(String stackName, String logicalResourceId,
+                                                      String physicalResourceId, String region) {
+        return describeStackResourcesView(stackName, logicalResourceId, physicalResourceId, region).resources();
+    }
+
+    /** The stack a call resolved to and the resources it answered with; the stack's own name is
+     * what AWS stamps on every member, and the caller may not have supplied it. */
+    public record StackResourcesView(String stackName, List<StackResource> resources) {
+    }
+
+    /** @see #describeStackResources(String, String, String, String) */
+    public StackResourcesView describeStackResourcesView(String stackName, String logicalResourceId,
+                                                         String physicalResourceId, String region) {
+        boolean hasStackName = stackName != null && !stackName.isBlank();
+        boolean hasPhysicalId = physicalResourceId != null && !physicalResourceId.isBlank();
+        if (!hasStackName && !hasPhysicalId) {
+            throw new AwsException("ValidationError",
+                    "Either StackName or PhysicalResourceId must be specified.", 400);
+        }
+        if (hasStackName && hasPhysicalId) {
+            throw new AwsException("ValidationError",
+                    "Cannot specify both StackName and PhysicalResourceId.", 400);
+        }
+
+        // A physical id names the stack, it does not narrow it: AWS returns "the associated
+        // resources of the stack that the resource belongs to", which is the whole stack.
+        Stack stack = hasStackName
+                ? getStackOrThrow(stackName, region)
+                : stackContaining(physicalResourceId, region);
+        List<StackResource> resources = new ArrayList<>(stack.resourcesSnapshot().values());
+
+        // Only a filter on the result. The reference documents no error for a logical id the
+        // stack does not have, and DescribeStackResource, the singular action where the resource
+        // is required rather than optional, is the one that raises for a miss.
+        if (logicalResourceId != null && !logicalResourceId.isBlank()) {
+            resources.removeIf(r -> !logicalResourceId.equals(r.getLogicalId()));
+        }
+        return new StackResourcesView(stack.getStackName(), resources);
+    }
+
+    /**
+     * The stack owning a physical id, for the {@code PhysicalResourceId}-only form of the call.
+     *
+     * <p>Live stacks are considered before deleted ones, newest first within each group.
+     * {@code listStacks} answers oldest first and keeps deleted stacks for their retention window,
+     * so walking it directly resolves a redeployed resource to the stack that used to own it.
+     */
+    private Stack stackContaining(String physicalResourceId, String region) {
+        List<Stack> candidates = new ArrayList<>(listStacks(region));
+        candidates.sort(Comparator
+                .comparing((Stack s) -> "DELETE_COMPLETE".equals(s.getStatus()))
+                .thenComparing(Stack::getCreationTime, Comparator.reverseOrder()));
+        for (Stack stack : candidates) {
+            boolean owns = stack.resourcesSnapshot().values().stream()
+                    .anyMatch(r -> physicalResourceId.equals(r.getPhysicalId()));
+            if (owns) {
+                return stack;
+            }
+        }
+        throw new AwsException("ValidationError",
+                "Stack for " + physicalResourceId + " does not exist", 400);
     }
 
     // ── ListStacks ────────────────────────────────────────────────────────────
@@ -1436,6 +1512,9 @@ public class CloudFormationService implements ResourceProvider {
             Set<String> changedResourceIds = isCreate
                     ? Set.of()
                     : changedResourceIds(stack, templateBody, params, region);
+            JsonNode previousResources = isCreate
+                    ? objectMapper.missingNode()
+                    : previousResources(stack, previousState, region, accountId);
             JsonNode template = parseTemplate(templateBody);
             stack.setOriginalTemplateBody(templateBody);
 
@@ -1545,11 +1624,16 @@ public class CloudFormationService implements ResourceProvider {
                                 props.isMissingNode() ? null : props,
                                 engine, region, accountId, isCreate, previousResource);
                     } else {
+                        JsonNode previousDefinition = previousResources.path(logicalId);
+                        JsonNode priorProps = type.equals(previousDefinition.path("Type").asText())
+                                && previousDefinition.path("Properties").isObject()
+                                ? previousDefinition.path("Properties") : null;
                         resource = dispatcher.provision(logicalId, type, props.isMissingNode() ? null : props,
                                 engine, region, accountId, stack.getStackName(),
                                 resource.getPhysicalId(), resource.getAttributes(),
                                 event -> addEvent(stack, logicalId, event.getPhysicalResourceId(), type,
-                                        event.getResourceStatus(), event.getResourceStatusReason()));
+                                        event.getResourceStatus(), event.getResourceStatusReason()),
+                                priorProps);
                     }
                     resource.setUpdateReplacePolicy(
                             resDef.path("UpdateReplacePolicy").asText(null));
@@ -2168,6 +2252,71 @@ public class CloudFormationService implements ResourceProvider {
         }
         existing.addSuppressed(additional);
         return existing;
+    }
+
+    /**
+     * The resources of the processed template an update replaces, so a provisioner can tell a
+     * property the update removes from one the stack never declared. All of them, since an update
+     * can provision a resource whose own definition did not change. Evaluated under the previous
+     * deployment's conditions: a top-level property whose {@code Fn::If} chose {@code AWS::NoValue}
+     * was never applied and is left out. Missing when there is no previous template, and when it no
+     * longer parses: the update then proceeds as if nothing had been declared.
+     */
+    private JsonNode previousResources(Stack stack, StackUpdateSnapshot previousState, String region,
+                                       String accountId) {
+        if (previousState.templateBody() == null) {
+            return objectMapper.missingNode();
+        }
+        try {
+            JsonNode previousTemplate = parseTemplate(previousState.templateBody());
+            // As the change-set preview does: raw parameters for a stack persisted before
+            // resolvedParameters existed.
+            Map<String, String> previousParams = previousState.resolvedParameters().isEmpty()
+                    ? previousState.parameters() : previousState.resolvedParameters();
+            Map<String, Boolean> conditions = resolveConditions(previousTemplate, previousParams, stack, region,
+                    accountId);
+            ObjectNode resources = objectMapper.createObjectNode();
+            for (Map.Entry<String, JsonNode> entry : previousTemplate.path("Resources").properties()) {
+                JsonNode definition = entry.getValue();
+                ObjectNode applied = resources.putObject(entry.getKey());
+                applied.set("Type", definition.path("Type"));
+                if (definition.path("Properties").isObject()) {
+                    applied.set("Properties", appliedProperties(definition.path("Properties"), conditions));
+                }
+            }
+            return resources;
+        } catch (Exception e) {
+            LOG.warnv("Previous template of stack {0} could not be evaluated ({1}); its updated resources see no prior properties",
+                    stack.getStackName(), e.getMessage());
+            return objectMapper.missingNode();
+        }
+    }
+
+    /**
+     * The top-level properties left after each one's {@code Fn::If} is decided, without those that
+     * chose {@code AWS::NoValue}. Decided as the template engine decides it: a condition the
+     * template does not define is false.
+     */
+    private ObjectNode appliedProperties(JsonNode properties, Map<String, Boolean> conditions) {
+        ObjectNode applied = objectMapper.createObjectNode();
+        for (Map.Entry<String, JsonNode> property : properties.properties()) {
+            JsonNode value = decideIf(property.getValue(), conditions);
+            boolean noValue = value.isObject() && value.size() == 1 && "AWS::NoValue".equals(value.path("Ref").asText());
+            if (!noValue) {
+                applied.set(property.getKey(), property.getValue());
+            }
+        }
+        return applied;
+    }
+
+    /** The branch an {@code Fn::If} chose, following nested ones; any other value as it is. */
+    private static JsonNode decideIf(JsonNode value, Map<String, Boolean> conditions) {
+        while (value.isObject() && value.size() == 1 && value.path("Fn::If").isArray()
+                && value.path("Fn::If").size() >= 3) {
+            JsonNode branches = value.path("Fn::If");
+            value = conditions.getOrDefault(branches.get(0).asText(), false) ? branches.get(1) : branches.get(2);
+        }
+        return value;
     }
 
     private StackUpdateSnapshot snapshotForUpdate(Stack stack) {

@@ -18,6 +18,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -367,5 +368,46 @@ class PipesTargetInvokerTest {
         when(lambdaService.invoke(eq(region), eq("my-fn"), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new io.github.hectorvent.floci.services.lambda.model.InvokeResult(200, "Unhandled", "boom".getBytes(), null, "req"));
         assertThrows(RuntimeException.class, () -> invoker.invoke(pipe, "{}", region));
+    }
+
+    @Test
+    void eventBridgeTarget_succeedsWhenPutEventsReportsNoFailures() {
+        String region = "us-east-1";
+        String busArn = "arn:aws:events:" + region + ":000000000000:event-bus/test-bus";
+
+        Pipe pipe = createPipe(busArn, null);
+        String payload = "{\"key\":\"value\"}";
+
+        EventBridgeService.PutEventsResult success = new EventBridgeService.PutEventsResult(
+                0,
+                List.of(Map.of("EventId", "evt-123")));
+
+        when(eventBridgeService.putEvents(anyList(), eq(region))).thenReturn(success);
+
+        assertDoesNotThrow(() -> invoker.invoke(pipe, payload, region));
+
+        verify(eventBridgeService).putEvents(anyList(), eq(region));
+    }
+
+    @Test
+    void eventBridgeTarget_throwsWhenPutEventsReportsFailure() {
+        String region = "us-east-1";
+        String busArn = "arn:aws:events:" + region + ":000000000000:event-bus/test-bus";
+
+        Pipe pipe = createPipe(busArn, null);
+        String payload = "not json at all";
+
+        Map<String, String> failedEntry = new HashMap<>();
+        failedEntry.put("ErrorCode", "MalformedDetail");
+        failedEntry.put("ErrorMessage", "The JSON provided is not valid.");
+        EventBridgeService.PutEventsResult failure = new EventBridgeService.PutEventsResult(1, List.of(failedEntry));
+
+        when(eventBridgeService.putEvents(anyList(), eq(region))).thenReturn(failure);
+
+        RuntimeException ex = assertThrows(RuntimeException.class,
+                () -> invoker.invoke(pipe, payload, region));
+
+        assertTrue(ex.getMessage().contains("MalformedDetail"),
+                "error message should surface the EventBridge failure code; was: " + ex.getMessage());
     }
 }

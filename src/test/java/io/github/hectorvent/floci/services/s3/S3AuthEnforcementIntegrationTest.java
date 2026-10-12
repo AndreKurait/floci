@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.s3;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.testing.S3EnforceAuthProfile;
 import io.github.hectorvent.floci.testutil.S3RequestSigner;
@@ -20,7 +21,6 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -585,7 +585,7 @@ class S3AuthEnforcementIntegrationTest {
     @Order(22)
     void presignedRequestWithExplicitContentSha256IsAccepted() throws Exception {
         String path = "/" + PRIVATE_BUCKET + "/" + PRIVATE_KEY;
-        String contentHash = sha256Hex("private body");
+        String contentHash = Digests.sha256Hex("private body");
         String sig = presignedSignature("GET", path, "test", "test", "3600", contentHash);
         given()
             .queryParam("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
@@ -629,8 +629,8 @@ class S3AuthEnforcementIntegrationTest {
     @Order(24)
     void presignedRequestWithMismatchedContentSha256IsRejected() throws Exception {
         String path = "/" + PRIVATE_BUCKET + "/" + PRIVATE_KEY;
-        String contentHash = sha256Hex("private body");
-        String wrongHash = sha256Hex("wrong body");
+        String contentHash = Digests.sha256Hex("private body");
+        String wrongHash = Digests.sha256Hex("wrong body");
         String sig = presignedSignature("GET", path, "test", "test", "3600", contentHash);
         given()
             .queryParam("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
@@ -1873,7 +1873,7 @@ class S3AuthEnforcementIntegrationTest {
             .header("Authorization", "AWS4-HMAC-SHA256 Credential=test/" + SIGNING_DATE
                     + "/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef")
             .header("x-amz-date", SIGNING_TIMESTAMP)
-            .header("x-amz-content-sha256", sha256Hex("forged"))
+            .header("x-amz-content-sha256", Digests.sha256Hex("forged"))
             .body("forged")
         .when()
             .put("/" + WRITE_BUCKET + "/" + key)
@@ -1904,7 +1904,7 @@ class S3AuthEnforcementIntegrationTest {
             .body(containsString("SignatureDoesNotMatch"));
 
         given()
-            .filter(LOCAL_SIGNER.withContentSha256(sha256Hex("the body that was signed")))
+            .filter(LOCAL_SIGNER.withContentSha256(Digests.sha256Hex("the body that was signed")))
             .body("a different body")
         .when()
             .put("/" + WRITE_BUCKET + "/" + key)
@@ -1935,7 +1935,7 @@ class S3AuthEnforcementIntegrationTest {
         assertThat(putWithoutContentType(WRITE_BUCKET + "?versioning", suspend, LOCAL_SIGNER).statusCode(),
                 equalTo(200));
         HttpResponse<String> mismatch = putWithoutContentType(WRITE_BUCKET + "?versioning", suspend,
-                LOCAL_SIGNER.withContentSha256(sha256Hex("something else")));
+                LOCAL_SIGNER.withContentSha256(Digests.sha256Hex("something else")));
         assertThat(mismatch.statusCode(), equalTo(400));
         assertThat(mismatch.body(), containsString("XAmzContentSHA256Mismatch"));
 
@@ -1975,7 +1975,7 @@ class S3AuthEnforcementIntegrationTest {
         given()
             .header("Authorization", "AWS4-HMAC-SHA256 Credential=test/" + SIGNING_DATE
                     + "/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc")
-            .header("x-amz-content-sha256", sha256Hex(""))
+            .header("x-amz-content-sha256", Digests.sha256Hex(""))
         .when()
             .get(path)
         .then()
@@ -1987,7 +1987,7 @@ class S3AuthEnforcementIntegrationTest {
             .header("Authorization", "AWS4-HMAC-SHA256 Credential=test/" + SIGNING_DATE
                     + "/us-east-1/s3/aws4_request")
             .header("x-amz-date", SIGNING_TIMESTAMP)
-            .header("x-amz-content-sha256", sha256Hex(""))
+            .header("x-amz-content-sha256", Digests.sha256Hex(""))
         .when()
             .get(path)
         .then()
@@ -1998,7 +1998,7 @@ class S3AuthEnforcementIntegrationTest {
             .header("Authorization", "AWS4-HMAC-SHA256 Credential=test/" + SIGNING_DATE
                     + "/us-east-1/sqs/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc")
             .header("x-amz-date", SIGNING_TIMESTAMP)
-            .header("x-amz-content-sha256", sha256Hex(""))
+            .header("x-amz-content-sha256", Digests.sha256Hex(""))
         .when()
             .get(path)
         .then()
@@ -2214,7 +2214,7 @@ class S3AuthEnforcementIntegrationTest {
             String stringToSign = "AWS4-HMAC-SHA256\n"
                     + SIGNING_TIMESTAMP + "\n"
                     + credentialScope + "\n"
-                    + sha256Hex(canonicalRequest);
+                    + Digests.sha256Hex(canonicalRequest);
 
             byte[] signingKey = deriveSigningKey(secretKey, SIGNING_DATE, "us-east-1", "s3");
             return hexEncode(hmacSha256(signingKey, stringToSign));
@@ -2236,11 +2236,6 @@ class S3AuthEnforcementIntegrationTest {
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(key, "HmacSHA256"));
         return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String sha256Hex(String input) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        return hexEncode(digest.digest(input.getBytes(StandardCharsets.UTF_8)));
     }
 
     private static String hexEncode(byte[] bytes) {

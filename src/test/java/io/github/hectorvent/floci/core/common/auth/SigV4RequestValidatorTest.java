@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common.auth;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.testutil.IamServiceTestHelper;
 import io.github.hectorvent.floci.testutil.SigV4TokenTestHelper;
@@ -48,7 +49,7 @@ class SigV4RequestValidatorTest {
         // This exact value is also hardcoded in validate()'s canonical request for the empty
         // body ElastiCache/RDS presigned tokens always carry; this pins it independently.
         assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                SigV4RequestValidator.sha256Hex(""));
+                Digests.sha256Hex(""));
     }
 
     @Test

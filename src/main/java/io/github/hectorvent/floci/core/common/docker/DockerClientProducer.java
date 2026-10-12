@@ -10,6 +10,7 @@ import com.github.dockerjava.core.SSLConfig;
 import com.github.dockerjava.core.util.CertificateUtils;
 import com.github.dockerjava.transport.DockerHttpClient;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.Digests;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Produces;
 import jakarta.inject.Inject;
@@ -21,12 +22,9 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
 import java.io.Serializable;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.Optional;
@@ -284,7 +282,7 @@ public class DockerClientProducer {
 
     private static String readContextDockerHost(Path dockerConfigDir, String contextName) {
         Path metaFile = dockerConfigDir.resolve("contexts").resolve("meta")
-                .resolve(sha256Hex(contextName)).resolve("meta.json");
+                .resolve(Digests.sha256Hex(contextName)).resolve("meta.json");
         if (!Files.isRegularFile(metaFile)) {
             return null;
         }
@@ -309,7 +307,7 @@ public class DockerClientProducer {
      */
     private static boolean readContextSkipTlsVerify(Path dockerConfigDir, String contextName) {
         Path metaFile = dockerConfigDir.resolve("contexts").resolve("meta")
-                .resolve(sha256Hex(contextName)).resolve("meta.json");
+                .resolve(Digests.sha256Hex(contextName)).resolve("meta.json");
         if (!Files.isRegularFile(metaFile)) {
             return false;
         }
@@ -342,7 +340,7 @@ public class DockerClientProducer {
      */
     private static Optional<Path> resolveActiveDockerContextTlsMaterial(Path dockerConfigDir, String contextName) {
         Path tlsDir = dockerConfigDir.resolve("contexts").resolve("tls")
-                .resolve(sha256Hex(contextName)).resolve(CONTEXT_TLS_ENDPOINT_DIR);
+                .resolve(Digests.sha256Hex(contextName)).resolve(CONTEXT_TLS_ENDPOINT_DIR);
         if (!Files.isDirectory(tlsDir)) {
             return Optional.empty();
         }
@@ -361,20 +359,6 @@ public class DockerClientProducer {
                             + "to an unauthenticated or unverified connection.", contextName, tlsDir));
         }
         return Optional.empty();
-    }
-
-    private static String sha256Hex(String value) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder(hash.length * 2);
-            for (byte b : hash) {
-                hex.append(String.format("%02x", b));
-            }
-            return hex.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 algorithm not available", e);
-        }
     }
 
     private static DefaultDockerClientConfig.Builder createDockerConfigBuilder() {

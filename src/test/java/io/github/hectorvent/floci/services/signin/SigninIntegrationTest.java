@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.signin;
 
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
@@ -8,8 +10,6 @@ import org.junit.jupiter.api.Test;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.Base64;
 import java.util.Map;
 import java.util.UUID;
 
@@ -528,9 +528,7 @@ class SigninIntegrationTest {
     }
 
     private static String challenge(String verifier) throws Exception {
-        byte[] digest = MessageDigest.getInstance("SHA-256")
-                .digest(verifier.getBytes(StandardCharsets.US_ASCII));
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
+        return Base64Url.encode(Digests.sha256(verifier.getBytes(StandardCharsets.US_ASCII)));
     }
 
     private static Map<String, String> queryParams(String query) {

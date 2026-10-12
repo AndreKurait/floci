@@ -54,7 +54,7 @@ class BuildV2AuthorizerEventTrailingSlashTest {
     private JsonNode buildEvent(String normalizedPath, String rawRequestUri) throws Exception {
         when(uriInfo.getRequestUri()).thenReturn(new URI(rawRequestUri));
         String json = controller.buildRequestAuthorizerEventV1(
-                "GET", normalizedPath, "abc123", "test", "us-east-1", headers, uriInfo);
+                "GET", normalizedPath, "abc123", "test", "us-east-1", headers, uriInfo, null);
         return new ObjectMapper().readTree(json);
     }
 

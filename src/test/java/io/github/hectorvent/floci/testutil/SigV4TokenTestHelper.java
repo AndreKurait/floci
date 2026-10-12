@@ -1,14 +1,15 @@
 package io.github.hectorvent.floci.testutil;
 
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.Digests;
+
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -156,7 +157,7 @@ public final class SigV4TokenTestHelper {
                 + "host\n"
                 + "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         String stringToSign = "AWS4-HMAC-SHA256\n" + dateTime + "\n" + credentialScope + "\n"
-                + sha256Hex(canonicalRequest);
+                + Digests.sha256Hex(canonicalRequest);
         String signature = hexEncode(hmacSha256(
                 deriveSigningKey(secretKey, date, "us-east-1", "rds-db"), stringToSign));
 
@@ -196,8 +197,7 @@ public final class SigV4TokenTestHelper {
         String url = "https://" + signToken(host, null, accessKeyId, secretKey, "us-east-1", "sts",
                 timestamp, expiresSeconds, params,
                 Map.of("host", host, "x-k8s-aws-id", clusterName));
-        return "k8s-aws-v1." + Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(url.getBytes(StandardCharsets.UTF_8));
+        return "k8s-aws-v1." + Base64Url.encode(url);
     }
 
     private static String signToken(
@@ -250,7 +250,7 @@ public final class SigV4TokenTestHelper {
         String stringToSign = "AWS4-HMAC-SHA256\n"
                 + dateTime + "\n"
                 + credentialScope + "\n"
-                + sha256Hex(canonicalRequest);
+                + Digests.sha256Hex(canonicalRequest);
 
         byte[] signingKey = deriveSigningKey(secretKey, date, region, service);
         String signature = hexEncode(hmacSha256(signingKey, stringToSign));
@@ -297,11 +297,6 @@ public final class SigV4TokenTestHelper {
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(key, "HmacSHA256"));
         return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String sha256Hex(String input) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        return hexEncode(digest.digest(input.getBytes(StandardCharsets.UTF_8)));
     }
 
     private static String hexEncode(byte[] bytes) {

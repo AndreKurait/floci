@@ -1,15 +1,21 @@
 package io.github.hectorvent.floci.services.iam;
 
+import io.github.hectorvent.floci.testing.EnforcementFixtures;
 import io.github.hectorvent.floci.testing.IamEnforcementProfile;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.net.URI;
 import java.util.Map;
 import java.util.UUID;
 
+import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
@@ -18,8 +24,13 @@ import static org.hamcrest.Matchers.not;
 @TestProfile(IamEnforcementProfile.class)
 class IamServingServiceEnforcementIntegrationTest {
 
+    @TestHTTPResource("/")
+    static URI baseUri;
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
+
     private static final String ACCOUNT_ID = "000000000000";
-    private static final String REGION = "us-east-1";
 
     @Test
     void queryRequestCannotBorrowPermissionsFromItsSigningScope() {
@@ -66,7 +77,7 @@ class IamServingServiceEnforcementIntegrationTest {
                 ]}""");
 
         given()
-                .header("Authorization", authorization(accessKeyId, "iam"))
+                .header("Authorization", auth(accessKeyId, "iam"))
                 .contentType("application/x-www-form-urlencoded")
                 .queryParam("Action", "GetUser")
                 .formParam("Action", "CreateUser")
@@ -92,7 +103,7 @@ class IamServingServiceEnforcementIntegrationTest {
                 ]}""");
 
         given()
-                .header("Authorization", authorization(accessKeyId, "iam"))
+                .header("Authorization", auth(accessKeyId, "iam"))
                 .contentType("application/json")
                 .body(Map.of("name", apiName))
         .when()
@@ -102,7 +113,7 @@ class IamServingServiceEnforcementIntegrationTest {
                 .body(containsString("apigateway:POST"));
 
         given()
-                .header("Authorization", authorization(ACCOUNT_ID, "apigateway"))
+                .header("Authorization", auth(ACCOUNT_ID, "apigateway"))
         .when()
                 .get("/restapis")
         .then()
@@ -120,38 +131,39 @@ class IamServingServiceEnforcementIntegrationTest {
                   {"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}
                 ]}""");
 
-        given().header("Authorization", authorization(ACCOUNT_ID, "s3"))
+        cleanup.register(() -> EnforcementFixtures.removeBucket(baseUri.getPort(),
+                auth(ACCOUNT_ID, "s3"), bucket));
+        given().header("Authorization", auth(ACCOUNT_ID, "s3"))
                 .when().put("/" + bucket).then().statusCode(200);
 
-        given().header("Authorization", authorization(accessKeyId, "s3"))
+        given().header("Authorization", auth(accessKeyId, "s3"))
                 .queryParam("Action", "ListBucket")
                 .body("query-spoof")
                 .when().put("/" + bucket + "/from-query")
                 .then().statusCode(403).body(containsString("s3:PutObject"));
 
-        given().header("Authorization", authorization(accessKeyId, "s3"))
+        given().header("Authorization", auth(accessKeyId, "s3"))
                 .contentType("application/x-www-form-urlencoded")
                 .body("Action=ListBucket")
                 .when().put("/" + bucket + "/from-form")
                 .then().statusCode(403).body(containsString("s3:PutObject"));
 
-        given().header("Authorization", authorization(ACCOUNT_ID, "s3"))
+        given().header("Authorization", auth(ACCOUNT_ID, "s3"))
                 .when().get("/" + bucket + "/from-query")
                 .then().statusCode(404);
-        given().header("Authorization", authorization(ACCOUNT_ID, "s3"))
+        given().header("Authorization", auth(ACCOUNT_ID, "s3"))
                 .when().get("/" + bucket + "/from-form")
                 .then().statusCode(404);
     }
 
-    private static String createUserWithPolicy(String userName, String policyName, String policyDocument) {
-        adminIam("CreateUser", Map.of("UserName", userName)).statusCode(200);
+    private String createUserWithPolicy(String userName, String policyName, String policyDocument) {
+        String accessKeyId = EnforcementFixtures.createUser(cleanup, baseUri.getPort(),
+                auth(ACCOUNT_ID, "iam"), userName).accessKeyId();
         adminIam("PutUserPolicy", Map.of(
                 "UserName", userName,
                 "PolicyName", policyName,
                 "PolicyDocument", policyDocument)).statusCode(200);
-        return adminIam("CreateAccessKey", Map.of("UserName", userName))
-                .statusCode(200)
-                .extract().path("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
+        return accessKeyId;
     }
 
     private static ValidatableResponse adminIam(String action, Map<String, String> params) {
@@ -171,7 +183,7 @@ class IamServingServiceEnforcementIntegrationTest {
     private static ValidatableResponse iamCall(String accessKeyId, String scope, String operationName,
                                                String operation, Map<String, String> params) {
         RequestSpecification spec = given()
-                .header("Authorization", authorization(accessKeyId, scope))
+                .header("Authorization", auth(accessKeyId, scope))
                 .contentType("application/x-www-form-urlencoded")
                 .formParam(operationName, operation)
                 .formParam("Version", "2010-05-08");
@@ -179,8 +191,4 @@ class IamServingServiceEnforcementIntegrationTest {
         return spec.when().post("/").then();
     }
 
-    private static String authorization(String accessKeyId, String service) {
-        return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260924/" + REGION + "/" + service
-                + "/aws4_request, SignedHeaders=host, Signature=abc";
-    }
 }

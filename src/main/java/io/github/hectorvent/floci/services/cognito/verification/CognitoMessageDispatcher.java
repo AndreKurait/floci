@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cognito.verification;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
 import io.github.hectorvent.floci.services.cognito.model.UserPool;
 import io.github.hectorvent.floci.services.ses.SesService;
@@ -203,7 +204,7 @@ public final class CognitoMessageDispatcher {
         }
         String domain = mailbox.getDomain().toLowerCase(Locale.ROOT);
         String identityDomain = identity.toLowerCase(Locale.ROOT);
-        return domain.equals(identityDomain) || domain.endsWith("." + identityDomain);
+        return DomainNames.isWithin(domain, identityDomain);
     }
 
     /** The identity an SES {@code identity/<name>} ARN names, or {@code null} for anything else. */

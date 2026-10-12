@@ -2,9 +2,9 @@ package io.github.hectorvent.floci.services.codeartifact;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.AuthorizationToken;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.AuthorizationTokenScope;
@@ -448,7 +448,7 @@ class CodeArtifactServiceTest {
 
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         PublishPackageVersionResult published = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                "ns", "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "false", content);
+                "ns", "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "false", content);
         assertEquals("Published", published.packageVersion().getStatus());
     }
 
@@ -769,7 +769,7 @@ class CodeArtifactServiceTest {
         service.createDomain(REGION, "dom", null, Map.of());
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
-        String sha256 = sha256Hex(content);
+        String sha256 = Digests.sha256Hex(content);
 
         PublishPackageVersionResult result = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
                 "my-ns", "my-pkg", "1.0.0", "asset.txt", sha256, "false", content);
@@ -814,7 +814,7 @@ class CodeArtifactServiceTest {
         service.createDomain(REGION, "dom", null, Map.of());
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
-        String sha256 = sha256Hex(content);
+        String sha256 = Digests.sha256Hex(content);
 
         // A newline here would land verbatim in the X-AssetName response header on GetPackageVersionAsset.
         AwsException e = assertThrows(AwsException.class, () -> service.publishPackageVersion(REGION, "dom", null,
@@ -830,11 +830,11 @@ class CodeArtifactServiceTest {
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
 
         AwsException e = assertThrows(AwsException.class, () -> service.publishPackageVersion(REGION, "dom", null,
-                "repo", "generic", null, "my-pkg", "1.0.0", "asset.txt", sha256Hex(content), "yes", content));
+                "repo", "generic", null, "my-pkg", "1.0.0", "asset.txt", Digests.sha256Hex(content), "yes", content));
         assertEquals("ValidationException", e.getErrorCode());
 
         PublishPackageVersionResult omitted = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "asset.txt", sha256Hex(content), null, content);
+                null, "my-pkg", "1.0.0", "asset.txt", Digests.sha256Hex(content), null, content);
         assertEquals("Published", omitted.packageVersion().getStatus());
     }
 
@@ -845,7 +845,7 @@ class CodeArtifactServiceTest {
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
 
         AwsException e = assertThrows(AwsException.class, () -> service.publishPackageVersion(REGION, "dom", null,
-                "repo", "npm", null, "my-pkg", "1.0.0", "asset.txt", sha256Hex(content), "false", content));
+                "repo", "npm", null, "my-pkg", "1.0.0", "asset.txt", Digests.sha256Hex(content), "false", content));
         assertEquals("ValidationException", e.getErrorCode());
     }
 
@@ -855,7 +855,7 @@ class CodeArtifactServiceTest {
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
 
         AwsException e = assertThrows(AwsException.class, () -> service.publishPackageVersion(REGION, "dom", null,
-                "no-such-repo", "generic", null, "my-pkg", "1.0.0", "asset.txt", sha256Hex(content), "false", content));
+                "no-such-repo", "generic", null, "my-pkg", "1.0.0", "asset.txt", Digests.sha256Hex(content), "false", content));
         assertEquals("ResourceNotFoundException", e.getErrorCode());
     }
 
@@ -866,7 +866,7 @@ class CodeArtifactServiceTest {
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
 
         AwsException publishMissingDomain = assertThrows(AwsException.class, () -> service.publishPackageVersion(
-                REGION, null, null, "repo", "generic", null, "my-pkg", "1.0.0", "asset.txt", sha256Hex(content),
+                REGION, null, null, "repo", "generic", null, "my-pkg", "1.0.0", "asset.txt", Digests.sha256Hex(content),
                 "false", content));
         assertEquals("ValidationException", publishMissingDomain.getErrorCode());
         assertEquals("domain is required.", publishMissingDomain.getMessage());
@@ -891,11 +891,11 @@ class CodeArtifactServiceTest {
         byte[] second = "second".getBytes(StandardCharsets.UTF_8);
 
         PublishPackageVersionResult r1 = service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null,
-                "my-pkg", "1.0.0", "a.txt", sha256Hex(first), "true", first);
+                "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(first), "true", first);
         assertEquals("Unfinished", r1.packageVersion().getStatus());
 
         PublishPackageVersionResult r2 = service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null,
-                "my-pkg", "1.0.0", "b.txt", sha256Hex(second), "false", second);
+                "my-pkg", "1.0.0", "b.txt", Digests.sha256Hex(second), "false", second);
         assertEquals("Published", r2.packageVersion().getStatus());
         assertEquals(2, r2.packageVersion().getAssets().size());
         assertTrue(r2.packageVersion().getAssets().containsKey("a.txt"));
@@ -908,13 +908,13 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "same-bytes".getBytes(StandardCharsets.UTF_8);
         PublishPackageVersionResult first = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "true", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "true", content);
         // pv is the same mutable object across calls in this storage backend, so the revision has
         // to be captured now, before the retry below has a chance to change it in place.
         String firstRevision = first.packageVersion().getRevision();
 
         PublishPackageVersionResult retry = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "true", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "true", content);
 
         assertEquals("Unfinished", retry.packageVersion().getStatus());
         assertEquals(1, retry.packageVersion().getAssets().size());
@@ -933,13 +933,13 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "same-bytes".getBytes(StandardCharsets.UTF_8);
         PublishPackageVersionResult unfinished = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "true", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "true", content);
         // pv is the same mutable object across calls in this storage backend, so this must be
         // checked before the second call mutates it, not read back afterward.
         assertEquals("Unfinished", unfinished.packageVersion().getStatus());
 
         PublishPackageVersionResult finalized = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "false", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "false", content);
 
         assertEquals("Published", finalized.packageVersion().getStatus());
         assertTrue(finalized.packageVersion().getPublishedTime() != null);
@@ -952,10 +952,10 @@ class CodeArtifactServiceTest {
         byte[] first = "first-bytes".getBytes(StandardCharsets.UTF_8);
         byte[] different = "different-bytes".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(first), "true", first);
+                Digests.sha256Hex(first), "true", first);
 
         AwsException e = assertThrows(AwsException.class, () -> service.publishPackageVersion(REGION, "dom", null,
-                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", sha256Hex(different), "true", different));
+                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(different), "true", different));
         assertEquals("ConflictException", e.getErrorCode());
         assertEquals("a.txt", e.getExtendedData().get("resourceId"));
         assertEquals("asset", e.getExtendedData().get("resourceType"));
@@ -967,10 +967,10 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         AwsException e = assertThrows(AwsException.class, () -> service.publishPackageVersion(REGION, "dom", null,
-                "repo", "generic", null, "my-pkg", "1.0.0", "b.txt", sha256Hex(content), "false", content));
+                "repo", "generic", null, "my-pkg", "1.0.0", "b.txt", Digests.sha256Hex(content), "false", content));
         assertEquals("ConflictException", e.getErrorCode());
         assertEquals("1.0.0", e.getExtendedData().get("resourceId"));
         assertEquals("package-version", e.getExtendedData().get("resourceType"));
@@ -982,13 +982,13 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         PublishPackageVersionResult first = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "false", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "false", content);
         // pv is the same mutable object across calls in this storage backend, so the revision has
         // to be captured now, before the retry below has a chance to change it in place.
         String firstRevision = first.packageVersion().getRevision();
 
         PublishPackageVersionResult retry = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "false", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "false", content);
 
         assertEquals("Published", retry.packageVersion().getStatus());
         assertEquals(firstRevision, retry.packageVersion().getRevision());
@@ -1000,11 +1000,11 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         byte[] different = "y".getBytes(StandardCharsets.UTF_8);
         AwsException e = assertThrows(AwsException.class, () -> service.publishPackageVersion(REGION, "dom", null,
-                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", sha256Hex(different), "false", different));
+                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(different), "false", different));
         assertEquals("ConflictException", e.getErrorCode());
         assertEquals("a.txt", e.getExtendedData().get("resourceId"));
         assertEquals("asset", e.getExtendedData().get("resourceType"));
@@ -1017,11 +1017,11 @@ class CodeArtifactServiceTest {
         for (int i = 0; i < 350; i++) {
             byte[] content = ("content-" + i).getBytes(StandardCharsets.UTF_8);
             service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0",
-                    "asset-" + i + ".txt", sha256Hex(content), "true", content);
+                    "asset-" + i + ".txt", Digests.sha256Hex(content), "true", content);
         }
         byte[] oneMore = "one-more".getBytes(StandardCharsets.UTF_8);
         AwsException e = assertThrows(AwsException.class, () -> service.publishPackageVersion(REGION, "dom", null,
-                "repo", "generic", null, "my-pkg", "1.0.0", "asset-350.txt", sha256Hex(oneMore), "true", oneMore));
+                "repo", "generic", null, "my-pkg", "1.0.0", "asset-350.txt", Digests.sha256Hex(oneMore), "true", oneMore));
         assertEquals("ServiceQuotaExceededException", e.getErrorCode());
         assertEquals("1.0.0", e.getExtendedData().get("resourceId"));
         assertEquals("package-version", e.getExtendedData().get("resourceType"));
@@ -1029,7 +1029,7 @@ class CodeArtifactServiceTest {
         // Re-publishing an asset name already on the version must not itself trip the cap.
         byte[] resend = "content-0".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "asset-0.txt",
-                sha256Hex(resend), "true", resend);
+                Digests.sha256Hex(resend), "true", resend);
     }
 
     @Test
@@ -1038,7 +1038,7 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         CodeArtifactPackageVersion pv = service.describePackageVersion(REGION, "dom", null, "repo", "generic", "ns",
                 "my-pkg", "1.0.0");
@@ -1056,9 +1056,9 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my::pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         CodeArtifactService.PackageDescription described = service.describePackage(REGION, "dom", null, "repo",
                 "generic", "ns", "my-pkg");
@@ -1199,7 +1199,7 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         service.putPackageOriginConfiguration(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "BLOCK",
                 "ALLOW");
@@ -1286,13 +1286,13 @@ class CodeArtifactServiceTest {
 
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         AwsException blocked = assertThrows(AwsException.class, () -> service.publishPackageVersion(REGION, "dom",
-                null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "false", content));
+                null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "false", content));
         assertEquals("ConflictException", blocked.getErrorCode());
 
         service.putPackageOriginConfiguration(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "ALLOW",
                 "ALLOW");
         PublishPackageVersionResult published = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                "ns", "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "false", content);
+                "ns", "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "false", content);
         assertEquals("Published", published.packageVersion().getStatus());
     }
 
@@ -1334,9 +1334,9 @@ class CodeArtifactServiceTest {
         byte[] secondContent = "second-package".getBytes(StandardCharsets.UTF_8);
 
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "a::b", "c", "1.0.0", "a.txt",
-                sha256Hex(firstContent), "false", firstContent);
+                Digests.sha256Hex(firstContent), "false", firstContent);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "a", "b::c", "1.0.0", "a.txt",
-                sha256Hex(secondContent), "false", secondContent);
+                Digests.sha256Hex(secondContent), "false", secondContent);
 
         PackageVersionAssetResult first = service.getPackageVersionAsset(REGION, "dom", null, "repo", "generic",
                 "a::b", "c", "1.0.0", "a.txt", null);
@@ -1396,7 +1396,7 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "victim".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "a:b", "x", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         AwsException describeVersion = assertThrows(AwsException.class, () -> service.describePackageVersion(REGION,
                 "dom", null, "repo", "generic", "a#cb", "x", "1.0.0"));
@@ -1413,11 +1413,11 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "2.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "other-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         CodeArtifactService.PackageDescription deleted = service.deletePackage(REGION, "dom", null, "repo",
                 "generic", "ns", "my-pkg");
@@ -1458,7 +1458,7 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
         service.putPackageOriginConfiguration(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "ALLOW",
                 "ALLOW");
 
@@ -1479,7 +1479,7 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "x".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
         service.putPackageOriginConfiguration(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "BLOCK",
                 "BLOCK");
 
@@ -1638,7 +1638,7 @@ class CodeArtifactServiceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         PublishPackageVersionResult published = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "false", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "false", content);
 
         PackageVersionAssetResult result = service.getPackageVersionAsset(REGION, "dom", null, "repo", "generic",
                 null, "my-pkg", "1.0.0", "a.txt", null);
@@ -1673,7 +1673,7 @@ class CodeArtifactServiceTest {
                 "com.example", "my-artifact", "1.0.0", "my-artifact-1.0.0.jar", null);
 
         assertEquals("jar bytes", new String(result.asset().getContent(), StandardCharsets.UTF_8));
-        assertEquals(sha256Hex((repoId + "/com.example/my-artifact/1.0.0").getBytes(StandardCharsets.UTF_8)),
+        assertEquals(Digests.sha256Hex((repoId + "/com.example/my-artifact/1.0.0").getBytes(StandardCharsets.UTF_8)),
                 result.packageVersionRevision());
     }
 
@@ -1808,7 +1808,7 @@ class CodeArtifactServiceTest {
                         go.await();
                         byte[] content = ("content-" + index).getBytes(StandardCharsets.UTF_8);
                         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg",
-                                "1.0.0", "asset-" + index + ".txt", sha256Hex(content), "true", content);
+                                "1.0.0", "asset-" + index + ".txt", Digests.sha256Hex(content), "true", content);
                     } catch (InterruptedException ignored) {
                         Thread.currentThread().interrupt();
                     }
@@ -1823,13 +1823,5 @@ class CodeArtifactServiceTest {
         CodeArtifactPackageVersion pv = service.describePackageVersion(REGION, "dom", null, "repo", "generic", null,
                 "my-pkg", "1.0.0");
         assertEquals(assetCount, pv.getAssets().size());
-    }
-
-    private static String sha256Hex(byte[] content) {
-        try {
-            return SigV4RequestValidator.sha256Hex(content);
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
-        }
     }
 }

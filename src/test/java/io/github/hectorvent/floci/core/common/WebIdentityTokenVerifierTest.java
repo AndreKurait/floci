@@ -17,7 +17,6 @@ import java.security.KeyPairGenerator;
 import java.security.PrivateKey;
 import java.security.Signature;
 import java.security.interfaces.RSAPublicKey;
-import java.util.Base64;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -63,8 +62,7 @@ class WebIdentityTokenVerifierTest {
     }
 
     private static String base64Url(String value) {
-        return Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(value.getBytes(StandardCharsets.UTF_8));
+        return Base64Url.encode(value);
     }
 
     /** Signs an arbitrary claim set, so tests can build tokens the production mint path never would. */
@@ -76,7 +74,7 @@ class WebIdentityTokenVerifierTest {
         signature.initSign(privateKey);
         signature.update((header + "." + payload).getBytes(StandardCharsets.UTF_8));
         return header + "." + payload + "."
-                + Base64.getUrlEncoder().withoutPadding().encodeToString(signature.sign());
+                + Base64Url.encode(signature.sign());
     }
 
     @Test

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.dynamodb.backend;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Api;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Reply;
@@ -93,9 +94,9 @@ class DynamoDbLocalClient implements AutoCloseable {
                     + "x-amz-date:" + amzDate + "\n"
                     + "x-amz-target:" + target + "\n\n"
                     + SIGNED_HEADERS + "\n"
-                    + SigV4RequestValidator.sha256Hex(payload);
+                    + Digests.sha256Hex(payload);
             String toSign = "AWS4-HMAC-SHA256\n" + amzDate + "\n" + credentialScope + "\n"
-                    + SigV4RequestValidator.sha256Hex(canonical);
+                    + Digests.sha256Hex(canonical);
             byte[] signingKey = SigV4RequestValidator.deriveSigningKey(SECRET_KEY, date, scope.region(), SERVICE);
             String signature = SigV4RequestValidator.hexEncode(SigV4RequestValidator.hmacSha256(signingKey, toSign));
             return "AWS4-HMAC-SHA256 Credential=floci" + scope.accountId() + "/" + credentialScope

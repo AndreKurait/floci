@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
@@ -49,6 +50,7 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -169,6 +171,10 @@ class EksServiceTest {
     }
 
     private Ec2Service realEc2Service() {
+        return realEc2Service(new HashMap<>());
+    }
+
+    private Ec2Service realEc2Service(Map<String, AccountAwareStorageBackend<?>> stores) {
         EmulatorConfig ec2Config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2ServiceConfig = mock(EmulatorConfig.Ec2ServiceConfig.class);
@@ -181,7 +187,9 @@ class EksServiceTest {
             @Override
             public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
                     TypeReference<Map<String, V>> typeReference) {
-                return AccountAwareStorageBackend.inMemory("000000000000");
+                AccountAwareStorageBackend<V> store = AccountAwareStorageBackend.inMemory("000000000000");
+                stores.put(fileName, store);
+                return store;
             }
         };
 
@@ -2227,10 +2235,18 @@ class EksServiceTest {
 
     @Test
     void createClusterWithBothDefaultServiceCidrsOverlappingVpcThrowsInvalidParameterException() {
-        Ec2Service ec2 = realEc2Service();
+        // No VPC block CreateVpc accepts (/16 to /28) covers both defaults, so the VPC is created
+        // normally and its block is then widened in the store, as state stored before that check is.
+        Map<String, AccountAwareStorageBackend<?>> ec2Stores = new HashMap<>();
+        Ec2Service ec2 = realEc2Service(ec2Stores);
         ec2.ensureDefaultResources("us-east-1");
-        String vpcId = ec2.createVpc("us-east-1", "0.0.0.0/0", false).getVpcId();
-        String subnetId = ec2.createSubnet("us-east-1", vpcId, "0.0.0.0/24", "us-east-1a").getSubnetId();
+        Vpc vpc = ec2.createVpc("us-east-1", "10.100.0.0/16", false);
+        String vpcId = vpc.getVpcId();
+        String subnetId = ec2.createSubnet("us-east-1", vpcId, "10.100.0.0/24", "us-east-1a").getSubnetId();
+        vpc.setCidrBlock("0.0.0.0/0");
+        @SuppressWarnings("unchecked")
+        AccountAwareStorageBackend<Vpc> vpcStore = (AccountAwareStorageBackend<Vpc>) ec2Stores.get("ec2-vpcs.json");
+        vpcStore.put("us-east-1::" + vpcId, vpc);
 
         EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2,
                 new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class),

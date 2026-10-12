@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.eks;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.services.iam.IamService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -95,7 +96,7 @@ class EksTokenValidator {
             String stringToSign = ALGORITHM + "\n"
                     + parameters.get("X-Amz-Date") + "\n"
                     + scope.value() + "\n"
-                    + sha256Hex(canonicalRequest);
+                    + Digests.sha256Hex(canonicalRequest);
             String expectedSignature = hexEncode(hmacSha256(
                     deriveSigningKey(secretKey, scope.date(), scope.region(), scope.service()), stringToSign));
             boolean valid = MessageDigest.isEqual(
@@ -229,10 +230,6 @@ class EksTokenValidator {
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(key, "HmacSHA256"));
         return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String sha256Hex(String input) throws Exception {
-        return hexEncode(MessageDigest.getInstance("SHA-256").digest(input.getBytes(StandardCharsets.UTF_8)));
     }
 
     private static String hexEncode(byte[] bytes) {

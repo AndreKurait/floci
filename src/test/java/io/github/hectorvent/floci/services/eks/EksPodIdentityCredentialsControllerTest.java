@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.WebIdentityTokenVerifier;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
@@ -22,7 +23,6 @@ import java.security.PrivateKey;
 import java.security.Signature;
 import java.security.interfaces.RSAPublicKey;
 import java.time.Instant;
-import java.util.Base64;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -105,13 +105,12 @@ class EksPodIdentityCredentialsControllerTest {
     }
 
     private static String signRs256(PrivateKey key, String claims) throws GeneralSecurityException {
-        Base64.Encoder enc = Base64.getUrlEncoder().withoutPadding();
-        String header = enc.encodeToString("{\"alg\":\"RS256\",\"typ\":\"JWT\"}".getBytes(StandardCharsets.UTF_8));
-        String payload = enc.encodeToString(claims.getBytes(StandardCharsets.UTF_8));
+        String header = Base64Url.encode("{\"alg\":\"RS256\",\"typ\":\"JWT\"}");
+        String payload = Base64Url.encode(claims);
         Signature sig = Signature.getInstance("SHA256withRSA");
         sig.initSign(key);
         sig.update((header + "." + payload).getBytes(StandardCharsets.UTF_8));
-        return header + "." + payload + "." + enc.encodeToString(sig.sign());
+        return header + "." + payload + "." + Base64Url.encode(sig.sign());
     }
 
     private String buildToken(PrivateKey key, String iss, String aud, String sub, long expOffset) throws GeneralSecurityException {

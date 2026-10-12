@@ -44,6 +44,27 @@
 | `DescribeImport` | Get import status and metadata |
 | `ListImports` | List imports, optionally filtered by table ARN |
 
+## Legacy conditional requests
+
+The native backend accepts `KeyConditions` together with `FilterExpression`.
+For legacy `Expected` conditions it also accepts `ComparisonOperator` with a single
+`Value`, including EQ and NE, just as the live AWS service does. Supplying both
+`Value` and `AttributeValueList`, omitting a required operand, or supplying the wrong
+number of operands returns `ValidationException` without changing the item.
+`NULL` and `NOT_NULL` take no operands.
+
+These behaviors were verified against AWS in `us-east-1` on October 12, 2026:
+40 pairs of equivalent conditional writes, matching and nonmatching queries,
+and 30 operand cases for each of `PutItem`, `UpdateItem` and `DeleteItem`.
+The SDK regression cases and recorded error messages are in
+`compatibility-tests/sdk-test-python/tests/test_dynamodb_legacy_expected.py` and
+`tests/fixtures/dynamodb-legacy-expected-aws.json` within that suite.
+
+AWS's [ExpectedAttributeValue documentation](https://docs.aws.amazon.com/sdk-for-python/v4/reference/clients/dynamodb/structures/ExpectedAttributeValue/)
+describes the parameter families as incompatible more broadly. Floci preserves
+the combinations accepted by the live service; this does not make every mixture
+of legacy and expression parameters valid.
+
 ## Streams {#streams}
 
 DynamoDB Streams are supported via a separate target (`DynamoDBStreams_20120810`):

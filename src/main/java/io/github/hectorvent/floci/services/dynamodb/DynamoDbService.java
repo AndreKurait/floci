@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
@@ -1733,7 +1734,7 @@ public class DynamoDbService {
             return new TransactWriteResult(applyTransactWrite(transactItems, region).writeCapacity(), false);
         }
         String cacheKey = regionResolver.getAccountId() + "::" + region + "::" + clientRequestToken;
-        String requestHash = sha256(rawRequest.toString());
+        String requestHash = Digests.sha256Hex(rawRequest.toString());
         for (;;) {
             long nowNanos = System.nanoTime();
             IdempotencyEntry fresh = new IdempotencyEntry(requestHash, nowNanos, new CompletableFuture<>());
@@ -4424,7 +4425,7 @@ public class DynamoDbService {
         if (exclusiveStartKey == null || exclusiveStartKey.isNull()) {
             return;
         }
-        DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, table, accessPath, false);
+        DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, table, accessPath);
 
         boolean withinBounds = keyConditionExpression != null
                 ? ExpressionEvaluator.matches(keyConditionExpression, exclusiveStartKey,
@@ -4659,23 +4660,6 @@ public class DynamoDbService {
             return HexFormat.of().formatHex(digest);
         } catch (NoSuchAlgorithmException e) {
             return "unknown";
-        }
-    }
-
-    /**
-     * SHA-256 hex digest of a string, used by ClientRequestToken idempotency to compare
-     * request bodies. SHA-256 is required (not MD5) for the dedup contract because a
-     * collision would allow a request with different parameters to be silently treated
-     * as a replay; SHA-256 is supported on every JVM via {@link MessageDigest}.
-     */
-    private static String sha256(String input) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            // SHA-256 is mandated by the JLS to be available on every JVM; this should never trigger.
-            throw new IllegalStateException("SHA-256 is required but not available on this JVM", e);
         }
     }
 

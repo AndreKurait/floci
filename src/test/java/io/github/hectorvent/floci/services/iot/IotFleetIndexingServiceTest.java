@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.iot.model.IotIndexingConfiguration;
 import io.github.hectorvent.floci.services.iot.model.IotIndexingConfiguration.Field;
@@ -1212,8 +1213,7 @@ class IotFleetIndexingServiceTest {
     @Test
     void aTokenThisOperationCouldNotHaveIssuedIsInvalid() {
         fleet();
-        String bareThingName = Base64.getUrlEncoder().withoutPadding()
-                .encodeToString("alpha-1".getBytes(StandardCharsets.UTF_8));
+        String bareThingName = Base64Url.encode("alpha-1");
 
         for (String token : List.of("YQ", "", "AAAA", bareThingName)) {
             assertSearchFails(query("*").put("nextToken", token), "InvalidRequestException", 400,
@@ -1222,10 +1222,8 @@ class IotFleetIndexingServiceTest {
 
         String issued = search(query("thingName:alpha*").put("maxResults", 1)).nextToken();
         String decoded = new String(Base64.getUrlDecoder().decode(issued), StandardCharsets.UTF_8);
-        String edited = Base64.getUrlEncoder().withoutPadding()
-                .encodeToString((decoded.substring(0, decoded.length() - 1) + "0").getBytes(StandardCharsets.UTF_8));
-        String shortened = Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(decoded.substring(0, decoded.length() - 1).getBytes(StandardCharsets.UTF_8));
+        String edited = Base64Url.encode(decoded.substring(0, decoded.length() - 1) + "0");
+        String shortened = Base64Url.encode(decoded.substring(0, decoded.length() - 1));
         String truncated = issued.substring(0, issued.length() - 2);
         for (String token : List.of(edited, shortened, truncated)) {
             assertSearchFails(query("thingName:alpha*").put("nextToken", token), "InvalidRequestException", 400,

@@ -5,6 +5,7 @@ import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
@@ -35,18 +36,14 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -1230,7 +1227,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private static String namespaceDisambiguator(EmulatorConfig config) {
         String namespace = config.docker() == null || config.docker().resourceNamespace() == null
                 ? "" : config.docker().resourceNamespace().orElse("").trim();
-        return namespace.isEmpty() ? "" : "-" + sha256Hex(namespace).substring(0, 12);
+        return namespace.isEmpty() ? "" : "-" + Digests.sha256Hex(namespace).substring(0, 12);
     }
 
     /** Leading part shared by every code volume (and completion marker) this configuration names. */
@@ -1264,7 +1261,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         if (resourceId.isBlank()) {
             throw new IllegalArgumentException("File system access point ARN must include a resource id");
         }
-        return "efs-" + resourceId + "-" + sha256Hex(accessPointArn);
+        return "efs-" + resourceId + "-" + Digests.sha256Hex(accessPointArn);
     }
 
     /**
@@ -1281,16 +1278,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             return legacyName;
         }
         return ContainerStorageHelper.dockerName(config, token);
-    }
-
-    private static String sha256Hex(String value) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(value.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is required but not available", e);
-        }
     }
 
     @FunctionalInterface

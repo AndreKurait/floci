@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.config;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
@@ -26,7 +27,6 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.KeyPair;
-import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.cert.X509Certificate;
@@ -152,7 +152,7 @@ public final class FlociCertificateAuthority {
     public String fingerprint() {
         try {
             return HexFormat.ofDelimiter(":").withUpperCase()
-                    .formatHex(MessageDigest.getInstance("SHA-256").digest(certificate.getEncoded()));
+                    .formatHex(Digests.sha256(certificate.getEncoded()));
         } catch (Exception e) {
             throw new IllegalStateException("Cannot fingerprint the CA certificate", e);
         }

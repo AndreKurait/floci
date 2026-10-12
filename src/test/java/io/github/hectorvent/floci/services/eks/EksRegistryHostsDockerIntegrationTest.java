@@ -5,6 +5,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
@@ -29,9 +30,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.util.Base64;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -289,13 +288,13 @@ class EksRegistryHostsDockerIntegrationTest {
             gzip.write(tarBytes);
         }
         byte[] layerBytes = gzOut.toByteArray();
-        String diffId = "sha256:" + sha256Hex(tarBytes);
-        String layerDigest = "sha256:" + sha256Hex(layerBytes);
+        String diffId = "sha256:" + Digests.sha256Hex(tarBytes);
+        String layerDigest = "sha256:" + Digests.sha256Hex(layerBytes);
 
         byte[] configBytes = ("{\"architecture\":\"" + arch + "\",\"os\":\"linux\",\"config\":{},"
                 + "\"rootfs\":{\"type\":\"layers\",\"diff_ids\":[\"" + diffId + "\"]}}")
                 .getBytes(StandardCharsets.UTF_8);
-        String configDigest = "sha256:" + sha256Hex(configBytes);
+        String configDigest = "sha256:" + Digests.sha256Hex(configBytes);
 
         uploadBlob(host, repo, layerDigest, layerBytes);
         uploadBlob(host, repo, configDigest, configBytes);
@@ -403,10 +402,6 @@ class EksRegistryHostsDockerIntegrationTest {
                 .body(content)
                 .when().put(location + separator + "digest=" + digest)
                 .then().statusCode(201);
-    }
-
-    private static String sha256Hex(byte[] data) throws Exception {
-        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(data));
     }
 
     private boolean isDockerAvailable() {

@@ -33,7 +33,6 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -1179,57 +1178,13 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
                 regionResolver.getAccountId(), "user:" + u.getUserId()).toString();
     }
 
-    private record UserAuthentication(AuthMode mode, List<String> passwords) {}
-
-    /**
-     * Resolves the authentication a CreateUser or ModifyUser request asks for. AWS accepts it
-     * either as an {@code AuthenticationMode} or through the top-level {@code Passwords} and
-     * {@code NoPasswordRequired} members, so passwords given either way mean password
-     * authentication. Returns null when the request names no authentication at all.
-     */
     private static UserAuthentication resolveUserAuthentication(MultivaluedMap<String, String> params) {
-        String type = params.getFirst("AuthenticationMode.Type");
         List<String> passwords = extractMemberList(params, "AuthenticationMode.Passwords.member.");
         if (passwords.isEmpty()) {
             passwords = extractMemberList(params, "Passwords.member.");
         }
-        boolean noPasswordRequired = Boolean.parseBoolean(params.getFirst("NoPasswordRequired"));
-
-        if (type == null || type.isBlank()) {
-            if (noPasswordRequired && !passwords.isEmpty()) {
-                throw invalidCombination("NoPasswordRequired cannot be true when Passwords are provided.");
-            }
-            if (!passwords.isEmpty()) {
-                return new UserAuthentication(AuthMode.PASSWORD, passwords);
-            }
-            return noPasswordRequired ? new UserAuthentication(AuthMode.NO_AUTH, List.of()) : null;
-        }
-
-        String normalizedType = type.toLowerCase(Locale.ROOT);
-        if (noPasswordRequired && !"no-password-required".equals(normalizedType)) {
-            throw invalidCombination("NoPasswordRequired cannot be true when AuthenticationMode.Type is " + type + ".");
-        }
-        return switch (normalizedType) {
-            case "password" -> {
-                if (passwords.isEmpty()) {
-                    throw new AwsException("InvalidParameterValue",
-                            "Passwords are required when AuthenticationMode.Type is password.", 400);
-                }
-                yield new UserAuthentication(AuthMode.PASSWORD, passwords);
-            }
-            case "iam", "no-password-required" -> {
-                if (!passwords.isEmpty()) {
-                    throw invalidCombination("Passwords cannot be provided when AuthenticationMode.Type is " + type + ".");
-                }
-                yield new UserAuthentication("iam".equals(normalizedType) ? AuthMode.IAM : AuthMode.NO_AUTH, List.of());
-            }
-            default -> throw new AwsException("InvalidParameterValue",
-                    "Invalid AuthenticationMode.Type " + type + ". Valid values are password, no-password-required and iam.", 400);
-        };
-    }
-
-    private static AwsException invalidCombination(String message) {
-        return new AwsException("InvalidParameterCombination", message, 400);
+        return UserAuthentication.resolve(params.getFirst("AuthenticationMode.Type"), passwords,
+                Boolean.parseBoolean(params.getFirst("NoPasswordRequired")));
     }
 
     private static String memberListXml(String name, Collection<String> values) {

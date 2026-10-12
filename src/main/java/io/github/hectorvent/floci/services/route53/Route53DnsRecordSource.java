@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.route53;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
 import io.github.hectorvent.floci.core.common.dns.DnsLookupHelper;
 import io.github.hectorvent.floci.core.common.dns.DnsRecordSource;
@@ -188,7 +189,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         String lower = name.toLowerCase();
         for (String suffix : flociSuffixes) {
             String s = suffix.toLowerCase();
-            if (lower.equals(s) || lower.endsWith("." + s)) {
+            if (DomainNames.isWithin(lower, s)) {
                 return true;
             }
         }

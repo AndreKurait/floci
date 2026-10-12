@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.eks;
 
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
 import io.restassured.response.ValidatableResponse;
@@ -117,8 +118,7 @@ class EksIrsaEndToEndIntegrationTest {
     }
 
     private static String base64Url(String value) {
-        return Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(value.getBytes(StandardCharsets.UTF_8));
+        return Base64Url.encode(value);
     }
 
     private Response assumeRole(String token) {
@@ -236,7 +236,7 @@ class EksIrsaEndToEndIntegrationTest {
         signature.initSign(clusterSigningKey());
         signature.update((header + "." + payload).getBytes(StandardCharsets.UTF_8));
         String token = header + "." + payload + "."
-                + Base64.getUrlEncoder().withoutPadding().encodeToString(signature.sign());
+                + Base64Url.encode(signature.sign());
 
         assumeRole(token)
         .then()

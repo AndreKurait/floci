@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.apigatewayv2;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.PublicKeys;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -27,10 +28,8 @@ import java.net.URI;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
-import java.security.KeyFactory;
 import java.security.Signature;
 import java.security.interfaces.RSAPublicKey;
-import java.security.spec.RSAPublicKeySpec;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
@@ -316,10 +315,8 @@ public class JwtSignatureVerifier implements AutoCloseable {
     }
 
     private RSAPublicKey toRsaPublicKey(String n, String e) throws GeneralSecurityException {
-        BigInteger modulus = new BigInteger(1, Base64.getUrlDecoder().decode(padBase64(n)));
-        BigInteger exponent = new BigInteger(1, Base64.getUrlDecoder().decode(padBase64(e)));
-        RSAPublicKeySpec spec = new RSAPublicKeySpec(modulus, exponent);
-        return (RSAPublicKey) KeyFactory.getInstance("RSA").generatePublic(spec);
+        return PublicKeys.rsa(new BigInteger(1, Base64.getUrlDecoder().decode(padBase64(n))),
+                new BigInteger(1, Base64.getUrlDecoder().decode(padBase64(e))));
     }
 
     private boolean signatureValid(String signingInput, String encodedSignature, RSAPublicKey publicKey) {

@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.InlineZipPackager;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
@@ -22,8 +23,6 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -638,12 +637,7 @@ public class LambdaCfnProvisioner implements CfnResourceProvisioner {
 
     private static String sha256Base64(String zipFileBase64) {
         byte[] zipBytes = Base64.getDecoder().decode(zipFileBase64);
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256").digest(zipBytes);
-            return Base64.getEncoder().encodeToString(digest);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
+        return Base64.getEncoder().encodeToString(Digests.sha256(zipBytes));
     }
 
     private static Map<String, String> environmentVariables(Object value) {

@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -602,8 +603,7 @@ class LambdaIntegrationTest {
         org.junit.jupiter.api.Assertions.assertEquals('K', pkg[1]);
 
         // Byte-exact: downloaded package hashes to the stored CodeSha256.
-        byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(pkg);
-        String downloadedSha256 = Base64.getEncoder().encodeToString(digest);
+        String downloadedSha256 = Base64.getEncoder().encodeToString(Digests.sha256(pkg));
         org.junit.jupiter.api.Assertions.assertEquals(expectedSha256, downloadedSha256,
                 "downloaded package must be byte-identical to the uploaded zip");
 

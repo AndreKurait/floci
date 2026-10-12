@@ -304,6 +304,10 @@ provider resolves to. A service reports one or the other: `DescribeServices` omi
 for a service created with a strategy, and omits `capacityProviderStrategy` for one created with a
 launch type, which is what AWS documents for the `Service` shape.
 
+Service reconciliation calculates the provider split for the desired task count and fills deficits
+using the current deployment's running tasks. Scale-out and stopped-task replacement account for
+existing provider counts; tasks from a previous deployment do not cover the new deployment's targets.
+
 With no launch type, no strategy and no cluster default, a task keeps Floci's `FARGATE` default: a
 local cluster has no container instances, so an EC2 default would have nowhere to place it.
 

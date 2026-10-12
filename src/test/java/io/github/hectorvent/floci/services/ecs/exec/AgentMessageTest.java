@@ -1,10 +1,10 @@
 package io.github.hectorvent.floci.services.ecs.exec;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -45,7 +45,7 @@ class AgentMessageTest {
         assertEquals(messageId.getMostSignificantBits(), buffer.getLong());
         byte[] digest = new byte[32];
         buffer.get(digest);
-        assertArrayEquals(MessageDigest.getInstance("SHA-256").digest(payload), digest,
+        assertArrayEquals(Digests.sha256(payload), digest,
                 "the digest covers the payload");
         assertEquals(AgentMessage.PAYLOAD_OUTPUT, buffer.getInt(), "payload type");
         assertEquals(payload.length, buffer.getInt(), "payload length");

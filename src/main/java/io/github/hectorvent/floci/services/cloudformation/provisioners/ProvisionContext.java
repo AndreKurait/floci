@@ -19,11 +19,11 @@ import java.util.function.Consumer;
  */
 public record ProvisionContext(CloudFormationTemplateEngine engine, String region,
                                String accountId, String stackName, String priorPhysicalId,
-                               Consumer<StackEvent> progress) {
+                               Consumer<StackEvent> progress, JsonNode priorProperties) {
 
     public ProvisionContext(CloudFormationTemplateEngine engine, String region,
                             String accountId, String stackName, String priorPhysicalId) {
-        this(engine, region, accountId, stackName, priorPhysicalId, event -> {});
+        this(engine, region, accountId, stackName, priorPhysicalId, event -> {}, null);
     }
 
     /** Intermediate resource events retain the stack pipeline's event IDs and metadata. */
@@ -56,6 +56,20 @@ public record ProvisionContext(CloudFormationTemplateEngine engine, String regio
      */
     public boolean isUpdate() {
         return priorPhysicalId != null && !priorPhysicalId.isBlank();
+    }
+
+    /**
+     * Whether the previous template declared {@code name} on this resource, which tells an update
+     * that removes a property apart from one the stack never declared.
+     *
+     * <p>Reads the previous template's properties after its conditions chose each top-level
+     * {@code Fn::If}, so one that chose {@code AWS::NoValue} was not declared. False for a resource
+     * that was never provisioned, which has no prior physical id: a create, a resource the previous
+     * template did not have, and one whose {@code Condition} kept it out.
+     */
+    public boolean previouslyDeclared(String name) {
+        return isUpdate() && priorProperties != null && priorProperties.has(name)
+                && !priorProperties.get(name).isNull();
     }
 
     /**

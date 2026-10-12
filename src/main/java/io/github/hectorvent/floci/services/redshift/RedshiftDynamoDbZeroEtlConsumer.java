@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
@@ -23,9 +24,6 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -220,7 +218,7 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
             }
         }
         ObjectNode record = objectMapper.createObjectNode()
-                .put("eventID", "backfill#" + integration.getIntegrationArn() + "#" + sha256Hex(keys.toString()))
+                .put("eventID", "backfill#" + integration.getIntegrationArn() + "#" + Digests.sha256Hex(keys.toString()))
                 .put("eventName", "INSERT");
         ObjectNode dynamodb = record.putObject("dynamodb").put("SequenceNumber", "backfill");
         dynamodb.set("Keys", keys);
@@ -251,19 +249,6 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
         } catch (JsonProcessingException e) {
             throw new AwsException("InternalFailure",
                     "Could not persist a zero-ETL backfill checkpoint.", 500);
-        }
-    }
-
-    private static String sha256Hex(String value) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(digest.length * 2);
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b));
-            }
-            return sb.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is not available", e);
         }
     }
 

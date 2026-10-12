@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.testutil;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.restassured.filter.Filter;
 import io.restassured.filter.FilterContext;
 import io.restassured.response.Response;
@@ -11,7 +12,6 @@ import javax.crypto.spec.SecretKeySpec;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -132,7 +132,7 @@ public final class S3RequestSigner implements Filter {
         String scopeDate = amzDate.substring(0, 8);
         String contentSha256 = contentSha256Override != null
                 ? contentSha256Override
-                : sha256Hex(body);
+                : Digests.sha256Hex(body);
 
         List<String[]> headers = new ArrayList<>();
         if (signHost) {
@@ -159,7 +159,7 @@ public final class S3RequestSigner implements Filter {
         String stringToSign = ALGORITHM + "\n"
                 + amzDate + "\n"
                 + credentialScope + "\n"
-                + sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
+                + Digests.sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
         String signature = signatureOverride != null
                 ? signatureOverride
                 : hexEncode(hmacSha256(signingKey(scopeDate), stringToSign));
@@ -213,7 +213,7 @@ public final class S3RequestSigner implements Filter {
         String stringToSign = ALGORITHM + "\n"
                 + amzDate + "\n"
                 + credentialScope + "\n"
-                + sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
+                + Digests.sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
         String signature = signatureOverride != null
                 ? signatureOverride
                 : hexEncode(hmacSha256(signingKey(scopeDate), stringToSign));
@@ -282,10 +282,6 @@ public final class S3RequestSigner implements Filter {
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(key, "HmacSHA256"));
         return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String sha256Hex(byte[] input) throws Exception {
-        return hexEncode(MessageDigest.getInstance("SHA-256").digest(input));
     }
 
     private static String hexEncode(byte[] bytes) {

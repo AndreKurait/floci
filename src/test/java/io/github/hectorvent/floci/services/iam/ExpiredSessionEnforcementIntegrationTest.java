@@ -21,6 +21,7 @@ import java.time.Instant;
 import java.util.Locale;
 import java.util.UUID;
 
+import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 
@@ -74,7 +75,7 @@ class ExpiredSessionEnforcementIntegrationTest {
         getCallerIdentity(accessKeyId)
                 .then().statusCode(403).body(containsString("<Code>ExpiredTokenException</Code>"));
         given()
-                .header("Authorization", authorization(accessKeyId, "lambda"))
+                .header("Authorization", auth(accessKeyId, "lambda"))
                 .contentType("application/json")
         .when()
                 .get("/2015-03-31/functions")
@@ -83,7 +84,7 @@ class ExpiredSessionEnforcementIntegrationTest {
                 .header("X-Amzn-Errortype", "ExpiredTokenException")
                 .body("__type", containsString("ExpiredTokenException"));
         given()
-                .header("Authorization", authorization(accessKeyId, "s3"))
+                .header("Authorization", auth(accessKeyId, "s3"))
         .when()
                 .get("/")
         .then()
@@ -97,9 +98,9 @@ class ExpiredSessionEnforcementIntegrationTest {
         String accessKeyId = expiredSession();
         String bucket = "expired-session-post-" + UUID.randomUUID().toString().substring(0, 8);
         cleanup.register(() -> EnforcementFixtures.removeBucket(baseUri.getPort(),
-                authorization("test", "s3"), bucket));
+                auth("test", "s3"), bucket));
         given()
-                .header("Authorization", authorization("test", "s3"))
+                .header("Authorization", auth("test", "s3"))
         .when()
                 .put("/" + bucket)
         .then()
@@ -148,15 +149,11 @@ class ExpiredSessionEnforcementIntegrationTest {
     private static Response getCallerIdentity(String accessKeyId) {
         return given()
                 .contentType("application/x-www-form-urlencoded")
-                .header("Authorization", authorization(accessKeyId, "sts"))
+                .header("Authorization", auth(accessKeyId, "sts"))
                 .formParam("Action", "GetCallerIdentity")
                 .formParam("Version", "2011-06-15")
         .when()
                 .post("/");
     }
 
-    private static String authorization(String accessKeyId, String service) {
-        return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260101/us-east-1/" + service
-                + "/aws4_request, SignedHeaders=host, Signature=not-verified";
-    }
 }

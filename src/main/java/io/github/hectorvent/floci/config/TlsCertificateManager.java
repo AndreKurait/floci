@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
@@ -252,7 +253,7 @@ public class TlsCertificateManager implements Resettable {
         config.dns().extraSuffixes().ifPresent(list -> list.forEach(s -> suffixes.add(s.toLowerCase(Locale.ROOT))));
         String bare = name.startsWith("*.") ? name.substring(2) : name;
         for (String suffix : suffixes) {
-            if (bare.equals(suffix) || bare.endsWith("." + suffix)) {
+            if (DomainNames.isWithin(bare, suffix)) {
                 return true;
             }
         }

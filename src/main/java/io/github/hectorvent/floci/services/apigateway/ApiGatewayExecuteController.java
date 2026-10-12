@@ -1244,14 +1244,8 @@ public class ApiGatewayExecuteController {
                 pathParams.forEach(ppNode::put);
             }
 
-            // stageVariables: populate from the Stage object (null if no variables configured)
             Map<String, String> stageVars = stage != null ? stage.getVariables() : null;
-            if (stageVars != null && !stageVars.isEmpty()) {
-                ObjectNode svNode = node.putObject("stageVariables");
-                stageVars.forEach(svNode::put);
-            } else {
-                node.putNull("stageVariables");
-            }
+            putStageVariables(node, stageVars);
 
             ObjectNode ctx = node.putObject("requestContext");
             ctx.put("accountId", regionResolver.getAccountId());
@@ -1376,14 +1370,8 @@ public class ApiGatewayExecuteController {
         extractPathParams(resourcePath, path).forEach(pathParams::put);
         greedyPathParam(resourcePath, path).forEach(pathParams::put);
 
-        // stageVariables: populate from the Stage object (null if no variables configured)
         Map<String, String> stageVars = stage != null ? stage.getVariables() : null;
-        if (stageVars != null && !stageVars.isEmpty()) {
-            ObjectNode svNode = event.putObject("stageVariables");
-            stageVars.forEach(svNode::put);
-        } else {
-            event.putNull("stageVariables");
-        }
+        putStageVariables(event, stageVars);
 
         String arnRegion = region != null ? region : regionResolver.getDefaultRegion();
         String domainName = restDomainName(apiId, arnRegion, headers);
@@ -2568,6 +2556,8 @@ public class ApiGatewayExecuteController {
                     .type(MediaType.APPLICATION_JSON).build();
         }
 
+        Map<String, String> stageVariables = apiGatewayV2Service.getStageVariables(region, apiId, stageName);
+
         // A route carries exactly one authorizationType, so AWS_IAM, JWT and CUSTOM are mutually
         // exclusive branches. AWS_IAM was previously absent here, which let an unsigned request
         // through to the integration as if the route were NONE.
@@ -2593,7 +2583,8 @@ public class ApiGatewayExecuteController {
         ObjectNode lambdaAuthorizerContext = null;
         if ("CUSTOM".equalsIgnoreCase(route.getAuthorizationType()) && route.getAuthorizerId() != null) {
             RequestAuthorizerResult requestResult =
-                    enforceRequestAuthorizerV2(region, apiId, stageName, route, httpMethod, path, headers, uriInfo);
+                    enforceRequestAuthorizerV2(region, apiId, stageName, route, httpMethod, path,
+                            headers, uriInfo, stageVariables);
             if (requestResult.errorResponse() != null) {
                 return requestResult.errorResponse();
             }
@@ -2636,16 +2627,13 @@ public class ApiGatewayExecuteController {
 
         String requestId = UUID.randomUUID().toString();
         boolean payloadV1 = "1.0".equals(integration.getPayloadFormatVersion());
-        Map<String, String> stageVariables = payloadV1
-                ? apiGatewayV2Service.getStage(region, apiId, stageName).getStageVariables()
-                : null;
         String eventJson = payloadV1
                 ? buildV1ProxyEvent(httpMethod, path, route.getRouteKey(),
                         apiId, region, stageName, stageVariables, headers, uriInfo, body, requestId,
                         jwtClaims, jwtScopes, lambdaAuthorizerContext, iamIdentity)
                 : buildV2ProxyEvent(httpMethod, path, route.getRouteKey(),
                         apiId, region, stageName, headers, uriInfo, body, requestId, jwtClaims, jwtScopes,
-                        lambdaAuthorizerContext, iamIdentity);
+                        lambdaAuthorizerContext, iamIdentity, stageVariables);
 
         LOG.debugv("execute-api v2: {0} {1}/{2}{3} → Lambda {4}", httpMethod, apiId, stageName, path, functionName);
 
@@ -3038,7 +3026,8 @@ public class ApiGatewayExecuteController {
      */
     private RequestAuthorizerResult enforceRequestAuthorizerV2(String region, String apiId, String stageName,
                                                 Route route, String httpMethod, String path,
-                                                HttpHeaders headers, UriInfo uriInfo) {
+                                                HttpHeaders headers, UriInfo uriInfo,
+                                                Map<String, String> stageVariables) {
         Authorizer authorizer = findV2Authorizer(region, apiId, route.getAuthorizerId()).orElse(null);
         if (authorizer == null) {
             return new RequestAuthorizerResult(Response.status(500)
@@ -3081,10 +3070,11 @@ public class ApiGatewayExecuteController {
         String eventJson;
         if ("2.0".equals(payloadFormatVersion)) {
             eventJson = buildRequestAuthorizerEventV2(httpMethod, path, route.getRouteKey(),
-                    apiId, stageName, region, headers, uriInfo);
+                    apiId, stageName, region, headers, uriInfo, stageVariables);
         } else {
             // Default to 1.0 format
-            eventJson = buildRequestAuthorizerEventV1(httpMethod, path, apiId, stageName, region, headers, uriInfo);
+            eventJson = buildRequestAuthorizerEventV1(httpMethod, path, apiId, stageName,
+                    region, headers, uriInfo, stageVariables);
         }
 
         // Extract the Lambda function name from the authorizer URI
@@ -3199,7 +3189,8 @@ public class ApiGatewayExecuteController {
      */
     String buildRequestAuthorizerEventV1(String httpMethod, String path,
                                          String apiId, String stageName, String region,
-                                         HttpHeaders headers, UriInfo uriInfo) {
+                                         HttpHeaders headers, UriInfo uriInfo,
+                                         Map<String, String> stageVariables) {
         // The JAX-RS {proxy} binding strips a trailing slash before dispatchV2 rebuilds the
         // path, so recover it from the raw request URI for the delivered path fields. methodArn
         // keeps the normalized path, as in the REST authorizer event (see toAuthorizerEvent),
@@ -3224,7 +3215,7 @@ public class ApiGatewayExecuteController {
         putMultiValueQueryStringParameters(event, uriInfo);
 
         event.putObject("pathParameters");
-        event.putNull("stageVariables");
+        putStageVariables(event, stageVariables);
 
         // Request context
         ObjectNode ctx = event.putObject("requestContext");
@@ -3249,7 +3240,8 @@ public class ApiGatewayExecuteController {
      */
     String buildRequestAuthorizerEventV2(String httpMethod, String path, String routeKey,
                                           String apiId, String stageName, String region,
-                                          HttpHeaders headers, UriInfo uriInfo) {
+                                          HttpHeaders headers, UriInfo uriInfo,
+                                          Map<String, String> stageVariables) {
         // rawPath is by contract the raw, unmodified path, so recover the trailing slash the
         // JAX-RS {proxy} binding stripped. routeArn keeps the normalized path for the same reason
         // methodArn does in the 1.0 shape above.
@@ -3267,7 +3259,7 @@ public class ApiGatewayExecuteController {
         putV2CookiesHeadersAndQuery(event, headers.getRequestHeaders(), uriInfo.getQueryParameters());
 
         event.putObject("pathParameters");
-        event.putNull("stageVariables");
+        putStageVariables(event, stageVariables);
 
         // Request context
         ObjectNode ctx = event.putObject("requestContext");
@@ -3419,6 +3411,15 @@ public class ApiGatewayExecuteController {
         };
     }
 
+    private static void putStageVariables(ObjectNode event, Map<String, String> stageVariables) {
+        if (stageVariables == null || stageVariables.isEmpty()) {
+            event.putNull("stageVariables");
+            return;
+        }
+        ObjectNode variables = event.putObject("stageVariables");
+        stageVariables.forEach(variables::put);
+    }
+
     /** Reuses the REST v1 event shape, then applies the documented HTTP API v1 differences. */
     String buildV1ProxyEvent(String httpMethod, String path, String routeKey,
                              String apiId, String region, String stageName,
@@ -3435,10 +3436,7 @@ public class ApiGatewayExecuteController {
         try {
             ObjectNode event = (ObjectNode) objectMapper.readTree(json);
             event.put("version", "1.0");
-            if (stageVariables != null && !stageVariables.isEmpty()) {
-                ObjectNode variables = event.putObject("stageVariables");
-                stageVariables.forEach(variables::put);
-            }
+            putStageVariables(event, stageVariables);
 
             Map<String, List<String>> lowercaseHeaders = new LinkedHashMap<>();
             headers.getRequestHeaders().forEach((name, values) ->
@@ -3526,6 +3524,18 @@ public class ApiGatewayExecuteController {
                                      byte[] body, String requestId, Map<String, String> jwtClaims,
                                      List<String> jwtScopes, ObjectNode lambdaAuthorizerContext,
                                      ExecuteApiSigV4Authorizer.CallerIdentity iamIdentity) {
+        return buildV2ProxyEvent(httpMethod, path, routeKey, apiId, region, stageName,
+                headers, uriInfo, body, requestId, jwtClaims, jwtScopes, lambdaAuthorizerContext,
+                iamIdentity, null);
+    }
+
+    String buildV2ProxyEvent(String httpMethod, String path, String routeKey,
+                                     String apiId, String region, String stageName,
+                                     HttpHeaders headers, UriInfo uriInfo,
+                                     byte[] body, String requestId, Map<String, String> jwtClaims,
+                                     List<String> jwtScopes, ObjectNode lambdaAuthorizerContext,
+                                     ExecuteApiSigV4Authorizer.CallerIdentity iamIdentity,
+                                     Map<String, String> stageVariables) {
         // The JAX-RS {proxy} binding strips a trailing slash, but rawPath is by contract the
         // raw path and routers treat /x and /x/ as distinct routes. Recover it from the raw
         // request URI for the event path fields. Route matching in dispatchV2 and the
@@ -3548,6 +3558,10 @@ public class ApiGatewayExecuteController {
         if (!pathParams.isEmpty()) {
             ObjectNode pp = event.putObject("pathParameters");
             pathParams.forEach(pp::put);
+        }
+
+        if (stageVariables != null && !stageVariables.isEmpty()) {
+            putStageVariables(event, stageVariables);
         }
 
         ObjectNode ctx = event.putObject("requestContext");

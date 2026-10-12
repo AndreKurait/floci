@@ -47,11 +47,17 @@
   "AWS::ApiGatewayV2::Api": [
     "ProtocolType"
   ],
+  "AWS::ApiGatewayV2::ApiMapping": [
+    "DomainName"
+  ],
   "AWS::ApiGatewayV2::Authorizer": [
     "ApiId"
   ],
   "AWS::ApiGatewayV2::Deployment": [
     "ApiId"
+  ],
+  "AWS::ApiGatewayV2::DomainName": [
+    "DomainName"
   ],
   "AWS::ApiGatewayV2::Integration": [
     "ApiId"

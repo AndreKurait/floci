@@ -162,7 +162,7 @@ cross-resource references.
 | ECS | `Cluster`, `TaskDefinition`, `Service`, `CapacityProvider`, `ClusterCapacityProviderAssociations` |
 | EKS | `Cluster`, `Nodegroup` |
 | RDS | `DBInstance` (starts a real container), `DBCluster` (starts a real container), `DBSubnetGroup`, `DBParameterGroup`, `DBClusterParameterGroup`, `DBProxy`, `DBProxyTargetGroup` |
-| ElastiCache | `CacheCluster` (starts a real container; modifying an existing cluster in place is not supported), `SubnetGroup` |
+| ElastiCache | `CacheCluster` (starts a real container; modifying an existing cluster in place is not supported), `SubnetGroup`, `User` (Tags are ignored), `UserGroup` (Tags are ignored) |
 | Redshift | `Cluster` (single-node container; Port and non-dev DBName ignored; ManageMasterPassword unsupported), `ClusterParameterGroup`, `ClusterSubnetGroup`, `ClusterSecurityGroup` (accepted; no EC2-Classic security group model) |
 | Redshift Serverless | `Namespace` (ManageAdminPassword is accepted and not applied; GetAtt uses the dotted Namespace.* form), `Workgroup` (starts a real container; one workgroup per namespace; capacity, VPC and price-performance settings are stored only; snapshot restore properties are ignored; GetAtt uses the dotted Workgroup.* form) |
 | EC2 | `VPC`, `Subnet`, `SecurityGroup` (inline `SecurityGroupIngress`/`SecurityGroupEgress` supported), `SecurityGroupIngress`, `SecurityGroupEgress`, `InternetGateway`, `RouteTable`, `SubnetRouteTableAssociation`, `Route`, `NatGateway`, `EIP`, `Instance`, `LaunchTemplate`, `VPCGatewayAttachment`, `VPCEndpoint`, `NetworkAcl`, `NetworkAclEntry`, `SubnetNetworkAclAssociation`, `FlowLog`, `KeyPair` |
@@ -172,7 +172,7 @@ cross-resource references.
 | Route 53 | `HostedZone`, `RecordSet`, `RecordSetGroup` |
 | Cloud Map | `HttpNamespace`, `PrivateDnsNamespace`, `PublicDnsNamespace`, `Service` |
 | API Gateway (v1) | `RestApi`, `Resource`, `Authorizer`, `Method`, `Deployment`, `Stage`, `Account`, `DomainName`, `BasePathMapping`, `GatewayResponse`, `ApiKey`, `UsagePlan`, `UsagePlanKey` |
-| API Gateway v2 | `Api`, `Authorizer`, `Route`, `Integration`, `Stage`, `Deployment`, `VpcLink` |
+| API Gateway v2 | `Api`, `Authorizer`, `Route`, `Integration`, `Stage`, `Deployment`, `DomainName`, `ApiMapping`, `VpcLink` |
 | AppSync | `GraphQLApi`, `GraphQLSchema`, `DataSource`, `FunctionConfiguration`, `Resolver`, `ApiKey`. `Ref` on `GraphQLApi` and `ApiKey` returns the id where AWS returns the ARN. See [AppSync](appsync.md#cloudformation) for `Ref` and `Fn::GetAtt` compared with AWS. |
 | Step Functions | `StateMachine` |
 | CodePipeline | `Pipeline`, `CustomActionType`, `Webhook` |
@@ -306,7 +306,16 @@ accepts, not only by name:
 - `MixedInstancesPolicy` → `LaunchTemplate` → `LaunchTemplateSpecification`, including
   `Overrides[].InstanceType` and `InstancesDistribution` (`OnDemandBaseCapacity`,
   `OnDemandPercentageAboveBaseCapacity`, `SpotAllocationStrategy`). A non-integer where AWS expects
-  a number fails the stack rather than being dropped.
+  a number fails the stack rather than being dropped. `Overrides[].WeightedCapacity` is carried
+  through as well.
+
+The group also passes `ServiceLinkedRoleARN`, `InstanceMaintenancePolicy`,
+`AvailabilityZoneDistribution` and `CapacityReservationSpecification` through to the group, with
+the same validation the Auto Scaling API applies. The resource schema requires
+`CapacityReservationPreference` on `CapacityReservationSpecification` and `Granularity` on each
+`MetricsCollection` entry. `MetricsCollection` enables the listed metrics (an entry naming none
+enables all of them), and on `UpdateStack` the group's enabled metrics are
+set to exactly what the template lists. Removing the property leaves collection as it was.
 
 ## Lambda Stack Updates
 
@@ -467,7 +476,24 @@ Lambda. floci supports two shapes:
   default); a resource that never completes fails the stack rather than hanging.
 
 The handler's `Data` keys resolve through `Fn::GetAtt`, except keys that begin with `__Floci`. Floci
-reserves that prefix for its own resource state, which no template can read.
+reserves that prefix for its own resource state and ignores such keys.
+
+A failed stack update rolls back a custom resource whose handler was sent an `Update`, as
+CloudFormation does. This holds whether the handler applied the update and a later resource failed,
+or the handler answered `FAILED` itself. The handler is sent a second `Update` under the same
+`PhysicalResourceId`, with the old properties as `ResourceProperties` and the attempted ones as
+`OldResourceProperties`, so it can undo the change. A handler that answers `FAILED` to that rollback
+leaves the resource `UPDATE_FAILED` with its `Reason`, and the stack `UPDATE_ROLLBACK_FAILED`. The
+old properties still become the resource's own, as on AWS: a later `DeleteStack` sends them in its
+`Delete`, and the next update sends them as `OldResourceProperties`. An update whose handler returned
+a new `PhysicalResourceId` replaced the resource. Its rollback sends no `Update`: the new id gets a
+`Delete` with the attempted properties, and the resource goes back to the old id. CloudFormation sends
+that `Delete` in its `UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS` phase. Floci has no rollback
+cleanup phase and sends it during the rollback. As in that phase, a `Delete` the handler fails is
+logged and does not fail the rollback. When the rollback's own `Update` returns a new id, the id it
+was sent gets a `Delete` straight away for the same reason. An update that changes `ServiceToken`
+reaches no handler: it fails with `Modifying service token is not allowed.`, as on AWS, and its
+rollback sends nothing.
 
 ## Deleted Stacks
 

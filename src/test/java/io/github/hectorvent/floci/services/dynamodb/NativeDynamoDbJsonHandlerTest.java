@@ -1043,7 +1043,7 @@ class NativeDynamoDbJsonHandlerTest {
         AwsException ex = expectValidationException("Scan", json("""
                 {"TableName": "Users", "Segment": 0, "TotalSegments": 1000001}
                 """));
-        assertEquals("1 validation error detected: Value '1000001' at 'totalSegments' failed to "
+        assertEquals("1 validation error detected: Value at 'TotalSegments' failed to "
                 + "satisfy constraint: Member must have value less than or equal to 1000000", ex.getMessage());
     }
 
@@ -1066,7 +1066,7 @@ class NativeDynamoDbJsonHandlerTest {
         AwsException ex = expectValidationException("Scan", json("""
                 {"TableName": "Users", "Segment": -1, "TotalSegments": 4}
                 """));
-        assertEquals("1 validation error detected: Value '-1' at 'segment' failed to satisfy constraint: "
+        assertEquals("1 validation error detected: Value at 'Segment' failed to satisfy constraint: "
                 + "Member must have value greater than or equal to 0", ex.getMessage());
     }
 
@@ -1075,20 +1075,50 @@ class NativeDynamoDbJsonHandlerTest {
         AwsException ex = expectValidationException("Scan", json("""
                 {"TableName": "Users", "Segment": 0, "TotalSegments": 0}
                 """));
-        assertEquals("1 validation error detected: Value '0' at 'totalSegments' failed to satisfy constraint: "
+        assertEquals("1 validation error detected: Value at 'TotalSegments' failed to satisfy constraint: "
                 + "Member must have value greater than or equal to 1", ex.getMessage());
     }
 
     @Test
-    void scanReportsTotalSegmentsBeforeSegmentWhenBothAreOutOfRange() {
+    void scanReportsSegmentBeforeTotalSegmentsWhenBothAreOutOfRange() {
         AwsException ex = expectValidationException("Scan", json("""
                 {"TableName": "Users", "Segment": -1, "TotalSegments": 0}
                 """));
         assertEquals("2 validation errors detected: "
-                + "Value '0' at 'totalSegments' failed to satisfy constraint: "
+                + "Value at 'Segment' failed to satisfy constraint: "
+                + "Member must have value greater than or equal to 0; "
+                + "Value at 'TotalSegments' failed to satisfy constraint: "
+                + "Member must have value greater than or equal to 1", ex.getMessage());
+    }
+
+    @Test
+    void scanReportsLimitAndSegmentTogetherBeforeTheTableLookup() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Missing", "Limit": 0, "Segment": -1, "TotalSegments": 2}
+                """));
+        assertEquals("2 validation errors detected: "
+                + "Value at 'Limit' failed to satisfy constraint: "
                 + "Member must have value greater than or equal to 1; "
-                + "Value '-1' at 'segment' failed to satisfy constraint: "
+                + "Value at 'Segment' failed to satisfy constraint: "
                 + "Member must have value greater than or equal to 0", ex.getMessage());
+    }
+
+    @Test
+    void scanRejectsASegmentNotBelowTotalSegments() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Segment": 5, "TotalSegments": 5}
+                """));
+        assertEquals("The Segment parameter is zero-based and must be less than parameter TotalSegments",
+                ex.getMessage());
+    }
+
+    @Test
+    void scanPrefixesTheMissingProjectionForSpecificAttributes() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Select": "SPECIFIC_ATTRIBUTES"}
+                """));
+        assertEquals("1 validation error detected: Must specify the AttributesToGet or ProjectionExpression "
+                + "when choosing to get SPECIFIC_ATTRIBUTES", ex.getMessage());
     }
 
     @Test

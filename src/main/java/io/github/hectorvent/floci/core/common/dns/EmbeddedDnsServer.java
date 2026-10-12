@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common.dns;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.TlsConfigSource;
+import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.quarkus.runtime.Startup;
@@ -242,7 +243,7 @@ public class EmbeddedDnsServer {
         String lower = name.toLowerCase();
         for (String suffix : suffixes) {
             String s = suffix.toLowerCase();
-            if (lower.equals(s) || lower.endsWith("." + s)) {
+            if (DomainNames.isWithin(lower, s)) {
                 return true;
             }
         }

@@ -277,7 +277,7 @@ class Ec2DedicatedHostIntegrationTest {
     @Order(10)
     void allocateRejectsANonexistentZoneAndStoresNothing() {
         int before = hostCount();
-        post("Action", "AllocateHosts", "InstanceType", "m5.large", "AvailabilityZone", "us-east-1z")
+        post("Action", "AllocateHosts", "InstanceType", "m5.large", "AvailabilityZone", "us-east-1aa")
                 .statusCode(400).body(containsString("InvalidParameterValue"));
         org.junit.jupiter.api.Assertions.assertEquals(before, hostCount());
     }

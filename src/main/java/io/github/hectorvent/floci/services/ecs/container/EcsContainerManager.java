@@ -14,6 +14,7 @@ import com.github.dockerjava.api.model.Statistics;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -68,14 +69,11 @@ import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -2202,13 +2200,13 @@ public class EcsContainerManager {
      */
     static String efsVolumeToken(String fileSystemId, String accessPointId, String rootDirectory) {
         if (accessPointId != null && !accessPointId.isBlank()) {
-            return "efs-" + fileSystemId + "-" + sha256Hex("accessPoint:" + accessPointId);
+            return "efs-" + fileSystemId + "-" + Digests.sha256Hex("accessPoint:" + accessPointId);
         }
         String normalizedRoot = normalizeRootDirectory(rootDirectory);
         if ("/".equals(normalizedRoot)) {
             return "efs-" + fileSystemId;
         }
-        return "efs-" + fileSystemId + "-" + sha256Hex(normalizedRoot);
+        return "efs-" + fileSystemId + "-" + Digests.sha256Hex(normalizedRoot);
     }
 
     /**
@@ -2242,15 +2240,6 @@ public class EcsContainerManager {
             collapsed = collapsed.substring(0, collapsed.length() - 1);
         }
         return collapsed.startsWith("/") ? collapsed : "/" + collapsed;
-    }
-
-    private static String sha256Hex(String value) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is required but not available", e);
-        }
     }
 
     // Inner enum to avoid import cycle — mirrors model.TaskStatus for readability

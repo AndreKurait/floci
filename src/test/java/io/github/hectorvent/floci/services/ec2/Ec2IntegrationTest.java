@@ -161,8 +161,292 @@ class Ec2IntegrationTest {
                     startsWith("us-east-1"));
     }
 
+    // DescribeAvailabilityZones parameter validation and filtering
     @Test
     @Order(5)
+    void describeAvailabilityZonesWithZoneName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("ZoneName.1", "us-east-1a")
+            .formParam("ZoneName.2", "us-east-1c")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(2))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.zoneName",
+                    hasItems("us-east-1a", "us-east-1c"));
+    }
+
+    @Test
+    @Order(6)
+    void describeAvailabilityZonesWithZoneId() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("ZoneId.1", "use1-az1")
+            .formParam("ZoneId.2", "use1-az3")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(2))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.zoneId",
+                    hasItems("use1-az1", "use1-az3"));
+    }
+
+    @Test
+    @Order(7)
+    void describeAvailabilityZonesRejectsUnknownZoneName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("ZoneName.1", "us-east-1aa")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
+    }
+
+    @Test
+    @Order(7)
+    void describeAvailabilityZonesRejectsUnknownZoneId() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("ZoneId.1", "use1-az99")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
+    }
+
+    @Test
+    @Order(8)
+    void describeAvailabilityZonesWithZoneNameAndZoneIdTogether() {
+        // Terraform's aws_availability_zone data source sends ZoneIds and ZoneNames together,
+        // so the pair is narrowed to their intersection rather than refused.
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("ZoneName.1", "us-east-1a")
+            .formParam("ZoneName.2", "us-east-1b")
+            .formParam("ZoneId.1", "use1-az1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(1))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].zoneName",
+                    equalTo("us-east-1a"));
+    }
+
+    @Test
+    @Order(9)
+    void describeAvailabilityZonesFilterByZoneName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "zone-name")
+            .formParam("Filter.1.Value.1", "us-east-1a")
+            .formParam("Filter.1.Value.2", "us-east-1b")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(2))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.zoneName",
+                    hasItems("us-east-1a", "us-east-1b"));
+    }
+
+    @Test
+    @Order(10)
+    void describeAvailabilityZonesFilterByZoneId() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "zone-id")
+            .formParam("Filter.1.Value.1", "use1-az2")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(1))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.zoneId",
+                    equalTo("use1-az2"));
+    }
+
+    @Test
+    @Order(11)
+    void describeAvailabilityZonesFilterByState() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "state")
+            .formParam("Filter.1.Value.1", "available")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3));
+    }
+
+    @Test
+    @Order(12)
+    void describeAvailabilityZonesFilterByRegionName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "region-name")
+            .formParam("Filter.1.Value.1", "us-east-1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3));
+    }
+
+    @Test
+    @Order(13)
+    void describeAvailabilityZonesFilterByZoneType() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "zone-type")
+            .formParam("Filter.1.Value.1", "availability-zone")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3));
+    }
+
+    @Test
+    @Order(14)
+    void describeAvailabilityZonesFilterByMessage() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "message")
+            .formParam("Filter.1.Value.1", "any")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(0));
+    }
+
+    @Test
+    @Order(15)
+    void describeAvailabilityZonesFilterByOptInStatus() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "opt-in-status")
+            .formParam("Filter.1.Value.1", "opt-in-not-required")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].optInStatus",
+                    equalTo("opt-in-not-required"));
+    }
+
+    @Test
+    @Order(16)
+    void describeAvailabilityZonesFilterByGroupName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "group-name")
+            .formParam("Filter.1.Value.1", "us-east-1-zg-1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].groupName",
+                    equalTo("us-east-1-zg-1"));
+    }
+
+    @Test
+    @Order(16)
+    void describeAvailabilityZonesFilterByGroupLongName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "group-long-name")
+            .formParam("Filter.1.Value.1", "US East (N. Virginia) 1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(3))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item[0].groupLongName",
+                    equalTo("US East (N. Virginia) 1"));
+    }
+
+    @Test
+    @Order(17)
+    void describeAvailabilityZonesRejectsInvalidFilterName() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "invalid-filter")
+            .formParam("Filter.1.Value.1", "any")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
+            .body("Response.Errors.Error.Message",
+                    containsString("The filter 'invalid-filter' is invalid"));
+    }
+
+    @Test
+    @Order(18)
+    void describeAvailabilityZonesMultipleFiltersAndSemantics() {
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "zone-name")
+            .formParam("Filter.1.Value.1", "us-east-1a")
+            .formParam("Filter.1.Value.2", "us-east-1b")
+            .formParam("Filter.2.Name", "state")
+            .formParam("Filter.2.Value.1", "available")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(2))
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.zoneName",
+                    hasItems("us-east-1a", "us-east-1b"));
+    }
+
+    @Test
+    @Order(19)
+    void describeAvailabilityZonesMultipleSameNameFiltersAndSemantics() {
+        // Two zone-name filters - should AND them
+        given()
+            .formParam("Action", "DescribeAvailabilityZones")
+            .formParam("Filter.1.Name", "zone-name")
+            .formParam("Filter.1.Value.1", "us-east-1a")
+            .formParam("Filter.2.Name", "zone-name")
+            .formParam("Filter.2.Value.1", "us-east-1b")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.size()", equalTo(0));
+    }
+
+    @Test
+    @Order(20)
     void describeRegions() {
         given()
             .formParam("Action", "DescribeRegions")

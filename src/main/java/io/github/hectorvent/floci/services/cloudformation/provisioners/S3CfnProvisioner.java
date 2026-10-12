@@ -10,9 +10,15 @@ import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.s3.model.FilterRule;
+import io.github.hectorvent.floci.services.s3.model.LambdaNotification;
+import io.github.hectorvent.floci.services.s3.model.NotificationConfiguration;
+import io.github.hectorvent.floci.services.s3.model.QueueNotification;
+import io.github.hectorvent.floci.services.s3.model.TopicNotification;
 import jakarta.enterprise.context.ApplicationScoped;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -22,14 +28,18 @@ import java.util.Set;
  *
  * <p>A property this class covers is translated into the XML its own S3 API call takes and handed
  * to the same service method, so the service validates and stores it exactly as it would a direct
- * {@code PutBucket*} request. A property the template does not declare is left alone.
+ * {@code PutBucket*} request. A property the template does not declare is left alone, except that
+ * an update removing {@code NotificationConfiguration} clears it.
  *
  * <p>Covered on {@code AWS::S3::Bucket}: {@code BucketName}, {@code CorsConfiguration},
  * {@code VersioningConfiguration}, {@code PublicAccessBlockConfiguration},
- * {@code BucketEncryption}, {@code LifecycleConfiguration}, {@code OwnershipControls} and {@code Tags}.
+ * {@code BucketEncryption}, {@code LifecycleConfiguration}, {@code OwnershipControls},
+ * {@code NotificationConfiguration} and {@code Tags}.
+ * {@code NotificationConfiguration} is the exception to the XML translation: its
+ * service method takes the parsed model, so the provisioner builds that model instead.
  *
  * <p><b>Silently dropped</b>, each of which has a service method waiting for it:
- * {@code NotificationConfiguration}, {@code WebsiteConfiguration}, {@code LoggingConfiguration},
+ * {@code WebsiteConfiguration}, {@code LoggingConfiguration},
  * {@code ObjectLockConfiguration}, {@code ReplicationConfiguration},
  * {@code AccelerateConfiguration}, {@code AccessControl}, and the four numbered configuration
  * lists ({@code AnalyticsConfigurations}, {@code IntelligentTieringConfigurations},
@@ -79,16 +89,38 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
         // AWS. With the name now stable across updates, the second UpdateStack must skip the create
         // and only reconcile the bucket's configuration. A replacing update derives a different
         // name and still creates, hence reusesPriorEntity rather than isUpdate.
-        if (!ctx.reusesPriorEntity(bucketName)) {
-            s3Service.createBucket(bucketName, ctx.region());
+        Unwind unwind = new Unwind();
+        try {
+            // Built before anything is created, so a configuration that fails validation creates nothing.
+            NotificationConfiguration notifications = notificationConfiguration(props, ctx);
+            if (!ctx.reusesPriorEntity(bucketName)) {
+                // In us-east-1 CreateBucket also answers for a bucket the account already owns,
+                // which this resource must never delete.
+                boolean owned = s3Service.ownsBucket(bucketName);
+                s3Service.createBucket(bucketName, ctx.region());
+                unwind.created = !owned;
+            }
+            // Ahead of the other properties, so a destination S3 cannot validate fails the resource
+            // before any of them has changed the bucket. An unchanged configuration is not put again:
+            // each put sends a fresh s3:TestEvent to every queue and topic.
+            if (notifications != null) {
+                NotificationConfiguration current = s3Service.getBucketNotificationConfiguration(bucketName);
+                if (!sameConfiguration(notifications, current)) {
+                    s3Service.putBucketNotificationConfiguration(bucketName, notifications);
+                    unwind.replacedNotifications = current;
+                }
+            }
+            applyBucketCorsConfiguration(bucketName, props, ctx);
+            applyBucketVersioningConfiguration(bucketName, props, ctx);
+            applyPublicAccessBlockConfiguration(bucketName, props, ctx);
+            applyBucketEncryption(bucketName, props, ctx);
+            applyLifecycleConfiguration(bucketName, props, ctx);
+            applyOwnershipControls(bucketName, props, ctx);
+            applyBucketTags(bucketName, props, ctx);
+        } catch (RuntimeException failure) {
+            unwind(r, bucketName, unwind, ctx, failure);
+            throw failure;
         }
-        applyBucketCorsConfiguration(bucketName, props, ctx);
-        applyBucketVersioningConfiguration(bucketName, props, ctx);
-        applyPublicAccessBlockConfiguration(bucketName, props, ctx);
-        applyBucketEncryption(bucketName, props, ctx);
-        applyLifecycleConfiguration(bucketName, props, ctx);
-        applyOwnershipControls(bucketName, props, ctx);
-        applyBucketTags(bucketName, props, ctx);
         r.setPhysicalId(bucketName);
         r.getAttributes().put("Arn",
                 AwsArnUtils.Arn.global(AwsRegions.partitionFor(ctx.region()), "s3", "", bucketName).toString());
@@ -225,6 +257,188 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
         String xml = new XmlBuilder().start("OwnershipControls", AwsNamespaces.S3)
                 .start("Rule").elem("ObjectOwnership", ownership).end("Rule").end("OwnershipControls").build();
         s3Service.putBucketOwnershipControls(bucketName, xml);
+    }
+
+    /** What a provision changed that a failure has to undo. */
+    private static final class Unwind {
+        private boolean created;
+        private NotificationConfiguration replacedNotifications;
+    }
+
+    /**
+     * Undoes what a failed provision changed. On a failed update the engine restores the previous
+     * resource record and reports it rolled back unless the provisioner records why it could not
+     * be, so the bucket itself has to be put back: one this attempt created is deleted, and a
+     * notification configuration it replaced is put back. The other properties have no restore;
+     * the notification configuration goes ahead of them, so a destination S3 rejects leaves them
+     * untouched.
+     */
+    private void unwind(StackResource r, String bucketName, Unwind unwind, ProvisionContext ctx,
+                        RuntimeException failure) {
+        try {
+            if (unwind.created) {
+                s3Service.deleteBucket(bucketName);
+            } else if (unwind.replacedNotifications != null) {
+                // Valid when it was put; its destinations are not checked again on the way back.
+                s3Service.putBucketNotificationConfiguration(bucketName, unwind.replacedNotifications, true);
+            }
+        } catch (RuntimeException e) {
+            LOG.warnv("Could not undo the failed provision of bucket {0}: {1}", bucketName, e.getMessage());
+            failure.addSuppressed(e);
+            if (ctx.isUpdate()) {
+                r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR,
+                        "Could not restore bucket " + bucketName + ": " + e.getMessage());
+            }
+        }
+    }
+
+    private static boolean sameConfiguration(NotificationConfiguration desired, NotificationConfiguration current) {
+        return desired.getQueueConfigurations().equals(current.getQueueConfigurations())
+                && desired.getTopicConfigurations().equals(current.getTopicConfigurations())
+                && desired.getLambdaFunctionConfigurations().equals(current.getLambdaFunctionConfigurations())
+                && desired.isEventBridgeEnabled() == current.isEventBridgeEnabled();
+    }
+
+    /**
+     * The configuration to put on the bucket through the same service method as
+     * {@code PutBucketNotificationConfiguration}, whose destination validation then fails the
+     * resource for a queue, topic or function that does not exist. Empty when the template declares
+     * an empty one, and when an update removes the property, both of which clear the bucket's, as
+     * on AWS. Null when the stack never declared it: the bucket's own configuration, one put
+     * outside the stack, is left alone, as AWS leaves it.
+     *
+     * <p>CloudFormation names one {@code Event} per entry where the API takes a list, and has no
+     * {@code Id}. Each entry becomes one API configuration with a blank id, which is what the
+     * service stores for an API request that omits {@code Id}.
+     */
+    private NotificationConfiguration notificationConfiguration(JsonNode props, ProvisionContext ctx) {
+        JsonNode declaredNode = declared(props, "NotificationConfiguration");
+        JsonNode notifications = declaredNode == null
+                ? null : ctx.engine().resolveNodeOmittingNoValue(declaredNode);
+        if (notifications == null || notifications.isMissingNode() || notifications.isNull()) {
+            return ctx.previouslyDeclared("NotificationConfiguration") ? new NotificationConfiguration() : null;
+        }
+        String path = "#/NotificationConfiguration";
+        requireObject(notifications, path);
+        NotificationConfiguration config = new NotificationConfiguration();
+        for (NotificationEntry entry : notificationEntries(notifications, "QueueConfigurations", "Queue", path)) {
+            config.getQueueConfigurations().add(
+                    new QueueNotification("", entry.arn(), List.of(entry.event()), entry.filterRules()));
+        }
+        for (NotificationEntry entry : notificationEntries(notifications, "TopicConfigurations", "Topic", path)) {
+            config.getTopicConfigurations().add(
+                    new TopicNotification("", entry.arn(), List.of(entry.event()), entry.filterRules()));
+        }
+        for (NotificationEntry entry : notificationEntries(notifications, "LambdaConfigurations", "Function", path)) {
+            config.getLambdaFunctionConfigurations().add(
+                    new LambdaNotification("", entry.arn(), List.of(entry.event()), entry.filterRules()));
+        }
+        JsonNode eventBridge = declared(notifications, "EventBridgeConfiguration");
+        if (eventBridge != null) {
+            String eventBridgePath = path + "/EventBridgeConfiguration";
+            JsonNode enabledNode = requiredNode(eventBridge, "EventBridgeEnabled", eventBridgePath);
+            String enabled = enabledNode.asText();
+            if (!"true".equalsIgnoreCase(enabled) && !"false".equalsIgnoreCase(enabled)) {
+                throw typeMismatch(eventBridgePath + "/EventBridgeEnabled", "Boolean", enabledNode);
+            }
+            config.setEventBridgeEnabled(Boolean.parseBoolean(enabled));
+        }
+        return config;
+    }
+
+    private record NotificationEntry(String event, String arn, List<FilterRule> filterRules) {}
+
+    private static List<NotificationEntry> notificationEntries(JsonNode notifications, String listName,
+                                                               String arnProperty, String path) {
+        JsonNode list = declaredArray(notifications, listName, path);
+        List<NotificationEntry> entries = new ArrayList<>();
+        if (list == null) {
+            return entries;
+        }
+        for (int index = 0; index < list.size(); index++) {
+            String entryPath = path + "/" + listName + "/" + index;
+            JsonNode entry = requireObject(list.get(index), entryPath);
+            String event = required(entry, "Event", entryPath);
+            String arn = required(entry, arnProperty, entryPath);
+            entries.add(new NotificationEntry(event, arn, filterRules(entry, entryPath)));
+        }
+        return entries;
+    }
+
+    private static List<FilterRule> filterRules(JsonNode entry, String entryPath) {
+        JsonNode filter = declared(entry, "Filter");
+        if (filter == null) {
+            return List.of();
+        }
+        requireObject(filter, entryPath + "/Filter");
+        JsonNode s3Key = requireObject(requiredNode(filter, "S3Key", entryPath + "/Filter"), entryPath + "/Filter/S3Key");
+        requiredNode(s3Key, "Rules", entryPath + "/Filter/S3Key");
+        JsonNode rules = declaredArray(s3Key, "Rules", entryPath + "/Filter/S3Key");
+        List<FilterRule> filterRules = new ArrayList<>();
+        for (int index = 0; index < rules.size(); index++) {
+            String rulePath = entryPath + "/Filter/S3Key/Rules/" + index;
+            JsonNode rule = requireObject(rules.get(index), rulePath);
+            filterRules.add(new FilterRule(required(rule, "Name", rulePath), required(rule, "Value", rulePath)));
+        }
+        return filterRules;
+    }
+
+    /**
+     * A string the registry schema marks required. Reads a configuration already resolved, so the
+     * value is not resolved a second time.
+     */
+    private static String required(JsonNode props, String name, String path) {
+        JsonNode value = requiredNode(props, name, path);
+        if (value.isContainerNode()) {
+            throw typeMismatch(path + "/" + name, "String", value);
+        }
+        return value.asText();
+    }
+
+    /** A key the registry schema marks required, with its JSON pointer in the message. */
+    private static JsonNode requiredNode(JsonNode props, String name, String path) {
+        JsonNode value = declared(props, name);
+        if (value == null) {
+            throw new AwsException("InvalidRequest",
+                    "Model validation failed (" + path + ": required key [" + name + "] not found)", 400);
+        }
+        return value;
+    }
+
+    /**
+     * The named list, or null when it is not declared. Anything other than a list fails, as the
+     * schema's array type does, rather than being read as an empty one: an empty rule list matches
+     * every key.
+     */
+    private static JsonNode declaredArray(JsonNode props, String name, String path) {
+        JsonNode value = declared(props, name);
+        if (value != null && !value.isArray()) {
+            throw typeMismatch(path + "/" + name, "JSONArray", value);
+        }
+        return value;
+    }
+
+    /** The value itself when it is an object. Anything else fails, rather than reading as an empty one. */
+    private static JsonNode requireObject(JsonNode value, String pointer) {
+        if (!value.isObject()) {
+            throw typeMismatch(pointer, "JSONObject", value);
+        }
+        return value;
+    }
+
+    private static AwsException typeMismatch(String pointer, String expected, JsonNode value) {
+        return new AwsException("InvalidRequest", "Model validation failed (" + pointer
+                + ": expected type: " + expected + ", found: " + schemaTypeName(value) + ")", 400);
+    }
+
+    private static String schemaTypeName(JsonNode value) {
+        return switch (value.getNodeType()) {
+            case OBJECT -> "JSONObject";
+            case ARRAY -> "JSONArray";
+            case BOOLEAN -> "Boolean";
+            case NUMBER -> value.isIntegralNumber() ? "Integer" : "Double";
+            default -> "String";
+        };
     }
 
     /** CloudFormation's lifecycle rule property names, spelled as the S3 API's XML. */

@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.eventbridge;
 
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
@@ -37,6 +38,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Instant;
@@ -54,6 +56,7 @@ import java.util.regex.Pattern;
 public class EventBridgeService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(EventBridgeService.class);
+    private static final List<String> REQUIRED_ENTRY_FIELDS = List.of("Source", "DetailType", "Detail");
 
     private final StorageBackend<String, EventBus> busStore;
     private final StorageBackend<String, Rule> ruleStore;
@@ -787,6 +790,33 @@ public class EventBridgeService implements ResourceProvider {
             // delivered envelope would correctly carry the call's region/account, giving an
             // inconsistent observable.
             Map<String, Object> entry = new HashMap<>(originalEntry);
+
+            String missingRequiredField = null;
+            for(String field : REQUIRED_ENTRY_FIELDS) {
+                if(entry.get(field) == null) {
+                    missingRequiredField = field;
+                    break;
+                }
+            }
+
+            if(missingRequiredField != null) {
+                Map<String, String> errorEntry = new HashMap<>();
+                errorEntry.put("ErrorCode", "InvalidArgument");
+                errorEntry.put("ErrorMessage",
+                        "Parameter " + missingRequiredField +  " is not valid. Reason: " + missingRequiredField + " is a required argument.");
+                resultEntries.add(errorEntry);
+                failed++;
+                continue;
+            }
+            if (!isValidDetailJson(entry)) {
+                Map<String, String> errorEntry = new HashMap<>();
+                errorEntry.put("ErrorCode", "MalformedDetail");
+                errorEntry.put("ErrorMessage", "The JSON provided is not valid.");
+                resultEntries.add(errorEntry);
+                failed++;
+
+                continue;
+            }
             if (isBlank(entry.get("Region"))) {
                 entry.put("Region", isBlank(region) ? regionResolver.getDefaultRegion() : region);
             }
@@ -840,6 +870,24 @@ public class EventBridgeService implements ResourceProvider {
         }
 
         return new PutEventsResult(failed, resultEntries);
+    }
+
+    private boolean isValidDetailJson(Map<String, Object> detail) {
+        Object raw = detail.get("Detail");
+        if (!(raw instanceof String jsonString) || jsonString.trim().isEmpty()) {
+            return false;
+        }
+
+        try (JsonParser parser = objectMapper.getFactory().createParser(jsonString)) {
+            JsonNode node = objectMapper.readTree(parser);
+            if (node == null || !node.isObject()) {
+                return false; // empty input or "123" or "[1,2]"
+            }
+            // check if there is more
+            return parser.nextToken() == null;
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     // ──────────────────────────── Pattern Matching ────────────────────────────

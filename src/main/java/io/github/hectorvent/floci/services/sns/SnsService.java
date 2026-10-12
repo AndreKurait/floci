@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
@@ -45,8 +46,6 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
@@ -729,7 +728,7 @@ public class SnsService implements Resettable, ResourceProvider {
                         "MessageGroupId is required for FIFO topics.", 400);
             }
             if (dedupId == null && "true".equals(topic.getAttributes().get("ContentBasedDeduplication"))) {
-                dedupId = sha256(message);
+                dedupId = Digests.sha256Hex(message);
             }
             if (dedupId != null && isDuplicate(effectiveArn, messageGroupId, dedupId,
                     isGroupScopedDeduplication(topic))) {
@@ -1196,7 +1195,7 @@ public class SnsService implements Resettable, ResourceProvider {
             }
             // Derive deduplication ID if ContentBasedDeduplication is enabled and not provided
             if (isFifo && messageDeduplicationId == null && "true".equals(topic.getAttributes().get("ContentBasedDeduplication"))) {
-                messageDeduplicationId = sha256(message);
+                messageDeduplicationId = Digests.sha256Hex(message);
             }
             if (isFifo && messageDeduplicationId != null && isDuplicate(topicArn, messageGroupId,
                     messageDeduplicationId, groupScopedDedup)) {
@@ -1999,7 +1998,7 @@ public class SnsService implements Resettable, ResourceProvider {
                     }
                     // Each failed subscription is a distinct DLQ delivery, even when
                     // several subscriptions share this queue for the same publish.
-                    deadLetterDeduplicationId = sha256(messageId + "\0" + sub.getSubscriptionArn());
+                    deadLetterDeduplicationId = Digests.sha256Hex(messageId + "\0" + sub.getSubscriptionArn());
                 }
                 sqsService.sendMessage(sqsArnToUrl(deadLetterTargetArn), body, null,
                         deadLetterGroupId, deadLetterDeduplicationId, sqsAttributes, null,
@@ -2338,16 +2337,6 @@ public class SnsService implements Resettable, ResourceProvider {
             }
         }
         return total;
-    }
-
-    private static String sha256(String message) {
-        try {
-        	MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] hash = md.digest(message.getBytes(StandardCharsets.UTF_8));
-            return HEX.formatHex(hash);
-        } catch (NoSuchAlgorithmException e) {
-            return UUID.randomUUID().toString();
-        }
     }
 
     private String smsAttributesKey(String region) {

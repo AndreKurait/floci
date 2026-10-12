@@ -166,6 +166,16 @@ class HttpApiLambdaProxyEventMultiValueIntegrationTest {
     }
 
     @Test
+    @Order(15)
+    void stageVariablesReachTheLambdaEvent() {
+        given()
+                .when().get("/execute-api/" + apiId + "/test/echo")
+                .then()
+                .statusCode(200)
+                .body("stageVariables.environment", equalTo("review"));
+    }
+
+    @Test
     @Order(999)
     void cleanup() throws Exception {
         if (apiId != null) {

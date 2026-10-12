@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.signin;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
@@ -13,12 +15,10 @@ import jakarta.inject.Inject;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Base64;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
@@ -291,20 +291,13 @@ public class SigninService {
     }
 
     private String encodeJson(Map<String, ?> value) throws JsonProcessingException {
-        return Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(objectMapper.writeValueAsBytes(value));
+        return Base64Url.encode(objectMapper.writeValueAsBytes(value));
     }
 
     private static boolean matchesPkce(String challenge, String verifier) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(verifier.getBytes(StandardCharsets.US_ASCII));
-            String calculated = Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
-            return MessageDigest.isEqual(calculated.getBytes(StandardCharsets.US_ASCII),
-                    challenge.getBytes(StandardCharsets.US_ASCII));
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is required by the AWS Sign-In protocol", e);
-        }
+        String calculated = Base64Url.encode(Digests.sha256(verifier.getBytes(StandardCharsets.US_ASCII)));
+        return MessageDigest.isEqual(calculated.getBytes(StandardCharsets.US_ASCII),
+                challenge.getBytes(StandardCharsets.US_ASCII));
     }
 
     private static void validateClient(String clientId) {
@@ -481,7 +474,7 @@ public class SigninService {
     private String randomToken(int bytes) {
         byte[] value = new byte[bytes];
         random.nextBytes(value);
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(value);
+        return Base64Url.encode(value);
     }
 
     private String randomAlphaNumeric(int length) {

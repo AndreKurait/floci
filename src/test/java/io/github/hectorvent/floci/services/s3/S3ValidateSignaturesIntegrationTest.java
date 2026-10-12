@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.s3;
 
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.testing.MutableClock;
 import io.github.hectorvent.floci.testing.ValidateSignaturesProfile;
@@ -20,7 +22,6 @@ import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -424,12 +425,11 @@ class S3ValidateSignaturesIntegrationTest {
 
     /** Runs the AWS Sign-In authorization-code flow through its consent page and returns the token response. */
     private static Response signIn() throws Exception {
-        byte[] digest = MessageDigest.getInstance("SHA-256")
-                .digest(SIGNIN_VERIFIER.getBytes(StandardCharsets.US_ASCII));
+        byte[] digest = Digests.sha256(SIGNIN_VERIFIER.getBytes(StandardCharsets.US_ASCII));
         String consent = given()
             .redirects().follow(false)
             .queryParam("client_id", SIGNIN_CLIENT_ID)
-            .queryParam("code_challenge", Base64.getUrlEncoder().withoutPadding().encodeToString(digest))
+            .queryParam("code_challenge", Base64Url.encode(digest))
             .queryParam("code_challenge_method", "SHA-256")
             .queryParam("redirect_uri", SIGNIN_REDIRECT_URI)
             .queryParam("response_type", "code")

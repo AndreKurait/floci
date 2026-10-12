@@ -248,6 +248,40 @@ class ContainerLauncherTest {
                 .orElse(null);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"$LATEST", "1", "7"})
+    void launchExposesTheExecutingVersion(String version) {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("version-fn");
+        fn.setHotReloadHostPath("/home/ci/code");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setVersion(version);
+
+        launcher.launch(fn);
+
+        assertEquals(List.of("AWS_LAMBDA_FUNCTION_VERSION=" + version),
+                captureRealContainerSpec().env().stream()
+                        .filter(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION=")).toList());
+    }
+
+    @Test
+    void launchPreventsAnEnvironmentOverrideOfTheExecutingVersion() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("version-fn");
+        fn.setHotReloadHostPath("/home/ci/code");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setVersion("7");
+        fn.setEnvironment(Map.of("AWS_LAMBDA_FUNCTION_VERSION", "user-override"));
+
+        launcher.launch(fn);
+
+        assertEquals(List.of("AWS_LAMBDA_FUNCTION_VERSION=7"),
+                captureRealContainerSpec().env().stream()
+                        .filter(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION=")).toList());
+    }
+
     @Test
     void launchFunction_hotReloadMountsTheHostDirectoryReadOnlyAtVarTask() {
         LambdaFunction fn = new LambdaFunction();

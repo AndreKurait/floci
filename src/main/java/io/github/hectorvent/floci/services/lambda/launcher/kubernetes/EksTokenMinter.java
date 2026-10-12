@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.lambda.launcher.kubernetes;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.Digests;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -10,12 +12,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
-import java.security.MessageDigest;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -294,13 +294,12 @@ final class EksTokenMinter {
                 + canonicalHeaders + "\n" + signedHeaders + "\n" + EMPTY_BODY_SHA256;
 
         String stringToSign = "AWS4-HMAC-SHA256\n" + amzDate + "\n" + credentialScope + "\n"
-                + sha256Hex(canonicalRequest);
+                + Digests.sha256Hex(canonicalRequest);
         byte[] signingKey = deriveSigningKey(credentials.secretAccessKey(), dateStamp, region, "sts");
         String signature = hexEncode(hmacSha256(signingKey, stringToSign));
 
         String url = "https://" + host + "/?" + canonicalQueryString + "&X-Amz-Signature=" + signature;
-        return TOKEN_PREFIX + Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(url.getBytes(StandardCharsets.UTF_8));
+        return TOKEN_PREFIX + Base64Url.encode(url);
     }
 
     record AwsCredentials(String accessKeyId, String secretAccessKey, String sessionToken) {
@@ -458,15 +457,6 @@ final class EksTokenMinter {
             return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException("Could not compute HMAC-SHA256: " + e.getMessage(), e);
-        }
-    }
-
-    private static String sha256Hex(String input) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return hexEncode(digest.digest(input.getBytes(StandardCharsets.UTF_8)));
-        } catch (GeneralSecurityException e) {
-            throw new IllegalStateException("Could not compute SHA-256: " + e.getMessage(), e);
         }
     }
 

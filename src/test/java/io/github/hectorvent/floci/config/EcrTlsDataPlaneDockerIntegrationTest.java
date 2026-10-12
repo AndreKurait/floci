@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.config;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator.GeneratedCertificate;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import io.quarkus.test.junit.QuarkusTest;
@@ -25,8 +26,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -90,7 +89,7 @@ class EcrTlsDataPlaneDockerIntegrationTest {
 
             // 2. Upload layer blob over TLS
             byte[] layerBytes = "floci-ecr-tls-layer-content-v1".getBytes(StandardCharsets.UTF_8);
-            String layerDigest = "sha256:" + sha256Hex(layerBytes);
+            String layerDigest = "sha256:" + Digests.sha256Hex(layerBytes);
 
             SimpleResponse startLayerUpload = execute(tlsClient, HttpMethod.POST, sslPort, tlsHost,
                     "/v2/tls-repo/blobs/uploads/", null, null, null);
@@ -106,7 +105,7 @@ class EcrTlsDataPlaneDockerIntegrationTest {
 
             // 3. Upload config blob over TLS
             byte[] configBytes = "{\"architecture\":\"amd64\",\"os\":\"linux\"}".getBytes(StandardCharsets.UTF_8);
-            String configDigest = "sha256:" + sha256Hex(configBytes);
+            String configDigest = "sha256:" + Digests.sha256Hex(configBytes);
 
             SimpleResponse startConfigUpload = execute(tlsClient, HttpMethod.POST, sslPort, tlsHost,
                     "/v2/tls-repo/blobs/uploads/", null, null, null);
@@ -217,24 +216,6 @@ class EcrTlsDataPlaneDockerIntegrationTest {
                 .compose(response -> response.body().map(responseBody ->
                         new SimpleResponse(response.statusCode(), response.headers(), responseBody)))
                 .toCompletionStage().toCompletableFuture().get(15, TimeUnit.SECONDS);
-    }
-
-    private static String sha256Hex(byte[] data) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(data);
-            StringBuilder hexString = new StringBuilder();
-            for (byte b : hash) {
-                String hex = Integer.toHexString(0xff & b);
-                if (hex.length() == 1) {
-                    hexString.append('0');
-                }
-                hexString.append(hex);
-            }
-            return hexString.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException(e);
-        }
     }
 
     private record SimpleResponse(int statusCode, MultiMap headers, Buffer body) {

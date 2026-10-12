@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.codeartifact;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
@@ -61,7 +62,7 @@ class CodeArtifactAssetPersistenceTest {
 
         byte[] content = "hello world, this is the asset payload".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         String json = Files.readString(dir.resolve("codeartifact-package-versions.json"));
         String base64Content = Base64.getEncoder().encodeToString(content);
@@ -76,7 +77,7 @@ class CodeArtifactAssetPersistenceTest {
         first.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         PublishPackageVersionResult published = first.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "false", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "false", content);
 
         CodeArtifactService restarted = newService(dir);
         PackageVersionAssetResult result = restarted.getPackageVersionAsset(REGION, "dom", null, "repo", "generic",
@@ -122,11 +123,11 @@ class CodeArtifactAssetPersistenceTest {
         first.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         first.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         CodeArtifactService restarted = newService(dir);
         PublishPackageVersionResult result = restarted.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "true", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "true", content);
 
         assertEquals("Unfinished", result.packageVersion().getStatus());
         assertEquals(1, result.packageVersion().getAssets().size());
@@ -139,12 +140,12 @@ class CodeArtifactAssetPersistenceTest {
         first.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         first.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         CodeArtifactService restarted = newService(dir);
         byte[] different = "different bytes".getBytes(StandardCharsets.UTF_8);
         AwsException e = assertThrows(AwsException.class, () -> restarted.publishPackageVersion(REGION, "dom", null,
-                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", sha256Hex(different), "true", different));
+                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(different), "true", different));
         assertEquals("ConflictException", e.getErrorCode());
         assertEquals("a.txt", e.getExtendedData().get("resourceId"));
     }
@@ -163,7 +164,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         Path assetRoot = dir.resolve("codeartifact-assets");
         try (Stream<Path> paths = Files.walk(assetRoot)) {
@@ -173,7 +174,7 @@ class CodeArtifactAssetPersistenceTest {
         }
 
         PublishPackageVersionResult result = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "true", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "true", content);
 
         assertEquals("Unfinished", result.packageVersion().getStatus());
         PackageVersionAssetResult fetched = service.getPackageVersionAsset(REGION, "dom", null, "repo", "generic",
@@ -194,7 +195,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         Path assetRoot = dir.resolve("codeartifact-assets");
         try (Stream<Path> paths = Files.walk(assetRoot)) {
@@ -204,7 +205,7 @@ class CodeArtifactAssetPersistenceTest {
         }
 
         PublishPackageVersionResult result = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "false", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "false", content);
 
         assertEquals("Published", result.packageVersion().getStatus());
         PackageVersionAssetResult fetched = service.getPackageVersionAsset(REGION, "dom", null, "repo", "generic",
@@ -226,7 +227,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         Path assetRoot = dir.resolve("codeartifact-assets");
         try (Stream<Path> paths = Files.walk(assetRoot)) {
@@ -236,7 +237,7 @@ class CodeArtifactAssetPersistenceTest {
         }
 
         PublishPackageVersionResult result = service.publishPackageVersion(REGION, "dom", null, "repo", "generic",
-                null, "my-pkg", "1.0.0", "a.txt", sha256Hex(content), "true", content);
+                null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(content), "true", content);
 
         assertEquals("Unfinished", result.packageVersion().getStatus());
         PackageVersionAssetResult fetched = service.getPackageVersionAsset(REGION, "dom", null, "repo", "generic",
@@ -263,7 +264,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         Path assetFile;
         try (Stream<Path> paths = Files.walk(dir.resolve("codeartifact-assets"))) {
@@ -277,7 +278,7 @@ class CodeArtifactAssetPersistenceTest {
         try {
             List<LogRecord> records = LogCapture.capture(CodeArtifactService.class, () ->
                     service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0",
-                            "a.txt", sha256Hex(content), "true", content));
+                            "a.txt", Digests.sha256Hex(content), "true", content));
 
             assertTrue(records.stream().anyMatch(r -> r.getMessage() != null
                             && r.getMessage().contains("Could not verify")
@@ -314,7 +315,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
         Path assetFile;
         try (Stream<Path> paths = Files.walk(dir.resolve("codeartifact-assets"))) {
             assetFile = paths.filter(Files::isRegularFile).findFirst().orElseThrow();
@@ -323,7 +324,7 @@ class CodeArtifactAssetPersistenceTest {
         assertNotNull(fileKeyBefore, "test filesystem must support file keys for this identity check to be meaningful");
 
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         Object fileKeyAfter = Files.readAttributes(assetFile, BasicFileAttributes.class).fileKey();
         assertEquals(fileKeyBefore, fileKeyAfter, "an intact retry must not replace the backing file");
@@ -336,7 +337,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
         Path assetFile;
         try (Stream<Path> paths = Files.walk(dir.resolve("codeartifact-assets"))) {
             assetFile = paths.filter(Files::isRegularFile).findFirst().orElseThrow();
@@ -345,7 +346,7 @@ class CodeArtifactAssetPersistenceTest {
         assertNotNull(fileKeyBefore, "test filesystem must support file keys for this identity check to be meaningful");
 
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "false", content);
+                Digests.sha256Hex(content), "false", content);
 
         Object fileKeyAfter = Files.readAttributes(assetFile, BasicFileAttributes.class).fileKey();
         assertEquals(fileKeyBefore, fileKeyAfter, "an intact retry must not replace the backing file");
@@ -365,7 +366,7 @@ class CodeArtifactAssetPersistenceTest {
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
         byte[] content = "hello world".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", null, "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(content), "true", content);
+                Digests.sha256Hex(content), "true", content);
 
         Path assetRoot = dir.resolve("codeartifact-assets");
         try (Stream<Path> paths = Files.walk(assetRoot)) {
@@ -376,7 +377,7 @@ class CodeArtifactAssetPersistenceTest {
 
         byte[] different = "different content".getBytes(StandardCharsets.UTF_8);
         AwsException e = assertThrows(AwsException.class, () -> service.publishPackageVersion(REGION, "dom", null,
-                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", sha256Hex(different), "true", different));
+                "repo", "generic", null, "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex(different), "true", different));
         assertEquals("ConflictException", e.getErrorCode());
         assertEquals("a.txt", e.getExtendedData().get("resourceId"));
     }
@@ -400,9 +401,9 @@ class CodeArtifactAssetPersistenceTest {
         byte[] contentA = "content of a".getBytes(StandardCharsets.UTF_8);
         byte[] contentB = "content of b".getBytes(StandardCharsets.UTF_8);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
-                sha256Hex(contentA), "true", contentA);
+                Digests.sha256Hex(contentA), "true", contentA);
         service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "my-pkg", "1.0.0", "b.txt",
-                sha256Hex(contentB), "true", contentB);
+                Digests.sha256Hex(contentB), "true", contentB);
 
         Path assetFileA;
         Path assetFileB;
@@ -448,7 +449,7 @@ class CodeArtifactAssetPersistenceTest {
         for (String name : names) {
             byte[] content = ("content of " + name).getBytes(StandardCharsets.UTF_8);
             service.publishPackageVersion(REGION, "dom", null, "repo", "generic", longToken, longToken, longToken,
-                    name, sha256Hex(content), "true", content);
+                    name, Digests.sha256Hex(content), "true", content);
         }
 
         CodeArtifactService restarted = newService(dir);
@@ -487,13 +488,5 @@ class CodeArtifactAssetPersistenceTest {
         PersistentStorage<String, V> backend = new PersistentStorage<>(dir.resolve(fileName), type);
         backend.load();
         return new AccountAwareStorageBackend<>(backend, null, ACCOUNT_ID);
-    }
-
-    private static String sha256Hex(byte[] content) {
-        try {
-            return io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator.sha256Hex(content);
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
-        }
     }
 }

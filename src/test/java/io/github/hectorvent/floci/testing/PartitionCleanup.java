@@ -38,7 +38,7 @@ public final class PartitionCleanup implements AfterEachCallback {
             Runnable action = actions.pop();
             try {
                 action.run();
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | AssertionError e) {
                 System.err.println("PartitionCleanup: cleanup step failed after "
                         + context.getDisplayName() + ": " + e);
             }

@@ -4,8 +4,10 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.CertificateMaterialException;
+import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pem;
+import io.github.hectorvent.floci.core.common.PublicKeys;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmService;
@@ -16,14 +18,12 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.security.AlgorithmParameters;
 import java.security.GeneralSecurityException;
 import java.security.PublicKey;
 import java.security.cert.CertificateParsingException;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.ECPublicKey;
 import java.security.interfaces.RSAPublicKey;
-import java.security.spec.ECGenParameterSpec;
 import java.security.spec.ECParameterSpec;
 import java.time.Clock;
 import java.time.Instant;
@@ -269,9 +269,7 @@ public class SesIdentityCertificateService {
 
     private static ECParameterSpec namedCurve(String name) {
         try {
-            AlgorithmParameters parameters = AlgorithmParameters.getInstance("EC");
-            parameters.init(new ECGenParameterSpec(name));
-            return parameters.getParameterSpec(ECParameterSpec.class);
+            return PublicKeys.namedCurve(name);
         } catch (GeneralSecurityException e) {
             LOG.warnv(e, "EC curve {0} is unavailable, so no key on it counts as a signing key", name);
             return null;
@@ -322,7 +320,7 @@ public class SesIdentityCertificateService {
         if (domain) {
             String addressDomain = fromAddress.substring(at + 1).toLowerCase(Locale.ROOT);
             String identityDomain = emailIdentity.toLowerCase(Locale.ROOT);
-            if (!addressDomain.equals(identityDomain) && !addressDomain.endsWith("." + identityDomain)) {
+            if (!DomainNames.isWithin(addressDomain, identityDomain)) {
                 throw badRequest("FromAddress <" + fromAddress + "> does not belong to the domain identity <"
                         + emailIdentity + ">.");
             }

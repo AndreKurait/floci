@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -51,8 +52,6 @@ import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.X509Certificate;
 import java.time.Clock;
@@ -62,7 +61,6 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -403,8 +401,8 @@ public class IotService {
     }
 
     /** AWS IoT's certificateId is the lowercase hex SHA-256 of the certificate's DER encoding. */
-    private static String certificateIdOf(X509Certificate x509) throws CertificateEncodingException, NoSuchAlgorithmException {
-        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(x509.getEncoded()));
+    private static String certificateIdOf(X509Certificate x509) throws CertificateEncodingException {
+        return Digests.sha256Hex(x509.getEncoded());
     }
 
     public IotCertificate describeCertificate(String certificateId, String region) {
@@ -457,7 +455,7 @@ public class IotService {
         String certificateId;
         try {
             certificateId = certificateIdOf(presented);
-        } catch (CertificateEncodingException | NoSuchAlgorithmException e) {
+        } catch (CertificateEncodingException e) {
             LOG.debugv("Could not fingerprint the presented device certificate: {0}", e.getMessage());
             return Optional.empty();
         }

@@ -65,7 +65,7 @@ class BuildV2ProxyEventMultiValueTest {
                     "abc123", "us-east-1", "$default", headers, uriInfo, null, "req-1");
             case AUTHORIZER -> controller.buildRequestAuthorizerEventV2(
                     "GET", "/echo", "GET /echo",
-                    "abc123", "$default", "us-east-1", headers, uriInfo);
+                    "abc123", "$default", "us-east-1", headers, uriInfo, null);
         };
         return new ObjectMapper().readTree(json);
     }

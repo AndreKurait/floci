@@ -55,7 +55,7 @@ type.
 | CreateRole | Creates an IAM role with an assume-role policy. |
 | GetRole | Returns a stored IAM role. |
 | DeleteRole | Deletes an IAM role from the local IAM store. |
-| ListRoles | Lists IAM roles in the local account. |
+| ListRoles | Lists IAM roles in the local account, with `Marker` and `MaxItems` paging. |
 | UpdateRole | Updates mutable IAM role fields. |
 | CreateServiceLinkedRole | Creates a role under /aws-service-role/ for a service principal. |
 | DeleteServiceLinkedRole | Deletes a service-linked role and returns a deletion task id. |
@@ -74,7 +74,7 @@ type.
 | CreatePolicy | Creates a customer-managed IAM policy. |
 | GetPolicy | Returns metadata for a managed IAM policy. |
 | DeletePolicy | Deletes a managed IAM policy. |
-| ListPolicies | Lists managed IAM policies, including seeded AWS managed policies. |
+| ListPolicies | Lists managed IAM policies, including seeded AWS managed policies, with `Marker` and `MaxItems` paging. |
 | ListEntitiesForPolicy | Lists roles, users, and groups with a direct managed-policy attachment. |
 | CreatePolicyVersion | Creates a new version of a managed policy. |
 | GetPolicyVersion | Returns a managed policy version document. |
@@ -88,6 +88,11 @@ type.
 `ListEntitiesForPolicy` currently returns direct permissions-policy attachments. `EntityFilter`,
 `PathPrefix`, `PolicyUsageFilter`, and pagination are not yet applied; responses return
 `IsTruncated=false`.
+
+`ListRoles` and `ListPolicies` return 100 items when `MaxItems` is omitted and reject a value
+outside 1 to 1000. `PathPrefix` and `Scope` filter before paging, and roles and customer managed
+policies are listed in name order so a `Marker` resumes where the previous page stopped.
+`ListPolicies` does not yet apply `OnlyAttached` or `PolicyUsageFilter`.
 
 ### Permission Boundaries
 

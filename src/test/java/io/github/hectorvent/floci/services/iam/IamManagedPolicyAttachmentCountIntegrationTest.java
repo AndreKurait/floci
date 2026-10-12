@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.path.xml.XmlPath;
 import io.restassured.response.Response;
 import org.junit.jupiter.api.Test;
 
@@ -81,10 +82,24 @@ class IamManagedPolicyAttachmentCountIntegrationTest {
         iam(accountId, "GetPolicy", Map.of("PolicyArn", POLICY_ARN)).then().statusCode(200)
                 .body("GetPolicyResponse.GetPolicyResult.Policy.AttachmentCount",
                         equalTo(Integer.toString(expectedCount)));
-        iam(accountId, "ListPolicies", Map.of("Scope", "AWS")).then().statusCode(200)
-                .body("ListPoliciesResponse.ListPoliciesResult.Policies.member.find { it.Arn == '"
-                                + POLICY_ARN + "' }.AttachmentCount",
-                        equalTo(Integer.toString(expectedCount)));
+        assertEquals(Integer.toString(expectedCount), listedAttachmentCount(accountId));
+    }
+
+    /** ListPolicies pages the AWS managed catalog, so this follows the Marker to the policy. */
+    private String listedAttachmentCount(String accountId) {
+        String result = "ListPoliciesResponse.ListPoliciesResult.";
+        Map<String, String> parameters = Map.of("Scope", "AWS", "MaxItems", "1000");
+        while (true) {
+            XmlPath page = iam(accountId, "ListPolicies", parameters).then().statusCode(200)
+                    .extract().xmlPath();
+            String count = page.getString(result + "Policies.member.find { it.Arn == '"
+                    + POLICY_ARN + "' }.AttachmentCount");
+            if (!count.isEmpty()) {
+                return count;
+            }
+            assertEquals("true", page.getString(result + "IsTruncated"), POLICY_ARN + " was never listed");
+            parameters = Map.of("Scope", "AWS", "MaxItems", "1000", "Marker", page.getString(result + "Marker"));
+        }
     }
 
     private void changeAttachment(String accountId, String action, String entityType, String name) {

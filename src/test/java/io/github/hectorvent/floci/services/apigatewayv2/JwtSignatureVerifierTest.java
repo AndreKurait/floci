@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.apigatewayv2;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpServer;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import org.apache.hc.client5.http.DnsResolver;
 import org.apache.hc.client5.http.SystemDefaultDnsResolver;
 import org.junit.jupiter.api.AfterEach;
@@ -20,7 +21,6 @@ import java.security.KeyPairGenerator;
 import java.security.Signature;
 import java.security.interfaces.RSAPrivateKey;
 import java.security.interfaces.RSAPublicKey;
-import java.util.Base64;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
@@ -310,13 +310,13 @@ class JwtSignatureVerifierTest {
         Signature signature = Signature.getInstance("SHA256withRSA");
         signature.initSign(signingKey);
         signature.update(signingInput.getBytes(StandardCharsets.UTF_8));
-        String encodedSignature = Base64.getUrlEncoder().withoutPadding().encodeToString(signature.sign());
+        String encodedSignature = Base64Url.encode(signature.sign());
 
         return signingInput + "." + encodedSignature;
     }
 
     private static String base64Url(String s) {
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(s.getBytes(StandardCharsets.UTF_8));
+        return Base64Url.encode(s);
     }
 
     private static String base64UrlUnsigned(BigInteger value) {
@@ -324,6 +324,6 @@ class JwtSignatureVerifierTest {
         if (bytes.length > 1 && bytes[0] == 0) {
             bytes = java.util.Arrays.copyOfRange(bytes, 1, bytes.length);
         }
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        return Base64Url.encode(bytes);
     }
 }

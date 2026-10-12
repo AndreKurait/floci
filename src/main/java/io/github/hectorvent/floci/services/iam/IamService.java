@@ -1321,6 +1321,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         String prefix = pathPrefix != null ? pathPrefix : "/";
         return roles.scan(k -> true).stream()
                 .filter(r -> r.getPath().startsWith(prefix))
+                .sorted(Comparator.comparing(IamRole::getRoleName))
                 .toList();
     }
 
@@ -1563,6 +1564,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             policies.scan(k -> true).stream()
                     .filter(p -> !AwsManagedPolicies.isManagedPolicyArn(p.getArn()))
                     .filter(p -> p.getPath().startsWith(prefix))
+                    .sorted(Comparator.comparing(IamPolicy::getPolicyName))
                     .forEach(result::add);
         }
         if (includeAws) {

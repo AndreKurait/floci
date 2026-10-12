@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.core.common.auth;
 
+import io.github.hectorvent.floci.core.common.Digests;
+
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -42,7 +44,7 @@ public final class SigV4Canonicalization {
             String stringToSign = ALGORITHM + "\n"
                     + amzDate + "\n"
                     + scope.credentialScope() + "\n"
-                    + SigV4RequestValidator.sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
+                    + Digests.sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
             String expected = SigV4RequestValidator.hexEncode(
                     SigV4RequestValidator.hmacSha256(signingKey, stringToSign));
             if (MessageDigest.isEqual(expected.getBytes(StandardCharsets.UTF_8),
@@ -147,7 +149,7 @@ public final class SigV4Canonicalization {
         if (presigned) {
             return "UNSIGNED-PAYLOAD";
         }
-        return SigV4RequestValidator.sha256Hex(body == null ? new byte[0] : body);
+        return Digests.sha256Hex(body == null ? new byte[0] : body);
     }
 
     /** RFC 3986 percent-encoding as SigV4 defines it: {@code /} is escaped, {@code -._~} are not. */

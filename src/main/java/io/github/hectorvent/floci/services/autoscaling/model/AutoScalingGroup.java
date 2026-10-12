@@ -50,6 +50,13 @@ public class AutoScalingGroup {
     private Boolean capacityRebalance;
     private Integer maxInstanceLifetime;
     private Integer defaultInstanceWarmup;
+    private String serviceLinkedRoleArn;
+    private InstanceMaintenancePolicy instanceMaintenancePolicy;
+    private AvailabilityZoneDistribution availabilityZoneDistribution;
+    private CapacityReservationSpecification capacityReservationSpecification;
+    // Set only by EnableMetricsCollection/DisableMetricsCollection. 1Minute is the only granularity
+    // the model allows, so the metric names are all that needs storing.
+    private List<String> enabledMetrics = new ArrayList<>();
 
     public AutoScalingGroup() {}
 
@@ -142,4 +149,19 @@ public class AutoScalingGroup {
 
     public Integer getDefaultInstanceWarmup() { return defaultInstanceWarmup; }
     public void setDefaultInstanceWarmup(Integer v) { this.defaultInstanceWarmup = v; }
+
+    public String getServiceLinkedRoleArn() { return serviceLinkedRoleArn; }
+    public void setServiceLinkedRoleArn(String v) { this.serviceLinkedRoleArn = v; }
+
+    public InstanceMaintenancePolicy getInstanceMaintenancePolicy() { return instanceMaintenancePolicy; }
+    public void setInstanceMaintenancePolicy(InstanceMaintenancePolicy v) { this.instanceMaintenancePolicy = v; }
+
+    public AvailabilityZoneDistribution getAvailabilityZoneDistribution() { return availabilityZoneDistribution; }
+    public void setAvailabilityZoneDistribution(AvailabilityZoneDistribution v) { this.availabilityZoneDistribution = v; }
+
+    public CapacityReservationSpecification getCapacityReservationSpecification() { return capacityReservationSpecification; }
+    public void setCapacityReservationSpecification(CapacityReservationSpecification v) { this.capacityReservationSpecification = v; }
+
+    public List<String> getEnabledMetrics() { return enabledMetrics; }
+    public void setEnabledMetrics(List<String> v) { this.enabledMetrics = v != null ? new ArrayList<>(v) : new ArrayList<>(); }
 }

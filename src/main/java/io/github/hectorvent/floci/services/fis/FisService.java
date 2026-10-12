@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.TagHandler;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -1300,7 +1301,7 @@ public class FisService implements TagHandler {
 
     private String encodeToken(String scope, String cursor) {
         String raw = scope + "\n" + cursor;
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
+        return Base64Url.encode(raw);
     }
 
     private String decodeToken(String token, String expectedScope) {
@@ -1712,8 +1713,7 @@ public class FisService implements TagHandler {
     }
 
     private String idempotencyKey(String region, String operation, String token) {
-        String encoded = Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(token.getBytes(StandardCharsets.UTF_8));
+        String encoded = Base64Url.encode(token);
         return key(region, "idempotency", operation + "::" + encoded);
     }
 

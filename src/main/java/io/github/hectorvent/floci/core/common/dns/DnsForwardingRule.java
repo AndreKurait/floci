@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.core.common.dns;
 
+import io.github.hectorvent.floci.core.common.DomainNames;
+
 import java.util.List;
 import java.util.Locale;
 
@@ -54,7 +56,7 @@ public record DnsForwardingRule(String domainName, List<Target> targets) {
             return true;
         }
         String query = normalize(queryName);
-        return query.equals(domainName) || query.endsWith("." + domainName);
+        return DomainNames.isWithin(query, domainName);
     }
 
     /**

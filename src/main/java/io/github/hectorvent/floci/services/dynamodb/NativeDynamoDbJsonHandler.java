@@ -918,6 +918,8 @@ public class NativeDynamoDbJsonHandler {
      *       {@code Exists: false} asks for plain absence.</li>
      *   <li>{@code Exists: false} forbids a {@code Value}: an attribute cannot be expected to
      *       hold a value while also being expected to be absent.</li>
+     *   <li>A comparison accepts either {@code Value} or {@code AttributeValueList}, but
+     *       never both, and must have the operator's required number of operands.</li>
      * </ul>
      * DynamoDB reports only the first offending entry, so validation stops at the first error.
      */
@@ -948,6 +950,37 @@ public class NativeDynamoDbJsonHandler {
                 throw legacyExpectedValidationError(
                         "Value cannot be used when Exists is false for Attribute: " + attrName);
             }
+            if (hasValue && condition.has("AttributeValueList")) {
+                throw legacyExpectedValidationError(
+                        "Value and AttributeValueList cannot be used together for Attribute: " + attrName);
+            }
+            if (hasComparisonOperator) {
+                validateLegacyComparisonOperands(attrName, condition);
+            }
+        }
+    }
+
+    private void validateLegacyComparisonOperands(String attrName, JsonNode condition) {
+        String operator = condition.get("ComparisonOperator").asText();
+        int required = switch (operator) {
+            case "NULL", "NOT_NULL" -> 0;
+            case "EQ", "NE", "LE", "LT", "GE", "GT", "CONTAINS", "NOT_CONTAINS", "BEGINS_WITH" -> 1;
+            case "BETWEEN" -> 2;
+            case "IN" -> -1;
+            default -> throw legacyExpectedValidationError("Invalid comparison operator");
+        };
+        boolean hasValue = condition.has("Value");
+        boolean hasList = condition.has("AttributeValueList");
+        if (required != 0 && !hasValue && !hasList) {
+            throw legacyExpectedValidationError(
+                    "Value or AttributeValueList must be used with ComparisonOperator: "
+                            + operator + " for Attribute: " + attrName);
+        }
+        // AWS accepts ComparisonOperator + Value as a single operand, including IN.
+        int count = hasValue ? 1 : hasList ? condition.get("AttributeValueList").size() : 0;
+        if (required == -1 ? count == 0 : count != required) {
+            throw legacyExpectedValidationError(
+                    "Invalid number of argument(s) for the " + operator + " ComparisonOperator");
         }
     }
 
@@ -1123,7 +1156,6 @@ public class NativeDynamoDbJsonHandler {
 
         boolean hasAttributesToGet = attributesToGet != null && attributesToGet.size() > 0;
         if ("SPECIFIC_ATTRIBUTES".equals(select) && projectionExpression == null && !hasAttributesToGet) {
-            // Query prefixes the count here, Scan does not.
             throw new AwsException("ValidationException",
                     "1 validation error detected: " + SELECT_NEEDS_PROJECTION, 400);
         }
@@ -1144,7 +1176,7 @@ public class NativeDynamoDbJsonHandler {
         checkUnusedEan(exprAttrNames, hashTokens);
         checkUnusedEav(exprAttrValues, extractColonTokens(keyConditionExpr, filterExpr));
         if (exclusiveStartKey != null) {
-            DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, queryTable, queryAccessPath, false);
+            DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, queryTable, queryAccessPath);
         }
 
         DynamoDbService.QueryResult result = dynamoDbService.query(tableName, keyConditions,
@@ -1228,33 +1260,24 @@ public class NativeDynamoDbJsonHandler {
                     + "Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}", 400);
         }
 
+        List<String> rangeErrors = new ArrayList<>();
         if (limit != null && limit < 1) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + limit + "' at 'limit' failed to satisfy constraint: "
-                    + "Member must have value greater than or equal to 1", 400);
-        }
-
-        var segmentErrors = new ArrayList<String>();
-        if (totalSegments != null) {
-            if (totalSegments < 1) {
-                segmentErrors.add("Value '" + totalSegments + "' at 'totalSegments' failed to satisfy constraint: "
-                        + "Member must have value greater than or equal to 1");
-            }
-            if (MAX_TOTAL_SEGMENTS < totalSegments) {
-                segmentErrors.add("Value '" + totalSegments + "' at 'totalSegments' failed to satisfy constraint: "
-                        + "Member must have value less than or equal to " + MAX_TOTAL_SEGMENTS);
-            }
+            rangeErrors.add("Value at 'Limit' failed to satisfy constraint: "
+                    + "Member must have value greater than or equal to 1");
         }
         if (segment != null && segment < 0) {
-            segmentErrors.add("Value '" + segment + "' at 'segment' failed to satisfy constraint: "
+            rangeErrors.add("Value at 'Segment' failed to satisfy constraint: "
                     + "Member must have value greater than or equal to 0");
         }
-        if (!segmentErrors.isEmpty()) {
-            var n = segmentErrors.size();
-            throw new AwsException("ValidationException",
-                    n + " validation error" + (n > 1 ? "s" : "") + " detected: "
-                    + String.join("; ", segmentErrors), 400);
+        if (totalSegments != null && totalSegments < 1) {
+            rangeErrors.add("Value at 'TotalSegments' failed to satisfy constraint: "
+                    + "Member must have value greater than or equal to 1");
         }
+        if (totalSegments != null && MAX_TOTAL_SEGMENTS < totalSegments) {
+            rangeErrors.add("Value at 'TotalSegments' failed to satisfy constraint: "
+                    + "Member must have value less than or equal to " + MAX_TOTAL_SEGMENTS);
+        }
+        throwValidationErrors(rangeErrors);
 
         if (segment != null && totalSegments == null) {
             throw new AwsException("ValidationException",
@@ -1266,8 +1289,7 @@ public class NativeDynamoDbJsonHandler {
         }
         if (segment != null && totalSegments != null && segment >= totalSegments) {
             throw new AwsException("ValidationException",
-                    "The Segment parameter is zero-based and must be less than parameter TotalSegments: "
-                    + "Segment: " + segment + " is not less than TotalSegments: " + totalSegments, 400);
+                    "The Segment parameter is zero-based and must be less than parameter TotalSegments", 400);
         }
 
         DynamoDbExpressionSize.checkReadWithSize(filterExpr, "FilterExpression");
@@ -1297,7 +1319,8 @@ public class NativeDynamoDbJsonHandler {
         boolean hasAttributesToGetScan = attributesToGetScan != null && attributesToGetScan.size() > 0;
         if ("SPECIFIC_ATTRIBUTES".equals(select)
                 && projectionExpressionScan == null && !hasAttributesToGetScan) {
-            throw new AwsException("ValidationException", SELECT_NEEDS_PROJECTION, 400);
+            throw new AwsException("ValidationException",
+                    "1 validation error detected: " + SELECT_NEEDS_PROJECTION, 400);
         }
 
         TableDefinition scanTable = dynamoDbService.requireTableForItemCall(tableName, region);
@@ -1307,7 +1330,7 @@ public class NativeDynamoDbJsonHandler {
         rejectConsistentReadOnGsi(request, scanAccessPath);
 
         if (exclusiveStartKey != null) {
-            DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, scanTable, scanAccessPath, true);
+            DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, scanTable, scanAccessPath);
         }
 
         DynamoDbService.ScanResult result = dynamoDbService.scan(

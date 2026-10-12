@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ecs.exec;
 
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.Resettable;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -11,7 +12,6 @@ import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -58,7 +58,7 @@ public class EcsExecSessionRegistry implements Resettable {
         byte[] token = new byte[32];
         RANDOM.nextBytes(token);
         ExecSession session = new ExecSession(sessionId,
-                Base64.getUrlEncoder().withoutPadding().encodeToString(token),
+                Base64Url.encode(token),
                 taskArn, clusterArn, containerName, containerArn, runtimeId, command, interactive,
                 clock.instant());
         sessions.put(sessionId, session);

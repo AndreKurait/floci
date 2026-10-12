@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.s3;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
@@ -233,7 +234,7 @@ public class S3HeaderSignatureFilter implements ContainerRequestFilter {
         String stringToSign = ALGORITHM + "\n"
                 + amzDate + "\n"
                 + scopeDate + "/" + region + "/" + SIGNING_SERVICE + "/" + TERMINATOR + "\n"
-                + SigV4RequestValidator.sha256Hex(canonicalRequest);
+                + Digests.sha256Hex(canonicalRequest);
         byte[] signingKey = SigV4RequestValidator.deriveSigningKey(secretKey, scopeDate, region, SIGNING_SERVICE);
         String expected = SigV4RequestValidator.hexEncode(SigV4RequestValidator.hmacSha256(signingKey, stringToSign));
         return MessageDigest.isEqual(
@@ -270,14 +271,10 @@ public class S3HeaderSignatureFilter implements ContainerRequestFilter {
     private static boolean bodyMatches(ContainerRequestContext ctx, String declaredHash) throws IOException {
         byte[] body = ctx.getEntityStream() != null ? ctx.getEntityStream().readAllBytes() : new byte[0];
         ctx.setEntityStream(new ByteArrayInputStream(body));
-        try {
-            String actual = SigV4RequestValidator.hexEncode(MessageDigest.getInstance("SHA-256").digest(body));
-            return MessageDigest.isEqual(
-                    actual.getBytes(StandardCharsets.UTF_8),
-                    declaredHash.toLowerCase().getBytes(StandardCharsets.UTF_8));
-        } catch (java.security.NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is required by SigV4", e);
-        }
+        String actual = SigV4RequestValidator.hexEncode(Digests.sha256(body));
+        return MessageDigest.isEqual(
+                actual.getBytes(StandardCharsets.UTF_8),
+                declaredHash.toLowerCase().getBytes(StandardCharsets.UTF_8));
     }
 
     /**

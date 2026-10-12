@@ -3,10 +3,15 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.autoscaling.AutoScalingService;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgOptionalFields;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
+import io.github.hectorvent.floci.services.autoscaling.model.AvailabilityZoneDistribution;
+import io.github.hectorvent.floci.services.autoscaling.model.CapacityReservationSpecification;
+import io.github.hectorvent.floci.services.autoscaling.model.InstanceMaintenancePolicy;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
+import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import org.junit.jupiter.api.Test;
@@ -169,6 +174,131 @@ class AutoScalingGroupCfnProvisionerTest {
     }
 
     @Test
+    void groupCreateCarriesTheOptionalStructuresAndMetricsCollection() {
+        when(autoScaling.createAutoScalingGroup(eq(REGION), eq("my-asg"), any(), any(), any(), any(),
+                any(), anyInt(), anyInt(), anyInt(), anyInt(), anyList(), anyList(), anyList(), anyList(),
+                any(), anyInt(), anyList(), anyMap(), anyMap(), any()))
+                .thenReturn(group("my-asg"));
+        StackResource r = resource(GROUP, "Asg", null);
+        ObjectNode props = mapper.createObjectNode()
+                .put("AutoScalingGroupName", "my-asg")
+                .put("MinSize", "1")
+                .put("MaxSize", "3")
+                .put("ServiceLinkedRoleARN", "role-arn");
+        props.putObject("InstanceMaintenancePolicy")
+                .put("MinHealthyPercentage", 90)
+                .put("MaxHealthyPercentage", 120);
+        props.putObject("AvailabilityZoneDistribution").put("CapacityDistributionStrategy", "balanced-only");
+        ObjectNode reservation = props.putObject("CapacityReservationSpecification")
+                .put("CapacityReservationPreference", "capacity-reservations-only");
+        reservation.putObject("CapacityReservationTarget").putArray("CapacityReservationIds").add("cr-1");
+        ObjectNode metrics = props.putArray("MetricsCollection").addObject().put("Granularity", "1Minute");
+        metrics.putArray("Metrics").add("GroupMinSize").add("GroupMaxSize");
+        ObjectNode launchTemplate = props.putObject("MixedInstancesPolicy").putObject("LaunchTemplate");
+        launchTemplate.putObject("LaunchTemplateSpecification").put("LaunchTemplateId", "lt-123");
+        launchTemplate.putArray("Overrides").addObject()
+                .put("InstanceType", "t3.micro")
+                .put("WeightedCapacity", "2");
+
+        provisioner.provision(r, props, ctx());
+
+        ArgumentCaptor<MixedInstancesPolicy> policyCaptor = ArgumentCaptor.forClass(MixedInstancesPolicy.class);
+        ArgumentCaptor<AsgOptionalFields> captor = ArgumentCaptor.forClass(AsgOptionalFields.class);
+        verify(autoScaling).createAutoScalingGroup(eq(REGION), eq("my-asg"), any(), any(), any(), any(),
+                policyCaptor.capture(), anyInt(), anyInt(), anyInt(), anyInt(), anyList(), anyList(), anyList(),
+                anyList(), any(), anyInt(), anyList(), anyMap(), anyMap(), captor.capture());
+        AsgOptionalFields optional = captor.getValue();
+        assertEquals("role-arn", optional.serviceLinkedRoleArn());
+        assertEquals(90, optional.instanceMaintenancePolicy().getMinHealthyPercentage());
+        assertEquals(120, optional.instanceMaintenancePolicy().getMaxHealthyPercentage());
+        assertEquals("balanced-only", optional.availabilityZoneDistribution().getCapacityDistributionStrategy());
+        assertEquals("capacity-reservations-only",
+                optional.capacityReservationSpecification().getCapacityReservationPreference());
+        assertEquals(List.of("cr-1"), optional.capacityReservationSpecification().getCapacityReservationIds());
+        assertEquals("2", policyCaptor.getValue().getLaunchTemplate().getOverrides().getFirst().getWeightedCapacity());
+        verify(autoScaling).enableMetricsCollection(REGION, "my-asg", List.of("GroupMinSize", "GroupMaxSize"), "1Minute");
+    }
+
+    @Test
+    void groupCreateLeavesTheOptionalStructuresNullAndMetricsAloneWhenTheTemplateOmitsThem() {
+        when(autoScaling.createAutoScalingGroup(eq(REGION), eq("my-asg"), any(), any(), any(), any(),
+                any(), anyInt(), anyInt(), anyInt(), anyInt(), anyList(), anyList(), anyList(), anyList(),
+                any(), anyInt(), anyList(), anyMap(), anyMap(), any()))
+                .thenReturn(group("my-asg"));
+        StackResource r = resource(GROUP, "Asg", null);
+        ObjectNode props = mapper.createObjectNode().put("AutoScalingGroupName", "my-asg");
+
+        provisioner.provision(r, props, ctx());
+
+        ArgumentCaptor<AsgOptionalFields> captor = ArgumentCaptor.forClass(AsgOptionalFields.class);
+        verify(autoScaling).createAutoScalingGroup(eq(REGION), eq("my-asg"), any(), any(), any(), any(),
+                any(), anyInt(), anyInt(), anyInt(), anyInt(), anyList(), anyList(), anyList(), anyList(),
+                any(), anyInt(), anyList(), anyMap(), anyMap(), captor.capture());
+        AsgOptionalFields optional = captor.getValue();
+        assertNull(optional.serviceLinkedRoleArn());
+        assertNull(optional.instanceMaintenancePolicy());
+        assertNull(optional.availabilityZoneDistribution());
+        assertNull(optional.capacityReservationSpecification());
+        verify(autoScaling, never()).enableMetricsCollection(anyString(), anyString(), anyList(), anyString());
+    }
+
+    @Test
+    void groupCreateRejectsAMetricsCollectionEntryWithoutGranularity() {
+        StackResource r = resource(GROUP, "Asg", null);
+        ObjectNode props = mapper.createObjectNode().put("AutoScalingGroupName", "my-asg");
+        props.putArray("MetricsCollection").addObject().putArray("Metrics").add("GroupMinSize");
+
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+
+        assertEquals("ValidationError", error.getErrorCode());
+        verify(autoScaling, never()).createAutoScalingGroup(any(), any(), any(), any(), any(), any(),
+                any(), anyInt(), anyInt(), anyInt(), anyInt(), anyList(), anyList(), anyList(), anyList(),
+                any(), anyInt(), anyList(), anyMap(), anyMap(), any());
+    }
+
+    @Test
+    void groupCreateRejectsAnUnknownMetricBeforeCreatingTheGroup() {
+        StackResource r = resource(GROUP, "Asg", null);
+        ObjectNode props = mapper.createObjectNode().put("AutoScalingGroupName", "my-asg");
+        props.putArray("MetricsCollection").addObject().put("Granularity", "1Minute")
+                .putArray("Metrics").add("CPUUtilization");
+
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+
+        assertEquals("ValidationError", error.getErrorCode());
+        verify(autoScaling, never()).createAutoScalingGroup(any(), any(), any(), any(), any(), any(),
+                any(), anyInt(), anyInt(), anyInt(), anyInt(), anyList(), anyList(), anyList(), anyList(),
+                any(), anyInt(), anyList(), anyMap(), anyMap(), any());
+    }
+
+    @Test
+    void groupCreateRejectsACapacityReservationSpecificationWithoutPreference() {
+        StackResource r = resource(GROUP, "Asg", null);
+        ObjectNode props = mapper.createObjectNode().put("AutoScalingGroupName", "my-asg");
+        props.putObject("CapacityReservationSpecification").putObject("CapacityReservationTarget")
+                .putArray("CapacityReservationIds").add("cr-1");
+
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+
+        assertEquals("ValidationError", error.getErrorCode());
+    }
+
+    @Test
+    void groupUpdateSetsEnabledMetricsToExactlyWhatTheTemplateLists() {
+        when(autoScaling.describeAutoScalingGroups(REGION, List.of("my-asg")))
+                .thenReturn(List.of(group("my-asg")));
+        StackResource r = resource(GROUP, "Asg", "my-asg");
+        ObjectNode props = mapper.createObjectNode().put("AutoScalingGroupName", "my-asg");
+        props.putArray("MetricsCollection").addObject().put("Granularity", "1Minute")
+                .putArray("Metrics").add("GroupTotalInstances");
+
+        provisioner.provision(r, props, ctx("my-asg"));
+
+        verify(autoScaling).disableMetricsCollection(REGION, "my-asg", List.of());
+        verify(autoScaling).enableMetricsCollection(REGION, "my-asg", List.of("GroupTotalInstances"), "1Minute");
+    }
+
+    @Test
     void groupUpdateReconcilesTheSameNameInsteadOfCreatingItAgain() {
         // provision() re-runs on every UpdateStack. createAutoScalingGroup throws AlreadyExists, so
         // a same-named group already on file has to go through updateAutoScalingGroup.
@@ -325,9 +455,75 @@ class AutoScalingGroupCfnProvisionerTest {
         assertEquals(0, optionalFields.maxInstanceLifetime());
         assertEquals(AsgOptionalFields.DEFAULT_INSTANCE_WARMUP_REMOVAL_SENTINEL,
                 optionalFields.defaultInstanceWarmup());
+        // The group had no maintenance policy before the update, so rollback clears whatever the
+        // update set, and restores the empty set of enabled metrics.
+        assertEquals(InstanceMaintenancePolicy.REMOVAL_SENTINEL,
+                optionalFields.instanceMaintenancePolicy().getMinHealthyPercentage());
+        assertEquals(InstanceMaintenancePolicy.REMOVAL_SENTINEL,
+                optionalFields.instanceMaintenancePolicy().getMaxHealthyPercentage());
+        verify(autoScaling).disableMetricsCollection(REGION, "my-asg", List.of());
 
         // Subsequent rollback should return false since snapshot is spent
         assertFalse(provisioner.rollbackUpdate(r));
+    }
+
+    @Test
+    void rollbackUpdateClearsMembersTheGroupDidNotHaveBeforeTheUpdate() {
+        // UpdateAutoScalingGroup has no clearing value for these three, so passing the snapshot's
+        // null through it would leave what the failed update added.
+        AutoScalingGroup existing = group("my-asg");
+        existing.setMinSize(1);
+        existing.setMaxSize(5);
+        when(autoScaling.describeAutoScalingGroups(eq(REGION), eq(List.of("my-asg"))))
+                .thenReturn(List.of(existing));
+        StackResource r = resource(GROUP, "Asg", "my-asg");
+        ObjectNode props = mapper.createObjectNode()
+                .put("AutoScalingGroupName", "my-asg")
+                .put("ServiceLinkedRoleARN", "role-arn");
+        props.putObject("AvailabilityZoneDistribution").put("CapacityDistributionStrategy", "balanced-only");
+        props.putObject("CapacityReservationSpecification").put("CapacityReservationPreference", "none");
+        provisioner.provision(r, props, ctx("my-asg"));
+        existing.setServiceLinkedRoleArn("role-arn");
+        existing.setAvailabilityZoneDistribution(new AvailabilityZoneDistribution("balanced-only"));
+        CapacityReservationSpecification reservation = new CapacityReservationSpecification();
+        reservation.setCapacityReservationPreference("none");
+        existing.setCapacityReservationSpecification(reservation);
+
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        assertNull(existing.getServiceLinkedRoleArn());
+        assertNull(existing.getAvailabilityZoneDistribution());
+        assertNull(existing.getCapacityReservationSpecification());
+        verify(autoScaling).saveAutoScalingGroupIfPresent(existing);
+    }
+
+    @Test
+    void groupCreatePassesBlankRoleAndWeightToTheServiceForValidation() {
+        // The service rejects an empty ServiceLinkedRoleARN or WeightedCapacity. Turning either
+        // into null here would read as "not set" and let the stack through.
+        when(autoScaling.createAutoScalingGroup(eq(REGION), eq("my-asg"), any(), any(), any(), any(),
+                any(), anyInt(), anyInt(), anyInt(), anyInt(), anyList(), anyList(), anyList(), anyList(),
+                any(), anyInt(), anyList(), anyMap(), anyMap(), any()))
+                .thenReturn(group("my-asg"));
+        StackResource r = resource(GROUP, "Asg", null);
+        ObjectNode props = mapper.createObjectNode()
+                .put("AutoScalingGroupName", "my-asg")
+                .put("ServiceLinkedRoleARN", "");
+        ObjectNode launchTemplate = props.putObject("MixedInstancesPolicy").putObject("LaunchTemplate");
+        launchTemplate.putObject("LaunchTemplateSpecification").put("LaunchTemplateId", "lt-123");
+        launchTemplate.putArray("Overrides").addObject()
+                .put("InstanceType", "t3.micro")
+                .put("WeightedCapacity", "");
+
+        provisioner.provision(r, props, ctx());
+
+        ArgumentCaptor<MixedInstancesPolicy> policyCaptor = ArgumentCaptor.forClass(MixedInstancesPolicy.class);
+        ArgumentCaptor<AsgOptionalFields> captor = ArgumentCaptor.forClass(AsgOptionalFields.class);
+        verify(autoScaling).createAutoScalingGroup(eq(REGION), eq("my-asg"), any(), any(), any(), any(),
+                policyCaptor.capture(), anyInt(), anyInt(), anyInt(), anyInt(), anyList(), anyList(), anyList(),
+                anyList(), any(), anyInt(), anyList(), anyMap(), anyMap(), captor.capture());
+        assertEquals("", captor.getValue().serviceLinkedRoleArn());
+        assertEquals("", policyCaptor.getValue().getLaunchTemplate().getOverrides().getFirst().getWeightedCapacity());
     }
 
     @Test

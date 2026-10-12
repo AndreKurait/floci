@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cognito;
 
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.services.cognito.model.CognitoAuthorizationCode;
 import io.github.hectorvent.floci.services.cognito.model.CognitoAuthorizationTransaction;
 import io.github.hectorvent.floci.services.cognito.model.CognitoManagedLoginSession;
@@ -8,7 +9,6 @@ import jakarta.enterprise.context.ApplicationScoped;
 import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Instant;
-import java.util.Base64;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
@@ -72,7 +72,7 @@ public class CognitoFederationStateStore {
     String generateOpaqueKey() {
         byte[] bytes = new byte[OPAQUE_KEY_BYTES];
         secureRandom.nextBytes(bytes);
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        return Base64Url.encode(bytes);
     }
 
     private <T> String put(ConcurrentHashMap<String, T> store, T value) {

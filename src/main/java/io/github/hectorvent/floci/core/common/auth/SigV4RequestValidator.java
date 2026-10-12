@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common.auth;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.services.iam.IamService;
 import org.jboss.logging.Logger;
 
@@ -133,7 +134,7 @@ public final class SigV4RequestValidator {
             String stringToSign = "AWS4-HMAC-SHA256\n"
                     + dateTime + "\n"
                     + credentialScope + "\n"
-                    + sha256Hex(canonicalRequest);
+                    + Digests.sha256Hex(canonicalRequest);
 
             byte[] signingKey = deriveSigningKey(secretKey, date, region, service);
             String expectedSignature = hexEncode(hmacSha256(signingKey, stringToSign));
@@ -292,16 +293,6 @@ public final class SigV4RequestValidator {
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(key, "HmacSHA256"));
         return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-    }
-
-    public static String sha256Hex(String input) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        return hexEncode(digest.digest(input.getBytes(StandardCharsets.UTF_8)));
-    }
-
-    public static String sha256Hex(byte[] input) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        return hexEncode(digest.digest(input));
     }
 
     public static String hexEncode(byte[] bytes) {

@@ -341,8 +341,7 @@ class DynamoDbAccessPathIntegrationTest {
                 """.formatted(TABLE))
             .statusCode(400)
             .body("__type", equalTo("ValidationException"))
-            .body("message", equalTo("The provided starting key is invalid: "
-                    + "The provided key element does not match the schema"));
+            .body("message", equalTo("The provided starting key is invalid"));
 
         request("DynamoDB_20120810.Query", """
                 {

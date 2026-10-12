@@ -144,6 +144,52 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void createVpcAcceptsDefaultOrDedicatedAndDefaultsWhenOmitted() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+
+        assertEquals("default", service.createVpc(region, "10.90.0.0/16", false, false, null).getInstanceTenancy());
+        // A present blank is not an enum value; only an absent parameter defaults.
+        assertEquals("InvalidParameterValue", assertThrows(AwsException.class,
+                () -> service.createVpc(region, "10.91.0.0/16", false, false, " ")).getErrorCode());
+        assertEquals("dedicated", service.createVpc(region, "10.92.0.0/16", false, false, "dedicated").getInstanceTenancy());
+
+        AwsException bogus = assertThrows(AwsException.class,
+                () -> service.createVpc(region, "10.93.0.0/16", false, false, "bogus"));
+        assertEquals("InvalidParameterValue", bogus.getErrorCode());
+        assertEquals(400, bogus.getHttpStatus());
+        assertTrue(bogus.getMessage().contains("Value (bogus) for parameter instanceTenancy is invalid"));
+
+        // The EC2 reference: "The host value cannot be used with this parameter."
+        AwsException host = assertThrows(AwsException.class,
+                () -> service.createVpc(region, "10.96.0.0/16", false, false, "host"));
+        assertEquals("InvalidParameterValue", host.getErrorCode());
+    }
+
+    @Test
+    void modifyVpcTenancyOnlyMovesADedicatedVpcToDefault() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String dedicated = service.createVpc(region, "10.94.0.0/16", false, false, "dedicated").getVpcId();
+        String alreadyDefault = service.createVpc(region, "10.95.0.0/16", false, false, "default").getVpcId();
+
+        service.modifyVpcTenancy(region, dedicated, "default");
+        assertEquals("default", service.requireVpc(region, dedicated).getInstanceTenancy());
+
+        AwsException fromDefault = assertThrows(AwsException.class,
+                () -> service.modifyVpcTenancy(region, alreadyDefault, "default"));
+        assertEquals("InvalidParameterValue", fromDefault.getErrorCode());
+
+        AwsException toDedicated = assertThrows(AwsException.class,
+                () -> service.modifyVpcTenancy(region, dedicated, "dedicated"));
+        assertEquals("InvalidParameterValue", toDedicated.getErrorCode());
+    }
+
+    @Test
     void deleteVpcRemovesVpcOwnedDefaultResourcesAndRules() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class),
@@ -799,6 +845,50 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void createSubnetRejectsIpv4PrefixOutsideSlash16ToSlash28() {
+        // VPC User Guide: "The allowed IPv4 CIDR block size for a subnet is between a /28 netmask and /16 netmask."
+        AccountAwareStorageBackend<Vpc> vpcStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-vpcs.json", vpcStore)));
+        String vpcId = slashEightVpc(service, vpcStore);
+
+        for (String cidr : List.of("10.0.0.0/15", "10.2.0.0/29", "10.2.0.16/30", "10.2.0.32/32")) {
+            AwsException error = assertThrows(AwsException.class,
+                    () -> service.createSubnet("us-east-1", vpcId, cidr, "us-east-1a"));
+            assertEquals("InvalidSubnet.Range", error.getErrorCode());
+            assertEquals("The CIDR '" + cidr + "' is invalid.", error.getMessage());
+            assertEquals(400, error.getHttpStatus());
+        }
+        assertEquals(0, service.describeSubnets("us-east-1", List.of(), Map.of()).stream()
+                .filter(s -> vpcId.equals(s.getVpcId())).count());
+    }
+
+    @Test
+    void createSubnetAcceptsTheSlash16AndSlash28PrefixBounds() {
+        AccountAwareStorageBackend<Vpc> vpcStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-vpcs.json", vpcStore)));
+        String vpcId = slashEightVpc(service, vpcStore);
+
+        assertEquals("10.1.0.0/16", service.createSubnet("us-east-1", vpcId, "10.1.0.0/16", "us-east-1a")
+                .getCidrBlock());
+        assertEquals("10.2.0.0/28", service.createSubnet("us-east-1", vpcId, "10.2.0.0/28", "us-east-1a")
+                .getCidrBlock());
+    }
+
+    /** CreateVpc refuses a /8, so the VPC is created as a /16 and widened to 10.0.0.0/8 in the store. */
+    private static String slashEightVpc(Ec2Service service, AccountAwareStorageBackend<Vpc> vpcStore) {
+        Vpc vpc = service.createVpc("us-east-1", "10.0.0.0/16", false);
+        vpc.setCidrBlock("10.0.0.0/8");
+        vpcStore.put("us-east-1::" + vpc.getVpcId(), vpc);
+        return vpc.getVpcId();
+    }
+
+    @Test
     void createVpcAndCreateSubnetStoreTheCidrBlockInCanonicalForm() {
         // AWS CreateVpc/CreateSubnet: "We modify the specified CIDR block to its canonical form; for
         // example, if you specify 100.68.0.18/18, we modify it to 100.68.0.0/18."
@@ -902,6 +992,48 @@ class Ec2ServiceTest {
         service.disassociateVpcCidrBlock("us-east-1", associationId);
         assertEquals("InvalidSubnet.Range", assertThrows(AwsException.class,
                 () -> service.createSubnet("us-east-1", vpcId, "192.168.2.0/24", "us-east-1a")).getErrorCode());
+    }
+
+    @Test
+    void createVpcAndAssociateVpcCidrBlockRejectIpv4PrefixOutsideSlash16ToSlash28() {
+        // VPC User Guide: "The allowed block size is between a /28 netmask and /16 netmask."
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        long vpcsBefore = service.describeVpcs("us-east-1", List.of(), Map.of()).size();
+        String vpcId = service.createVpc("us-east-1", "10.0.0.0/16", false).getVpcId();
+
+        for (String cidr : List.of("0.0.0.0/0", "10.0.0.0/8", "10.0.0.0/15", "10.0.0.0/29", "10.0.0.0/32")) {
+            AwsException createError = assertThrows(AwsException.class,
+                    () -> service.createVpc("us-east-1", cidr, false));
+            assertEquals("InvalidVpc.Range", createError.getErrorCode());
+            assertEquals("The CIDR '" + cidr + "' is invalid.", createError.getMessage());
+            assertEquals(400, createError.getHttpStatus());
+
+            AwsException associateError = assertThrows(AwsException.class,
+                    () -> service.associateVpcCidrBlock("us-east-1", vpcId, cidr));
+            assertEquals("InvalidVpc.Range", associateError.getErrorCode());
+            assertEquals(400, associateError.getHttpStatus());
+        }
+        assertEquals(vpcsBefore + 1, service.describeVpcs("us-east-1", List.of(), Map.of()).size());
+        assertEquals(1, service.describeVpcs("us-east-1", List.of(vpcId), Map.of()).getFirst()
+                .getCidrBlockAssociationSet().size());
+    }
+
+    @Test
+    void createVpcAndAssociateVpcCidrBlockAcceptTheSlash16AndSlash28PrefixBounds() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+
+        assertEquals("10.1.0.0/16", service.createVpc("us-east-1", "10.1.0.0/16", false).getCidrBlock());
+        Vpc smallest = service.createVpc("us-east-1", "10.2.0.0/28", false);
+        assertEquals("10.2.0.0/28", smallest.getCidrBlock());
+        // Secondary blocks stay in 10.0.0.0/8, the range AWS lets a 10.x VPC add from.
+        assertEquals("10.3.0.0/16", service.associateVpcCidrBlock("us-east-1", smallest.getVpcId(),
+                "10.3.0.0/16").getCidrBlock());
+        assertEquals("10.4.0.0/28", service.associateVpcCidrBlock("us-east-1", smallest.getVpcId(),
+                "10.4.0.0/28").getCidrBlock());
     }
 
     @Test
@@ -1659,12 +1791,20 @@ class Ec2ServiceTest {
 
     @Test
     void interfaceEndpointIsRefusedInASubnetWithNoAssignableAddress() {
+        // CreateSubnet refuses a /30, so the subnet is written straight into the subnet store.
+        AccountAwareStorageBackend<Subnet> subnetStore = AccountAwareStorageBackend.inMemory("000000000000");
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
-                mock(Ec2PortForwardManager.class),
-                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
-                new InMemoryStorageFactory());
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-subnets.json", subnetStore)));
         String vpcId = service.createVpc("us-east-1", "10.64.0.0/16", false).getVpcId();
-        String tiny = service.createSubnet("us-east-1", vpcId, "10.64.1.0/30", "us-east-1a").getSubnetId();
+        Subnet tinySubnet = new Subnet();
+        tinySubnet.setSubnetId("subnet-0000000000000031");
+        tinySubnet.setVpcId(vpcId);
+        tinySubnet.setRegion("us-east-1");
+        tinySubnet.setCidrBlock("10.64.1.0/30");
+        tinySubnet.setAvailabilityZone("us-east-1a");
+        subnetStore.put("us-east-1::" + tinySubnet.getSubnetId(), tinySubnet);
+        String tiny = tinySubnet.getSubnetId();
         String roomy = service.createSubnet("us-east-1", vpcId, "10.64.2.0/28", "us-east-1b").getSubnetId();
 
         AwsException createError = assertThrows(AwsException.class, () ->

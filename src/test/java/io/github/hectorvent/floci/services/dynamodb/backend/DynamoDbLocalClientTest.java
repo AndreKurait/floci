@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Api;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Reply;
@@ -237,10 +238,10 @@ class DynamoDbLocalClientTest {
                 + "x-amz-date:" + amzDate + "\n"
                 + "x-amz-target:" + headers.getFirst("X-Amz-Target") + "\n\n"
                 + "content-type;host;x-amz-date;x-amz-target\n"
-                + SigV4RequestValidator.sha256Hex(request.body());
+                + Digests.sha256Hex(request.body());
         String credentialScope = date + "/eu-west-1/dynamodb/aws4_request";
         String toSign = "AWS4-HMAC-SHA256\n" + amzDate + "\n" + credentialScope + "\n"
-                + SigV4RequestValidator.sha256Hex(canonical);
+                + Digests.sha256Hex(canonical);
         byte[] key = SigV4RequestValidator.deriveSigningKey("floci", date, "eu-west-1", "dynamodb");
         return SigV4RequestValidator.hexEncode(SigV4RequestValidator.hmacSha256(key, toSign));
     }

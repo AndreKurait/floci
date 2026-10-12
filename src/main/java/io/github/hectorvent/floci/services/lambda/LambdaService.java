@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CustomResourceLiveness;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
@@ -3400,11 +3401,7 @@ public class LambdaService implements ResourceProvider {
             // deploy move $LATEST between those two steps, so a version would carry code whose hash
             // the caller never authorised even though the check passed. Extraction to disk stays
             // outside the lock; only the fields that decide what a snapshot copies are inside it.
-            String newSha256 = null;
-            try {
-                byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(zipBytes);
-                newSha256 = Base64.getEncoder().encodeToString(digest);
-            } catch (java.security.NoSuchAlgorithmException ignored) {}
+            String newSha256 = Base64.getEncoder().encodeToString(Digests.sha256(zipBytes));
             synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
                 fn.setCodeLocalPath(codePath.toAbsolutePath().normalize().toString());
                 fn.setCodeSizeBytes(zipBytes.length);

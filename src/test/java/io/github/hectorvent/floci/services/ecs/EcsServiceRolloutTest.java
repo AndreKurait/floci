@@ -7,17 +7,25 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ecs.container.EcsContainerManager;
+import io.github.hectorvent.floci.services.ecs.model.CapacityProviderStrategyItem;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
+import io.github.hectorvent.floci.services.ecs.model.CreateServiceRequest;
 import io.github.hectorvent.floci.services.ecs.model.EcsServiceModel;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import io.github.hectorvent.floci.services.ecs.model.TaskStatus;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -41,6 +49,99 @@ import static org.mockito.Mockito.when;
 class EcsServiceRolloutTest {
 
     private static final String REGION = "us-east-1";
+
+    private static Stream<Arguments> mixedCapacityProviderStrategies() {
+        return Stream.of(
+                Arguments.of(List.of(new CapacityProviderStrategyItem("FARGATE", 1, 0),
+                                new CapacityProviderStrategyItem("FARGATE_SPOT", 1, 0)),
+                        Map.of("FARGATE", 1L, "FARGATE_SPOT", 1L),
+                        Map.of("FARGATE", 2L, "FARGATE_SPOT", 2L)),
+                Arguments.of(List.of(new CapacityProviderStrategyItem("FARGATE", 0, 1),
+                                new CapacityProviderStrategyItem("FARGATE_SPOT", 1, 0)),
+                        Map.of("FARGATE", 1L, "FARGATE_SPOT", 1L),
+                        Map.of("FARGATE", 1L, "FARGATE_SPOT", 5L)),
+                Arguments.of(List.of(new CapacityProviderStrategyItem("FARGATE", 1, 1),
+                                new CapacityProviderStrategyItem("FARGATE_SPOT", 3, 0)),
+                        Map.of("FARGATE", 2L, "FARGATE_SPOT", 3L),
+                        Map.of("FARGATE", 3L, "FARGATE_SPOT", 6L)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("mixedCapacityProviderStrategies")
+    void mixedProviderServicesKeepTheirSplitOnScaleOutReplacementAndRollout(
+            List<CapacityProviderStrategyItem> strategy, Map<String, Long> initial, Map<String, Long> scaled) {
+        EcsService service = newMockModeService();
+        service.createCluster("roll-cluster", REGION);
+        registerTaskDef(service, "roll-fam", "app:1");
+        CreateServiceRequest request = new CreateServiceRequest();
+        request.setCluster("roll-cluster");
+        request.setServiceName("roll-svc");
+        request.setTaskDefinition("roll-fam");
+        request.setDesiredCount(initial.values().stream().mapToInt(Long::intValue).sum());
+        request.setCapacityProviderStrategy(strategy);
+        service.createService(request, REGION);
+
+        service.reconcileServices();
+        assertEquals(initial, providerCounts(service));
+
+        service.updateService("roll-cluster", "roll-svc", null,
+                scaled.values().stream().mapToInt(Long::intValue).sum(), null, REGION);
+        service.reconcileServices();
+        assertEquals(scaled, providerCounts(service));
+
+        for (String provider : scaled.keySet()) {
+            EcsTask stopped = runningTasks(service).stream()
+                    .filter(task -> provider.equals(task.getCapacityProviderName())).findFirst().orElseThrow();
+            service.stopTask("roll-cluster", stopped.getTaskArn(), "replacement test", REGION);
+            service.reconcileServices();
+            assertEquals(scaled, providerCounts(service));
+            assertTrue(runningTasks(service).stream().noneMatch(task -> task.getTaskArn().equals(stopped.getTaskArn())));
+        }
+
+        TaskDefinition revision = registerTaskDef(service, "roll-fam", "app:2");
+        service.updateService("roll-cluster", "roll-svc", revision.getTaskDefinitionArn(), null, null, REGION);
+        service.reconcileServices();
+        service.reconcileServices();
+        assertEquals(scaled, providerCounts(service));
+        assertTrue(runningTasks(service).stream()
+                .allMatch(task -> revision.getTaskDefinitionArn().equals(task.getTaskDefinitionArn())));
+    }
+
+    private static Map<String, Long> providerCounts(EcsService service) {
+        return runningTasks(service).stream()
+                .collect(Collectors.groupingBy(EcsTask::getCapacityProviderName, Collectors.counting()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"FARGATE", "FARGATE_SPOT"})
+    void capacityProviderServiceStartsAndReplacesStoppedTasks(String provider) {
+        EcsService service = newMockModeService();
+        service.createCluster("roll-cluster", REGION);
+        registerTaskDef(service, "roll-fam", "app:1");
+        CreateServiceRequest request = new CreateServiceRequest();
+        request.setCluster("roll-cluster");
+        request.setServiceName("roll-svc");
+        request.setTaskDefinition("roll-fam");
+        request.setDesiredCount(2);
+        request.setCapacityProviderStrategy(List.of(new CapacityProviderStrategyItem(provider, 1, 0)));
+        EcsServiceModel svc = service.createService(request, REGION);
+
+        service.reconcileServices();
+        List<EcsTask> first = runningTasks(service);
+        assertEquals(2, first.size());
+        for (EcsTask task : first) {
+            assertEquals(provider, task.getCapacityProviderName());
+            assertEquals(LaunchType.FARGATE, task.getLaunchType());
+            assertEquals(svc.getServiceArn(), task.getOwningServiceArn());
+        }
+
+        service.stopTask("roll-cluster", first.getFirst().getTaskArn(), "replacement test", REGION);
+        service.reconcileServices();
+        List<EcsTask> after = runningTasks(service);
+        assertEquals(2, after.size());
+        assertTrue(after.stream().noneMatch(task -> task.getTaskArn().equals(first.getFirst().getTaskArn())));
+        assertTrue(after.stream().allMatch(task -> provider.equals(task.getCapacityProviderName())));
+    }
 
     @Test
     void updatedTaskDefinitionReplacesRunningTasksReplacementsFirst() {

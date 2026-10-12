@@ -24,6 +24,8 @@ import org.awaitility.Awaitility;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
@@ -182,6 +184,25 @@ class KubernetesPodLauncherTest {
             pod.setStatus(new PodStatusBuilder().withPhase(phase).build());
             client.pods().inNamespace("default").resource(pod).updateStatus();
         });
+    }
+
+    @ParameterizedTest
+    @CsvSource({"$LATEST, $$LATEST", "1, 1", "7, 7"})
+    void launchExposesTheExecutingVersionInThePodAndRuntimeApi(String version, String podValue) {
+        markPodPhaseInBackground("floci-lambda-my-fn-", "Running");
+        LambdaFunction fn = function();
+        fn.setVersion(version);
+        fn.setEnvironment(Map.of("AWS_LAMBDA_FUNCTION_VERSION", "user-override"));
+
+        ContainerHandle handle = launcher.launch(fn);
+
+        Pod pod = client.pods().inNamespace("default").withName(handle.getContainerId()).get();
+        // The pod spec escapes dollars for kubelet expansion; the runtime receives literal $LATEST.
+        assertThat(pod.getSpec().getContainers().getFirst().getEnv())
+                .filteredOn(variable -> "AWS_LAMBDA_FUNCTION_VERSION".equals(variable.getName()))
+                .extracting(EnvVar::getValue)
+                .containsExactly(podValue);
+        verify(runtimeApiServer).setFunctionMetadata("my-fn", version, "index.handler", "000000000000");
     }
 
     @Test

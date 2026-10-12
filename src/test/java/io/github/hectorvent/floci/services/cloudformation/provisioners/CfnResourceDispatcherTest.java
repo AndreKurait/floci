@@ -75,6 +75,18 @@ class CfnResourceDispatcherTest {
     }
 
     @Test
+    void provisionHandsThePriorPropertiesToTheContext() {
+        AtomicReference<ProvisionContext> seenContext = new AtomicReference<>();
+        when(registry.forType(TYPE)).thenReturn(Optional.of(provisioner((resource, ctx) -> seenContext.set(ctx))));
+        JsonNode prior = mapper.createObjectNode().put("Removed", "value");
+
+        dispatcher.provision("Thing", TYPE, mapper.createObjectNode(), null, "us-east-1", "000000000000",
+                "my-stack", "thing-prior", Map.of(), event -> { }, prior);
+
+        assertEquals(prior, seenContext.get().priorProperties());
+    }
+
+    @Test
     void aProvisionerThatMigratesAStubWithoutWritingAnArnDropsTheStubArn() {
         when(registry.forType(TYPE)).thenReturn(Optional.of(provisioner((resource, ctx) ->
                 resource.setPhysicalId("dash-real"))));

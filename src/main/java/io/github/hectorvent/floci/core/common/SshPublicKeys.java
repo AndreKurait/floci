@@ -8,8 +8,6 @@ import java.security.KeyFactory;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.interfaces.RSAPublicKey;
-import java.security.spec.InvalidKeySpecException;
-import java.security.spec.RSAPublicKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 import java.util.HexFormat;
@@ -122,9 +120,8 @@ public final class SshPublicKeys {
         BigInteger exponent = new BigInteger(reader.readField());
         BigInteger modulus = new BigInteger(reader.readField());
         try {
-            return (RSAPublicKey) KeyFactory.getInstance("RSA")
-                    .generatePublic(new RSAPublicKeySpec(modulus, exponent));
-        } catch (NoSuchAlgorithmException | InvalidKeySpecException e) {
+            return PublicKeys.rsa(modulus, exponent);
+        } catch (GeneralSecurityException e) {
             throw new SshPublicKeyException("not a usable RSA public key: " + e.getMessage(), e);
         }
     }

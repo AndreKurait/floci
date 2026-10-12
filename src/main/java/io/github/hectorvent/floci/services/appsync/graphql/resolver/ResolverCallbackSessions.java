@@ -1,9 +1,9 @@
 package io.github.hectorvent.floci.services.appsync.graphql.resolver;
 
+import io.github.hectorvent.floci.core.common.Base64Url;
 import jakarta.enterprise.context.ApplicationScoped;
 
 import java.security.SecureRandom;
-import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -84,7 +84,7 @@ public class ResolverCallbackSessions {
     public Session open(String apiId, Object identity, String authType) {
         byte[] bytes = new byte[TOKEN_BYTES];
         random.nextBytes(bytes);
-        String token = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        String token = Base64Url.encode(bytes);
         Session session = new Session(sessions, token, apiId, identity, authType);
         sessions.put(token, session);
         return session;

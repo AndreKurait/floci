@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class PipesTargetInvoker {
@@ -192,7 +193,18 @@ public class PipesTargetInvoker {
                 "DetailType", detailType,
                 "Detail", payload
         );
-        eventBridgeService.putEvents(List.of(entry), ebRegion);
+
+        EventBridgeService.PutEventsResult result = eventBridgeService.putEvents(List.of(entry), ebRegion);
+
+        if (result != null && result.failedCount() > 0) {
+            String details = result.entries().stream()
+                    .filter(e -> e.get("ErrorCode") != null)
+                    .map(e -> e.get("ErrorCode") + ": " + e.get("ErrorMessage"))
+                    .collect(Collectors.joining("; "));
+            throw new RuntimeException(
+                    "EventBridge PutEvents rejected " + result.failedCount()
+                            + " entry(ies): " + details);
+        }
         LOG.debugv("Pipe delivered to EventBridge: {0}", arn);
     }
 

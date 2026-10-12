@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.testutil;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.restassured.filter.Filter;
 import io.restassured.filter.FilterContext;
@@ -128,10 +129,10 @@ public final class AwsRequestSigner implements Filter {
                 + S3RequestSigner.canonicalQueryString(uri.getRawQuery()) + "\n"
                 + canonicalHeaders + "\n"
                 + signedHeaders + "\n"
-                + SigV4RequestValidator.sha256Hex(body);
+                + Digests.sha256Hex(body);
         String credentialScope = scopeDate + "/us-east-1/" + service + "/aws4_request";
         String stringToSign = ALGORITHM + "\n" + amzDate + "\n" + credentialScope + "\n"
-                + SigV4RequestValidator.sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
+                + Digests.sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
         byte[] signingKey = SigV4RequestValidator.deriveSigningKey(secretKey, scopeDate, "us-east-1", service);
         String signature = SigV4RequestValidator.hexEncode(SigV4RequestValidator.hmacSha256(signingKey, stringToSign));
 

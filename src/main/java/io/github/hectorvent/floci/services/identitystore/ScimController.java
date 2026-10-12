@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.services.identitystore.model.Group;
 import io.github.hectorvent.floci.services.identitystore.model.Membership;
 import io.github.hectorvent.floci.services.identitystore.model.User;
@@ -1363,8 +1364,7 @@ public class ScimController {
 
     private static String encodeCursor(int offset, String filter) {
         String fingerprint = filter == null ? "" : filter;
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(
-                (offset + "\n" + fingerprint).getBytes(StandardCharsets.UTF_8));
+        return Base64Url.encode(offset + "\n" + fingerprint);
     }
 
     private static int decodeCursor(String cursor, String filter) {

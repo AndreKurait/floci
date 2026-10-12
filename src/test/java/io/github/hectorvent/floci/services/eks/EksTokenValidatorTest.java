@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.eks;
 
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.testutil.IamServiceTestHelper;
 import io.github.hectorvent.floci.testutil.SigV4TokenTestHelper;
@@ -245,7 +246,6 @@ class EksTokenValidatorTest {
         String encodedRequest = token.substring(prefix.length());
         String request = new String(Base64.getUrlDecoder().decode(encodedRequest), StandardCharsets.UTF_8);
         String tamperedRequest = request.replace(target, replacement);
-        return prefix + Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(tamperedRequest.getBytes(StandardCharsets.UTF_8));
+        return prefix + Base64Url.encode(tamperedRequest);
     }
 }

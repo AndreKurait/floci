@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.s3;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.testing.S3EnforceAuthProfile;
 import io.github.hectorvent.floci.testutil.S3RequestSigner;
 import io.quarkus.test.junit.QuarkusTest;
@@ -22,7 +23,6 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -240,7 +240,7 @@ class S3LeadingSlashKeyAuthEnforcementIntegrationTest {
         String stringToSign = "AWS4-HMAC-SHA256\n"
                 + timestamp + "\n"
                 + credentialScope + "\n"
-                + hex(MessageDigest.getInstance("SHA-256").digest(canonicalRequest.getBytes(StandardCharsets.UTF_8)));
+                + Digests.sha256Hex(canonicalRequest);
 
         byte[] kDate = hmac(("AWS4test").getBytes(StandardCharsets.UTF_8), date);
         byte[] kRegion = hmac(kDate, "us-east-1");

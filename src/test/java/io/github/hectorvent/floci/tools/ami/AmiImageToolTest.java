@@ -1,13 +1,12 @@
 package io.github.hectorvent.floci.tools.ami;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.util.HexFormat;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -159,8 +158,6 @@ class AmiImageToolTest {
     }
 
     private static String sha256(Path path) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        digest.update(Files.readAllBytes(path));
-        return HexFormat.of().formatHex(digest.digest());
+        return Digests.sha256Hex(Files.readAllBytes(path));
     }
 }

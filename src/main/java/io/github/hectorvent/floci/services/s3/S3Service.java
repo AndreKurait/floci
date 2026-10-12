@@ -8,6 +8,8 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
@@ -3024,8 +3026,7 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     private String encodeAnnotationContinuationToken(String lastAnnotationName) {
-        return Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(lastAnnotationName.getBytes(StandardCharsets.UTF_8));
+        return Base64Url.encode(lastAnnotationName);
     }
 
     private String decodeAnnotationContinuationToken(String token) {
@@ -3054,22 +3055,8 @@ public class S3Service implements Resettable, ResourceProvider {
         // collision-free across object keys that contain '#v#', '@', or path-like characters.
         // Cleanup is metadata-driven, so the mapping never needs to be reversed.
         // Every path component below bucketDir is SHA-256 hex, so no traversal is possible.
-        Path parentDir = bucketDir.resolve(sha256Hex(annotationIdentity(key, versionId)));
-        return parentDir.resolve(sha256Hex(annotationName) + ANNOTATION_DATA_SUFFIX);
-    }
-
-    private static String sha256Hex(String value) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(digest.length * 2);
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b));
-            }
-            return sb.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 algorithm is not available", e);
-        }
+        Path parentDir = bucketDir.resolve(Digests.sha256Hex(annotationIdentity(key, versionId)));
+        return parentDir.resolve(Digests.sha256Hex(annotationName) + ANNOTATION_DATA_SUFFIX);
     }
 
     private void writeAnnotationPayload(ObjectAnnotation annotation, byte[] payload) {
@@ -5907,6 +5894,14 @@ public class S3Service implements Resettable, ResourceProvider {
 
     public boolean bucketExists(String bucketName) {
         return resolveBucket(bucketName).isPresent();
+    }
+
+    /**
+     * Whether the calling account has the bucket, which is the lookup {@link #createBucket} makes.
+     * Unlike {@link #bucketExists}, it never spans other accounts' buckets.
+     */
+    public boolean ownsBucket(String bucketName) {
+        return bucketStore.get(bucketName).isPresent();
     }
 
     /**

@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.apigateway;
 
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.AccessKey;
@@ -294,7 +295,7 @@ class ExecuteApiSigV4AuthorizerTest {
         byte[] signedBody = "{\"amount\":1}".getBytes();
         Map<String, String> signed = new java.util.LinkedHashMap<>(ExecuteApiRequestSigner.signedHeaders(
                 "POST", PATH, Map.of(), HOST, signedBody, "test", "test", REGION, Instant.now()));
-        signed.put("x-amz-content-sha256", sha256Hex(signedBody));
+        signed.put("x-amz-content-sha256", Digests.sha256Hex(signedBody));
 
         ExecuteApiSigV4Authorizer.Result result = authorizer.authorize(
                 "POST", headers(signed), uriInfo(PATH, null), "{\"amount\":9999}".getBytes(), null);
@@ -329,15 +330,6 @@ class ExecuteApiSigV4AuthorizerTest {
                 uriInfo(PATH, null), null, clientPath);
 
         assertTrue(result.authorized(), String.valueOf(result.detail()));
-    }
-
-    private static String sha256Hex(byte[] input) throws Exception {
-        byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(input);
-        StringBuilder hex = new StringBuilder(digest.length * 2);
-        for (byte b : digest) {
-            hex.append(String.format("%02x", b));
-        }
-        return hex.toString();
     }
 
     private static HttpHeaders headers(Map<String, String> values) {

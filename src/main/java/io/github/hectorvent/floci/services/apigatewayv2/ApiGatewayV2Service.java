@@ -829,6 +829,12 @@ public class ApiGatewayV2Service {
                 .orElseThrow(() -> new AwsException("NotFoundException", "Stage not found", 404));
     }
 
+    public Map<String, String> getStageVariables(String region, String apiId, String stageName) {
+        return stageStore.get(stageKey(region, apiId, stageName))
+                .map(Stage::getStageVariables)
+                .orElse(Map.of());
+    }
+
     public List<Stage> getStages(String region, String apiId) {
         getApi(region, apiId);
         String prefix = region + "::" + apiId + "::";

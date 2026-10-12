@@ -71,6 +71,15 @@ public final class CfnRollback {
     public static final String EVENT_INVOKE_CONFIG_SNAPSHOT_ATTR = "__FlociEventInvokeConfigSnapshot";
 
     /**
+     * Holds what a custom resource had before an update sent its handler an {@code Update}: the
+     * physical id, the old and the attempted properties, the region and the {@code Data} attributes,
+     * so a failed stack update can send the handler the old properties back, whether the handler
+     * applied the update or failed it. Written by {@code CustomResourceCfnProvisioner} before the
+     * invoke and spent by its {@code rollbackUpdate}.
+     */
+    public static final String CUSTOM_RESOURCE_UPDATE_SNAPSHOT_ATTR = "__FlociCustomResourceUpdateSnapshot";
+
+    /**
      * Holds the body and tags a dashboard carried before an in-place update changed them, or the
      * fact that it did not exist, so a failed stack update can put it back. Written by
      * {@code CloudWatchDashboardCfnProvisioner} before its first mutating call and spent by its
@@ -133,6 +142,22 @@ public final class CfnRollback {
      * spent by its {@code rollbackUpdate}.
      */
     public static final String INTEGRATION_CONNECTION_SNAPSHOT_ATTR = "__FlociIntegrationConnectionSnapshot";
+
+    /**
+     * Holds the certificate, security policy, endpoint type and tags an API Gateway v2 custom domain
+     * carried before an in-place update changed them, so a failed stack update can put them back.
+     * Written by {@code ApiGatewayV2DomainCfnProvisioner} before its first mutating call and spent
+     * by its {@code rollbackUpdate}.
+     */
+    public static final String API_GATEWAY_V2_DOMAIN_UPDATE_SNAPSHOT_ATTR = "__FlociApiGatewayV2DomainUpdateSnapshot";
+
+    /**
+     * Holds the key, API and stage an API Gateway v2 API mapping carried before an in-place update
+     * changed them, with the domain that addresses it, so a failed stack update can put them back.
+     * Written by {@code ApiGatewayV2DomainCfnProvisioner} before its update call and spent by its
+     * {@code rollbackUpdate}.
+     */
+    public static final String API_MAPPING_UPDATE_SNAPSHOT_ATTR = "__FlociApiMappingUpdateSnapshot";
 
     /**
      * Holds the complete prior metric filter, identity, name mode and per-address mutation outcomes

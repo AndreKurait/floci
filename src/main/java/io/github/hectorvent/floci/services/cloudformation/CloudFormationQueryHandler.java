@@ -399,8 +399,11 @@ public class CloudFormationQueryHandler {
     private Response describeStackResources(MultivaluedMap<String, String> params, String region) {
         String stackName = params.getFirst("StackName");
         try {
-            List<StackResource> resources = cfnService.describeStackResources(stackName, region);
-            return stackResourcesXml(resources, stackName, region);
+            CloudFormationService.StackResourcesView view = cfnService.describeStackResourcesView(stackName,
+                    params.getFirst("LogicalResourceId"), params.getFirst("PhysicalResourceId"), region);
+            // The stack's own name, not what the caller passed: it may be an ARN, or absent
+            // entirely when the call named only a PhysicalResourceId.
+            return stackResourcesXml(view.resources(), view.stackName(), region);
         } catch (AwsException e) {
             return xmlError(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
         }

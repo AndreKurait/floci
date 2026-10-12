@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.eks;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -272,8 +273,7 @@ public class EksPodIdentityAssociationService {
                 .toList();
 
         String token = remaining.size() > limit
-                ? Base64.getUrlEncoder().withoutPadding().encodeToString(
-                        (prefix + "\n" + page.getLast().associationId()).getBytes(StandardCharsets.UTF_8))
+                ? Base64Url.encode(prefix + "\n" + page.getLast().associationId())
                 : null;
 
         return new Page(page, token);

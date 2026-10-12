@@ -1,9 +1,9 @@
 package io.github.hectorvent.floci.services.ecs.exec;
 
+import io.github.hectorvent.floci.core.common.Digests;
+
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.UUID;
 
@@ -79,7 +79,7 @@ public record AgentMessage(
         buffer.putLong(flags);
         buffer.putLong(messageId.getLeastSignificantBits());
         buffer.putLong(messageId.getMostSignificantBits());
-        buffer.put(sha256(body));
+        buffer.put(Digests.sha256(body));
         buffer.putInt(payloadType);
         buffer.putInt(body.length);
         buffer.put(body);
@@ -124,13 +124,5 @@ public record AgentMessage(
         byte[] raw = messageType.getBytes(StandardCharsets.UTF_8);
         System.arraycopy(raw, 0, padded, 0, Math.min(raw.length, MESSAGE_TYPE_LENGTH));
         return padded;
-    }
-
-    private static byte[] sha256(byte[] input) {
-        try {
-            return MessageDigest.getInstance("SHA-256").digest(input);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is required to frame a Session Manager message", e);
-        }
     }
 }

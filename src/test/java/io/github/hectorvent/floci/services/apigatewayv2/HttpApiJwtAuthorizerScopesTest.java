@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.apigatewayv2;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
 import org.junit.jupiter.api.AfterAll;
@@ -269,15 +270,13 @@ class HttpApiJwtAuthorizerScopesTest {
     // ──────────────────────────── Helpers ────────────────────────────
 
     private static String signedToken(Map<String, Object> claims) throws Exception {
-        Base64.Encoder enc = Base64.getUrlEncoder().withoutPadding();
-        String header = enc.encodeToString(
-                ("{\"alg\":\"RS256\",\"typ\":\"JWT\",\"kid\":\"" + KEY_ID + "\"}").getBytes(StandardCharsets.UTF_8));
-        String payload = enc.encodeToString(MAPPER.writeValueAsBytes(claims));
+        String header = Base64Url.encode("{\"alg\":\"RS256\",\"typ\":\"JWT\",\"kid\":\"" + KEY_ID + "\"}");
+        String payload = Base64Url.encode(MAPPER.writeValueAsBytes(claims));
         String signingInput = header + "." + payload;
         Signature signature = Signature.getInstance("SHA256withRSA");
         signature.initSign(privateKey);
         signature.update(signingInput.getBytes(StandardCharsets.UTF_8));
-        return signingInput + "." + enc.encodeToString(signature.sign());
+        return signingInput + "." + Base64Url.encode(signature.sign());
     }
 
     private static long farFuture() {
@@ -289,7 +288,7 @@ class HttpApiJwtAuthorizerScopesTest {
         if (bytes.length > 1 && bytes[0] == 0) {
             bytes = java.util.Arrays.copyOfRange(bytes, 1, bytes.length);
         }
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        return Base64Url.encode(bytes);
     }
 
     private static byte[] zipEntries(Map<String, String> entries) throws Exception {

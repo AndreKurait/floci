@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AvailabilityZoneIds;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartition;
+import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CidrCanonicalizer;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
@@ -145,7 +146,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     /**
      * The availability zones every region is modelled with. DescribeAvailabilityZones publishes
      * exactly these, the seeded default subnets sit in them, and CreateSubnet refuses a zone id
-     * outside them, so the three cannot drift apart.
+     * outside them, so they cannot drift apart.
      */
     private static final String[] MODELLED_ZONE_SUFFIXES = {"a", "b", "c"};
     private static final DateTimeFormatter ISO_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
@@ -213,6 +214,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private static final Set<String> EGRESS_ONLY_INTERNET_GATEWAY_FILTERS = Set.of(
             "attachment.state", "attachment.vpc-id",
             "egress-only-internet-gateway-id", "tag-key", "tag-value");
+    private static final Set<String> AVAILABILITY_ZONE_FILTERS = Set.of(
+            "group-long-name", "group-name", "message", "opt-in-status",
+            "parent-zone-id", "parent-zone-name", "region-name", "state",
+            "zone-id", "zone-name", "zone-type");
     private static final Set<String> SPOT_PRICE_HISTORY_FILTERS = Set.of(
             "availability-zone", "availability-zone-id",
             "instance-type", "product-description",
@@ -4624,10 +4629,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (options == null) {
             return;
         }
-        requireMetadataOptionValue("HttpTokens", options.getHttpTokens(), "optional", "required");
-        requireMetadataOptionValue("HttpEndpoint", options.getHttpEndpoint(), "enabled", "disabled");
-        requireMetadataOptionValue("HttpProtocolIpv6", options.getHttpProtocolIpv6(), "enabled", "disabled");
-        requireMetadataOptionValue("InstanceMetadataTags", options.getInstanceMetadataTags(), "enabled", "disabled");
+        requireParameterValue("HttpTokens", options.getHttpTokens(), "optional", "required");
+        requireParameterValue("HttpEndpoint", options.getHttpEndpoint(), "enabled", "disabled");
+        requireParameterValue("HttpProtocolIpv6", options.getHttpProtocolIpv6(), "enabled", "disabled");
+        requireParameterValue("InstanceMetadataTags", options.getInstanceMetadataTags(), "enabled", "disabled");
         Integer hopLimit = options.getHttpPutResponseHopLimit();
         if (hopLimit != null && (hopLimit < 1 || hopLimit > 64)) {
             throw new AwsException("InvalidParameterValue",
@@ -4636,7 +4641,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
-    private static void requireMetadataOptionValue(String parameter, String value, String... allowed) {
+    /** Rejects a value outside an enumerated parameter's allowed set with EC2's InvalidParameterValue. */
+    private static void requireParameterValue(String parameter, String value, String... allowed) {
         if (value == null || List.of(allowed).contains(value)) {
             return;
         }
@@ -4779,8 +4785,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
                          boolean amazonProvidedIpv6CidrBlock) {
+        return createVpc(region, requestedCidrBlock, isDefault, amazonProvidedIpv6CidrBlock, null);
+    }
+
+    /**
+     * CreateVpc takes {@code default} or {@code dedicated} only: "The host value cannot be used with
+     * this parameter" (https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateVpc.html).
+     */
+    private static String requireVpcTenancy(String instanceTenancy) {
+        // Only an absent parameter defaults; a present blank is not one of the enum values.
+        String tenancy = instanceTenancy == null ? "default" : instanceTenancy;
+        requireParameterValue("instanceTenancy", tenancy, "default", "dedicated");
+        return tenancy;
+    }
+
+    /**
+     * @param instanceTenancy {@code default} or {@code dedicated} as CreateVpc's
+     *                        InstanceTenancy parameter; null means {@code default}.
+     */
+    public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
+                         boolean amazonProvidedIpv6CidrBlock, String instanceTenancy) {
         // AWS stores the CIDR in canonical form: "100.68.0.18/18" becomes "100.68.0.0/18".
         String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
+        rejectOutOfRangePrefix(cidrBlock, "InvalidVpc.Range");
         ensureDefaultResources(region);
         String vpcId = "vpc-" + randomHex(8);
         Vpc vpc = new Vpc();
@@ -4788,6 +4815,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         vpc.setCidrBlock(cidrBlock);
         vpc.setState("available");
         vpc.setDefault(isDefault);
+        vpc.setInstanceTenancy(requireVpcTenancy(instanceTenancy));
         vpc.setOwnerId(callerAccountId());
         vpc.setRegion(region);
         vpc.getCidrBlockAssociationSet().add(
@@ -4809,7 +4837,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // matchesFilters answers true for a name it does not recognise, so without this an
         // unsupported filter matches every VPC instead of narrowing anything. Real EC2 rejects the
         // name outright, which is the difference between a wrong result and an error.
-        requireSupportedFilters(filters, VPC_FILTERS);
+        requireSupportedFilters(filters.keySet(), VPC_FILTERS);
         return vpcs.scan(k -> true).stream()
                 .filter(v -> v.getRegion().equals(region))
                 .filter(v -> vpcIds.isEmpty() || vpcIds.contains(v.getVpcId()))
@@ -4819,7 +4847,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<String> describeVpnGatewayIds(
             List<String> gatewayIds, Map<String, List<String>> filters) {
-        requireSupportedFilters(filters, VPN_GATEWAY_FILTERS);
+        requireSupportedFilters(filters.keySet(), VPN_GATEWAY_FILTERS);
         if (!gatewayIds.isEmpty()) {
             throw new AwsException("InvalidVpnGatewayID.NotFound",
                     "The vpnGateway ID '" + gatewayIds.getFirst() + "' does not exist", 400);
@@ -4830,12 +4858,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // AWS answers an unknown egress-only gateway ID with an empty set, not an error; callers such as
     // the Terraform provider treat the empty result as "not found".
     public List<String> describeEgressOnlyInternetGatewayIds(Map<String, List<String>> filters) {
-        requireSupportedFilters(filters, EGRESS_ONLY_INTERNET_GATEWAY_FILTERS);
+        requireSupportedFilters(filters.keySet(), EGRESS_ONLY_INTERNET_GATEWAY_FILTERS);
         return List.of();
     }
 
-    private void requireSupportedFilters(Map<String, List<String>> filters, Set<String> supportedFilters) {
-        filters.keySet().stream()
+    private void requireSupportedFilters(Collection<String> filterNames, Set<String> supportedFilters) {
+        filterNames.stream()
                 .filter(name -> !supportedFilters.contains(name)
                         && !(supportedFilters.contains("tag-key") && name.startsWith("tag:")))
                 .findFirst()
@@ -4953,6 +4981,27 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         vpcs.put(key(region, vpcId), vpc);
     }
 
+    /**
+     * ModifyVpcTenancy: only {@code dedicated} to {@code default} is allowed, as on AWS
+     * (https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyVpcTenancy.html).
+     */
+    public void modifyVpcTenancy(String region, String vpcId, String instanceTenancy) {
+        ensureDefaultResources(region);
+        Vpc vpc = getRequiredVpc(region, vpcId);
+        if (!"default".equals(instanceTenancy)) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value (" + instanceTenancy + ") for parameter instanceTenancy is invalid. "
+                            + "Only 'default' is supported.", 400);
+        }
+        if (!"dedicated".equals(vpc.getInstanceTenancy())) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value (" + instanceTenancy + ") for parameter instanceTenancy is invalid. "
+                            + "The instance tenancy of a VPC can only be changed from 'dedicated' to 'default'.", 400);
+        }
+        vpc.setInstanceTenancy(instanceTenancy);
+        vpcs.put(key(region, vpcId), vpc);
+    }
+
     public Vpc describeVpcAttribute(String region, String vpcId, String attribute) {
         ensureDefaultResources(region);
         Vpc vpc = getRequiredVpc(region, vpcId);
@@ -4970,6 +5019,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public VpcCidrBlockAssociation associateVpcCidrBlock(String region, String vpcId, String cidrBlock) {
+        rejectOutOfRangePrefix(cidrBlock, "InvalidVpc.Range");
         ensureDefaultResources(region);
         synchronized (attachmentTopologyLock(region)) {
             synchronized (lockFor(key(region, vpcId))) {
@@ -5726,7 +5776,18 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     private String resolveSubnetZoneName(String region, String availabilityZone, String availabilityZoneId) {
         if (!isSet(availabilityZoneId)) {
-            return isSet(availabilityZone) ? availabilityZone : region + "a";
+            String zoneName = isSet(availabilityZone) ? availabilityZone : region + "a";
+            boolean zoneExists = Arrays.stream(MODELLED_ZONE_SUFFIXES)
+                    .anyMatch(suffix -> zoneName.equals(region + suffix));
+            if (!zoneExists) {
+                throw new AwsException("InvalidParameterValue",
+                        "Value (" + zoneName + ") for parameter availabilityZone is invalid. Subnets can "
+                                + "currently only be created in the following availability zones: "
+                                + Arrays.stream(MODELLED_ZONE_SUFFIXES)
+                                        .map(suffix -> region + suffix)
+                                        .collect(Collectors.joining(", ")) + ".", 400);
+            }
+            return zoneName;
         }
         String fromId = zoneNameForZoneId(region, availabilityZoneId);
         if (isSet(availabilityZone) && !availabilityZone.equals(fromId)) {
@@ -5778,6 +5839,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     "Ipv6CidrBlock can only be specified for a subnet in a VPC with an associated "
                             + "IPv6 CIDR block. VPC " + vpcId + " has none.", 400);
         }
+
+        rejectOutOfRangePrefix(cidrBlock, "InvalidSubnet.Range");
 
         String zoneName = resolveSubnetZoneName(region, availabilityZone, availabilityZoneId);
 
@@ -5838,6 +5901,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         .anyMatch(block -> Ipv4Cidrs.contains(block, cidrBlock)));
         if (!contained) {
             throw new AwsException("InvalidSubnet.Range", "The CIDR '" + cidrBlock + "' is invalid.", 400);
+        }
+    }
+
+    /**
+     * The VPC User Guide limits an IPv4 VPC block, primary or secondary, and an IPv4 subnet to a
+     * prefix between /16 and /28 ("The allowed block size is between a /28 netmask and /16
+     * netmask."), and AWS answers anything else with InvalidVpc.Range or InvalidSubnet.Range, which
+     * the caller passes as {@code errorCode}. Requests with no IPv4 CIDR, or one that does not parse,
+     * are left to the checks that already handle them.
+     */
+    private void rejectOutOfRangePrefix(String cidrBlock, String errorCode) {
+        int[] range = cidrRange(cidrBlock);
+        if (range == null) {
+            return;
+        }
+        int prefix = range[1];
+        if (prefix < 16 || prefix > 28) {
+            throw new AwsException(errorCode, "The CIDR '" + cidrBlock + "' is invalid.", 400);
         }
     }
 
@@ -9799,19 +9880,105 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     // ─── Availability Zones & Regions ─────────────────────────────────────────
 
-    public List<Map<String, String>> describeAvailabilityZones(String region) {
-        List<Map<String, String>> zones = new ArrayList<>();
+    public List<Map<String, String>> describeAvailabilityZones(String region, List<String> zoneNames,
+                                                           List<String> zoneIds,
+                                                           List<Map.Entry<String, List<String>>> filters) {
+        List<Map<String, String>> allZones = new ArrayList<>();
         String[] azSuffixes = MODELLED_ZONE_SUFFIXES;
         for (String suffix : azSuffixes) {
+            String zoneName = region + suffix;
             Map<String, String> az = new LinkedHashMap<>();
-            az.put("zoneName", region + suffix);
+            az.put("zoneName", zoneName);
             az.put("state", "available");
             az.put("regionName", region);
-            az.put("zoneId", AvailabilityZoneIds.forZoneName(region, region + suffix));
+            az.put("zoneId", AvailabilityZoneIds.forZoneName(region, zoneName));
             az.put("zoneType", "availability-zone");
-            zones.add(az);
+            az.put("optInStatus", "opt-in-not-required");
+            az.put("groupName", zoneGroupName(region));
+            az.put("groupLongName", zoneGroupLongName(region));
+            allZones.add(az);
         }
-        return zones;
+
+        // Filter by ZoneName
+        if (!zoneNames.isEmpty()) {
+            Set<String> requestedNames = new HashSet<>(zoneNames);
+            for (String requestedName : requestedNames) {
+                boolean found = false;
+                for (Map<String, String> az : allZones) {
+                    if (requestedName.equals(az.get("zoneName"))) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    throw new AwsException("InvalidParameterValue",
+                            "The zone name '" + requestedName + "' is not valid for this region.", 400);
+                }
+            }
+            allZones.removeIf(az -> !requestedNames.contains(az.get("zoneName")));
+        }
+
+        // Filter by ZoneId: an id this region does not publish is a client error, exactly
+        // as an unknown ZoneName is, rather than a silent empty result.
+        if (!zoneIds.isEmpty()) {
+            Set<String> requestedIds = new HashSet<>(zoneIds);
+            Set<String> publishedIds = allZones.stream()
+                    .map(az -> az.get("zoneId"))
+                    .collect(Collectors.toSet());
+            for (String requestedId : requestedIds) {
+                if (!publishedIds.contains(requestedId)) {
+                    throw new AwsException("InvalidParameterValue",
+                            "The zone ID '" + requestedId + "' is not valid for this region.", 400);
+                }
+            }
+            allZones.removeIf(az -> !requestedIds.contains(az.get("zoneId")));
+        }
+
+        // Apply filters
+        if (filters != null && !filters.isEmpty()) {
+            requireSupportedFilters(filters.stream().map(Map.Entry::getKey).toList(),
+                    AVAILABILITY_ZONE_FILTERS);
+            for (Map.Entry<String, List<String>> filter : filters) {
+                allZones.removeIf(az -> !zoneMatchesFilter(az, filter.getKey(), filter.getValue()));
+            }
+        }
+
+        return allZones;
+    }
+
+    private boolean zoneMatchesFilter(Map<String, String> az, String filterName, List<String> values) {
+        return switch (filterName) {
+            case "zone-name" -> matchesValue(az.get("zoneName"), values);
+            case "zone-id" -> matchesValue(az.get("zoneId"), values);
+            case "zone-type" -> matchesValue(az.get("zoneType"), values);
+            case "state" -> matchesValue(az.get("state"), values);
+            case "region-name" -> matchesValue(az.get("regionName"), values);
+            case "group-name" -> matchesValue(az.get("groupName"), values);
+            case "group-long-name" -> matchesValue(az.get("groupLongName"), values);
+            case "opt-in-status" -> matchesValue(az.get("optInStatus"), values);
+            case "message", "parent-zone-id", "parent-zone-name" -> matchesValue("", values);
+            default -> true;
+        };
+    }
+
+    /**
+     * The zone group of the Availability Zones in a Region. AWS renamed this from the bare
+     * Region code to {@code <region>-zg-1} in October 2024, so the group name is now
+     * distinguishable from a Local Zone group such as {@code us-west-2-lax-1}.
+     */
+    private static String zoneGroupName(String region) {
+        return region + "-zg-1";
+    }
+
+    /**
+     * The long name of an Availability Zone group, which AWS forms from the Region's display
+     * name and the group number, for example {@code US East (N. Virginia) 1}.
+     */
+    private static String zoneGroupLongName(String region) {
+        return AwsPartitions.forRegionOrCommercial(region)
+                .region(region)
+                .map(AwsPartition.Region::description)
+                .orElse(region) + " 1";
     }
 
     /**
@@ -9863,7 +10030,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 : "availability-zone";
         List<String> locations = "region".equals(effectiveLocationType)
                 ? List.of(region)
-                : describeAvailabilityZones(region).stream()
+                : describeAvailabilityZones(region, List.of(), List.of(), null).stream()
                         .map(zone -> zone.get("zoneName"))
                         .toList();
         List<String> locationFilter = filters != null ? filters.get("location") : null;
@@ -11538,7 +11705,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                          Instant endTime,
                                          Map<String, List<String>> filters) {
         if (filters != null && !filters.isEmpty()) {
-            requireSupportedFilters(filters, SPOT_PRICE_HISTORY_FILTERS);
+            requireSupportedFilters(filters.keySet(), SPOT_PRICE_HISTORY_FILTERS);
         }
         if (productDescriptions != null) {
             for (String desc : productDescriptions) {
@@ -11589,7 +11756,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             return new SpotPriceHistoryResult(List.of(), null);
         }
 
-        List<Map<String, String>> zones = describeAvailabilityZones(region);
+        List<Map<String, String>> zones = describeAvailabilityZones(region, List.of(), List.of(), null);
         if (availabilityZone != null) {
             zones = zones.stream()
                     .filter(z -> availabilityZone.equals(z.get("zoneName")))

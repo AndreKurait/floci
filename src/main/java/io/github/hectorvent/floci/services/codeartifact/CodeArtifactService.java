@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -36,7 +38,6 @@ import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -572,7 +573,7 @@ public class CodeArtifactService implements Resettable {
                     "The maximum asset file size is 5 Gigabytes.", 402,
                     resourceFields(assetName, "asset"));
         }
-        String actualSha256 = sha256Hex(assetContent);
+        String actualSha256 = Digests.sha256Hex(assetContent);
         if (!assetSha256.equalsIgnoreCase(actualSha256)) {
             throw validation("assetSHA256 does not match the SHA-256 hash of the uploaded content.");
         }
@@ -1004,7 +1005,7 @@ public class CodeArtifactService implements Resettable {
         }
         String repoId = ensureFormatContainerId(format, region, domain, owner, repository);
         String revisionKey = repoId + "/" + (namespace == null ? "" : namespace) + "/" + packageName + "/" + version;
-        String revision = sha256Hex(revisionKey.getBytes(StandardCharsets.UTF_8));
+        String revision = Digests.sha256Hex(revisionKey.getBytes(StandardCharsets.UTF_8));
         if (packageVersionRevision != null && !packageVersionRevision.equals(revision)) {
             throw notFound("Package version '" + version + "' was not found at revision '"
                     + packageVersionRevision + "'.", version, "package-version");
@@ -1076,7 +1077,7 @@ public class CodeArtifactService implements Resettable {
     private static String generateAuthorizationToken() {
         byte[] bytes = new byte[TOKEN_RANDOM_BYTES];
         new SecureRandom().nextBytes(bytes);
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        return Base64Url.encode(bytes);
     }
 
     // -------------------------------------------------------------------- tags
@@ -1349,7 +1350,7 @@ public class CodeArtifactService implements Resettable {
                                          String expectedSha256) {
         if (inMemory) {
             byte[] existing = memoryAssetStore.get(assetStoreKey(owner, packageVersionKey, assetName));
-            return existing != null && expectedSha256.equalsIgnoreCase(sha256Hex(existing));
+            return existing != null && expectedSha256.equalsIgnoreCase(Digests.sha256Hex(existing));
         }
         Path filePath = resolveAssetPath(owner, packageVersionKey, assetName);
         try (InputStream in = Files.newInputStream(filePath)) {
@@ -1428,8 +1429,8 @@ public class CodeArtifactService implements Resettable {
      */
     private Path resolveAssetPath(String owner, String packageVersionKey, String assetName) {
         return assetRoot.resolve(owner)
-                .resolve(sha256Hex(packageVersionKey.getBytes(StandardCharsets.UTF_8)))
-                .resolve(sha256Hex(assetName.getBytes(StandardCharsets.UTF_8)));
+                .resolve(Digests.sha256Hex(packageVersionKey.getBytes(StandardCharsets.UTF_8)))
+                .resolve(Digests.sha256Hex(assetName.getBytes(StandardCharsets.UTF_8)));
     }
 
     private void deleteAssetRoot() {
@@ -1490,14 +1491,6 @@ public class CodeArtifactService implements Resettable {
             hashes.put(algorithm, SigV4RequestValidator.hexEncode(digest(algorithm, content)));
         }
         return hashes;
-    }
-
-    private static String sha256Hex(byte[] content) {
-        try {
-            return SigV4RequestValidator.sha256Hex(content);
-        } catch (Exception e) {
-            throw new IllegalStateException("JVM does not support SHA-256", e);
-        }
     }
 
     private static byte[] digest(String algorithm, byte[] content) {

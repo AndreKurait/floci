@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.route53;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -602,7 +603,7 @@ public class Route53Service implements Resettable {
         }
         String normalizedQname = normalizeName(qname).toLowerCase();
         if (privateZoneNameCounts.isEmpty()
-                || privateZoneNameCounts.keySet().stream().noneMatch(z -> normalizedQname.equals(z) || normalizedQname.endsWith("." + z))) {
+                || privateZoneNameCounts.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
             return false;
         }
         for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
@@ -611,7 +612,7 @@ public class Route53Service implements Resettable {
                 continue;
             }
             String zoneName = normalizeName(zone.getName()).toLowerCase();
-            if (normalizedQname.equals(zoneName) || normalizedQname.endsWith("." + zoneName)) {
+            if (DomainNames.isWithin(normalizedQname, zoneName)) {
                 return true;
             }
         }
@@ -696,7 +697,7 @@ public class Route53Service implements Resettable {
     /** The private zones with the longest name containing {@code normalizedQname}, so a parent zone never answers for a child. */
     private List<OwnedZone> mostSpecificPrivateZones(String normalizedQname) {
         if (privateZoneNameCounts.isEmpty()
-                || privateZoneNameCounts.keySet().stream().noneMatch(z -> normalizedQname.equals(z) || normalizedQname.endsWith("." + z))) {
+                || privateZoneNameCounts.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
             return List.of();
         }
         List<OwnedZone> matchingZones = new ArrayList<>();
@@ -707,7 +708,7 @@ public class Route53Service implements Resettable {
                 continue;
             }
             String zoneName = normalizeName(zone.getName()).toLowerCase();
-            if (!normalizedQname.equals(zoneName) && !normalizedQname.endsWith("." + zoneName)) {
+            if (!DomainNames.isWithin(normalizedQname, zoneName)) {
                 continue;
             }
             if (zoneName.length() > maxZoneLength) {

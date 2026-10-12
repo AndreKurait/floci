@@ -1,17 +1,23 @@
 package io.github.hectorvent.floci.services.ssm;
 
+import io.github.hectorvent.floci.testing.EnforcementFixtures;
 import io.github.hectorvent.floci.testing.IamEnforcementProfile;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.net.URI;
 import java.util.Map;
 import java.util.UUID;
 
+import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 
@@ -24,8 +30,13 @@ import static org.hamcrest.Matchers.equalTo;
 @TestProfile(IamEnforcementProfile.class)
 class SsmSecretsManagerReferenceIamEnforcementIntegrationTest {
 
+    @TestHTTPResource("/")
+    static URI baseUri;
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
+
     private static final String ACCOUNT_ID = "000000000000";
-    private static final String REGION = "us-east-1";
     private static final String PREFIX = "/aws/reference/secretsmanager/";
     private static final String DEPENDENCY_FAILED = "An error occurred while calling one AWS dependency service.";
     private static final String SSM_ONLY = """
@@ -107,19 +118,18 @@ class SsmSecretsManagerReferenceIamEnforcementIntegrationTest {
         return name;
     }
 
-    private static String createUserWithPolicy(String prefix, String policyDocument) {
+    private String createUserWithPolicy(String prefix, String policyDocument) {
         String userName = prefix + "-" + UUID.randomUUID().toString().substring(0, 8);
-        adminIam(Map.of("Action", "CreateUser", "UserName", userName)).statusCode(200);
+        String accessKeyId = EnforcementFixtures.createUser(cleanup, baseUri.getPort(),
+                auth(ACCOUNT_ID, "iam"), userName).accessKeyId();
         adminIam(Map.of("Action", "PutUserPolicy", "UserName", userName, "PolicyName", "inline",
                 "PolicyDocument", policyDocument)).statusCode(200);
-        return adminIam(Map.of("Action", "CreateAccessKey", "UserName", userName))
-            .statusCode(200)
-            .extract().path("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
+        return accessKeyId;
     }
 
     private static ValidatableResponse adminIam(Map<String, String> params) {
         RequestSpecification spec = given()
-            .header("Authorization", authorization(ACCOUNT_ID, "iam"))
+            .header("Authorization", auth(ACCOUNT_ID, "iam"))
             .contentType("application/x-www-form-urlencoded")
             .formParam("Version", "2010-05-08");
         params.forEach(spec::formParam);
@@ -132,15 +142,11 @@ class SsmSecretsManagerReferenceIamEnforcementIntegrationTest {
 
     private static ValidatableResponse json(String accessKeyId, String scope, String target, String body) {
         return given()
-            .header("Authorization", authorization(accessKeyId, scope))
+            .header("Authorization", auth(accessKeyId, scope))
             .header("X-Amz-Target", target)
             .contentType("application/x-amz-json-1.1")
             .body(body)
         .when().post("/").then();
     }
 
-    private static String authorization(String accessKeyId, String service) {
-        return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260928/" + REGION + "/" + service
-                + "/aws4_request, SignedHeaders=host, Signature=abc";
-    }
 }

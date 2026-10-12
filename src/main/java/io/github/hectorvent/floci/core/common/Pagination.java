@@ -100,7 +100,7 @@ public final class Pagination {
     }
 
     private static String encodeToken(String cursor) {
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(cursor.getBytes(StandardCharsets.UTF_8));
+        return Base64Url.encode(cursor);
     }
 
     private static String decodeCursor(String token, String prefix,

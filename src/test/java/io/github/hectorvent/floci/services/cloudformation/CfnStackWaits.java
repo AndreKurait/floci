@@ -74,6 +74,50 @@ final class CfnStackWaits {
     }
 
     /**
+     * Waits until DescribeStacks reports {@code expectedStatus} and returns that state. Unlike
+     * {@link #awaitTerminal}, a rollback is waited out: a stack rolling back shows CREATE_FAILED or
+     * UPDATE_FAILED for a moment before ROLLBACK_IN_PROGRESS, so while a rollback status is expected
+     * only a failed rollback is final. Any other terminal status fails at once with its reason, as
+     * do a DescribeStacks that is not 200 and ten seconds without the expected status.
+     */
+    static StackState awaitStatus(String stackName, String expectedStatus) {
+        long deadline = System.currentTimeMillis() + 10_000;
+        boolean rollbackExpected = expectedStatus.contains("ROLLBACK");
+        StackState last = new StackState(null, "");
+        while (System.currentTimeMillis() < deadline) {
+            Response response = given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DescribeStacks")
+                .formParam("StackName", stackName)
+                .when().post("/");
+            if (response.statusCode() != 200) {
+                fail("DescribeStacks " + stackName + " answered " + response.statusCode() + ": " + response.asString());
+            }
+            XmlPath xml = response.xmlPath();
+            String status = xml.getString("**.find { it.name() == 'StackStatus' }");
+            String reason = xml.getString("**.find { it.name() == 'StackStatusReason' }");
+            last = new StackState(status == null || status.isEmpty() ? null : status, reason == null ? "" : reason);
+            if (expectedStatus.equals(last.status())) {
+                return last;
+            }
+            boolean onTheWayToRollback = rollbackExpected
+                    && ("CREATE_FAILED".equals(last.status()) || "UPDATE_FAILED".equals(last.status()));
+            if (last.status() != null && TERMINAL.contains(last.status()) && !onTheWayToRollback) {
+                fail("Stack " + stackName + " reached " + last.status() + " instead of " + expectedStatus
+                        + ": " + last.reason());
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("Interrupted while waiting for stack " + stackName, e);
+            }
+        }
+        fail("Stack " + stackName + " did not reach " + expectedStatus + " within ten seconds, last: " + last);
+        return last;
+    }
+
+    /**
      * Waits until DescribeStacks answers 400, which is how a missing stack is reported. Fails on
      * DELETE_FAILED or after ten seconds.
      */

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
@@ -1846,12 +1847,7 @@ class KmsServiceTest {
     void signWithDigestMessageTypeMatchesRawSignature() {
         KmsKey key = kmsService.createKey("rsa digest key", "SIGN_VERIFY", "RSA_2048", null, Map.of(), REGION);
         byte[] message = "deterministic pkcs1".getBytes(StandardCharsets.UTF_8);
-        byte[] digest;
-        try {
-            digest = MessageDigest.getInstance("SHA-256").digest(message);
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        byte[] digest = Digests.sha256(message);
 
         // PKCS#1 v1.5 is deterministic, so signing the digest (DIGEST) and signing the
         // message (RAW) with the same algorithm must produce identical signatures.
@@ -1866,7 +1862,7 @@ class KmsServiceTest {
     void signWithDigestMessageTypePssVerifiesWithExternalVerifier() throws Exception {
         KmsKey key = kmsService.createKey("rsa pss digest key", "SIGN_VERIFY", "RSA_2048", null, Map.of(), REGION);
         byte[] message = "floci kms pss round-trip".getBytes(StandardCharsets.UTF_8);
-        byte[] digest = MessageDigest.getInstance("SHA-256").digest(message);
+        byte[] digest = Digests.sha256(message);
 
         byte[] sig = kmsService.sign(key.getKeyId(), digest,
                 "RSASSA_PSS_SHA_256", KmsMessageType.DIGEST, REGION);

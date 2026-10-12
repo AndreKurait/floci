@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayExecuteApiHostFilter;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
@@ -25,6 +26,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Vert.x-based WebSocket handler for API Gateway v2 WebSocket APIs.
@@ -707,8 +709,8 @@ public class WebSocketHandler {
      */
     private static String generateConnectionId() {
         byte[] bytes = new byte[9];
-        java.util.concurrent.ThreadLocalRandom.current().nextBytes(bytes);
-        return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        ThreadLocalRandom.current().nextBytes(bytes);
+        return Base64Url.encode(bytes);
     }
 
     /**

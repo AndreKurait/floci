@@ -177,4 +177,42 @@ class Ec2SubnetAvailabilityZoneIdIntegrationTest {
             .statusCode(400)
             .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
     }
+
+    @Test
+    void aNonModeledZoneNameIsRefused() {
+        given()
+            .formParam("Action", "CreateSubnet")
+            .formParam("VpcId", vpcId)
+            .formParam("CidrBlock", "10.90.8.0/24")
+            .formParam("AvailabilityZone", "us-east-1-custom")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
+            .body("Response.Errors.Error.Message", containsString(
+                    "Value (us-east-1-custom) for parameter availabilityZone is invalid. Subnets can "
+                            + "currently only be created in the following availability zones: "
+                            + "us-east-1a, us-east-1b, us-east-1c."));
+    }
+
+    @Test
+    void aZoneNameBeyondModeledRangeIsRefused() {
+        given()
+            .formParam("Action", "CreateSubnet")
+            .formParam("VpcId", vpcId)
+            .formParam("CidrBlock", "10.90.9.0/24")
+            .formParam("AvailabilityZone", "us-east-1aa")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
+            .body("Response.Errors.Error.Message", containsString(
+                    "Value (us-east-1aa) for parameter availabilityZone is invalid. Subnets can "
+                            + "currently only be created in the following availability zones: "
+                            + "us-east-1a, us-east-1b, us-east-1c."));
+    }
 }

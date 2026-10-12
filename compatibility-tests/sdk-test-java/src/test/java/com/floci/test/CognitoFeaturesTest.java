@@ -454,6 +454,21 @@ class CognitoFeaturesTest {
         assertThat(sub.mutable()).isFalse();
     }
 
+    @Test
+    @Order(56)
+    void describeUserPoolReturnsItsPrefixDomain() {
+        String domain = "compat-" + UUID.randomUUID().toString().replace("-", "").substring(0, 20);
+        cognito.createUserPoolDomain(b -> b.domain(domain).userPoolId(poolId));
+
+        try {
+            UserPoolType userPool = cognito.describeUserPool(b -> b.userPoolId(poolId)).userPool();
+            assertThat(userPool.domain()).isEqualTo(domain);
+            assertThat(userPool.customDomain()).isNull();
+        } finally {
+            cognito.deleteUserPoolDomain(b -> b.domain(domain).userPoolId(poolId));
+        }
+    }
+
     // ── AdminRespondToAuthChallenge ─────────────────────────────────────────
 
     @Test

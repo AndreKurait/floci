@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.appsync.graphql.auth;
 import io.github.hectorvent.floci.core.common.AccountResolver;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.auth.CredentialScope;
 import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
@@ -128,12 +129,12 @@ public class IamAuthValidator {
         checkSessionToken(accessKeyId, info.requestHeaders());
         try {
             String canonicalUri = "/v1/apis/" + apiId + "/graphql";
-            String payloadHash = SigV4RequestValidator.sha256Hex(info.rawBody().getBytes(StandardCharsets.UTF_8));
+            String payloadHash = Digests.sha256Hex(info.rawBody().getBytes(StandardCharsets.UTF_8));
             String canonicalHeaders = canonicalHeaders(signed.signedHeaders(), info.requestHeaders());
             String canonicalRequest = "POST\n" + canonicalUri + "\n\n"
                     + canonicalHeaders + "\n" + signed.signedHeaders() + "\n" + payloadHash;
             String stringToSign = ALGORITHM + "\n" + signed.amzDate() + "\n" + scope.credentialScope() + "\n"
-                    + SigV4RequestValidator.sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
+                    + Digests.sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
             byte[] signingKey = SigV4RequestValidator.deriveSigningKey(
                     secretKey, scope.date(), scope.region(), scope.service());
             String expected = SigV4RequestValidator.hexEncode(

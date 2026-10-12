@@ -162,7 +162,8 @@ public class AwsQueryController {
             "DescribeScalingActivities",
             "DescribeAutoScalingNotificationTypes", "DescribeTerminationPolicyTypes",
             "DescribeAdjustmentTypes", "DescribeAccountLimits",
-            "DescribeLifecycleHookTypes", "DescribeMetricCollectionTypes"
+            "DescribeLifecycleHookTypes", "DescribeMetricCollectionTypes",
+            "EnableMetricsCollection", "DisableMetricsCollection"
     );
 
     private static final Set<String> ELB_V2_ACTIONS = Set.of(

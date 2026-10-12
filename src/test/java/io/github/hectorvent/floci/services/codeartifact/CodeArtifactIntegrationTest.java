@@ -1,6 +1,6 @@
 package io.github.hectorvent.floci.services.codeartifact;
 
-import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.BeforeAll;
@@ -147,7 +147,7 @@ class CodeArtifactIntegrationTest {
                 .body("{}").post("/v1/repository?domain=pkg-domain&repository=pkg-repo").then().statusCode(200);
 
         byte[] content = "hello codeartifact".getBytes(StandardCharsets.UTF_8);
-        String sha256 = sha256Hex(content);
+        String sha256 = Digests.sha256Hex(content);
 
         given().header("Authorization", AUTH).header("x-amz-content-sha256", sha256)
                 .contentType("application/octet-stream").body(content)
@@ -189,7 +189,7 @@ class CodeArtifactIntegrationTest {
         given().contentType("application/json").header("Authorization", AUTH)
                 .body("{}").post("/v1/repository?domain=describe-domain&repository=repo").then().statusCode(200);
         byte[] content = "describe".getBytes(StandardCharsets.UTF_8);
-        given().header("Authorization", AUTH).header("x-amz-content-sha256", sha256Hex(content))
+        given().header("Authorization", AUTH).header("x-amz-content-sha256", Digests.sha256Hex(content))
                 .contentType("application/octet-stream").body(content)
                 .post("/v1/package/version/publish?domain=describe-domain&repository=repo&format=generic"
                         + "&namespace=ns&package=my-pkg&version=1.0.0&asset=a.txt")
@@ -218,7 +218,7 @@ class CodeArtifactIntegrationTest {
         given().contentType("application/json").header("Authorization", AUTH)
                 .body("{}").post("/v1/repository?domain=delete-domain&repository=repo").then().statusCode(200);
         byte[] content = "delete-me".getBytes(StandardCharsets.UTF_8);
-        given().header("Authorization", AUTH).header("x-amz-content-sha256", sha256Hex(content))
+        given().header("Authorization", AUTH).header("x-amz-content-sha256", Digests.sha256Hex(content))
                 .contentType("application/octet-stream").body(content)
                 .post("/v1/package/version/publish?domain=delete-domain&repository=repo&format=generic"
                         + "&namespace=ns&package=my-pkg&version=1.0.0&asset=a.txt")
@@ -274,7 +274,7 @@ class CodeArtifactIntegrationTest {
                 .body("package.originConfiguration.restrictions.upstream", equalTo("ALLOW"));
 
         byte[] content = "blocked".getBytes(StandardCharsets.UTF_8);
-        given().header("Authorization", AUTH).header("x-amz-content-sha256", sha256Hex(content))
+        given().header("Authorization", AUTH).header("x-amz-content-sha256", Digests.sha256Hex(content))
                 .contentType("application/octet-stream").body(content)
                 .post("/v1/package/version/publish?domain=origin-config-domain&repository=repo&format=generic"
                         + "&namespace=ns&package=never-published&version=1.0.0&asset=a.txt")
@@ -301,7 +301,7 @@ class CodeArtifactIntegrationTest {
                 .body("{}").post("/v1/repository?domain=unfinished-domain&repository=repo").then().statusCode(200);
 
         byte[] content = "partial".getBytes(StandardCharsets.UTF_8);
-        String sha256 = sha256Hex(content);
+        String sha256 = Digests.sha256Hex(content);
 
         given().header("Authorization", AUTH).header("x-amz-content-sha256", sha256)
                 .contentType("application/octet-stream").body(content)
@@ -362,13 +362,5 @@ class CodeArtifactIntegrationTest {
         given().get("/codeartifact/npm/no-such-domain/no-such-repo/lodash")
                 .then().statusCode(401)
                 .header("WWW-Authenticate", equalTo("Bearer"));
-    }
-
-    private static String sha256Hex(byte[] content) {
-        try {
-            return SigV4RequestValidator.sha256Hex(content);
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
-        }
     }
 }

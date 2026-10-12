@@ -6,10 +6,18 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.s3.model.FilterRule;
+import io.github.hectorvent.floci.services.s3.model.LambdaNotification;
+import io.github.hectorvent.floci.services.s3.model.NotificationConfiguration;
+import io.github.hectorvent.floci.services.s3.model.QueueNotification;
+import io.github.hectorvent.floci.services.s3.model.TopicNotification;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -18,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -45,6 +54,9 @@ class S3CfnProvisionerTest {
             return node == null || node.isMissingNode() || node.isNull() ? null : node.asText();
         });
         when(engine.resolveNode(any())).thenAnswer(i -> i.getArgument(0));
+        when(engine.resolveNodeOmittingNoValue(any())).thenAnswer(i -> i.getArgument(0));
+        // A bucket carrying a configuration no test declares, so every declared one is a change.
+        when(s3.getBucketNotificationConfiguration(anyString())).thenReturn(queueNotification("existing"));
         ctx = new ProvisionContext(engine, REGION, "000000000000", "my-stack");
     }
 
@@ -251,6 +263,385 @@ class S3CfnProvisionerTest {
                 {"BucketName": "c"}
                 """);
         verify(s3, never()).putBucketVersioning("c", null);
+    }
+
+    private NotificationConfiguration provisionedNotifications(String json) {
+        ArgumentCaptor<NotificationConfiguration> config = ArgumentCaptor.forClass(NotificationConfiguration.class);
+        provisionBucket(json);
+        verify(s3).putBucketNotificationConfiguration(eq("b"), config.capture());
+        return config.getValue();
+    }
+
+    /**
+     * CloudFormation names one Event per entry and the API takes a list, so each entry is one API
+     * configuration. Two entries for the same function stay two configurations.
+     */
+    @Test
+    void notificationEntriesBecomeOneApiConfigurationEachWithTheirFilters() {
+        NotificationConfiguration config = provisionedNotifications("""
+                {
+                  "BucketName": "b",
+                  "NotificationConfiguration": {
+                    "QueueConfigurations": [
+                      {"Event": "s3:ObjectRemoved:*", "Queue": "arn:aws:sqs:us-east-1:000000000000:q"}
+                    ],
+                    "TopicConfigurations": [
+                      {"Event": "s3:ObjectRestore:Completed", "Topic": "arn:aws:sns:us-east-1:000000000000:t"}
+                    ],
+                    "LambdaConfigurations": [
+                      {"Event": "s3:ObjectCreated:*", "Function": "arn:aws:lambda:us-east-1:000000000000:function:f",
+                       "Filter": {"S3Key": {"Rules": [{"Name": "prefix", "Value": "images/"},
+                                                      {"Name": "suffix", "Value": ".webp"}]}}},
+                      {"Event": "s3:ObjectTagging:Put", "Function": "arn:aws:lambda:us-east-1:000000000000:function:f"}
+                    ]
+                  }
+                }
+                """);
+
+        assertEquals(List.of(new QueueNotification("", "arn:aws:sqs:us-east-1:000000000000:q",
+                List.of("s3:ObjectRemoved:*"), List.of())), config.getQueueConfigurations());
+        assertEquals(List.of(new TopicNotification("", "arn:aws:sns:us-east-1:000000000000:t",
+                List.of("s3:ObjectRestore:Completed"), List.of())), config.getTopicConfigurations());
+        assertEquals(List.of(
+                new LambdaNotification("", "arn:aws:lambda:us-east-1:000000000000:function:f",
+                        List.of("s3:ObjectCreated:*"),
+                        List.of(new FilterRule("prefix", "images/"), new FilterRule("suffix", ".webp"))),
+                new LambdaNotification("", "arn:aws:lambda:us-east-1:000000000000:function:f",
+                        List.of("s3:ObjectTagging:Put"), List.of())),
+                config.getLambdaFunctionConfigurations());
+        assertFalse(config.isEventBridgeEnabled());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"true,true", "false,false"})
+    void eventBridgeConfigurationSetsDeliveryAsDeclared(String declared, boolean enabled) {
+        NotificationConfiguration config = provisionedNotifications("""
+                {"BucketName": "b",
+                 "NotificationConfiguration": {"EventBridgeConfiguration": {"EventBridgeEnabled": %s}}}
+                """.formatted(declared));
+
+        assertEquals(enabled, config.isEventBridgeEnabled());
+    }
+
+    /**
+     * Omitted and explicitly empty differ. An undeclared configuration is left alone, as the other
+     * properties here are, so a configuration put on the bucket outside the stack survives an
+     * update. A declared empty one is applied, which clears the bucket's.
+     */
+    @Test
+    void anUndeclaredNotificationConfigurationLeavesTheBucketAlone() {
+        provisionBucket("""
+                {"BucketName": "b"}
+                """);
+
+        verify(s3, never()).putBucketNotificationConfiguration(anyString(), any());
+    }
+
+    private void updateBucket(String priorProperties, String properties) {
+        StackResource r = resource("Bucket", "AWS::S3::Bucket");
+        r.setPhysicalId("b");
+        provisioner.provision(r, props(properties), new ProvisionContext(ctx.engine(), REGION,
+                "000000000000", "my-stack", "b", event -> { }, props(priorProperties)));
+    }
+
+    /** AWS clears the configuration when an update removes the property. */
+    @Test
+    void anUpdateThatRemovesTheNotificationConfigurationClearsIt() {
+        ArgumentCaptor<NotificationConfiguration> config = ArgumentCaptor.forClass(NotificationConfiguration.class);
+
+        updateBucket("""
+                {"BucketName": "b", "NotificationConfiguration": {"QueueConfigurations": [
+                  {"Event": "s3:ObjectCreated:*", "Queue": "arn:aws:sqs:us-east-1:000000000000:q"}]}}
+                """, """
+                {"BucketName": "b"}
+                """);
+
+        verify(s3).putBucketNotificationConfiguration(eq("b"), config.capture());
+        assertTrue(config.getValue().isEmpty());
+    }
+
+    /** An update of a bucket whose template never declared the property leaves its configuration alone. */
+    @Test
+    void anUpdateOfABucketThatNeverDeclaredTheNotificationConfigurationLeavesItAlone() {
+        updateBucket("""
+                {"BucketName": "b"}
+                """, """
+                {"BucketName": "b", "Tags": [{"Key": "k", "Value": "v"}]}
+                """);
+
+        verify(s3, never()).putBucketNotificationConfiguration(anyString(), any());
+    }
+
+    @Test
+    void aDeclaredEmptyNotificationConfigurationClearsTheBucket() {
+        NotificationConfiguration config = provisionedNotifications("""
+                {"BucketName": "b", "NotificationConfiguration": {}}
+                """);
+
+        assertTrue(config.isEmpty());
+    }
+
+    /** The registry schema's required keys at each level, reported before S3 is called. */
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            {"QueueConfigurations": [{"Queue": "arn:aws:sqs:us-east-1:000000000000:q"}]}                  | #/NotificationConfiguration/QueueConfigurations/0: required key [Event] not found
+            {"QueueConfigurations": [{"Event": "s3:ObjectCreated:*"}]}                                     | #/NotificationConfiguration/QueueConfigurations/0: required key [Queue] not found
+            {"TopicConfigurations": [{"Event": "s3:ObjectCreated:*"}]}                                     | #/NotificationConfiguration/TopicConfigurations/0: required key [Topic] not found
+            {"LambdaConfigurations": [{"Event": "s3:ObjectCreated:*"}]}                                    | #/NotificationConfiguration/LambdaConfigurations/0: required key [Function] not found
+            {"LambdaConfigurations": [{"Event": "e", "Function": "f", "Filter": {}}]}                       | #/NotificationConfiguration/LambdaConfigurations/0/Filter: required key [S3Key] not found
+            {"LambdaConfigurations": [{"Event": "e", "Function": "f", "Filter": {"S3Key": {}}}]}           | #/NotificationConfiguration/LambdaConfigurations/0/Filter/S3Key: required key [Rules] not found
+            {"LambdaConfigurations": [{"Event": "e", "Function": "f", "Filter": {"S3Key": {"Rules": [{"Value": "v"}]}}}]} | #/NotificationConfiguration/LambdaConfigurations/0/Filter/S3Key/Rules/0: required key [Name] not found
+            {"LambdaConfigurations": [{"Event": "e", "Function": "f", "Filter": {"S3Key": {"Rules": [{"Name": "prefix"}]}}}]} | #/NotificationConfiguration/LambdaConfigurations/0/Filter/S3Key/Rules/0: required key [Value] not found
+            {"EventBridgeConfiguration": {}}                                                               | #/NotificationConfiguration/EventBridgeConfiguration: required key [EventBridgeEnabled] not found
+            {"EventBridgeConfiguration": {"EventBridgeEnabled": "yes"}}                                    | #/NotificationConfiguration/EventBridgeConfiguration/EventBridgeEnabled: expected type: Boolean, found: String
+            {"QueueConfigurations": {"Event": "e", "Queue": "q"}}                                           | #/NotificationConfiguration/QueueConfigurations: expected type: JSONArray, found: JSONObject
+            {"TopicConfigurations": 5}                                                                     | #/NotificationConfiguration/TopicConfigurations: expected type: JSONArray, found: Integer
+            {"LambdaConfigurations": true}                                                                 | #/NotificationConfiguration/LambdaConfigurations: expected type: JSONArray, found: Boolean
+            {"QueueConfigurations": [{"Event": ["s3:ObjectCreated:*"], "Queue": "q"}]}                      | #/NotificationConfiguration/QueueConfigurations/0/Event: expected type: String, found: JSONArray
+            {"EventBridgeConfiguration": {"EventBridgeEnabled": {"Ref": "Flag"}}}                           | #/NotificationConfiguration/EventBridgeConfiguration/EventBridgeEnabled: expected type: Boolean, found: JSONObject
+            "not-a-configuration"                                                                          | #/NotificationConfiguration: expected type: JSONObject, found: String
+            [{"QueueConfigurations": []}]                                                                  | #/NotificationConfiguration: expected type: JSONObject, found: JSONArray
+            {"QueueConfigurations": ["s3:ObjectCreated:*"]}                                                 | #/NotificationConfiguration/QueueConfigurations/0: expected type: JSONObject, found: String
+            {"QueueConfigurations": [{"Event": "e", "Queue": "q", "Filter": "prefix"}]}                     | #/NotificationConfiguration/QueueConfigurations/0/Filter: expected type: JSONObject, found: String
+            {"QueueConfigurations": [{"Event": "e", "Queue": "q", "Filter": {"S3Key": []}}]}                | #/NotificationConfiguration/QueueConfigurations/0/Filter/S3Key: expected type: JSONObject, found: JSONArray
+            {"QueueConfigurations": [{"Event": "e", "Queue": "q", "Filter": {"S3Key": {"Rules": ["x/"]}}}]} | #/NotificationConfiguration/QueueConfigurations/0/Filter/S3Key/Rules/0: expected type: JSONObject, found: String
+            {"LambdaConfigurations": [{"Event": "e", "Function": "f", "Filter": {"S3Key": {"Rules": {"Name": "prefix", "Value": "x/"}}}}]} | #/NotificationConfiguration/LambdaConfigurations/0/Filter/S3Key/Rules: expected type: JSONArray, found: JSONObject
+            """)
+    void aMissingRequiredNotificationKeyFailsTheResource(String notificationConfiguration, String reason) {
+        AwsException e = assertThrows(AwsException.class, () -> provisionBucket("""
+                {"BucketName": "b", "NotificationConfiguration": %s}
+                """.formatted(notificationConfiguration)));
+
+        assertEquals("Model validation failed (" + reason + ")", e.getMessage());
+        verify(s3, never()).createBucket(anyString(), anyString());
+        verify(s3, never()).putBucketNotificationConfiguration(anyString(), any());
+    }
+
+    private static final String REJECTED_QUEUE = """
+            "NotificationConfiguration": {"QueueConfigurations": [
+              {"Event": "s3:ObjectCreated:*", "Queue": "arn:aws:sqs:us-east-1:000000000000:missing"}]}
+            """;
+
+    private void rejectDestinations() {
+        doThrow(new AwsException("InvalidArgument", "Unable to validate the following destination configurations", 400))
+                .when(s3).putBucketNotificationConfiguration(anyString(), any());
+    }
+
+    /**
+     * A destination S3 cannot validate fails the resource instead of reporting CREATE_COMPLETE, and
+     * the bucket the attempt created is deleted rather than orphaned. The resource is left without
+     * an id, which is how Cloud Control tells a failed create from a successful one.
+     */
+    @Test
+    void aRejectedDestinationFailsTheCreateAndDeletesTheBucketItCreated() {
+        rejectDestinations();
+        StackResource r = resource("Bucket", "AWS::S3::Bucket");
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"BucketName": "b", "Tags": [{"Key": "k", "Value": "v"}], %s}
+                """.formatted(REJECTED_QUEUE)), ctx));
+
+        assertEquals("InvalidArgument", e.getErrorCode());
+        verify(s3).createBucket("b", REGION);
+        verify(s3).deleteBucket("b");
+        verify(s3, never()).putBucketTagging(anyString(), any());
+        assertEquals(null, r.getPhysicalId());
+    }
+
+    /** CreateBucket also answers in us-east-1 for a bucket the account already owns; that one stays. */
+    @Test
+    void aRejectedDestinationNeverDeletesABucketTheAttemptDidNotCreate() {
+        rejectDestinations();
+        when(s3.ownsBucket("b")).thenReturn(true);
+
+        assertThrows(AwsException.class, () -> provisionBucket("""
+                {"BucketName": "b", %s}
+                """.formatted(REJECTED_QUEUE)));
+
+        verify(s3, never()).deleteBucket(anyString());
+    }
+
+    @Test
+    void aBucketThatCannotBeDeletedAfterARejectionKeepsTheOriginalFailure() {
+        rejectDestinations();
+        AwsException deleteFailure = new AwsException("InternalError", "disk", 500);
+        doThrow(deleteFailure).when(s3).deleteBucket("b");
+
+        AwsException e = assertThrows(AwsException.class, () -> provisionBucket("""
+                {"BucketName": "b", %s}
+                """.formatted(REJECTED_QUEUE)));
+
+        assertEquals("InvalidArgument", e.getErrorCode());
+        assertEquals(List.of(deleteFailure), List.of(e.getSuppressed()));
+    }
+
+    /** An update rejected before any property changed the bucket leaves the bucket as it was. */
+    @Test
+    void aRejectedUpdateLeavesTheBucketAsItWas() {
+        rejectDestinations();
+        StackResource r = resource("Bucket", "AWS::S3::Bucket");
+        r.setPhysicalId("b");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"BucketName": "b", %s}
+                """.formatted(REJECTED_QUEUE)), new ProvisionContext(ctx.engine(), REGION, "000000000000",
+                "my-stack", "b", event -> { }, props("{\"BucketName\": \"b\"}"))));
+
+        verify(s3, never()).deleteBucket(anyString());
+        verify(s3, never()).putBucketNotificationConfiguration(anyString(), any(), eq(true));
+        assertFalse(r.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
+    }
+
+    /** A replacing update creates a new bucket; rejected, that one is deleted and the original stays. */
+    @Test
+    void aRejectedReplacingUpdateDeletesOnlyTheReplacementBucket() {
+        rejectDestinations();
+        StackResource r = resource("Bucket", "AWS::S3::Bucket");
+        r.setPhysicalId("old");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"BucketName": "new", %s}
+                """.formatted(REJECTED_QUEUE)), new ProvisionContext(ctx.engine(), REGION, "000000000000",
+                "my-stack", "old", event -> { }, props("{\"BucketName\": \"old\"}"))));
+
+        verify(s3).createBucket("new", REGION);
+        verify(s3).deleteBucket("new");
+        verify(s3, never()).deleteBucket("old");
+        assertFalse(r.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
+    }
+
+    /** A CreateBucket that is itself rejected created nothing, so there is nothing to delete. */
+    @Test
+    void aRejectedCreateBucketLeavesNothingToUndo() {
+        doThrow(new AwsException("InvalidBucketName", "The specified bucket is not valid.", 400))
+                .when(s3).createBucket("new", REGION);
+        StackResource r = resource("Bucket", "AWS::S3::Bucket");
+        r.setPhysicalId("old");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"BucketName": "new"}
+                """), new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack", "old",
+                event -> { }, props("{\"BucketName\": \"old\"}"))));
+
+        verify(s3, never()).deleteBucket(anyString());
+        assertFalse(r.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
+    }
+
+    @Test
+    void anUpdateFailingModelValidationChangesNothing() {
+        StackResource r = resource("Bucket", "AWS::S3::Bucket");
+        r.setPhysicalId("b");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"BucketName": "b", "VersioningConfiguration": {"Status": "Enabled"},
+                 "NotificationConfiguration": {"QueueConfigurations": [{"Event": "s3:ObjectCreated:*"}]}}
+                """), new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack", "b",
+                event -> { }, props("{\"BucketName\": \"b\"}"))));
+
+        verify(s3, never()).putBucketVersioning(anyString(), anyString());
+        verify(s3, never()).putBucketNotificationConfiguration(anyString(), any());
+    }
+
+    private static NotificationConfiguration queueNotification(String queueName) {
+        NotificationConfiguration config = new NotificationConfiguration();
+        config.getQueueConfigurations().add(new QueueNotification("", "arn:aws:sqs:us-east-1:000000000000:" + queueName,
+                List.of("s3:ObjectCreated:*"), List.of()));
+        return config;
+    }
+
+    /**
+     * A property that fails after the configuration was put has the replaced configuration put back,
+     * since the engine reports a failed update as rolled back. Its destinations were valid when it
+     * was put, so they are not checked again.
+     */
+    @Test
+    void aLaterFailurePutsTheReplacedNotificationConfigurationBack() {
+        NotificationConfiguration before = queueNotification("old");
+        when(s3.getBucketNotificationConfiguration("b")).thenReturn(before);
+        doThrow(new AwsException("MalformedXML", "bad", 400)).when(s3).putBucketVersioning("b", "Bogus");
+        StackResource r = resource("Bucket", "AWS::S3::Bucket");
+        r.setPhysicalId("b");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"BucketName": "b", "VersioningConfiguration": {"Status": "Bogus"},
+                 "NotificationConfiguration": {"QueueConfigurations": [
+                   {"Event": "s3:ObjectCreated:*", "Queue": "arn:aws:sqs:us-east-1:000000000000:new"}]}}
+                """), new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack", "b",
+                event -> { }, props("{\"BucketName\": \"b\"}"))));
+
+        verify(s3).putBucketNotificationConfiguration(eq("b"), any());
+        verify(s3).putBucketNotificationConfiguration("b", before, true);
+        assertFalse(r.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
+    }
+
+    @Test
+    void aLaterFailureOnCreateDeletesTheBucketItCreated() {
+        doThrow(new AwsException("MalformedXML", "bad", 400)).when(s3).putBucketVersioning("b", "Bogus");
+
+        assertThrows(AwsException.class, () -> provisionBucket("""
+                {"BucketName": "b", "VersioningConfiguration": {"Status": "Bogus"}}
+                """));
+
+        verify(s3).deleteBucket("b");
+    }
+
+    /** An update whose own undo fails is reported as a rollback failure, not as rolled back. */
+    @Test
+    void anUndoThatFailsOnAnUpdateIsReportedAsARollbackFailure() {
+        when(s3.getBucketNotificationConfiguration("b")).thenReturn(queueNotification("old"));
+        doThrow(new AwsException("MalformedXML", "bad", 400)).when(s3).putBucketVersioning("b", "Bogus");
+        doThrow(new AwsException("InternalError", "disk", 500))
+                .when(s3).putBucketNotificationConfiguration(eq("b"), any(), eq(true));
+        StackResource r = resource("Bucket", "AWS::S3::Bucket");
+        r.setPhysicalId("b");
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"BucketName": "b", "VersioningConfiguration": {"Status": "Bogus"},
+                 "NotificationConfiguration": {"QueueConfigurations": [
+                   {"Event": "s3:ObjectCreated:*", "Queue": "arn:aws:sqs:us-east-1:000000000000:new"}]}}
+                """), new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack", "b",
+                event -> { }, props("{\"BucketName\": \"b\"}"))));
+
+        assertEquals("MalformedXML", e.getErrorCode());
+        assertEquals("Could not restore bucket b: disk", r.getAttributes().get(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
+    }
+
+    /** Each put sends a fresh s3:TestEvent to every queue and topic, so an unchanged one is not put again. */
+    @Test
+    void anUnchangedNotificationConfigurationIsNotPutAgain() {
+        NotificationConfiguration current = new NotificationConfiguration();
+        current.getQueueConfigurations().add(new QueueNotification("", "arn:aws:sqs:us-east-1:000000000000:q",
+                List.of("s3:ObjectCreated:*"), List.of()));
+        when(s3.getBucketNotificationConfiguration("b")).thenReturn(current);
+
+        updateBucket("""
+                {"BucketName": "b", "NotificationConfiguration": {"QueueConfigurations": [
+                  {"Event": "s3:ObjectCreated:*", "Queue": "arn:aws:sqs:us-east-1:000000000000:q"}]}}
+                """, """
+                {"BucketName": "b", "Tags": [{"Key": "k", "Value": "v"}],
+                 "NotificationConfiguration": {"QueueConfigurations": [
+                   {"Event": "s3:ObjectCreated:*", "Queue": "arn:aws:sqs:us-east-1:000000000000:q"}]}}
+                """);
+
+        verify(s3, never()).putBucketNotificationConfiguration(anyString(), any());
+    }
+
+    /** An update that a destination rejects has changed nothing else on the bucket. */
+    @Test
+    void aRejectedDestinationFailsAnUpdateBeforeAnyOtherPropertyIsApplied() {
+        doThrow(new AwsException("InvalidArgument", "Unable to validate the following destination configurations", 400))
+                .when(s3).putBucketNotificationConfiguration(eq("b"), any());
+
+        assertThrows(AwsException.class, () -> updateBucket("""
+                {"BucketName": "b"}
+                """, """
+                {"BucketName": "b", "VersioningConfiguration": {"Status": "Enabled"},
+                 "NotificationConfiguration": {"QueueConfigurations": [
+                   {"Event": "s3:ObjectCreated:*", "Queue": "arn:aws:sqs:us-east-1:000000000000:missing"}]}}
+                """));
+
+        verify(s3, never()).putBucketVersioning(anyString(), anyString());
+        verify(s3, never()).deleteBucketCors(anyString());
     }
 
     /**

@@ -73,6 +73,7 @@ import software.amazon.awssdk.services.iam.model.ListInstanceProfilesResponse;
 import software.amazon.awssdk.services.iam.model.ListPoliciesGrantingServiceAccessEntry;
 import software.amazon.awssdk.services.iam.model.ListPoliciesGrantingServiceAccessRequest;
 import software.amazon.awssdk.services.iam.model.ListPoliciesGrantingServiceAccessResponse;
+import software.amazon.awssdk.services.iam.model.ListPoliciesResponse;
 import software.amazon.awssdk.services.iam.model.ListRolePoliciesRequest;
 import software.amazon.awssdk.services.iam.model.ListRolePoliciesResponse;
 import software.amazon.awssdk.services.iam.model.ListRolesResponse;
@@ -83,10 +84,12 @@ import software.amazon.awssdk.services.iam.model.ListUserTagsRequest;
 import software.amazon.awssdk.services.iam.model.ListUserTagsResponse;
 import software.amazon.awssdk.services.iam.model.ListUsersResponse;
 import software.amazon.awssdk.services.iam.model.NoSuchEntityException;
+import software.amazon.awssdk.services.iam.model.Policy;
 import software.amazon.awssdk.services.iam.model.PolicyScopeType;
 import software.amazon.awssdk.services.iam.model.PutRolePolicyRequest;
 import software.amazon.awssdk.services.iam.model.RemoveRoleFromInstanceProfileRequest;
 import software.amazon.awssdk.services.iam.model.RemoveUserFromGroupRequest;
+import software.amazon.awssdk.services.iam.model.Role;
 import software.amazon.awssdk.services.iam.model.SimulatePrincipalPolicyRequest;
 import software.amazon.awssdk.services.iam.model.SimulatePrincipalPolicyResponse;
 import software.amazon.awssdk.services.iam.model.StatusType;
@@ -104,6 +107,7 @@ import software.amazon.awssdk.services.iam.model.UpdateSamlProviderRequest;
 
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.*;
@@ -372,10 +376,69 @@ class IamTest {
     @Test
     @Order(17)
     void listRoles() {
-        ListRolesResponse response = iam.listRoles();
-
-        assertThat(response.roles())
+        assertThat(iam.listRolesPaginator().roles())
                 .anyMatch(r -> ROLE_NAME.equals(r.roleName()));
+    }
+
+    @Test
+    @Order(17)
+    void listRolesPagesThroughMaxItemsAndMarker() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String path = "/sdk-page-roles-" + suffix + "/";
+        List<String> names = List.of("sdk-page-" + suffix + "-a", "sdk-page-" + suffix + "-b",
+                "sdk-page-" + suffix + "-c");
+        names.forEach(name -> iam.createRole(CreateRoleRequest.builder()
+                .roleName(name).path(path).assumeRolePolicyDocument(TRUST_POLICY).build()));
+        try {
+            List<ListRolesResponse> pages = iam.listRolesPaginator(request -> request
+                    .pathPrefix(path).maxItems(2)).stream().toList();
+
+            assertThat(pages).hasSize(2);
+            assertThat(pages.get(0).isTruncated()).isTrue();
+            assertThat(pages.get(0).marker()).isNotBlank();
+            assertThat(pages.get(1).isTruncated()).isFalse();
+            assertThat(pages.get(1).marker()).isNull();
+            assertThat(pages.stream().flatMap(page -> page.roles().stream()).map(Role::roleName).toList())
+                    .containsExactlyElementsOf(names);
+        } finally {
+            names.forEach(name -> iam.deleteRole(DeleteRoleRequest.builder().roleName(name).build()));
+        }
+    }
+
+    @Test
+    @Order(17)
+    void listPoliciesPagesThroughMaxItemsAndMarker() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String path = "/sdk-page-policies-" + suffix + "/";
+        List<String> arns = new ArrayList<>();
+        for (String letter : List.of("a", "b", "c")) {
+            arns.add(iam.createPolicy(CreatePolicyRequest.builder().policyName("sdk-page-" + suffix + "-" + letter)
+                    .path(path).policyDocument(POLICY_DOCUMENT).build()).policy().arn());
+        }
+        try {
+            List<ListPoliciesResponse> pages = iam.listPoliciesPaginator(request -> request
+                    .scope(PolicyScopeType.LOCAL).pathPrefix(path).maxItems(2)).stream().toList();
+
+            assertThat(pages).hasSize(2);
+            assertThat(pages.get(0).isTruncated()).isTrue();
+            assertThat(pages.get(0).marker()).isNotBlank();
+            assertThat(pages.get(1).isTruncated()).isFalse();
+            assertThat(pages.get(1).marker()).isNull();
+            assertThat(pages.stream().flatMap(page -> page.policies().stream()).map(Policy::arn).toList())
+                    .containsExactlyElementsOf(arns);
+        } finally {
+            arns.forEach(arn -> iam.deletePolicy(DeletePolicyRequest.builder().policyArn(arn).build()));
+        }
+    }
+
+    @Test
+    @Order(17)
+    void listPoliciesReturnsOneHundredWhenMaxItemsIsOmitted() {
+        ListPoliciesResponse response = iam.listPolicies(request -> request.scope(PolicyScopeType.AWS));
+
+        assertThat(response.policies()).hasSize(100);
+        assertThat(response.isTruncated()).isTrue();
+        assertThat(response.marker()).isNotBlank();
     }
 
     // ── Managed Policies ───────────────────────────────────────────────

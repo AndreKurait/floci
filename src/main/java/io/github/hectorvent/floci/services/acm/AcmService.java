@@ -5,6 +5,8 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
@@ -28,8 +30,6 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.security.cert.X509Certificate;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -39,7 +39,6 @@ import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -796,7 +795,7 @@ public class AcmService implements ResourceProvider {
     static boolean isValidationDomainOf(String domain, String validationDomain) {
         String lowerDomain = domain.toLowerCase(Locale.ROOT);
         String lowerValidationDomain = validationDomain.toLowerCase(Locale.ROOT);
-        return lowerDomain.equals(lowerValidationDomain) || lowerDomain.endsWith("." + lowerValidationDomain);
+        return DomainNames.isWithin(lowerDomain, lowerValidationDomain);
     }
 
     /**
@@ -848,13 +847,7 @@ public class AcmService implements ResourceProvider {
 
     private String generateValidationToken(String domain) {
         String tokenInput = regionResolver.getAccountId() + ":" + baseDomain(domain);
-        try {
-            return HexFormat.of().formatHex(
-                MessageDigest.getInstance("SHA-256").digest(tokenInput.getBytes(StandardCharsets.UTF_8))
-            );
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is unavailable", e);
-        }
+        return Digests.sha256Hex(tokenInput);
     }
 
     private static String baseDomain(String domain) {

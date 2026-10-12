@@ -1078,7 +1078,7 @@ class DynamoDbIntegrationTest {
         .then()
             .statusCode(400)
             .body("__type", equalTo("ValidationException"))
-            .body("message", equalTo("Must specify the AttributesToGet or "
+            .body("message", equalTo("1 validation error detected: Must specify the AttributesToGet or "
                     + "ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"));
     }
 

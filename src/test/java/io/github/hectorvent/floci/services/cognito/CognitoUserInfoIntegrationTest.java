@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cognito;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
@@ -365,7 +366,6 @@ class CognitoUserInfoIntegrationTest {
     }
 
     private static String base64Url(String raw) {
-        return java.util.Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(raw.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return Base64Url.encode(raw);
     }
 }

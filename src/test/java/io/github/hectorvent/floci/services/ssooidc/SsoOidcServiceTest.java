@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.ssooidc;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.ssooidc.model.AuthorizationCode;
 import io.github.hectorvent.floci.services.ssooidc.model.DeviceAuthorization;
@@ -10,6 +12,7 @@ import io.github.hectorvent.floci.services.ssooidc.model.TokenSession;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -125,8 +128,7 @@ class SsoOidcServiceTest {
         register.putArray("redirectUris").add("http://127.0.0.1:8400/callback");
         RegisteredClient client = service.registerClient(register);
         String verifier = "01234567890123456789012345678901234567890123456789";
-        String challenge = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
-                sha256(verifier));
+        String challenge = Base64Url.encode(Digests.sha256(verifier.getBytes(StandardCharsets.US_ASCII)));
         AuthorizationCode code = service.createAuthorizationCode(client.clientId(),
                 "http://127.0.0.1:8400/callback", challenge);
 
@@ -172,14 +174,6 @@ class SsoOidcServiceTest {
 
         assertOidcError("invalid_grant",
                 () -> service.createIamToken(exchange, sourceApplication, java.util.List.of("openid")));
-    }
-    private static byte[] sha256(String value) {
-        try {
-            return java.security.MessageDigest.getInstance("SHA-256")
-                    .digest(value.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
-        } catch (java.security.NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
     }
 
     @Test

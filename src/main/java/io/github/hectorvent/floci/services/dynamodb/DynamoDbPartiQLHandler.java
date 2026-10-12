@@ -216,7 +216,7 @@ class DynamoDbPartiQLHandler {
             boolean partialProjection = !"ALL".equals(accessPath.projectionType());
             String fe = partialProjection ? null : buildFe(scanFilters, eav, ean);
             JsonNode exclusiveStartKey = startKey.get();
-            DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, table, accessPath, true);
+            DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, table, accessPath);
             DynamoDbService.ScanResult result = service.scan(stmt.table(), fe,
                     ean.isEmpty() ? null : ean.toNode(mapper),
                     eav.isEmpty() ? null : eav.toNode(mapper),
@@ -241,7 +241,7 @@ class DynamoDbPartiQLHandler {
         String kce = buildKce(pkEq, skCond, pkName, skName, eav, ean);
         String fe = buildFe(filterConds, eav, ean);
         JsonNode exclusiveStartKey = startKey.get();
-        DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, table, accessPath, false);
+        DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, table, accessPath);
         DynamoDbService.QueryResult result = service.query(
                 stmt.table(), null, eav.toNode(mapper), kce, fe,
                 limit, null, accessPath.indexName(), exclusiveStartKey,
@@ -255,7 +255,7 @@ class DynamoDbPartiQLHandler {
         ExprAttrNameBuilder ean = new ExprAttrNameBuilder();
         String kce = ean.alias(accessPath.partitionKeyName()) + " = " + eav.add(toTypedNode(routing.partition()));
         JsonNode exclusiveStartKey = startKey.get();
-        DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, table, accessPath, false);
+        DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, table, accessPath);
         DynamoDbService.QueryResult result = service.query(stmt.table(), null, eav.toNode(mapper), kce, null,
                 limit, null, accessPath.indexName(), exclusiveStartKey, ean.toNode(mapper), region);
         List<JsonNode> matching = matchingIndexView(result.items(), routing.filterConds(), accessPath, table);

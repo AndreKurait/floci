@@ -50,6 +50,38 @@ class ProvisionContextTest {
         }
     }
 
+    private ProvisionContext contextWithPriorProperties(String priorProperties) {
+        return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", "prior-id",
+                event -> { }, priorProperties == null ? null : props(priorProperties));
+    }
+
+    @Test
+    void previouslyDeclaredReadsThePreviousTemplatesProperties() {
+        ProvisionContext ctx = contextWithPriorProperties("""
+                {"Declared": {"Fn::GetAtt": ["Other", "Arn"]}, "ExplicitNull": null}
+                """);
+
+        assertTrue(ctx.previouslyDeclared("Declared"), "declared, whatever it resolved to");
+        assertFalse(ctx.previouslyDeclared("ExplicitNull"), "null is how a template omits a property");
+        assertFalse(ctx.previouslyDeclared("Absent"));
+    }
+
+    /** A resource the previous deployment never provisioned, such as one its Condition kept out, declared nothing. */
+    @Test
+    void aResourceWithoutAPriorPhysicalIdDeclaredNothing() {
+        ProvisionContext ctx = new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", null,
+                event -> { }, props("{\"Declared\": \"value\"}"));
+
+        assertFalse(ctx.previouslyDeclared("Declared"));
+    }
+
+    @Test
+    void nothingIsPreviouslyDeclaredWithoutAPreviousTemplate() {
+        assertFalse(contextWithPriorProperties(null).previouslyDeclared("Declared"));
+        assertFalse(context("prior-id").previouslyDeclared("Declared"),
+                "the constructors without prior properties have none");
+    }
+
     @Test
     void isUpdateReflectsWhetherAPriorPhysicalIdExists() {
         assertFalse(context(null).isUpdate(), "a first-time create has no prior physical id");
