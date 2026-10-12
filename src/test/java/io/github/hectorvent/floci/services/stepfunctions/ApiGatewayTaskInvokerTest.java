@@ -4,10 +4,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpServer;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.auth.CredentialScope;
 import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
-import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayService;
 import io.github.hectorvent.floci.services.apigateway.model.RestApi;
 import io.github.hectorvent.floci.services.iam.AssumeRolePolicyEvaluator;
@@ -100,7 +100,7 @@ class ApiGatewayTaskInvokerTest {
                 assertEquals(issued[2], exchange.getRequestHeaders().getFirst("x-amz-security-token"));
                 assertTrue(SigV4Canonicalization.signatureMatches("POST", exchange.getRequestURI().getRawPath(), "",
                         SigV4Canonicalization.canonicalHeaders(auth.signedHeaders(), exchange.getRequestHeaders()::getFirst),
-                        auth.signedHeaders(), SigV4RequestValidator.sha256Hex(body),
+                        auth.signedHeaders(), Digests.sha256Hex(body),
                         exchange.getRequestHeaders().getFirst("x-amz-date"), scope, issued[1], auth.signature()));
             } catch (Throwable error) {
                 serverFailure.set(error);
