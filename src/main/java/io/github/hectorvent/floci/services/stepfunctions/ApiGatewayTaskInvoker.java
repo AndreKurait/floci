@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.auth.CredentialScope;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
@@ -243,9 +244,9 @@ public class ApiGatewayTaskInvoker {
         CredentialScope scope = new CredentialScope(accessKey, stamp.substring(0, 8), region, "execute-api");
         String canonical = "POST\n" + uri.getRawPath() + "\n\n"
                 + SigV4Canonicalization.canonicalHeaders(signed, headers::get) + "\n" + signed + "\n"
-                + SigV4RequestValidator.sha256Hex(payload);
+                + Digests.sha256Hex(payload);
         String toSign = "AWS4-HMAC-SHA256\n" + stamp + "\n" + scope.credentialScope() + "\n"
-                + SigV4RequestValidator.sha256Hex(canonical.getBytes(StandardCharsets.UTF_8));
+                + Digests.sha256Hex(canonical);
         String signature = SigV4RequestValidator.hexEncode(SigV4RequestValidator.hmacSha256(
                 SigV4RequestValidator.deriveSigningKey(secret, scope.date(), region, "execute-api"), toSign));
         headers.put("authorization", "AWS4-HMAC-SHA256 Credential=" + accessKey + "/" + scope.credentialScope()
