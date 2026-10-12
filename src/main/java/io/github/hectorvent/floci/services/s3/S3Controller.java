@@ -847,6 +847,7 @@ public class S3Controller {
                     return handleUploadPartCopy(
                             copySource, bucket, key, uploadId, partNumber, httpHeaders, authorization);
                 }
+                requireDeclaredSizeWithin(httpHeaders, contentEncoding, contentSha256, S3Service.MAX_PART_SIZE);
                 Part part = s3Service.storePart(bucket, key, uploadId, partNumber,
                         decodedBody(body, contentEncoding, contentSha256, trailerHeader(httpHeaders, uriInfo)),
                         uploadChecksums(httpHeaders, uriInfo),
@@ -890,6 +891,7 @@ public class S3Controller {
             String sseCustomerKeyMd5 = httpHeaders.getHeaderString("x-amz-server-side-encryption-customer-key-MD5");
             String cannedAcl = httpHeaders.getHeaderString("x-amz-acl");
             s3Service.authorizePutObject(bucket, key, authorization);
+            requireDeclaredSizeWithin(httpHeaders, contentEncoding, contentSha256, S3Service.MAX_PUT_OBJECT_SIZE);
             S3Object obj = s3Service.putObject(bucket, key,
                     decodedBody(body, contentEncoding, contentSha256, trailerHeader(httpHeaders, uriInfo)),
                     uploadChecksums(httpHeaders, uriInfo), contentType, extractUserMetadata(httpHeaders, uriInfo),
@@ -2163,27 +2165,55 @@ public class S3Controller {
      * The object data of an upload body, read as it arrives. A streaming payload, and any aws-chunked
      * body that declares {@code x-amz-trailer}, is decoded from its framing on the way through so the
      * trailing checksum can be checked. A Content-Encoding naming aws-chunked without either of those
-     * does not guarantee framing, so that body is read whole and kept as sent when it does not decode.
+     * does not guarantee framing, so that body is read whole, failing with EntityTooLarge past the most
+     * one array holds, and kept as sent when it does not decode.
      */
     private InputStream decodedBody(InputStream body, String contentEncoding, String contentSha256,
                                     String trailer) {
         InputStream raw = body != null ? body : InputStream.nullInputStream();
-        boolean awsChunked = contentEncoding != null
-                && contentEncoding.toLowerCase(Locale.ROOT).contains("aws-chunked");
+        boolean awsChunked = namesAwsChunked(contentEncoding);
         if (declaresStreamingPayload(contentSha256) || (awsChunked && trailer != null && !trailer.isBlank())) {
             return new AwsChunkedInputStream(raw, trailerChecksumAlgorithm(trailer));
         }
         if (awsChunked) {
-            return new ByteArrayInputStream(decodeAwsChunked(readWholeBody(raw), contentEncoding, contentSha256));
+            byte[] whole = S3Service.readWithin(raw, S3Service.MAX_IN_MEMORY_OBJECT_SIZE, readSoFar -> LOG.warnv(
+                    "Rejecting an aws-chunked body of more than {0} bytes: sent without a streaming x-amz-content-sha256 or an x-amz-trailer, it is read whole to be decoded",
+                    S3Service.MAX_IN_MEMORY_OBJECT_SIZE));
+            return new ByteArrayInputStream(decodeAwsChunked(whole, contentEncoding, contentSha256));
         }
         return raw;
+    }
+
+    /**
+     * Rejects an upload that declares more data than {@code maxSize} before any of it is read. An
+     * aws-chunked body declares its data in {@code x-amz-decoded-content-length}, since its
+     * Content-Length also counts the framing. A body that declares no size, or a size that is not a
+     * number, is held to the limit as it is read.
+     */
+    static void requireDeclaredSizeWithin(HttpHeaders httpHeaders, String contentEncoding, String contentSha256,
+                                          long maxSize) {
+        boolean awsChunked = declaresStreamingPayload(contentSha256) || namesAwsChunked(contentEncoding);
+        String declared = httpHeaders.getHeaderString(awsChunked ? "x-amz-decoded-content-length" : "Content-Length");
+        if (declared == null) {
+            return;
+        }
+        long size;
+        try {
+            size = Long.parseLong(declared.trim());
+        } catch (NumberFormatException ignored) {
+            // Not a size, so nothing is known before the body is read, which is held to the limit as it arrives.
+            return;
+        }
+        if (size > maxSize) {
+            throw S3Service.entityTooLarge(size, maxSize);
+        }
     }
 
     private static String trailerHeader(HttpHeaders httpHeaders, UriInfo uriInfo) {
         return resolveHeaderOrQueryParam(httpHeaders, uriInfo, "x-amz-trailer");
     }
 
-    /** The whole of a body that is small by nature, such as a subresource's XML, or must be read whole to be decoded. */
+    /** The whole of a body that is small by nature, such as a subresource's XML. */
     private static byte[] readWholeBody(InputStream body) {
         if (body == null) {
             return new byte[0];
@@ -2201,8 +2231,7 @@ public class S3Controller {
      */
     private byte[] decodeAwsChunked(byte[] body, String contentEncoding, String contentSha256) {
         boolean declaresStreamingPayload = declaresStreamingPayload(contentSha256);
-        boolean isAwsChunked = declaresStreamingPayload || (contentEncoding != null
-                && contentEncoding.toLowerCase(Locale.ROOT).contains("aws-chunked"));
+        boolean isAwsChunked = declaresStreamingPayload || namesAwsChunked(contentEncoding);
         if (!isAwsChunked) {
             return body;
         }
@@ -2255,6 +2284,11 @@ public class S3Controller {
             LOG.debugv("Failed to decode aws-chunked body, using raw: {0}", e.getMessage());
             return body;
         }
+    }
+
+    /** Whether a Content-Encoding names aws-chunked, alone or with other codings. */
+    private static boolean namesAwsChunked(String contentEncoding) {
+        return contentEncoding != null && contentEncoding.toLowerCase(Locale.ROOT).contains("aws-chunked");
     }
 
     /** Whether x-amz-content-sha256 declares a streaming payload, which is always aws-chunked. */
@@ -3401,8 +3435,15 @@ public class S3Controller {
             xmlBuilder.elem("Condition", condition);
         }
         // S3 InvalidArgument responses carry ArgumentName and ArgumentValue so the SDK can
-        // surface which input was rejected. They travel through AwsException.extendedData.
+        // surface which input was rejected, and EntityTooLarge the proposed and allowed sizes.
+        // They travel through AwsException.extendedData.
         if (e.getExtendedData() != null) {
+            for (String sizeField : List.of("ProposedSize", "MaxSizeAllowed")) {
+                Object size = e.getExtendedData().get(sizeField);
+                if (size != null) {
+                    xmlBuilder.elem(sizeField, size.toString());
+                }
+            }
             Object resource = e.getExtendedData().get("Resource");
             if (resource != null) {
                 xmlBuilder.elem("Resource", resource.toString());
@@ -4290,8 +4331,7 @@ public class S3Controller {
         if (contentSha256 != null && contentSha256.startsWith("STREAMING-")) {
             return true;
         }
-        String contentEncoding = httpHeaders.getHeaderString("Content-Encoding");
-        if (contentEncoding != null && contentEncoding.toLowerCase(Locale.ROOT).contains("aws-chunked")) {
+        if (namesAwsChunked(httpHeaders.getHeaderString("Content-Encoding"))) {
             return true;
         }
         if (httpHeaders.getHeaderString("x-amz-decoded-content-length") != null

@@ -190,9 +190,12 @@ including empty strings, return `InvalidParameterValue` before changing resource
 | `CopyDBClusterSnapshot` | `CopyTags` | Defaults to `false`; explicit request tags still apply |
 | `CreateEventSubscription` | `Enabled` | Defaults to `true` |
 | `ModifyEventSubscription` | `Enabled` | Preserves the current value |
+| `RestoreDBInstanceFromDBSnapshot` | `MultiAZ`, `EnableIAMDatabaseAuthentication` | Defaults to `false`, regardless of the snapshot setting |
+| `RestoreDBClusterFromSnapshot`, `RestoreDBClusterToPointInTime` | `EnableIAMDatabaseAuthentication` | Defaults to `false`, regardless of the source setting |
 
 Malformed reset flags leave saved parameter overrides unchanged. Malformed event-subscription
 flags leave the subscription and its topic, source type and event categories unchanged.
+Malformed restore flags are rejected before starting an instance or cluster restore.
 
 
 ## Event notification subscriptions

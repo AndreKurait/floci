@@ -2,9 +2,9 @@ package io.github.hectorvent.floci.services.elb;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
@@ -18,7 +18,6 @@ import io.github.hectorvent.floci.services.elb.model.ClassicListener;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.ServerCertificateReferenceProvider;
-import io.github.hectorvent.floci.services.iam.model.ServerCertificate;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -32,7 +31,6 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -63,7 +61,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
     private final IamService iamService;
-    private final AcmService acmService;
+    private final CertificateReferenceResolver certificates;
 
     // region → load balancer name → record
     private Map<String, Map<String, ClassicLoadBalancer>> loadBalancers = new ConcurrentHashMap<>();
@@ -100,7 +98,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         this.config = config;
         this.regionResolver = regionResolver;
         this.iamService = iamService;
-        this.acmService = acmService;
+        this.certificates = new CertificateReferenceResolver(iamService, acmService);
     }
 
     @PostConstruct
@@ -615,81 +613,38 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
     }
 
     /**
-     * Runs a write that records a listener's IAM server certificate while IAM holds the lock
-     * {@code DeleteServerCertificate} takes, so the certificate cannot be deleted between the
-     * check and the write. The callers re-check inside the guard: the fail-fast check above it
-     * keeps the error precedence AWS has, and only the one under the guard is atomic with the
-     * commit.
+     * Runs a listener write under {@link CertificateReferenceResolver#runWhileHeld}, so an IAM
+     * server certificate it records cannot be deleted between the check and the write. The
+     * callers re-check inside the guard: the fail-fast check above it keeps the error precedence
+     * AWS has, and only the one under the guard is atomic with the commit.
      *
-     * <p>Only for a write that names an IAM certificate. A listener with no certificate, or one
-     * served by ACM, cannot leave a load balancer holding a deleted IAM certificate, and the
-     * delete reads a snapshot of the listener list rather than the live one, so an unguarded
-     * write cannot disturb its walk either. Taking the lock for every write would instead make a
-     * certificate delete wait on an unrelated load balancer, listener or zone write, and the
-     * other way round, for writes that cannot affect it.
-     *
-     * <p>This class's own invariants do not ride on this lock. The unique load balancer name is
+     * <p>This class's own invariants do not ride on that lock. The unique load balancer name is
      * carried by {@code putIfAbsent} and the listener list by {@link #listenerLock}, both of
      * which hold whether or not IAM is present, which is what the unit tests build.
      */
     private void whileCertificatesHeld(List<ClassicListener> listeners, Runnable action) {
-        if (iamService == null || !namesIamCertificate(listeners)) {
-            action.run();
-            return;
-        }
-        iamService.runWithServerCertificatesHeld(action);
-    }
-
-    /** Whether any of these listeners names a certificate that IAM serves, rather than ACM. */
-    private static boolean namesIamCertificate(List<ClassicListener> listeners) {
-        for (ClassicListener listener : listeners) {
-            String certificate = listener.getSslCertificateId();
-            if (certificate != null && !certificate.isBlank() && AwsArnUtils.isArn(certificate)
-                    && "iam".equals(AwsArnUtils.parse(certificate).service())) {
-                return true;
-            }
-        }
-        return false;
+        certificates.runWhileHeld(certificateIdsOf(listeners), action);
     }
 
     private void requireCertificates(String region, List<ClassicListener> listeners) {
         for (ClassicListener listener : listeners) {
             String certificateId = listener.getSslCertificateId();
-            if (certificateId != null && !certificateId.isBlank() && !certificateExists(region, certificateId)) {
+            if (certificateId != null && !certificateId.isBlank()
+                    && !certificates.exists(region, certificateId)) {
                 throw new AwsException("CertificateNotFound",
                         "Server Certificate not found for the key: " + certificateId, 400);
             }
         }
     }
 
-    private boolean certificateExists(String region, String certificateArn) {
-        if (!AwsArnUtils.isArn(certificateArn)) {
-            return false;
+    private static List<String> certificateIdsOf(List<ClassicListener> listeners) {
+        List<String> certificateIds = new ArrayList<>();
+        for (ClassicListener listener : listeners) {
+            if (listener.getSslCertificateId() != null) {
+                certificateIds.add(listener.getSslCertificateId());
+            }
         }
-        AwsArnUtils.Arn arn = AwsArnUtils.parse(certificateArn);
-        return switch (arn.service()) {
-            case "iam" -> iamService == null || iamServerCertificate(arn, certificateArn).isPresent();
-            case "acm" -> acmService == null || acmCertificateExists(region, certificateArn);
-            default -> false;
-        };
-    }
-
-    private Optional<ServerCertificate> iamServerCertificate(AwsArnUtils.Arn arn, String certificateArn) {
-        if (!arn.resource().startsWith("server-certificate/")) {
-            return Optional.empty();
-        }
-        String name = arn.resource().substring(arn.resource().lastIndexOf('/') + 1);
-        return iamService.findServerCertificate(name)
-                .filter(certificate -> certificateArn.equals(certificate.getArn()));
-    }
-
-    private boolean acmCertificateExists(String region, String certificateArn) {
-        try {
-            return certificateArn.equals(acmService.describeCertificate(certificateArn, region).getArn());
-        } catch (AwsException e) {
-            LOG.debugv("ACM certificate {0} not usable in {1}: {2}", certificateArn, region, e.getMessage());
-            return false;
-        }
+        return certificateIds;
     }
 
     private static void validateListener(ClassicListener listener) {

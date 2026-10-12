@@ -3954,6 +3954,36 @@ class RdsServiceTest {
         verify(containerManager).createPostgresSnapshot(any(), eq("admin"));
     }
 
+    @ParameterizedTest
+    @CsvSource({"true, , false, ", "true, false, false, ", "true, true, true, ",
+            "false, , false, ", "false, false, false, ", "false, true, true, ",
+            "true, , false, 5433", "true, false, false, 5433", "true, true, true, 5433",
+            "false, , false, 5433", "false, false, false, 5433", "false, true, true, 5433"})
+    void instanceSnapshotRestoreIamDefaultsToDisabled(boolean sourceEnabled, Boolean requested,
+                                                       boolean expected, Integer port) {
+        DbInstance source = rdsService.createDbInstance("iam-source", "postgres", "16.3",
+                "admin", "password", "dbname", "db.t3.micro", 20, sourceEnabled,
+                null, null, null);
+        when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("DUMP");
+        DbSnapshot snapshot = rdsService.createDbSnapshot("iam-snapshot", "iam-source");
+        clearInvocations(proxyManager);
+
+        DbInstance restored = rdsService.restoreDbInstanceFromDbSnapshot("iam-restored", "iam-snapshot",
+                null, null, false, null, List.of(), Map.of(), "us-east-1", port, requested);
+
+        assertEquals(expected, restored.isIamDatabaseAuthenticationEnabled());
+        assertEquals(expected, rdsService.getDbInstance("iam-restored").isIamDatabaseAuthenticationEnabled());
+        assertEquals(sourceEnabled, source.isIamDatabaseAuthenticationEnabled());
+        assertEquals(sourceEnabled, snapshot.isIamDatabaseAuthenticationEnabled());
+        verify(proxyManager).startProxy(any(), any(), eq(expected), anyInt(), any(), anyInt(),
+                any(), any(), any(), any(), any(), any());
+        if (requested == null) {
+            DbInstance legacy = rdsService.restoreDbInstanceFromDbSnapshot("iam-legacy", "iam-snapshot",
+                    null, null, false, null, List.of(), Map.of(), "us-east-1");
+            assertFalse(legacy.isIamDatabaseAuthenticationEnabled());
+        }
+    }
+
     @Test
     void createCopyAndRestoreDbSnapshotPreserveEncryptionWithoutExplicitKmsKey() {
         DbInstance sourceInstance = rdsService.createDbInstance("mydb", "postgres", "13",
@@ -4265,6 +4295,35 @@ class RdsServiceTest {
                 () -> rdsService.createDbClusterSnapshot("other", "absent-cluster", null)).getErrorCode());
         assertEquals("DBClusterSnapshotNotFoundFault", assertThrows(AwsException.class,
                 () -> rdsService.describeDbClusterSnapshots("absent", null, null)).getErrorCode());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "snapshot, true, , false", "snapshot, true, false, false", "snapshot, true, true, true",
+            "snapshot, false, , false", "snapshot, false, false, false", "snapshot, false, true, true",
+            "point, true, , false", "point, true, false, false", "point, true, true, true",
+            "point, false, , false", "point, false, false, false", "point, false, true, true"
+    })
+    void clusterRestoreIamDefaultsToDisabled(String path, boolean sourceEnabled, Boolean requested,
+                                              boolean expected) {
+        DbCluster source = rdsService.createDbCluster("iam-source", "aurora-postgresql", "16.3",
+                "admin", "password", "dbname", sourceEnabled, null);
+        when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("CLUSTER_DUMP");
+        DbClusterSnapshot snapshot = rdsService.createDbClusterSnapshot("iam-snapshot", "iam-source", null);
+        clearInvocations(proxyManager);
+
+        DbCluster restored = "snapshot".equals(path)
+                ? rdsService.restoreDbClusterFromSnapshot("iam-restored", "iam-snapshot", "aurora-postgresql",
+                        null, null, null, null, null, null, requested, null, null, "us-east-1")
+                : rdsService.restoreDbClusterToPointInTime("iam-restored", "iam-source", null, null,
+                        null, true, null, null, null, requested, null, null, "us-east-1");
+
+        assertEquals(expected, restored.isIamDatabaseAuthenticationEnabled());
+        assertEquals(expected, rdsService.getDbCluster("iam-restored").isIamDatabaseAuthenticationEnabled());
+        assertEquals(sourceEnabled, source.isIamDatabaseAuthenticationEnabled());
+        assertEquals(sourceEnabled, snapshot.isIamDatabaseAuthenticationEnabled());
+        verify(proxyManager).startProxy(any(), any(), eq(expected), anyInt(), any(), anyInt(),
+                any(), any(), any(), any(), any(), any());
     }
 
     @Test

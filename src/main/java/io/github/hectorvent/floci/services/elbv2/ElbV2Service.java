@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
@@ -53,6 +54,14 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     @Inject
     EmulatorConfig config;
+
+    /**
+     * Left null by the unit tests, which wire this service without IAM or ACM. A referrer with no
+     * resolver keeps the behaviour it had before the check existed, rather than refusing every
+     * certificate because it cannot look one up.
+     */
+    @Inject
+    CertificateReferenceResolver certificateResolver;
 
     // region → ARN → resource
     private Map<String, Map<String, LoadBalancer>> loadBalancers = new ConcurrentHashMap<>();
@@ -515,6 +524,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                     "A listener already exists on port " + port + " for this load balancer.", 400);
         }
 
+        // Fail fast, then again under the guard the listener is published inside: this one keeps
+        // the error precedence, and only the one holding the lock is atomic with the write.
+        requireCertificates(region, protocol, certificates);
+
         LoadBalancer lb = requireLoadBalancer(region, lbArn);
         String lbType = lb.getType() != null ? lb.getType() : "application";
         String typePrefix = lbTypePrefix(lbType);
@@ -532,8 +545,15 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         listener.setDefaultActions(defaultActions != null ? new ArrayList<>(defaultActions) : new ArrayList<>());
         listener.setAlpnPolicy(alpnPolicy != null ? new ArrayList<>(alpnPolicy) : new ArrayList<>());
 
-        regionListeners.put(listenerArn, listener);
-        listeners.put(region, regionListeners);
+        // Published under the guard, re-checking inside it. Until the listener is in the map,
+        // DeleteServerCertificate walking the reference providers cannot see that it holds the
+        // certificate, so a delete landing in that window would take the certificate out from
+        // under a listener that is about to serve it.
+        whileCertificatesHeld(certificates, () -> {
+            requireCertificates(region, protocol, certificates);
+            regionListeners.put(listenerArn, listener);
+            listeners.put(region, regionListeners);
+        });
         lbToListeners.computeIfAbsent(lbArn, k -> new ArrayList<>()).add(listenerArn);
 
         // auto-create the default rule
@@ -610,7 +630,8 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         boolean restartDataPlane = false;
         boolean recompileRules = false;
 
-        if (port != null && !Objects.equals(listener.getPort(), port)) {
+        boolean portChanges = port != null && !Objects.equals(listener.getPort(), port);
+        if (portChanges) {
             // check duplicate port on same LB
             Map<String, Listener> regionListeners = listeners.getOrDefault(region, Map.of());
             boolean portExists = regionListeners.values().stream()
@@ -620,12 +641,32 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 throw new AwsException("DuplicateListener",
                         "A listener already exists on port " + port + " for this load balancer.", 400);
             }
+        }
+
+        // Both refusals land before the first setter, because the listener being modified is the
+        // stored one: a request refused after one of them had run would answer 400 and still have
+        // changed the listener's port, protocol or policy.
+        //
+        // The protocol and the certificates checked are the ones the listener ends the call with.
+        // A request that turns an HTTP listener into an HTTPS one brings the certificate the new
+        // protocol needs, and one that changes the protocol alone puts the certificates the
+        // listener already holds into service, where they have to be certificates the account has.
+        String effectiveProtocol = protocol != null ? protocol : listener.getProtocol();
+        requireCertificates(region, effectiveProtocol,
+                certificates != null ? certificates : listener.getCertificates());
+
+        if (portChanges) {
             listener.setPort(port);
             restartDataPlane = true;
         }
         if (protocol != null)      listener.setProtocol(protocol);
         if (sslPolicy != null)     listener.setSslPolicy(sslPolicy);
-        if (certificates != null)  listener.setCertificates(new ArrayList<>(certificates));
+        if (certificates != null) {
+            whileCertificatesHeld(certificates, () -> {
+                requireCertificates(region, effectiveProtocol, certificates);
+                listener.setCertificates(new ArrayList<>(certificates));
+            });
+        }
         if (alpnPolicy != null)    listener.setAlpnPolicy(new ArrayList<>(alpnPolicy));
         if (defaultActions != null) {
             listener.setDefaultActions(new ArrayList<>(defaultActions));
@@ -929,12 +970,16 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     public void addListenerCertificates(String region, String listenerArn, List<String> certArns) {
         Listener listener = requireListener(region, listenerArn);
-        for (String certArn : certArns) {
-            if (!listener.getCertificates().contains(certArn)) {
-                listener.getCertificates().add(certArn);
+        requireCertificates(region, listener.getProtocol(), certArns);
+        whileCertificatesHeld(certArns, () -> {
+            requireCertificates(region, listener.getProtocol(), certArns);
+            for (String certArn : certArns) {
+                if (!listener.getCertificates().contains(certArn)) {
+                    listener.getCertificates().add(certArn);
+                }
             }
-        }
-        persistRegion(listeners, region);
+            persistRegion(listeners, region);
+        });
     }
 
     public void removeListenerCertificates(String region, String listenerArn, List<String> certArns) {
@@ -949,6 +994,57 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Refuses a certificate the account does not have. {@code CertificateNotFound} is modeled on
+     * {@code CreateListener}, {@code ModifyListener} and {@code AddListenerCertificates} alone,
+     * and the reference gives it one sentence, so that sentence is the message rather than one
+     * naming the ARN.
+     *
+     * <p>Only for the listener types the member belongs to. The reference marks {@code
+     * Certificates} "[HTTPS and TLS listeners]" and the user guide scopes the certificate list to
+     * an HTTPS listener, so a certificate on a listener of any other protocol is a configuration
+     * AWS does not describe, and what it answers there is not {@code CertificateNotFound} on any
+     * evidence here. Such a request keeps the behaviour it had rather than being refused with a
+     * code read off the wrong case.
+     *
+     * <p>A blank entry is refused like any other. {@code Certificates} is a list of the
+     * certificates the listener serves, and an empty value in it names one no better than a value
+     * that is no ARN at all, so letting it through would store a certificate the listener cannot
+     * serve.
+     */
+    private void requireCertificates(String region, String protocol,
+                                     List<String> certificateArns) {
+        if (certificateResolver == null || certificateArns == null || !servesCertificates(protocol)) {
+            return;
+        }
+        for (String certificateArn : certificateArns) {
+            if (certificateArn == null || certificateArn.isBlank()
+                    || !certificateResolver.exists(region, certificateArn)) {
+                throw new AwsException("CertificateNotFound",
+                        "The specified certificate does not exist.", 400);
+            }
+        }
+    }
+
+    /** The listener protocols a certificate belongs to, per the reference's own bracket. */
+    private static boolean servesCertificates(String protocol) {
+        return "HTTPS".equalsIgnoreCase(protocol) || "TLS".equalsIgnoreCase(protocol);
+    }
+
+    /**
+     * Runs a listener write under {@link CertificateReferenceResolver#runWhileHeld}, so an IAM
+     * server certificate it records cannot be deleted between the check and the write. The
+     * callers re-check inside the guard: the fail-fast check above it keeps the error precedence
+     * AWS has, and only the one under the guard is atomic with the write.
+     */
+    private void whileCertificatesHeld(List<String> certificateArns, Runnable action) {
+        if (certificateResolver == null) {
+            action.run();
+            return;
+        }
+        certificateResolver.runWhileHeld(certificateArns, action);
+    }
 
     private LoadBalancer requireLoadBalancer(String region, String arn) {
         LoadBalancer lb = loadBalancers.getOrDefault(region, Map.of()).get(arn);

@@ -350,6 +350,8 @@ read; the comparison is driven entirely by the policy's own condition operator (
 | GetServiceLastAccessedDetails | Returns the job's status and its service-access report. |
 | GetServiceLastAccessedDetailsWithEntities | Returns the job's status and the entities that used a given service. |
 | ListPoliciesGrantingServiceAccess | Lists the policies that let an IAM identity access each requested service. |
+| GenerateOrganizationsAccessReport | Starts a report of the services the SCPs along an Organizations entity path leave reachable, and returns its job ID. |
+| GetOrganizationsAccessReport | Returns the job's status and its report. |
 
 Floci does not record service access. Nothing populates a principal's usage history, and
 `GetAccessKeyLastUsed` already answers with AWS's documented "never used" shape rather than
@@ -419,6 +421,73 @@ not carve out. Permissions boundaries are excluded, as the operation's documenta
 resource-based policies, ACLs, Organizations policies and trust policies are not consulted.
 Resources and conditions are not evaluated either: the question is which policies could grant the
 service at all, not whether one specific call would be authorized.
+
+The Organizations access report is the same job shape over a different question. Instead of one
+entity's permissions policies it reports the services the service control policies along an
+Organizations entity path leave reachable, and it is answered from Floci's own Organizations tree:
+the entity path names the organization, its root and the OUs or account below, and the SCPs attached
+to each of those are read and evaluated. Only SCP logic applies, which the reference is explicit
+about, so identity policies, resource policies, ACLs, permissions boundaries and trust policies play
+no part. The entity path has to be a path the organization actually has: the segments below the root
+name a chain of parent and child, so the path is held to the one Organizations reports for its last
+node, and a path assembled from two branches, or one that skips an OU, fails the job rather than
+reporting the policies of a chain that does not exist.
+
+Attached SCPs are a union within one level and the levels are intersected, so a service survives only
+where every level allows it. That question cannot be answered a namespace at a time, because a
+service is reachable only while some action in it survives the whole chain: two levels allowing
+single disjoint actions, `s3:GetObject` under `s3:PutObject`, leave no S3 action at all, and a `Deny`
+on the one action a level allows leaves none either. What a namespace-wide reading got right stays
+right: an SCP denying `s3:DeleteBucket` alone keeps S3 on the list, because every other S3 action is
+still reachable, and a `Deny` that carries a `Condition` or names particular resources closes nothing
+at all, since the region-restricting deny on `*` that most organizations carry, and a deny scoped to
+one bucket, both leave the service reachable by every request they do not cover. The survivors are
+found by probing the chain with the actions the policies themselves name plus one stand-in action per
+wildcard, which is exact for the patterns policies are written with; a wildcard that is not a
+trailing one, as in `s3:*Object`, cannot be probed that way and leaves the service on the list rather
+than off it.
+
+The management account is not limited by SCPs, so its report lists every service and an
+`OrganizationsPolicyId` passed with it is ignored, as the reference says. Passing that ID otherwise
+narrows the report to the one SCP named, and it has to name one: Organizations keeps tag, backup,
+chatbot and opt-out policies in the same ID space, none of them carries statements, and evaluating
+one as a ceiling would read as a level that constrains nothing and report every service there is.
+
+Every service in the report is one principals are allowed but never reached, since Floci records no
+access, and that is the shape the reference's own example gives such a service: a namespace and a
+zero count, with no region, entity path or last-authenticated time. `NumberOfServicesNotAccessed`
+therefore equals `NumberOfServicesAccessible`. `ServiceName` carries a display name
+("Amazon S3") that Floci has no mapping for, so the namespace stands in for it, as on the
+last-accessed reader. `SortKey` is validated against its four values; the namespace keys sort the
+list and the two time keys leave it in namespace order, because ordering on a timestamp no entry
+carries would be ordering on nothing.
+
+A caller who is not the management account gets `AccessDenied` 403. Neither operation models a code
+for that, but a per-action error list is additive: the reference's common error types "that this AWS
+service may return" apply to every action and include the 403 permission denial, and the IAM user
+guide names the code for a denied IAM action outright, in the `AddRoleToInstanceProfile`
+troubleshooting entry. The common error page spells it `AccessDeniedException` while the user guide
+and the rest of Floci's IAM and STS surface spell it `AccessDenied`; the latter is used here, for
+consistency with the surface a caller is already on.
+
+Three things about this pair are inferences, and they are the same inference three times. The
+generator models no error for an entity path that is well-formed but resolves to nothing, so a path
+naming another organization, an entity outside this one, or a chain the organization does not have,
+produces a `FAILED` job carrying `ErrorDetails` instead. Nor does it model one for the prerequisite
+the reference states, that SCPs be enabled for the organization root, so an organization without them
+produces a `FAILED` job too, carrying `PolicyTypeNotEnabled`. Nor one for an `OrganizationsPolicyId`
+that names a policy of some other type, which fails the job carrying Organizations'
+`InvalidInputException`. All three are read off the shape of the API rather than off a sentence: AWS
+publishes both `FAILED` and `ErrorDetails` on this reader, for failures the generator does not
+report synchronously, and the alternatives are all worse. Letting Organizations' own error escape
+unchanged would put another service's code on an IAM operation, a `COMPLETED` job with an empty list
+cannot be told apart from an organization that reaches no services, and `ValidationError` is for a
+shape violation, which a resolvable-looking path, a disabled policy type and an existing policy of
+the wrong type are not.
+
+The generator's only modeled error, `ReportGenerationLimitExceeded`, reports concurrent generations
+for the account and stays unreachable here: a job is complete the moment it is created, so two can
+never overlap.
 
 ### Multi-Factor Authentication
 
@@ -989,6 +1058,7 @@ When `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED` is active, Floci also queries regi
 - An explicit **Deny** in a resource policy overrides any allows.
 - In cross-account scenarios or resource-controlled access, an explicit **Allow** in a resource policy grants access to the principal.
 - For detailed S3 bucket policy behavior and configuration, see [S3 Bucket Policy Enforcement](s3.md#bucket-policy-enforcement).
+- Lambda function policies, the statements `AddPermission` adds, take part the same way. An invoke of another account's function by ARN runs it in that account, so its function policy has to allow the caller as well; see [Function policies under IAM enforcement](lambda.md#function-policies-under-iam-enforcement).
 
 ### Service control policies (SCPs)
 
@@ -1064,9 +1134,13 @@ format of each type. `make iam-action-resources-check` gates its shape offline o
 request and `make iam-action-resources-verify` checks every claim in it against AWS weekly, so a
 type that drifts from what AWS publishes fails in CI rather than authorizing against the wrong
 resource. What stays in Java is the half that is Floci's: the request parameter each type's name
-arrives in, the creates, the actions whose request carries an ARN, and the resource types that
-belong only to actions Floci does not dispatch. `IamActionResourcesTest` checks the one against
-the other, so a regeneration that introduces a resource type nothing resolves fails a test naming
+arrives in, the creates, the actions whose request carries an ARN, the four whose request names
+the resource some other way, and the resource types that belong only to actions Floci does not
+dispatch. `GenerateOrganizationsAccessReport` is one of the four: the reference spells its type as
+`access-report/${EntityPath}`, so the Organizations entity path goes into the ARN whole, its
+slashes being the organization's tree rather than an IAM path. `IamActionResourcesTest` checks the
+one against the other, so a regeneration that introduces a resource type nothing resolves fails a
+test naming
 it rather than quietly putting that action back on `*`.
 
 The nineteen user actions whose `UserName` the model marks optional, `GetUser`, `ListAccessKeys` and
@@ -1201,9 +1275,8 @@ being bounded by SCPs (below): both forms of root enforcement now agree. A negat
 absent key cannot equal what the policy names, so the condition holds, and a `Deny` written
 that way applies when the key is missing.
 
-**Not yet supported**: `NotPrincipal`, resource-based policies (S3 bucket policy, Lambda resource
-policy), and `dynamodb:LeadingKeys` for `Scan`, `TransactWriteItems` / `TransactGetItems` and the
-PartiQL operations.
+**Not yet supported**: `dynamodb:LeadingKeys` for `Scan`, `TransactWriteItems` / `TransactGetItems`
+and the PartiQL operations.
 
 ### Assumed roles
 

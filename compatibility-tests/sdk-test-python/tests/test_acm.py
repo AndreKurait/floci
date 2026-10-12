@@ -1,14 +1,12 @@
 """ACM integration tests."""
 
-import datetime
 import re
 
 import pytest
 from botocore.exceptions import ClientError
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
-from cryptography.x509.oid import NameOID
 
 FAKE_ARN = "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
 
@@ -109,41 +107,9 @@ class TestACMCertificateLifecycle:
 class TestACMImportExport:
     """Test ACM import and export operations."""
 
-    @staticmethod
-    def _generate_self_signed_cert():
-        """Generate a self-signed certificate and private key.
-
-        Returns:
-            Tuple of (cert_pem_bytes, key_pem_bytes).
-        """
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        subject = issuer = x509.Name(
-            [x509.NameAttribute(NameOID.COMMON_NAME, "test.example.com")]
-        )
-        cert = (
-            x509.CertificateBuilder()
-            .subject_name(subject)
-            .issuer_name(issuer)
-            .public_key(key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
-            .not_valid_after(
-                datetime.datetime.now(datetime.timezone.utc)
-                + datetime.timedelta(days=365)
-            )
-            .sign(key, hashes.SHA256())
-        )
-        cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-        key_pem = key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption(),
-        )
-        return cert_pem, key_pem
-
-    def test_import_certificate(self, acm_client):
+    def test_import_certificate(self, acm_client, make_self_signed_certificate):
         """Test ImportCertificate with self-signed cert returns ARN."""
-        cert_pem, key_pem = self._generate_self_signed_cert()
+        cert_pem, key_pem = make_self_signed_certificate()
 
         response = acm_client.import_certificate(
             Certificate=cert_pem, PrivateKey=key_pem
@@ -156,9 +122,9 @@ class TestACMImportExport:
         finally:
             acm_client.delete_certificate(CertificateArn=arn)
 
-    def test_import_certificate_with_chain(self, acm_client):
+    def test_import_certificate_with_chain(self, acm_client, make_self_signed_certificate):
         """Test ImportCertificate with certificate chain returns ARN."""
-        cert_pem, key_pem = self._generate_self_signed_cert()
+        cert_pem, key_pem = make_self_signed_certificate()
 
         response = acm_client.import_certificate(
             Certificate=cert_pem,
@@ -173,9 +139,9 @@ class TestACMImportExport:
         finally:
             acm_client.delete_certificate(CertificateArn=arn)
 
-    def test_get_imported_certificate(self, acm_client):
+    def test_get_imported_certificate(self, acm_client, make_self_signed_certificate):
         """Test GetCertificate on imported cert returns matching body."""
-        cert_pem, key_pem = self._generate_self_signed_cert()
+        cert_pem, key_pem = make_self_signed_certificate()
 
         import_response = acm_client.import_certificate(
             Certificate=cert_pem, PrivateKey=key_pem
@@ -189,9 +155,9 @@ class TestACMImportExport:
         finally:
             acm_client.delete_certificate(CertificateArn=arn)
 
-    def test_export_certificate(self, acm_client):
+    def test_export_certificate(self, acm_client, make_self_signed_certificate):
         """Test ExportCertificate returns the imported key, encrypted under the passphrase."""
-        cert_pem, key_pem = self._generate_self_signed_cert()
+        cert_pem, key_pem = make_self_signed_certificate()
         passphrase = b"test-passphrase"
 
         import_response = acm_client.import_certificate(

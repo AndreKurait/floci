@@ -15,18 +15,21 @@ import java.util.Map;
 
 /**
  * Passes an upload body through while computing its MD5, the checksums it is checked against or
- * stored with, and its size, so a body can be validated and stored without being held whole.
+ * stored with, and its size, so a body can be validated and stored without being held whole. A body
+ * that runs past the most its request may upload fails with EntityTooLarge, whatever size it declared.
  */
 final class DigestingInputStream extends FilterInputStream {
 
     private final MessageDigest md5;
     private final Map<ChecksumAlgorithm, S3Checksum.Calculator> calculators = new EnumMap<>(ChecksumAlgorithm.class);
     private final Map<ChecksumAlgorithm, String> checksums = new EnumMap<>(ChecksumAlgorithm.class);
+    private final long maxSize;
     private byte[] md5Digest;
     private long size;
 
-    DigestingInputStream(InputStream in, Collection<ChecksumAlgorithm> algorithms) {
+    DigestingInputStream(InputStream in, Collection<ChecksumAlgorithm> algorithms, long maxSize) {
         super(in);
+        this.maxSize = maxSize;
         try {
             this.md5 = MessageDigest.getInstance("MD5");
         } catch (NoSuchAlgorithmException e) {
@@ -106,6 +109,9 @@ final class DigestingInputStream extends FilterInputStream {
     }
 
     private void update(byte[] buffer, int offset, int length) {
+        if (size + length > maxSize) {
+            throw S3Service.entityTooLarge(maxSize);
+        }
         md5.update(buffer, offset, length);
         for (S3Checksum.Calculator calculator : calculators.values()) {
             calculator.update(buffer, offset, length);

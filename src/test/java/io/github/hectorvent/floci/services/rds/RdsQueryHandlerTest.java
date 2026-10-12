@@ -2469,10 +2469,122 @@ class RdsQueryHandlerTest {
                 eq(List.of("222222222222")), eq(List.of("111111111111")), isNull());
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "RestoreDBInstanceFromDBSnapshot, MultiAZ",
+            "RestoreDBInstanceFromDBSnapshot, EnableIAMDatabaseAuthentication",
+            "RestoreDBClusterFromSnapshot, EnableIAMDatabaseAuthentication",
+            "RestoreDBClusterToPointInTime, EnableIAMDatabaseAuthentication"
+    })
+    void restoreBooleanFlagsRejectMalformedValuesBeforeServiceCalls(String action, String parameter) {
+        when(service.restoreDbInstanceFromDbSnapshot(any(), any(), any(), any(), anyBoolean(),
+                any(), any(), any(), any(), any(), any())).thenReturn(makeInstance("restored"));
+        when(service.restoreDbClusterFromSnapshot(any(), any(), any(), any(), any(), any(),
+                any(), any(), any(), any(), any(), any(), any())).thenReturn(makeCluster("restored"));
+        when(service.restoreDbClusterToPointInTime(any(), any(), any(), any(), any(), any(),
+                any(), any(), any(), any(), any(), any(), any())).thenReturn(makeCluster("restored"));
+        for (String invalid : List.of("yes", "", "not-a-boolean")) {
+            MultivaluedMap<String, String> p = params();
+            p.putSingle("DBInstanceIdentifier", "restored");
+            p.putSingle("DBSnapshotIdentifier", "source");
+            p.putSingle("DBClusterIdentifier", "restored");
+            p.putSingle("SnapshotIdentifier", "source");
+            p.putSingle("SourceDBClusterIdentifier", "source");
+            p.putSingle("Engine", "aurora-postgresql");
+            p.putSingle("UseLatestRestorableTime", "true");
+            p.putSingle(parameter, invalid);
+
+            Response response = handler.handle(action, p);
+
+            assertEquals(400, response.getStatus());
+            assertTrue(((String) response.getEntity()).contains("<Code>InvalidParameterValue</Code>"));
+            assertTrue(((String) response.getEntity()).contains(parameter + " must be true or false."));
+            verifyNoInteractions(service);
+        }
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"true", "false", "TrUe", "FaLsE"})
+    void restoreInstanceSnapshotPreservesMultiAzValuesAndDefault(String value) {
+        boolean enabled = Boolean.parseBoolean(value);
+        when(service.restoreDbInstanceFromDbSnapshot(eq("restored"), eq("source"), isNull(), isNull(),
+                eq(enabled), isNull(), eq(List.of()), eq(Map.of()), isNull(), isNull(), isNull()))
+                .thenReturn(makeInstance("restored"));
+        when(service.restoreDbInstanceFromDbSnapshot(eq("restored"), eq("source"), isNull(), isNull(),
+                eq(enabled), isNull(), eq(List.of()), eq(Map.of()), isNull(), eq(5433), isNull()))
+                .thenReturn(makeInstance("restored"));
+        MultivaluedMap<String, String> p = params();
+        p.putSingle("DBInstanceIdentifier", "restored");
+        p.putSingle("DBSnapshotIdentifier", "source");
+        if (value != null) {
+            p.putSingle("MultiAZ", value);
+        }
+
+        assertEquals(200, handler.handle("RestoreDBInstanceFromDBSnapshot", p).getStatus());
+        verify(service).restoreDbInstanceFromDbSnapshot("restored", "source", null, null,
+                enabled, null, List.of(), Map.of(), null, null, null);
+        p.putSingle("Port", "5433");
+        assertEquals(200, handler.handle("RestoreDBInstanceFromDBSnapshot", p).getStatus());
+        verify(service).restoreDbInstanceFromDbSnapshot("restored", "source", null, null,
+                enabled, null, List.of(), Map.of(), null, 5433, null);
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"true", "false", "TrUe", "FaLsE"})
+    void restoreInstanceSnapshotForwardsIamFlagWithAndWithoutPort(String value) {
+        Boolean enabled = value == null ? null : Boolean.parseBoolean(value);
+        when(service.restoreDbInstanceFromDbSnapshot(any(), any(), any(), any(), anyBoolean(),
+                any(), any(), any(), any(), any(), eq(enabled))).thenReturn(makeInstance("restored"));
+        MultivaluedMap<String, String> p = params();
+        p.putSingle("DBInstanceIdentifier", "restored");
+        p.putSingle("DBSnapshotIdentifier", "source");
+        if (value != null) {
+            p.putSingle("EnableIAMDatabaseAuthentication", value);
+        }
+        assertEquals(200, handler.handle("RestoreDBInstanceFromDBSnapshot", p).getStatus());
+        verify(service).restoreDbInstanceFromDbSnapshot("restored", "source", null, null,
+                false, null, List.of(), Map.of(), null, null, enabled);
+        p.putSingle("Port", "5433");
+        assertEquals(200, handler.handle("RestoreDBInstanceFromDBSnapshot", p).getStatus());
+        verify(service).restoreDbInstanceFromDbSnapshot("restored", "source", null, null,
+                false, null, List.of(), Map.of(), null, 5433, enabled);
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"true", "false", "TrUe", "FaLsE"})
+    void restoreClusterActionsPreserveIamValuesAndOmission(String value) {
+        Boolean enabled = value == null ? null : Boolean.parseBoolean(value);
+        when(service.restoreDbClusterFromSnapshot(eq("restored"), eq("snapshot"), eq("aurora-postgresql"),
+                isNull(), isNull(), isNull(), isNull(), isNull(), isNull(), eq(enabled), isNull(),
+                eq(Map.of()), isNull())).thenReturn(makeCluster("restored"));
+        when(service.restoreDbClusterToPointInTime(eq("restored"), eq("source"), isNull(), isNull(),
+                isNull(), eq(true), isNull(), isNull(), isNull(), eq(enabled), isNull(),
+                eq(Map.of()), isNull())).thenReturn(makeCluster("restored"));
+        MultivaluedMap<String, String> p = params();
+        p.putSingle("DBClusterIdentifier", "restored");
+        p.putSingle("SnapshotIdentifier", "snapshot");
+        p.putSingle("Engine", "aurora-postgresql");
+        if (value != null) {
+            p.putSingle("EnableIAMDatabaseAuthentication", value);
+        }
+
+        assertEquals(200, handler.handle("RestoreDBClusterFromSnapshot", p).getStatus());
+        verify(service).restoreDbClusterFromSnapshot("restored", "snapshot", "aurora-postgresql",
+                null, null, null, null, null, null, enabled, null, Map.of(), null);
+        p.putSingle("SourceDBClusterIdentifier", "source");
+        p.putSingle("UseLatestRestorableTime", "true");
+        assertEquals(200, handler.handle("RestoreDBClusterToPointInTime", p).getStatus());
+        verify(service).restoreDbClusterToPointInTime("restored", "source", null, null, null, true,
+                null, null, null, enabled, null, Map.of(), null);
+    }
+
     @Test
     void restoreDbInstanceFromDbSnapshot_success() {
         DbInstance instance = makeInstance("mydb");
-        when(service.restoreDbInstanceFromDbSnapshot(eq("mydb"), eq("mysnap"), eq("db.t3.large"), eq("us-east-1a"), eq(true), eq("my-subnets"), eq(List.of("sg-123")), eq(Map.of("Env", "Prod")), isNull()))
+        when(service.restoreDbInstanceFromDbSnapshot(eq("mydb"), eq("mysnap"), eq("db.t3.large"), eq("us-east-1a"), eq(true), eq("my-subnets"), eq(List.of("sg-123")), eq(Map.of("Env", "Prod")), isNull(), isNull(), isNull()))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();

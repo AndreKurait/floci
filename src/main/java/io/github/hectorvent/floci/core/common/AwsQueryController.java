@@ -113,6 +113,7 @@ public class AwsQueryController {
             "TagSAMLProvider", "UntagSAMLProvider", "ListSAMLProviderTags",
             "GenerateServiceLastAccessedDetails", "GetServiceLastAccessedDetails",
             "GetServiceLastAccessedDetailsWithEntities", "ListPoliciesGrantingServiceAccess",
+            "GenerateOrganizationsAccessReport", "GetOrganizationsAccessReport",
             "UploadServerCertificate", "GetServerCertificate", "UpdateServerCertificate",
             "DeleteServerCertificate", "ListServerCertificates",
             "TagServerCertificate", "UntagServerCertificate", "ListServerCertificateTags",

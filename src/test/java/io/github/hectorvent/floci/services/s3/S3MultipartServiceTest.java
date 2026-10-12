@@ -569,7 +569,9 @@ class S3MultipartServiceTest {
 
         assertEquals("EntityTooLarge", error.getErrorCode());
         assertEquals(400, error.getHttpStatus());
-        assertEquals("Your proposed upload exceeds the maximum allowed object size.", error.getMessage());
+        assertEquals("Your proposed upload exceeds the maximum allowed size", error.getMessage());
+        assertEquals(Map.of("ProposedSize", (long) Integer.MAX_VALUE, "MaxSizeAllowed", Integer.MAX_VALUE - 8L),
+                error.getExtendedData());
         assertNull(upload.getParts().get(2), "a rejected part is not recorded");
         s3Service.uploadPart("test-bucket", "huge.bin", upload.getUploadId(), 1, new byte[16]);
         assertEquals(16, upload.getParts().get(1).getSize(), "re-uploading a part replaces its size in the total");

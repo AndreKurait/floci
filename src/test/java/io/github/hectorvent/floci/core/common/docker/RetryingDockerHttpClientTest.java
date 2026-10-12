@@ -9,6 +9,8 @@ import org.junit.jupiter.api.Test;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.BindException;
+import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -406,6 +408,34 @@ class RetryingDockerHttpClientTest {
                 assertThrows(IllegalStateException.class, () -> rejectedClient.execute(ping));
         assertSame(rejection, surfaced, "a daemon rejection must surface unchanged");
         assertEquals(1, rejectedDelegate.calls.get());
+    }
+
+    @Test
+    void execute_missingDockerSocket_failsWithoutRetry() {
+        RuntimeException missingSocket = new RuntimeException(new SocketException("No such file or directory"));
+        FakeTransport delegate = new FakeTransport(attempt -> {
+            throw missingSocket;
+        });
+        RetryingDockerHttpClient client = new RetryingDockerHttpClient(delegate, MAX_ATTEMPTS, 0L);
+        Request list = Request.builder().method(Request.Method.GET).path("/containers/json").build();
+
+        RuntimeException thrown = assertThrows(RuntimeException.class, () -> client.execute(list));
+        assertSame(missingSocket, thrown);
+        assertEquals(1, delegate.calls.get(), "a missing docker socket must not be retried");
+    }
+
+    @Test
+    void execute_dockerSocketPermissionDenied_failsWithoutRetry() {
+        RuntimeException denied = new RuntimeException(new BindException("Permission denied"));
+        FakeTransport delegate = new FakeTransport(attempt -> {
+            throw denied;
+        });
+        RetryingDockerHttpClient client = new RetryingDockerHttpClient(delegate, MAX_ATTEMPTS, 0L);
+        Request inspect = Request.builder().method(Request.Method.GET).path("/volumes/data").build();
+
+        RuntimeException thrown = assertThrows(RuntimeException.class, () -> client.execute(inspect));
+        assertSame(denied, thrown);
+        assertEquals(1, delegate.calls.get(), "a docker socket this process may not open must not be retried");
     }
 
     @Test

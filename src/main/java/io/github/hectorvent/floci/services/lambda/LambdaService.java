@@ -1234,9 +1234,10 @@ public class LambdaService implements ResourceProvider {
         String name = ref.name();
         String qualifier = ref.qualifier();
         LambdaFunction fn;
-        if (functionName.startsWith("arn:")) {
-            AwsArnUtils.Arn arn = AwsArnUtils.parse(functionName);
-            fn = targetResolver.resolveInvokeTargetForAccount(arn.accountId(), region, name, qualifier);
+        // A full or partial ARN names its account, which is where the function runs and what IAM
+        // enforcement authorized the call against.
+        if (ref.account() != null) {
+            fn = targetResolver.resolveInvokeTargetForAccount(ref.account(), region, name, qualifier);
         } else {
             fn = targetResolver.resolveInvokeTarget(region, name, qualifier);
         }
@@ -3734,6 +3735,40 @@ public class LambdaService implements ResourceProvider {
             policy.put("Statement", statements);
             return Map.of("policy", policy, "revisionId", fn.getRevisionId());
         }
+    }
+
+    /**
+     * Every statement in the resource-based policies of a function in {@code accountId}: the
+     * function's own and those of each of its versions and aliases, which each statement's
+     * {@code Resource} tells apart. Read under the lock the policy mutations hold, so a statement
+     * being added or removed is seen whole or not at all. Empty when the function does not exist or
+     * has no policy.
+     */
+    public List<Map<String, Object>> policyStatements(String accountId, String region, String functionName) {
+        Optional<LambdaFunction> observed = functionStore.getForAccount(accountId, region, functionName);
+        if (observed.isEmpty()) {
+            return List.of();
+        }
+        synchronized (lockForPolicyMutation(observed.get().getFunctionArn())) {
+            return functionStore.getForAccount(accountId, region, functionName)
+                    .map(fn -> fn.getPolicies().stream()
+                            .<Map<String, Object>>map(LinkedHashMap::new)
+                            .toList())
+                    .orElse(List.of());
+        }
+    }
+
+    /**
+     * Reads the function, version or alias a full ARN names, in the ARN's own account and Region,
+     * where an invoke of that ARN runs it. {@link #getFunction(String, String)} reads a name in the
+     * caller's account, which for another account's ARN is a different function or none.
+     */
+    public LambdaFunction getFunctionByArn(String functionArn) {
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionArn);
+        if (ref.region() == null || ref.account() == null) {
+            throw new AwsException("InvalidParameterValueException", "Not a function ARN: " + functionArn, 400);
+        }
+        return targetResolver.resolveReadTargetForAccount(ref.account(), ref.region(), ref.name(), ref.qualifier());
     }
 
     /**

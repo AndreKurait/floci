@@ -284,7 +284,9 @@ class S3StreamedUploadTest {
 
             assertEquals("EntityTooLarge", error.getErrorCode());
             assertEquals(400, error.getHttpStatus());
-            assertEquals("Your proposed upload exceeds the maximum allowed object size.", error.getMessage());
+            assertEquals("Your proposed upload exceeds the maximum allowed size", error.getMessage());
+            assertEquals(Map.of("ProposedSize", overLimit, "MaxSizeAllowed", S3Service.MAX_PART_SIZE),
+                    error.getExtendedData());
         }
         assertTrue(s3Service.getMultipartUpload("bucket", "copy.bin", upload.getUploadId()).getParts().isEmpty());
         assertNothingStaged();

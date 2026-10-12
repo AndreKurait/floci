@@ -76,6 +76,29 @@ The event invoke configuration is stored and returned as AWS does, and `AWS::Lam
 provisions it from a stack. Asynchronous invocations apply its retry, event age, destination settings,
 and dead-letter queue configurations (`DeadLetterConfig`).
 
+### Function policies under IAM enforcement
+
+With [IAM enforcement](iam.md#resource-based-policies) on, the statements `AddPermission` adds take
+part in authorizing calls to the function:
+
+- An invoke of a function named by a full or partial ARN runs the function in the account in the
+  ARN. An invoke of another account's function needs its function policy to allow the caller as
+  well as the caller's own identity policy.
+- `GetFunction`, `GetFunctionConfiguration` and `ListDurableExecutionsByFunction`, given a full ARN
+  with a version or alias, read the function in the account in the ARN, and need its function
+  policy to allow the caller in the same way.
+- Other operations act on the caller's own function of the name the ARN gives, whatever account
+  the ARN names, and are authorized against that function. Floci does not serve them on another
+  account's function, which AWS allows through a function policy.
+- Within one account, a statement naming the caller grants on its own.
+- An invoke is authorized against the version or alias it names, in the function name or in
+  `Qualifier`. A grant added with `Qualifier` covers that version or alias only, and a grant on the
+  function does not cover a qualified invoke. Other operations are authorized against the
+  unqualified function.
+- A statement conditioned on `InvokedViaFunctionUrl` does not admit a direct `Invoke`.
+- `aws:PrincipalOrgID` is not part of the request context, so a grant added with `PrincipalOrgID`
+  admits no caller.
+
 ### Reserved Concurrency
 
 Unqualified `GetFunction` reads include `Concurrency.ReservedConcurrentExecutions` when a reservation

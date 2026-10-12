@@ -89,7 +89,7 @@ class SecretsManagerWriteLockTest {
     @Test
     void deletingASecretWaitsForTheFinalSaveOfARotation() throws Exception {
         LambdaService lambda = mock(LambdaService.class);
-        when(lambda.getFunction(anyString(), anyString())).thenReturn(new LambdaFunction());
+        when(lambda.getFunctionByArn(anyString())).thenReturn(new LambdaFunction());
         InvokeResult ok = new InvokeResult();
         ok.setStatusCode(200);
         when(lambda.invoke(anyString(), anyString(), any(byte[].class), any())).thenReturn(ok);

@@ -16,6 +16,10 @@ class S3AwsChunkedIntegrationTest {
     private static final String STREAMING_UNSIGNED = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
     private static final String INCOMPLETE_BODY_MESSAGE =
             "You did not provide the number of bytes specified by the Content-Length HTTP header.";
+    private static final String ENTITY_TOO_LARGE_MESSAGE = "Your proposed upload exceeds the maximum allowed size";
+    // S3 names the size proposed and the most allowed, in this order, between the message and the request id.
+    private static final String ENTITY_TOO_LARGE_SIZES =
+            "</Message><ProposedSize>5368709121</ProposedSize><MaxSizeAllowed>5368709120</MaxSizeAllowed><RequestId>";
 
     @Test
     void putObject_chunkShorterThanItsDeclaredSize_isIncompleteBodyAndNotStored() {
@@ -294,6 +298,60 @@ class S3AwsChunkedIntegrationTest {
         .then()
             .statusCode(400)
             .body(containsString("<Code>IncompleteBody</Code>"));
+
+        given()
+            .when().get("/" + bucket + "/object.txt?uploadId=" + uploadId)
+            .then().statusCode(200)
+            .body(not(containsString("<Part>")));
+    }
+
+    @Test
+    void putObject_declaringMoreThanFiveGibibytes_isEntityTooLargeAndNotStored() {
+        String bucket = createBucket("chunked-too-large");
+
+        given()
+            .header("x-amz-content-sha256", STREAMING_UNSIGNED)
+            .header("Content-Encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", "5368709121")
+            .body("5\r\nhello\r\n0\r\n\r\n")
+        .when()
+            .put("/" + bucket + "/object.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>EntityTooLarge</Code>"))
+            .body(containsString("<Message>" + ENTITY_TOO_LARGE_MESSAGE + ENTITY_TOO_LARGE_SIZES));
+        assertObjectAbsent(bucket, "object.txt");
+
+        given()
+            .header("x-amz-content-sha256", STREAMING_UNSIGNED)
+            .header("Content-Encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", "5")
+            .body("5\r\nhello\r\n0\r\n\r\n")
+        .when()
+            .put("/" + bucket + "/object.txt")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    void uploadPart_declaringMoreThanFiveGibibytes_isEntityTooLargeAndNoPartIsStored() {
+        String bucket = createBucket("chunked-part-too-large");
+        String uploadId = given()
+            .when().post("/" + bucket + "/object.txt?uploads")
+            .then().statusCode(200)
+            .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+
+        given()
+            .header("x-amz-content-sha256", STREAMING_UNSIGNED)
+            .header("Content-Encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", "5368709121")
+            .body("5\r\nhello\r\n0\r\n\r\n")
+        .when()
+            .put("/" + bucket + "/object.txt?partNumber=1&uploadId=" + uploadId)
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>EntityTooLarge</Code>"))
+            .body(containsString("<Message>" + ENTITY_TOO_LARGE_MESSAGE + ENTITY_TOO_LARGE_SIZES));
 
         given()
             .when().get("/" + bucket + "/object.txt?uploadId=" + uploadId)

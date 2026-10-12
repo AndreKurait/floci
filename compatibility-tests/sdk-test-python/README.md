@@ -22,6 +22,7 @@ Compatibility tests for [Floci](https://github.com/hectorvent/floci) using **bot
 | `cloudwatch-metrics`    | PutMetricData, ListMetrics, GetMetricStatistics, alarms                  |
 | `cloudformation-naming` | Auto physical name generation, explicit name precedence, cross-reference |
 | `cognito`               | User pools, clients, AdminCreateUser, InitiateAuth, GetUser              |
+| `elbv2`                 | Listener certificates resolved against IAM and ACM                       |
 
 ## Requirements
 

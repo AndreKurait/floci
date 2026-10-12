@@ -58,6 +58,7 @@ Standard and compat have identical startup time (~24 ms) and memory footprint (~
 - Java 25+
 - Maven 3.9+
 - (Optional) GraalVM Mandrel for native compilation
+- (Optional) Docker Engine 25.0+ to build the Docker images
 
 ### Clone and run
 

@@ -2,7 +2,6 @@ package io.github.hectorvent.floci.services.iam;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.iam.model.ServiceLastAccessedEntity;
@@ -37,7 +36,7 @@ public class ServiceLastAccessedService {
     private static final Set<String> GRANULARITIES = Set.of("SERVICE_LEVEL", "ACTION_LEVEL");
     private static final String DEFAULT_GRANULARITY = "SERVICE_LEVEL";
 
-    private final StorageBackend<String, ServiceLastAccessedJob> jobs;
+    private final IamJobStore<ServiceLastAccessedJob> jobs;
 
     @Inject
     public ServiceLastAccessedService(StorageFactory storageFactory) {
@@ -45,7 +44,7 @@ public class ServiceLastAccessedService {
     }
 
     ServiceLastAccessedService(StorageBackend<String, ServiceLastAccessedJob> jobs) {
-        this.jobs = jobs;
+        this.jobs = new IamJobStore<>(jobs, ServiceLastAccessedJob::getJobId);
     }
 
     /**
@@ -68,30 +67,15 @@ public class ServiceLastAccessedService {
         ServiceLastAccessedJob job = new ServiceLastAccessedJob(UUID.randomUUID().toString(), arn,
                 granularity == null ? DEFAULT_GRANULARITY : granularity, now, now,
                 serviceNamespaces, entities);
-        putForAccount(accountId, job);
+        jobs.put(accountId, job);
         return job;
     }
 
     public ServiceLastAccessedJob get(String accountId, String jobId) {
-        return find(accountId, jobId).orElseThrow(() -> new AwsException("NoSuchEntity",
-                "The job ID " + jobId + " cannot be found.", 404));
+        return jobs.get(accountId, jobId);
     }
 
     public Optional<ServiceLastAccessedJob> find(String accountId, String jobId) {
-        if (jobId == null || jobId.isBlank()) {
-            return Optional.empty();
-        }
-        if (jobs instanceof AccountAwareStorageBackend<ServiceLastAccessedJob> aware) {
-            return aware.getForAccount(accountId, jobId);
-        }
-        return jobs.get(jobId);
-    }
-
-    private void putForAccount(String accountId, ServiceLastAccessedJob job) {
-        if (jobs instanceof AccountAwareStorageBackend<ServiceLastAccessedJob> aware) {
-            aware.putForAccount(accountId, job.getJobId(), job);
-        } else {
-            jobs.put(job.getJobId(), job);
-        }
+        return jobs.find(accountId, jobId);
     }
 }

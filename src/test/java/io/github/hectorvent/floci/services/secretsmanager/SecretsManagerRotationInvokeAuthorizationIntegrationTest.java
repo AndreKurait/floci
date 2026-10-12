@@ -60,7 +60,7 @@ class SecretsManagerRotationInvokeAuthorizationIntegrationTest {
 
     @BeforeEach
     void stubLambda() {
-        Mockito.when(lambdaService.getFunction(anyString(), anyString())).thenReturn(new LambdaFunction());
+        Mockito.when(lambdaService.getFunctionByArn(anyString())).thenReturn(new LambdaFunction());
         InvokeResult ok = new InvokeResult();
         ok.setStatusCode(200);
         Mockito.when(lambdaService.invoke(any(), any(), any(), any())).thenReturn(ok);

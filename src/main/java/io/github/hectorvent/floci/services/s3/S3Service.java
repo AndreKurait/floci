@@ -85,6 +85,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.LongConsumer;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -220,7 +221,7 @@ public class S3Service implements Resettable, ResourceProvider {
         return locks;
     }
     // Memory mode keeps an object in one byte array; this is the largest the JDK reliably allocates.
-    private static final long MAX_IN_MEMORY_OBJECT_SIZE = Integer.MAX_VALUE - 8;
+    static final long MAX_IN_MEMORY_OBJECT_SIZE = Integer.MAX_VALUE - 8;
     // Directory under .multipart where a streamed part or object body is written before it is
     // published. Upload IDs are UUIDs, so it never collides with an upload's own directory, and the
     // sweep at startup and reset clears it with them.
@@ -633,7 +634,8 @@ public class S3Service implements Resettable, ResourceProvider {
      * it in memory in the disk-backed modes. Everything the request alone decides is checked before
      * any of the body is read, so a write that cannot succeed fails without transferring it. The body
      * is staged on disk with its ETag and checksum worked out as it arrives, then moved into place
-     * like an assembled multipart object.
+     * like an assembled multipart object. A body of more than 5 GiB, the most S3 takes in one
+     * PutObject, fails with EntityTooLarge as soon as it passes that.
      */
     S3Object putObject(String bucketName, String key, InputStream body, UploadChecksums checksums,
                        String contentType, Map<String, String> metadata, PutObjectOptions options) {
@@ -661,7 +663,7 @@ public class S3Service implements Resettable, ResourceProvider {
         ChecksumAlgorithm computed = effectiveOptions.getClientChecksum() != null ? null
                 : declared != null ? declared : ChecksumAlgorithm.CRC64NVME;
         DigestingInputStream digests = new DigestingInputStream(body,
-                digestAlgorithms(checksums, computed));
+                digestAlgorithms(checksums, computed), MAX_PUT_OBJECT_SIZE);
         Path staged = stageBody(digests);
         try {
             checksums.verify(digests.md5(), digests::checksum);
@@ -2303,6 +2305,28 @@ public class S3Service implements Resettable, ResourceProvider {
     // The most one part of a multipart upload can hold, per S3's multipart upload limits.
     static final long MAX_PART_SIZE = 5L * 1024 * 1024 * 1024;
 
+    // The User Guide's "up to 5 GB" in one PutObject, read as 5 GiB like CopyObject's 5 GB limit;
+    // a larger object is uploaded in parts.
+    static final long MAX_PUT_OBJECT_SIZE = 5L * 1024 * 1024 * 1024;
+
+    /**
+     * The message of S3's {@code EntityTooLarge} error as S3 sends it, which is not the wording of the
+     * error code table's description.
+     */
+    static final String ENTITY_TOO_LARGE_MESSAGE = "Your proposed upload exceeds the maximum allowed size";
+
+    /** S3's error for an upload over the most it takes, naming the size proposed and the most allowed. */
+    static AwsException entityTooLarge(long proposedSize, long maxSizeAllowed) {
+        return new AwsException("EntityTooLarge", ENTITY_TOO_LARGE_MESSAGE, 400,
+                Map.of("ProposedSize", proposedSize, "MaxSizeAllowed", maxSizeAllowed));
+    }
+
+    /** The same error for a body that ran past the most allowed before its whole size was known. */
+    static AwsException entityTooLarge(long maxSizeAllowed) {
+        return new AwsException("EntityTooLarge", ENTITY_TOO_LARGE_MESSAGE, 400,
+                Map.of("MaxSizeAllowed", maxSizeAllowed));
+    }
+
     static void requireCopyableSize(S3Object source) {
         if (source.getSize() > MAX_COPY_OBJECT_SOURCE_SIZE) {
             throw new AwsException("InvalidRequest",
@@ -3898,7 +3922,9 @@ public class S3Service implements Resettable, ResourceProvider {
      * body is staged outside the upload's directory and outside any lock, so parts of one upload still
      * arrive in parallel and a slow client never holds up the bucket's other multipart operations. Only
      * once it has passed its checks is it moved into the upload and its record published, under the
-     * upload's lock, so an upload aborted or completed meanwhile fails the part with NoSuchUpload.
+     * upload's lock, so an upload aborted or completed meanwhile fails the part with NoSuchUpload. A
+     * body of more than 5 GiB, the most one part holds, fails with EntityTooLarge as soon as it
+     * passes that.
      */
     Part storePart(String bucket, String key, String uploadId, int partNumber, InputStream body,
                    UploadChecksums checksums,
@@ -3920,7 +3946,7 @@ public class S3Service implements Resettable, ResourceProvider {
         }
         ChecksumAlgorithm algorithm = declared != null ? declared : ChecksumAlgorithm.CRC64NVME;
         DigestingInputStream digests = new DigestingInputStream(body,
-                digestAlgorithms(checksums, algorithm));
+                digestAlgorithms(checksums, algorithm), MAX_PART_SIZE);
         Path staged = stageBody(digests);
         try {
             checksums.verify(digests.md5(), digests::checksum);
@@ -3956,19 +3982,36 @@ public class S3Service implements Resettable, ResourceProvider {
      * with EntityTooLarge once it outgrows the largest array the JDK allocates.
      */
     private static byte[] readVerified(InputStream body, UploadChecksums checksums, String upload) {
-        DigestingInputStream digests = new DigestingInputStream(body, digestAlgorithms(checksums, null));
+        // The memory cap is lower than the most S3 takes in one body, so it is the limit here.
+        DigestingInputStream digests = new DigestingInputStream(body, digestAlgorithms(checksums, null),
+                Long.MAX_VALUE);
+        byte[] data = readWithin(digests, MAX_IN_MEMORY_OBJECT_SIZE,
+                readSoFar -> warnTooLargeForMemory(upload, readSoFar));
+        checksums.verify(digests.md5(), digests::checksum);
+        verifyChunkedTrailers(body, digests, checksums);
+        return data;
+    }
+
+    /**
+     * Reads all of {@code body} into one array, failing with EntityTooLarge once it passes
+     * {@code maxSize}, after telling {@code tooLarge} how many bytes it had read by then.
+     */
+    static byte[] readWithin(InputStream body, long maxSize, LongConsumer tooLarge) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         byte[] buffer = new byte[64 * 1024];
         try {
-            for (int read = digests.read(buffer); read >= 0; read = digests.read(buffer)) {
-                requireFitsInMemory(upload, (long) out.size() + read);
+            for (int read = body.read(buffer); read >= 0; read = body.read(buffer)) {
+                long readSoFar = (long) out.size() + read;
+                if (readSoFar > maxSize) {
+                    tooLarge.accept(readSoFar);
+                    // The rest of the body is not read, so its whole size is not known to name.
+                    throw entityTooLarge(maxSize);
+                }
                 out.write(buffer, 0, read);
             }
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to read the upload body", e);
         }
-        checksums.verify(digests.md5(), digests::checksum);
-        verifyChunkedTrailers(body, digests, checksums);
         return out.toByteArray();
     }
 
@@ -4065,8 +4108,7 @@ public class S3Service implements Resettable, ResourceProvider {
                     copySourceSseCustomerHeaders.keyMd5());
             CopySourceRange range = CopySourceRange.parse(copySourceRange, source.getSize());
             if (range.length() > MAX_PART_SIZE) {
-                throw new AwsException("EntityTooLarge",
-                        "Your proposed upload exceeds the maximum allowed object size.", 400);
+                throw entityTooLarge(range.length(), MAX_PART_SIZE);
             }
             return storePart(destBucket, destKey, uploadId, partNumber,
                     new ByteRangeInputStream(read.body(), range.first(), range.length()), UploadChecksums.NONE,
@@ -4261,15 +4303,20 @@ public class S3Service implements Resettable, ResourceProvider {
 
     /**
      * Rejects an upload that memory mode could not hold in one byte array, with the error S3 gives an
-     * object over its size limit, so it fails at the part that crosses the limit instead of running
-     * the heap out of memory or overflowing the array size at completion.
+     * object over its size limit, naming the upload's size and the most memory mode holds, so it fails
+     * at the part that crosses the limit instead of running the heap out of memory or overflowing the
+     * array size at completion.
      */
     private static void requireFitsInMemory(String upload, long uploadSize) {
         if (uploadSize > MAX_IN_MEMORY_OBJECT_SIZE) {
-            LOG.warnv("{0} would hold {1} bytes, over the {2} an object can have in memory storage mode; set FLOCI_STORAGE_SERVICES_S3_MODE=persistent for larger objects",
-                    upload, uploadSize, MAX_IN_MEMORY_OBJECT_SIZE);
-            throw new AwsException("EntityTooLarge", "Your proposed upload exceeds the maximum allowed object size.", 400);
+            warnTooLargeForMemory(upload, uploadSize);
+            throw entityTooLarge(uploadSize, MAX_IN_MEMORY_OBJECT_SIZE);
         }
+    }
+
+    private static void warnTooLargeForMemory(String upload, long uploadSize) {
+        LOG.warnv("{0} would hold {1} bytes, over the {2} an object can have in memory storage mode; set FLOCI_STORAGE_SERVICES_S3_MODE=persistent for larger objects",
+                upload, uploadSize, MAX_IN_MEMORY_OBJECT_SIZE);
     }
 
     /**

@@ -22,6 +22,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -58,6 +59,14 @@ public class IamPolicyEvaluator {
     /** An account's root principal ({@code arn:<partition>:iam::<account>:root}) in any partition. */
     private static final Pattern ROOT_PRINCIPAL_ARN =
             Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:root");
+
+    /**
+     * The verb of the stand-in action a wildcard is probed with in
+     * {@link #servicesAllowedByScpLevels}. Any string no real action spells out will do, since it
+     * stands for "some other action this pattern covers". Lowercase, because action patterns are
+     * lowercased at parse time and matched case-sensitively from there on.
+     */
+    private static final String ANY_ACTION = "flociprobedaction";
 
     public enum Decision { ALLOW, DENY }
 
@@ -522,6 +531,194 @@ public class IamPolicyEvaluator {
             }
         }
         return false;
+    }
+
+    /**
+     * The service namespaces an SCP chain leaves reachable, backing the service list in
+     * {@code GetOrganizationsAccessReport}.
+     *
+     * <p>Level conventions are {@link #scpAllows}'s. A {@code null} chain means SCPs do not apply
+     * and every published namespace is reachable, which is the management account's case. A level
+     * with no document constrains nothing, since AWS keeps FullAWSAccess attached to every target,
+     * and a level carrying a document that fails to parse leaves nothing reachable, because the
+     * ceiling cannot tell what an unreadable guardrail would have said.
+     *
+     * <p>Attached SCPs are a union within a level and the levels are intersected. The question is
+     * service-level, but it cannot be answered a namespace at a time: a service is reachable only
+     * while some action in it survives the whole chain. Two levels allowing single disjoint
+     * actions, {@code s3:GetObject} under {@code s3:PutObject}, leave no S3 action at all, and a
+     * {@code Deny} on the one action a level allows leaves none either, so neither reports S3.
+     * What a namespace-wide reading got right stays right: an SCP denying {@code s3:DeleteBucket}
+     * alone keeps S3 on the list, because every other S3 action is still reachable.
+     *
+     * <p>This is not {@link #scpAllows} asked once per namespace. That question needs a concrete
+     * action, and a request action of {@code s3:*} would not match a statement naming
+     * {@code s3:GetObject}, because a pattern globs against a request value and never the other
+     * way round. The survivors are found by probing instead, with the actions the policies
+     * themselves name and one stand-in action per wildcard.
+     */
+    public List<String> servicesAllowedByScpLevels(List<List<String>> scpLevels) {
+        if (scpLevels == null) {
+            return List.copyOf(new TreeSet<>(AwsServiceNamespaces.all()));
+        }
+        Set<String> reachable = null;
+        List<List<PolicyStatement>> allowLevels = new ArrayList<>();
+        List<PolicyStatement> denials = new ArrayList<>();
+        for (List<String> level : scpLevels) {
+            ParsedDocuments parsed = parseAllTracked(level);
+            if (parsed.anyFailed()) {
+                return List.of();
+            }
+            if (parsed.statements().isEmpty()) {
+                continue;
+            }
+            Set<String> levelAllows = new TreeSet<>(servicesGrantedBy(level));
+            if (reachable == null) {
+                reachable = levelAllows;
+            } else {
+                reachable.retainAll(levelAllows);
+            }
+            List<PolicyStatement> allows = new ArrayList<>();
+            for (PolicyStatement stmt : parsed.statements()) {
+                if (stmt.isDeny()) {
+                    denials.add(stmt);
+                } else {
+                    allows.add(stmt);
+                }
+            }
+            allowLevels.add(allows);
+        }
+        if (reachable == null) {
+            return List.copyOf(new TreeSet<>(AwsServiceNamespaces.all()));
+        }
+        // The namespace pass above is the cheap half of the answer and only ever too generous, so
+        // what survives it is then asked the question that needs an action.
+        reachable.removeIf(namespace -> !anyActionSurvives(allowLevels, denials, namespace));
+        return List.copyOf(reachable);
+    }
+
+    /**
+     * Whether any action in the namespace is allowed by every level and denied by none.
+     *
+     * <p>The actions worth asking about are the ones the policies name, plus a stand-in for each
+     * wildcard: {@code s3:Get*} is probed as an action starting with {@code Get} that nothing else
+     * spells out, which is what makes a deny on {@code s3:GetObject} leave the service reachable
+     * while a deny on {@code s3:Get*} does not. A pattern whose wildcard is not its last character
+     * cannot be probed this way, since the stand-in for {@code s3:*Object} misses the
+     * {@code s3:GetObject} that {@code s3:Get*} would allow. Such a pattern leaves the namespace
+     * on the list rather than off it, keeping the imprecision on the side the namespace pass was
+     * already on.
+     */
+    private boolean anyActionSurvives(List<List<PolicyStatement>> allowLevels,
+                                      List<PolicyStatement> denials, String serviceNamespace) {
+        Set<String> probes = new LinkedHashSet<>();
+        probes.add(serviceNamespace + ":" + ANY_ACTION);
+        boolean decidable = true;
+        for (List<PolicyStatement> level : allowLevels) {
+            for (PolicyStatement stmt : level) {
+                decidable = collectProbes(stmt.getActions(), serviceNamespace, probes) && decidable;
+                decidable = collectProbes(stmt.getNotActions(), serviceNamespace, probes) && decidable;
+            }
+        }
+        for (PolicyStatement stmt : denials) {
+            decidable = collectProbes(stmt.getActions(), serviceNamespace, probes) && decidable;
+            decidable = collectProbes(stmt.getNotActions(), serviceNamespace, probes) && decidable;
+        }
+        for (String action : probes) {
+            if (allowedByEveryLevel(allowLevels, action) && !deniedByAny(denials, action)) {
+                return true;
+            }
+        }
+        return !decidable;
+    }
+
+    /**
+     * Adds one probe action per pattern that reaches the namespace, and reports whether every
+     * pattern seen was one a probe decides exactly.
+     */
+    private static boolean collectProbes(List<String> patterns, String serviceNamespace,
+                                         Set<String> probes) {
+        if (patterns == null) {
+            return true;
+        }
+        boolean decidable = true;
+        for (String pattern : patterns) {
+            if (!actionPatternReaches(pattern, serviceNamespace)) {
+                continue;
+            }
+            int colon = pattern.indexOf(':');
+            String verb = colon < 0 ? "*" : pattern.substring(colon + 1);
+            int star = verb.indexOf('*');
+            if (verb.indexOf('?') >= 0 || (star >= 0 && star != verb.length() - 1)) {
+                decidable = false;
+            }
+            probes.add(serviceNamespace + ":" + verb.replace("*", ANY_ACTION).replace("?", "a"));
+        }
+        return decidable;
+    }
+
+    /** Whether one action clears the ceiling at every level, each level being a union. */
+    private boolean allowedByEveryLevel(List<List<PolicyStatement>> allowLevels, String action) {
+        for (List<PolicyStatement> level : allowLevels) {
+            boolean allowed = false;
+            for (PolicyStatement stmt : level) {
+                if (permits(stmt, action)) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (!allowed) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether an {@code Allow} covers the action. Resources and conditions are left out of the
+     * allow side, as everywhere else in this answer: narrowing a grant to one bucket still leaves
+     * the service reachable.
+     */
+    private boolean permits(PolicyStatement stmt, String action) {
+        if (stmt.getNotActions() != null) {
+            return !matchesAny(stmt.getNotActions(), action);
+        }
+        return stmt.getActions() != null && matchesAny(stmt.getActions(), action);
+    }
+
+    /**
+     * Whether a {@code Deny} that bites on every request covers the action. A deny carrying a
+     * {@code Condition}, or scoped to particular resources, is not one of those: the
+     * region-restricting {@code Deny} on {@code *} that most organizations carry would otherwise
+     * empty the report, and a deny on one bucket would drop S3 while every other bucket is still
+     * there.
+     */
+    private boolean deniedByAny(List<PolicyStatement> denials, String action) {
+        for (PolicyStatement stmt : denials) {
+            if (!deniesEveryRequest(stmt)) {
+                continue;
+            }
+            if (stmt.getNotActions() != null) {
+                if (!matchesAny(stmt.getNotActions(), action)) {
+                    return true;
+                }
+            } else if (stmt.getActions() != null && matchesAny(stmt.getActions(), action)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether a {@code Deny} applies to every request, rather than to some of them. */
+    private static boolean deniesEveryRequest(PolicyStatement stmt) {
+        if (stmt.getConditions() != null && !stmt.getConditions().isEmpty()) {
+            return false;
+        }
+        if (stmt.getNotResources() != null && !stmt.getNotResources().isEmpty()) {
+            return false;
+        }
+        List<String> resources = stmt.getResources();
+        return resources == null || resources.isEmpty() || resources.contains("*");
     }
 
     /** Appends the key name inside every {@code ${key}} policy variable found in {@code values}. */

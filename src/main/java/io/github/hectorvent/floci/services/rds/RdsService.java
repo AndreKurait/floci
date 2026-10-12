@@ -1154,6 +1154,15 @@ public class RdsService implements Resettable, ResourceProvider {
                                                        List<String> vpcSecurityGroupIds,
                                                        Map<String, String> tags, String region,
                                                        Integer requestedPort) {
+        return restoreDbInstanceFromDbSnapshot(instanceId, snapshotId, dbInstanceClass, availabilityZone,
+                multiAz, dbSubnetGroupName, vpcSecurityGroupIds, tags, region, requestedPort, null);
+    }
+
+    public DbInstance restoreDbInstanceFromDbSnapshot(String instanceId, String snapshotId, String dbInstanceClass,
+                                                       String availabilityZone, boolean multiAz, String dbSubnetGroupName,
+                                                       List<String> vpcSecurityGroupIds,
+                                                       Map<String, String> tags, String region,
+                                                       Integer requestedPort, Boolean iamEnabled) {
         String effectiveRegion = effectiveRegion(region);
         DbSnapshot snapshot = Optional.ofNullable(findSnapshotForScope(currentAccountId(), effectiveRegion, snapshotId))
                 .orElseThrow(() -> new AwsException("DBSnapshotNotFound", "DBSnapshot " + snapshotId + " not found.", 404));
@@ -1170,7 +1179,7 @@ public class RdsService implements Resettable, ResourceProvider {
                 snapshot.isStorageEncrypted(), snapshot.getKmsKeyId(), null, null, null, null);
         DbInstance instance = createDbInstance(instanceId, snapshot.getEngine().name().toLowerCase(), snapshot.getEngineVersion(),
                 snapshot.getMasterUsername(), snapshot.getMasterPassword(),
-                snapshot.getDbName(), targetClass, snapshot.getAllocatedStorage(), snapshot.isIamDatabaseAuthenticationEnabled(),
+                snapshot.getDbName(), targetClass, snapshot.getAllocatedStorage(), Boolean.TRUE.equals(iamEnabled),
                 null, dbSubnetGroupName, null, availabilityZone, multiAz, false, null, tags, vpcSecurityGroupIds,
                 null, effectiveRegion, true, restoreSettings, null, requestedPort);
 
@@ -1959,7 +1968,7 @@ public class RdsService implements Resettable, ResourceProvider {
                 engineVersion != null && !engineVersion.isBlank() ? engineVersion : snapshot.getEngineVersion(),
                 snapshot.getMasterUsername(), snapshot.getMasterPassword(),
                 databaseName != null && !databaseName.isBlank() ? databaseName : snapshot.getDatabaseName(),
-                iamEnabled != null ? iamEnabled : snapshot.isIamDatabaseAuthenticationEnabled(),
+                Boolean.TRUE.equals(iamEnabled),
                 parameterGroupName, dbSubnetGroupName, availabilityZone, false, effectiveRegion,
                 null, null, null, false, null,
                 engineMode != null && !engineMode.isBlank() ? engineMode : snapshot.getEngineMode(),
@@ -2038,7 +2047,7 @@ public class RdsService implements Resettable, ResourceProvider {
                 ? source.getEngineIdentifier() : source.getEngine().name().toLowerCase(Locale.ROOT);
         DbCluster cluster = createDbClusterWithPort(clusterId, engineParam, source.getEngineVersion(),
                 source.getMasterUsername(), source.getMasterPassword(), source.getDatabaseName(),
-                iamEnabled != null ? iamEnabled : source.isIamDatabaseAuthenticationEnabled(),
+                Boolean.TRUE.equals(iamEnabled),
                 parameterGroupName, dbSubnetGroupName, null, false, effectiveRegion,
                 null, null, null, false, null,
                 !isBlank(engineMode) ? engineMode : source.getEngineMode(),

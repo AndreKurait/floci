@@ -1149,10 +1149,11 @@ public class SecretsManagerService implements ResourceProvider {
 
         // A function that cannot be found is reported the way AWS reports it, AccessDeniedException with
         // HTTP 400; any other reference Lambda refuses is an invalid RotationLambdaARN. Either way the
-        // secret is left as it was.
+        // secret is left as it was. The function is looked up where the rotation will invoke it: in the
+        // ARN's account, and as the version or alias the ARN names.
         if (!serviceManaged && lambdaService != null) {
             try {
-                lambdaService.getFunction(region, functionArn);
+                lambdaService.getFunctionByArn(functionArn);
             } catch (AwsException e) {
                 if (e.getHttpStatus() == 404) {
                     throw new AwsException("AccessDeniedException",

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.iam;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
@@ -78,7 +79,7 @@ public class ResourceArnBuilder {
         String path = ctx.getUriInfo().getPath();
         return switch (credentialScope) {
             case "s3"             -> List.of(buildS3Arn(path, region));
-            case "lambda"         -> List.of(buildLambdaArn(path, region, accountId));
+            case "lambda"         -> List.of(buildLambdaArn(path, ctx, region, accountId));
             case "sqs"            -> List.of(buildSqsArn(ctx, region, accountId));
             case "sns"            -> List.of(buildSnsArn(ctx, region, accountId));
             case "dynamodb"       -> buildDynamoDbArns(ctx, region, accountId);
@@ -164,7 +165,6 @@ public class ResourceArnBuilder {
      * exists to close.
      */
     static final Map<String, String> UNRESOLVED_TYPES = Map.of(
-            "access-report", "GenerateOrganizationsAccessReport is not dispatched",
             "delegation-request", "the delegation request family is not dispatched",
             "role-template", "GetRoleTemplateVersion is not dispatched");
 
@@ -182,10 +182,12 @@ public class ResourceArnBuilder {
     static final Map<String, String> IAM_ARN_PARAMETERS = iamArnParameters();
 
     /**
-     * The actions resolved by a branch of their own in {@link #buildIamArns}, because the request
-     * identifies the resource without naming it: a service principal for
-     * {@code CreateServiceLinkedRole}, an access key id for {@code GetAccessKeyLastUsed}, and a
-     * deletion task id for {@code GetServiceLinkedRoleDeletionStatus}.
+     * The actions resolved by a branch of their own in {@link #buildIamArns}, because what the
+     * request carries is not an IAM entity's name: a service principal for
+     * {@code CreateServiceLinkedRole}, an access key id for {@code GetAccessKeyLastUsed}, a
+     * deletion task id for {@code GetServiceLinkedRoleDeletionStatus}, and an Organizations
+     * entity path for {@code GenerateOrganizationsAccessReport}, whose resource lives in another
+     * service's tree.
      *
      * <p>The resolver is the value rather than a branch elsewhere, so this cannot become a list
      * that says an action is handled while the dispatch has nothing for it. The keys are also what
@@ -196,7 +198,9 @@ public class ResourceArnBuilder {
             "CreateServiceLinkedRole", ResourceArnBuilder::serviceLinkedRoleArn,
             "GetAccessKeyLastUsed",
             (self, ctx, region, accountId) -> self.accessKeyOwnerArn(ctx, accountId),
-            "GetServiceLinkedRoleDeletionStatus", ResourceArnBuilder::deletionTaskRoleArn);
+            "GetServiceLinkedRoleDeletionStatus", ResourceArnBuilder::deletionTaskRoleArn,
+            "GenerateOrganizationsAccessReport",
+            ResourceArnBuilder::organizationsAccessReportArn);
 
     /** How one of {@link #DERIVED_RESOLVERS} reads its resource out of the request. */
     interface DerivedResolver {
@@ -465,6 +469,22 @@ public class ResourceArnBuilder {
                 .orElse(List.of("*"));
     }
 
+    /**
+     * The report {@code GenerateOrganizationsAccessReport} would produce. The reference spells the
+     * type as {@code access-report/${EntityPath}}, so the resource is the Organizations entity
+     * path the request carries and there is no IAM {@code Path} to read: the slashes inside it are
+     * the organization's own tree, not an IAM path.
+     */
+    private List<String> organizationsAccessReportArn(ContainerRequestContext ctx, String region,
+                                                      String accountId) {
+        String entityPath = RequestBodyReader.formField(ctx, "EntityPath");
+        if (entityPath == null || entityPath.isBlank()) {
+            return List.of("*");
+        }
+        return List.of(AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "iam", accountId,
+                "access-report/" + entityPath).toString());
+    }
+
     /** A request's Path as it appears in an ARN: slash-delimited, defaulting to a bare slash. */
     private static String normalizeArnPath(String path) {
         if (path == null || path.isBlank()) {
@@ -541,7 +561,19 @@ public class ResourceArnBuilder {
     }
 
     // ── Lambda ──────────────────────────────────────────────────────────────────
-    private String buildLambdaArn(String path, String region, String accountId) {
+
+    /**
+     * The function a Lambda request acts on, as an IAM policy names it. An invoke runs the function
+     * in the account and Region its full or partial ARN names, so it is evaluated against that
+     * function, and against the version or alias it names in the function name or in
+     * {@code Qualifier}, since Lambda authorizes a qualified call against the qualified ARN (Lambda
+     * Developer Guide, "Referencing functions in the Resource section of policies"). The reads
+     * {@link #readsInTheAccountItNames} names act in the account a qualified ARN names too. Every
+     * other route acts on the caller's own function of that name, whatever account an ARN names.
+     * Those are evaluated unqualified, because not every one of them acts on the qualifier it is
+     * given.
+     */
+    private String buildLambdaArn(String path, ContainerRequestContext ctx, String region, String accountId) {
         String executionArn = durableExecutionArn(path);
         if (executionArn == null) {
             executionArn = durableCallbackExecutionArn(path);
@@ -552,10 +584,49 @@ public class ResourceArnBuilder {
         // path: /2015-03-31/functions/name or similar
         String name = extractSegmentAfter(path, "functions");
         if (name == null) return "*";
-        // strip qualifier if present
-        int colon = name.indexOf(':');
-        if (colon > 0) name = name.substring(0, colon);
-        return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
+        boolean invoke = path.endsWith("/functions/" + name + "/invocations");
+        try {
+            if (!invoke) {
+                LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(name);
+                boolean namedAccount = readsInTheAccountItNames(path, name, ref, ctx);
+                return AwsArnUtils.Arn.of("lambda",
+                        namedAccount ? ref.region() : region,
+                        namedAccount ? ref.account() : accountId,
+                        "function:" + ref.name()).toString();
+            }
+            LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolveWithQualifier(
+                    name, ctx.getUriInfo().getQueryParameters().getFirst("Qualifier"));
+            String resource = ref.qualifier() != null
+                    ? "function:" + ref.name() + ":" + ref.qualifier()
+                    : "function:" + ref.name();
+            return AwsArnUtils.Arn.of("lambda",
+                    ref.region() != null ? ref.region() : region,
+                    ref.account() != null ? ref.account() : accountId,
+                    resource).toString();
+        } catch (AwsException e) {
+            // A reference Lambda refuses, which its handler answers with a 400 before acting on anything.
+            return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
+        }
+    }
+
+    /**
+     * {@code GetFunction}, {@code GetFunctionConfiguration} and {@code ListDurableExecutionsByFunction}
+     * read a function named by a qualified full ARN in the account the ARN names, where the version or
+     * alias is resolved ({@code LambdaService.getFunction(region, name, qualifier)}). Unqualified, or
+     * by partial ARN, they read the caller's own function of that name, as every other route acts.
+     */
+    private static boolean readsInTheAccountItNames(String path, String name,
+                                                    LambdaArnUtils.ResolvedFunctionRef ref,
+                                                    ContainerRequestContext ctx) {
+        if (!"GET".equals(ctx.getMethod()) || !name.startsWith("arn:")) {
+            return false;
+        }
+        String route = path.substring(path.indexOf("/functions/" + name) + "/functions/".length() + name.length());
+        if (!route.isEmpty() && !route.equals("/configuration") && !route.equals("/durable-executions")) {
+            return false;
+        }
+        String qualifier = ctx.getUriInfo().getQueryParameters().getFirst("Qualifier");
+        return ref.qualifier() != null || (qualifier != null && !qualifier.isBlank());
     }
 
     /** Durable execution actions are authorized against the execution ARN, which carries the version. */
