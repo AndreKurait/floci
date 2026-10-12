@@ -550,7 +550,7 @@ public class ApiGatewayExecuteController {
                 authorizerResult.principalId(), authorizerResult.context(), resolvedApiKey, iamIdentity);
 
         try {
-            InvokeResult result = lambdaService.invoke(region, functionName, eventJson.getBytes(),
+            InvokeResult result = lambdaService.invokeTarget(region, functionName, eventJson.getBytes(),
                     InvocationType.RequestResponse);
             Response response = buildProxyResponse(result, false);
             if (response.getStatus() == 502 && isGatewayGeneratedProxyFailure(result)) {
@@ -1043,7 +1043,7 @@ public class ApiGatewayExecuteController {
             RestLambdaAuthorizer.Result verified = restLambdaAuthorizer.get(key);
             if (verified == null) {
                 try (RestLambdaAuthorizer.Invocation pending = restLambdaAuthorizer.beginInvocation(key)) {
-                    InvokeResult invocation = lambdaService.invoke(region, function,
+                    InvokeResult invocation = lambdaService.invokeTarget(region, function,
                             event.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
                     if (invocation.getFunctionError() != null) {
                         return lambdaAuthorizerFailure(scope, invocation);
@@ -1336,10 +1336,10 @@ public class ApiGatewayExecuteController {
     /**
      * Extracts function name from integration URI like
      * {@code arn:aws:apigateway:...:lambda:path/2015-03-31/functions/{fnArn}/invocations}.
-     * Delegates to {@link LambdaArnUtils#extractFunctionNameFromUri(String)}.
+     * Delegates to {@link LambdaArnUtils#extractFunctionReferenceFromUri(String)}.
      */
     private String functionNameFromUri(String uri) {
-        return LambdaArnUtils.extractFunctionNameFromUri(uri);
+        return LambdaArnUtils.extractFunctionReferenceFromUri(uri);
     }
 
     // Package-private rather than private so a focused unit test can assert the event's wire shape
@@ -1776,7 +1776,7 @@ public class ApiGatewayExecuteController {
                             "Cannot resolve Lambda function name from URI: " + integration.getUri(), 400);
                 }
                 byte[] payload = transformedBody != null ? transformedBody.getBytes(StandardCharsets.UTF_8) : new byte[0];
-                InvokeResult invokeResult = lambdaService.invoke(region, functionName, payload, InvocationType.RequestResponse);
+                InvokeResult invokeResult = lambdaService.invokeTarget(region, functionName, payload, InvocationType.RequestResponse);
                 String lambdaResponseBody = invokeResult.getPayload() != null
                         ? new String(invokeResult.getPayload(), StandardCharsets.UTF_8) : "{}";
                 int lambdaStatus = invokeResult.getStatusCode() > 0 ? invokeResult.getStatusCode() : 200;
@@ -2650,7 +2650,7 @@ public class ApiGatewayExecuteController {
         LOG.debugv("execute-api v2: {0} {1}/{2}{3} → Lambda {4}", httpMethod, apiId, stageName, path, functionName);
 
         try {
-            InvokeResult result = lambdaService.invoke(region, functionName,
+            InvokeResult result = lambdaService.invokeTarget(region, functionName,
                     eventJson.getBytes(), InvocationType.RequestResponse);
             return buildProxyResponse(result, true, !payloadV1);
         } catch (AwsException e) {
@@ -3099,7 +3099,7 @@ public class ApiGatewayExecuteController {
         // Invoke the authorizer Lambda
         InvokeResult invokeResult;
         try {
-            invokeResult = lambdaService.invoke(region, functionName,
+            invokeResult = lambdaService.invokeTarget(region, functionName,
                     eventJson.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
         } catch (Exception e) {
             LOG.warnv("Lambda REQUEST authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());

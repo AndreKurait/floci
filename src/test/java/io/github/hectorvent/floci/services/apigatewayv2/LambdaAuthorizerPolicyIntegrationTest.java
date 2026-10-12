@@ -55,12 +55,12 @@ class LambdaAuthorizerPolicyIntegrationTest {
     void httpRequestsEnforceAuthorizerPolicies(String scenario, String statements, int expectedStatus) {
         configureApi("HTTP");
         stubAuthorizer(statements);
-        when(lambdaService.invoke(eq("us-east-1"), eq(BACKEND_FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + BACKEND_FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(result("{\"statusCode\":200,\"body\":\"allowed\"}"));
         given().header("X-Forwarded-For", "198.51.100.42")
                 .get("/execute-api/" + apiId + "/test/items").then().statusCode(expectedStatus);
         verify(lambdaService, times(expectedStatus == 200 ? 1 : 0))
-                .invoke(eq("us-east-1"), eq(BACKEND_FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse));
+                .invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + BACKEND_FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
     @ParameterizedTest(name = "WebSocket: {0}")
@@ -122,7 +122,7 @@ class LambdaAuthorizerPolicyIntegrationTest {
     }
 
     private void stubAuthorizer(String statements) {
-        when(lambdaService.invoke(eq("us-east-1"), eq(AUTHORIZER_FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + AUTHORIZER_FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenAnswer(invocation -> {
                     JsonNode event = MAPPER.readTree((byte[]) invocation.getArgument(2));
                     String arn = event.has("routeArn") ? event.path("routeArn").asText() : event.path("methodArn").asText();
