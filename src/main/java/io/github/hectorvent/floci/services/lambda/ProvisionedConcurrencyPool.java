@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -57,7 +58,7 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
     private final Map<ContainerHandle, Allocation> leases = new HashMap<>();
     private final Map<ContainerHandle, Configuration> owned = new HashMap<>();
     private final Set<ContainerHandle> pendingTeardown = new HashSet<>();
-    private final Set<ContainerHandle> stopping = new HashSet<>();
+    private final Map<ContainerHandle, CountDownLatch> stopping = new HashMap<>();
     private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
             Thread.ofPlatform().daemon().name("lambda-provisioned-concurrency").factory());
@@ -313,6 +314,9 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
         try {
             List<ContainerHandle> retry;
             synchronized (lock) {
+                if (stopped) {
+                    return;
+                }
                 retry = new ArrayList<>(pendingTeardown);
             }
             stop(retry);
@@ -446,6 +450,10 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
     }
 
     private void stop(List<ContainerHandle> handles) {
+        stop(handles, false);
+    }
+
+    private void stop(List<ContainerHandle> handles, boolean shutdownDrain) {
         synchronized (lock) {
             for (ContainerHandle handle : handles) {
                 if (owned.containsKey(handle)) {
@@ -453,15 +461,38 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
                     handle.setState(ContainerState.STOPPED);
                 }
             }
-        }
-        ContainerTeardowns.stopInParallel(handles, this::stop, LOG);
-    }
-
-    private void stop(ContainerHandle handle) {
-        synchronized (lock) {
-            if (!owned.containsKey(handle) || !stopping.add(handle)) {
+            if (stopped && !shutdownDrain) {
                 return;
             }
+        }
+        ContainerTeardowns.stopInParallel(handles, handle -> stop(handle, shutdownDrain), LOG);
+    }
+
+    private void stop(ContainerHandle handle, boolean shutdownDrain) {
+        CountDownLatch completion;
+        boolean alreadyStopping;
+        synchronized (lock) {
+            if (!owned.containsKey(handle) || (stopped && !shutdownDrain)) {
+                return;
+            }
+            completion = stopping.get(handle);
+            alreadyStopping = completion != null;
+            if (!alreadyStopping) {
+                completion = new CountDownLatch(1);
+                stopping.put(handle, completion);
+            }
+        }
+        if (alreadyStopping) {
+            // An admitted retry owns this stop. Shutdown joins it within the same bounded
+            // drain instead of returning while it runs, or issuing another Docker stop.
+            if (shutdownDrain) {
+                try {
+                    completion.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return;
         }
         try {
             launcher.stop(handle);
@@ -476,6 +507,7 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
             synchronized (lock) {
                 stopping.remove(handle);
             }
+            completion.countDown();
         }
     }
 
@@ -559,14 +591,23 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
 
     @Override
     public void stopManagedContainers() {
-        List<ContainerHandle> retired = new ArrayList<>();
+        List<ContainerHandle> retired;
         synchronized (lock) {
+            if (stopped) {
+                return;
+            }
             stopped = true;
-            allocations.values().forEach(entry -> retired.addAll(retire(entry)));
+            allocations.values().forEach(this::retire);
             allocations.clear();
-            retired.addAll(pendingTeardown);
+            retired = new ArrayList<>(owned.keySet());
         }
-        stop(retired);
+        stop(retired, true);
+        synchronized (lock) {
+            if (!owned.isEmpty()) {
+                LOG.warnv("Shutdown drain ended with {0} provisioned Lambda environment(s) still owned",
+                        owned.size());
+            }
+        }
     }
 
     @PreDestroy

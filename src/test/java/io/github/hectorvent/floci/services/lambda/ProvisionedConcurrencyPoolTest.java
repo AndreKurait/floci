@@ -20,8 +20,11 @@ import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -313,11 +316,104 @@ class ProvisionedConcurrencyPoolTest {
             launcher.stopGate.complete(null);
             drain.join(5000);
         }
+        int attempts = environments.stream().mapToInt(environment -> environment.stops.get()).sum();
+        pool.stopManagedContainers();
+        pool.reconcileSafely();
+        assertEquals(attempts, environments.stream().mapToInt(environment -> environment.stops.get()).sum());
+        // A deliberate reset reopens normal reconciliation; repeated shutdown never does.
+        pool.clear();
         await().atMost(Duration.ofSeconds(5)).until(() -> {
-            pool.stopManagedContainers();
+            pool.reconcileSafely();
             return environments.stream().noneMatch(environment -> environment.alive);
         });
         assertTrue(environments.stream().allMatch(environment -> environment.stops.get() > 0));
+    }
+
+    @Test
+    void failedShutdownIsNotRetriedByReconciliationOrBeanDestruction() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        launcher.stopFailures.set(1);
+
+        pool.stopManagedContainers();
+        assertTrue(first.alive);
+        assertEquals(1, first.stops.get());
+        pool.reconcileSafely();
+        pool.stopManagedContainers();
+        pool.shutdown();
+
+        assertTrue(first.alive, "A failed stop must remain visible rather than imply cleanup succeeded");
+        assertEquals(1, first.stops.get(), "Shutdown must not renew the drain budget");
+    }
+
+    @Test
+    void reconciliationCannotRetryWhileTheShutdownDrainIsRunning() throws Exception {
+        put(2);
+        Environment held = launched();
+        Environment failed = launched();
+        held.initialized.complete(null);
+        failed.initialized.complete(null);
+        ready();
+        held.stopGate = new CompletableFuture<>();
+        launcher.stopFailures.set(1);
+        CompletableFuture<Void> drained = CompletableFuture.runAsync(pool::stopManagedContainers);
+        try {
+            assertNotNull(launcher.stopping.poll(2, TimeUnit.SECONDS));
+            assertNotNull(launcher.stopping.poll(2, TimeUnit.SECONDS));
+            await().atMost(Duration.ofSeconds(2)).until(() -> launcher.stopFailures.get() == 0);
+            assertFalse(drained.isDone());
+
+            pool.reconcileSafely();
+            assertEquals(1, failed.stops.get(), "The scheduler must not compete with shutdown");
+            assertEquals(1, held.stops.get());
+        } finally {
+            held.stopGate.complete(null);
+            drained.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shutdownWaitsForAnAdmittedRetryWithoutStoppingTheHandleTwice() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        pool.put(REGION, "example", "1", 1, ACCOUNT);
+        Environment second = launched();
+        second.initialized.complete(null);
+        await().atMost(Duration.ofSeconds(2)).until(() ->
+                "READY".equals(pool.get(REGION, "example", "1", ACCOUNT).status()));
+        launcher.stopFailures.set(1);
+        assertThrows(AwsException.class, () -> pool.delete(REGION, "example", "live", ACCOUNT));
+        launcher.stopping.clear();
+        first.stopGate = new CompletableFuture<>();
+        try (ExecutorService tasks = Executors.newFixedThreadPool(2)) {
+            CompletableFuture<Void> retry = CompletableFuture.runAsync(pool::reconcileSafely, tasks);
+            CompletableFuture<Void> shutdown = null;
+            try {
+                assertSame(first, launcher.stopping.poll(2, TimeUnit.SECONDS));
+                shutdown = CompletableFuture.runAsync(pool::stopManagedContainers, tasks);
+                assertSame(second, launcher.stopping.poll(2, TimeUnit.SECONDS),
+                        "Shutdown has admitted its own handle while joining the earlier retry");
+                CompletableFuture<Void> drain = shutdown;
+                assertThrows(TimeoutException.class, () -> drain.get(100, TimeUnit.MILLISECONDS));
+                assertEquals(2, first.stops.get());
+            } finally {
+                first.stopGate.complete(null);
+                retry.get(5, TimeUnit.SECONDS);
+                if (shutdown != null) {
+                    shutdown.get(5, TimeUnit.SECONDS);
+                }
+            }
+        }
+        assertFalse(first.alive);
+        assertFalse(second.alive);
+        assertEquals(2, first.stops.get());
+        assertEquals(1, second.stops.get());
+        pool.shutdown();
+        assertEquals(2, first.stops.get());
     }
 
     @Test
@@ -370,6 +466,7 @@ class ProvisionedConcurrencyPoolTest {
         final CompletableFuture<Void> initialized = new CompletableFuture<>();
         final AtomicInteger stops = new AtomicInteger();
         final ContainerHandle handle;
+        volatile CompletableFuture<Void> stopGate = CompletableFuture.completedFuture(null);
         volatile boolean alive = true;
 
         Environment(int id, LambdaFunction fn) throws Exception {
@@ -428,6 +525,7 @@ class ProvisionedConcurrencyPoolTest {
             stopping.add(environment);
             try {
                 stopGate.get(5, TimeUnit.SECONDS);
+                environment.stopGate.get(5, TimeUnit.SECONDS);
             } catch (InterruptedException failure) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException(failure);
