@@ -4,6 +4,8 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -32,6 +34,62 @@ class RdsEventSubscriptionIntegrationTest {
 
     private static String name(String prefix) {
         return prefix + "-" + Long.toString(System.nanoTime(), 36);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"yes", "", " true "})
+    void malformedEnabledDoesNotCreateASubscription(String enabled) {
+        String subscription = name("invalid-enabled");
+        try {
+            rds("CreateEventSubscription", "SubscriptionName", subscription, "SnsTopicArn", TOPIC,
+                    "Enabled", enabled).statusCode(400)
+                .body(containsString("InvalidParameterValue"))
+                .body(containsString("Enabled must be true or false."));
+            rds("DescribeEventSubscriptions", "SubscriptionName", subscription).statusCode(404);
+        } finally {
+            rds("DeleteEventSubscription", "SubscriptionName", subscription);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"yes", "", " true "})
+    void malformedEnabledLeavesTheSubscriptionUnchanged(String enabled) {
+        String subscription = name("unchanged-enabled");
+        rds("CreateEventSubscription", "SubscriptionName", subscription, "SnsTopicArn", TOPIC,
+                "SourceType", "db-instance", "EventCategories.member.1", "availability").statusCode(200);
+        try {
+            rds("ModifyEventSubscription", "SubscriptionName", subscription,
+                    "SnsTopicArn", "arn:aws:sns:us-east-1:000000000000:changed",
+                    "SourceType", "db-cluster", "EventCategories.member.1", "failure",
+                    "Enabled", enabled).statusCode(400)
+                .body(containsString("InvalidParameterValue"));
+            rds("DescribeEventSubscriptions", "SubscriptionName", subscription).statusCode(200)
+                .body(containsString("<SnsTopicArn>" + TOPIC + "</SnsTopicArn>"))
+                .body(containsString("<SourceType>db-instance</SourceType>"))
+                .body(containsString("<EventCategory>availability</EventCategory>"))
+                .body(not(containsString("<EventCategory>failure</EventCategory>")))
+                .body(containsString("<Enabled>true</Enabled>"));
+        } finally {
+            rds("DeleteEventSubscription", "SubscriptionName", subscription).statusCode(200);
+        }
+    }
+
+    @Test
+    void enabledPreservesCreateDefaultAndOmittedModifyState() {
+        String subscription = name("enabled-default");
+        rds("CreateEventSubscription", "SubscriptionName", subscription, "SnsTopicArn", TOPIC)
+            .statusCode(200).body(containsString("<Enabled>true</Enabled>"));
+        try {
+            for (String enabled : new String[]{"FaLsE", "TrUe"}) {
+                String expected = "<Enabled>" + Boolean.parseBoolean(enabled) + "</Enabled>";
+                rds("ModifyEventSubscription", "SubscriptionName", subscription, "Enabled", enabled)
+                    .statusCode(200).body(containsString(expected));
+                rds("ModifyEventSubscription", "SubscriptionName", subscription)
+                    .statusCode(200).body(containsString(expected));
+            }
+        } finally {
+            rds("DeleteEventSubscription", "SubscriptionName", subscription).statusCode(200);
+        }
     }
 
     @Test

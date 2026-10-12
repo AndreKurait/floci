@@ -51,7 +51,8 @@ final class SesAddressSyntax {
     /**
      * Checks the To, Cc and Bcc of one bulk entry, then the request's Reply-To. AWS reports a
      * malformed entry recipient as that entry's status, and a malformed Reply-To as the status of
-     * every entry, not as a request error (probe-confirmed).
+     * every entry, not as a request error (probe-confirmed). An address list of the wrong JSON type
+     * never reaches this check: the controller rejects the whole request with SerializationException.
      */
     static void requireBulkDestination(BulkEmailEntry entry, List<String> replyToAddresses) {
         for (List<String> addresses : Arrays.asList(entry.toAddresses(), entry.ccAddresses(), entry.bccAddresses(),

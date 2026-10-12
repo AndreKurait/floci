@@ -217,13 +217,14 @@ class SesV2JsonTest {
 
     @Test
     void stringArrayOrAbsent_keepsEmptyListDistinctFromAbsent() {
-        JsonNode node = json("{\"a\":[\"x\",\"y\"],\"e\":[],\"z\":null,\"s\":\"x\",\"m\":[1]}");
+        JsonNode node = json("{\"a\":[\"x\",\"y\"],\"e\":[],\"z\":null,\"s\":\"x\",\"m\":[1],\"n\":[null]}");
         assertEquals(List.of("x", "y"), SesV2Json.stringArrayOrAbsent(node, "a"));
         assertEquals(List.of(), SesV2Json.stringArrayOrAbsent(node, "e"));
         assertNull(SesV2Json.stringArrayOrAbsent(node, "z"));
         assertNull(SesV2Json.stringArrayOrAbsent(node, "missing"));
         assertAws("SerializationException", 400, () -> SesV2Json.stringArrayOrAbsent(node, "s"));
         assertAws("SerializationException", 400, () -> SesV2Json.stringArrayOrAbsent(node, "m"));
+        assertAws("SerializationException", 400, () -> SesV2Json.stringArrayOrAbsent(node, "n"));
     }
 
     @Test

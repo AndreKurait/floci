@@ -36,7 +36,6 @@ import org.jboss.logging.Logger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -103,10 +102,10 @@ public class SesSendController {
             String fromEmailAddress = request.path("FromEmailAddress").asText(null);
 
             JsonNode destination = requireObjectOrAbsent(request, "Destination");
-            List<String> toAddresses = destinationAddresses(destination, "ToAddresses");
-            List<String> ccAddresses = destinationAddresses(destination, "CcAddresses");
-            List<String> bccAddresses = destinationAddresses(destination, "BccAddresses");
-            List<String> replyToAddresses = jsonArrayToList(request.path("ReplyToAddresses"));
+            List<String> toAddresses = addressList(destination, "ToAddresses");
+            List<String> ccAddresses = addressList(destination, "CcAddresses");
+            List<String> bccAddresses = addressList(destination, "BccAddresses");
+            List<String> replyToAddresses = addressList(request, "ReplyToAddresses");
             String feedbackForwardingAddress =
                     request.path("FeedbackForwardingEmailAddress").asText(null);
             String configurationSetName = request.path("ConfigurationSetName").asText(null);
@@ -243,7 +242,7 @@ public class SesSendController {
                         "FromEmailAddress is required.", 400);
             }
             SesAddressSyntax.requireBulkAddress(fromEmailAddress);
-            List<String> replyToAddresses = jsonArrayToList(request.path("ReplyToAddresses"));
+            List<String> replyToAddresses = addressList(request, "ReplyToAddresses");
             String feedbackForwardingAddress =
                     request.path("FeedbackForwardingEmailAddress").asText(null);
             SesAddressSyntax.requireBulkAddress(feedbackForwardingAddress);
@@ -314,9 +313,9 @@ public class SesSendController {
                             "BulkEmailEntries elements must be JSON objects.", 400);
                 }
                 JsonNode dest = requireObjectOrAbsent(node, "Destination");
-                List<String> to = jsonArrayToList(dest.path("ToAddresses"));
-                List<String> cc = jsonArrayToList(dest.path("CcAddresses"));
-                List<String> bcc = jsonArrayToList(dest.path("BccAddresses"));
+                List<String> to = addressList(dest, "ToAddresses");
+                List<String> cc = addressList(dest, "CcAddresses");
+                List<String> bcc = addressList(dest, "BccAddresses");
                 JsonNode replacementContent = requireObjectOrAbsent(node, "ReplacementEmailContent");
                 JsonNode replacementTemplate = requireObjectOrAbsent(replacementContent, "ReplacementTemplate");
                 JsonNode replacementData = parseTemplateData(replacementTemplate, "ReplacementTemplateData");
@@ -405,19 +404,10 @@ public class SesSendController {
 
     // ──────────────────────────── Helpers ────────────────────────────
 
-    // A Raw send falls back to the MIME recipients when no destination is given, so a present member
-    // of the wrong JSON type must be rejected rather than read as an omitted one.
-    private static List<String> destinationAddresses(JsonNode destination, String field) {
-        return Objects.requireNonNullElse(stringArrayOrAbsent(destination, field), List.of());
-    }
-
-    private List<String> jsonArrayToList(JsonNode arrayNode) {
-        if (arrayNode == null || arrayNode.isMissingNode() || !arrayNode.isArray()) {
-            return Collections.emptyList();
-        }
-        List<String> list = new ArrayList<>();
-        arrayNode.forEach(node -> list.add(node.asText()));
-        return list;
+    // A present address list of the wrong JSON type, or with a non-string element, is rejected
+    // rather than read as empty or coerced.
+    private static List<String> addressList(JsonNode parent, String field) {
+        return Objects.requireNonNullElse(stringArrayOrAbsent(parent, field), List.of());
     }
 
     private JsonNode parseTemplateData(JsonNode parent, String fieldName) {

@@ -313,7 +313,7 @@ public class RdsQueryHandler {
                 params.getFirst("SourceType"),
                 memberList(params, "SourceIds"),
                 memberList(params, "EventCategories"),
-                optionalBoolean(params.getFirst("Enabled")),
+                parseOptionalBoolean(params, "Enabled"),
                 parseTags(params));
         return Response.ok(AwsQueryResponse.envelope("CreateEventSubscription", AwsNamespaces.RDS,
                 new XmlBuilder().raw(eventSubscriptionXml(subscription)).build())).build();
@@ -325,7 +325,7 @@ public class RdsQueryHandler {
                 params.getFirst("SnsTopicArn"),
                 params.getFirst("SourceType"),
                 memberList(params, "EventCategories"),
-                optionalBoolean(params.getFirst("Enabled")));
+                parseOptionalBoolean(params, "Enabled"));
         return Response.ok(AwsQueryResponse.envelope("ModifyEventSubscription", AwsNamespaces.RDS,
                 new XmlBuilder().raw(eventSubscriptionXml(subscription)).build())).build();
     }
@@ -2300,7 +2300,7 @@ public class RdsQueryHandler {
         if (missing != null) {
             return missing;
         }
-        boolean copyTags = "true".equalsIgnoreCase(params.getFirst("CopyTags"));
+        boolean copyTags = Boolean.TRUE.equals(parseOptionalBoolean(params, "CopyTags"));
         DbClusterSnapshot copy = service.copyDbClusterSnapshot(sourceId, targetId, copyTags, parseTags(params), region);
         return Response.ok(AwsQueryResponse.envelope("CopyDBClusterSnapshot", AwsNamespaces.RDS,
                 dbClusterSnapshotXml(copy))).build();

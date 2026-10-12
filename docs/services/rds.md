@@ -187,8 +187,12 @@ including empty strings, return `InvalidParameterValue` before changing resource
 | `CreateDBProxy` | `RequireTLS`, `DebugLogging` | Defaults to `false` |
 | `ModifyDBProxy` | `RequireTLS`, `DebugLogging` | Preserves the current value |
 | `ResetDBParameterGroup`, `ResetDBClusterParameterGroup` | `ResetAllParameters` | Defaults to `false`; named parameter resets keep their existing behavior |
+| `CopyDBClusterSnapshot` | `CopyTags` | Defaults to `false`; explicit request tags still apply |
+| `CreateEventSubscription` | `Enabled` | Defaults to `true` |
+| `ModifyEventSubscription` | `Enabled` | Preserves the current value |
 
-Malformed reset flags leave saved parameter overrides unchanged.
+Malformed reset flags leave saved parameter overrides unchanged. Malformed event-subscription
+flags leave the subscription and its topic, source type and event categories unchanged.
 
 
 ## Event notification subscriptions
