@@ -310,27 +310,6 @@ public class AslExecutor {
                 Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
                 CustomResourceLiveness customResourceLiveness,
                 Clock clock, Sleeper sleeper, Integer maxWaitSecondsOverride,
-                RedshiftDataJsonHandler redshiftDataHandler, ServiceRegistry serviceRegistry) {
-        this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
-                sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
-                ec2Service, s3Service, ecsService, ecsJsonHandler,
-                eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
-                objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                clock, sleeper, maxWaitSecondsOverride, redshiftDataHandler, serviceRegistry, null);
-    }
-
-    AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
-                DynamoDbFacade dynamoDb, DynamoDbJsonHandler dynamoDbJsonHandler,
-                SqsJsonHandler sqsJsonHandler, SnsJsonHandler snsJsonHandler,
-                CloudFormationQueryHandler cloudFormationHandler,
-                Ec2Service ec2Service, S3Service s3Service,
-                EcsService ecsService, EcsJsonHandler ecsJsonHandler,
-                EventBridgeHandler eventBridgeHandler, SchedulerService schedulerService,
-                SchedulerController schedulerController, RdsDataService rdsDataService,
-                ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
-                Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
-                CustomResourceLiveness customResourceLiveness,
-                Clock clock, Sleeper sleeper, Integer maxWaitSecondsOverride,
                 RedshiftDataJsonHandler redshiftDataHandler, ServiceRegistry serviceRegistry,
                 NestedTaskCredentials nestedTaskCredentials) {
         this.nestedTaskCredentials = nestedTaskCredentials;
@@ -391,7 +370,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null);
+                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null);
     }
 
     // Kept for tests that do not exercise the Redshift Data API integration.
@@ -412,7 +391,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                clock, sleeper, maxWaitSecondsOverride, null, null);
+                clock, sleeper, maxWaitSecondsOverride, null, null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,

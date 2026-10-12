@@ -64,13 +64,27 @@ class StepFunctionsTaskCredentialsIntegrationTest {
     @Test
     void dynamicRoleUsesInputPathBeforeParameters() throws Exception {
         String child = machine(TARGET, PASS, "STANDARD");
-        ObjectNode definition = definition(child, "states:startExecution.sync:2", role());
+        String taskRole = role();
+        ObjectNode definition = definition(child, "states:startExecution.sync:2", taskRole);
         ObjectNode task = (ObjectNode) definition.path("States").path("Child");
         task.put("InputPath", "$.selected");
         task.set("Credentials", MAPPER.valueToTree(Map.of("RoleArn.$", "$.role")));
-        String input = MAPPER.writeValueAsString(Map.of("selected", Map.of("role", role())));
+        String input = MAPPER.writeValueAsString(Map.of("selected", Map.of("role", taskRole)));
         String execution = start(machine(SOURCE, definition.toString(), "STANDARD"), input);
         Response done = terminal(SOURCE, execution);
+        assertEquals("SUCCEEDED", done.jsonPath().getString("status"), done.asString());
+    }
+
+    @Test
+    void jsonataRoleUsesOriginalStateInput() throws Exception {
+        String child = machine(TARGET, PASS, "STANDARD");
+        ObjectNode definition = definition(child, "states:startExecution.sync:2", role());
+        definition.put("QueryLanguage", "JSONata");
+        ObjectNode task = (ObjectNode) definition.path("States").path("Child");
+        task.set("Arguments", task.remove("Parameters"));
+        task.set("Credentials", MAPPER.valueToTree(Map.of("RoleArn", "{% $states.input.role %}")));
+        Response done = terminal(SOURCE, start(machine(SOURCE, definition.toString(), "STANDARD"),
+                MAPPER.writeValueAsString(Map.of("role", role()))));
         assertEquals("SUCCEEDED", done.jsonPath().getString("status"), done.asString());
     }
 
@@ -144,6 +158,22 @@ class StepFunctionsTaskCredentialsIntegrationTest {
         request(SOURCE, "StopExecution", Map.of("executionArn", execution)).then().statusCode(200);
         assertEquals("ABORTED", terminal(TARGET, childExecution).jsonPath().getString("status"));
         assertEquals("ABORTED", terminal(SOURCE, execution).jsonPath().getString("status"));
+    }
+
+    @Test
+    void taskTimeoutStopsForeignChild() throws Exception {
+        String child = machine(TARGET, """
+                {"StartAt":"Wait","States":{"Wait":{"Type":"Wait","Seconds":60,"End":true}}}
+                """, "STANDARD");
+        ObjectNode definition = definition(child, "states:startExecution.sync:2", role());
+        ((ObjectNode) definition.path("States").path("Child")).put("TimeoutSeconds", 1);
+        Response done = terminal(SOURCE, start(machine(SOURCE, definition.toString(), "STANDARD"), "{}"));
+        assertEquals("FAILED", done.jsonPath().getString("status"), done.asString());
+        assertEquals("States.Timeout", done.jsonPath().getString("error"));
+        Response children = request(TARGET, "ListExecutions", Map.of("stateMachineArn", child));
+        children.then().statusCode(200).body("executions.size()", org.hamcrest.Matchers.equalTo(1));
+        String execution = children.jsonPath().getString("executions[0].executionArn");
+        assertEquals("ABORTED", terminal(TARGET, execution).jsonPath().getString("status"));
     }
 
     private static ObjectNode definition(String child, String resource, String role) throws Exception {
