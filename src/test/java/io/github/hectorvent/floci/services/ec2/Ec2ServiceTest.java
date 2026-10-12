@@ -101,6 +101,35 @@ import static org.mockito.Mockito.when;
 class Ec2ServiceTest {
 
     @Test
+    void subnetAvailableAddressesTrackAllocationsAndRelease() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.97.0.0/16", false).getVpcId();
+        Subnet small = service.createSubnet(region, vpcId, "10.97.0.0/28", region + "a");
+        Subnet large = service.createSubnet(region, vpcId, "10.97.1.0/24", region + "a");
+        assertEquals(11, small.getAvailableIpAddressCount());
+        assertEquals(251, large.getAvailableIpAddressCount());
+
+        NetworkInterface eni = service.createNetworkInterface(region, small.getSubnetId(), "count-probe",
+                "10.97.0.4", List.of("10.97.0.4", "10.97.0.5"), List.of(), List.of());
+        assertEquals(9, service.describeSubnets(region, List.of(small.getSubnetId()), Map.of())
+                .getFirst().getAvailableIpAddressCount());
+        Reservation reservation = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), small.getSubnetId(), null, List.of(), null, null);
+        assertEquals(8, service.describeSubnets(region, List.of(small.getSubnetId()), Map.of())
+                .getFirst().getAvailableIpAddressCount());
+
+        service.terminateInstances(region, List.of(reservation.getInstances().getFirst().getInstanceId()));
+        service.deleteNetworkInterface(region, eni.getNetworkInterfaceId());
+        assertEquals(11, service.describeSubnets(region, List.of(small.getSubnetId()), Map.of())
+                .getFirst().getAvailableIpAddressCount());
+        assertEquals(251, service.describeSubnets(region, List.of(large.getSubnetId()), Map.of())
+                .getFirst().getAvailableIpAddressCount());
+    }
+
+    @Test
     void createAndDescribeVpcsDoNotContactDockerEvenOnFirstUse() {
         EmulatorConfig config = mockConfig(false);
         EmulatorConfig.VpcNetworksConfig networks = mock(EmulatorConfig.VpcNetworksConfig.class);

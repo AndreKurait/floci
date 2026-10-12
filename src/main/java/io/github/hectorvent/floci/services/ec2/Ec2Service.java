@@ -5698,7 +5698,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         subnet.setState("available");
         subnet.setAvailabilityZone(zoneName);
         subnet.setAvailabilityZoneId(AvailabilityZoneIds.forZoneName(region, zoneName));
-        subnet.setAvailableIpAddressCount(251);
+        subnet.setAvailableIpAddressCount(Cidr4.parse(cidrBlock)
+                .map(cidr -> (int) Math.max(0, cidr.size() - 5)).orElse(0));
         String ownerAccountId = callerAccountId();
         subnet.setOwnerId(ownerAccountId);
         subnet.setRegion(region);
@@ -5794,7 +5795,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .filter(s -> s.getRegion().equals(region))
                 .filter(s -> subnetIds.isEmpty() || subnetIds.contains(s.getSubnetId()))
                 .filter(s -> matchesFilters(s, filters, region))
+                .map(subnet -> {
+                    subnet.setAvailableIpAddressCount(availableSubnetAddresses(region, subnet));
+                    return subnet;
+                })
                 .collect(Collectors.toList());
+    }
+
+    private int availableSubnetAddresses(String region, Subnet subnet) {
+        Set<String> inUse = privateIpsInUse(region, subnet.getSubnetId());
+        Set<String> endpointAddresses = endpointPrivateIpsIn(region, subnet.getSubnetId(), inUse);
+        inUse.addAll(endpointAddresses);
+        return Cidr4.parse(subnet.getCidrBlock())
+                .map(cidr -> (int) Math.max(0, cidr.size() - 5 - inUse.size())).orElse(0);
     }
 
     public void deleteSubnet(String region, String subnetId) {
