@@ -20,6 +20,7 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyInt;
@@ -33,6 +34,45 @@ import static org.mockito.Mockito.when;
 
 class AutoScalingPlacementTest {
     private static final String REGION = "us-east-1";
+
+    @Test
+    void changedSubnetsTakePrecedenceOverOlderZoneMetadata() {
+        Fixture fixture = new Fixture(Map.of("subnet-b", REGION + "b"), List.of("subnet-b"));
+        fixture.group.setAvailabilityZones(List.of(REGION + "a"));
+        fixture.grow(2);
+        assertEquals(Map.of(REGION + "b", 2L), fixture.counts());
+        fixture.assertReportedZones();
+    }
+
+    @Test
+    void exhaustedSubnetsDoNotBlockOtherConfiguredZones() {
+        Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a", "subnet-b", REGION + "b"),
+                List.of("subnet-a", "subnet-b"));
+        fixture.availableIps.put("subnet-a", 0);
+        fixture.grow(2);
+        assertEquals(Map.of(REGION + "b", 2L), fixture.counts());
+    }
+
+    @Test
+    void oneRemainingAddressIsNotSelectedAgainWithinTheSameScaleOut() {
+        Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a", "subnet-b", REGION + "b"),
+                List.of("subnet-a", "subnet-b"));
+        fixture.availableIps.put("subnet-a", 1);
+        fixture.availableIps.put("subnet-b", 10);
+        fixture.grow(4);
+        assertEquals(Map.of(REGION + "a", 1L, REGION + "b", 3L), fixture.counts());
+        assertEquals(0, fixture.availableIps.get("subnet-a"));
+    }
+
+    @Test
+    void failedSaveStillCleansUpSuccessfulAllocationsAndRethrows() {
+        Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a", "subnet-b", REGION + "b"),
+                List.of("subnet-a", "subnet-b"));
+        fixture.saveFailure = new IllegalStateException("fixture save failure");
+        assertEquals(fixture.saveFailure, assertThrows(IllegalStateException.class, () -> fixture.grow(2)));
+        verify(fixture.ec2).terminateInstances(REGION, List.of("i-1", "i-2"));
+        assertTrue(fixture.group.getInstances().isEmpty());
+    }
 
     @Test
     void repeatedGrowthBalancesActualZonesAndReportsEachInstancePlacement() {
@@ -145,6 +185,7 @@ class AutoScalingPlacementTest {
         boolean deleteOnFailure;
         int allocations;
         int failAfter = Integer.MAX_VALUE;
+        RuntimeException saveFailure;
 
         Fixture(Map<String, String> zones, List<String> declaredSubnets) {
             AutoScalingService groups = mock(AutoScalingService.class);
@@ -159,6 +200,9 @@ class AutoScalingPlacementTest {
             when(groups.describeLaunchConfigurations(REGION, List.of("launch"))).thenReturn(List.of(launch));
             when(groups.saveAutoScalingGroupIfPresent(group)).thenAnswer(call -> {
                 savedMembers.add(group.getInstances().stream().map(instance -> instance.getInstanceId()).toList());
+                if (saveFailure != null) {
+                    throw saveFailure;
+                }
                 return groupPresent;
             });
             List<Subnet> subnets = zones.entrySet().stream().map(entry -> {

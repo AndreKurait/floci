@@ -3833,12 +3833,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /** Every private address a live instance, network interface or NAT gateway holds in the subnet. */
     private Set<String> privateIpsInUse(String region, String subnetId) {
+        return new HashSet<>(privateIpsBySubnet(region).getOrDefault(subnetId, Set.of()));
+    }
+
+    private Map<String, Set<String>> privateIpsBySubnet(String region) {
         String regionPrefix = region + "::";
-        Set<String> inUse = new HashSet<>();
+        Map<String, Set<String>> bySubnet = new HashMap<>();
         for (NetworkInterface ni : networkInterfaces.scan(k -> k.startsWith(regionPrefix))) {
-            if (!Objects.equals(subnetId, ni.getSubnetId())) {
-                continue;
-            }
+            Set<String> inUse = bySubnet.computeIfAbsent(ni.getSubnetId(), ignored -> new HashSet<>());
             addIfSet(inUse, ni.getPrivateIpAddress());
             for (NetworkInterfacePrivateIpAddress ip : nullToEmpty(ni.getPrivateIpAddresses())) {
                 addIfSet(inUse, ip.getPrivateIpAddress());
@@ -3849,24 +3851,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if ("terminated".equals(state)) {
                 continue;
             }
-            if (Objects.equals(subnetId, instance.getSubnetId())) {
-                addIfSet(inUse, instance.getPrivateIpAddress());
-            }
+            addIfSet(bySubnet.computeIfAbsent(instance.getSubnetId(), ignored -> new HashSet<>()),
+                    instance.getPrivateIpAddress());
             for (InstanceNetworkInterface ni : nullToEmpty(instance.getNetworkInterfaces())) {
-                if (Objects.equals(subnetId, ni.getSubnetId())) {
-                    addIfSet(inUse, ni.getPrivateIpAddress());
-                }
+                addIfSet(bySubnet.computeIfAbsent(ni.getSubnetId(), ignored -> new HashSet<>()),
+                        ni.getPrivateIpAddress());
             }
         }
         for (NatGateway natGateway : natGateways.scan(k -> k.startsWith(regionPrefix))) {
-            if (!Objects.equals(subnetId, natGateway.getSubnetId()) || "deleted".equals(natGateway.getState())) {
+            if ("deleted".equals(natGateway.getState())) {
                 continue;
             }
+            Set<String> inUse = bySubnet.computeIfAbsent(natGateway.getSubnetId(), ignored -> new HashSet<>());
             for (NatGatewayAddress address : nullToEmpty(natGateway.getNatGatewayAddresses())) {
                 addIfSet(inUse, address.getPrivateIp());
             }
         }
-        return inUse;
+        return bySubnet;
     }
 
     private static <T> List<T> nullToEmpty(List<T> list) {
@@ -5791,23 +5792,42 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<Subnet> describeSubnets(String region, List<String> subnetIds, Map<String, List<String>> filters) {
         ensureDefaultResources(region);
-        return subnets.scan(k -> true).stream()
+        List<Subnet> result = subnets.scan(k -> true).stream()
                 .filter(s -> s.getRegion().equals(region))
                 .filter(s -> subnetIds.isEmpty() || subnetIds.contains(s.getSubnetId()))
                 .filter(s -> matchesFilters(s, filters, region))
-                .map(subnet -> {
-                    subnet.setAvailableIpAddressCount(availableSubnetAddresses(region, subnet));
-                    return subnet;
-                })
                 .collect(Collectors.toList());
+        if (result.isEmpty()) {
+            return result;
+        }
+        Map<String, Set<String>> inUse = privateIpsBySubnet(region);
+        Map<String, Set<Long>> occupiedBySubnet = new HashMap<>();
+        inUse.forEach((id, addresses) -> occupiedBySubnet.put(id, addressValues(addresses)));
+        // Seed empty subnets too, so endpoint derivation never needs another resource-store scan.
+        result.forEach(subnet -> occupiedBySubnet.putIfAbsent(subnet.getSubnetId(), Set.of()));
+        for (VpcEndpoint endpoint : vpcEndpoints.scan(k -> true)) {
+            if (!region.equals(endpoint.getRegion()) || !"Interface".equalsIgnoreCase(endpoint.getVpcEndpointType())) {
+                continue;
+            }
+            endpoint.getSubnetIds().forEach(id -> occupiedBySubnet.putIfAbsent(id, Set.of()));
+            for (NetworkInterface ni : endpointNetworkInterfacesOf(endpoint, occupiedBySubnet)) {
+                addIfSet(inUse.computeIfAbsent(ni.getSubnetId(), ignored -> new HashSet<>()),
+                        ni.getPrivateIpAddress());
+            }
+        }
+        for (Subnet subnet : result) {
+            subnet.setAvailableIpAddressCount(availableSubnetAddresses(subnet,
+                    inUse.getOrDefault(subnet.getSubnetId(), Set.of())));
+        }
+        return result;
     }
 
-    private int availableSubnetAddresses(String region, Subnet subnet) {
-        Set<String> inUse = privateIpsInUse(region, subnet.getSubnetId());
-        Set<String> endpointAddresses = endpointPrivateIpsIn(region, subnet.getSubnetId(), inUse);
-        inUse.addAll(endpointAddresses);
-        return Cidr4.parse(subnet.getCidrBlock())
-                .map(cidr -> (int) Math.max(0, cidr.size() - 5 - inUse.size())).orElse(0);
+    private static int availableSubnetAddresses(Subnet subnet, Set<String> inUse) {
+        return Cidr4.parse(subnet.getCidrBlock()).map(cidr -> {
+            long occupied = addressValues(inUse).stream()
+                    .filter(address -> address >= cidr.network() + 4 && address < cidr.broadcast()).count();
+            return (int) Math.max(0, cidr.size() - 5 - occupied);
+        }).orElse(0);
     }
 
     public void deleteSubnet(String region, String subnetId) {

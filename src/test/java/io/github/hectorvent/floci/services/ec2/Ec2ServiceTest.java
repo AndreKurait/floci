@@ -127,6 +127,11 @@ class Ec2ServiceTest {
                 .getFirst().getAvailableIpAddressCount());
         assertEquals(251, service.describeSubnets(region, List.of(large.getSubnetId()), Map.of())
                 .getFirst().getAvailableIpAddressCount());
+        // Legacy records can contain invalid addresses; they do not consume usable subnet space.
+        service.createNetworkInterface(region, small.getSubnetId(), "legacy-addresses",
+                "10.98.0.4", List.of("10.97.0.0", "10.97.0.15"), List.of(), List.of());
+        assertEquals(11, service.describeSubnets(region, List.of(small.getSubnetId()), Map.of())
+                .getFirst().getAvailableIpAddressCount());
     }
 
     @Test

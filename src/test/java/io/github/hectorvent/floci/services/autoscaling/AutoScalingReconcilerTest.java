@@ -97,6 +97,7 @@ class AutoScalingReconcilerTest {
         AutoScalingGroup asg = new AutoScalingGroup();
         asg.setRegion("us-east-1");
         asg.setAutoScalingGroupName("app-asg");
+        when(asgService.saveAutoScalingGroupIfPresent(asg)).thenReturn(true);
         asg.setDesiredCapacity(1);
         asg.setLaunchTemplateId("lt-123");
         asg.setLaunchTemplateVersion("1");
@@ -254,6 +255,7 @@ class AutoScalingReconcilerTest {
         AutoScalingGroup asg = new AutoScalingGroup();
         asg.setRegion("us-east-1");
         asg.setAutoScalingGroupName("app-asg");
+        when(asgService.saveAutoScalingGroupIfPresent(asg)).thenReturn(true);
         asg.setDesiredCapacity(1);
         asg.setLaunchTemplateId("lt-123");
         asg.setLaunchTemplateVersion("$Latest");
@@ -291,6 +293,7 @@ class AutoScalingReconcilerTest {
         AutoScalingGroup asg = new AutoScalingGroup();
         asg.setRegion("us-east-1");
         asg.setAutoScalingGroupName("app-asg");
+        when(asgService.saveAutoScalingGroupIfPresent(asg)).thenReturn(true);
         asg.setDesiredCapacity(1);
         MixedInstancesPolicy policy = new MixedInstancesPolicy();
         MixedInstancesPolicy.LaunchTemplate launchTemplatePolicy =

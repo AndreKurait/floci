@@ -38,15 +38,17 @@ and creation time. The SDK regression is
 `compatibility-tests/sdk-test-python/tests/test_autoscaling_subnet_whitespace.py`.
 
 Scale-out chooses an enabled Availability Zone with the fewest active group
-instances, then a subnet in that zone with the most available IP addresses.
+instances among subnets with free IPv4 addresses, then the subnet in that zone
+with the most available IP addresses.
 Existing EC2 placement takes precedence over stale group zone metadata, and each
 new group member reports the EC2 placement actually returned. This
 follows the [AWS placement rules](https://docs.aws.amazon.com/autoscaling/ec2/userguide/auto-scaling-benefits.html).
 A live AWS check in `us-east-2` on October 12, 2026 at 19:49-19:50 UTC grew a group
 from two to three to four instances: the two-zone counts were 1/1, 1/2, then 2/2.
 Both instances in the zone with two subnets used the subnet with more free IPs.
-This covers successful scale-out; capacity-failure fallback and rebalancing
-existing instances without a desired-capacity increase are not implemented here.
+This covers successful scale-out; retrying another zone after an EC2 launch error
+and rebalancing existing instances without a desired-capacity increase are not
+implemented here.
 
 ### Instance Management
 

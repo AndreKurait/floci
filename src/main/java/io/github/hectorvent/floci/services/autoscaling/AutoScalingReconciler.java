@@ -350,8 +350,9 @@ public class AutoScalingReconciler {
         LOG.infov("ASG {0}: scaling out by {1}", asg.getAutoScalingGroupName(), count);
         List<String> launchedInstanceIds = new ArrayList<>();
         try {
+            List<LaunchPlacement> placements = new ArrayList<>(launchPlacements(asg));
             for (int index = 0; index < count; index++) {
-                LaunchPlacement placement = leastPopulatedPlacement(asg, launchPlacements(asg));
+                LaunchPlacement placement = leastPopulatedPlacement(asg, placements);
                 Reservation reservation = ec2Service.runInstances(
                         asg.getRegion(),
                         launchSource.imageId(),
@@ -383,18 +384,31 @@ public class AutoScalingReconciler {
                     LOG.infov("ASG {0}: launched instance {1} (Pending)",
                             asg.getAutoScalingGroupName(), ec2Inst.getInstanceId());
                 }
+                if (placement.subnetId() != null) {
+                    placements.set(placements.indexOf(placement), new LaunchPlacement(placement.subnetId(),
+                            placement.availabilityZone(), Math.max(0,
+                                    placement.availableIpAddresses() - reservation.getInstances().size())));
+                }
             }
         } catch (Exception e) {
             LOG.warnv("ASG {0}: failed to launch instances: {1}",
                     asg.getAutoScalingGroupName(), e.getMessage());
         } finally {
             // Preserve successful allocations even if a later single-instance launch fails.
-            if (!launchedInstanceIds.isEmpty() && !asgService.saveAutoScalingGroupIfPresent(asg)) {
+            if (!launchedInstanceIds.isEmpty()) {
+                boolean saved = false;
                 try {
-                    ec2Service.terminateInstances(asg.getRegion(), launchedInstanceIds);
-                } catch (Exception e) {
-                    LOG.warnv("ASG {0}: failed to clean up instances {1} after group deletion: {2}",
-                            asg.getAutoScalingGroupName(), launchedInstanceIds, e.getMessage());
+                    saved = asgService.saveAutoScalingGroupIfPresent(asg);
+                } finally {
+                    if (!saved) {
+                        try {
+                            ec2Service.terminateInstances(asg.getRegion(), launchedInstanceIds);
+                            asg.getInstances().removeIf(instance -> launchedInstanceIds.contains(instance.getInstanceId()));
+                        } catch (Exception e) {
+                            LOG.warnv("ASG {0}: failed to clean up unpersisted instances {1}: {2}",
+                                    asg.getAutoScalingGroupName(), launchedInstanceIds, e.getMessage());
+                        }
+                    }
                 }
             }
         }
@@ -410,13 +424,8 @@ public class AutoScalingReconciler {
                 if (subnet == null) {
                     throw new AwsException("InvalidSubnetID.NotFound", "The subnet ID '" + id + "' does not exist", 400);
                 }
-                if (asg.getAvailabilityZones().isEmpty()
-                        || asg.getAvailabilityZones().contains(subnet.getAvailabilityZone())) {
-                    placements.add(new LaunchPlacement(id, subnet.getAvailabilityZone(), subnet.getAvailableIpAddressCount()));
-                }
-            }
-            if (placements.isEmpty()) {
-                throw new AwsException("ValidationError", "No declared subnet is in a configured availability zone", 400);
+                // Subnets remain authoritative when an update leaves older zone metadata behind.
+                placements.add(new LaunchPlacement(id, subnet.getAvailabilityZone(), subnet.getAvailableIpAddressCount()));
             }
             return placements;
         }
@@ -442,10 +451,13 @@ public class AutoScalingReconciler {
                 zoneCounts.compute(zone, (ignored, count) -> count + 1);
             }
         }
-        return placements.stream().min(Comparator
+        return placements.stream()
+                .filter(placement -> placement.subnetId() == null || placement.availableIpAddresses() > 0)
+                .min(Comparator
                 .comparingLong((LaunchPlacement placement) -> zoneCounts.get(placement.availabilityZone()))
                 .thenComparing(Comparator.comparingInt(LaunchPlacement::availableIpAddresses).reversed()))
-                .orElseThrow();
+                .orElseThrow(() -> new AwsException("InsufficientFreeAddressesInSubnet",
+                        "No configured subnet has free IPv4 addresses.", 400));
     }
 
     private record LaunchPlacement(String subnetId, String availabilityZone, int availableIpAddresses) {}
