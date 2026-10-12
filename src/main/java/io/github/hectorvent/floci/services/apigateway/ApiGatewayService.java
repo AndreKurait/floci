@@ -3426,6 +3426,7 @@ public class ApiGatewayService implements ResourceProvider {
         // Lambda authorizer land as authorizationType=NONE and are silently open at runtime.
         Map<String, String> schemeToAuthorizerId = new HashMap<>();
         Map<String, String> schemeToAuthType = new HashMap<>();
+        Set<String> apiKeySchemes = new HashSet<>();
         Map<String, String> authorizerNameToId = new HashMap<>();
         for (Authorizer authorizer : getAuthorizers(region, apiId)) {
             if (authorizer.getName() != null) {
@@ -3443,6 +3444,12 @@ public class ApiGatewayService implements ResourceProvider {
                 SecurityScheme scheme = schemeEntry.getValue();
                 String authtype = importedAuthorizationType(scheme, schemeName);
                 Map<String, Object> authDef = importedAuthorizerDefinition(scheme, schemeName);
+                if (authDef == null && scheme != null
+                        && SecurityScheme.Type.APIKEY.equals(scheme.getType())
+                        && scheme.getIn() != null && "header".equalsIgnoreCase(scheme.getIn().toString())
+                        && scheme.getName() != null && "x-api-key".equalsIgnoreCase(scheme.getName())) {
+                    apiKeySchemes.add(schemeName);
+                }
                 if (authDef != null) {
                     String t = importedAuthorizerType(authDef, schemeName); // token | request | cognito_user_pools
                     Map<String, Object> req = new HashMap<>();
@@ -3537,7 +3544,8 @@ public class ApiGatewayService implements ResourceProvider {
                     String httpMethod = opEntry.getKey().name().toUpperCase();
                     try {
                         applyOperation(region, apiId, resourceId, httpMethod, opEntry.getValue(), openAPI,
-                                schemeToAuthorizerId, schemeToAuthType, validatorNameToId, defaultValidatorId);
+                                schemeToAuthorizerId, schemeToAuthType, apiKeySchemes,
+                                validatorNameToId, defaultValidatorId);
                     } catch (AwsException e) {
                         if (PARAMETER_NAME_ERROR.equals(e.getMessage())) {
                             throw importParameterNameFailure(httpMethod, path, e);
@@ -3558,7 +3566,8 @@ public class ApiGatewayService implements ResourceProvider {
                     Operation anyOperation = parseAnyMethodOperation(path, anyMethodExt);
                     try {
                         applyOperation(region, apiId, resourceId, "ANY", anyOperation, openAPI,
-                                schemeToAuthorizerId, schemeToAuthType, validatorNameToId, defaultValidatorId);
+                                schemeToAuthorizerId, schemeToAuthType, apiKeySchemes,
+                                validatorNameToId, defaultValidatorId);
                     } catch (AwsException e) {
                         if (PARAMETER_NAME_ERROR.equals(e.getMessage())) {
                             throw importParameterNameFailure("ANY", path, e);
@@ -3619,7 +3628,8 @@ public class ApiGatewayService implements ResourceProvider {
 
     private void applyOperation(String region, String apiId, String resourceId, String httpMethod,
             Operation operation, OpenAPI openAPI, Map<String, String> schemeToAuthorizerId,
-            Map<String, String> schemeToAuthType, Map<String, String> validatorNameToId,
+            Map<String, String> schemeToAuthType, Set<String> apiKeySchemes,
+            Map<String, String> validatorNameToId,
             String defaultValidatorId) {
         // Create the method
         Map<String, Object> methodRequest = new HashMap<>();
@@ -3627,12 +3637,14 @@ public class ApiGatewayService implements ResourceProvider {
         // to a method authorizationType (CUSTOM/AWS_IAM/COGNITO_USER_POOLS) + authorizerId.
         List<SecurityRequirement> secReqs = operation.getSecurity() != null
                 ? operation.getSecurity() : openAPI.getSecurity();
+        boolean apiKeyRequired = secReqs != null && !secReqs.isEmpty()
+                && secReqs.stream().allMatch(requirement -> requirement.keySet().stream()
+                        .anyMatch(apiKeySchemes::contains));
         String authType = "NONE";
         String authorizerId = null;
         List<String> authorizationScopes = List.of();
         if (secReqs != null) {
-            // AWS resolves the OR-list of security requirements to the first declared
-            // authorizer scheme (a method has exactly one authorizer), so stop at the first match.
+            // An API Gateway method can reference only one authorizer, so preserve the first match.
             resolveAuth:
             for (SecurityRequirement secReq : secReqs) {
                 for (String schemeName : secReq.keySet()) {
@@ -3651,7 +3663,7 @@ public class ApiGatewayService implements ResourceProvider {
             }
         }
         methodRequest.put("authorizationType", authType);
-        methodRequest.put("apiKeyRequired", requiresImportedApiKey(secReqs, openAPI));
+        methodRequest.put("apiKeyRequired", apiKeyRequired);
         if (authorizerId != null) {
             methodRequest.put("authorizerId", authorizerId);
         }
@@ -3735,27 +3747,6 @@ public class ApiGatewayService implements ResourceProvider {
         if (integrationExt != null) {
             applyIntegration(region, apiId, resourceId, httpMethod, integrationExt);
         }
-    }
-
-    private boolean requiresImportedApiKey(List<SecurityRequirement> requirements, OpenAPI openAPI) {
-        if (requirements == null || openAPI.getComponents() == null
-                || openAPI.getComponents().getSecuritySchemes() == null) {
-            return false;
-        }
-        for (SecurityRequirement requirement : requirements) {
-            for (String name : requirement.keySet()) {
-                SecurityScheme scheme = openAPI.getComponents().getSecuritySchemes().get(name);
-                if (scheme != null && scheme.getType() == SecurityScheme.Type.APIKEY
-                        && scheme.getIn() == SecurityScheme.In.HEADER
-                        && "x-api-key".equalsIgnoreCase(scheme.getName())
-                        && (scheme.getExtensions() == null
-                            || (!scheme.getExtensions().containsKey("x-amazon-apigateway-authorizer")
-                                && !scheme.getExtensions().containsKey("x-amazon-apigateway-authtype")))) {
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     private static final String PARAMETER_REF_PREFIX = "#/components/parameters/";

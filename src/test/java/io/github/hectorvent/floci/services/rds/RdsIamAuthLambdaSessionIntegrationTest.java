@@ -4,7 +4,6 @@ import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.testutil.SigV4TokenTestHelper;
 import io.quarkus.test.junit.QuarkusTest;
-import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
@@ -19,8 +18,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Properties;
 
-import static io.restassured.RestAssured.given;
-import static io.restassured.http.ContentType.URLENC;
+import static io.github.hectorvent.floci.testing.RdsRequests.rds;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -39,9 +37,6 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 @Tag("docker")
 class RdsIamAuthLambdaSessionIntegrationTest {
 
-    private static final String RDS_AUTH =
-            "AWS4-HMAC-SHA256 Credential=test/20261002/us-east-1/rds/aws4_request, "
-            + "SignedHeaders=content-type;host, Signature=test";
     private static final String ACCOUNT_ID = "000000000000";
     private static final String MASTER_USER = "master";
     private static final String MASTER_PASSWORD = "Master123!";
@@ -122,12 +117,5 @@ class RdsIamAuthLambdaSessionIntegrationTest {
         properties.setProperty("sslmode", "disable");
         properties.setProperty("connectTimeout", "5");
         return DriverManager.getConnection("jdbc:postgresql://127.0.0.1:" + port + "/" + DATABASE, properties);
-    }
-
-    private static RequestSpecification rds(String action) {
-        return given().header("Authorization", RDS_AUTH)
-                .contentType(URLENC)
-                .formParam("Action", action)
-                .formParam("Version", "2014-10-31");
     }
 }

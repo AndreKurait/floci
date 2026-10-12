@@ -6,8 +6,7 @@ import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
-import static io.restassured.RestAssured.given;
-import static io.restassured.http.ContentType.URLENC;
+import static io.github.hectorvent.floci.testing.RdsRequests.rds;
 import static org.hamcrest.Matchers.containsString;
 
 /**
@@ -23,15 +22,6 @@ class RdsClusterEngineModeStorageEncryptedIntegrationTest {
 
     private static final String ID = "engine-mode-cluster";
     private static final String NON_AURORA_ID = "engine-mode-non-aurora-cluster";
-
-    private static io.restassured.specification.RequestSpecification rds(String action) {
-        return given().header("Authorization",
-                        "AWS4-HMAC-SHA256 Credential=test/20260615/us-east-1/rds/aws4_request, "
-                        + "SignedHeaders=content-type;host, Signature=test")
-                .contentType(URLENC)
-                .formParam("Action", action)
-                .formParam("Version", "2014-10-31");
-    }
 
     @AfterEach
     void cleanUp() {

@@ -3,12 +3,10 @@ package io.github.hectorvent.floci.services.rds;
 import io.github.hectorvent.floci.testing.RdsMockProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
-import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
-import static io.restassured.RestAssured.given;
-import static io.restassured.http.ContentType.URLENC;
+import static io.github.hectorvent.floci.testing.RdsRequests.rds;
 import static org.hamcrest.Matchers.containsString;
 
 /** RDS creation and restore responses must expose usable proxy ports on the wire. */
@@ -23,15 +21,6 @@ class RdsClusterSnapshotRestorePortIntegrationTest {
     private static final String INSTANCE = "restore-port-instance";
     private static final String INSTANCE_SNAPSHOT = "restore-port-instance-snapshot";
     private static final String RESTORED_INSTANCE = "restore-port-instance-target";
-
-    private static RequestSpecification rds(String action) {
-        return given().header("Authorization",
-                        "AWS4-HMAC-SHA256 Credential=test/20260924/us-east-1/rds/aws4_request, "
-                        + "SignedHeaders=content-type;host, Signature=test")
-                .contentType(URLENC)
-                .formParam("Action", action)
-                .formParam("Version", "2014-10-31");
-    }
 
     @AfterEach
     void cleanUp() {
