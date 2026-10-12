@@ -46,7 +46,11 @@ follows the [AWS placement rules](https://docs.aws.amazon.com/autoscaling/ec2/us
 A live AWS check in `us-east-2` on October 12, 2026 at 19:49-19:50 UTC grew a group
 from two to three to four instances: the two-zone counts were 1/1, 1/2, then 2/2.
 Both instances in the zone with two subnets used the subnet with more free IPs.
-This covers successful scale-out; retrying another zone after an EC2 launch error
+Scale-out failures propagate to the reconciliation caller after preserving any
+successful partial launches. Failed reconciliation does not complete an instance
+refresh. Save and cleanup failures remain observable, including as suppressed
+exceptions when a launch already failed; the scheduler logs the exception and
+continues processing other groups. Retrying another zone within the same attempt
 and rebalancing existing instances without a desired-capacity increase are not
 implemented here.
 

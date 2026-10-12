@@ -17,9 +17,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
@@ -28,6 +31,7 @@ import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -143,9 +147,11 @@ class AutoScalingPlacementTest {
     void missingDeclaredSubnetRefusesBeforeAnyAllocation() {
         Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a"),
                 List.of("subnet-a", "subnet-missing"));
-        fixture.grow(2);
+        AwsException error = assertThrows(AwsException.class, () -> fixture.grow(2));
+        assertEquals("InvalidSubnetID.NotFound", error.getErrorCode());
         assertEquals(Map.of(), fixture.instances);
         assertEquals(0, fixture.group.getInstances().size());
+        verify(fixture.groups, never()).saveAutoScalingGroupIfPresent(any());
     }
 
     @Test
@@ -153,11 +159,15 @@ class AutoScalingPlacementTest {
         Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a", "subnet-b", REGION + "b"),
                 List.of("subnet-a", "subnet-b"));
         fixture.failAfter = 1;
-        fixture.grow(2);
+        assertSame(fixture.launchFailure, assertThrows(AwsException.class, () -> fixture.grow(2)));
         assertEquals(1, fixture.instances.size());
         assertEquals(List.of("i-1"), fixture.group.getInstances().stream()
                 .map(instance -> instance.getInstanceId()).toList());
         assertTrue(fixture.savedMembers.contains(List.of("i-1")));
+        verify(fixture.groups, never()).completeInstanceRefreshIfSettled(any(), any());
+        fixture.failAfter = Integer.MAX_VALUE;
+        fixture.grow(2);
+        assertEquals(2, fixture.allocations);
     }
 
     @Test
@@ -167,11 +177,69 @@ class AutoScalingPlacementTest {
         fixture.instances.put("i-unrelated", new Instance());
         fixture.failAfter = 1;
         fixture.deleteOnFailure = true;
-        fixture.grow(2);
+        assertSame(fixture.launchFailure, assertThrows(AwsException.class, () -> fixture.grow(2)));
         assertTrue(fixture.savedMembers.contains(List.of("i-1")));
         verify(fixture.ec2).terminateInstances(REGION, List.of("i-1"));
         verify(fixture.ec2, times(1)).terminateInstances(eq(REGION), anyList());
         assertTrue(fixture.instances.containsKey("i-unrelated"));
+    }
+
+    @Test
+    void exhaustedPlacementFailsBeforeAnyAllocationOrSuccessfulReconciliation() {
+        Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a"), List.of("subnet-a"));
+        fixture.availableIps.put("subnet-a", 0);
+        AwsException error = assertThrows(AwsException.class, () -> fixture.grow(1));
+        assertEquals("InsufficientFreeAddressesInSubnet", error.getErrorCode());
+        assertEquals(0, fixture.allocations);
+        verify(fixture.groups, never()).completeInstanceRefreshIfSettled(any(), any());
+    }
+
+    @Test
+    void unexpectedLaunchFailurePropagatesAfterSavingPartialAllocations() {
+        Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a"), List.of("subnet-a"));
+        fixture.failAfter = 1;
+        fixture.launchFailure = new IllegalStateException("unexpected launch failure");
+        assertSame(fixture.launchFailure, assertThrows(IllegalStateException.class, () -> fixture.grow(2)));
+        assertEquals(List.of(List.of("i-1")), fixture.savedMembers);
+        verify(fixture.ec2, never()).terminateInstances(any(), any());
+        verify(fixture.groups, never()).completeInstanceRefreshIfSettled(any(), any());
+    }
+
+    @Test
+    void launchFailureRetainsSaveAndCleanupFailuresAsSuppressedExceptions() {
+        Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a"), List.of("subnet-a"));
+        fixture.failAfter = 1;
+        fixture.saveFailure = new IllegalStateException("save failed");
+        RuntimeException cleanupFailure = new IllegalStateException("cleanup failed");
+        when(fixture.ec2.terminateInstances(REGION, List.of("i-1"))).thenThrow(cleanupFailure);
+        assertSame(fixture.launchFailure, assertThrows(AwsException.class, () -> fixture.grow(2)));
+        assertEquals(List.of(fixture.saveFailure), List.of(fixture.launchFailure.getSuppressed()));
+        assertEquals(List.of(cleanupFailure), List.of(fixture.saveFailure.getSuppressed()));
+    }
+
+    @Test
+    void deletedGroupCleanupFailurePropagates() {
+        Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a"), List.of("subnet-a"));
+        fixture.groupPresent = false;
+        RuntimeException cleanupFailure = new IllegalStateException("cleanup failed");
+        when(fixture.ec2.terminateInstances(REGION, List.of("i-1"))).thenThrow(cleanupFailure);
+        assertSame(cleanupFailure, assertThrows(IllegalStateException.class, () -> fixture.grow(1)));
+    }
+
+    @Test
+    void scheduledReconciliationContinuesAfterOneGroupFails() {
+        Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a"), List.of("subnet-a"));
+        fixture.group.setDesiredCapacity(1);
+        fixture.failAfter = 0;
+        AutoScalingGroup healthyGroup = new AutoScalingGroup();
+        healthyGroup.setRegion(REGION);
+        healthyGroup.setAutoScalingGroupName("healthy-group");
+        when(fixture.groups.autoScalingGroupAccountIds()).thenReturn(Set.of("000000000000"));
+        when(fixture.groups.describeAutoScalingGroups(null, null)).thenReturn(List.of(fixture.group, healthyGroup));
+        when(fixture.groups.saveAutoScalingGroupIfPresent(healthyGroup)).thenReturn(true);
+        assertDoesNotThrow(fixture.reconciler::reconcileAll);
+        verify(fixture.groups).completeInstanceRefreshIfSettled(REGION, "healthy-group");
+        verify(fixture.groups, never()).completeInstanceRefreshIfSettled(REGION, "placement-group");
     }
 
     private static class Fixture {
@@ -179,6 +247,7 @@ class AutoScalingPlacementTest {
         final Map<String, Instance> instances = new LinkedHashMap<>();
         final Map<String, Integer> availableIps = new LinkedHashMap<>();
         final AutoScalingReconciler reconciler;
+        final AutoScalingService groups = mock(AutoScalingService.class);
         final Ec2Service ec2 = mock(Ec2Service.class);
         final List<List<String>> savedMembers = new ArrayList<>();
         boolean groupPresent = true;
@@ -186,9 +255,10 @@ class AutoScalingPlacementTest {
         int allocations;
         int failAfter = Integer.MAX_VALUE;
         RuntimeException saveFailure;
+        RuntimeException launchFailure =
+                new AwsException("InsufficientInstanceCapacity", "fixture allocation failure", 400);
 
         Fixture(Map<String, String> zones, List<String> declaredSubnets) {
-            AutoScalingService groups = mock(AutoScalingService.class);
             reconciler = new AutoScalingReconciler(groups, ec2, mock(ElbV2Service.class));
             group.setRegion(REGION);
             group.setAutoScalingGroupName("placement-group");
@@ -231,7 +301,7 @@ class AutoScalingPlacementTest {
                             if (deleteOnFailure) {
                                 groupPresent = false;
                             }
-                            throw new AwsException("InsufficientInstanceCapacity", "fixture allocation failure", 400);
+                            throw launchFailure;
                         }
                         String subnet = call.getArgument(7);
                         String zone = call.getArgument(15);

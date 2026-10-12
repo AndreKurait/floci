@@ -116,8 +116,8 @@ public class AutoScalingReconciler {
                 try {
                     reconcile(asg);
                 } catch (Exception e) {
-                    LOG.warnv("Reconcile failed for ASG {0} in account {1}: {2}",
-                            asg.getAutoScalingGroupName(), accountId, e.getMessage());
+                    LOG.warnv(e, "Reconcile failed for ASG {0} in account {1}",
+                            asg.getAutoScalingGroupName(), accountId);
                 }
             }
         } catch (Exception e) {
@@ -349,6 +349,7 @@ public class AutoScalingReconciler {
         }
         LOG.infov("ASG {0}: scaling out by {1}", asg.getAutoScalingGroupName(), count);
         List<String> launchedInstanceIds = new ArrayList<>();
+        RuntimeException launchFailure = null;
         try {
             List<LaunchPlacement> placements = new ArrayList<>(launchPlacements(asg));
             for (int index = 0; index < count; index++) {
@@ -390,27 +391,44 @@ public class AutoScalingReconciler {
                                     placement.availableIpAddresses() - reservation.getInstances().size())));
                 }
             }
-        } catch (Exception e) {
-            LOG.warnv("ASG {0}: failed to launch instances: {1}",
-                    asg.getAutoScalingGroupName(), e.getMessage());
+        } catch (RuntimeException e) {
+            launchFailure = e;
+            throw e;
         } finally {
             // Preserve successful allocations even if a later single-instance launch fails.
             if (!launchedInstanceIds.isEmpty()) {
-                boolean saved = false;
                 try {
-                    saved = asgService.saveAutoScalingGroupIfPresent(asg);
-                } finally {
-                    if (!saved) {
-                        try {
-                            ec2Service.terminateInstances(asg.getRegion(), launchedInstanceIds);
-                            asg.getInstances().removeIf(instance -> launchedInstanceIds.contains(instance.getInstanceId()));
-                        } catch (Exception e) {
-                            LOG.warnv("ASG {0}: failed to clean up unpersisted instances {1}: {2}",
-                                    asg.getAutoScalingGroupName(), launchedInstanceIds, e.getMessage());
-                        }
+                    preserveScaleOutAllocations(asg, launchedInstanceIds);
+                } catch (RuntimeException persistenceFailure) {
+                    if (launchFailure == null) {
+                        throw persistenceFailure;
                     }
+                    launchFailure.addSuppressed(persistenceFailure);
                 }
             }
+        }
+    }
+
+    private void preserveScaleOutAllocations(AutoScalingGroup asg, List<String> launchedInstanceIds) {
+        RuntimeException saveFailure = null;
+        try {
+            if (asgService.saveAutoScalingGroupIfPresent(asg)) {
+                return;
+            }
+        } catch (RuntimeException e) {
+            saveFailure = e;
+        }
+        try {
+            ec2Service.terminateInstances(asg.getRegion(), launchedInstanceIds);
+            asg.getInstances().removeIf(instance -> launchedInstanceIds.contains(instance.getInstanceId()));
+        } catch (RuntimeException cleanupFailure) {
+            if (saveFailure == null) {
+                throw cleanupFailure;
+            }
+            saveFailure.addSuppressed(cleanupFailure);
+        }
+        if (saveFailure != null) {
+            throw saveFailure;
         }
     }
 
