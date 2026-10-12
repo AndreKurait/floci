@@ -135,6 +135,22 @@ class SesServiceAddressLengthTest {
     }
 
     @Test
+    void v2RawSend_fromHeaderIsNotMeasuredWhenSenderIsGiven() {
+        String from = address(321, 'c');
+
+        assertDoesNotThrow(() -> service.sendEmail(request(SENDER)
+                .content(new EmailContent.Raw(raw(from, TO, "").data(), true)).build()));
+    }
+
+    @Test
+    void v2RawSend_fromHeaderIsMeasuredWithoutSender() {
+        String from = address(321, 'c');
+
+        assertRejects(from, () -> service.sendEmail(request(null)
+                .content(new EmailContent.Raw(raw(from, TO, "").data(), true)).build()));
+    }
+
+    @Test
     void rawSend_destinationsAreReportedBeforeToHeader() {
         String destination = address(500, 'd');
 

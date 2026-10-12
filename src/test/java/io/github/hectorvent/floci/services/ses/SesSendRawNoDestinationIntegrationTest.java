@@ -71,6 +71,25 @@ class SesSendRawNoDestinationIntegrationTest {
     }
 
     @Test
+    void v2SendEmail_rawWithoutAnyRecipient_reportsUnknownConfigurationSetFirst() {
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH)
+            .body("""
+                {
+                    "ConfigurationSetName": "no-destination-missing-cs",
+                    "Content": {"Raw": {"Data": "%s"}}
+                }
+                """.formatted(rawData("From: sender@example.com\r\n")))
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(404)
+            .body("__type", equalTo("NotFoundException"))
+            .body("message", equalTo("Configuration set <no-destination-missing-cs> does not exist."));
+    }
+
+    @Test
     void v2SendEmail_rawWithEmptyDestination_returnsMissingToHeader() {
         given()
             .contentType("application/json")

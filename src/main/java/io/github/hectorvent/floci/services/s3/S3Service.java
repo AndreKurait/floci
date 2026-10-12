@@ -2327,6 +2327,18 @@ public class S3Service implements Resettable, ResourceProvider {
                 Map.of("MaxSizeAllowed", maxSizeAllowed));
     }
 
+    /**
+     * The message of S3's {@code EntityTooSmall} error as S3 sends it, which, like
+     * {@link #ENTITY_TOO_LARGE_MESSAGE}, is not the wording of the error code table's description.
+     */
+    static final String ENTITY_TOO_SMALL_MESSAGE = "Your proposed upload is smaller than the minimum allowed size";
+
+    /** S3's error for an upload under the least it takes, naming the size proposed and the least allowed. */
+    static AwsException entityTooSmall(long proposedSize, long minSizeAllowed) {
+        return new AwsException("EntityTooSmall", ENTITY_TOO_SMALL_MESSAGE, 400,
+                Map.of("ProposedSize", proposedSize, "MinSizeAllowed", minSizeAllowed));
+    }
+
     static void requireCopyableSize(S3Object source) {
         if (source.getSize() > MAX_COPY_OBJECT_SOURCE_SIZE) {
             throw new AwsException("InvalidRequest",

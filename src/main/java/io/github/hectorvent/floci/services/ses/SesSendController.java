@@ -135,7 +135,7 @@ public class SesSendController {
                     throw new AwsException("BadRequestException",
                             "Content.Raw.Data is required.", 400);
                 }
-                SendEmailRequest rawRequest = sendRequest.content(new EmailContent.Raw(rawData)).build();
+                SendEmailRequest rawRequest = sendRequest.content(new EmailContent.Raw(rawData, true)).build();
                 sesService.checkTenantRawSendAccess(tenantName, fromEmailAddress, rawData,
                         rawRequest.hasRecipients(), configurationSetName, regionResolver.getAccountId(), region);
                 messageId = sesService.sendEmail(rawRequest);

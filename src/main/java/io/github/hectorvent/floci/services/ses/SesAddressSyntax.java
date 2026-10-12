@@ -2,11 +2,13 @@ package io.github.hectorvent.floci.services.ses;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ses.model.BulkEmailEntry;
+import io.github.hectorvent.floci.services.ses.model.EmailContent;
 import io.github.hectorvent.floci.services.ses.model.SendEmailRequest;
 import org.apache.james.mime4j.dom.Message;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.Consumer;
 
 /**
  * The address syntax check AWS applies to every address of a send ahead of the destination,
@@ -18,11 +20,15 @@ import java.util.List;
  * except for a CR or LF, which AWS rejects with its own wording even before whitespace.
  * In a raw message AWS checks the From, To, Cc and Bcc headers (probe-confirmed);
  * the Reply-To and Return-Path headers were not probed and are left unchecked. The v2 controller
- * remaps the code to BadRequestException.
+ * remaps the code to BadRequestException. A v2 raw send checks its From header only without a
+ * sender parameter, and then answers an invalid From address for every violation but a missing
+ * {@code @}, which it reports later (probe-confirmed for the four JavaMail messages; a quoted CR
+ * or LF is assumed to follow).
  */
 final class SesAddressSyntax {
 
     private static final List<String> RAW_CHECKED_HEADERS = List.of("To", "Cc", "Bcc");
+    private static final String MISSING_FINAL_DOMAIN = "Missing final '@domain'";
 
     private SesAddressSyntax() {
     }
@@ -31,8 +37,40 @@ final class SesAddressSyntax {
         SesSendAddresses.forEachEnvelope(request, SesAddressSyntax::require);
     }
 
-    static void requireRaw(SendEmailRequest request, Message message) {
-        SesSendAddresses.forEachRaw(request, message, RAW_CHECKED_HEADERS, SesAddressSyntax::require);
+    static void requireRaw(SendEmailRequest request, EmailContent.Raw raw, Message message) {
+        SesSendAddresses.forEachRaw(request, message, RAW_CHECKED_HEADERS, fromHeaderCheck(request, raw),
+                SesAddressSyntax::require);
+    }
+
+    private static Consumer<String> fromHeaderCheck(SendEmailRequest request, EmailContent.Raw raw) {
+        if (!raw.checksFromHeader(request.hasSource())) {
+            return SesSendAddresses.UNCHECKED;
+        }
+        return raw.fromHeaderAsFallback() ? SesAddressSyntax::requireFallbackFrom : SesAddressSyntax::require;
+    }
+
+    private static void requireFallbackFrom(String address) {
+        String violation = violation(address);
+        if (violation != null && !MISSING_FINAL_DOMAIN.equals(violation)) {
+            throw new AwsException("InvalidParameterValue", "Invalid From address provided.", 400);
+        }
+    }
+
+    /**
+     * The missing {@code @} of a v2 raw From header read in place of the sender, which AWS reports
+     * only after the configuration set and the missing-destination checks, and before the length
+     * check (probe-confirmed).
+     */
+    static void requireFallbackFromAt(SendEmailRequest request, EmailContent.Raw raw, Message message) {
+        if (raw.fromHeaderAsFallback() && !request.hasSource()) {
+            SesSendAddresses.forEachHeaderAddress(message, "From", SesAddressSyntax::requireAt);
+        }
+    }
+
+    private static void requireAt(String address) {
+        if (MISSING_FINAL_DOMAIN.equals(violation(address))) {
+            throw new AwsException("InvalidParameterValue", MISSING_FINAL_DOMAIN, 400);
+        }
     }
 
     /**
@@ -98,7 +136,7 @@ final class SesAddressSyntax {
             }
         }
         if (i >= addrSpec.length()) {
-            return "Missing final '@domain'";
+            return MISSING_FINAL_DOMAIN;
         }
         String domain = addrSpec.substring(i + 1);
         if (domain.isEmpty()) {

@@ -2,12 +2,16 @@ package io.github.hectorvent.floci.services.ses;
 
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 
 @QuarkusTest
@@ -268,5 +272,121 @@ class SesSendAddressSyntaxIntegrationTest {
             .statusCode(400)
             .body("ErrorResponse.Error.Code", equalTo("InvalidParameterValue"))
             .body("ErrorResponse.Error.Message", equalTo("Invalid email address<bounce@>."));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "sender.example.com, Missing final '@domain'",
+        "sender@, Invalid From address provided.",
+        "やまだ@example.com, Invalid From address provided.",
+        "sender@例え.jp, Invalid From address provided."
+    })
+    void v2SendEmailRaw_malformedFromHeaderWithoutFromEmailAddress(String from, String message) {
+        given()
+            .contentType("application/json; charset=UTF-8")
+            .header("Authorization", AUTH)
+            .body("""
+                {
+                    "Destination": {"ToAddresses": ["%s"]},
+                    "Content": {"Raw": {"Data": "%s"}}
+                }
+                """.formatted(TO, rawMessage(from)))
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("BadRequestException"))
+            .body("message", equalTo(message));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"sender.example.com", "sender@", "やまだ@example.com", "sender@例え.jp"})
+    void v2SendEmailRaw_malformedFromHeaderIsNotCheckedWithFromEmailAddress(String from) {
+        given()
+            .contentType("application/json; charset=UTF-8")
+            .header("Authorization", AUTH)
+            .body("""
+                {
+                    "FromEmailAddress": "sender@example.com",
+                    "Destination": {"ToAddresses": ["%s"]},
+                    "Content": {"Raw": {"Data": "%s"}}
+                }
+                """.formatted(TO, rawMessage(from)))
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(200)
+            .body("MessageId", notNullValue());
+    }
+
+    @Test
+    void v2SendEmailRaw_overLimitFromHeaderIsNotMeasuredWithFromEmailAddress() {
+        String from = "A".repeat(321 - " <sender@example.com>".length()) + " <sender@example.com>";
+
+        given()
+            .contentType("application/json; charset=UTF-8")
+            .header("Authorization", AUTH)
+            .body("""
+                {
+                    "FromEmailAddress": "sender@example.com",
+                    "Destination": {"ToAddresses": ["%s"]},
+                    "Content": {"Raw": {"Data": "%s"}}
+                }
+                """.formatted(TO, rawMessage(from)))
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(200)
+            .body("MessageId", notNullValue());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "sender.example.com, Missing required header 'To'.",
+        "sender@, Invalid From address provided."
+    })
+    void v2SendEmailRaw_malformedFromHeaderWithoutAnyDestination(String from, String message) {
+        String raw = Base64.getEncoder().encodeToString(("From: " + from + "\r\nSubject: s\r\n\r\nb")
+                .getBytes(StandardCharsets.UTF_8));
+
+        given()
+            .contentType("application/json; charset=UTF-8")
+            .header("Authorization", AUTH)
+            .body("""
+                {"Content": {"Raw": {"Data": "%s"}}}
+                """.formatted(raw))
+        .when()
+            .post("/v2/email/outbound-emails")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("BadRequestException"))
+            .body("message", equalTo(message));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "sender.example.com, Missing final '@domain'",
+        "sender@, Missing domain",
+        "やまだ@example.com, Local address contains control or whitespace",
+        "sender@例え.jp, Domain contains control or whitespace"
+    })
+    void v1SendRawEmail_malformedFromHeader_keepsJavaMailMessages(String from, String message) {
+        given()
+            .contentType("application/x-www-form-urlencoded; charset=UTF-8")
+            .header("Authorization", AUTH)
+            .formParam("Action", "SendRawEmail")
+            .formParam("Destinations.member.1", TO)
+            .formParam("RawMessage.Data", rawMessage(from))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("ErrorResponse.Error.Code", equalTo("InvalidParameterValue"))
+            .body("ErrorResponse.Error.Message", equalTo(message));
+    }
+
+    private static String rawMessage(String from) {
+        return Base64.getEncoder().encodeToString(("From: " + from + "\r\nTo: " + TO + "\r\nSubject: s\r\n\r\nb")
+                .getBytes(StandardCharsets.UTF_8));
     }
 }

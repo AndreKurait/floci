@@ -426,13 +426,12 @@ public class SesService {
         if (raw.data() == null || raw.data().isBlank()) {
             throw new AwsException("InvalidParameterValue", "RawMessage.Data is required.", 400);
         }
-        boolean sourceOmitted = source == null || source.isBlank();
         // The MIME headers are always parsed: X-SES-CONFIGURATION-SET can name the configuration
         // set that decides whether events are published at all, so the configuration set cannot be
         // resolved before the message has been read.
         SmtpRelay.ParsedRawMessage parsed = SmtpRelay.parseRawMessage(raw.data());
         SmtpRelay.RawMessageHeaders headers = parsed.headers();
-        SesAddressSyntax.requireRaw(request, parsed.message());
+        SesAddressSyntax.requireRaw(request, raw, parsed.message());
         // AWS accepts the configuration set either as a request field or as the
         // X-SES-CONFIGURATION-SET header on the message itself; the request field wins.
         String requestedConfigSet = firstNonBlank(request.configurationSetName(), headers.configurationSet());
@@ -444,7 +443,7 @@ public class SesService {
         List<MessageTag> effectiveTags = (request.emailTags() == null || request.emailTags().isEmpty())
                 ? headers.messageTags()
                 : request.emailTags();
-        String effectiveSource = sourceOmitted && !headers.from().isBlank()
+        String effectiveSource = !request.hasSource() && !headers.from().isBlank()
                 ? headers.from()
                 : source;
         if (effectiveSource == null || effectiveSource.isBlank()) {
@@ -454,12 +453,11 @@ public class SesService {
             // both with this message.
             throw new AwsException("InvalidParameterValue", "Missing required header 'From'.", 400);
         }
-        SesAddressLength.requireRaw(request, parsed.message());
         // FromEmailAddress was omitted, so the configuration set couldn't be resolved from the
         // sender until the MIME "From" was parsed. Re-resolve from the effective sender now so an
         // email identity's default configuration set still applies to a Raw send without an
         // explicit FromEmailAddress.
-        if (sourceOmitted && (requestedConfigSet == null || requestedConfigSet.isBlank())) {
+        if (!request.hasSource() && (requestedConfigSet == null || requestedConfigSet.isBlank())) {
             effectiveConfigSet = resolveDefaultConfigurationSet(requestedConfigSet, effectiveSource, region);
             configSetService.validateForSending(effectiveConfigSet, region);
         }
@@ -469,6 +467,8 @@ public class SesService {
         if (effectiveDestinations.isEmpty()) {
             throw new AwsException("InvalidParameterValue", "Missing required header 'To'.", 400);
         }
+        SesAddressSyntax.requireFallbackFromAt(request, raw, parsed.message());
+        SesAddressLength.requireRaw(request, raw, parsed.message());
         // Resolve suppression before recording the message so a bad ListManagementOptions (e.g. an
         // unknown contact list) fails the whole send without leaving an orphaned SentEmail record.
         Map<String, String> suppressedReasons = new LinkedHashMap<>(

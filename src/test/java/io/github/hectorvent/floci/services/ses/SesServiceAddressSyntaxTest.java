@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ses.model.BulkEmailEntry;
 import io.github.hectorvent.floci.services.ses.model.BulkEmailEntryResult;
 import io.github.hectorvent.floci.services.ses.model.EmailContent;
+import io.github.hectorvent.floci.services.ses.model.Identity;
 import io.github.hectorvent.floci.services.ses.model.SendBulkEmailRequest;
 import io.github.hectorvent.floci.services.ses.model.SendEmailRequest;
 import org.junit.jupiter.api.BeforeEach;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 
@@ -26,19 +28,24 @@ class SesServiceAddressSyntaxTest {
     private static final String TO = "success@simulator.amazonses.com";
     private static final String NON_ASCII_LOCAL = "やまだ@" + DOMAIN;
     private static final String NO_AT = "sender." + DOMAIN;
+    private static final String EMPTY_DOMAIN = "sender@";
+    private static final String NON_ASCII_DOMAIN = "sender@例え.jp";
     private static final String MISSING_FINAL_DOMAIN = "Missing final '@domain'";
     private static final String LOCAL_CONTROL = "Local address contains control or whitespace";
+    private static final String INVALID_FROM = "Invalid From address provided.";
     private static final EmailContent.Simple SIMPLE =
             new EmailContent.Simple("Subject", "body", null, List.of());
 
     private SesService service;
     private SesSentEmailService sentEmails;
+    private SesIdentityService identityService;
 
     @BeforeEach
     void setUp() {
         SesServiceTestBuilder builder = SesServiceTestBuilder.create();
         service = builder.build();
         sentEmails = builder.sentEmailService();
+        identityService = builder.identityService();
     }
 
     @Test
@@ -120,6 +127,92 @@ class SesServiceAddressSyntaxTest {
     void rawSend_fromHeaderIsChecked() {
         assertRejects(MISSING_FINAL_DOMAIN, () -> service.sendEmail(request(null)
                 .content(raw(NO_AT, TO)).build()));
+    }
+
+    @Test
+    void rawSend_fromHeaderKeepsJavaMailMessagesWithOrWithoutSender() {
+        for (String source : Arrays.asList(null, SENDER)) {
+            assertRejects("Missing domain", () -> service.sendEmail(request(source)
+                    .content(fromHeaderRaw(EMPTY_DOMAIN, false)).build()));
+            assertRejects(LOCAL_CONTROL, () -> service.sendEmail(request(source)
+                    .content(fromHeaderRaw(NON_ASCII_LOCAL, false)).build()));
+            assertRejects("Domain contains control or whitespace", () -> service.sendEmail(request(source)
+                    .content(fromHeaderRaw(NON_ASCII_DOMAIN, false)).build()));
+        }
+    }
+
+    @Test
+    void v2RawSend_fromHeaderWithoutAtKeepsJavaMailMessage() {
+        assertRejects(MISSING_FINAL_DOMAIN, () -> service.sendEmail(request(null)
+                .content(fromHeaderRaw(NO_AT, true)).build()));
+    }
+
+    @Test
+    void v2RawSend_otherFromHeaderViolationsAreAnInvalidFromAddress() {
+        for (String from : List.of(EMPTY_DOMAIN, NON_ASCII_LOCAL, NON_ASCII_DOMAIN)) {
+            assertRejects(INVALID_FROM, () -> service.sendEmail(request(null)
+                    .content(fromHeaderRaw(from, true)).build()));
+        }
+    }
+
+    @Test
+    void v2RawSend_fromHeaderIsNotCheckedWhenSenderIsGiven() {
+        for (String from : List.of(NO_AT, EMPTY_DOMAIN, NON_ASCII_LOCAL, NON_ASCII_DOMAIN)) {
+            assertDoesNotThrow(() -> service.sendEmail(request(SENDER)
+                    .content(fromHeaderRaw(from, true)).build()));
+        }
+    }
+
+    @Test
+    void v2RawSend_malformedSenderKeepsJavaMailMessage() {
+        assertRejects("Missing domain", () -> service.sendEmail(request(EMPTY_DOMAIN)
+                .content(fromHeaderRaw(SENDER, true)).build()));
+    }
+
+    @Test
+    void v2RawSend_fromHeaderWithoutAtIsReportedAfterMissingDestination() {
+        assertRejects("Missing required header 'To'.", () -> service.sendEmail(request(null).toAddresses(List.of())
+                .content(v2RawWithoutTo(NO_AT)).build()));
+    }
+
+    @Test
+    void v2RawSend_staleDefaultConfigurationSetOfFromHeaderIsReportedBeforeMissingDestination() {
+        Identity identity = new Identity(DOMAIN, "Domain");
+        identity.setConfigurationSetName("deleted");
+        identityService.save(identity, REGION);
+
+        AwsException e = assertThrows(AwsException.class, () -> service.sendEmail(request(null)
+                .toAddresses(List.of()).content(v2RawWithoutTo(SENDER)).build()));
+
+        assertEquals("Configuration set <deleted> does not exist.", e.getMessage());
+    }
+
+    @Test
+    void v2RawSend_otherFromHeaderViolationsAreReportedBeforeMissingDestination() {
+        assertRejects(INVALID_FROM, () -> service.sendEmail(request(null).toAddresses(List.of())
+                .content(v2RawWithoutTo(EMPTY_DOMAIN)).build()));
+    }
+
+    @Test
+    void v2RawSend_fromHeaderWithoutAtIsReportedAfterRecipientSyntax() {
+        assertRejects(LOCAL_CONTROL, () -> service.sendEmail(request(null).toAddresses(List.of(NON_ASCII_LOCAL))
+                .content(fromHeaderRaw(NO_AT, true)).build()));
+        assertRejects(LOCAL_CONTROL, () -> service.sendEmail(request(null).toAddresses(List.of())
+                .content(fromHeaderRaw(NO_AT, true, NON_ASCII_LOCAL)).build()));
+    }
+
+    @Test
+    void v2RawSend_fromHeaderWithoutAtIsReportedAfterUnknownConfigurationSet() {
+        AwsException e = assertThrows(AwsException.class, () -> service.sendEmail(request(null)
+                .configurationSetName("missing").content(fromHeaderRaw(NO_AT, true)).build()));
+
+        assertEquals("ConfigurationSetDoesNotExist", e.getErrorCode());
+    }
+
+    @Test
+    void v2RawSend_fromHeaderWithoutAtIsReportedBeforeLength() {
+        assertRejects(MISSING_FINAL_DOMAIN, () -> service.sendEmail(request(null).toAddresses(List.of(address(321)))
+                .content(fromHeaderRaw(NO_AT, true)).build()));
     }
 
     @Test
@@ -218,6 +311,20 @@ class SesServiceAddressSyntaxTest {
 
     private static EmailContent.Raw raw(String from, String to) {
         return raw(from, to, "");
+    }
+
+    private static EmailContent.Raw fromHeaderRaw(String from, boolean fromHeaderAsFallback) {
+        return fromHeaderRaw(from, fromHeaderAsFallback, TO);
+    }
+
+    private static EmailContent.Raw fromHeaderRaw(String from, boolean fromHeaderAsFallback, String to) {
+        return new EmailContent.Raw(Base64.getEncoder().encodeToString(("From: " + from + "\r\nTo: " + to
+                + "\r\nSubject: s\r\n\r\nbody").getBytes(StandardCharsets.UTF_8)), fromHeaderAsFallback);
+    }
+
+    private static EmailContent.Raw v2RawWithoutTo(String from) {
+        return new EmailContent.Raw(Base64.getEncoder().encodeToString(("From: " + from
+                + "\r\nSubject: s\r\n\r\nbody").getBytes(StandardCharsets.UTF_8)), true);
     }
 
     private static EmailContent.Raw raw(String from, String to, String extraHeaders) {

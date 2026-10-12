@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ses;
 
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.ses.model.EmailContent;
 import io.github.hectorvent.floci.services.ses.model.SendEmailRequest;
 import org.apache.james.mime4j.dom.Message;
 
@@ -32,8 +33,10 @@ final class SesAddressLength {
      * encoded and escaped quotes count (probe-confirmed). Each address of a header is checked on its
      * own, so a header listing several short addresses passes however long it is.
      */
-    static void requireRaw(SendEmailRequest request, Message message) {
-        SesSendAddresses.forEachRaw(request, message, RAW_RECIPIENT_HEADERS, SesAddressLength::require);
+    static void requireRaw(SendEmailRequest request, EmailContent.Raw raw, Message message) {
+        SesSendAddresses.forEachRaw(request, message, RAW_RECIPIENT_HEADERS,
+                raw.checksFromHeader(request.hasSource()) ? SesAddressLength::require : SesSendAddresses.UNCHECKED,
+                SesAddressLength::require);
     }
 
     static void require(String address) {

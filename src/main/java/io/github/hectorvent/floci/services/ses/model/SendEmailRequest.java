@@ -50,6 +50,10 @@ public record SendEmailRequest(
         return all;
     }
 
+    public boolean hasSource() {
+        return source != null && !source.isBlank();
+    }
+
     public boolean hasRecipients() {
         return !recipients().isEmpty();
     }

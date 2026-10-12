@@ -79,6 +79,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.StringJoiner;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
@@ -3435,10 +3436,10 @@ public class S3Controller {
             xmlBuilder.elem("Condition", condition);
         }
         // S3 InvalidArgument responses carry ArgumentName and ArgumentValue so the SDK can
-        // surface which input was rejected, and EntityTooLarge the proposed and allowed sizes.
-        // They travel through AwsException.extendedData.
+        // surface which input was rejected, and EntityTooSmall and EntityTooLarge the proposed and
+        // allowed sizes. They travel through AwsException.extendedData.
         if (e.getExtendedData() != null) {
-            for (String sizeField : List.of("ProposedSize", "MaxSizeAllowed")) {
+            for (String sizeField : List.of("ProposedSize", "MinSizeAllowed", "MaxSizeAllowed")) {
                 Object size = e.getExtendedData().get(sizeField);
                 if (size != null) {
                     xmlBuilder.elem(sizeField, size.toString());
@@ -3855,9 +3856,7 @@ public class S3Controller {
                 actualValue = fields.get(lookupKey);
             }
             if (actualValue == null || !actualValue.equals(expectedValue)) {
-                throw new AwsException("AccessDenied",
-                        "Invalid according to Policy: Policy Condition failed: "
-                                + "[\"eq\", \"$" + fieldName + "\", \"" + expectedValue + "\"]", 403);
+                throw policyConditionFailed("[\"eq\", \"$" + fieldName + "\", \"" + expectedValue + "\"]");
             }
         }
     }
@@ -3869,11 +3868,13 @@ public class S3Controller {
         }
         String operator = condition.get(0).asText().toLowerCase(Locale.ROOT);
         if ("content-length-range".equals(operator)) {
-            long min = condition.get(1).asLong();
-            long max = condition.get(2).asLong();
-            if (contentLength < min || contentLength > max) {
-                throw new AwsException("EntityTooLarge",
-                        "Your proposed upload exceeds the maximum allowed size.", 400);
+            long min = contentLengthBound(condition, 1);
+            long max = contentLengthBound(condition, 2);
+            if (contentLength < min) {
+                throw S3Service.entityTooSmall(contentLength, min);
+            }
+            if (contentLength > max) {
+                throw S3Service.entityTooLarge(contentLength, max);
             }
         } else if ("eq".equals(operator)) {
             String fieldRef = condition.get(1).asText();
@@ -3881,9 +3882,7 @@ public class S3Controller {
             String fieldName = fieldRef.startsWith("$") ? fieldRef.substring(1) : fieldRef;
             String actualValue = resolveFieldValue(fieldName.toLowerCase(Locale.ROOT), bucket, fields);
             if (actualValue == null || !actualValue.equals(expectedValue)) {
-                throw new AwsException("AccessDenied",
-                        "Invalid according to Policy: Policy Condition failed: "
-                                + "[\"eq\", \"$" + fieldName + "\", \"" + expectedValue + "\"]", 403);
+                throw policyConditionFailed("[\"eq\", \"$" + fieldName + "\", \"" + expectedValue + "\"]");
             }
         } else if ("starts-with".equals(operator)) {
             String fieldRef = condition.get(1).asText();
@@ -3891,11 +3890,43 @@ public class S3Controller {
             String fieldName = fieldRef.startsWith("$") ? fieldRef.substring(1) : fieldRef;
             String actualValue = resolveFieldValue(fieldName.toLowerCase(Locale.ROOT), bucket, fields);
             if (actualValue == null || !actualValue.startsWith(prefix)) {
-                throw new AwsException("AccessDenied",
-                        "Invalid according to Policy: Policy Condition failed: "
-                                + "[\"starts-with\", \"$" + fieldName + "\", \"" + prefix + "\"]", 403);
+                throw policyConditionFailed("[\"starts-with\", \"$" + fieldName + "\", \"" + prefix + "\"]");
             }
         }
+    }
+
+    /**
+     * One bound of a content-length-range condition: a number that fits in a long, any fraction dropped,
+     * or a string holding a whole number that does. Any other bound fails the condition, as S3 answers
+     * {@code ["content-length-range", "test", "10"]}.
+     */
+    private static long contentLengthBound(JsonNode condition, int index) {
+        JsonNode bound = condition.get(index);
+        if (bound.isNumber() && bound.canConvertToLong()) {
+            return bound.longValue();
+        }
+        if (bound.isTextual()) {
+            try {
+                return Long.parseLong(bound.textValue());
+            } catch (NumberFormatException e) {
+                throw policyConditionFailed(policyConditionText(condition));
+            }
+        }
+        throw policyConditionFailed(policyConditionText(condition));
+    }
+
+    /** A policy condition as S3 quotes it in an error: its elements as JSON, comma-separated. */
+    private static String policyConditionText(JsonNode condition) {
+        StringJoiner elements = new StringJoiner(", ", "[", "]");
+        for (JsonNode element : condition) {
+            elements.add(element.toString());
+        }
+        return elements.toString();
+    }
+
+    private static AwsException policyConditionFailed(String condition) {
+        return new AwsException("AccessDenied",
+                "Invalid according to Policy: Policy Condition failed: " + condition, 403);
     }
 
     private static String resolveFieldValue(String fieldName, String bucket, Map<String, String> fields) {

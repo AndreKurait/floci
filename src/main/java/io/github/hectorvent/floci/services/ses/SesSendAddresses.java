@@ -15,6 +15,8 @@ import java.util.function.Consumer;
  */
 final class SesSendAddresses {
 
+    static final Consumer<String> UNCHECKED = address -> { };
+
     private SesSendAddresses() {
     }
 
@@ -30,12 +32,13 @@ final class SesSendAddresses {
     /**
      * A raw send: the sender parameter, the From header, the envelope fields of the request, and
      * then the named headers of the MIME message. Each address of a header is visited on its own,
-     * as written (an encoded-word name stays encoded).
+     * as written (an encoded-word name stays encoded). The From header goes to its own check, which
+     * is {@link #UNCHECKED} when the send ignores that header.
      */
     static void forEachRaw(SendEmailRequest request, Message message, List<String> headerNames,
-                           Consumer<String> check) {
+                           Consumer<String> fromHeaderCheck, Consumer<String> check) {
         check.accept(request.source());
-        forEachHeaderAddress(message, "From", check);
+        forEachHeaderAddress(message, "From", fromHeaderCheck);
         forEachRecipient(request, check);
         for (String name : headerNames) {
             forEachHeaderAddress(message, name, check);
@@ -130,7 +133,7 @@ final class SesSendAddresses {
         }
     }
 
-    private static void forEachHeaderAddress(Message message, String name, Consumer<String> check) {
+    static void forEachHeaderAddress(Message message, String name, Consumer<String> check) {
         Header header = message == null ? null : message.getHeader();
         if (header == null) {
             return;
