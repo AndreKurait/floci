@@ -39,8 +39,10 @@ public final class ContainerTeardowns {
         if (resources.isEmpty()) {
             return;
         }
-        ExecutorService executor = Executors.newFixedThreadPool(Math.min(resources.size(), 16),
-                Thread.ofPlatform().daemon().name("container-teardown-", 0).factory());
+        // Every owned container must receive its stop within the same deadline. A fixed worker
+        // queue lets slow Docker calls consume that budget before later containers can even stop.
+        ExecutorService executor = Executors.newThreadPerTaskExecutor(
+                Thread.ofVirtual().name("container-teardown-", 0).factory());
         try {
             List<Callable<Void>> tasks = new ArrayList<>(resources.size());
             for (T resource : resources) {

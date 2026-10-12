@@ -284,7 +284,7 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     @Test
-    void interruptedDrainRetainsRunningAndQueuedEnvironmentsForRetry() throws Exception {
+    void interruptedDrainRetainsEveryOwnedEnvironmentForRetry() throws Exception {
         pool.shutdown();
         pool = new ProvisionedConcurrencyPool(
                 launcher, functions, aliases, storage, Clock.systemUTC(), 32, 32, false);
@@ -303,10 +303,11 @@ class ProvisionedConcurrencyPoolTest {
             interruptionPreserved.set(Thread.currentThread().isInterrupted());
         });
         try {
-            for (int i = 0; i < 16; i++) {
+            for (int i = 0; i < environments.size(); i++) {
                 assertNotNull(launcher.stopping.poll(2, TimeUnit.SECONDS));
             }
-            assertEquals(16, environments.stream().mapToInt(environment -> environment.stops.get()).sum());
+            assertEquals(environments.size(),
+                    environments.stream().mapToInt(environment -> environment.stops.get()).sum());
             drain.interrupt();
             drain.join(5000);
             assertFalse(drain.isAlive());

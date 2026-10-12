@@ -526,11 +526,19 @@ public class ContainerLifecycleManager {
      * only once the container is gone; when removal fails it is left open for the retry.
      */
     public void stopAndRemoveStrict(String containerId, Closeable logStream) {
+        stopAndRemoveStrict(containerId, logStream, 5);
+    }
+
+    /**
+     * Stops and removes a container with the caller's stop timeout, retaining cleanup ownership
+     * through an exception if Docker cannot confirm removal.
+     */
+    public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds) {
         LOG.infov("Stopping container {0}", containerId);
 
         Exception stopFailure = null;
         try {
-            dockerClient.stopContainerCmd(containerId).withTimeout(5).exec();
+            dockerClient.stopContainerCmd(containerId).withTimeout(stopTimeoutSeconds).exec();
         } catch (NotFoundException e) {
             LOG.debugv("Container {0} not found (already removed)", containerId);
             closeLogStreamIfPresent(logStream);

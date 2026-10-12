@@ -679,7 +679,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // extension shutdown work — only that we will not preempt PID 1 for at least
         // that long if it happens to be slow.
         int stopTimeoutSeconds = server.hasRegisteredExtensions() ? 2 : 1;
-        lifecycleManager.stopAndRemove(handle.getContainerId(), handle.getLogStream(),
+        lifecycleManager.stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(),
                 stopTimeoutSeconds);
 
         // Only now close the runtime API socket. Any pollers that were still parked when
