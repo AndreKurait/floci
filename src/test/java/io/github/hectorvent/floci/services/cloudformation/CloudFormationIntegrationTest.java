@@ -10002,10 +10002,10 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
-    void updateStack_unsupportedResourceRollbackRemainsExplicitlyFailed() {
+    void updateStack_ssmRollbackRestoresTheValueAndTemplate() {
         String suffix = Long.toString(System.nanoTime(), 36);
-        String stackName = "unsupported-update-rollback-" + suffix;
-        String parameterName = "/cfn/unsupported-update-rollback/" + suffix;
+        String stackName = "ssm-update-rollback-" + suffix;
+        String parameterName = "/cfn/ssm-update-rollback/" + suffix;
         String template = """
             {
               "Resources": {
@@ -10031,7 +10031,7 @@ class CloudFormationIntegrationTest {
                   "Type": "AWS::SecretsManager::Secret",
                   "DependsOn": "Parameter",
                   "Properties": {
-                    "Name": "unsupported-update-rollback-secret-%s",
+                    "Name": "ssm-update-rollback-secret-%s",
                     "SecretString": "explicit",
                     "GenerateSecretString": {"PasswordLength": 32}
                   }
@@ -10066,8 +10066,7 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body(containsString("<StackStatus>UPDATE_ROLLBACK_FAILED</StackStatus>"))
-            .body(containsString("Parameter"));
+            .body(containsString("<StackStatus>UPDATE_ROLLBACK_COMPLETE</StackStatus>"));
 
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -10078,7 +10077,7 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("<LogicalResourceId>Parameter</LogicalResourceId>"))
-            .body(containsString("<ResourceStatus>UPDATE_FAILED</ResourceStatus>"))
+            .body(containsString("<ResourceStatus>CREATE_COMPLETE</ResourceStatus>"))
             .body(not(containsString("<LogicalResourceId>BadSecret</LogicalResourceId>")));
 
         given()
@@ -10089,7 +10088,7 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("Parameter.Value", equalTo("updated"));
+            .body("Parameter.Value", equalTo("initial"));
 
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -10099,7 +10098,8 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body(containsString("updated"));
+            .body(containsString("initial"))
+            .body(not(containsString("BadSecret")));
 
         given()
             .contentType("application/x-www-form-urlencoded")
