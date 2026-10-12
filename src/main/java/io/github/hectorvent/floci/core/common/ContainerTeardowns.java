@@ -36,7 +36,17 @@ public final class ContainerTeardowns {
     }
 
     public static <T> void stopInParallel(List<T> resources, Consumer<T> stop, Logger log) {
+        stopInParallel(resources, stop, log, System.nanoTime() + TimeUnit.SECONDS.toNanos(15));
+    }
+
+    public static <T> void stopInParallel(List<T> resources, Consumer<T> stop, Logger log,
+                                         long deadlineNanos) {
         if (resources.isEmpty()) {
+            return;
+        }
+        long remaining = Math.max(0, deadlineNanos - System.nanoTime());
+        if (remaining == 0) {
+            log.warnv("Container drain deadline expired with {0} resource(s) pending", resources.size());
             return;
         }
         // Every owned container must receive its stop within the same deadline. A fixed worker
@@ -51,7 +61,8 @@ public final class ContainerTeardowns {
                     return null;
                 });
             }
-            for (Future<Void> task : executor.invokeAll(tasks, 15, TimeUnit.SECONDS)) {
+            for (Future<Void> task : executor.invokeAll(tasks,
+                    Math.max(0, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS)) {
                 if (task.isCancelled()) {
                     log.warn("Container drain did not finish before the shared deadline");
                 } else {

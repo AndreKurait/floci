@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.ContainerTeardowns;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -17,7 +16,6 @@ import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -43,7 +41,7 @@ import java.util.concurrent.TimeUnit;
  * Persisted requests never imply readiness: every new process must finish real initialization.
  */
 @ApplicationScoped
-public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable {
+public class ProvisionedConcurrencyPool implements Resettable {
     private static final Logger LOG = Logger.getLogger(ProvisionedConcurrencyPool.class);
     private final Object lock = new Object();
     private final LambdaRuntimeLauncher launcher;
@@ -454,6 +452,10 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
     }
 
     private void stop(List<ContainerHandle> handles, boolean shutdownDrain) {
+        stop(handles, shutdownDrain, System.nanoTime() + TimeUnit.SECONDS.toNanos(15));
+    }
+
+    private void stop(List<ContainerHandle> handles, boolean shutdownDrain, long deadlineNanos) {
         synchronized (lock) {
             for (ContainerHandle handle : handles) {
                 if (owned.containsKey(handle)) {
@@ -465,10 +467,11 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
                 return;
             }
         }
-        ContainerTeardowns.stopInParallel(handles, handle -> stop(handle, shutdownDrain), LOG);
+        ContainerTeardowns.stopInParallel(handles, handle -> stop(handle, shutdownDrain, deadlineNanos),
+                LOG, deadlineNanos);
     }
 
-    private void stop(ContainerHandle handle, boolean shutdownDrain) {
+    private void stop(ContainerHandle handle, boolean shutdownDrain, long deadlineNanos) {
         CountDownLatch completion;
         boolean alreadyStopping;
         synchronized (lock) {
@@ -487,7 +490,7 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
             // drain instead of returning while it runs, or issuing another Docker stop.
             if (shutdownDrain) {
                 try {
-                    completion.await();
+                    completion.await(Math.max(0, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                 }
@@ -589,8 +592,11 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
         }
     }
 
-    @Override
     public void stopManagedContainers() {
+        stopManagedContainers(System.nanoTime() + TimeUnit.SECONDS.toNanos(15));
+    }
+
+    void stopManagedContainers(long deadlineNanos) {
         List<ContainerHandle> retired;
         synchronized (lock) {
             if (stopped) {
@@ -601,7 +607,7 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
             allocations.clear();
             retired = new ArrayList<>(owned.keySet());
         }
-        stop(retired, true);
+        stop(retired, true, deadlineNanos);
         synchronized (lock) {
             if (!owned.isEmpty()) {
                 LOG.warnv("Shutdown drain ended with {0} provisioned Lambda environment(s) still owned",
@@ -610,11 +616,21 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
         }
     }
 
-    @PreDestroy
     void shutdown() {
-        scheduler.shutdownNow();
         stopManagedContainers();
+        closeExecutors();
+    }
+
+    void closeExecutors() {
+        scheduler.shutdownNow();
         workers.shutdownNow();
+    }
+
+    @Override
+    public void afterReset() {
+        synchronized (lock) {
+            stopped = false;
+        }
     }
 
     private static AwsException invalid(String message) {

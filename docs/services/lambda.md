@@ -462,6 +462,17 @@ accounting, automatic scaling, or weighted-alias allocation. Provisioned runtime
 their numeric `AWS_LAMBDA_FUNCTION_VERSION` and
 `AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency`.
 
+Shutdown drains provisioned and on-demand containers concurrently within one
+`floci.services.lambda.container-drain-timeout-seconds` budget. The default is 15 seconds;
+set `FLOCI_SERVICES_LAMBDA_CONTAINER_DRAIN_TIMEOUT_SECONDS` when a larger fleet needs more
+time for Docker to finish removing stopped containers. Supported values are 1 through 300;
+invalid values fail initialization. The parent process's stop grace must exceed this
+budget. The destruction hook does not start another drain budget. Failed removals remain
+owned for a later retirement or reset retry; a completed removal is not repeated.
+A launch that outlasts the deadline is reported as incomplete cleanup. Its invocation is
+refused, and any returned container remains owned for a later cleanup retry; the deadline
+does not guarantee cancellation of an unresponsive container launcher.
+
 ## Not Implemented
 
 These AWS Lambda operations have no handler in Floci. Calls will return `404` or an error:

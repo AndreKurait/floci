@@ -11,6 +11,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -62,5 +63,13 @@ class ContainerTeardownsTest {
             }
         }, LOG);
         assertEquals(Set.copyOf(resources), attempted);
+    }
+
+    @Test
+    void anExpiredDeadlineDoesNotStartAnotherDrainBudget() {
+        AtomicInteger attempts = new AtomicInteger();
+        ContainerTeardowns.stopInParallel(List.of(1, 2),
+                ignored -> attempts.incrementAndGet(), LOG, System.nanoTime() - 1);
+        assertEquals(0, attempts.get());
     }
 }

@@ -150,6 +150,7 @@ floci:
       enabled: true
     lambda:
       enabled: true
+      container-drain-timeout-seconds: 15
       docker-flags: ""
       # additional-docker-networks: []
       honour-architectures: false

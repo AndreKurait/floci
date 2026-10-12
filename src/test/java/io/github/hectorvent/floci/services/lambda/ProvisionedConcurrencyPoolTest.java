@@ -284,6 +284,34 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     @Test
+    void suppliedShutdownDeadlineCancelsRemovalAndResetCanRetry() throws Exception {
+        put(1);
+        Environment environment = launched();
+        environment.initialized.complete(null);
+        ready();
+        launcher.stopGate = new CompletableFuture<>();
+        CompletableFuture<Void> drained = CompletableFuture.runAsync(() ->
+                pool.stopManagedContainers(System.nanoTime() + TimeUnit.SECONDS.toNanos(1)));
+        try {
+            assertNotNull(launcher.stopping.poll(2, TimeUnit.SECONDS));
+            drained.get(3, TimeUnit.SECONDS);
+            assertTrue(environment.alive, "Canceled Docker removal must remain owned");
+            pool.stopManagedContainers();
+            assertEquals(1, environment.stops.get(), "The destruction path must not renew the deadline");
+        } finally {
+            launcher.stopGate.complete(null);
+        }
+        pool.clear();
+        await().atMost(Duration.ofSeconds(5)).until(() -> {
+            pool.reconcileSafely();
+            return !environment.alive;
+        });
+        int completedAttempts = environment.stops.get();
+        pool.stopManagedContainers();
+        assertEquals(completedAttempts, environment.stops.get());
+    }
+
+    @Test
     void interruptedDrainRetainsEveryOwnedEnvironmentForRetry() throws Exception {
         pool.shutdown();
         pool = new ProvisionedConcurrencyPool(
