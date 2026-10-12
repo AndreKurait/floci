@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.autoscaling;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
+import io.github.hectorvent.floci.services.autoscaling.model.ScalingActivity;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
@@ -22,6 +23,7 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -29,6 +31,7 @@ import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -147,8 +150,8 @@ class AutoScalingPlacementTest {
     void missingDeclaredSubnetRefusesBeforeAnyAllocation() {
         Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a"),
                 List.of("subnet-a", "subnet-missing"));
-        AwsException error = assertThrows(AwsException.class, () -> fixture.grow(2));
-        assertEquals("InvalidSubnetID.NotFound", error.getErrorCode());
+        fixture.grow(2);
+        assertTrue(fixture.activities().getFirst().getStatusMessage().contains("subnet-missing"));
         assertEquals(Map.of(), fixture.instances);
         assertEquals(0, fixture.group.getInstances().size());
         verify(fixture.groups, never()).saveAutoScalingGroupIfPresent(any());
@@ -159,11 +162,22 @@ class AutoScalingPlacementTest {
         Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a", "subnet-b", REGION + "b"),
                 List.of("subnet-a", "subnet-b"));
         fixture.failAfter = 1;
-        assertSame(fixture.launchFailure, assertThrows(AwsException.class, () -> fixture.grow(2)));
+        fixture.grow(2);
         assertEquals(1, fixture.instances.size());
         assertEquals(List.of("i-1"), fixture.group.getInstances().stream()
                 .map(instance -> instance.getInstanceId()).toList());
         assertTrue(fixture.savedMembers.contains(List.of("i-1")));
+        ScalingActivity activity = fixture.activities().getFirst();
+        assertEquals("Failed", activity.getStatusCode());
+        assertEquals("fixture allocation failure", activity.getStatusMessage());
+        assertEquals(100, activity.getProgress());
+        assertNotNull(activity.getEndTime());
+        fixture.grow(2);
+        assertEquals(1, fixture.activities().size());
+        fixture.launchFailure = new AwsException("RequestLimitExceeded", "request limit exceeded", 503);
+        fixture.grow(2);
+        assertEquals(2, fixture.activities().size());
+        assertEquals("request limit exceeded", fixture.activities().getFirst().getStatusMessage());
         verify(fixture.groups, never()).completeInstanceRefreshIfSettled(any(), any());
         fixture.failAfter = Integer.MAX_VALUE;
         fixture.grow(2);
@@ -177,7 +191,7 @@ class AutoScalingPlacementTest {
         fixture.instances.put("i-unrelated", new Instance());
         fixture.failAfter = 1;
         fixture.deleteOnFailure = true;
-        assertSame(fixture.launchFailure, assertThrows(AwsException.class, () -> fixture.grow(2)));
+        fixture.grow(2);
         assertTrue(fixture.savedMembers.contains(List.of("i-1")));
         verify(fixture.ec2).terminateInstances(REGION, List.of("i-1"));
         verify(fixture.ec2, times(1)).terminateInstances(eq(REGION), anyList());
@@ -188,8 +202,9 @@ class AutoScalingPlacementTest {
     void exhaustedPlacementFailsBeforeAnyAllocationOrSuccessfulReconciliation() {
         Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a"), List.of("subnet-a"));
         fixture.availableIps.put("subnet-a", 0);
-        AwsException error = assertThrows(AwsException.class, () -> fixture.grow(1));
-        assertEquals("InsufficientFreeAddressesInSubnet", error.getErrorCode());
+        fixture.grow(1);
+        assertEquals("No configured subnet has free IPv4 addresses.",
+                fixture.activities().getFirst().getStatusMessage());
         assertEquals(0, fixture.allocations);
         verify(fixture.groups, never()).completeInstanceRefreshIfSettled(any(), any());
     }
@@ -248,6 +263,7 @@ class AutoScalingPlacementTest {
         final Map<String, Integer> availableIps = new LinkedHashMap<>();
         final AutoScalingReconciler reconciler;
         final AutoScalingService groups = mock(AutoScalingService.class);
+        final AutoScalingService activityStore = new AutoScalingService();
         final Ec2Service ec2 = mock(Ec2Service.class);
         final List<List<String>> savedMembers = new ArrayList<>();
         boolean groupPresent = true;
@@ -260,6 +276,15 @@ class AutoScalingPlacementTest {
 
         Fixture(Map<String, String> zones, List<String> declaredSubnets) {
             reconciler = new AutoScalingReconciler(groups, ec2, mock(ElbV2Service.class));
+            when(groups.describeScalingActivities(anyString(), anyString())).thenAnswer(call ->
+                    activityStore.describeScalingActivities(call.getArgument(0), call.getArgument(1)));
+            when(groups.recordActivity(anyString(), anyString(), anyString(), anyString(), anyString()))
+                    .thenAnswer(call -> activityStore.recordActivity(call.getArgument(0), call.getArgument(1),
+                            call.getArgument(2), call.getArgument(3), call.getArgument(4)));
+            doAnswer(call -> {
+                activityStore.completeActivity(call.getArgument(0), call.getArgument(1), call.getArgument(2));
+                return null;
+            }).when(groups).completeActivity(anyString(), anyString(), anyString());
             group.setRegion(REGION);
             group.setAutoScalingGroupName("placement-group");
             group.setLaunchConfigurationName("launch");
@@ -334,6 +359,10 @@ class AutoScalingPlacementTest {
         void grow(int desired) {
             group.setDesiredCapacity(desired);
             reconciler.reconcile(group);
+        }
+
+        List<ScalingActivity> activities() {
+            return groups.describeScalingActivities(REGION, group.getAutoScalingGroupName());
         }
 
         Map<String, Long> counts() {

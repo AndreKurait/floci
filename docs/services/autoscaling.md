@@ -37,31 +37,17 @@ and zero capacity. Both groups had identical configuration except for name, ARN
 and creation time. The SDK regression is
 `compatibility-tests/sdk-test-python/tests/test_autoscaling_subnet_whitespace.py`.
 
-Scale-out chooses an enabled Availability Zone with the fewest active group
-instances among subnets with free IPv4 addresses, then the subnet in that zone
-with the most available IP addresses.
-Existing EC2 placement takes precedence over stale group zone metadata, and each
-new group member reports the EC2 placement actually returned. This
-follows the [AWS placement rules](https://docs.aws.amazon.com/autoscaling/ec2/userguide/auto-scaling-benefits.html).
-A live AWS check in `us-east-2` on October 12, 2026 at 19:49-19:50 UTC grew a group
-from two to three to four instances: the two-zone counts were 1/1, 1/2, then 2/2.
-Both instances in the zone with two subnets used the subnet with more free IPs.
-Scale-out failures propagate to the reconciliation caller after preserving any
-successful partial launches. Failed reconciliation does not complete an instance
-refresh. Save and cleanup failures remain observable, including as suppressed
-exceptions when a launch already failed; the scheduler logs the exception and
-continues processing other groups. Retrying another zone within the same attempt
-and rebalancing existing instances without a desired-capacity increase are not
-implemented here.
+Scale-out follows the [AWS placement rules](https://docs.aws.amazon.com/autoscaling/ec2/userguide/auto-scaling-benefits.html):
+choose the zone with the fewest active instances, then its subnet with the most
+free IPv4 addresses. Declared subnets and actual EC2 placement take precedence
+over stale group zone metadata. Exhausted subnets are skipped. Retrying another
+zone after a launch error and rebalancing without a capacity increase are not implemented.
 
-Create and update reject explicitly supplied Availability Zones outside the EC2
-zone catalog with `ValidationError`, before changing the group. This prevents
-zone-only groups from repeatedly attempting launches in an unmodelled zone. A live
-AWS check in `us-east-2` on October 12, 2026 at 20:43 UTC rejected both an unknown
-zone alone and a mix of valid and unknown zones; an invalid update left the
-existing zones and maximum size unchanged. Floci currently advertises zones
-`a`, `b` and `c` in each region; this validation uses that catalog rather than
-assuming AWS advertises the same zones in every region.
+AWS launch errors appear as failed scaling activities after preserving partial
+launches. Repeated identical failures reuse the recorded activity, following the
+scale-in behavior, and do not complete an instance refresh. Unexpected runtime,
+save and cleanup failures still propagate. Create and update reject explicitly
+supplied zones outside Floci's EC2 zone catalog before changing group state.
 
 ### Instance Management
 

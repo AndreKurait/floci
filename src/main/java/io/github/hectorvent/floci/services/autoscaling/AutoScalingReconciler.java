@@ -135,7 +135,9 @@ public class AutoScalingReconciler {
         int desired = asg.getDesiredCapacity();
 
         if (activeCapacity < desired) {
-            scaleOut(asg, (int) (desired - activeCapacity));
+            if (!scaleOut(asg, (int) (desired - activeCapacity))) {
+                return;
+            }
         } else if (activeCapacity > desired) {
             scaleIn(asg, (int) (activeCapacity - desired));
         }
@@ -341,11 +343,11 @@ public class AutoScalingReconciler {
         return "Pending".equals(state) || "InService".equals(state);
     }
 
-    private void scaleOut(AutoScalingGroup asg, int count) {
+    private boolean scaleOut(AutoScalingGroup asg, int count) {
         LaunchSource launchSource = resolveLaunchSource(asg);
         if (launchSource == null) {
             LOG.warnv("ASG {0}: no launch source found, cannot scale out", asg.getAutoScalingGroupName());
-            return;
+            return true;
         }
         LOG.infov("ASG {0}: scaling out by {1}", asg.getAutoScalingGroupName(), count);
         List<String> launchedInstanceIds = new ArrayList<>();
@@ -393,20 +395,28 @@ public class AutoScalingReconciler {
             }
         } catch (RuntimeException e) {
             launchFailure = e;
-            throw e;
-        } finally {
-            // Preserve successful allocations even if a later single-instance launch fails.
-            if (!launchedInstanceIds.isEmpty()) {
-                try {
-                    preserveScaleOutAllocations(asg, launchedInstanceIds);
-                } catch (RuntimeException persistenceFailure) {
-                    if (launchFailure == null) {
-                        throw persistenceFailure;
-                    }
+        }
+        // Preserve successful allocations even if a later single-instance launch fails.
+        if (!launchedInstanceIds.isEmpty()) {
+            try {
+                preserveScaleOutAllocations(asg, launchedInstanceIds);
+            } catch (RuntimeException persistenceFailure) {
+                if (launchFailure != null) {
                     launchFailure.addSuppressed(persistenceFailure);
+                    throw launchFailure;
                 }
+                throw persistenceFailure;
             }
         }
+        if (launchFailure instanceof AwsException) {
+            recordFailedActivity(asg, "Launching new EC2 instances",
+                    "Instances were requested in response to a desired capacity change.", launchFailure);
+            return false;
+        }
+        if (launchFailure != null) {
+            throw launchFailure;
+        }
+        return true;
     }
 
     private void preserveScaleOutAllocations(AutoScalingGroup asg, List<String> launchedInstanceIds) {
@@ -537,7 +547,7 @@ public class AutoScalingReconciler {
     /**
      * Records a failed scaling activity with the error text, matching AWS (100% progress and a
      * {@code StatusMessage}). A failure that repeats on a later pass with the same error, because
-     * termination keeps failing, is not recorded again: the latest activity with the same
+     * scaling keeps failing, is not recorded again: the latest activity with the same
      * description already records it, whatever other activities were recorded after it. A
      * different error is recorded, so the history carries the current reason.
      */
