@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.efs;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.AvailabilityZoneIds;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -121,7 +122,7 @@ public class EfsService implements Resettable {
         fs.setKmsKeyId(request.getKmsKeyId());
         if (request.getAvailabilityZoneName() != null) {
             fs.setAvailabilityZoneName(request.getAvailabilityZoneName());
-            fs.setAvailabilityZoneId(generateAzId(request.getAvailabilityZoneName()));
+            fs.setAvailabilityZoneId(AvailabilityZoneIds.forZoneName(region, request.getAvailabilityZoneName()));
         }
         
         if (request.getTags() != null) {
@@ -404,7 +405,7 @@ public class EfsService implements Resettable {
             mt.setLifeCycleState(LifeCycleState.available);
             mt.setVpcId("vpc-12345678");
             mt.setAvailabilityZoneName(region + "a");
-            mt.setAvailabilityZoneId(generateAzId(region + "a"));
+            mt.setAvailabilityZoneId(AvailabilityZoneIds.forZoneName(region, region + "a"));
         mt.setNetworkInterfaceId("eni-" + UUID.randomUUID().toString().replace("-", "").substring(0, 17));
         if (request.getSecurityGroups() != null) {
             mt.setSecurityGroups(new ArrayList<>(request.getSecurityGroups()));
@@ -635,22 +636,5 @@ public class EfsService implements Resettable {
 
     private String regionKey(String region, String id) {
         return region + "::" + id;
-    }
-
-    private String generateAzId(String azName) {
-        if (azName == null || azName.length() < 2) return azName + "-id";
-        String region = azName.substring(0, azName.length() - 1);
-        char letter = azName.charAt(azName.length() - 1);
-        int num = (letter >= 'a' && letter <= 'z') ? (letter - 'a' + 1) : 1;
-        
-        String shortCode = region;
-        String[] parts = region.split("-");
-        if (parts.length == 3) {
-            String mid = parts[1].replace("north", "n").replace("south", "s")
-                                 .replace("east", "e").replace("west", "w")
-                                 .replace("central", "c");
-            shortCode = parts[0] + mid + parts[2];
-        }
-        return shortCode + "-az" + num;
     }
 }

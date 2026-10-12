@@ -1582,41 +1582,69 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     @Test
-    void transactWriteItemsCancelsOnAnUpdateValueWithALeafAtLevel33() throws Exception {
+    void transactWriteItemsRejectsAnUpdateValueWithALeafAtLevel33() {
         createUsersTable("eu-west-1");
         ObjectNode update = mapper.createObjectNode();
         update.set("Key", item("userId", "u1"));
         update.put("UpdateExpression", "SET deep = :deep");
         update.set("ExpressionAttributeValues", mapper.createObjectNode().set(":deep", nestedMaps(32)));
 
-        Response response = handler.handle("TransactWriteItems", transactWrite("Update", update), "eu-west-1");
-        assertEquals(400, response.getStatus());
-        JsonNode body = mapper.convertValue(response.getEntity(), JsonNode.class);
-        assertEquals("TransactionCanceledException", body.get("__type").asText());
-        JsonNode reason = body.get("CancellationReasons").get(0);
-        assertEquals("ValidationError", reason.get("Code").asText());
-        assertEquals("Nesting Levels have exceeded supported limits", reason.get("Message").asText());
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("TransactWriteItems", transactWrite("Update", update), "eu-west-1"));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Nesting Levels have exceeded supported limits: "
+                + "Attributes in the item have nested levels beyond supported limit", ex.getMessage());
         assertNull(service.getItem("Users", item("userId", "u1"), "eu-west-1"));
     }
 
     @Test
-    void transactWriteItemsDoesNotCheckTheDepthOfAConditionCheckValue() throws Exception {
-        createUsersTable("eu-west-1");
-        ObjectNode putRequest = mapper.createObjectNode();
-        putRequest.put("TableName", "Users");
-        putRequest.set("Item", item("userId", "u1", "marker", "x"));
-        handler.handle("PutItem", putRequest, "eu-west-1");
+    void transactWriteItemsRejectsAConditionCheckValueWithALeafAtLevel33BeforeTheTableLookup() {
         ObjectNode check = mapper.createObjectNode();
         check.set("Key", item("userId", "u1"));
         check.put("ConditionExpression", "#d = :deep");
         check.set("ExpressionAttributeNames", mapper.createObjectNode().put("#d", "data"));
         check.set("ExpressionAttributeValues", mapper.createObjectNode().set(":deep", nestedMaps(32)));
 
-        Response response = handler.handle("TransactWriteItems", transactWrite("ConditionCheck", check), "eu-west-1");
-        assertEquals(400, response.getStatus());
-        JsonNode reason = mapper.convertValue(response.getEntity(), JsonNode.class).get("CancellationReasons").get(0);
-        assertEquals("ConditionalCheckFailed", reason.get("Code").asText());
-        assertEquals("The conditional request failed", reason.get("Message").asText());
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("TransactWriteItems", transactWrite("ConditionCheck", check), "eu-west-1"));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Nesting Levels have exceeded supported limits: "
+                + "Attributes in the item have nested levels beyond supported limit", ex.getMessage());
+    }
+
+    @Test
+    void transactWriteItemsRejectsAnUnusedValueWithALeafAtLevel33() {
+        createUsersTable("eu-west-1");
+        ObjectNode delete = mapper.createObjectNode();
+        delete.set("Key", item("userId", "u1"));
+        delete.set("ExpressionAttributeValues", mapper.createObjectNode().set(":deep", nestedMaps(32)));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("TransactWriteItems", transactWrite("Delete", delete), "eu-west-1"));
+        assertEquals("Nesting Levels have exceeded supported limits: "
+                + "Attributes in the item have nested levels beyond supported limit", ex.getMessage());
+    }
+
+    @Test
+    void transactWriteItemsChecksDepthBeforeTheExpressionsOfLaterMembersOnly() {
+        createUsersTable("eu-west-1");
+        ObjectNode deep = transactMember("ConditionCheck", "Users", "Key", item("userId", "u1"));
+        ObjectNode deepCheck = (ObjectNode) deep.get("ConditionCheck");
+        deepCheck.put("ConditionExpression", "#d = :deep");
+        deepCheck.set("ExpressionAttributeNames", mapper.createObjectNode().put("#d", "data"));
+        deepCheck.set("ExpressionAttributeValues", mapper.createObjectNode().set(":deep", nestedMaps(32)));
+        ObjectNode broken = transactMember("ConditionCheck", "Users", "Key", item("userId", "u2"));
+        ((ObjectNode) broken.get("ConditionCheck")).put("ConditionExpression", "attribute_exists(");
+
+        AwsException deepEx = assertThrows(AwsException.class,
+                () -> handler.handle("TransactWriteItems", transactWriteOf(deep, broken), "eu-west-1"));
+        assertEquals("Nesting Levels have exceeded supported limits: "
+                + "Attributes in the item have nested levels beyond supported limit", deepEx.getMessage());
+
+        AwsException syntaxEx = assertThrows(AwsException.class,
+                () -> handler.handle("TransactWriteItems", transactWriteOf(broken, deep), "eu-west-1"));
+        assertTrue(syntaxEx.getMessage().startsWith("Invalid ConditionExpression: Syntax error"),
+                syntaxEx.getMessage());
     }
 
     @Test
@@ -1919,6 +1947,91 @@ class NativeDynamoDbJsonHandlerTest {
 
         Response response = handler.handle("ExecuteStatement", request, "eu-west-1");
         assertEquals(200, response.getStatus());
+    }
+
+    @Test
+    void executeTransactionEvaluatesAConditionOnAParameterWithALeafAtLevel33() throws Exception {
+        createUsersTable("eu-west-1");
+        service.putItem("Users", item("userId", "u1"), "eu-west-1");
+        ObjectNode statement = mapper.createObjectNode();
+        statement.put("Statement", "UPDATE \"Users\" SET touched=? WHERE userId=? AND deep=?");
+        statement.set("Parameters", mapper.createArrayNode()
+                .add(attributeValue("S", "y")).add(attributeValue("S", "u1")).add(nestedMaps(32)));
+        ObjectNode request = mapper.createObjectNode();
+        request.set("TransactStatements", mapper.createArrayNode().add(statement));
+
+        Response response = handler.handle("ExecuteTransaction", request, "eu-west-1");
+        assertEquals(400, response.getStatus());
+        JsonNode reason = mapper.convertValue(response.getEntity(), JsonNode.class).get("CancellationReasons").get(0);
+        assertEquals("ConditionalCheckFailed", reason.get("Code").asText());
+    }
+
+    @Test
+    void executeTransactionReportsAFailedConditionBeforeATooDeepSetParameter() throws Exception {
+        createUsersTable("eu-west-1");
+        service.putItem("Users", item("userId", "u1"), "eu-west-1");
+        ObjectNode statement = mapper.createObjectNode();
+        statement.put("Statement", "UPDATE \"Users\" SET deep=? WHERE userId=? AND marker=?");
+        statement.set("Parameters", mapper.createArrayNode()
+                .add(nestedMaps(32)).add(attributeValue("S", "u1")).add(attributeValue("S", "x")));
+        ObjectNode request = mapper.createObjectNode();
+        request.set("TransactStatements", mapper.createArrayNode().add(statement));
+
+        Response response = handler.handle("ExecuteTransaction", request, "eu-west-1");
+        JsonNode reasons = mapper.convertValue(response.getEntity(), JsonNode.class).get("CancellationReasons");
+        assertEquals(1, reasons.size());
+        assertEquals("ConditionalCheckFailed", reasons.get(0).get("Code").asText());
+    }
+
+    @Test
+    void executeTransactionReportsATooDeepResultAlongsideAnotherStatementsFailedCondition() throws Exception {
+        createUsersTable("eu-west-1");
+        service.putItem("Users", item("userId", "u1"), "eu-west-1");
+        service.putItem("Users", item("userId", "u2"), "eu-west-1");
+        ObjectNode failing = mapper.createObjectNode();
+        failing.put("Statement", "UPDATE \"Users\" SET touched=? WHERE userId=? AND marker=?");
+        failing.set("Parameters", mapper.createArrayNode()
+                .add(attributeValue("S", "y")).add(attributeValue("S", "u1")).add(attributeValue("S", "x")));
+        ObjectNode deep = mapper.createObjectNode();
+        deep.put("Statement", "UPDATE \"Users\" SET deep=? WHERE userId=?");
+        deep.set("Parameters", mapper.createArrayNode().add(nestedMaps(32)).add(attributeValue("S", "u2")));
+        ObjectNode request = mapper.createObjectNode();
+        request.set("TransactStatements", mapper.createArrayNode().add(failing).add(deep));
+
+        Response response = handler.handle("ExecuteTransaction", request, "eu-west-1");
+        JsonNode reasons = mapper.convertValue(response.getEntity(), JsonNode.class).get("CancellationReasons");
+        assertEquals("ConditionalCheckFailed", reasons.get(0).get("Code").asText());
+        assertEquals("ValidationError", reasons.get(1).get("Code").asText());
+        assertEquals("Nesting Levels have exceeded supported limits", reasons.get(1).get("Message").asText());
+    }
+
+    @Test
+    void transactWriteItemsReportsATooDeepResultOnEveryMember() throws Exception {
+        createUsersTable("eu-west-1");
+        service.putItem("Users", item("userId", "u1"), "eu-west-1");
+        for (String userId : List.of("u2", "u3")) {
+            ObjectNode stored = item("userId", userId);
+            stored.set("a", nestedMaps(30));
+            service.putItem("Users", stored, "eu-west-1");
+        }
+        ObjectNode failing = transactMember("ConditionCheck", "Users", "Key", item("userId", "u1"));
+        ((ObjectNode) failing.get("ConditionCheck")).put("ConditionExpression", "attribute_exists(marker)");
+
+        Response response = handler.handle("TransactWriteItems",
+                transactWriteOf(deepeningUpdate("u2"), failing, deepeningUpdate("u3")), "eu-west-1");
+        assertEquals(400, response.getStatus());
+        JsonNode reasons = mapper.convertValue(response.getEntity(), JsonNode.class).get("CancellationReasons");
+        assertEquals("ValidationError", reasons.get(0).get("Code").asText());
+        assertEquals("ConditionalCheckFailed", reasons.get(1).get("Code").asText());
+        assertEquals("ValidationError", reasons.get(2).get("Code").asText());
+    }
+
+    private ObjectNode deepeningUpdate(String userId) {
+        ObjectNode member = transactMember("Update", "Users", "Key", item("userId", userId));
+        ObjectNode update = (ObjectNode) member.get("Update");
+        update.put("UpdateExpression", "SET a" + ".n".repeat(30) + " = :v");
+        update.set("ExpressionAttributeValues", mapper.createObjectNode().set(":v", nestedMaps(2)));
+        return member;
     }
 
     @Test

@@ -1821,9 +1821,10 @@ public class DynamoDbService {
             List<TransactionCanceledException.CancellationReason> cancellationReasons = new ArrayList<>();
             boolean hasFailed = false;
             for (JsonNode transactItem : transactItems) {
-                var failReason = transactUpdateValueTooDeep(transactItem);
+                TransactionCanceledException.CancellationReason failReason =
+                        evaluateTransactCondition(transactItem, region, staged);
                 if (failReason == null) {
-                    failReason = evaluateTransactCondition(transactItem, region, staged);
+                    failReason = transactItemValidationFailure(transactItem, region, staged);
                 }
                 if (failReason != null) {
                     hasFailed = true;
@@ -1834,15 +1835,6 @@ public class DynamoDbService {
             }
             if (hasFailed) {
                 throw new TransactionCanceledException(cancellationReasons);
-            }
-
-            for (int i = 0; i < transactItems.size(); i++) {
-                try {
-                    validateTransactItem(transactItems.get(i), region, staged);
-                } catch (KeySchemaMismatchException | ItemNestingExceededException
-                        | UpdatedItemTooLargeException e) {
-                    throw cancelledByMember(transactItems.size(), i, e.getMessage());
-                }
             }
             List<JsonNode> oldImages = stagedImages(memberParticipants, staged);
             for (JsonNode transactItem : transactItems) {
@@ -1974,17 +1966,6 @@ public class DynamoDbService {
         return new TransactParticipant(storageKey, itemKey, tableName);
     }
 
-    // AWS checks the depth of a transact Update's values as part of that member, so a too
-    // deep value cancels the transaction instead of failing the request up front.
-    private TransactionCanceledException.CancellationReason transactUpdateValueTooDeep(JsonNode transactItem) {
-        var values = transactItem.path("Update").get("ExpressionAttributeValues");
-        if (DynamoDbAttributeValueValidator.nestingWithinLimit(values)) {
-            return null;
-        }
-        return new TransactionCanceledException.CancellationReason("ValidationError", null,
-                "Nesting Levels have exceeded supported limits");
-    }
-
     // AWS checks every member's key against the table schema, in order, before it looks for
     // duplicate items or evaluates a condition. The first mismatch cancels with that member's
     // reason alone. An empty key value still fails the whole request.
@@ -2041,6 +2022,17 @@ public class DynamoDbService {
                     : new TransactionCanceledException.CancellationReason("", null));
         }
         return new TransactionCanceledException(reasons);
+    }
+
+    private TransactionCanceledException.CancellationReason transactItemValidationFailure(
+            JsonNode transactItem, String region,
+            Map<String, ConcurrentSkipListMap<String, JsonNode>> staged) {
+        try {
+            validateTransactItem(transactItem, region, staged);
+            return null;
+        } catch (KeySchemaMismatchException | ItemNestingExceededException | UpdatedItemTooLargeException e) {
+            return new TransactionCanceledException.CancellationReason("ValidationError", null, e.getMessage());
+        }
     }
 
     private TransactionCanceledException.CancellationReason evaluateTransactCondition(JsonNode transactItem, String region) {

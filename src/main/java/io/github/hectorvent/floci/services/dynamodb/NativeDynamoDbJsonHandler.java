@@ -1904,6 +1904,11 @@ public class NativeDynamoDbJsonHandler {
                         ? op.get("UpdateExpression").asText() : null;
                 JsonNode opExprAttrNames = op.get("ExpressionAttributeNames");
                 JsonNode opExprAttrValues = op.get("ExpressionAttributeValues");
+                // AWS checks the depth of every value of a member before anything else,
+                // so even an unused or condition-only value fails the request.
+                DynamoDbAttributeValueValidator.requireNestingWithinLimit(op.get("Item"), false);
+                DynamoDbAttributeValueValidator.requireNestingWithinLimit(op.get("Key"), false);
+                DynamoDbAttributeValueValidator.requireNestingWithinLimit(opExprAttrValues, false);
                 DynamoDbExpressionSize.checkRead(op.path("UpdateExpression").textValue(), "UpdateExpression");
                 DynamoDbExpressionSize.checkReadWithSize(conditionExpression, "ConditionExpression");
                 ExpressionEvaluator.validateSyntax(conditionExpression, "ConditionExpression");
@@ -1913,7 +1918,6 @@ public class NativeDynamoDbJsonHandler {
                 requireDefinedTokens(conditionExpression, "ConditionExpression", opExprAttrNames, opExprAttrValues);
                 ExpressionEvaluator.validateSemantics(conditionExpression, "ConditionExpression",
                         opExprAttrNames, opExprAttrValues);
-                DynamoDbAttributeValueValidator.requireNestingWithinLimit(op.get("Item"), false);
                 dynamoDbService.requireAddOrDeleteOperandTypes(op.path("UpdateExpression").textValue(),
                         opExprAttrValues, false);
             }

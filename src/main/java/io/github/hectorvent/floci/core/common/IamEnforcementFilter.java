@@ -684,6 +684,16 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             for (Map<String, List<String>> targetContext : targetContexts) {
                 Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
                         targetContext, resource, region, accountId, resourceOwnerAccountId);
+                if ("dynamodb".equals(credentialScope)) {
+                    Map<String, List<String>> batchContext =
+                            conditionContextResolver.dynamoDbBatchConditionContext(action, ctx, resource);
+                    if (batchContext != null) {
+                        effectiveContext.remove("dynamodb:LeadingKeys");
+                        effectiveContext.remove("dynamodb:Attributes");
+                        effectiveContext.remove("dynamodb:Select");
+                        effectiveContext.putAll(batchContext);
+                    }
+                }
                 ResourcePolicyDecision resourcePolicyDecision = evaluator.evaluateResourcePolicyFor(
                         effectiveResourcePolicies, principal, action, resource, effectiveContext);
                 Decision decision = evaluator.evaluateResolvedResourcePolicy(
@@ -759,7 +769,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             Map<String, List<String>> copy = new HashMap<>(targetContext);
             copy.keySet().removeIf(key ->
                     key.startsWith(IamConditionContextResolver.EXISTING_OBJECT_TAG_PREFIX)
-                            || key.startsWith(IamConditionContextResolver.REQUEST_OBJECT_TAG_PREFIX));
+                            || key.startsWith(IamConditionContextResolver.REQUEST_OBJECT_TAG_PREFIX)
+                            || key.equals(IamConditionContextResolver.REQUEST_OBJECT_TAG_KEYS));
             stripped.add(copy.isEmpty() ? null : copy);
         }
         return stripped;

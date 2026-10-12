@@ -1199,11 +1199,13 @@ account key carries no identity policies of its own.
 - `NumericEquals`, `NumericNotEquals`, `NumericLessThan`, `NumericGreaterThan` (and Equals variants)
 - `DateEquals`, `DateNotEquals`, `DateLessThan`, `DateGreaterThan` (and Equals variants)
 - `Bool`, `IpAddress`, `NotIpAddress`, `Null`
-- Supports `...IfExists` variants for all operators.
+- Supports `...IfExists` variants for all operators except `Null`.
 - Set operators `ForAllValues:` and `ForAnyValue:` over multi-valued condition keys, in AWS's
   own spelling (the prefix match is case-sensitive). They compose with `IfExists`
-  (`ForAnyValue:StringEqualsIfExists`). `ForAllValues:` over an empty set matches vacuously
-  and `ForAnyValue:` over an empty set does not match, so pair `ForAllValues:` with
+  (`ForAnyValue:StringEqualsIfExists`). `ForAllValues:` matches when the context key is absent
+  or its value set is empty; `ForAnyValue:` does not match either case. This follows the
+  [AWS set-operator rules](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-single-vs-multi-valued-context-keys.html).
+  Pair `ForAllValues:` with
   `"Null":{"<key>":"false"}` as you would on AWS: `Null` treats a present-but-empty set as
   absent, so the guard fires either way.
 - When a condition lists several values, a positive operator matches if the request value
@@ -1232,11 +1234,17 @@ floci populates:
   An allow conditioned on it denies the delete of a correctly tagged object, and a create cannot
   be gated on tags an object does not have yet.
 - `s3:RequestObjectTag/<key>`: a tag the request asks to attach. `s3:PutObject` reads these
-  from the `x-amz-tagging` header and `s3:PutObjectTagging` from the `<Tagging>` body. Any pair
+  from the `x-amz-tagging` header, or its query parameter when the header is absent,
+  and `s3:PutObjectTagging` from the `<Tagging>` body. Any pair
   that does not decode is dropped, so a policy conditioned on the key denies such a request. Where
   enforcement lets it through, the handler still answers a malformed header with
-  `400 InvalidTag`. `s3:RequestObjectTagKeys` is **not** populated, so a condition on it never
-  matches.
+  `400 InvalidTag`.
+- `s3:RequestObjectTagKeys`: the case-sensitive requested object tag keys from the same
+  `PutObject` header/query source or `PutObjectTagging` body. Header and query tag keys
+  are URL-decoded before matching; a present header takes precedence over the query.
+  `ForAllValues:StringEquals` can limit all requested keys without a `Null` guard; an
+  omitted or empty tag set still follows the absent-key rules above. Existing object tags
+  do not contribute to this requested set. See the [AWS object-tag policy guidance](https://docs.aws.amazon.com/AmazonS3/latest/userguide/tagging-and-policies.html).
 - A `PutObject` carrying `If-Match` is authorized as `s3:GetObject` as well, and that second
   check is made without the object's tags in the context, as measured on AWS. `If-None-Match`
   needs no such permission.
@@ -1247,6 +1255,9 @@ floci populates:
   `assumed-role` session ARN, as AWS reports it ("For IAM roles, the request context returns the
   ARN of the role"); a condition naming the session ARN does not match. It is **absent** only for
   unknown keys, where nothing about the caller can be resolved.
+- `aws:TagKeys`: the case-sensitive requested tag keys for EC2 `RunInstances` and
+  `CreateTags`, and S3 `PutBucketTagging`. `ForAllValues:StringEquals` can restrict the
+  complete requested set without a `Null` guard; no tags still means absent context.
 - `dynamodb:LeadingKeys`, `dynamodb:Attributes`, `dynamodb:Select`: from the DynamoDB request
   body, for `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `BatchGetItem` and
   `BatchWriteItem` (`dynamodb:Select` for `Query` and `Scan`). `LeadingKeys` holds the
@@ -1256,18 +1267,16 @@ floci populates:
   projection / update / filter / condition / key-condition expressions, and
   `ExpressionAttributeNames`); a request with no projection returns every attribute while
   reporting only the names it mentions, exactly as on AWS, which is why AWS pairs `Attributes`
-  with `dynamodb:Select`. Each key is **omitted** when it cannot be determined (unknown table,
-  a `Key` that omits the partition attribute, an unparseable `KeyConditionExpression`, a
-  multi-table batch), so a policy scoping access through it denies the request rather than
-  allowing an unproven one.
+  with `dynamodb:Select`. Query equality supports the attribute on either side, including aliases.
+  Each batch entry uses its own table schema; authorization evaluates each table's requested
+  keys separately, combining name and ARN entries for the same table. Each key is **omitted**
+  when it cannot be determined, such as an unknown table, a missing partition attribute, or
+  an unparseable expression. A `ForAllValues` condition matches absent context; add
+  `Null:false` when the policy must require a resolved key. Malformed requests that pass
+  authorization are still checked by the DynamoDB handler.
 
-  **Consequence:** with enforcement on and access scoped purely through `dynamodb:LeadingKeys`,
-  a malformed request (such as a `GetItem` whose `Key` omits the partition attribute) is answered with
-  `AccessDeniedException` instead of the `ValidationException` DynamoDB would return. Failing
-  closed is the correct direction for a security boundary.
-
-**Any other condition key is absent from the request context.** A plain (non-`IfExists`)
-operator on an absent key makes the whole statement *not apply*: it neither matches nor
+**Any other condition key is absent from the request context.** A positive scalar operator
+without `IfExists` on an absent key makes the whole statement *not apply*: it neither matches nor
 blocks. A `DenyRootUser`-style guardrail keyed on `aws:PrincipalArn` therefore fires against
 the account root the same way it does on real AWS, consistent with the account root already
 being bounded by SCPs (below): both forms of root enforcement now agree. A negated operator

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ec2;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AvailabilityZoneIds;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartition;
@@ -1076,7 +1077,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             subnet.setCidrBlock(cidrBlocks[i]);
             subnet.setState("available");
             subnet.setAvailabilityZone(region + azSuffixes[i]);
-            subnet.setAvailabilityZoneId(zoneIdForZoneName(region, region + azSuffixes[i]));
+            subnet.setAvailabilityZoneId(AvailabilityZoneIds.forZoneName(region, region + azSuffixes[i]));
             subnet.setAvailableIpAddressCount(4091);
             subnet.setDefaultForAz(true);
             subnet.setMapPublicIpOnLaunch(true);
@@ -5717,24 +5718,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // ─── Subnets ───────────────────────────────────────────────────────────────
 
     /**
-     * The zone id Floci publishes for a zone name. AWS's real zone ids are opaque and per-account
-     * ({@code use1-az4}); Floci derives a deterministic one instead, and what matters is that
-     * every surface derives it the same way, DescribeAvailabilityZones, the seeded default
-     * subnets and CreateSubnet all come through here, so a subnet's zone id agrees with the zone
-     * list a client just read. A zone name that is not this region's {@code <region><letter>}
-     * keeps the first zone's id, which is what an unrecognised name resolved to before.
-     */
-    static String zoneIdForZoneName(String region, String zoneName) {
-        if (zoneName != null && zoneName.length() == region.length() + 1 && zoneName.startsWith(region)) {
-            char letter = Character.toLowerCase(zoneName.charAt(zoneName.length() - 1));
-            if (letter >= 'a' && letter <= 'z') {
-                return region + "-az" + (letter - 'a' + 1);
-            }
-        }
-        return region + "-az1";
-    }
-
-    /**
      * Resolves the zone a new subnet lands in from whichever of AvailabilityZone and
      * AvailabilityZoneId the caller supplied. Terraform's aws_subnet exposes both
      * ({@code availability_zone} and {@code availability_zone_id}) and forbids setting both at
@@ -5755,28 +5738,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     /**
-     * The inverse of {@link #zoneIdForZoneName}. An id outside the zones this region publishes is
-     * refused rather than resolved: placing a subnet in a zone DescribeAvailabilityZones does not
-     * list would leave a client unable to pair the two, which is the same inconsistency the
-     * hardcoded az1 produced, only quieter.
+     * The zone name an {@link AvailabilityZoneIds} id names. An id outside the zones this region
+     * publishes is refused rather than resolved: placing a subnet in a zone
+     * DescribeAvailabilityZones does not list would leave a client unable to pair the two, which
+     * is the same inconsistency the hardcoded az1 produced, only quieter.
      */
     private static String zoneNameForZoneId(String region, String availabilityZoneId) {
-        String prefix = region + "-az";
-        if (availabilityZoneId.startsWith(prefix)) {
-            try {
-                int index = Integer.parseInt(availabilityZoneId.substring(prefix.length()));
-                if (index >= 1 && index <= MODELLED_ZONE_SUFFIXES.length) {
-                    return region + MODELLED_ZONE_SUFFIXES[index - 1];
-                }
-            } catch (NumberFormatException e) {
-                LOG.debugv("Availability zone ID {0} has a non-numeric zone index: {1}",
-                        availabilityZoneId, e.getMessage());
-            }
+        int index = AvailabilityZoneIds.indexOf(region, availabilityZoneId);
+        if (index >= 1 && index <= MODELLED_ZONE_SUFFIXES.length) {
+            return region + MODELLED_ZONE_SUFFIXES[index - 1];
         }
         throw new AwsException("InvalidParameterValue",
                 "Invalid availability zone ID: '" + availabilityZoneId + "'. This region publishes "
-                        + MODELLED_ZONE_SUFFIXES.length + " availability zones, " + prefix + "1 to "
-                        + prefix + MODELLED_ZONE_SUFFIXES.length + ".", 400);
+                        + MODELLED_ZONE_SUFFIXES.length + " availability zones, "
+                        + AvailabilityZoneIds.forIndex(region, 1) + " to "
+                        + AvailabilityZoneIds.forIndex(region, MODELLED_ZONE_SUFFIXES.length) + ".", 400);
     }
 
     public Subnet createSubnet(String region, String vpcId, String cidrBlock, String availabilityZone) {
@@ -5812,7 +5788,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         subnet.setCidrBlock(cidrBlock);
         subnet.setState("available");
         subnet.setAvailabilityZone(zoneName);
-        subnet.setAvailabilityZoneId(zoneIdForZoneName(region, zoneName));
+        subnet.setAvailabilityZoneId(AvailabilityZoneIds.forZoneName(region, zoneName));
         subnet.setAvailableIpAddressCount(251);
         String ownerAccountId = callerAccountId();
         subnet.setOwnerId(ownerAccountId);
@@ -9831,7 +9807,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             az.put("zoneName", region + suffix);
             az.put("state", "available");
             az.put("regionName", region);
-            az.put("zoneId", zoneIdForZoneName(region, region + suffix));
+            az.put("zoneId", AvailabilityZoneIds.forZoneName(region, region + suffix));
             az.put("zoneType", "availability-zone");
             zones.add(az);
         }

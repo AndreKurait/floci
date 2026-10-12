@@ -26,9 +26,11 @@ import org.mockito.ArgumentCaptor;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -92,6 +94,7 @@ class IamConditionContextResolverTest {
         UriInfo uriInfo = mock(UriInfo.class);
         when(containerRequest.getUriInfo()).thenReturn(uriInfo);
         when(uriInfo.getPath()).thenReturn(path);
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
         when(containerRequest.getEntityStream())
                 .thenReturn(new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
         return containerRequest;
@@ -147,6 +150,55 @@ class IamConditionContextResolverTest {
         assertNull(resolver.resolve("s3", "s3:DeleteObject", containerRequest));
         // A supported object action with nothing to read tags from offers no keys either.
         assertNull(resolver.resolve("s3", "s3:GetObject", containerRequest));
+    }
+
+    @Test
+    void objectTagKeysDecodeHeadersAndRetainCaseWithoutDuplicates() {
+        ContainerRequestContext request = s3Request("/bucket/object", "");
+        when(request.getHeaderString("x-amz-tagging"))
+                .thenReturn("%54eam=one&Team=two&team=three&Cost%20Center=four&bad=%zz");
+        Map<String, List<String>> conditions = resolver.resolve("s3", "s3:PutObject", request);
+        assertEquals(List.of("Team", "team", "Cost Center"), conditions.get("s3:RequestObjectTagKeys"));
+        assertEquals(List.of("two"), conditions.get("s3:RequestObjectTag/Team"));
+        assertFalse(conditions.containsKey("s3:RequestObjectTag/bad"));
+    }
+
+    @Test
+    void queryObjectTagKeysUseHeaderPrecedenceIncludingAnEmptyHeader() {
+        ContainerRequestContext request = s3Request("/bucket/object", "");
+        request.getUriInfo().getQueryParameters().putSingle("x-amz-tagging", "%54eam=payments");
+        Map<String, List<String>> query = resolver.resolve("s3", "s3:PutObject", request);
+        assertEquals(List.of("Team"), query.get("s3:RequestObjectTagKeys"));
+        assertEquals(List.of("payments"), query.get("s3:RequestObjectTag/Team"));
+        when(request.getHeaderString("x-amz-tagging")).thenReturn("Other=value");
+        assertEquals(List.of("Other"), resolver.resolve("s3", "s3:PutObject", request)
+                .get("s3:RequestObjectTagKeys"));
+        when(request.getHeaderString("x-amz-tagging")).thenReturn("");
+        assertNull(resolver.resolve("s3", "s3:PutObject", request));
+    }
+
+    @Test
+    void objectTagKeysComeOnlyFromTheRequestedXmlTags() {
+        ContainerRequestContext request = s3Request("/bucket/object",
+                "<Tagging><TagSet><Tag><Key>Team</Key><Value>payments</Value></Tag>"
+                        + "<Tag><Key>Cost&amp;Center</Key><Value>42</Value></Tag></TagSet></Tagging>");
+        when(request.getUriInfo().getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
+        when(s3Service.getObjectTagging("bucket", "object", null)).thenReturn(Map.of("Previous", "old"));
+        Map<String, List<String>> conditions = resolver.resolve("s3", "s3:PutObjectTagging", request);
+        assertEquals(Set.of("Team", "Cost&Center"), new HashSet<>(conditions.get("s3:RequestObjectTagKeys")));
+        assertEquals(List.of("old"), conditions.get("s3:ExistingObjectTag/Previous"));
+        assertEquals(List.of("42"), conditions.get("s3:RequestObjectTag/Cost&Center"));
+    }
+
+    @Test
+    void emptyObjectTagRequestsDoNotExposeRequestedKeys() {
+        assertNull(resolver.resolve("s3", "s3:PutObject", s3Request("/bucket/object", "")));
+        ContainerRequestContext empty = s3Request("/bucket/object", "<Tagging><TagSet/></Tagging>");
+        when(empty.getUriInfo().getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
+        when(s3Service.getObjectTagging("bucket", "object", null)).thenReturn(Map.of("Previous", "old"));
+        Map<String, List<String>> conditions = resolver.resolve("s3", "s3:PutObjectTagging", empty);
+        assertEquals(List.of("old"), conditions.get("s3:ExistingObjectTag/Previous"));
+        assertFalse(conditions.containsKey("s3:RequestObjectTagKeys"));
     }
 
     @Test
@@ -220,19 +272,25 @@ class IamConditionContextResolverTest {
     }
 
     @Test
-    void omitsLeadingKeysForAMultiTableBatch() {
-        // A batch spanning two tables has no single key schema: applying table A's partition
-        // key name to table B's items would be wrong, so no leading keys are produced.
+    void resolvesEachBatchTableWithItsOwnSchema() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
         when(containerRequest.getProperty("floci.bufferedJsonBody")).thenReturn(json("""
                 {"RequestItems":{
                    "FgacTable":{"Keys":[{"PK":{"S":"USER_alice"}}]},
-                   "OtherTable":{"Keys":[{"PK":{"S":"USER_bob"}}]}}}"""));
+                   "OtherTable":{"Keys":[{"Tenant":{"S":"USER_bob"}}]}}}"""));
 
+        TableDefinition other = new TableDefinition();
+        other.setTableName("OtherTable");
+        other.setKeySchema(List.of(new KeySchemaElement("Tenant", "HASH")));
+        when(dynamoDbService.findTable("FgacTable", "us-east-1")).thenReturn(Optional.of(fgacTable()));
+        when(dynamoDbService.findTable("OtherTable", "us-east-1")).thenReturn(Optional.of(other));
         Map<String, List<String>> conditions =
                 resolver.resolve("dynamodb", "dynamodb:BatchGetItem", containerRequest);
 
-        assertFalse(conditions.containsKey("dynamodb:LeadingKeys"));
+        assertEquals(List.of("USER_alice", "USER_bob"), conditions.get("dynamodb:LeadingKeys"));
+        assertEquals(List.of("USER_bob"), resolver.dynamoDbBatchConditionContext(
+                "dynamodb:BatchGetItem", containerRequest,
+                "arn:aws:dynamodb:us-east-1:000000000000:table/OtherTable").get("dynamodb:LeadingKeys"));
     }
 
     // ── aws:RequestTag and aws:ResourceTag ─────────────────────────────────────
@@ -249,6 +307,7 @@ class IamConditionContextResolverTest {
 
         assertEquals(List.of("payments"), conditions.get("aws:RequestTag/Team"));
         assertEquals(List.of("prod"), conditions.get("aws:RequestTag/Env"));
+        assertEquals(Set.of("Team", "Env"), new HashSet<>(conditions.get("aws:TagKeys")));
     }
 
     @Test
@@ -295,6 +354,7 @@ class IamConditionContextResolverTest {
 
         assertEquals(List.of("payments"), conditions.get("aws:RequestTag/Team"));
         assertEquals(List.of("prod"), conditions.get("aws:RequestTag/Env"));
+        assertEquals(List.of("Team", "Env"), conditions.get("aws:TagKeys"));
         assertFalse(conditions.containsKey("aws:ResourceTag/Team"));
     }
 

@@ -2,10 +2,13 @@ package io.github.hectorvent.floci.services.s3;
 
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.github.hectorvent.floci.testing.PartitionMatrix;
+import io.github.hectorvent.floci.testing.PartitionMatrix.PartitionCase;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -13,8 +16,8 @@ import static org.hamcrest.Matchers.containsString;
 /**
  * S3's CreateBucket region rules are the same in every partition (moto's {@code aws_verified}
  * matrix): the {@code us-east-1} endpoint takes any constraint but its own, and every other
- * regional endpoint requires a constraint naming exactly its region. In a China deployment the
- * constraint is therefore mandatory, which is what the China SDKs send.
+ * regional endpoint requires a constraint naming exactly its region. In a non-commercial
+ * deployment the constraint is therefore mandatory, which is what those SDKs send.
  */
 @QuarkusTest
 class S3PartitionIntegrationTest {
@@ -42,21 +45,23 @@ class S3PartitionIntegrationTest {
         cleanup.register(() -> s3(region).delete("/" + bucket));
     }
 
-    @Test
-    void aChinaEndpointRequiresItsOwnLocationConstraint() {
-        String bucket = bucketName("cn");
-        s3("cn-north-1").put("/" + bucket).then().statusCode(400)
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void aNonCommercialEndpointRequiresItsOwnLocationConstraint(PartitionCase partitionCase) {
+        String region = partitionCase.region();
+        String bucket = bucketName(partitionCase.partition());
+        s3(region).put("/" + bucket).then().statusCode(400)
                 .body(containsString("<Code>IllegalLocationConstraintException</Code>"))
                 .body(containsString("<Message>" + UNSPECIFIED + "</Message>"));
 
-        s3("cn-north-1").contentType("application/xml").body(constraint("cn-north-1"))
+        s3(region).contentType("application/xml").body(constraint(region))
                 .put("/" + bucket).then().statusCode(200);
-        deleteLater("cn-north-1", bucket);
+        deleteLater(region, bucket);
 
-        s3("cn-north-1").get("/" + bucket + "?location").then().statusCode(200)
-                .body(containsString(">cn-north-1</LocationConstraint>"));
+        s3(region).get("/" + bucket + "?location").then().statusCode(200)
+                .body(containsString(">" + region + "</LocationConstraint>"));
 
-        s3("cn-north-1").contentType("application/xml").body(constraint("cn-north-1"))
+        s3(region).contentType("application/xml").body(constraint(region))
                 .put("/" + bucket).then().statusCode(409)
                 .body(containsString("<Code>BucketAlreadyOwnedByYou</Code>"));
     }

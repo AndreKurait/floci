@@ -24,6 +24,10 @@ public final class PartitionMatrix {
 
     public static final String ACCOUNT = "000000000000";
 
+    /** The {@code @MethodSource} name of {@link #nonCommercialCases()}. */
+    public static final String NON_COMMERCIAL_CASES =
+            "io.github.hectorvent.floci.testing.PartitionMatrix#nonCommercialCases";
+
     private static final List<PartitionCase> ALL = List.of(
             new PartitionCase("aws", "us-east-1", "amazonaws.com"),
             new PartitionCase("aws-cn", "cn-north-1", "amazonaws.com.cn"),
@@ -44,6 +48,11 @@ public final class PartitionMatrix {
     /** For {@code @MethodSource("io.github.hectorvent.floci.testing.PartitionMatrix#cases")}. */
     public static Stream<PartitionCase> cases() {
         return ALL.stream();
+    }
+
+    /** Every case but the commercial one; for {@code @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)}. */
+    public static Stream<PartitionCase> nonCommercialCases() {
+        return ALL.stream().filter(c -> !"aws".equals(c.partition()));
     }
 
     /** A SigV4 Authorization header whose credential scope signs {@code region} for {@code service}. */

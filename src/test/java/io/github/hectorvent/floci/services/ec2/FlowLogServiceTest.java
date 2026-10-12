@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ec2;
 
+import io.github.hectorvent.floci.core.common.AvailabilityZoneIds;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.ec2.model.FlowLog;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
@@ -183,8 +184,8 @@ class FlowLogServiceTest {
 
     /**
      * A record's az-id is the zone id subnets and DescribeAvailabilityZones publish for the same
-     * zone. FlowLogService once derived its own ({@code use1-az1}, and {@code cnnorth1-az1} for
-     * China), so the two never agreed in any region.
+     * zone. FlowLogService once derived its own, with a different rule ({@code cnnorth1-az1} for
+     * China), so the two did not agree.
      */
     @Test
     void azIdMatchesTheZoneIdEc2PublishesForTheZone() throws Exception {
@@ -193,7 +194,7 @@ class FlowLogServiceTest {
 
             assertEquals("az-id", lines.get(0));
             for (String row : records(lines)) {
-                assertEquals(Ec2Service.zoneIdForZoneName(region, region + "a"), row, "in " + region);
+                assertEquals(AvailabilityZoneIds.forZoneName(region, region + "a"), row, "in " + region);
             }
         }
     }

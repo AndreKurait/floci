@@ -179,6 +179,26 @@ class LambdaServiceTest {
         assertEquals("InvalidParameterValueException", error.getErrorCode());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "arn:aws-cn:elasticfilesystem:cn-north-1:",
+            "arn:aws-us-gov:elasticfilesystem:us-gov-west-1:",
+            "arn:aws-iso:elasticfilesystem:us-iso-east-1:",
+            "arn:aws-iso-b:elasticfilesystem:us-isob-east-1:",
+            "arn:aws-iso-e:elasticfilesystem:eu-isoe-west-1:",
+            "arn:aws-iso-f:elasticfilesystem:us-isof-south-1:",
+            "arn:aws-eusc:elasticfilesystem:eusc-de-east-1:"})
+    void createFunctionAcceptsAnEfsAccessPointInEveryPartition(String arnPrefix) {
+        String arn = arnPrefix + "000000000000:access-point/fsap-0123456789abcdef0";
+        Map<String, Object> request = baseRequest("efs-partition-function");
+        request.put("VpcConfig", vpcConfig());
+        request.put("FileSystemConfigs", List.of(Map.of("Arn", arn, "LocalMountPath", "/mnt/shared")));
+
+        LambdaFunction created = service.createFunction(REGION, request);
+
+        assertEquals(arn, created.getFileSystemConfigs().getFirst().getArn());
+    }
+
     @Test
     void createFunctionRejectsUnsupportedS3FilesAccessPointArn() {
         Map<String, Object> request = baseRequest("s3-files-function");

@@ -11,7 +11,7 @@ import static org.hamcrest.Matchers.hasItem;
 
 /**
  * CreateSubnet never read AvailabilityZoneId and hardcoded every new subnet's zone id to the
- * region's first zone, so a subnet asked for us-east-1-az2 came back in us-east-1-az1, and even
+ * region's first zone, so a subnet asked for use1-az2 came back in use1-az1, and even
  * a subnet placed correctly by zone <em>name</em> reported a zone id that contradicted it.
  * Anything selecting subnets by zone id (Terraform's aws_subnet.availability_zone_id, and any
  * client pairing subnets with the DescribeAvailabilityZones list) therefore saw one zone.
@@ -50,7 +50,7 @@ class Ec2SubnetAvailabilityZoneIdIntegrationTest {
         .then()
             .statusCode(200)
             .body("CreateSubnetResponse.subnet.availabilityZone", equalTo("us-east-1b"))
-            .body("CreateSubnetResponse.subnet.availabilityZoneId", equalTo("us-east-1-az2"));
+            .body("CreateSubnetResponse.subnet.availabilityZoneId", equalTo("use1-az2"));
     }
 
     @Test
@@ -59,13 +59,13 @@ class Ec2SubnetAvailabilityZoneIdIntegrationTest {
             .formParam("Action", "CreateSubnet")
             .formParam("VpcId", vpcId)
             .formParam("CidrBlock", "10.90.2.0/24")
-            .formParam("AvailabilityZoneId", "us-east-1-az3")
+            .formParam("AvailabilityZoneId", "use1-az3")
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
         .then()
             .statusCode(200)
-            .body("CreateSubnetResponse.subnet.availabilityZoneId", equalTo("us-east-1-az3"))
+            .body("CreateSubnetResponse.subnet.availabilityZoneId", equalTo("use1-az3"))
             .body("CreateSubnetResponse.subnet.availabilityZone", equalTo("us-east-1c"))
             .extract().path("CreateSubnetResponse.subnet.subnetId");
 
@@ -78,7 +78,7 @@ class Ec2SubnetAvailabilityZoneIdIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("DescribeSubnetsResponse.subnetSet.item.availabilityZoneId", equalTo("us-east-1-az3"));
+            .body("DescribeSubnetsResponse.subnetSet.item.availabilityZoneId", equalTo("use1-az3"));
     }
 
     /**
@@ -97,7 +97,7 @@ class Ec2SubnetAvailabilityZoneIdIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("CreateSubnetResponse.subnet.availabilityZoneId", equalTo("us-east-1-az3"));
+            .body("CreateSubnetResponse.subnet.availabilityZoneId", equalTo("use1-az3"));
 
         given()
             .formParam("Action", "DescribeAvailabilityZones")
@@ -107,7 +107,7 @@ class Ec2SubnetAvailabilityZoneIdIntegrationTest {
         .then()
             .statusCode(200)
             .body("DescribeAvailabilityZonesResponse.availabilityZoneInfo.item.zoneId",
-                    hasItem("us-east-1-az3"));
+                    hasItem("use1-az3"));
     }
 
     @Test
@@ -117,7 +117,7 @@ class Ec2SubnetAvailabilityZoneIdIntegrationTest {
             .formParam("VpcId", vpcId)
             .formParam("CidrBlock", "10.90.4.0/24")
             .formParam("AvailabilityZone", "us-east-1a")
-            .formParam("AvailabilityZoneId", "us-east-1-az2")
+            .formParam("AvailabilityZoneId", "use1-az2")
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -133,7 +133,7 @@ class Ec2SubnetAvailabilityZoneIdIntegrationTest {
             .formParam("VpcId", vpcId)
             .formParam("CidrBlock", "10.90.5.0/24")
             .formParam("AvailabilityZone", "us-east-1b")
-            .formParam("AvailabilityZoneId", "us-east-1-az2")
+            .formParam("AvailabilityZoneId", "use1-az2")
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -153,14 +153,14 @@ class Ec2SubnetAvailabilityZoneIdIntegrationTest {
             .formParam("Action", "CreateSubnet")
             .formParam("VpcId", vpcId)
             .formParam("CidrBlock", "10.90.7.0/24")
-            .formParam("AvailabilityZoneId", "us-east-1-az4")
+            .formParam("AvailabilityZoneId", "use1-az4")
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
         .then()
             .statusCode(400)
             .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
-            .body("Response.Errors.Error.Message", containsString("us-east-1-az1 to us-east-1-az3"));
+            .body("Response.Errors.Error.Message", containsString("use1-az1 to use1-az3"));
     }
 
     @Test

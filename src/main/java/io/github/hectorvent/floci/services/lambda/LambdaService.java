@@ -86,7 +86,7 @@ public class LambdaService implements ResourceProvider {
     private static final Pattern QUALIFIER = Pattern.compile(QUALIFIER_PATTERN);
     private static final Pattern EFS_ACCESS_POINT_ARN = Pattern.compile(
             "^arn:" + AwsArnUtils.PARTITION_REGEX + ":elasticfilesystem:(?:eusc-)?[a-z]{2}"
-                    + "(?:(?:-gov)|(?:-iso(?:b)?))?-[a-z]+-\\d:"
+                    + "(?:(?:-gov)|(?:-iso[a-z]?))?-[a-z]+-\\d:"
                     + "\\d{12}:access-point/fsap-[a-f0-9]{17}$");
     private static final Pattern FILE_SYSTEM_LOCAL_MOUNT_PATH = Pattern.compile("^/mnt/[A-Za-z0-9._-]+$");
     private static final Pattern LOG_GROUP_PATTERN = Pattern.compile("[.\\-_/#A-Za-z0-9]+");

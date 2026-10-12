@@ -19,8 +19,6 @@ patterns:
   - regex: acs\.amazonaws\.com/groups/
     reason: S3 canned-ACL grantee URIs (AllUsers, AuthenticatedUsers, LogDelivery) are
       partition-invariant identifiers in the S3 model.
-  - regex: 'case "[a-z]{2}-[a-z]+-\d" -> "[a-z]{3,5}\d";'
-    reason: VPC Flow Logs' documented region abbreviations (use1, euw1, ...).
   - regex: \bPARTITION_REGEX\b
     reason: the line builds its regex from AwsArnUtils.PARTITION_REGEX, which is the
       sanctioned way to recognise an ARN in any partition.

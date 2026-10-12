@@ -233,6 +233,9 @@ the commercial value or Floci's own base host until sourced:
 - the Lambda function-URL host outside the commercial partition;
 - whether AWS managed policy documents differ in content in China or GovCloud;
 - the API Gateway regional hosted zone per region;
+- the availability-zone id prefix of the ISO and EUSC regions: zone ids there keep the whole region
+  (`us-iso-east-1-az1`), where the other partitions get AWS's short prefix (`use1-az1`, `usgw1-az1`,
+  `cnn1-az1`);
 - S3 `LocationConstraint` enum values and Route 53 hosted zones for the ISO and EUSC regions;
 - the SAML sign-on URL in `aws-iso-e`, `aws-iso-f` and `aws-eusc`, where assertions keep being
   checked against the commercial `https://signin.aws.amazon.com/saml`;

@@ -86,6 +86,15 @@ class LambdaArnUtilsTest {
     }
 
     @Test
+    void aBadNameQuotesTheModelsFunctionNamePattern() {
+        AwsException ex = assertThrows(AwsException.class, () -> LambdaArnUtils.resolve("bad.name"));
+
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertTrue(ex.getMessage().contains("((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?"),
+                ex.getMessage());
+    }
+
+    @Test
     void resolveAccepts140CharPartialArn() {
         String name = "a".repeat(118);
         String partialArn = "000000000000:function:" + name;

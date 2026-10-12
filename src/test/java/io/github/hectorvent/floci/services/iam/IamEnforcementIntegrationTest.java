@@ -219,7 +219,8 @@ class IamEnforcementIntegrationTest {
         {"Version":"2012-10-17","Statement":[
           {"Effect":"Allow","Action":["dynamodb:GetItem","dynamodb:Query"],
            "Resource":"arn:aws:dynamodb:us-east-1:000000000000:table/FgacTable",
-           "Condition":{"ForAllValues:StringLike":{"dynamodb:LeadingKeys":["USER_alice*"]}}}
+           "Condition":{"ForAllValues:StringLike":{"dynamodb:LeadingKeys":["USER_alice*"]},
+             "Null":{"dynamodb:LeadingKeys":"false"}}}
         ]}""";
 
     @Test
@@ -234,7 +235,7 @@ class IamEnforcementIntegrationTest {
                 "arn:aws:dynamodb:us-east-1:000000000000:table/FgacTable",
                 Map.of("dynamodb:LeadingKeys", List.of("USER_bob"))));
 
-        // The leading key could not be resolved from the request: fail closed.
+        // Null:false requires a leading key even though ForAllValues alone would match.
         assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(
                 List.of(LEADING_KEYS_SCOPED_POLICY), "dynamodb:GetItem",
                 "arn:aws:dynamodb:us-east-1:000000000000:table/FgacTable",

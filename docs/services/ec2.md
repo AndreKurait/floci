@@ -816,6 +816,13 @@ allocated address.
 | DescribeRegions | Returns the regions known to the local EC2 service. |
 | DescribeAccountAttributes | Returns local account-level EC2 attributes. |
 
+A zone id has AWS's shape, a short region prefix and `-az<n>`: `use1-az1` in `us-east-1`, `apne1-az1`
+in `ap-northeast-1`, `usgw1-az1` in `us-gov-west-1`. On AWS the pairing of a zone name with a zone id
+differs per account; Floci always pairs zone `a` with `az1`, `b` with `az2`, and so on. Subnets, VPC
+flow-log records and EFS mount targets report the same id for the same zone. The ISO and EUSC
+regions, for which AWS publishes no zone id, keep the whole region as the prefix
+(`us-iso-east-1-az1`).
+
 ### Instance Types
 
 | Action | Description |
