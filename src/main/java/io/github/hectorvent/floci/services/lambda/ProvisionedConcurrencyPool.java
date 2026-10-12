@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
+import io.github.hectorvent.floci.core.common.ContainerTeardowns;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -445,27 +446,35 @@ public class ProvisionedConcurrencyPool implements ContainerTeardown, Resettable
     }
 
     private void stop(List<ContainerHandle> handles) {
-        for (ContainerHandle handle : handles) {
-            synchronized (lock) {
-                if (!owned.containsKey(handle) || !stopping.add(handle)) {
-                    continue;
+        synchronized (lock) {
+            for (ContainerHandle handle : handles) {
+                if (owned.containsKey(handle)) {
+                    pendingTeardown.add(handle);
+                    handle.setState(ContainerState.STOPPED);
                 }
-                pendingTeardown.add(handle);
-                handle.setState(ContainerState.STOPPED);
             }
-            try {
-                launcher.stop(handle);
-                synchronized (lock) {
-                    pendingTeardown.remove(handle);
-                    owned.remove(handle);
-                }
-            } catch (RuntimeException failure) {
-                LOG.warnv("Could not stop provisioned Lambda environment {0}: {1}",
-                        handle.getContainerId(), failure.getClass().getSimpleName());
-            } finally {
-                synchronized (lock) {
-                    stopping.remove(handle);
-                }
+        }
+        ContainerTeardowns.stopInParallel(handles, this::stop, LOG);
+    }
+
+    private void stop(ContainerHandle handle) {
+        synchronized (lock) {
+            if (!owned.containsKey(handle) || !stopping.add(handle)) {
+                return;
+            }
+        }
+        try {
+            launcher.stop(handle);
+            synchronized (lock) {
+                pendingTeardown.remove(handle);
+                owned.remove(handle);
+            }
+        } catch (RuntimeException failure) {
+            LOG.warnv("Could not stop provisioned Lambda environment {0}: {1}",
+                    handle.getContainerId(), failure.getClass().getSimpleName());
+        } finally {
+            synchronized (lock) {
+                stopping.remove(handle);
             }
         }
     }

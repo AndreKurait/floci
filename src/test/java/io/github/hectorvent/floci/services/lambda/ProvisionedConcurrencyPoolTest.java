@@ -14,12 +14,15 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.awaitility.Awaitility.await;
@@ -244,6 +247,80 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     @Test
+    void shutdownDrainsIdleAndBusyEnvironmentsConcurrentlyWithoutDuplicateStops() throws Exception {
+        put(4);
+        List<Environment> environments = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            Environment environment = launched();
+            environments.add(environment);
+            environment.initialized.complete(null);
+        }
+        ready();
+        assertNotNull(pool.acquire(version, "live"));
+        launcher.stopGate = new CompletableFuture<>();
+        CompletableFuture<Void> drained = CompletableFuture.runAsync(pool::stopManagedContainers);
+        try {
+            for (Environment environment : environments) {
+                assertNotNull(launcher.stopping.poll(2, TimeUnit.SECONDS),
+                        "Every environment must start stopping before the others finish");
+            }
+            assertFalse(drained.isDone(), "Teardown must wait for the container stops");
+            assertEquals(409, assertThrows(AwsException.class, () -> put(1)).getHttpStatus());
+            pool.stopManagedContainers();
+            for (Environment environment : environments) {
+                assertEquals(1, environment.stops.get());
+            }
+        } finally {
+            launcher.stopGate.complete(null);
+            drained.get(10, TimeUnit.SECONDS);
+        }
+        for (Environment environment : environments) {
+            assertFalse(environment.alive);
+            assertEquals(1, environment.stops.get());
+        }
+    }
+
+    @Test
+    void interruptedDrainRetainsRunningAndQueuedEnvironmentsForRetry() throws Exception {
+        pool.shutdown();
+        pool = new ProvisionedConcurrencyPool(
+                launcher, functions, aliases, storage, Clock.systemUTC(), 32, 32, false);
+        put(32);
+        List<Environment> environments = new ArrayList<>();
+        for (int i = 0; i < 32; i++) {
+            Environment environment = launched();
+            environments.add(environment);
+            environment.initialized.complete(null);
+        }
+        ready();
+        launcher.stopGate = new CompletableFuture<>();
+        AtomicBoolean interruptionPreserved = new AtomicBoolean();
+        Thread drain = Thread.ofPlatform().start(() -> {
+            pool.stopManagedContainers();
+            interruptionPreserved.set(Thread.currentThread().isInterrupted());
+        });
+        try {
+            for (int i = 0; i < 16; i++) {
+                assertNotNull(launcher.stopping.poll(2, TimeUnit.SECONDS));
+            }
+            assertEquals(16, environments.stream().mapToInt(environment -> environment.stops.get()).sum());
+            drain.interrupt();
+            drain.join(5000);
+            assertFalse(drain.isAlive());
+            assertTrue(interruptionPreserved.get());
+        } finally {
+            drain.interrupt();
+            launcher.stopGate.complete(null);
+            drain.join(5000);
+        }
+        await().atMost(Duration.ofSeconds(5)).until(() -> {
+            pool.stopManagedContainers();
+            return environments.stream().noneMatch(environment -> environment.alive);
+        });
+        assertTrue(environments.stream().allMatch(environment -> environment.stops.get() > 0));
+    }
+
+    @Test
     void configurationValidationHasNoLaunchSideEffects() {
         assertThrows(AwsException.class, () -> put(0));
         assertThrows(AwsException.class, () -> put(5));
@@ -308,10 +385,12 @@ class ProvisionedConcurrencyPoolTest {
 
     private static final class Launcher implements LambdaRuntimeLauncher {
         final BlockingQueue<Environment> launched = new LinkedBlockingQueue<>();
+        final BlockingQueue<Environment> stopping = new LinkedBlockingQueue<>();
         final Map<ContainerHandle, Environment> environments = new ConcurrentHashMap<>();
         final AtomicInteger starts = new AtomicInteger();
         final AtomicInteger stopFailures = new AtomicInteger();
         volatile CompletableFuture<Void> launchGate = CompletableFuture.completedFuture(null);
+        volatile CompletableFuture<Void> stopGate = CompletableFuture.completedFuture(null);
         boolean supported = true;
 
         @Override
@@ -346,6 +425,15 @@ class ProvisionedConcurrencyPoolTest {
         public void stop(ContainerHandle handle) {
             Environment environment = environments.get(handle);
             environment.stops.incrementAndGet();
+            stopping.add(environment);
+            try {
+                stopGate.get(5, TimeUnit.SECONDS);
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(failure);
+            } catch (Exception failure) {
+                throw new IllegalStateException(failure);
+            }
             if (stopFailures.getAndUpdate(value -> Math.max(0, value - 1)) > 0) {
                 throw new IllegalStateException("controlled first stop failure");
             }

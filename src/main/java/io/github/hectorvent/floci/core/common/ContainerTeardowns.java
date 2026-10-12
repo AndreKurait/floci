@@ -3,6 +3,16 @@ package io.github.hectorvent.floci.core.common;
 import jakarta.enterprise.inject.Instance;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
 /**
  * Runs every {@link ContainerTeardown} implementation, tolerating a failure in one so it
  * doesn't block the others or whatever cleanup the caller runs next. {@code EmulatorLifecycle}
@@ -22,6 +32,39 @@ public final class ContainerTeardowns {
                 log.warnv("Container teardown failed for {0}: {1}",
                         teardown.getClass().getSimpleName(), e.getMessage());
             }
+        }
+    }
+
+    public static <T> void stopInParallel(List<T> resources, Consumer<T> stop, Logger log) {
+        if (resources.isEmpty()) {
+            return;
+        }
+        ExecutorService executor = Executors.newFixedThreadPool(Math.min(resources.size(), 16),
+                Thread.ofPlatform().daemon().name("container-teardown-", 0).factory());
+        try {
+            List<Callable<Void>> tasks = new ArrayList<>(resources.size());
+            for (T resource : resources) {
+                tasks.add(() -> {
+                    stop.accept(resource);
+                    return null;
+                });
+            }
+            for (Future<Void> task : executor.invokeAll(tasks, 15, TimeUnit.SECONDS)) {
+                if (task.isCancelled()) {
+                    log.warn("Container drain did not finish before the shared deadline");
+                } else {
+                    try {
+                        task.get();
+                    } catch (ExecutionException failure) {
+                        log.warnv(failure.getCause(), "Container drain failed");
+                    }
+                }
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            log.warn("Container drain interrupted");
+        } finally {
+            executor.shutdownNow();
         }
     }
 }
