@@ -3,8 +3,11 @@
 import uuid
 from contextlib import ExitStack
 
+import pytest
 
-def test_network_interface_association_filters(ec2_client):
+
+@pytest.mark.parametrize("supplied_interface", [False, True])
+def test_network_interface_association_filters(ec2_client, supplied_interface):
     with ExitStack() as cleanup:
         vpc = ec2_client.create_vpc(CidrBlock="10.237.0.0/24")["Vpc"]["VpcId"]
         cleanup.callback(ec2_client.delete_vpc, VpcId=vpc)
@@ -15,8 +18,16 @@ def test_network_interface_association_filters(ec2_client):
             Name="eni-filter-" + uuid.uuid4().hex, Architecture="x86_64",
             RootDeviceName="/dev/sda1")["ImageId"]
         cleanup.callback(ec2_client.deregister_image, ImageId=image)
+        placement = {"SubnetId": subnet}
+        if supplied_interface:
+            eni_id = ec2_client.create_network_interface(SubnetId=subnet)["NetworkInterface"]["NetworkInterfaceId"]
+            cleanup.callback(ec2_client.delete_network_interface, NetworkInterfaceId=eni_id)
+            placement = {"NetworkInterfaces": [{"NetworkInterfaceId": eni_id, "DeviceIndex": 0}]}
         instances = ec2_client.run_instances(
-            ImageId=image, InstanceType="t3.nano", MinCount=2, MaxCount=2,
+            ImageId=image, InstanceType="t3.nano", MinCount=1, MaxCount=1,
+            **placement)["Instances"]
+        instances += ec2_client.run_instances(
+            ImageId=image, InstanceType="t3.nano", MinCount=1, MaxCount=1,
             SubnetId=subnet)["Instances"]
         cleanup.callback(ec2_client.terminate_instances,
                          InstanceIds=[instance["InstanceId"] for instance in instances])

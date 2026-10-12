@@ -59,6 +59,8 @@ import org.bouncycastle.openssl.PEMKeyPair;
 import org.bouncycastle.openssl.PEMParser;
 import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.StringReader;
 import java.lang.reflect.Field;
@@ -516,14 +518,21 @@ class Ec2ServiceTest {
         assertEquals(1, result.networkInterfaces().size());
     }
 
-    @Test
-    void describeNetworkInterfacesFiltersActualAddressAssociations() {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void describeNetworkInterfacesFiltersActualAddressAssociations(boolean suppliedInterface) {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
                 new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
-        Reservation reservation = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
-                2, 2, null, List.of(), null, null, List.of(), null, null);
-        Instance associated = reservation.getInstances().getFirst();
+        String suppliedId = suppliedInterface
+                ? service.createNetworkInterface("us-east-1",
+                        service.describeSubnets("us-east-1", List.of(), Map.of()).getFirst().getSubnetId(),
+                        null, null, List.of(), List.of(), List.of()).getNetworkInterfaceId() : null;
+        Instance associated = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null,
+                null, suppliedId, 0).getInstances().getFirst();
+        Instance other = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
         Address address = service.allocateAddress("us-east-1");
         service.associateAddress("us-east-1", address.getAllocationId(), associated.getInstanceId());
         String interfaceId = associated.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
@@ -545,11 +554,25 @@ class Ec2ServiceTest {
         assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
                 Map.of("association.ip-owner-id", List.of(ownerId),
                         "association.public-ip", List.of("192.0.2.254")), 0, null).networkInterfaces().isEmpty());
+        service.associateAddress("us-east-1", address.getAllocationId(), other.getInstanceId());
+        assertEquals(List.of(other.getNetworkInterfaces().getFirst().getNetworkInterfaceId()),
+                service.describeNetworkInterfaces("us-east-1", List.of(),
+                        Map.of("association.public-ip", List.of(address.getPublicIp())), 0, null)
+                        .networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+        service.associateAddress("us-east-1", address.getAllocationId(), associated.getInstanceId());
+        NetworkInterface described = service.describeNetworkInterfaces("us-east-1", List.of(interfaceId),
+                Map.of(), 0, null).networkInterfaces().getFirst();
+        assertEquals(address.getAllocationId(), described.getPrivateIpAddresses().getFirst()
+                .getAssociation().getAllocationId());
         service.disassociateAddress("us-east-1", address.getAssociationId());
         for (String filter : List.of("association.ip-owner-id", "association.public-ip")) {
             assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
                     Map.of(filter, List.of("*")), 0, null).networkInterfaces().isEmpty());
         }
+        service.associateAddress("us-east-1", address.getAllocationId(), associated.getInstanceId());
+        service.releaseAddress("us-east-1", address.getAllocationId());
+        assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("association.public-ip", List.of("*")), 0, null).networkInterfaces().isEmpty());
         assertEquals(2, service.describeNetworkInterfaces("us-east-1", List.of(), Map.of(), 0, null)
                 .networkInterfaces().size());
     }
