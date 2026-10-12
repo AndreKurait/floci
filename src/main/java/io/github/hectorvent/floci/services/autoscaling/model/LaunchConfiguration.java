@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.autoscaling.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -19,6 +20,7 @@ public class LaunchConfiguration {
     private List<String> securityGroups = new ArrayList<>();
     private String userData;
     private String iamInstanceProfile;
+    private LaunchTemplateData.MetadataOptions metadataOptions;
     // Nullable on purpose: AWS treats an absent flag as "fall back to the
     // subnet's MapPublicIpOnLaunch" and an explicit false as an override.
     private Boolean associatePublicIpAddress;
@@ -52,6 +54,9 @@ public class LaunchConfiguration {
 
     public String getUserData() { return userData; }
     public void setUserData(String v) { this.userData = v; }
+
+    public LaunchTemplateData.MetadataOptions getMetadataOptions() { return metadataOptions; }
+    public void setMetadataOptions(LaunchTemplateData.MetadataOptions value) { this.metadataOptions = value; }
 
     public String getIamInstanceProfile() { return iamInstanceProfile; }
     public void setIamInstanceProfile(String v) { this.iamInstanceProfile = v; }

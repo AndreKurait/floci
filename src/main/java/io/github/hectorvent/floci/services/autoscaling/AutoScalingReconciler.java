@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.autoscaling;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
@@ -366,9 +367,10 @@ public class AutoScalingReconciler {
                         null,
                         propagatedInstanceTags(asg, launchSource),
                         launchSource.userData(),
-                        launchSource.iamInstanceProfile(),
+                        launchSource.launchConfigurationName() == null ? launchSource.iamInstanceProfile()
+                                : resolveLaunchConfigurationProfile(launchSource.iamInstanceProfile()),
                         launchSource.associatePublicIpAddress(), null, 0, placement.availabilityZone(),
-                        null, null, null, false, null, null, launchSource.blockDevices());
+                        launchSource.metadataOptions(), null, null, false, null, null, launchSource.blockDevices());
 
                 for (Instance ec2Inst : reservation.getInstances()) {
                     AsgInstance asgInst = new AsgInstance();
@@ -391,6 +393,8 @@ public class AutoScalingReconciler {
         } catch (Exception e) {
             LOG.warnv("ASG {0}: failed to launch instances: {1}",
                     asg.getAutoScalingGroupName(), e.getMessage());
+            recordFailedActivity(asg, "Launching EC2 instance(s) for desired capacity: " + count,
+                    "A capacity change requested additional instances.", e);
         } finally {
             // Preserve successful allocations even if a later single-instance launch fails.
             if (!launchedInstanceIds.isEmpty() && !asgService.saveAutoScalingGroupIfPresent(asg)) {
@@ -629,7 +633,7 @@ public class AutoScalingReconciler {
                     // Forwarded as-is: an explicit false has to beat a public
                     // subnet's MapPublicIpOnLaunch, and only null means
                     // "fall back to the subnet default".
-                    lc.getAssociatePublicIpAddress(), launchConfigurationBlockDevices(lc));
+                    lc.getAssociatePublicIpAddress(), launchConfigurationBlockDevices(lc), lc.getMetadataOptions());
         }
 
         LaunchTemplate launchTemplate = resolveLaunchTemplate(asg);
@@ -656,7 +660,8 @@ public class AutoScalingReconciler {
                     asg.getLaunchTemplateId(),
                     asg.getLaunchTemplateName(),
                     resolvedVersion,
-                    version.getData().effectiveAssociatePublicIpAddress(), version.getData().getBlockDeviceMappings());
+                    version.getData().effectiveAssociatePublicIpAddress(), version.getData().getBlockDeviceMappings(),
+                    version.getData().getMetadataOptions());
         }
 
         MixedInstancesPolicy.LaunchTemplateSpecification specification =
@@ -689,11 +694,21 @@ public class AutoScalingReconciler {
                                 : specification.getLaunchTemplateId(),
                         specification.getLaunchTemplateName(),
                         resolvedVersion,
-                        version.getData().effectiveAssociatePublicIpAddress(), version.getData().getBlockDeviceMappings());
+                        version.getData().effectiveAssociatePublicIpAddress(), version.getData().getBlockDeviceMappings(),
+                    version.getData().getMetadataOptions());
             }
         }
 
         return null;
+    }
+
+    private String resolveLaunchConfigurationProfile(String profile) {
+        if (profile == null || profile.isBlank()) {
+            return null;
+        }
+        return AwsArnUtils.isArn(profile)
+                ? ec2Service.resolveIamInstanceProfileArn(null, profile)
+                : ec2Service.resolveIamInstanceProfileName(profile);
     }
 
     private LaunchConfiguration resolveLaunchConfiguration(AutoScalingGroup asg) {
@@ -820,7 +835,8 @@ public class AutoScalingReconciler {
             String launchTemplateName,
             String launchTemplateVersion,
             Boolean associatePublicIpAddress,
-            List<LaunchTemplateData.BlockDeviceMapping> blockDevices) {}
+            List<LaunchTemplateData.BlockDeviceMapping> blockDevices,
+            LaunchTemplateData.MetadataOptions metadataOptions) {}
 
     // Override for describeAutoScalingGroups with null region (all regions)
     // The service only filters by region when non-null; null means all.

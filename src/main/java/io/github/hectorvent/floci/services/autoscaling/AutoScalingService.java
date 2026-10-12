@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.autoscaling.model.*;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -114,6 +115,19 @@ public class AutoScalingService {
                                                           Boolean associatePublicIpAddress,
                                                           Boolean instanceMonitoringEnabled,
                                                           List<LaunchConfigurationBlockDeviceMapping> blockDeviceMappings) {
+        return createLaunchConfiguration(region, name, instanceId, imageId, instanceType, keyName,
+                securityGroups, userData, iamInstanceProfile, associatePublicIpAddress,
+                instanceMonitoringEnabled, blockDeviceMappings, null);
+    }
+
+    public LaunchConfiguration createLaunchConfiguration(String region, String name, String instanceId,
+                                                          String imageId, String instanceType, String keyName,
+                                                          List<String> securityGroups, String userData,
+                                                          String iamInstanceProfile, Boolean associatePublicIpAddress,
+                                                          Boolean instanceMonitoringEnabled,
+                                                          List<LaunchConfigurationBlockDeviceMapping> blockDeviceMappings,
+                                                          LaunchTemplateData.MetadataOptions metadataOptions) {
+        Ec2Service.validateMetadataOptions(metadataOptions);
         String key = lcKey(region, name);
         if (launchConfigs.containsKey(key)) {
             throw new AwsException("AlreadyExists",
@@ -164,6 +178,7 @@ public class AutoScalingService {
         lc.setSecurityGroups(securityGroups != null ? new ArrayList<>(securityGroups) : new ArrayList<>());
         lc.setUserData(userData);
         lc.setIamInstanceProfile(iamInstanceProfile);
+        lc.setMetadataOptions(metadataOptions);
         lc.setAssociatePublicIpAddress(associatePublicIpAddress);
         // AWS documents InstanceMonitoring as enabled by default and always returns the
         // structure from Describe, unlike AssociatePublicIpAddress whose absence is meaningful.

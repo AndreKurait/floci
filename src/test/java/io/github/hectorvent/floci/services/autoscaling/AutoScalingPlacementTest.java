@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.autoscaling;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
+import io.github.hectorvent.floci.services.autoscaling.model.ScalingActivity;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
@@ -133,6 +134,12 @@ class AutoScalingPlacementTest {
 
         Fixture(Map<String, String> zones, List<String> declaredSubnets) {
             AutoScalingService groups = mock(AutoScalingService.class);
+            when(groups.recordActivity(anyString(), anyString(), anyString(), anyString(), anyString()))
+                    .thenAnswer(call -> {
+                        ScalingActivity activity = new ScalingActivity();
+                        activity.setActivityId("placement-activity");
+                        return activity;
+                    });
             reconciler = new AutoScalingReconciler(groups, ec2, mock(ElbV2Service.class));
             group.setRegion(REGION);
             group.setAutoScalingGroupName("placement-group");

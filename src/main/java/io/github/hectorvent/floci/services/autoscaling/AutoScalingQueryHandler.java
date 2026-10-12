@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.autoscaling.model.*;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -119,13 +120,28 @@ public class AutoScalingQueryHandler {
                 p.getFirst("IamInstanceProfile"),
                 nullableBoolParam(p, "AssociatePublicIpAddress"),
                 nullableBoolParam(p, "InstanceMonitoring.Enabled"),
-                parseLaunchConfigurationBlockDeviceMappings(p));
+                parseLaunchConfigurationBlockDeviceMappings(p), parseMetadataOptions(p));
         String xml = new XmlBuilder()
                 .start("CreateLaunchConfigurationResponse", NS)
                   .raw(AwsQueryResponse.responseMetadata())
                 .end("CreateLaunchConfigurationResponse")
                 .build();
         return ok(xml);
+    }
+
+    private static LaunchTemplateData.MetadataOptions parseMetadataOptions(MultivaluedMap<String, String> p) {
+        LaunchTemplateData.MetadataOptions options = new LaunchTemplateData.MetadataOptions();
+        options.setHttpTokens(p.getFirst("MetadataOptions.HttpTokens"));
+        options.setHttpEndpoint(p.getFirst("MetadataOptions.HttpEndpoint"));
+        String hopLimit = p.getFirst("MetadataOptions.HttpPutResponseHopLimit");
+        if (hopLimit != null) {
+            try {
+                options.setHttpPutResponseHopLimit(Integer.valueOf(hopLimit));
+            } catch (NumberFormatException invalid) {
+                throw new AwsException("ValidationError", "HttpPutResponseHopLimit must be an integer.", 400);
+            }
+        }
+        return options;
     }
 
     private Response handleDescribeLaunchConfigurations(MultivaluedMap<String, String> p, String region) {
@@ -159,6 +175,13 @@ public class AutoScalingQueryHandler {
                .elem("Enabled", String.valueOf(
                        lc.getInstanceMonitoringEnabled() != null ? lc.getInstanceMonitoringEnabled() : Boolean.TRUE))
                .end("InstanceMonitoring");
+            LaunchTemplateData.MetadataOptions metadata = LaunchTemplateData.MetadataOptions.merge(
+                    LaunchTemplateData.MetadataOptions.launchDefaults(), lc.getMetadataOptions());
+            xml.start("MetadataOptions")
+               .elem("HttpTokens", metadata.getHttpTokens())
+               .elem("HttpEndpoint", metadata.getHttpEndpoint())
+               .elem("HttpPutResponseHopLimit", String.valueOf(metadata.getHttpPutResponseHopLimit()))
+               .end("MetadataOptions");
             writeLaunchConfigurationBlockDeviceMappings(xml, lc.getBlockDeviceMappings());
             xml.end("member");
         }
