@@ -428,10 +428,14 @@ Provisioned concurrency still requires an immutable version and actual runtime i
 adds the corresponding security schemes and operation requirements. API Gateway imports
 these as `authorizationType: AWS_IAM` and `apiKeyRequired: true`: invocation requires both
 a valid SigV4 signature and an enabled API key associated with the invoked stage when both
-controls are selected. Existing supported inline requirements are preserved.
+controls are selected. Existing inline requirements and their scheme definitions are
+preserved. Defaults are selected by the SAM names `AWS_IAM` and `api_key`; an existing
+scheme with another name does not suppress either default.
 
 Other `Auth` properties, custom default authorizers, external definitions, unresolved or
-custom security requirements, and method override markers are rejected. The transform
+malformed security requirements, and method override markers are rejected. Existing
+custom schemes remain subject to API Gateway's importer and invocation support; preserving
+them does not implement another authentication protocol. The transform
 preserves integration credentials, Lambda permissions and inline resource policies.
 Preserving a policy does not enforce it: API Gateway's documented IAM identity-policy and
 resource-policy evaluation limitation still applies. This support does not establish

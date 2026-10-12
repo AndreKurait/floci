@@ -83,10 +83,10 @@ final class SamRestApiAuth {
                 JsonNode existing = operation.has("security")
                         ? operation.get("security") : document.path("security");
                 ArrayNode security = security(existing, definitions);
-                if (iam && !hasScheme(security, definitions, true)) {
+                if (iam && !hasScheme(security, "AWS_IAM")) {
                     security.add(mapper.createObjectNode().set("AWS_IAM", mapper.createArrayNode()));
                 }
-                if (keyRequired && !hasScheme(security, definitions, false)) {
+                if (keyRequired && !hasScheme(security, "api_key")) {
                     security.add(mapper.createObjectNode().set("api_key", mapper.createArrayNode()));
                 }
                 operation.set("security", security);
@@ -108,22 +108,23 @@ final class SamRestApiAuth {
             requirement.fields().forEachRemaining(entry -> {
                 JsonNode scopes = entry.getValue();
                 JsonNode scheme = definitions.path(entry.getKey());
-                if (!scopes.isArray() || !scopes.isEmpty()
-                        || (!isScheme(scheme, true) && !isScheme(scheme, false))) {
-                    throw invalid("Auth cannot safely translate the existing security requirement.");
+                if (!scopes.isArray() || !scheme.isObject()) {
+                    throw invalid("Security requirements must reference defined schemes with an array of scopes.");
+                }
+                for (JsonNode scope : scopes) {
+                    if (!scope.isTextual()) {
+                        throw invalid("Security requirement scopes must be strings.");
+                    }
                 }
             });
         }
         return value.deepCopy();
     }
 
-    private boolean hasScheme(ArrayNode security, ObjectNode definitions, boolean iam) {
+    private boolean hasScheme(ArrayNode security, String name) {
         for (JsonNode requirement : security) {
-            Iterator<String> names = requirement.fieldNames();
-            while (names.hasNext()) {
-                if (isScheme(definitions.path(names.next()), iam)) {
-                    return true;
-                }
+            if (requirement.has(name)) {
+                return true;
             }
         }
         return false;

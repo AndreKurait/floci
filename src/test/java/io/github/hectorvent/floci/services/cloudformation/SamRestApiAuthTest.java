@@ -77,15 +77,54 @@ class SamRestApiAuthTest {
     }
 
     @Test
-    void refusesExistingCustomSecurityInsteadOfReplacingItsEnforcedAuthorizer() throws Exception {
+    void preservesExistingCustomSecurityAndAddsTheNamedDefault() throws Exception {
         ObjectNode template = template(false);
         ObjectNode body = (ObjectNode) template.at("/Resources/Api/Properties/DefinitionBody");
-        body.set("security", mapper.readTree("[{\"custom\":[]}]"));
+        body.set("security", mapper.readTree("[{\"custom\":[\"read\"]}]"));
         body.set("components", mapper.readTree("""
                 {"securitySchemes":{"custom":{"type":"apiKey","name":"Authorization","in":"header",
                   "x-amazon-apigateway-authorizer":{"type":"request","authorizerUri":"unused"}}}}
                 """));
+        JsonNode original = template.deepCopy();
+        JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
+        assertEquals(original, template);
+        assertEquals(body.at("/components/securitySchemes/custom"),
+                expanded.at("/components/securitySchemes/custom"));
+        assertEquals(mapper.readTree("[{\"custom\":[\"read\"]},{\"AWS_IAM\":[]},{\"api_key\":[]}]"),
+                expanded.at("/paths/~1items/get/security"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"custom-authentication", "awsSigv4"})
+    void existingSchemeMetadataDoesNotSuppressTheNamedIamDefault(String authType) throws Exception {
+        ObjectNode template = template(false);
+        ObjectNode body = (ObjectNode) template.at("/Resources/Api/Properties/DefinitionBody");
+        ObjectNode scheme = mapper.createObjectNode()
+                .put("type", "apiKey").put("name", "Authorization").put("in", "header")
+                .put("x-amazon-apigateway-authtype", authType);
+        body.set("components", mapper.createObjectNode().set("securitySchemes",
+                mapper.createObjectNode().set("existing", scheme)));
+        body.set("security", mapper.readTree("[{\"existing\":[]}]"));
+        JsonNode original = template.deepCopy();
+        JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
+        assertEquals(original, template);
+        assertEquals(scheme, expanded.at("/components/securitySchemes/existing"));
+        assertEquals(mapper.readTree("[{\"existing\":[]},{\"AWS_IAM\":[]},{\"api_key\":[]}]"),
+                expanded.at("/paths/~1items/get/security"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"[{\"missing\":[]}]", "[{\"existing\":\"scope\"}]", "[{\"existing\":[42]}]"})
+    void refusesUndefinedSchemesAndMalformedScopes(String security) throws Exception {
+        ObjectNode template = template(false);
+        ObjectNode body = (ObjectNode) template.at("/Resources/Api/Properties/DefinitionBody");
+        body.set("components", mapper.readTree("""
+                {"securitySchemes":{"existing":{"type":"oauth2","flows":{}}}}
+                """));
+        body.set("security", mapper.readTree(security));
+        JsonNode original = template.deepCopy();
         assertThrows(AwsException.class, () -> processor.expandSamTemplate(template));
+        assertEquals(original, template);
     }
 
     @Test

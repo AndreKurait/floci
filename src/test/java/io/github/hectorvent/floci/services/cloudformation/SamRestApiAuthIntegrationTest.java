@@ -8,7 +8,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.http.ContentType;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.time.Instant;
 import java.util.Map;
@@ -25,9 +25,23 @@ class SamRestApiAuthIntegrationTest {
     private final ObjectMapper mapper = new ObjectMapper();
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void importedSamApiRequiresBothValidSignatureAndEnabledStageKey(boolean swagger) throws Exception {
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void importedSamApiRequiresBothValidSignatureAndEnabledStageKey(boolean swagger, boolean existingScheme)
+            throws Exception {
         ObjectNode template = template(swagger);
+        if (existingScheme) {
+            ObjectNode body = (ObjectNode) template.at("/Resources/Api/Properties/DefinitionBody");
+            ObjectNode schemes = mapper.createObjectNode().set("existing", mapper.readTree("""
+                    {"type":"apiKey","name":"Authorization","in":"header",
+                     "x-amazon-apigateway-authtype":"custom-authentication"}
+                    """));
+            if (swagger) {
+                body.set("securityDefinitions", schemes);
+            } else {
+                body.set("components", mapper.createObjectNode().set("securitySchemes", schemes));
+            }
+            body.set("security", mapper.readTree("[{\"existing\":[]}]"));
+        }
         JsonNode document = new SamTransformProcessor(mapper).expandSamTemplate(template)
                 .at("/Resources/Api/Properties/Body");
         String apiId = null;
