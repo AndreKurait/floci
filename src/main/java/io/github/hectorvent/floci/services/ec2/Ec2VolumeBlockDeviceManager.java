@@ -4,6 +4,7 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
@@ -13,7 +14,6 @@ import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
-import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -40,7 +40,7 @@ import java.util.regex.Pattern;
  * created inside the target container at the requested path.
  */
 @ApplicationScoped
-public class Ec2VolumeBlockDeviceManager implements Resettable {
+public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettable {
 
     private static final Logger LOG = Logger.getLogger(Ec2VolumeBlockDeviceManager.class);
     private static final int DEFAULT_TIMEOUT_SECONDS = 30;
@@ -54,8 +54,6 @@ public class Ec2VolumeBlockDeviceManager implements Resettable {
 
     private volatile Boolean dockerAvailableCached;
     private volatile long dockerAvailableCheckTime;
-    private String helperContainerId;
-    private volatile boolean stopping;
 
     @Inject
     public Ec2VolumeBlockDeviceManager(DockerClient dockerClient,
@@ -72,9 +70,6 @@ public class Ec2VolumeBlockDeviceManager implements Resettable {
      * Checks if volume block device support is configured and Docker is reachable.
      */
     public boolean isAvailable() {
-        if (stopping) {
-            return false;
-        }
         if (config == null || config.services() == null || config.services().ec2() == null) {
             return false;
         }
@@ -427,17 +422,14 @@ public class Ec2VolumeBlockDeviceManager implements Resettable {
     }
 
     private synchronized String ensureHelperContainer() {
-        if (stopping) {
-            return null;
-        }
         String helperName = ContainerStorageHelper.resourceName(config, "ec2", null, "volume-helper");
         try {
             InspectContainerResponse inspect = dockerClient.inspectContainerCmd(helperName).exec();
-            if (!Boolean.TRUE.equals(inspect.getState().getRunning())) {
-                dockerClient.startContainerCmd(helperName).exec();
+            if (Boolean.TRUE.equals(inspect.getState().getRunning())) {
+                return inspect.getId();
             }
-            helperContainerId = inspect.getId();
-            return helperContainerId;
+            dockerClient.startContainerCmd(helperName).exec();
+            return inspect.getId();
         } catch (NotFoundException e) {
             // Container does not exist yet; proceed to create it
         } catch (Exception e) {
@@ -464,22 +456,57 @@ public class Ec2VolumeBlockDeviceManager implements Resettable {
             }
 
             ContainerSpec spec = builder.build();
-            helperContainerId = lifecycleManager.createAndStart(spec).containerId();
-            return helperContainerId;
+            return lifecycleManager.createAndStart(spec).containerId();
         } catch (Exception e) {
             LOG.warnv("Failed to create and start EC2 volume helper container {0}: {1}", helperName, e.getMessage());
             return null;
         }
     }
 
-    @PreDestroy
-    synchronized void stop() {
-        stopping = true;
-        if (helperContainerId != null) {
-            // The remembered ID cannot select a replacement or remove persisted volume data.
-            lifecycleManager.removeIfExistsStrict(helperContainerId);
-            helperContainerId = null;
+    /**
+     * Removes the helper container on shutdown and on a state reset. The helper is looked up by
+     * name and never created here, so one left behind by an earlier process is collected too.
+     * Backing files stay in storage, and the next volume operation recreates the helper.
+     */
+    @Override
+    public synchronized void stopManagedContainers() {
+        if (!isAvailable()) {
+            return;
         }
+        String helperName = ContainerStorageHelper.resourceName(config, "ec2", null, "volume-helper");
+        InspectContainerResponse helper;
+        try {
+            helper = dockerClient.inspectContainerCmd(helperName).exec();
+        } catch (NotFoundException e) {
+            LOG.debugv("No EC2 volume helper container {0} to remove", helperName);
+            return;
+        } catch (Exception e) {
+            LOG.warnv("Failed to inspect EC2 volume helper container {0}: {1}", helperName, e.getMessage());
+            return;
+        }
+        if (Boolean.TRUE.equals(helper.getState().getRunning())) {
+            // One pass per file: a loop device still held open by an instance container is
+            // detached lazily and stays listed, so retrying it until it disappears would spin.
+            // Every loop is tried, and one that would not detach fails the script so it is reported.
+            String script = SHELL_LOOP_FINDER
+                    + "failed=0\n"
+                    + "for f in /volumes/*.raw; do\n"
+                    + "  [ -f \"$f\" ] || continue\n"
+                    + "  for loop in $(find_loops \"$f\"); do\n"
+                    + "    losetup -d \"$loop\" 2>/dev/null || { echo \"could not detach $loop from $f\"; failed=1; }\n"
+                    + "  done\n"
+                    + "done\n"
+                    + "exit $failed";
+            ContainerExec.Result released = execInContainer(helper.getId(),
+                    new String[]{"sh", "-c", script}, DEFAULT_TIMEOUT_SECONDS);
+            if (released.exitCode() != 0) {
+                LOG.warnv("Failed to release loop devices before removing EC2 volume helper container {0}: {1}",
+                        helperName, released.summary());
+            }
+        }
+        // The helper only sleeps and would ignore SIGTERM as PID 1, so do not wait on a graceful stop.
+        lifecycleManager.stopAndRemove(helper.getId(), null, 0);
+        activeLoopDevices.clear();
     }
 
     private ContainerExec.Result execInContainer(String containerId, String[] cmd, int timeoutSeconds) {
@@ -509,6 +536,9 @@ public class Ec2VolumeBlockDeviceManager implements Resettable {
                     + "  rm -f \"$f\"\n"
                     + "done";
             execInContainer(helperId, new String[]{"sh", "-c", script}, DEFAULT_TIMEOUT_SECONDS);
+            // The helper was only needed to delete the files, so a reset ends as a shutdown does:
+            // without one.
+            lifecycleManager.stopAndRemove(helperId, null, 0);
         }
         activeLoopDevices.clear();
     }

@@ -209,6 +209,10 @@ public class SesService {
                 "tenant", tenantService);
     }
 
+    private String callerAccountId() {
+        return regionResolver != null ? regionResolver.getAccountId() : defaultAccountId;
+    }
+
     /**
      * v2 CreateEmailIdentity. The identity domain builds and persists the complete record in one
      * write; only the configuration-set existence check is cross-domain, so it is passed in as the
@@ -226,7 +230,7 @@ public class SesService {
         if (identityValue == null || identityValue.isBlank()) {
             return;
         }
-        String accountId = regionResolver != null ? regionResolver.getAccountId() : defaultAccountId;
+        String accountId = callerAccountId();
         tenantService.deleteBackingResource(SesTenantService.RESOURCE_TYPE_IDENTITY, identityValue,
                 region, () -> certificateService.deleteIdentityGuarded(identityValue, accountId, region,
                         () -> doDeleteIdentity(identityValue, region)));
@@ -242,9 +246,30 @@ public class SesService {
         LOG.infov("Deleted identity: {0}", identityValue);
     }
 
+    /**
+     * The SES send operations: v1 {@code SendEmail}, {@code SendRawEmail} and
+     * {@code SendTemplatedEmail}, and v2 {@code SendEmail}. The Source, the return path and, on a raw
+     * send, every From mailbox the send reads, the Sender and the Return-Path header must be verified
+     * identities, the address itself, its domain or a parent domain, as on AWS. An address that a
+     * sending-authorization ARN puts under another account's identity is not checked.
+     */
     public String sendEmail(SendEmailRequest request) {
+        return sendEmail(request, true);
+    }
+
+    /**
+     * A message another service sends to its users, such as a Cognito verification code or
+     * invitation. Its sender is not checked against the account's identities: Cognito's default
+     * sender, {@code no-reply@verificationemail.com}, belongs to an SES account Cognito owns, and a
+     * pool's {@code EmailConfiguration} sender is used only once Cognito has found it verified.
+     */
+    public String sendServiceEmail(SendEmailRequest request) {
+        return sendEmail(request, false);
+    }
+
+    private String sendEmail(SendEmailRequest request, boolean requireVerifiedSender) {
         if (request.content() instanceof EmailContent.Raw raw) {
-            return sendRawEmail(request, raw);
+            return sendRawEmail(request, raw, requireVerifiedSender);
         }
         if (request.content() instanceof EmailContent.InlineTemplate inline) {
             requireInlineTemplateContent(inline.subject(), inline.textPart(), inline.htmlPart());
@@ -263,7 +288,78 @@ public class SesService {
             case EmailContent.InlineTemplate inline -> SesTemplateService.render(inline);
             case EmailContent.Raw raw -> throw new IllegalStateException("Raw content is sent above");
         };
+        if (requireVerifiedSender) {
+            requireVerifiedSenders(List.of(
+                    new SendingAddress(request.source(), request.sourceArn()),
+                    new SendingAddress(request.returnPath(), request.returnPathArn())), request.region());
+        }
         return sendSimpleEmail(request.toBuilder().content(content).build(), content, effectiveConfigSet);
+    }
+
+    /**
+     * An address a send uses as a sender, and the sending-authorization ARN of the identity that
+     * covers it, when the request names one.
+     */
+    private record SendingAddress(String address, String identityArn) {
+    }
+
+    // "The message must be sent from a verified email address or domain" (API_SendEmail), and the
+    // error "could apply to the "From", "Source", "Sender", or "Return-Path" address" (developer
+    // guide, Email sending errors). It runs after the request's own validation so that
+    // probe-confirmed order is unchanged; where AWS places this check among those errors has not
+    // been probed.
+    private void requireVerifiedSenders(List<SendingAddress> senders, String region) {
+        String accountId = callerAccountId();
+        // A blank address is not used, and neither is the null reverse-path "<>".
+        List<String> unverified = senders.stream()
+                .filter(sender -> sender.address() != null)
+                .filter(sender -> !isAnotherAccountsIdentity(sender.identityArn(), accountId))
+                .map(sender -> extractEmailAddress(sender.address()))
+                .filter(address -> !address.isEmpty())
+                .filter(address -> !identityService.isVerifiedSender(address, region))
+                .distinct()
+                .toList();
+        if (!unverified.isEmpty()) {
+            throw new AwsException("MessageRejected",
+                    "Email address is not verified. The following identities failed the check in region "
+                            + region.toUpperCase(Locale.ROOT) + ": " + String.join(", ", unverified), 400);
+        }
+    }
+
+    // Sending authorization: an ARN naming another account's identity puts the address under that
+    // account's identity and policy. Floci evaluates neither, so it lets the delegate through. An
+    // ARN of the caller's own account, or one that names no SES identity, changes nothing.
+    private static boolean isAnotherAccountsIdentity(String identityArn, String accountId) {
+        return AwsArnUtils.resourceIfArnFor(identityArn, "ses")
+                .filter(resource -> resource.startsWith("identity/"))
+                .isPresent()
+                && AwsArnUtils.isForeignAccount(AwsArnUtils.parse(identityArn), accountId);
+    }
+
+    // A raw send's senders. The From header counts wherever the send reads it: always on v1, and on
+    // v2 only in place of a missing FromEmailAddress (a v2 send with one accepts any From header,
+    // probe-confirmed). An ARN passed as a parameter wins over its X-SES-*-ARN header, and the
+    // source ARN also covers the From and return-path addresses that have no ARN of their own ("If
+    // you only specify the SourceArn, Amazon SES sets the "From" address and the "Return Path"
+    // addresses to the identity that you specified in SourceArn"). AWS names no ARN for the Sender.
+    // Whether AWS still checks a Return-Path header that the request's return path overrides has
+    // not been probed; every address present is checked.
+    private static List<SendingAddress> rawSendingAddresses(SendEmailRequest request, EmailContent.Raw raw,
+                                                            SmtpRelay.RawMessageHeaders headers) {
+        String sourceArn = firstNonBlank(request.sourceArn(), headers.sourceArn());
+        String fromArn = firstNonBlank(request.fromArn(), headers.fromArn(), sourceArn);
+        String returnPathArn = firstNonBlank(request.returnPathArn(), headers.returnPathArn(), sourceArn);
+        List<SendingAddress> senders = new ArrayList<>();
+        senders.add(new SendingAddress(request.source(), sourceArn));
+        if (raw.checksFromHeader(request.hasSource())) {
+            for (String from : headers.fromAddresses()) {
+                senders.add(new SendingAddress(from, fromArn));
+            }
+        }
+        senders.add(new SendingAddress(headers.sender(), null));
+        senders.add(new SendingAddress(request.returnPath(), returnPathArn));
+        senders.add(new SendingAddress(headers.returnPath(), returnPathArn));
+        return senders;
     }
 
     private static EmailContent.Simple renderInlineTemplate(EmailContent.InlineTemplate template) {
@@ -420,7 +516,7 @@ public class SesService {
         return List.copyOf(out);
     }
 
-    private String sendRawEmail(SendEmailRequest request, EmailContent.Raw raw) {
+    private String sendRawEmail(SendEmailRequest request, EmailContent.Raw raw, boolean requireVerifiedSender) {
         String source = request.source();
         String region = request.region();
         if (raw.data() == null || raw.data().isBlank()) {
@@ -469,6 +565,9 @@ public class SesService {
         }
         SesAddressSyntax.requireFallbackFromAt(request, raw, parsed.message());
         SesAddressLength.requireRaw(request, raw, parsed.message());
+        if (requireVerifiedSender) {
+            requireVerifiedSenders(rawSendingAddresses(request, raw, headers), region);
+        }
         // Resolve suppression before recording the message so a bad ListManagementOptions (e.g. an
         // unknown contact list) fails the whole send without leaving an orphaned SentEmail record.
         Map<String, String> suppressedReasons = new LinkedHashMap<>(
@@ -570,7 +669,7 @@ public class SesService {
         Instant timestamp = Instant.now();
         // Report the caller's account (resolved per request) in the event payload and source ARN,
         // falling back to the default account outside a request context (e.g. unit tests).
-        String sendingAccountId = regionResolver != null ? regionResolver.getAccountId() : defaultAccountId;
+        String sendingAccountId = callerAccountId();
         String sourceArn = (source == null || source.isBlank())
                 ? null
                 : AwsArnUtils.Arn.of("ses", region, sendingAccountId,
@@ -1265,7 +1364,7 @@ public class SesService {
      * mismatched or the resource doesn't exist anywhere.
      */
     private void requireCallerAccount(ResourceRef ref) {
-        String callerAccountId = regionResolver != null ? regionResolver.getAccountId() : defaultAccountId;
+        String callerAccountId = callerAccountId();
         if (!ref.account().equals(callerAccountId)) {
             throw new AwsException("BadRequestException",
                     "Operations on a resource created in a different account is not allowed", 400);

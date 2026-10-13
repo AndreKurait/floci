@@ -152,6 +152,7 @@ public class CognitoService implements ResourceProvider {
     private final StorageBackend<String, UserPool> poolStore;
     private final StorageBackend<String, UserPoolClient> clientStore;
     private final StorageBackend<String, ResourceServer> resourceServerStore;
+    private final Object resourceServerCreateLock = new Object();
     private final StorageBackend<String, UserPoolDomain> domainStore;
     private final StorageBackend<String, IdentityProvider> identityProviderStore;
     private final StorageBackend<String, CognitoUser> userStore;
@@ -1502,17 +1503,19 @@ public class CognitoService implements ResourceProvider {
         }
 
         String key = resourceServerKey(userPoolId, identifier);
-        if (resourceServerStore.get(key).isPresent()) {
-            throw new AwsException("ResourceConflictException", "Resource server already exists", 400);
-        }
+        synchronized (resourceServerCreateLock) {
+            if (resourceServerStore.get(key).isPresent()) {
+                throw new AwsException("ResourceConflictException", "Resource server already exists", 400);
+            }
 
-        ResourceServer server = new ResourceServer();
-        server.setUserPoolId(userPoolId);
-        server.setIdentifier(identifier);
-        server.setName(name);
-        server.setScopes(normalizeScopes(scopes));
-        resourceServerStore.put(key, server);
-        return server;
+            ResourceServer server = new ResourceServer();
+            server.setUserPoolId(userPoolId);
+            server.setIdentifier(identifier);
+            server.setName(name);
+            server.setScopes(normalizeScopes(scopes));
+            resourceServerStore.put(key, server);
+            return server;
+        }
     }
 
     public ResourceServer describeResourceServer(String userPoolId, String identifier) {

@@ -40,7 +40,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -50,6 +54,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -389,6 +394,45 @@ class CloudFrontCustomOriginServingTest {
         assertEquals("chunked", received.get().header("Transfer-Encoding"));
         assertNull(received.get().header("Content-Length"));
         assertArrayEquals(upload, received.get().body());
+    }
+
+    @Test
+    void releasesOriginConnectionsWhenViewersDisconnectBeforeOriginHeaders() throws Exception {
+        BlockingQueue<CountDownLatch> pendingResponses = new LinkedBlockingQueue<>();
+        originServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        originServer.createContext("/", exchange -> {
+            CountDownLatch sendResponse = new CountDownLatch(1);
+            pendingResponses.add(sendResponse);
+            try {
+                if (!sendResponse.await(10, TimeUnit.SECONDS)) {
+                    throw new IOException("Timed out waiting for viewer disconnect");
+                }
+                byte[] body = "origin-ok".getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Origin response interrupted", e);
+            } finally {
+                exchange.close();
+            }
+        });
+        originServer.createContext("/after-disconnects", exchange -> {
+            byte[] body = "origin-ok".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        originServer.start();
+        Distribution created = cloudFrontService.createDistribution(
+                customOriginDistribution(allMethodsBehavior()), Map.of());
+
+        for (int i = 0; i < CloudFrontOriginHttpClient.MAX_CONNECTIONS + 10; i++) {
+            disconnectViewerBeforeOriginHeaders(created.getDomainName(), i, pendingResponses);
+        }
+
+        given().header("Host", created.getDomainName()).when().get("/after-disconnects")
+                .then().statusCode(200).body(equalTo("origin-ok"));
     }
 
     @Test
@@ -809,6 +853,23 @@ class CloudFrontCustomOriginServingTest {
         assertNull(request.header("Accept-Language"));
         assertEquals("Amazon CloudFront", request.header("User-Agent"));
         assertEquals("127.0.0.1:" + originServer.getAddress().getPort(), request.header("Host"));
+    }
+
+    private static void disconnectViewerBeforeOriginHeaders(String host, int requestIndex,
+                                                            BlockingQueue<CountDownLatch> pendingResponses)
+            throws Exception {
+        CountDownLatch sendResponse = null;
+        try (Socket viewer = new Socket("127.0.0.1", RestAssured.port)) {
+            viewer.setSoLinger(true, 0);
+            viewer.getOutputStream().write(("GET /disconnect/" + requestIndex + " HTTP/1.1\r\nHost: "
+                    + host + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            sendResponse = pendingResponses.poll(5, TimeUnit.SECONDS);
+            assertNotNull(sendResponse, "No origin connection for viewer " + requestIndex);
+        } finally {
+            if (sendResponse != null) {
+                sendResponse.countDown();
+            }
+        }
     }
 
     private void startRecordingOrigin(AtomicReference<ReceivedRequest> received, AtomicInteger hits)

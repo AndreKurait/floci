@@ -69,6 +69,9 @@ public class SmtpRelay {
 
     private static final String X_SES_PREFIX = "x-ses-";
     private static final String HEADER_RETURN_PATH = "Return-Path";
+    private static final String HEADER_SOURCE_ARN = "X-SES-SOURCE-ARN";
+    private static final String HEADER_FROM_ARN = "X-SES-FROM-ARN";
+    private static final String HEADER_RETURN_PATH_ARN = "X-SES-RETURN-PATH-ARN";
     private static final String MESSAGE_ID_DOMAIN = "email.amazonses.com";
     private static final String DEFAULT_ATTACHMENT_CONTENT_TYPE = "application/octet-stream";
 
@@ -681,18 +684,23 @@ public class SmtpRelay {
     // ──────────────────────────── Raw header parsing ────────────────────────────
 
     /**
-     * Structured headers extracted from a raw RFC 5322 MIME message: the From address, subject,
-     * separate To / Cc / Bcc address lists, the {@code Return-Path} envelope sender, and the
-     * {@code X-SES-CONFIGURATION-SET} / {@code X-SES-MESSAGE-TAGS} control headers. Empty fields
-     * when the corresponding header is missing.
+     * Structured headers extracted from a raw RFC 5322 MIME message: the first From address, the
+     * subject, separate To / Cc / Bcc address lists, the {@code Return-Path} envelope sender, the
+     * {@code X-SES-CONFIGURATION-SET} / {@code X-SES-MESSAGE-TAGS} control headers, every
+     * mailbox the From header names, the Sender mailbox, and the sending-authorization headers
+     * {@code X-SES-SOURCE-ARN}, {@code X-SES-FROM-ARN} and {@code X-SES-RETURN-PATH-ARN}. Of a
+     * header given more than once, only the first is read, as SES does for the X-headers. Empty
+     * fields when the corresponding header is missing.
      */
     public record RawMessageHeaders(String from, String subject,
                                     List<String> to, List<String> cc, List<String> bcc,
                                     String returnPath, String configurationSet,
-                                    List<MessageTag> messageTags) {
+                                    List<MessageTag> messageTags, List<String> fromAddresses,
+                                    String sender, String sourceArn, String fromArn,
+                                    String returnPathArn) {
         public static RawMessageHeaders empty() {
             return new RawMessageHeaders("", "", List.of(), List.of(), List.of(),
-                    "", "", List.of());
+                    "", "", List.of(), List.of(), "", "", "", "");
         }
     }
 
@@ -748,10 +756,15 @@ public class SmtpRelay {
             String configurationSet = headerValue(message, HEADER_CONFIGURATION_SET);
             List<MessageTag> messageTags = parseMessageTagsHeader(
                     headerValue(message, HEADER_MESSAGE_TAGS));
+            Mailbox sender = message.getSender();
             return new RawMessageHeaders(from.isEmpty() ? "" : from.get(0), subject, to, cc, bcc,
                     returnPath == null ? "" : returnPath,
                     configurationSet == null ? "" : configurationSet,
-                    messageTags);
+                    messageTags, from,
+                    sender == null ? "" : sender.getAddress(),
+                    headerValueOrEmpty(message, HEADER_SOURCE_ARN),
+                    headerValueOrEmpty(message, HEADER_FROM_ARN),
+                    headerValueOrEmpty(message, HEADER_RETURN_PATH_ARN));
         } catch (Exception ignored) {
             // A message whose addresses cannot be read is treated like one without headers.
             return RawMessageHeaders.empty();
@@ -805,6 +818,11 @@ public class SmtpRelay {
         }
         String value = field.getBody().trim();
         return value.isEmpty() ? null : value;
+    }
+
+    private static String headerValueOrEmpty(Entity entity, String name) {
+        String value = headerValue(entity, name);
+        return value == null ? "" : value;
     }
 
     /** Unwraps the {@code <addr@example.com>} form used by Return-Path and friends. */

@@ -441,6 +441,37 @@ class SmtpRelayTest {
     }
 
     @Test
+    void parseRawHeaders_extractsSenderAndTheFirstSendingAuthorizationHeaders() {
+        String raw = "From: sender@example.com\r\n"
+                + "Sender: Assistant <assistant@example.com>\r\n"
+                + "To: to@example.com\r\n"
+                + "X-SES-SOURCE-ARN: arn:aws:ses:us-east-1:111111111111:identity/example.com\r\n"
+                + "X-SES-SOURCE-ARN: arn:aws:ses:us-east-1:222222222222:identity/example.com\r\n"
+                + "X-SES-FROM-ARN: arn:aws:ses:us-east-1:333333333333:identity/example.com\r\n"
+                + "X-SES-RETURN-PATH-ARN: arn:aws:ses:us-east-1:444444444444:identity/example.com\r\n"
+                + "Subject: x\r\n\r\nbody";
+
+        SmtpRelay.RawMessageHeaders h = SmtpRelay.parseRawHeaders(raw);
+
+        assertEquals("assistant@example.com", h.sender());
+        assertEquals("arn:aws:ses:us-east-1:111111111111:identity/example.com", h.sourceArn());
+        assertEquals("arn:aws:ses:us-east-1:333333333333:identity/example.com", h.fromArn());
+        assertEquals("arn:aws:ses:us-east-1:444444444444:identity/example.com", h.returnPathArn());
+    }
+
+    @Test
+    void parseRawHeaders_withoutSenderOrSendingAuthorizationHeaders_returnsBlanks() {
+        String raw = "From: sender@example.com\r\nTo: to@example.com\r\nSubject: x\r\n\r\nbody";
+
+        SmtpRelay.RawMessageHeaders h = SmtpRelay.parseRawHeaders(raw);
+
+        assertEquals("", h.sender());
+        assertEquals("", h.sourceArn());
+        assertEquals("", h.fromArn());
+        assertEquals("", h.returnPathArn());
+    }
+
+    @Test
     void parseMessageTagsHeader_skipsEntriesWithoutAName() {
         assertEquals(List.of(new MessageTag("ok", "1")),
                 SmtpRelay.parseMessageTagsHeader("ok=1, =2, novalueseparator"));

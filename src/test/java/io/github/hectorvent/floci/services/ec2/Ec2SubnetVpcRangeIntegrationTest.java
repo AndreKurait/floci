@@ -18,12 +18,12 @@ class Ec2SubnetVpcRangeIntegrationTest {
     void subnetRangeMustFitPrimaryOrAssociatedSecondaryVpcBlock() {
         String vpcId = ec2("CreateVpc").formParam("CidrBlock", "10.0.0.0/16").post("/").then()
                 .statusCode(200).extract().path("CreateVpcResponse.vpc.vpcId");
-        ec2("CreateSubnet").formParam("VpcId", vpcId).formParam("CidrBlock", "192.168.1.0/24")
+        ec2("CreateSubnet").formParam("VpcId", vpcId).formParam("CidrBlock", "10.1.1.0/24")
                 .post("/").then().statusCode(400).body("Response.Errors.Error.Code", equalTo("InvalidSubnet.Range"));
-        ec2("AssociateVpcCidrBlock").formParam("VpcId", vpcId).formParam("CidrBlock", "192.168.0.0/16")
+        ec2("AssociateVpcCidrBlock").formParam("VpcId", vpcId).formParam("CidrBlock", "10.1.0.0/16")
                 .post("/").then().statusCode(200);
-        String subnetId = ec2("CreateSubnet").formParam("VpcId", vpcId).formParam("CidrBlock", "192.168.1.9/24")
-                .post("/").then().statusCode(200).body("CreateSubnetResponse.subnet.cidrBlock", equalTo("192.168.1.0/24"))
+        String subnetId = ec2("CreateSubnet").formParam("VpcId", vpcId).formParam("CidrBlock", "10.1.1.9/24")
+                .post("/").then().statusCode(200).body("CreateSubnetResponse.subnet.cidrBlock", equalTo("10.1.1.0/24"))
                 .extract().path("CreateSubnetResponse.subnet.subnetId");
         ec2("DeleteSubnet").formParam("SubnetId", subnetId).post("/").then().statusCode(200);
         ec2("DeleteVpc").formParam("VpcId", vpcId).post("/").then().statusCode(200);

@@ -102,6 +102,21 @@ class AwsPartitionsTest {
     }
 
     /** botocore publishes no {@code aws-eusc-global}, and EUSC has no partition-wide service at all. */
+    @ParameterizedTest
+    @CsvSource({
+            "aws,        us-east-1,      us-east-1.signin.aws.amazon.com",
+            "aws-cn,     cn-north-1,     cn-north-1.signin.amazonaws.cn",
+            "aws-us-gov, us-gov-west-1,  us-gov-west-1.signin.amazonaws-us-gov.com",
+            "aws-iso,    us-iso-east-1,  us-iso-east-1.signin.c2shome.ic.gov",
+            "aws-iso-b,  us-isob-east-1, us-isob-east-1.signin.sc2shome.sgov.gov",
+            "aws-iso-e,  eu-isoe-west-1, eu-isoe-west-1.signin.csphome.adc-e.uk",
+            "aws-iso-f,  us-isof-south-1, us-isof-south-1.signin.csphome.hci.ic.gov",
+            "aws-eusc,   eusc-de-east-1, eusc-de-east-1.signin.amazonaws-eusc.eu"
+    })
+    void everyPartitionPublishesItsSigninHost(String partition, String region, String host) {
+        assertEquals(Optional.of(host), AwsPartitions.byId(partition).signinHostname(region));
+    }
+
     @Test
     void euscHasNoPseudoRegionAndNoGlobalServices() {
         AwsPartition eusc = AwsPartitions.byId("aws-eusc");

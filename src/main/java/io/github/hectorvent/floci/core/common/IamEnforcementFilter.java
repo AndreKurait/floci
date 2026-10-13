@@ -533,7 +533,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             if (queryAction == null || queryAction.isBlank()) {
                 return new ResolvedAuthorization(claimedScope, null);
             }
-            String service = queryServiceResolver.resolve(auth, queryAction);
+            String service = queryServiceResolver.resolve(auth, queryAction, actionRegistry.queryVersion(ctx));
             String servingScope = catalog.byExternalKey(service)
                     .map(descriptor -> iamServiceScope(descriptor, claimedScope))
                     .orElseGet(() -> catalog.canonicalCredentialScope(service));

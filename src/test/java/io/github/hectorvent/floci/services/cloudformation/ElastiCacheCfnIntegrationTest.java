@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.DockerAvailability;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -17,9 +18,7 @@ import software.amazon.awssdk.services.elasticache.model.CacheSubnetGroupNotFoun
 import software.amazon.awssdk.services.elasticache.model.ElastiCacheException;
 import software.amazon.awssdk.services.elasticache.model.UserGroupNotFoundException;
 
-import java.io.IOException;
 import java.net.URI;
-import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -191,7 +190,7 @@ class ElastiCacheCfnIntegrationTest {
 
     @Test
     void cacheClusterExposesEndpoints() throws Exception {
-        Assumptions.assumeTrue(dockerAvailable(), "Docker is required for the cache data plane");
+        Assumptions.assumeTrue(DockerAvailability.isAvailable(), "Docker is required for the cache data plane");
         cloudFormation(DATA_STACK, "CreateStack", DATA_TEMPLATE);
         String stacks = describeStacks(DATA_STACK, "CREATE_COMPLETE");
 
@@ -210,21 +209,6 @@ class ElastiCacheCfnIntegrationTest {
         CfnStackWaits.awaitStackDeleted(DATA_STACK);
     }
 
-    private static boolean dockerAvailable() throws Exception {
-        Process process;
-        try {
-            process = new ProcessBuilder("docker", "info").redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                    .redirectError(ProcessBuilder.Redirect.DISCARD).start();
-        } catch (IOException expected) {
-            // Docker CLI is optional on development machines.
-            return false;
-        }
-        if (!process.waitFor(10, TimeUnit.SECONDS)) {
-            process.destroyForcibly();
-            return false;
-        }
-        return process.exitValue() == 0;
-    }
 
     private static void cloudFormation(String stack, String action, String templateBody) {
         RequestSpecification request = given()

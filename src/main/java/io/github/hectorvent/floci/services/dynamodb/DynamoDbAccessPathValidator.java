@@ -56,11 +56,13 @@ final class DynamoDbAccessPathValidator {
                                   String select, String projectionExpression,
                                   JsonNode attributesToGet, JsonNode expressionAttributeNames) {
         if (projectionExpression != null && select != null && !"SPECIFIC_ATTRIBUTES".equals(select)) {
-            throw validationException("Cannot specify the ProjectionExpression when choosing to get "
+            throw validationException("1 validation error detected: "
+                    + "Cannot specify the ProjectionExpression when choosing to get "
                     + ("COUNT".equals(select) ? "only the Count" : select));
         }
         if ("ALL_PROJECTED_ATTRIBUTES".equals(select) && !accessPath.isIndex()) {
-            throw validationException("ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName");
+            throw validationException("1 validation error detected: "
+                    + "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName");
         }
         if (attributesToGet != null && select != null && !"SPECIFIC_ATTRIBUTES".equals(select)) {
             throw validationException("Cannot use both Select and AttributesToGet unless Select is SPECIFIC_ATTRIBUTES");
