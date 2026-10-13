@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ec2;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.model.Image;
@@ -77,7 +78,7 @@ class Ec2RegisteredImageRuntimeTest {
         containerManager = mock(Ec2ContainerManager.class);
         service = new Ec2Service(config, containerManager, mock(Ec2PortForwardManager.class),
                 new AmiImageResolver(catalog), catalog, new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
-        handler = new Ec2QueryHandler(service, config, null, null, null, null);
+        handler = new Ec2QueryHandler(service, config, null, null, null, null, mock(RegionResolver.class));
     }
 
     @Test
