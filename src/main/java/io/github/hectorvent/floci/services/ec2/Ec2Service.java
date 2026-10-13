@@ -5906,8 +5906,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         subnet.setState("available");
         subnet.setAvailabilityZone(zoneName);
         subnet.setAvailabilityZoneId(AvailabilityZoneIds.forZoneName(region, zoneName));
-        subnet.setAvailableIpAddressCount(Cidr4.parse(cidrBlock)
-                .map(cidr -> (int) Math.max(0, cidr.size() - 5)).orElse(0));
+        subnet.setAvailableIpAddressCount(availableSubnetAddresses(subnet, Set.of()));
         String ownerAccountId = callerAccountId();
         subnet.setOwnerId(ownerAccountId);
         subnet.setRegion(region);

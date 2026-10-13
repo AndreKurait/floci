@@ -43,6 +43,7 @@ import java.util.stream.Collectors;
 public class AutoScalingReconciler {
 
     private static final Logger LOG = Logger.getLogger(AutoScalingReconciler.class);
+    private static final String SCALE_OUT_CAUSE = "An instance was started in response to a desired capacity change.";
 
     /** The codes DescribeLaunchTemplates raises for an explicit name or id that does not exist. */
     private static final Set<String> LAUNCH_TEMPLATE_NOT_FOUND_CODES =
@@ -181,7 +182,7 @@ public class AutoScalingReconciler {
                     changed = true;
                     asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
                             "Launching a new EC2 instance: " + asgInst.getInstanceId(),
-                            "An instance was started in response to a desired capacity change.",
+                            SCALE_OUT_CAUSE,
                             "Successful");
                     LOG.infov("ASG {0}: instance {1} is now InService",
                             asg.getAutoScalingGroupName(), asgInst.getInstanceId());
@@ -420,7 +421,7 @@ public class AutoScalingReconciler {
             String description = "Launching a new EC2 instance.";
             String message = statusMessage(launchFailure, " Launching EC2 instance failed.");
             recordFailedActivity(asg, description + "  Status Reason: " + message,
-                    "Instances were requested in response to a desired capacity change.", message, description);
+                    SCALE_OUT_CAUSE, message, description);
             return false;
         }
         if (launchFailure != null) {
