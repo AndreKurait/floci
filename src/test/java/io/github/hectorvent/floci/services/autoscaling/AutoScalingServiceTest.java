@@ -62,43 +62,21 @@ class AutoScalingServiceTest {
     }
 
     @Test
-    void createZoneOnlyGroupRejectsUnadvertisedZoneWithoutSavingGroup() {
-        stubAvailabilityZones();
+    void zoneOnlyGroupAcceptsRealZonesOutsideTheLocalSubnetCatalog() {
+        service.ec2Service = mock(Ec2Service.class);
         service.createLaunchConfiguration(REGION, "zone-lc", null, "ami-test", "t3.nano",
                 null, List.of(), null, null, null);
-        for (List<String> zones : List.of(List.of("us-east-1d"), List.of("us-east-1a", "us-east-1d"))) {
-            AwsException error = assertThrows(AwsException.class, () -> service.createAutoScalingGroup(
-                    REGION, "invalid-zone", "zone-lc", null, null, null, null,
-                    0, 0, 0, 300, zones, List.of(), List.of(), List.of(),
-                    "EC2", 0, List.of(), Map.of(), Map.of(), AsgOptionalFields.none()));
-            assertEquals("ValidationError", error.getErrorCode());
-            assertTrue(error.getMessage().contains("us-east-1d"));
-            assertTrue(service.describeAutoScalingGroups(REGION, List.of("invalid-zone")).isEmpty());
-        }
-    }
-
-    @Test
-    void updateGroupRejectsUnadvertisedZoneBeforeMutatingOtherFields() {
-        stubAvailabilityZones();
-        LaunchTemplate template = new LaunchTemplate();
-        template.getData().setImageId("ami-test");
-        when(service.ec2Service.describeLaunchTemplateVersions(REGION, "lt-original", null, List.of("1")))
-                .thenReturn(List.of(template));
-        AwsException error = assertThrows(AwsException.class, () -> service.updateAutoScalingGroup(
-                REGION, "test-asg", null, null, null, null, null,
-                null, 10, null, null, List.of("us-east-1a", "us-east-1d"), null,
-                null, null, null, AsgOptionalFields.none()));
-        assertEquals("ValidationError", error.getErrorCode());
-        AutoScalingGroup group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
-        assertEquals(List.of("us-east-1a"), group.getAvailabilityZones());
-        assertEquals(3, group.getMaxSize());
-    }
-
-    private void stubAvailabilityZones() {
-        service.ec2Service = mock(Ec2Service.class);
-        when(service.ec2Service.describeAvailabilityZones(REGION, List.of(), List.of(), null))
-                .thenReturn(List.of(Map.of("zoneName", "us-east-1a"),
-                        Map.of("zoneName", "us-east-1b"), Map.of("zoneName", "us-east-1c")));
+        service.createAutoScalingGroup(REGION, "zone-only", "zone-lc", null, null, null, null,
+                0, 0, 0, 300, List.of("us-east-1d"), List.of(), List.of(), List.of(),
+                "EC2", 0, List.of(), Map.of(), Map.of(), AsgOptionalFields.none());
+        assertEquals(List.of("us-east-1d"), service.describeAutoScalingGroups(
+                REGION, List.of("zone-only")).getFirst().getAvailabilityZones());
+        service.updateAutoScalingGroup(REGION, "zone-only", null, null, null, null, null,
+                null, 10, null, null, List.of("us-east-1d", "us-east-1f"), null,
+                null, null, null, AsgOptionalFields.none());
+        AutoScalingGroup group = service.describeAutoScalingGroups(REGION, List.of("zone-only")).getFirst();
+        assertEquals(List.of("us-east-1d", "us-east-1f"), group.getAvailabilityZones());
+        assertEquals(10, group.getMaxSize());
     }
 
     @Test

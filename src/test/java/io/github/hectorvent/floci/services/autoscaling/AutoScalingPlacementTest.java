@@ -127,12 +127,15 @@ class AutoScalingPlacementTest {
     }
 
     @Test
-    void declaredZoneWithoutSubnetsReachesNativeEc2Placement() {
+    void unmodelledZonesLaunchUnpinnedAndBalanceUnderTheirRequestedZones() {
         Fixture fixture = new Fixture(Map.of(), List.of());
-        fixture.group.setAvailabilityZones(List.of(REGION + "b"));
+        fixture.group.setAvailabilityZones(List.of(REGION + "d", REGION + "f"));
         fixture.grow(2);
-        assertEquals(Map.of(REGION + "b", 2L), fixture.counts());
-        fixture.assertReportedZones();
+        fixture.grow(3);
+        fixture.grow(4);
+        assertEquals(Map.of(REGION + "a", 4L), fixture.counts());
+        assertEquals(Map.of(REGION + "d", 2L, REGION + "f", 2L), fixture.group.getInstances().stream()
+                .collect(Collectors.groupingBy(instance -> instance.getAvailabilityZone(), Collectors.counting())));
     }
 
     @Test
@@ -169,7 +172,9 @@ class AutoScalingPlacementTest {
         assertTrue(fixture.savedMembers.contains(List.of("i-1")));
         ScalingActivity activity = fixture.activities().getFirst();
         assertEquals("Failed", activity.getStatusCode());
-        assertEquals("fixture allocation failure", activity.getStatusMessage());
+        assertEquals("fixture allocation failure Launching EC2 instance failed.", activity.getStatusMessage());
+        assertEquals("Launching a new EC2 instance.  Status Reason: " + activity.getStatusMessage(),
+                activity.getDescription());
         assertEquals(100, activity.getProgress());
         assertNotNull(activity.getEndTime());
         fixture.grow(2);
@@ -177,7 +182,11 @@ class AutoScalingPlacementTest {
         fixture.launchFailure = new AwsException("RequestLimitExceeded", "request limit exceeded", 503);
         fixture.grow(2);
         assertEquals(2, fixture.activities().size());
-        assertEquals("request limit exceeded", fixture.activities().getFirst().getStatusMessage());
+        assertEquals("request limit exceeded Launching EC2 instance failed.",
+                fixture.activities().getFirst().getStatusMessage());
+        fixture.launchFailure = new AwsException("InsufficientInstanceCapacity", "fixture allocation failure", 400);
+        fixture.grow(2);
+        assertEquals(3, fixture.activities().size());
         verify(fixture.groups, never()).completeInstanceRefreshIfSettled(any(), any());
         fixture.failAfter = Integer.MAX_VALUE;
         fixture.grow(2);
@@ -199,14 +208,29 @@ class AutoScalingPlacementTest {
     }
 
     @Test
-    void exhaustedPlacementFailsBeforeAnyAllocationOrSuccessfulReconciliation() {
-        Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a"), List.of("subnet-a"));
-        fixture.availableIps.put("subnet-a", 0);
+    void exhaustedPlacementsLetEc2ReportTheLeastPopulatedSubnetsFailure() {
+        Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a", "subnet-b", REGION + "b"),
+                List.of("subnet-a", "subnet-b"));
         fixture.grow(1);
-        assertEquals("No configured subnet has free IPv4 addresses.",
+        fixture.availableIps.put("subnet-a", 0);
+        fixture.availableIps.put("subnet-b", 0);
+        fixture.grow(2);
+        assertEquals("There are not enough free addresses in subnet 'subnet-b' to satisfy the requested "
+                        + "number of instances. Launching EC2 instance failed.",
                 fixture.activities().getFirst().getStatusMessage());
-        assertEquals(0, fixture.allocations);
-        verify(fixture.groups, never()).completeInstanceRefreshIfSettled(any(), any());
+        assertEquals(1, fixture.allocations);
+        verify(fixture.groups, times(1)).completeInstanceRefreshIfSettled(any(), any());
+    }
+
+    @Test
+    void ipv6OnlySubnetsDoNotRequireFreeIpv4Addresses() {
+        Fixture fixture = new Fixture(Map.of("subnet-a", REGION + "a", "subnet-v6", REGION + "b"),
+                List.of("subnet-a", "subnet-v6"));
+        fixture.ipv6Only.add("subnet-v6");
+        fixture.availableIps.put("subnet-v6", 0);
+        fixture.grow(4);
+        assertEquals(Map.of(REGION + "a", 2L, REGION + "b", 2L), fixture.counts());
+        assertTrue(fixture.activities().isEmpty());
     }
 
     @Test
@@ -261,6 +285,7 @@ class AutoScalingPlacementTest {
         final AutoScalingGroup group = new AutoScalingGroup();
         final Map<String, Instance> instances = new LinkedHashMap<>();
         final Map<String, Integer> availableIps = new LinkedHashMap<>();
+        final List<String> ipv6Only = new ArrayList<>();
         final AutoScalingReconciler reconciler;
         final AutoScalingService groups = mock(AutoScalingService.class);
         final AutoScalingService activityStore = new AutoScalingService();
@@ -311,8 +336,10 @@ class AutoScalingPlacementTest {
                 return subnet;
             }).toList();
             when(ec2.describeSubnets(eq(REGION), anyList(), any())).thenAnswer(call -> {
-                subnets.forEach(subnet -> subnet.setAvailableIpAddressCount(
-                        availableIps.getOrDefault(subnet.getSubnetId(), 251)));
+                subnets.forEach(subnet -> {
+                    subnet.setAvailableIpAddressCount(availableIps.getOrDefault(subnet.getSubnetId(), 251));
+                    subnet.setCidrBlock(ipv6Only.contains(subnet.getSubnetId()) ? null : "10.0.0.0/24");
+                });
                 return subnets;
             });
             when(ec2.getInstance(eq(REGION), anyString()))
@@ -336,6 +363,11 @@ class AutoScalingPlacementTest {
                         String subnet = call.getArgument(7);
                         String zone = call.getArgument(15);
                         if (subnet != null) {
+                            if (!ipv6Only.contains(subnet) && availableIps.getOrDefault(subnet, 251) == 0) {
+                                throw new AwsException("InsufficientFreeAddressesInSubnet",
+                                        "There are not enough free addresses in subnet '" + subnet
+                                                + "' to satisfy the requested number of instances.", 400);
+                            }
                             zone = zones.get(subnet);
                         }
                         if (zone == null) {

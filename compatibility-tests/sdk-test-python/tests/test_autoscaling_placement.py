@@ -4,8 +4,6 @@ import uuid
 from contextlib import ExitStack, closing
 
 import boto3
-import pytest
-from botocore.exceptions import ClientError
 
 
 def test_subnet_counts_track_address_allocation(ec2_client):
@@ -27,17 +25,15 @@ def test_subnet_counts_track_address_allocation(ec2_client):
             assert described["AvailableIpAddressCount"] == capacity
 
 
-def test_zone_only_groups_validate_create_and_update_atomically(
-    ec2_client, aws_config, client_config
+def test_zone_only_groups_accept_real_zones_outside_local_subnet_catalog(
+    aws_config, client_config
 ):
-    name = "zone-validation-" + uuid.uuid4().hex[:12]
-    zones = [
-        zone["ZoneName"]
-        for zone in ec2_client.describe_availability_zones()["AvailabilityZones"]
-    ]
-    unknown_zone = aws_config["region_name"] + "z"
-    assert unknown_zone not in zones
-    with closing(boto3.client("autoscaling", config=client_config, **aws_config)) as autoscaling:
+    name = "zone-placement-" + uuid.uuid4().hex[:12]
+    aws_config = {**aws_config, "region_name": "us-east-1"}
+    with (
+        closing(boto3.client("ec2", config=client_config, **aws_config)) as ec2_client,
+        closing(boto3.client("autoscaling", config=client_config, **aws_config)) as autoscaling,
+    ):
         with ExitStack() as cleanup:
             image = ec2_client.register_image(
                 Name=name, Architecture="x86_64", RootDeviceName="/dev/sda1"
@@ -48,39 +44,20 @@ def test_zone_only_groups_validate_create_and_update_atomically(
                 LaunchTemplateData={"ImageId": image, "InstanceType": "t3.nano"},
             )["LaunchTemplate"]["LaunchTemplateId"]
             cleanup.callback(ec2_client.delete_launch_template, LaunchTemplateId=template)
-            for requested in [[unknown_zone], [zones[0], unknown_zone]]:
-                with pytest.raises(ClientError) as error:
-                    autoscaling.create_auto_scaling_group(
-                        AutoScalingGroupName=name,
-                        MinSize=0, MaxSize=0, DesiredCapacity=0,
-                        LaunchTemplate={"LaunchTemplateId": template},
-                        AvailabilityZones=requested,
-                    )
-                assert error.value.response["Error"]["Code"] == "ValidationError"
-                assert unknown_zone in error.value.response["Error"]["Message"]
-                assert autoscaling.describe_auto_scaling_groups(
-                    AutoScalingGroupNames=[name]
-                )["AutoScalingGroups"] == []
             autoscaling.create_auto_scaling_group(
                 AutoScalingGroupName=name,
                 MinSize=0, MaxSize=0, DesiredCapacity=0,
                 LaunchTemplate={"LaunchTemplateId": template},
-                AvailabilityZones=zones[:2],
+                AvailabilityZones=["us-east-1d"],
             )
-            cleanup.callback(
-                autoscaling.delete_auto_scaling_group,
-                AutoScalingGroupName=name, ForceDelete=True,
-            )
-            with pytest.raises(ClientError) as error:
-                autoscaling.update_auto_scaling_group(
-                    AutoScalingGroupName=name, MaxSize=3,
-                    AvailabilityZones=[zones[0], unknown_zone],
-                )
-            assert error.value.response["Error"]["Code"] == "ValidationError"
+            cleanup.callback(autoscaling.delete_auto_scaling_group,
+                             AutoScalingGroupName=name, ForceDelete=True)
             group = autoscaling.describe_auto_scaling_groups(
-                AutoScalingGroupNames=[name]
-            )["AutoScalingGroups"][0]
-            assert group["AvailabilityZones"] == zones[:2]
-            assert group["MaxSize"] == 0
-            assert group["DesiredCapacity"] == 0
+                AutoScalingGroupNames=[name])["AutoScalingGroups"][0]
+            assert group["AvailabilityZones"] == ["us-east-1d"]
+            autoscaling.update_auto_scaling_group(
+                AutoScalingGroupName=name, AvailabilityZones=["us-east-1d", "us-east-1f"])
+            group = autoscaling.describe_auto_scaling_groups(
+                AutoScalingGroupNames=[name])["AutoScalingGroups"][0]
+            assert group["AvailabilityZones"] == ["us-east-1d", "us-east-1f"]
             assert group["Instances"] == []

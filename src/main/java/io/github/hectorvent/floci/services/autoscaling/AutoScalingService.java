@@ -320,7 +320,6 @@ public class AutoScalingService {
         validateDesiredCapacityType(
                 optionalFields != null ? optionalFields.desiredCapacityType() : null,
                 mixedInstancesPolicy);
-        validateAvailabilityZones(region, availabilityZones);
 
         AutoScalingGroup asg = new AutoScalingGroup();
         asg.setAutoScalingGroupName(name);
@@ -389,7 +388,6 @@ public class AutoScalingService {
         validateDesiredCapacityType(
                 effectiveDesiredCapacityType(asg, optionalFields),
                 effectiveIdentity.mixedInstancesPolicy());
-        validateAvailabilityZones(region, availabilityZones);
         if (launchConfigName != null) {
             asg.setLaunchConfigurationName(launchConfigName);
             asg.setLaunchTemplateId(null);
@@ -1501,22 +1499,6 @@ public class AutoScalingService {
             return new LaunchIdentity(null, null, null, null, mixedInstancesPolicy);
         }
         return identity;
-    }
-
-    private void validateAvailabilityZones(String region, List<String> availabilityZones) {
-        if (availabilityZones == null || availabilityZones.isEmpty() || ec2Service == null) {
-            return;
-        }
-        Set<String> availableZones = ec2Service.describeAvailabilityZones(region, List.of(), List.of(), null)
-                .stream()
-                .map(zone -> zone.get("zoneName"))
-                .collect(Collectors.toSet());
-        for (String zone : availabilityZones) {
-            if (!availableZones.contains(zone)) {
-                throw new AwsException("ValidationError",
-                        "The availability zone [" + zone + "] is not legal", 400);
-            }
-        }
     }
 
     private void validateEffectiveLaunchImage(String region,
