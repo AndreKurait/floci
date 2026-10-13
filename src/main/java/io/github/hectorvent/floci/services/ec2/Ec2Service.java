@@ -9794,6 +9794,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ensureDefaultResources(region);
         Address addr = getRequiredAddress(region, allocationId);
 
+        if (addr.getAssociationId() != null) {
+            disassociateAddress(region, addr.getAssociationId());
+        }
         addr.setInstanceId(instanceId);
         addr.setAssociationId("eipassoc-" + randomHex(17));
         pointAddressAtInstance(addr, region, instanceId);
@@ -9845,6 +9848,37 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (inst.getNetworkInterfaces() != null && !inst.getNetworkInterfaces().isEmpty()) {
             addr.setNetworkInterfaceId(inst.getNetworkInterfaces().get(0).getNetworkInterfaceId());
         }
+        updateStoredAddressAssociation(addr);
+    }
+
+    private void updateStoredAddressAssociation(Address address) {
+        if (address.getNetworkInterfaceId() == null) {
+            return;
+        }
+        String interfaceKey = key(address.getRegion(), address.getNetworkInterfaceId());
+        networkInterfaces.get(interfaceKey).ifPresent(ni -> {
+            for (NetworkInterfacePrivateIpAddress ip : ni.getPrivateIpAddresses()) {
+                if (!ip.isPrimary()) {
+                    continue;
+                }
+                if (address.getAssociationId() != null) {
+                    ip.setAssociation(networkInterfaceAssociation(address, ni.getOwnerId()));
+                } else if (ip.getAssociation() != null
+                        && address.getAllocationId().equals(ip.getAssociation().getAllocationId())) {
+                    ip.setAssociation(null);
+                }
+            }
+            networkInterfaces.put(interfaceKey, ni);
+        });
+    }
+
+    private static NetworkInterfaceAssociation networkInterfaceAssociation(Address address, String ownerId) {
+        NetworkInterfaceAssociation association = new NetworkInterfaceAssociation();
+        association.setPublicIp(address.getPublicIp());
+        association.setAllocationId(address.getAllocationId());
+        association.setAssociationId(address.getAssociationId());
+        association.setIpOwnerId(ownerId);
+        return association;
     }
 
     private Address getRequiredAddress(String region, String allocationId) {
@@ -9861,6 +9895,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if (addr.getRegion().equals(region) && associationId.equals(addr.getAssociationId())) {
                 addr.setInstanceId(null);
                 addr.setAssociationId(null);
+                updateStoredAddressAssociation(addr);
                 addr.setNetworkInterfaceId(null);
                 addr.setPrivateIpAddress(null);
                 // Hand the allocation back its allocated address: with no instance behind it,
@@ -9876,8 +9911,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public void releaseAddress(String region, String allocationId) {
         ensureDefaultResources(region);
-        if (addresses.get(key(region, allocationId)).isEmpty()) {
-            throw new AwsException("InvalidAllocationID.NotFound", "The allocation ID '" + allocationId + "' does not exist", 400);
+        Address address = getRequiredAddress(region, allocationId);
+        if (address.getAssociationId() != null) {
+            Instance instance = getRequiredInstance(region, address.getInstanceId());
+            if (!getRequiredVpc(region, instance.getVpcId()).isDefault()) {
+                throw new AwsException("InvalidIPAddress.InUse",
+                        "Address " + address.getPublicIp() + " is in use.", 400);
+            }
+            disassociateAddress(region, address.getAssociationId());
         }
         addresses.delete(key(region, allocationId));
     }
@@ -11105,14 +11146,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 primaryIp.setPrivateDnsName(eni.getPrivateDnsName());
                 primaryIp.setPrimary(true);
                 // Look up EIP association for this instance
-                addressForInstance(inst.getInstanceId()).ifPresent(addr -> {
-                    NetworkInterfaceAssociation assoc = new NetworkInterfaceAssociation();
-                    assoc.setPublicIp(addr.getPublicIp());
-                    assoc.setAllocationId(addr.getAllocationId());
-                    assoc.setAssociationId(addr.getAssociationId());
-                    assoc.setIpOwnerId(eni.getOwnerId());
-                    primaryIp.setAssociation(assoc);
-                });
+                addressForInstance(inst.getInstanceId()).ifPresent(addr ->
+                        primaryIp.setAssociation(networkInterfaceAssociation(addr, eni.getOwnerId())));
                 ni.getPrivateIpAddresses().add(primaryIp);
 
                 // Phase 4: apply filters

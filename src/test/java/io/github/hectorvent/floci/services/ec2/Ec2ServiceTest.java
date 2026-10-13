@@ -59,6 +59,8 @@ import org.bouncycastle.openssl.PEMKeyPair;
 import org.bouncycastle.openssl.PEMParser;
 import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.StringReader;
 import java.lang.reflect.Field;
@@ -548,6 +550,124 @@ class Ec2ServiceTest {
                 Map.of("group-id", List.of(groupId)), 0, null);
 
         assertEquals(1, result.networkInterfaces().size());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void describeNetworkInterfacesFiltersActualAddressAssociations(boolean suppliedInterface, boolean defaultVpc) {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String subnetId = defaultVpc
+                ? service.describeSubnets("us-east-1", List.of(), Map.of()).getFirst().getSubnetId()
+                : service.createSubnet("us-east-1",
+                        service.createVpc("us-east-1", "10.237.0.0/24", false).getVpcId(),
+                        "10.237.0.0/26", "us-east-1a").getSubnetId();
+        String suppliedId = suppliedInterface
+                ? service.createNetworkInterface("us-east-1", subnetId,
+                        null, null, List.of(), List.of(), List.of()).getNetworkInterfaceId() : null;
+        Instance associated = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnetId, null, List.of(), null, null,
+                null, suppliedId, 0).getInstances().getFirst();
+        Instance other = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        Address address = service.allocateAddress("us-east-1");
+        service.associateAddress("us-east-1", address.getAllocationId(), associated.getInstanceId());
+        String interfaceId = associated.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        String ownerId = associated.getNetworkInterfaces().getFirst().getOwnerId();
+
+        assertEquals(List.of(interfaceId), service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("association.ip-owner-id", List.of(ownerId)), 0, null).networkInterfaces().stream()
+                .map(NetworkInterface::getNetworkInterfaceId).toList());
+        assertEquals(List.of(interfaceId), service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("association.public-ip", List.of(address.getPublicIp())), 0, null).networkInterfaces().stream()
+                .map(NetworkInterface::getNetworkInterfaceId).toList());
+        assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("association.ip-owner-id", List.of("unmatched-owner")), 0, null).networkInterfaces().isEmpty());
+        assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("association.public-ip", List.of("192.0.2.254")), 0, null).networkInterfaces().isEmpty());
+        assertEquals(1, service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("association.ip-owner-id", List.of("unmatched-owner", ownerId),
+                        "association.public-ip", List.of("*")), 0, null).networkInterfaces().size());
+        assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("association.ip-owner-id", List.of(ownerId),
+                        "association.public-ip", List.of("192.0.2.254")), 0, null).networkInterfaces().isEmpty());
+        service.associateAddress("us-east-1", address.getAllocationId(), other.getInstanceId());
+        assertEquals(List.of(other.getNetworkInterfaces().getFirst().getNetworkInterfaceId()),
+                service.describeNetworkInterfaces("us-east-1", List.of(),
+                        Map.of("association.public-ip", List.of(address.getPublicIp())), 0, null)
+                        .networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+        service.associateAddress("us-east-1", address.getAllocationId(), associated.getInstanceId());
+        NetworkInterface described = service.describeNetworkInterfaces("us-east-1", List.of(interfaceId),
+                Map.of(), 0, null).networkInterfaces().getFirst();
+        assertEquals(address.getAllocationId(), described.getPrivateIpAddresses().getFirst()
+                .getAssociation().getAllocationId());
+        service.disassociateAddress("us-east-1", address.getAssociationId());
+        for (String filter : List.of("association.ip-owner-id", "association.public-ip")) {
+            assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
+                    Map.of(filter, List.of("*")), 0, null).networkInterfaces().isEmpty());
+        }
+        service.associateAddress("us-east-1", address.getAllocationId(), associated.getInstanceId());
+        if (!defaultVpc) {
+            String associationId = address.getAssociationId();
+            AwsException error = assertThrows(AwsException.class,
+                    () -> service.releaseAddress("us-east-1", address.getAllocationId()));
+            assertEquals("InvalidIPAddress.InUse", error.getErrorCode());
+            assertEquals(associationId, service.describeAddresses("us-east-1",
+                    List.of(address.getAllocationId()), Map.of()).getFirst().getAssociationId());
+            NetworkInterface unchanged = service.describeNetworkInterfaces("us-east-1", List.of(interfaceId),
+                    Map.of("association.public-ip", List.of(address.getPublicIp()),
+                            "association.ip-owner-id", List.of(ownerId)), 0, null).networkInterfaces().getFirst();
+            assertEquals(associationId, unchanged.getPrivateIpAddresses().getFirst()
+                    .getAssociation().getAssociationId());
+            service.disassociateAddress("us-east-1", associationId);
+        }
+        service.releaseAddress("us-east-1", address.getAllocationId());
+        assertTrue(service.describeAddresses("us-east-1", List.of(address.getAllocationId()), Map.of()).isEmpty());
+        assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("association.public-ip", List.of("*")), 0, null).networkInterfaces().isEmpty());
+        assertEquals(2, service.describeNetworkInterfaces("us-east-1", List.of(), Map.of(), 0, null)
+                .networkInterfaces().size());
+    }
+
+    @Test
+    void networkInterfaceAssociationFiltersExcludeSecondaryAddressAssociations() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String subnetId = service.describeSubnets("us-east-1", List.of(), Map.of()).getFirst().getSubnetId();
+        NetworkInterface eni = service.createNetworkInterface("us-east-1", subnetId, null,
+                null, List.of(), List.of(), List.of());
+        NetworkInterfacePrivateIpAddress primary = eni.getPrivateIpAddresses().getFirst();
+        NetworkInterfaceAssociation primaryAssociation = new NetworkInterfaceAssociation();
+        primaryAssociation.setIpOwnerId("primary-owner");
+        primaryAssociation.setPublicIp("192.0.2.10");
+        primary.setAssociation(primaryAssociation);
+        NetworkInterfacePrivateIpAddress secondary = new NetworkInterfacePrivateIpAddress();
+        secondary.setPrivateIpAddress("172.31.0.99");
+        NetworkInterfaceAssociation secondaryAssociation = new NetworkInterfaceAssociation();
+        secondaryAssociation.setIpOwnerId("secondary-owner");
+        secondaryAssociation.setPublicIp("192.0.2.20");
+        secondary.setAssociation(secondaryAssociation);
+        eni.getPrivateIpAddresses().add(secondary);
+
+        assertEquals(1, service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("association.ip-owner-id", List.of("primary-owner"),
+                        "association.public-ip", List.of("192.0.2.10")), 0, null).networkInterfaces().size());
+        assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("association.ip-owner-id", List.of("secondary-owner")), 0, null).networkInterfaces().isEmpty());
+        assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
+                Map.of("association.public-ip", List.of("192.0.2.20")), 0, null).networkInterfaces().isEmpty());
+        primary.setAssociation(null);
+        for (String filter : List.of("association.ip-owner-id", "association.public-ip")) {
+            assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
+                    Map.of(filter, List.of("*")), 0, null).networkInterfaces().isEmpty());
+        }
+        primary.setAssociation(new NetworkInterfaceAssociation());
+        for (String filter : List.of("association.ip-owner-id", "association.public-ip")) {
+            assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
+                    Map.of(filter, List.of("*")), 0, null).networkInterfaces().isEmpty());
+        }
     }
 
     @Test
