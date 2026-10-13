@@ -31,7 +31,9 @@ import software.amazon.awssdk.services.elasticache.model.ModifyReplicationGroupR
 import software.amazon.awssdk.services.elasticache.model.ModifyUserRequest;
 import software.amazon.awssdk.services.elasticache.model.ModifyUserResponse;
 import software.amazon.awssdk.services.elasticache.model.ReplicationGroup;
+import software.amazon.awssdk.services.elasticache.model.UserAlreadyExistsException;
 import software.amazon.awssdk.services.elasticache.model.UserGroupNotFoundException;
+import software.amazon.awssdk.services.elasticache.model.UserNotFoundException;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -193,8 +195,6 @@ class ElastiCacheTest {
     void createDuplicateUserThrows409() {
         requireUser();
 
-        // Floci returns generic error code, SDK maps to ElastiCacheException
-        // rather than UserAlreadyExistsException (pre-existing deviation)
         assertThatThrownBy(() -> elasticache.createUser(CreateUserRequest.builder()
                 .userId(userId)
                 .userName(userName)
@@ -205,7 +205,7 @@ class ElastiCacheTest {
                         .passwords("user-password-1")
                         .build())
                 .build()))
-                .isInstanceOf(ElastiCacheException.class)
+                .isInstanceOf(UserAlreadyExistsException.class)
                 .hasMessageContaining("already exists");
     }
 
@@ -276,12 +276,10 @@ class ElastiCacheTest {
 
         elasticache.deleteUser(DeleteUserRequest.builder().userId(userId).build());
 
-        // Floci returns generic error code, SDK maps to ElastiCacheException
-        // rather than UserNotFoundException (pre-existing deviation)
         assertThatThrownBy(() -> elasticache.describeUsers(DescribeUsersRequest.builder()
                 .userId(userId)
                 .build()))
-                .isInstanceOf(ElastiCacheException.class)
+                .isInstanceOf(UserNotFoundException.class)
                 .hasMessageContaining("not found");
         userCreated = false;
     }

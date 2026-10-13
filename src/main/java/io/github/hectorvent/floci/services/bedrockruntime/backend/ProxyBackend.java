@@ -5,21 +5,33 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
+import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
@@ -34,6 +46,7 @@ public class ProxyBackend implements BedrockBackend {
 
     private final ObjectMapper objectMapper;
     private final EmulatorConfig config;
+    private final CurrentVertxRequest currentRequest;
 
     // Config is immutable for the process's lifetime, so the mapping string is parsed
     // once here rather than on every Converse request.
@@ -45,9 +58,10 @@ public class ProxyBackend implements BedrockBackend {
             .build();
 
     @Inject
-    public ProxyBackend(ObjectMapper objectMapper, EmulatorConfig config) {
+    public ProxyBackend(ObjectMapper objectMapper, EmulatorConfig config, CurrentVertxRequest currentRequest) {
         this.objectMapper = objectMapper;
         this.config = config;
+        this.currentRequest = currentRequest;
         this.modelMapping = parseModelMapping(config.services().bedrockRuntime().proxy().modelMapping().orElse(""));
     }
 
@@ -96,37 +110,120 @@ public class ProxyBackend implements BedrockBackend {
         // BedrockOpenAiTranslator.streamBedrockEvents).
         HttpRequest request = buildHttpRequest(proxyConfig, openAiRequest);
         long startNanos = System.nanoTime();
-        HttpResponse<Stream<String>> response = invoke(modelId, request, HttpResponse.BodyHandlers.ofLines());
-
-        if (response.statusCode() >= 300) {
-            String errorBody;
-            try (Stream<String> body = response.body()) {
-                errorBody = body.limit(50).collect(Collectors.joining("\n"));
+        // A stalled upstream must be closed on caller disconnect without waiting for another token.
+        RoutingContext context = currentRequest.getCurrent();
+        CompletableFuture<HttpResponse<InputStream>> pending = httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream());
+        AtomicBoolean complete = new AtomicBoolean();
+        Thread monitor = monitorCancellation(context.response()::closed, complete, () -> {
+            pending.thenAccept(response -> closeBody(response.body()));
+            pending.cancel(true);
+        });
+        HttpResponse<InputStream> response;
+        try {
+            response = pending.get();
+            if (response.statusCode() >= 300) {
+                String errorBody;
+                try {
+                    errorBody = new String(response.body().readNBytes(8192), StandardCharsets.UTF_8);
+                } catch (IOException unavailable) {
+                    LOG.warnv("Failed to read Bedrock proxy error response: modelId={0}, status={1}",
+                            modelId, response.statusCode());
+                    errorBody = "";
+                } finally {
+                    closeBody(response.body());
+                }
+                throw failedRequest(response.statusCode(), errorBody);
             }
-            throw failedRequest(response.statusCode(), errorBody);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            pending.thenAccept(completed -> closeBody(completed.body()));
+            pending.cancel(true);
+            complete.set(true);
+            monitor.interrupt();
+            throw new AwsException("ModelErrorException", "Proxy stream interrupted.", 424);
+        } catch (ExecutionException | CancellationException failure) {
+            complete.set(true);
+            monitor.interrupt();
+            if (failure.getCause() instanceof HttpTimeoutException) {
+                LOG.warnv("Bedrock proxy backend timed out: modelId={0}", modelId);
+                throw new AwsException("ModelTimeoutException", "Proxy stream timed out.", 408);
+            }
+            if (failure instanceof ExecutionException) {
+                LOG.warnv("Bedrock proxy backend call failed: modelId={0}", modelId);
+            }
+            throw new AwsException("ModelErrorException", "Proxy stream unavailable or disconnected.", 424);
+        } catch (RuntimeException failure) {
+            complete.set(true);
+            monitor.interrupt();
+            throw failure;
         }
+        return output -> {
+            try (InputStream body = response.body();
+                 Stream<String> lines = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8)).lines()) {
+                BedrockOpenAiTranslator.streamBedrockEvents(objectMapper, lines, output, startNanos);
+            } catch (IOException failure) {
+                throw new UncheckedIOException(failure);
+            } finally {
+                complete.set(true);
+                monitor.interrupt();
+            }
+        };
+    }
 
-        return output -> BedrockOpenAiTranslator.streamBedrockEvents(objectMapper, response.body(), output, startNanos);
+    private static void closeBody(InputStream body) {
+        try {
+            body.close();
+        } catch (IOException ignored) {
+            // The transport is already disconnected; no response data belongs in diagnostics.
+        }
     }
 
     private static AwsException failedRequest(int response, String errorBody) {
-        LOG.warnv("Bedrock proxy backend returned HTTP {0}: {1}", response, errorBody);
+        LOG.warnv("Bedrock proxy backend returned HTTP {0}", response);
         return new AwsException("ModelErrorException",
                 "Proxy backend returned HTTP %d: %s".formatted(response, truncate(errorBody, 512)), 424);
     }
 
     private <T> HttpResponse<T> invoke(String modelId, HttpRequest request, HttpResponse.BodyHandler<T> bodyHandler) {
+        RoutingContext context = currentRequest.getCurrent();
+        CompletableFuture<HttpResponse<T>> pending = httpClient.sendAsync(request, bodyHandler);
+        AtomicBoolean complete = new AtomicBoolean();
+        Thread monitor = monitorCancellation(context.response()::closed, complete, () -> pending.cancel(true));
         try {
-            return httpClient.send(request, bodyHandler);
-        } catch (HttpTimeoutException e) {
-            LOG.warnv("Bedrock proxy backend timed out: modelId={0}, url={1}, error={2}",
-                    modelId, request.uri(), e.getMessage());
-            throw new AwsException("ModelTimeoutException", "Proxy backend timed out: " + e.getMessage(), 408);
-        } catch (Exception e) {
-            LOG.warnv("Bedrock proxy backend call failed: modelId={0}, url={1}, error={2}",
-                    modelId, request.uri(), e.getMessage());
-            throw new AwsException("ModelErrorException", "Failed to reach proxy backend: " + e.getMessage(), 424);
+            return pending.get();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            pending.cancel(true);
+            throw new AwsException("ModelErrorException", "Proxy request interrupted.", 424);
+        } catch (ExecutionException | CancellationException failure) {
+            if (failure.getCause() instanceof HttpTimeoutException) {
+                LOG.warnv("Bedrock proxy backend timed out: modelId={0}", modelId);
+                throw new AwsException("ModelTimeoutException", "Proxy backend timed out.", 408);
+            }
+            if (failure instanceof ExecutionException) {
+                LOG.warnv("Bedrock proxy backend call failed: modelId={0}", modelId);
+            }
+            throw new AwsException("ModelErrorException", "Proxy backend unavailable or disconnected.", 424);
+        } finally {
+            complete.set(true);
+            monitor.interrupt();
         }
+    }
+
+    private static Thread monitorCancellation(BooleanSupplier shouldCancel, AtomicBoolean complete, Runnable cancelAction) {
+        return Thread.ofVirtual().name("bedrock-proxy-cancellation").start(() -> {
+            try {
+                while (!complete.get()) {
+                    if (shouldCancel.getAsBoolean()) {
+                        cancelAction.run();
+                        return;
+                    }
+                    Thread.sleep(100);
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        });
     }
 
     private HttpRequest buildHttpRequest(EmulatorConfig.BedrockProxyConfig proxyConfig, ObjectNode openAiRequest) {

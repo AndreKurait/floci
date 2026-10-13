@@ -11,6 +11,19 @@ public final class Digests {
     private Digests() {
     }
 
+    public static byte[] sha1(byte[] data) {
+        try {
+            return MessageDigest.getInstance("SHA-1").digest(data);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-1 is not available", e);
+        }
+    }
+
+    /** The SHA-1 digest of the UTF-8 bytes of {@code text} as lowercase hex. */
+    public static String sha1Hex(String text) {
+        return HexFormat.of().formatHex(sha1(text.getBytes(StandardCharsets.UTF_8)));
+    }
+
     public static byte[] sha256(byte[] data) {
         try {
             return MessageDigest.getInstance("SHA-256").digest(data);

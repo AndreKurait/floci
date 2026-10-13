@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.signin;
 import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.RestAssured;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
@@ -10,10 +11,14 @@ import org.junit.jupiter.api.Test;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.Map;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.not;
@@ -27,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class SigninIntegrationTest {
 
     private static final String CLIENT_ID = "arn:aws:signin:::devtools/same-device";
+    private static final String CROSS_DEVICE_CLIENT_ID = "arn:aws:signin:::devtools/cross-device";
     private static final String REDIRECT_URI = "http://127.0.0.1:4567/oauth/callback";
 
     @Test
@@ -106,6 +112,89 @@ class SigninIntegrationTest {
         Map<String, String> params = queryParams(redirect.getRawQuery());
         assertTrue(params.get("code").length() >= 1);
         assertEquals(state, params.get("state"));
+    }
+
+    @Test
+    void crossDeviceLoginShowsAVerificationCodeTheCliCanExchange() throws Exception {
+        String verifier = verifier();
+        String state = UUID.randomUUID().toString();
+        // What `aws login --remote --endpoint-url <floci>` sends: the endpoint it was given.
+        String redirectUri = "http://localhost:" + RestAssured.port + "/v1/sessions/confirmation";
+
+        String consentLocation = request()
+                .redirects().follow(false)
+                .queryParam("client_id", CROSS_DEVICE_CLIENT_ID)
+                .queryParam("code_challenge", challenge(verifier))
+                .queryParam("code_challenge_method", "SHA-256")
+                .queryParam("redirect_uri", redirectUri)
+                .queryParam("response_type", "code")
+                .queryParam("scope", "openid")
+                .queryParam("state", state)
+                .when()
+                .get("/v1/authorize")
+                .then()
+                .statusCode(302)
+                .extract()
+                .header("Location");
+        String confirmationLocation = approve(consentLocation);
+        assertTrue(confirmationLocation.startsWith(redirectUri + "?"), confirmationLocation);
+
+        String page = request()
+                .when()
+                .get(confirmationLocation)
+                .then()
+                .statusCode(200)
+                .header("Cache-Control", equalTo("no-store"))
+                .contentType(containsString("text/html"))
+                .extract()
+                .asString();
+        Matcher shown = Pattern.compile("<p class=\"verification-code\">([^<]+)</p>").matcher(page);
+        assertTrue(shown.find(), page);
+        Map<String, String> pasted = queryParams(
+                new String(Base64.getDecoder().decode(shown.group(1)), StandardCharsets.UTF_8));
+        assertEquals(state, pasted.get("state"));
+
+        request()
+                .contentType("application/json")
+                .body(Map.of(
+                        "clientId", CROSS_DEVICE_CLIENT_ID,
+                        "grantType", "authorization_code",
+                        "code", pasted.get("code"),
+                        "redirectUri", redirectUri,
+                        "codeVerifier", verifier))
+                .when()
+                .post("/v1/token")
+                .then()
+                .statusCode(200)
+                .body("tokenType", equalTo("aws_sigv4"))
+                .body("accessToken.accessKeyId", notNullValue());
+    }
+
+    @Test
+    void crossDeviceLoginRefusesARedirectToAnotherOrigin() throws Exception {
+        request()
+                .redirects().follow(false)
+                .queryParam("client_id", CROSS_DEVICE_CLIENT_ID)
+                .queryParam("code_challenge", challenge(verifier()))
+                .queryParam("code_challenge_method", "SHA-256")
+                .queryParam("redirect_uri", "http://example.com:" + RestAssured.port + "/v1/sessions/confirmation")
+                .queryParam("response_type", "code")
+                .queryParam("scope", "openid")
+                .queryParam("state", "state")
+                .when()
+                .get("/v1/authorize")
+                .then()
+                .statusCode(400);
+    }
+
+    @Test
+    void confirmationPageWithoutACodeIsARequestError() {
+        request()
+                .when()
+                .get("/v1/sessions/confirmation")
+                .then()
+                .statusCode(400)
+                .contentType(containsString("text/html"));
     }
 
     @Test

@@ -8,7 +8,6 @@ import java.io.IOException;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyPairGenerator;
-import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.interfaces.RSAPublicKey;
 import java.util.Base64;
@@ -58,8 +57,7 @@ public final class Ec2KeyMaterial {
 
             // "The SHA-1 digest of the DER encoded private key" for a key pair AWS created.
             // (Imported keys use the MD5 of the public key instead -- see fingerprintOf.)
-            String fingerprint = colonHex(
-                    MessageDigest.getInstance("SHA-1").digest(pair.getPrivate().getEncoded()));
+            String fingerprint = colonHex(Digests.sha1(pair.getPrivate().getEncoded()));
 
             return new Generated(
                     out.toString(),

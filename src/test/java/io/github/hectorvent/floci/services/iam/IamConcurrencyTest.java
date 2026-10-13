@@ -346,6 +346,57 @@ class IamConcurrencyTest {
         }
     }
 
+    /**
+     * Every racing ChangePassword presents the same valid old password, so exactly one can be
+     * right: once the first write lands, the old password the others hold is no longer the current
+     * one. A request told it succeeded has to be the one whose password is in the store, since the
+     * caller has no way to find out otherwise, the operation echoing nothing back.
+     */
+    @Test
+    void concurrentPasswordChangesLeaveExactlyOneWinner() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(THREADS);
+        try {
+            for (int trial = 0; trial < TRIALS; trial++) {
+                IamService iam = newIamService();
+                iam.createUser("racer", "/");
+                iam.createLoginProfile("racer", "Passw0rd$start", false);
+                CountDownLatch start = new CountDownLatch(1);
+                CountDownLatch done = new CountDownLatch(N);
+                List<String> winners = new CopyOnWriteArrayList<>();
+                List<String> unexpected = new CopyOnWriteArrayList<>();
+
+                for (int i = 0; i < N; i++) {
+                    String candidate = "Passw0rd$" + i;
+                    pool.execute(() -> {
+                        try {
+                            start.await(10, TimeUnit.SECONDS);
+                            iam.changePassword("racer", "Passw0rd$start", candidate);
+                            winners.add(candidate);
+                        } catch (io.github.hectorvent.floci.core.common.AwsException e) {
+                            if (!"InvalidParameterValue".equals(e.getErrorCode())) {
+                                unexpected.add(e.getErrorCode());
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        } finally {
+                            done.countDown();
+                        }
+                    });
+                }
+                start.countDown();
+                assertTrue(done.await(30, TimeUnit.SECONDS), "password workers stalled");
+
+                String stored = iam.getLoginProfile("racer").getPassword();
+                if (winners.size() != 1 || !winners.contains(stored) || !unexpected.isEmpty()) {
+                    fail("changePassword trial " + trial + ": winners=" + winners
+                            + " stored=" + stored + " unexpectedErrors=" + unexpected);
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
     private static String[] createPolicies(IamService iam, String prefix) {
         String[] arns = new String[N];
         for (int i = 0; i < N; i++) {

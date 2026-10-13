@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.services.acm.model.CertificateStatus;
 import io.github.hectorvent.floci.services.cognito.model.CognitoGroup;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
 import io.github.hectorvent.floci.services.cognito.model.IdentityProvider;
+import io.github.hectorvent.floci.services.cognito.model.ResourceServer;
 import io.github.hectorvent.floci.services.cognito.model.ResourceServerScope;
 import io.github.hectorvent.floci.services.cognito.model.RevokedTokenInfo;
 import io.github.hectorvent.floci.services.cognito.model.UserPool;
@@ -35,6 +36,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
@@ -44,13 +48,16 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
@@ -110,6 +117,123 @@ class CognitoServiceTest {
                 null,
                 acmService
         );
+    }
+
+    @Test
+    void concurrentResourceServerCreatesPreserveTheWinningRequest() throws Exception {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "ConcurrentResourceServers"), "us-east-1");
+        String identifier = "https://resource-server.floci.test";
+        String targetKey = pool.getId() + "::" + identifier;
+        CountDownLatch firstEmptyLookup = new CountDownLatch(1);
+        CountDownLatch secondEmptyLookup = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        AtomicInteger emptyLookups = new AtomicInteger();
+        AtomicReference<Thread> firstWorker = new AtomicReference<>();
+        AtomicReference<Thread> secondWorker = new AtomicReference<>();
+        InMemoryStorage<String, ResourceServer> resourceServers = new InMemoryStorage<>() {
+            @Override
+            public Optional<ResourceServer> get(String key) {
+                Optional<ResourceServer> snapshot = super.get(key);
+                if (!targetKey.equals(key) || snapshot.isPresent()) {
+                    return snapshot;
+                }
+                int lookup = emptyLookups.incrementAndGet();
+                if (lookup == 1) {
+                    firstEmptyLookup.countDown();
+                    try {
+                        assertTrue(releaseFirst.await(10, TimeUnit.SECONDS), "first lookup was not released");
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError("first lookup was interrupted", interrupted);
+                    }
+                } else if (lookup == 2) {
+                    secondEmptyLookup.countDown();
+                }
+                return snapshot;
+            }
+        };
+        CognitoService concurrentService = new CognitoService(poolStore, new InMemoryStorage<>(), resourceServers,
+                userStore, groupStore, revokedTokenStore, "http://localhost:4566", "cloudfront.net",
+                regionResolver, null, acmService);
+        ResourceServerScope firstScope = new ResourceServerScope();
+        firstScope.setScopeName("first-read");
+        firstScope.setScopeDescription("First request scope");
+        ResourceServerScope secondScope = new ResourceServerScope();
+        secondScope.setScopeName("second-read");
+        secondScope.setScopeDescription("Second request scope");
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<ResourceServer> first = executor.submit(() -> {
+                firstWorker.set(Thread.currentThread());
+                return concurrentService.createResourceServer(pool.getId(), identifier, "First", List.of(firstScope));
+            });
+            assertTrue(firstEmptyLookup.await(5, TimeUnit.SECONDS), "first create did not capture an empty lookup");
+            Future<ResourceServer> second = executor.submit(() -> {
+                secondWorker.set(Thread.currentThread());
+                return concurrentService.createResourceServer(pool.getId(), identifier, "Second", List.of(secondScope));
+            });
+            ThreadMXBean threads = ManagementFactory.getThreadMXBean();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            boolean overlappingCreatesObserved = false;
+            while (System.nanoTime() < deadline) {
+                if (secondEmptyLookup.getCount() == 0) {
+                    overlappingCreatesObserved = true;
+                    break;
+                }
+                Thread worker = secondWorker.get();
+                ThreadInfo info = worker == null ? null : threads.getThreadInfo(worker.threadId(), 32);
+                if (info != null && info.getThreadState() == Thread.State.BLOCKED
+                        && info.getLockOwnerId() == firstWorker.get().threadId()) {
+                    for (StackTraceElement frame : info.getStackTrace()) {
+                        if (CognitoService.class.getName().equals(frame.getClassName())
+                                && "createResourceServer".equals(frame.getMethodName())) {
+                            overlappingCreatesObserved = true;
+                            break;
+                        }
+                    }
+                    if (overlappingCreatesObserved) {
+                        break;
+                    }
+                }
+                Thread.sleep(1L);
+            }
+            assertTrue(overlappingCreatesObserved, "second create neither captured empty nor blocked on the first create");
+            releaseFirst.countDown();
+            List<ResourceServer> created = new ArrayList<>();
+            int conflicts = 0;
+            for (Future<ResourceServer> result : List.of(first, second)) {
+                try {
+                    created.add(result.get(5, TimeUnit.SECONDS));
+                } catch (ExecutionException failure) {
+                    AwsException conflict = assertInstanceOf(AwsException.class, failure.getCause());
+                    assertEquals("ResourceConflictException", conflict.getErrorCode());
+                    assertEquals(400, conflict.getHttpStatus());
+                    conflicts++;
+                }
+            }
+            assertEquals(1, created.size(), "Concurrent empty lookup snapshots: " + emptyLookups.get());
+            assertEquals(1, conflicts);
+            ResourceServer winner = created.getFirst();
+            assertEquals("First", winner.getName());
+            assertEquals("first-read", winner.getScopes().getFirst().getScopeName());
+            assertEquals("First request scope", winner.getScopes().getFirst().getScopeDescription());
+            ResourceServer stored = concurrentService.describeResourceServer(pool.getId(), identifier);
+            assertEquals(pool.getId(), stored.getUserPoolId());
+            assertEquals(identifier, stored.getIdentifier());
+            assertEquals(winner.getName(), stored.getName());
+            assertEquals(1, stored.getScopes().size());
+            assertEquals(winner.getScopes().getFirst().getScopeName(), stored.getScopes().getFirst().getScopeName());
+            assertEquals(winner.getScopes().getFirst().getScopeDescription(),
+                    stored.getScopes().getFirst().getScopeDescription());
+            List<ResourceServer> listed = concurrentService.listResourceServers(pool.getId());
+            assertEquals(1, listed.size());
+            assertEquals(winner.getName(), listed.getFirst().getName());
+            assertEquals(winner.getScopes().getFirst().getScopeName(), listed.getFirst().getScopes().getFirst().getScopeName());
+        } finally {
+            releaseFirst.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "create workers did not terminate");
+        }
     }
 
     private UserPool createPoolAndUser() {
@@ -5734,7 +5858,10 @@ class CognitoServiceTest {
 
     @Test
     void getUserAuthFactors_userWithoutPassword_omitsPasswordFactor() {
-        UserPool pool = service.createUserPool(Map.of("PoolName", "PasswordlessPool"), "us-east-1");
+        // AdminCreateUser leaves a user without a password only where passwordless sign-in is offered.
+        UserPool pool = service.createUserPool(Map.of("PoolName", "PasswordlessPool",
+                "Policies", Map.of("SignInPolicy", Map.of("AllowedFirstAuthFactors", List.of("PASSWORD", "EMAIL_OTP")))),
+                "us-east-1");
         UserPoolClient client = service.createUserPoolClient(
                 pool.getId(), "c", false, false, List.of(), List.of());
         CognitoUser user = service.adminCreateUser(pool.getId(), "bob",
@@ -5750,7 +5877,9 @@ class CognitoServiceTest {
 
     @Test
     void getUserAuthFactors_userWithNoFactors_returnsOnlyUsername() {
-        UserPool pool = service.createUserPool(Map.of("PoolName", "NoFactorPool"), "us-east-1");
+        UserPool pool = service.createUserPool(Map.of("PoolName", "NoFactorPool",
+                "Policies", Map.of("SignInPolicy", Map.of("AllowedFirstAuthFactors", List.of("PASSWORD", "EMAIL_OTP")))),
+                "us-east-1");
         UserPoolClient client = service.createUserPoolClient(
                 pool.getId(), "c", false, false, List.of(), List.of());
         CognitoUser user = service.adminCreateUser(pool.getId(), "carol",
@@ -6455,5 +6584,279 @@ class CognitoServiceTest {
         int pad = (4 - segment.length() % 4) % 4;
         segment += "=".repeat(pad);
         return new String(Base64.getUrlDecoder().decode(segment), StandardCharsets.UTF_8);
+    }
+
+    @Nested
+    class AdminCreateUserInvitation {
+
+        private CognitoService svc;
+        private CognitoMessageDispatcher messageDispatcher;
+
+        @BeforeEach
+        void setUpMessaging() {
+            messageDispatcher = mock(CognitoMessageDispatcher.class);
+            svc = new CognitoService(
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    "http://localhost:4566",
+                    regionResolver,
+                    null,
+                    acmService,
+                    mock(VerificationCodeService.class),
+                    messageDispatcher,
+                    mock(TlsCertificateManager.class)
+            );
+        }
+
+        private CognitoUser create(UserPool pool, String username, Map<String, String> attributes,
+                                   String temporaryPassword, String messageAction, List<String> mediums) {
+            return svc.adminCreateUser(pool.getId(), username, attributes, temporaryPassword, messageAction,
+                    false, mediums, Map.of(), Map.of());
+        }
+
+        private String sentPassword() {
+            ArgumentCaptor<String> password = ArgumentCaptor.forClass(String.class);
+            verify(messageDispatcher).dispatchInvitation(any(), any(), password.capture(), any(), any());
+            return password.getValue();
+        }
+
+        private UserPool passwordlessPool(List<String> firstAuthFactors) {
+            return svc.createUserPool(Map.of(
+                    "PoolName", "PasswordlessInvitePool",
+                    "Policies", Map.of("SignInPolicy", Map.of("AllowedFirstAuthFactors", firstAuthFactors))),
+                    "us-east-1");
+        }
+
+        private void failDelivery() {
+            doThrow(new RuntimeException("SES down"))
+                    .when(messageDispatcher).dispatchInvitation(any(), any(), any(), any(), any());
+        }
+
+        @Test
+        void withoutTemporaryPassword_generatesOneThatMeetsThePasswordPolicy() {
+            UserPool pool = svc.createUserPool(Map.of(
+                    "PoolName", "GeneratedPasswordPool",
+                    "Policies", Map.of("PasswordPolicy", Map.of(
+                            "MinimumLength", 14,
+                            "RequireUppercase", true,
+                            "RequireLowercase", true,
+                            "RequireNumbers", true,
+                            "RequireSymbols", true))), "us-east-1");
+
+            CognitoUser user = create(pool, "alice", Map.of("email", "alice@example.com"), null, null,
+                    List.of("EMAIL"));
+
+            assertEquals("FORCE_CHANGE_PASSWORD", user.getUserStatus());
+            assertNotNull(user.getPasswordHash());
+            String password = sentPassword();
+            assertTrue(password.length() >= 14, password);
+            assertTrue(password.chars().anyMatch(Character::isUpperCase), password);
+            assertTrue(password.chars().anyMatch(Character::isLowerCase), password);
+            assertTrue(password.chars().anyMatch(Character::isDigit), password);
+            assertTrue(password.chars().anyMatch(c -> !Character.isLetterOrDigit(c)), password);
+            // The pool's own policy check accepts the generated password.
+            assertDoesNotThrow(() -> svc.adminSetUserPassword(pool.getId(), "alice", password, false));
+        }
+
+        @Test
+        void withoutMessageAction_sendsTheInvitationThroughTheRequestedMediums() {
+            UserPool pool = svc.createUserPool(Map.of("PoolName", "InvitePool"), "us-east-1");
+
+            CognitoUser user = create(pool, "alice", Map.of("email", "alice@example.com"), "Temp1234!", null,
+                    List.of("EMAIL"));
+
+            verify(messageDispatcher).dispatchInvitation(any(), eq(user), eq("Temp1234!"), eq(List.of("EMAIL")),
+                    isNull());
+        }
+
+        @Test
+        void withoutDesiredDeliveryMediums_sendsBySms() {
+            UserPool pool = svc.createUserPool(Map.of("PoolName", "SmsDefaultPool"), "us-east-1");
+
+            create(pool, "alice", Map.of("phone_number", "+5215551234567"), "Temp1234!", null, List.of());
+
+            verify(messageDispatcher).dispatchInvitation(any(), any(), eq("Temp1234!"), eq(List.of("SMS")), isNull());
+        }
+
+        @Test
+        void unknownDeliveryMedium_isRefusedAndCreatesNoUser() {
+            UserPool pool = svc.createUserPool(Map.of("PoolName", "BadMediumPool"), "us-east-1");
+
+            AwsException failure = assertThrows(AwsException.class, () -> create(pool, "alice",
+                    Map.of("email", "alice@example.com"), "Temp1234!", null, List.of("EMAIL", "VOICE")));
+
+            assertEquals("InvalidParameterException", failure.getErrorCode());
+            assertEquals("1 validation error detected: Value '[EMAIL, VOICE]' at 'desiredDeliveryMediums' failed "
+                    + "to satisfy constraint: Member must satisfy constraint: [Member must satisfy enum value set: "
+                    + "[SMS, EMAIL]]", failure.getMessage());
+            assertEquals("UserNotFoundException",
+                    assertThrows(AwsException.class, () -> svc.adminGetUser(pool.getId(), "alice")).getErrorCode());
+            verifyNoInteractions(messageDispatcher);
+        }
+
+        @Test
+        void unknownMessageAction_isRefused() {
+            UserPool pool = svc.createUserPool(Map.of("PoolName", "BadActionPool"), "us-east-1");
+
+            AwsException failure = assertThrows(AwsException.class, () -> create(pool, "alice",
+                    Map.of("email", "alice@example.com"), "Temp1234!", "suppress", List.of("EMAIL")));
+
+            assertEquals("InvalidParameterException", failure.getErrorCode());
+            assertEquals("1 validation error detected: Value 'suppress' at 'messageAction' failed to satisfy "
+                    + "constraint: Member must satisfy enum value set: [RESEND, SUPPRESS]", failure.getMessage());
+            verifyNoInteractions(messageDispatcher);
+        }
+
+        @Test
+        void suppress_sendsNoInvitationButStillGeneratesAPassword() {
+            UserPool pool = svc.createUserPool(Map.of("PoolName", "SuppressPool"), "us-east-1");
+
+            CognitoUser user = create(pool, "alice", Map.of("email", "alice@example.com"), null, "SUPPRESS",
+                    List.of("EMAIL"));
+
+            assertEquals("FORCE_CHANGE_PASSWORD", user.getUserStatus());
+            assertNotNull(user.getPasswordHash());
+            verify(messageDispatcher, never()).dispatchInvitation(any(), any(), any(), any(), any());
+        }
+
+        @Test
+        void passwordlessPool_withoutTemporaryPassword_createsAConfirmedUserWithoutAPassword() {
+            UserPool pool = passwordlessPool(List.of("PASSWORD", "EMAIL_OTP"));
+
+            CognitoUser user = create(pool, "alice", Map.of("email", "alice@example.com"), null, null,
+                    List.of("EMAIL"));
+
+            assertEquals("CONFIRMED", user.getUserStatus());
+            assertNull(user.getPasswordHash());
+            assertNull(sentPassword());
+        }
+
+        @Test
+        void passwordlessPool_withoutAnAttributeForAPasswordlessFactor_isRefused() {
+            UserPool pool = passwordlessPool(List.of("PASSWORD", "EMAIL_OTP"));
+
+            AwsException failure = assertThrows(AwsException.class, () -> create(pool, "alice",
+                    Map.of("phone_number", "+5215551234567"), null, null, List.of("SMS")));
+
+            assertEquals("InvalidParameterException", failure.getErrorCode());
+            assertEquals("UserNotFoundException",
+                    assertThrows(AwsException.class, () -> svc.adminGetUser(pool.getId(), "alice")).getErrorCode());
+        }
+
+        @Test
+        void passwordlessPool_withoutARequiredAttribute_isRefused() {
+            UserPool pool = svc.createUserPool(Map.of(
+                    "PoolName", "RequiredAttributePool",
+                    "Schema", List.of(Map.of("Name", "name", "AttributeDataType", "String",
+                            "Mutable", true, "Required", true)),
+                    "Policies", Map.of("SignInPolicy", Map.of("AllowedFirstAuthFactors",
+                            List.of("PASSWORD", "EMAIL_OTP")))), "us-east-1");
+
+            AwsException failure = assertThrows(AwsException.class, () -> create(pool, "alice",
+                    Map.of("email", "alice@example.com"), null, null, List.of("EMAIL")));
+
+            assertEquals("InvalidParameterException", failure.getErrorCode());
+            assertEquals("Attributes did not conform to the schema: name: The attribute is required",
+                    failure.getMessage());
+            // "Administrators can omit values for required attributes when they create users with
+            // temporary passwords."
+            assertEquals("FORCE_CHANGE_PASSWORD", create(pool, "bob", Map.of("email", "bob@example.com"),
+                    "Temp1234!", null, List.of("EMAIL")).getUserStatus());
+        }
+
+        @Test
+        void passkeyPool_withoutTemporaryPassword_stillGeneratesOne() {
+            // "If the only authentication flows available to new users require a password, for example
+            // passkey or username-password, you must create or generate a temporary password".
+            UserPool pool = passwordlessPool(List.of("PASSWORD", "WEB_AUTHN"));
+
+            CognitoUser user = create(pool, "alice", Map.of("email", "alice@example.com"), null, null,
+                    List.of("EMAIL"));
+
+            assertEquals("FORCE_CHANGE_PASSWORD", user.getUserStatus());
+            assertNotNull(sentPassword());
+        }
+
+        @Test
+        void resend_givesANewTemporaryPasswordAndSendsTheInvitationAgain() {
+            UserPool pool = svc.createUserPool(Map.of("PoolName", "ResendPool"), "us-east-1");
+            String firstHash = create(pool, "alice", Map.of("email", "alice@example.com"), "Temp1234!",
+                    "SUPPRESS", List.of("EMAIL")).getPasswordHash();
+
+            CognitoUser resent = create(pool, "alice", Map.of(), null, "RESEND", List.of("EMAIL"));
+
+            String password = sentPassword();
+            assertNotEquals("Temp1234!", password);
+            assertNotEquals(firstHash, resent.getPasswordHash());
+            assertEquals("FORCE_CHANGE_PASSWORD", resent.getUserStatus());
+        }
+
+        @Test
+        void resend_failedDelivery_keepsThePreviousTemporaryPassword() {
+            UserPool pool = svc.createUserPool(Map.of("PoolName", "FailedResendPool"), "us-east-1");
+            String firstHash = create(pool, "alice", Map.of("email", "alice@example.com"), "Temp1234!",
+                    "SUPPRESS", List.of("EMAIL")).getPasswordHash();
+            failDelivery();
+
+            AwsException failure = assertThrows(AwsException.class, () -> create(pool, "alice", Map.of(),
+                    "Other1234!", "RESEND", List.of("EMAIL")));
+
+            assertEquals("CodeDeliveryFailureException", failure.getErrorCode());
+            assertEquals(firstHash, svc.adminGetUser(pool.getId(), "alice").getPasswordHash());
+        }
+
+        @Test
+        void resend_passwordOutsideThePolicy_isRefusedBeforeAnythingIsSent() {
+            UserPool pool = svc.createUserPool(Map.of(
+                    "PoolName", "ResendPolicyPool",
+                    "Policies", Map.of("PasswordPolicy", Map.of("MinimumLength", 12))), "us-east-1");
+            create(pool, "alice", Map.of("email", "alice@example.com"), "LongEnough1234!", "SUPPRESS",
+                    List.of("EMAIL"));
+
+            AwsException failure = assertThrows(AwsException.class, () -> create(pool, "alice", Map.of(),
+                    "Short1!", "RESEND", List.of("EMAIL")));
+
+            assertEquals("InvalidPasswordException", failure.getErrorCode());
+            verify(messageDispatcher, never()).dispatchInvitation(any(), any(), any(), any(), any());
+        }
+
+        @Test
+        void failedInvitationDelivery_isCodeDeliveryFailureAndCreatesNoUser() {
+            UserPool pool = svc.createUserPool(Map.of("PoolName", "FailedDeliveryPool"), "us-east-1");
+            failDelivery();
+
+            AwsException failure = assertThrows(AwsException.class, () -> create(pool, "alice",
+                    Map.of("email", "alice@example.com"), null, null, List.of("EMAIL")));
+
+            assertEquals("CodeDeliveryFailureException", failure.getErrorCode());
+            AwsException lookup = assertThrows(AwsException.class, () -> svc.adminGetUser(pool.getId(), "alice"));
+            assertEquals("UserNotFoundException", lookup.getErrorCode());
+        }
+
+        @Test
+        void failedInvitationDelivery_withForceAliasCreation_leavesTheAliasWithItsHolder() {
+            Map<String, Object> poolRequest = Map.of("PoolName", "AliasInvitePool",
+                    "UsernameAttributes", List.of("email"));
+            UserPool pool = svc.createUserPool(poolRequest, "us-east-1");
+            CognitoUser holder = create(pool, "alice@example.com", Map.of("email_verified", "true"), "Temp1234!",
+                    "SUPPRESS", List.of("EMAIL"));
+            failDelivery();
+
+            AwsException failure = assertThrows(AwsException.class, () -> svc.adminCreateUser(pool.getId(),
+                    "alice@example.com", Map.of("email_verified", "true"), null, null, true, List.of("EMAIL"),
+                    Map.of(), Map.of()));
+
+            assertEquals("CodeDeliveryFailureException", failure.getErrorCode());
+            CognitoUser after = svc.adminGetUser(pool.getId(), holder.getUsername());
+            assertEquals("alice@example.com", after.getAttributes().get("email"));
+            assertEquals("true", after.getAttributes().get("email_verified"));
+            assertEquals(holder.getUsername(), svc.adminGetUser(pool.getId(), "alice@example.com").getUsername());
+        }
     }
 }

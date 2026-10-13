@@ -12,8 +12,10 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -72,13 +74,7 @@ public class CognitoUserPoolUserCfnProvisioner implements CfnResourceProvisioner
                             + "replacing. Rename " + username + " and update the stack again.", 400);
         }
 
-        Map<String, String> userAttributes = new LinkedHashMap<>();
-        for (JsonNode attribute : resolved.path("UserAttributes")) {
-            userAttributes.put(attribute.path("Name").asText(), attribute.path("Value").asText());
-        }
-        // DesiredDeliveryMediums only reaches a message transport, which AdminCreateUser does not
-        // drive here. ValidationData and ClientMetadata are not passed to the PreSignUp trigger,
-        // which sees empty maps. All three only take part in the createOnly record.
+        Map<String, String> userAttributes = attributeMap(resolved.path("UserAttributes"));
         String name = customNamed ? username : ctx.generatePhysicalName(r.getLogicalId(), 128, false);
         String messageAction = text(resolved, "MessageAction");
         if ("RESEND".equalsIgnoreCase(messageAction)) {
@@ -87,8 +83,15 @@ public class CognitoUserPoolUserCfnProvisioner implements CfnResourceProvisioner
             throw new AwsException("AlreadyExists", "Resource of type 'AWS::Cognito::UserPoolUser' with identifier '"
                     + userPoolId + "|" + existing.getUsername() + "' already exists.", 400);
         }
+        Map<String, String> clientMetadata = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonNode> entry : resolved.path("ClientMetadata").properties()) {
+            clientMetadata.put(entry.getKey(), entry.getValue().asText());
+        }
+        List<String> desiredDeliveryMediums = new ArrayList<>();
+        resolved.path("DesiredDeliveryMediums").forEach(medium -> desiredDeliveryMediums.add(medium.asText()));
         CognitoUser user = cognitoService.adminCreateUser(userPoolId, name, userAttributes, null, messageAction,
-                Boolean.parseBoolean(text(resolved, "ForceAliasCreation")));
+                Boolean.parseBoolean(text(resolved, "ForceAliasCreation")), desiredDeliveryMediums,
+                attributeMap(resolved.path("ValidationData")), clientMetadata);
 
         r.setPhysicalId(user.getUsername());
         r.getAttributes().put(CREATE_ONLY_ATTR, resolved.toString());
@@ -203,6 +206,15 @@ public class CognitoUserPoolUserCfnProvisioner implements CfnResourceProvisioner
             LOG.warnv("Unreadable Cognito user createOnly record, treating it as absent: {0}", e.getMessage());
             return null;
         }
+    }
+
+    /** An {@code AttributeType} list, {@code [{"Name": ..., "Value": ...}]}, as a map. */
+    private static Map<String, String> attributeMap(JsonNode attributes) {
+        Map<String, String> map = new LinkedHashMap<>();
+        for (JsonNode attribute : attributes) {
+            map.put(attribute.path("Name").asText(), attribute.path("Value").asText());
+        }
+        return map;
     }
 
     private static String text(JsonNode node, String name) {

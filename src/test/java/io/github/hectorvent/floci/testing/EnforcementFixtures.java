@@ -4,6 +4,11 @@ import io.restassured.path.xml.XmlPath;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+
 import static io.restassured.RestAssured.given;
 
 /**
@@ -166,7 +171,7 @@ public final class EnforcementFixtures {
                 "InstanceProfileName", profileName).statusCode(200);
     }
 
-    /** Deletes a group, and first the users in it, which IAM wants gone before it will. */
+    /** Deletes a group after removing its users, inline policies and managed policy attachments. */
     public static void removeGroup(int port, String authorization, String groupName) {
         if (iam(port, authorization, "GetGroup", "GroupName", groupName)
                 .extract().statusCode() == 404) {
@@ -185,6 +190,13 @@ public final class EnforcementFixtures {
             iam(port, authorization, "DeleteGroupPolicy", "GroupName", groupName,
                     "PolicyName", policyName).statusCode(200);
         }
+        for (String policyArn : iam(port, authorization, "ListAttachedGroupPolicies",
+                "GroupName", groupName).statusCode(200).extract().xmlPath()
+                .getList("ListAttachedGroupPoliciesResponse.ListAttachedGroupPoliciesResult"
+                        + ".AttachedPolicies.member.PolicyArn", String.class)) {
+            iam(port, authorization, "DetachGroupPolicy", "GroupName", groupName,
+                    "PolicyArn", policyArn).statusCode(200);
+        }
         iam(port, authorization, "DeleteGroup", "GroupName", groupName).statusCode(200);
     }
 
@@ -200,28 +212,55 @@ public final class EnforcementFixtures {
     }
 
     /**
-     * Deletes an unversioned S3 bucket after its current objects. This helper lists one page of
-     * objects and does not remove old versions or delete markers, so callers must use it only for
-     * unversioned buckets with at most one page of objects.
+     * Deletes an S3 bucket after all its object versions and delete markers. Repeatedly removes
+     * the first page so deleting a page cannot invalidate a continuation marker. Retained or
+     * locked versions are left for the caller's cleanup to report as a failure.
      *
-     * @param authorization an S3-scoped header for an identity allowed to read and delete here
+     * @param authorization an S3-scoped header for an identity allowed to list bucket versions,
+     *                      delete object versions, and delete the bucket
      */
     public static void removeBucket(int port, String authorization, String bucket) {
         if (s3(port, authorization).when().head("/" + bucket)
                 .then().extract().statusCode() == 404) {
             return;
         }
-        for (String key : s3(port, authorization)
-                .queryParam("list-type", "2")
-            .when()
-                .get("/" + bucket)
-            .then()
-                .statusCode(200)
-                .extract().xmlPath().getList("ListBucketResult.Contents.Key", String.class)) {
-            s3(port, authorization).when().delete("/" + bucket + "/" + key)
-                    .then().statusCode(204);
+        List<ObjectVersion> previousPage = List.of();
+        while (true) {
+            XmlPath listing = s3(port, authorization).queryParam("versions", "")
+                    .queryParam("max-keys", 10)
+                    .when().get("/" + bucket)
+                    .then().statusCode(200).extract().xmlPath();
+            List<ObjectVersion> page = new ArrayList<>();
+            addVersions(page, listing, "Version");
+            addVersions(page, listing, "DeleteMarker");
+            if (page.isEmpty()) {
+                break;
+            }
+            if (page.equals(previousPage)) {
+                throw new IllegalStateException("S3 fixture purge made no progress for bucket " + bucket);
+            }
+            for (ObjectVersion version : page) {
+                String encodedKey = URLEncoder.encode(version.key(), StandardCharsets.UTF_8)
+                        .replace("+", "%20").replace("%2F", "/");
+                s3(port, authorization).urlEncodingEnabled(false)
+                        .queryParam("versionId", version.versionId())
+                        .when().delete("/" + bucket + "/" + encodedKey)
+                        .then().statusCode(204);
+            }
+            previousPage = page;
         }
         s3(port, authorization).when().delete("/" + bucket).then().statusCode(204);
+    }
+
+    private static void addVersions(List<ObjectVersion> page, XmlPath listing, String element) {
+        List<String> keys = listing.getList("ListVersionsResult." + element + ".Key", String.class);
+        List<String> versionIds = listing.getList("ListVersionsResult." + element + ".VersionId", String.class);
+        for (int i = 0; i < keys.size(); i++) {
+            page.add(new ObjectVersion(keys.get(i), versionIds.get(i)));
+        }
+    }
+
+    private record ObjectVersion(String key, String versionId) {
     }
 
     private static ValidatableResponse iam(int port, String authorization, String action,

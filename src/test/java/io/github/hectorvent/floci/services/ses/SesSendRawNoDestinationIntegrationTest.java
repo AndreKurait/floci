@@ -17,6 +17,7 @@ class SesSendRawNoDestinationIntegrationTest {
     private static final String AUTH =
             "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request";
     private static final String TO = "success@simulator.amazonses.com";
+    private static final String VERIFIED_SENDER = "no-destination-sender@floci.test";
 
     private static String rawData(String headers) {
         return Base64.getEncoder().encodeToString(
@@ -25,15 +26,25 @@ class SesSendRawNoDestinationIntegrationTest {
 
     @Test
     void v2SendEmail_rawWithoutDestination_takesRecipientsFromHeaders() {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH)
+            .formParam("Action", "VerifyEmailIdentity")
+            .formParam("EmailAddress", VERIFIED_SENDER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
         String messageId = given()
             .contentType("application/json")
             .header("Authorization", AUTH)
             .body("""
                 {
-                    "FromEmailAddress": "sender@example.com",
+                    "FromEmailAddress": "%s",
                     "Content": {"Raw": {"Data": "%s"}}
                 }
-                """.formatted(rawData("From: sender@example.com\r\nTo: " + TO + "\r\n")))
+                """.formatted(VERIFIED_SENDER, rawData("From: " + VERIFIED_SENDER + "\r\nTo: " + TO + "\r\n")))
         .when()
             .post("/v2/email/outbound-emails")
         .then()

@@ -55,6 +55,7 @@ order:
   - AWS::Logs
   - AWS::WAFv2
   - AWS::Config
+  - AWS::BedrockAgentCore
   - AWS::CloudFormation
   - AWS::CloudTrail
   - Custom
@@ -109,6 +110,7 @@ type_order:
   AWS::Cognito: [UserPool, UserPoolClient]
   AWS::Events: [Rule, EventBus, EventBusPolicy]
   AWS::CloudFormation: [CustomResource]
+  AWS::BedrockAgentCore: [Runtime, RuntimeEndpoint, Memory]
 
 # Namespace -> the service name shown in the Service column.
 service_labels:
@@ -119,6 +121,7 @@ service_labels:
   AWS::AutoScaling: Auto Scaling
   AWS::Batch: Batch
   AWS::Backup: Backup
+  AWS::BedrockAgentCore: Bedrock AgentCore
   AWS::CDK: CDK
   AWS::CertificateManager: ACM
   AWS::CloudFormation: CloudFormation
@@ -169,6 +172,7 @@ notes:
   AWS::Lambda::Function: Zip via S3/inline `ZipFile`, Image, and the `hot-reload` bind-mount bucket
   AWS::Lambda::EventSourceMapping: 'SQS, Kinesis, DynamoDB Streams; `ParallelizationFactor` and `TumblingWindowInSeconds` are ignored'
   AWS::Lambda::Alias: also what SAM's `AutoPublishAlias` expands into
+  AWS::Lambda::EventInvokeConfig: also what a SAM function's `EventInvokeConfig` expands into
   AWS::EC2::SecurityGroup: inline `SecurityGroupIngress`/`SecurityGroupEgress` supported
   AWS::ApplicationAutoScaling::ScalableTarget: '`ScheduledActions` are accepted and not run; Floci has no scheduled scaling'
   AWS::RDS::DBInstance: starts a real container
@@ -190,6 +194,9 @@ notes:
   AWS::Cognito::UserPool: '`ProviderURL` is the local issuer of the tokens Floci mints, `<base-url>/<pool id>`'
   AWS::Events::Archive: '`KmsKeyIdentifier` is ignored'
   AWS::CloudFront::Function: '`KeyValueStoreAssociations` is ignored'
+  AWS::BedrockAgentCore::Runtime: 'Ref returns the AgentRuntimeId; CapacityProviderConfiguration, FilesystemConfigurations, LifecycleConfiguration, PlatformVersion and RequestHeaderConfiguration are accepted and not stored'
+  AWS::BedrockAgentCore::RuntimeEndpoint: 'Ref returns the endpoint ARN; Tags are accepted and not stored'
+  AWS::BedrockAgentCore::Memory: 'Ref returns the memory ARN; MemoryStrategies, IndexedKeys, NamespaceKeys and StreamDeliveryResources are accepted and not stored'
 
 # Trailing prose appended to a row after its type list, for behaviour that belongs to the service
 # rather than to one type.

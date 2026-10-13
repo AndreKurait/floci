@@ -70,8 +70,11 @@ supported ranges before changing any stored settings. A rejected value returns
 `InvalidParameterValueException` and leaves the function configuration unchanged.
 
 The event invoke configuration is stored and returned as AWS does, and `AWS::Lambda::EventInvokeConfig`
-provisions it from a stack. Asynchronous invocations apply its retry, event age, destination settings,
-and dead-letter queue configurations (`DeadLetterConfig`).
+provisions it from a stack. A SAM function's `EventInvokeConfig` expands into that resource as
+`sam deploy` does: on `$LATEST`, or on the `AutoPublishAlias` alias, with the inline role policy for
+each destination and the SQS queue or SNS topic SAM creates when a destination gives only its `Type`.
+Asynchronous invocations apply its retry, event age, destination settings, and dead-letter queue
+configurations (`DeadLetterConfig`).
 
 ### Function policies under IAM enforcement
 
@@ -425,7 +428,7 @@ passes here and fails on deploy. The content is never mounted at `/opt` either w
 is logged at attach time and again at invoke; publish your own copy of the content locally under a
 name you control if the handler needs it at runtime.
 
-A layer ARN outside the `aws` partition is refused whatever that setting says. Partitions are
+A layer ARN outside the caller's partition is refused whatever that setting says. Partitions are
 isolated, so no resource policy can ever make such a layer readable, and `GetLayerVersionByArn`
 rejects one outright with `InvalidParameterValueException: Invalid layer version ...`.
 

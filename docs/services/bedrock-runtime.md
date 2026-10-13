@@ -52,6 +52,16 @@ export FLOCI_SERVICES_BEDROCK_RUNTIME_PROXY_DEFAULT_MODEL=llama3.2
 
 Useful for integration testing: applications that call Bedrock directly don't need to stand up their own stub/mock of Bedrock — point the existing SDK client at Floci and get real responses from whatever OpenAI-compatible backend is already available, with the stubbing concern handled by Floci instead of the application under test.
 
+### Upstream failures and caller cancellation
+
+When a caller disconnects during `Converse` or `ConverseStream`, the proxy cancels
+pending upstream requests and closes streaming response bodies, including streams
+that stall between tokens. The model server controls how it reacts to that signal.
+
+Operational HTTP-error warnings retain the upstream status code and omit the
+backend response body. A connected caller receives `ModelErrorException` with a
+bounded backend error description. Streaming error-body reads are limited to 8 KiB.
+
 ## Examples
 
 ### Structured outputs through the proxy

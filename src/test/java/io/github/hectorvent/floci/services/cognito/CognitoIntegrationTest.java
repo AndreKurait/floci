@@ -768,6 +768,108 @@ class CognitoIntegrationTest {
                         equalTo("no-reply@verificationemail.com"));
     }
 
+    @Test
+    void adminCreateUserEmailsAnInvitationWithAWorkingTemporaryPassword() throws Exception {
+        String invitePoolId = cognitoJson("CreateUserPool", """
+                { "PoolName": "InvitationPool" }
+                """).path("UserPool").path("Id").asText();
+        String inviteClientId = cognitoJson("CreateUserPoolClient", """
+                {
+                  "UserPoolId": "%s",
+                  "ClientName": "invitation-client",
+                  "ExplicitAuthFlows": ["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
+                }
+                """.formatted(invitePoolId)).path("UserPoolClient").path("ClientId").asText();
+        String invitee = "invited+" + UUID.randomUUID() + "@example.com";
+
+        cognitoAction("AdminCreateUser", """
+                {
+                  "UserPoolId": "%s",
+                  "Username": "%s",
+                  "UserAttributes": [{ "Name": "email", "Value": "%s" }],
+                  "DesiredDeliveryMediums": ["EMAIL"]
+                }
+                """.formatted(invitePoolId, invitee, invitee))
+                .then()
+                .statusCode(200)
+                .body("User.UserStatus", equalTo("FORCE_CHANGE_PASSWORD"));
+
+        String toInvitee = "messages.findAll { it.Destination?.ToAddresses?.contains('" + invitee + "') }";
+        String body = given()
+                .when()
+                .get("/_aws/ses")
+                .then()
+                .statusCode(200)
+                .body(toInvitee, hasSize(1))
+                .body(toInvitee + "[0].Subject", equalTo("Your temporary password"))
+                .extract()
+                .path(toInvitee + "[0].Body.text_part");
+        Matcher invitation = Pattern.compile("^Your username is (\\S+) and temporary password is (\\S+)\\.$")
+                .matcher(body);
+        assertTrue(invitation.find(), body);
+        assertEquals(invitee, invitation.group(1));
+
+        cognitoAction("AdminInitiateAuth", """
+                {
+                  "UserPoolId": "%s",
+                  "ClientId": "%s",
+                  "AuthFlow": "ADMIN_USER_PASSWORD_AUTH",
+                  "AuthParameters": { "USERNAME": "%s", "PASSWORD": "%s" }
+                }
+                """.formatted(invitePoolId, inviteClientId, invitee, invitation.group(2)))
+                .then()
+                .statusCode(200)
+                .body("ChallengeName", equalTo("NEW_PASSWORD_REQUIRED"));
+    }
+
+    @Test
+    void adminCreateUserWithSuppressSendsNoInvitation() throws Exception {
+        String suppressPoolId = cognitoJson("CreateUserPool", """
+                { "PoolName": "SuppressedInvitationPool" }
+                """).path("UserPool").path("Id").asText();
+        String invitee = "suppressed+" + UUID.randomUUID() + "@example.com";
+
+        cognitoAction("AdminCreateUser", """
+                {
+                  "UserPoolId": "%s",
+                  "Username": "%s",
+                  "UserAttributes": [{ "Name": "email", "Value": "%s" }],
+                  "DesiredDeliveryMediums": ["EMAIL"],
+                  "MessageAction": "SUPPRESS"
+                }
+                """.formatted(suppressPoolId, invitee, invitee))
+                .then()
+                .statusCode(200)
+                .body("User.UserStatus", equalTo("FORCE_CHANGE_PASSWORD"));
+
+        given()
+                .when()
+                .get("/_aws/ses")
+                .then()
+                .statusCode(200)
+                .body("messages.findAll { it.Destination?.ToAddresses?.contains('" + invitee + "') }", hasSize(0));
+    }
+
+    @Test
+    void adminCreateUserRefusesAnUnknownDeliveryMedium() throws Exception {
+        String mediumPoolId = cognitoJson("CreateUserPool", """
+                { "PoolName": "UnknownMediumPool" }
+                """).path("UserPool").path("Id").asText();
+
+        cognitoAction("AdminCreateUser", """
+                {
+                  "UserPoolId": "%s",
+                  "Username": "medium-user",
+                  "UserAttributes": [{ "Name": "email", "Value": "medium@example.com" }],
+                  "DesiredDeliveryMediums": ["VOICE"]
+                }
+                """.formatted(mediumPoolId))
+                .then()
+                .statusCode(400)
+                .body("__type", equalTo("InvalidParameterException"))
+                .body("message", containsString("'desiredDeliveryMediums'"));
+    }
+
     /** Creates a pool with {@code emailConfiguration}, signs a new user up to it and returns the username. */
     private static String signUpWithEmailConfiguration(String poolName, String emailConfiguration) throws Exception {
         JsonNode poolResponse = cognitoJson("CreateUserPool", """

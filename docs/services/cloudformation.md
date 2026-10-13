@@ -111,6 +111,27 @@ filter pattern) can fail after deletion and trigger restoration. The CFN schema 
 256-character metric namespace, but Floci's Logs API validation currently accepts at most 255:
 passing model validation does not imply provider acceptance.
 
+## Cognito user pool resource servers
+
+`AWS::Cognito::UserPoolResourceServer` returns its `Identifier` for `Ref`. Changing `Identifier`
+or `UserPoolId` replaces the server; changing `Name` or `Scopes` updates it in place. Optional
+`Scopes` or individual scope entries can be omitted by `Fn::If` selecting `AWS::NoValue`.
+The provisioner keeps the pool and identifier together in private replacement bookkeeping,
+so changing only the pool still cleans up the displaced server without changing the `Ref` value.
+
+Replacement rollback and historical cleanup use the shared bounded replacement lifecycle.
+Provisioning leaves historical cleanup for a committed update or stack deletion. A failed provision
+keeps that debt and its remaining retry budget.
+Committed replacements honor `UpdateReplacePolicy: Retain`; failed rollback replacements remain
+owed cleanup while their retry budget remains. Exhausted historical records are abandoned across
+later updates and stack-delete retries. Historical cleanup is address-based and does not provide
+an atomic ownership check against another stack or a direct Cognito API writer reusing the address.
+
+Failed in-place restoration preserves the original name and scopes for a later update retry.
+Deleting the current server keeps this snapshot if deletion fails. An update that skips a server
+with pending restoration can remain in `UPDATE_COMPLETE_CLEANUP_IN_PROGRESS`, blocking another
+update. `ContinueUpdateRollback` remains unsupported.
+
 ## Supported Resource Types
 
 Resource types provisioned during `CreateStack` / `UpdateStack` / `DeleteStack`. Each delegates to
@@ -128,7 +149,7 @@ cross-resource references.
 | SQS | `Queue`, `QueuePolicy` (accepted; policy not enforced) |
 | SNS | `Topic`, `Subscription`, `TopicPolicy` |
 | DynamoDB | `Table`, `GlobalTable` |
-| Lambda | `Function` (Zip via S3/inline `ZipFile`, Image, and the `hot-reload` bind-mount bucket), `LayerVersion`, `EventSourceMapping` (SQS, Kinesis, DynamoDB Streams; `ParallelizationFactor` and `TumblingWindowInSeconds` are ignored), `Version`, `Alias` (also what SAM's `AutoPublishAlias` expands into), `Permission`, `EventInvokeConfig`, `MicrovmImage`, `NetworkConnector`, `Url`. Inline `ZipFile` packages include the `cfn-response` (Node.js) / `cfnresponse` (Python) module AWS injects for that code path, so Solutions-style custom-resource handlers work. |
+| Lambda | `Function` (Zip via S3/inline `ZipFile`, Image, and the `hot-reload` bind-mount bucket), `LayerVersion`, `EventSourceMapping` (SQS, Kinesis, DynamoDB Streams; `ParallelizationFactor` and `TumblingWindowInSeconds` are ignored), `Version`, `Alias` (also what SAM's `AutoPublishAlias` expands into), `Permission`, `EventInvokeConfig` (also what a SAM function's `EventInvokeConfig` expands into), `MicrovmImage`, `NetworkConnector`, `Url`. Inline `ZipFile` packages include the `cfn-response` (Node.js) / `cfnresponse` (Python) module AWS injects for that code path, so Solutions-style custom-resource handlers work. |
 | IAM | `Role`, `User` (template `LoginProfile` and `PermissionsBoundary` are ignored; an API-created login profile is removed on delete), `AccessKey`, `Policy`, `ManagedPolicy`, `InstanceProfile` |
 | Organizations | `Organization`, `OrganizationalUnit`, `Account`, `Policy`, `ResourcePolicy` |
 | SSM | `Parameter` |
@@ -154,7 +175,7 @@ cross-resource references.
 | CodePipeline | `Pipeline`, `CustomActionType`, `Webhook` |
 | CodeBuild | `Project` |
 | Batch | `ComputeEnvironment`, `JobQueue`, `JobDefinition` |
-| Cognito | `UserPool` (`ProviderURL` is the local issuer of the tokens Floci mints, `<base-url>/<pool id>`), `UserPoolClient`, `UserPoolDomain`, `UserPoolGroup`, `UserPoolUser`, `UserPoolUserToGroupAttachment` |
+| Cognito | `UserPool` (`ProviderURL` is the local issuer of the tokens Floci mints, `<base-url>/<pool id>`), `UserPoolClient`, `UserPoolDomain`, `UserPoolGroup`, `UserPoolResourceServer`, `UserPoolUser`, `UserPoolUserToGroupAttachment` |
 | ACM | `Certificate` |
 | EventBridge | `Rule`, `EventBus`, `EventBusPolicy`, `ApiDestination`, `Archive` (`KmsKeyIdentifier` is ignored) |
 | EventBridge Scheduler | `ScheduleGroup` |
@@ -169,6 +190,7 @@ cross-resource references.
 | CloudWatch Logs | `LogGroup`, `LogStream`, `MetricFilter` |
 | WAFv2 | `WebACL`, `WebACLAssociation` |
 | Config | `ConfigRule` |
+| Bedrock AgentCore | `Runtime` (Ref returns the AgentRuntimeId; CapacityProviderConfiguration, FilesystemConfigurations, LifecycleConfiguration, PlatformVersion and RequestHeaderConfiguration are accepted and not stored), `RuntimeEndpoint` (Ref returns the endpoint ARN; Tags are accepted and not stored), `Memory` (Ref returns the memory ARN; MemoryStrategies, IndexedKeys, NamespaceKeys and StreamDeliveryResources are accepted and not stored) |
 | CloudFormation | `CustomResource`, `Custom::DynamoDBReplica` (applied natively against DynamoDB, not via a provider Lambda), `Stack` (nested stacks), `Custom::*` (Lambda-backed) |
 | CloudTrail | `Trail` |
 | CDK | `CDK::Metadata` (accepted; no-op) |
