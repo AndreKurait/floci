@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.exception.NotFoundException;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerExecStubs;
@@ -15,9 +16,14 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -29,6 +35,8 @@ class Ec2VolumeBlockDeviceManagerTest {
     private static final String HELPER_ID = "helper-container-id";
 
     private DockerClient dockerClient;
+    private InspectContainerResponse helper;
+    private ContainerLifecycleManager lifecycleManager;
     private Ec2VolumeBlockDeviceManager manager;
 
     @BeforeEach
@@ -38,13 +46,91 @@ class Ec2VolumeBlockDeviceManagerTest {
         when(config.services().ec2().mock()).thenReturn(false);
 
         dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
-        InspectContainerResponse helper = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        helper = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
         when(helper.getState().getRunning()).thenReturn(true);
         when(helper.getId()).thenReturn(HELPER_ID);
         when(dockerClient.inspectContainerCmd(anyString()).exec()).thenReturn(helper);
 
+        lifecycleManager = mock(ContainerLifecycleManager.class);
         manager = new Ec2VolumeBlockDeviceManager(dockerClient, mock(ContainerBuilder.class),
-                mock(ContainerLifecycleManager.class), config);
+                lifecycleManager, config);
+    }
+
+    @Test
+    void stopManagedContainersReleasesLoopDevicesAndRemovesTheHelper() {
+        List<List<String>> commands = ContainerExecStubs.completeEveryExec(dockerClient, HELPER_ID, 0, "", "");
+
+        manager.stopManagedContainers();
+
+        assertEquals(1, commands.size());
+        String script = commands.getFirst().get(2);
+        assertTrue(script.contains("losetup -d \"$loop\""));
+        assertFalse(script.contains("rm -f"), "backing files must survive a shutdown");
+        verify(lifecycleManager).stopAndRemove(HELPER_ID, null, 0);
+    }
+
+    @Test
+    void stopManagedContainersRemovesAStoppedHelperWithoutRunningAnythingInIt() {
+        when(helper.getState().getRunning()).thenReturn(false);
+
+        manager.stopManagedContainers();
+
+        verify(dockerClient, never()).execCreateCmd(anyString());
+        verify(lifecycleManager).stopAndRemove(HELPER_ID, null, 0);
+    }
+
+    @Test
+    void stopManagedContainersNeverCreatesAHelperThatDoesNotExist() {
+        when(dockerClient.inspectContainerCmd(anyString()).exec()).thenThrow(new NotFoundException("no such container"));
+
+        manager.stopManagedContainers();
+
+        verifyNoInteractions(lifecycleManager);
+    }
+
+    @Test
+    void stopManagedContainersStillRemovesTheHelperWhenReleasingLoopDevicesFails() {
+        when(dockerClient.execCreateCmd(HELPER_ID)).thenThrow(new IllegalStateException("daemon went away"));
+
+        assertDoesNotThrow(() -> manager.stopManagedContainers());
+
+        verify(lifecycleManager).stopAndRemove(HELPER_ID, null, 0);
+    }
+
+    @Test
+    void stopManagedContainersFailsTheReleaseScriptWhenALoopDeviceWillNotDetach() {
+        List<List<String>> commands = ContainerExecStubs.completeEveryExec(dockerClient, HELPER_ID, 1,
+                "could not detach /dev/loop3 from /volumes/vol-1.raw", "");
+
+        assertDoesNotThrow(() -> manager.stopManagedContainers());
+
+        String script = commands.getFirst().get(2);
+        assertTrue(script.contains("|| { echo \"could not detach $loop from $f\"; failed=1; }"));
+        assertTrue(script.endsWith("exit $failed"));
+        verify(lifecycleManager).stopAndRemove(HELPER_ID, null, 0);
+    }
+
+    @Test
+    void clearDeletesTheBackingFilesAndRemovesTheHelper() {
+        List<List<String>> commands = ContainerExecStubs.completeEveryExec(dockerClient, HELPER_ID, 0, "", "");
+
+        manager.clear();
+
+        assertEquals(1, commands.size());
+        assertTrue(commands.getFirst().get(2).contains("rm -f \"$f\""));
+        verify(lifecycleManager).stopAndRemove(HELPER_ID, null, 0);
+    }
+
+    @Test
+    void stopManagedContainersDoesNothingWhenBlockDevicesAreDisabled() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().ec2().volumeBlockDevices()).thenReturn(false);
+        Ec2VolumeBlockDeviceManager disabledManager = new Ec2VolumeBlockDeviceManager(dockerClient,
+                mock(ContainerBuilder.class), lifecycleManager, config);
+
+        disabledManager.stopManagedContainers();
+
+        verify(lifecycleManager, never()).stopAndRemove(anyString(), any(), anyInt());
     }
 
     @Test

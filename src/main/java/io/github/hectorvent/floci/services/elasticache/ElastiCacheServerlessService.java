@@ -32,18 +32,16 @@ public class ElastiCacheServerlessService implements Resettable {
     private final RegionResolver resolver;
     private final ElastiCacheService runtime;
     private final ElastiCacheMemcachedService memcached;
-    private final ElastiCacheService groups;
     private final ConcurrentHashMap<String, Object> locks = new ConcurrentHashMap<>();
 
     @Inject
     public ElastiCacheServerlessService(StorageFactory factory, RegionResolver resolver, ElastiCacheService runtime,
-                                        ElastiCacheMemcachedService memcached, ElastiCacheService groups) {
+                                        ElastiCacheMemcachedService memcached) {
         this.caches = factory.create("elasticache", "elasticache-serverless-caches.json",
                 new TypeReference<Map<String, ServerlessCache>>() {});
         this.resolver = resolver;
         this.runtime = runtime;
         this.memcached = memcached;
-        this.groups = groups;
     }
 
     public record CreateServerlessCacheRequest(String serverlessCacheName, String engine, String majorEngineVersion,
@@ -55,7 +53,19 @@ public class ElastiCacheServerlessService implements Resettable {
     public record ModifyServerlessCacheRequest(String serverlessCacheName, String description, String engine,
                                                String majorEngineVersion, List<String> securityGroupIds,
                                                String userGroupId, Boolean removeUserGroup, CacheUsageLimits cacheUsageLimits,
-                                               Integer snapshotRetentionLimit, String dailySnapshotTime) {}
+                                               Integer snapshotRetentionLimit, String dailySnapshotTime,
+                                               boolean resetUnset) {
+
+        /** The API form: an omitted field leaves the stored value unchanged. */
+        public ModifyServerlessCacheRequest(String serverlessCacheName, String description, String engine,
+                                            String majorEngineVersion, List<String> securityGroupIds,
+                                            String userGroupId, Boolean removeUserGroup,
+                                            CacheUsageLimits cacheUsageLimits, Integer snapshotRetentionLimit,
+                                            String dailySnapshotTime) {
+            this(serverlessCacheName, description, engine, majorEngineVersion, securityGroupIds, userGroupId,
+                    removeUserGroup, cacheUsageLimits, snapshotRetentionLimit, dailySnapshotTime, false);
+        }
+    }
 
     public ServerlessCache createServerlessCache(CreateServerlessCacheRequest request) {
         String name = normalizedName(request.serverlessCacheName());
@@ -69,9 +79,7 @@ public class ElastiCacheServerlessService implements Resettable {
         if (request.snapshotArnsToRestore() != null && !request.snapshotArnsToRestore().isEmpty()) {
             throw invalid("Snapshot restore is not supported locally.");
         }
-        if (request.tags() != null && request.tags().size() > 50) {
-            throw new AwsException("TagQuotaPerResourceExceeded", "At most 50 tags are supported.", 400);
-        }
+        validateTagCount(request.tags());
         String rawGroup = request.userGroupId();
         String group = normalizedUserGroupId(rawGroup);
         String region = resolver.getRegion();
@@ -85,7 +93,7 @@ public class ElastiCacheServerlessService implements Resettable {
             CacheCluster backing = null;
             try {
                 if (group != null) {
-                    groups.attachServerlessCache(group, key(name), engine);
+                    runtime.attachServerlessCache(group, key(name), engine);
                     attached = true;
                 }
                 String runtimeId = "serverless-" + UUID.randomUUID();
@@ -131,7 +139,7 @@ public class ElastiCacheServerlessService implements Resettable {
                 }
                 if (attached) {
                     try {
-                        groups.detachServerlessCache(group, key(name));
+                        runtime.detachServerlessCache(group, key(name));
                     } catch (RuntimeException cleanupFailure) {
                         exception.addSuppressed(cleanupFailure);
                     }
@@ -178,7 +186,7 @@ public class ElastiCacheServerlessService implements Resettable {
             validateGroup(group, previous.getEngine(), previous.getRegion());
             boolean changedGroup = !Objects.equals(group, previous.getUserGroupId());
             if (changedGroup && group != null) {
-                groups.attachServerlessCache(group, key(name), previous.getEngine());
+                runtime.attachServerlessCache(group, key(name), previous.getEngine());
             }
             try {
                 if (changedGroup && !"memcached".equals(previous.getEngine())) {
@@ -191,13 +199,15 @@ public class ElastiCacheServerlessService implements Resettable {
                 if (request.securityGroupIds() != null) {
                     updated.setSecurityGroupIds(request.securityGroupIds());
                 }
-                if (request.cacheUsageLimits() != null) {
+                // CloudFormation sends the whole desired state, so an omitted field goes back to its create default.
+                if (request.cacheUsageLimits() != null || request.resetUnset()) {
                     updated.setCacheUsageLimits(request.cacheUsageLimits());
                 }
-                if (request.snapshotRetentionLimit() != null) {
-                    updated.setSnapshotRetentionLimit(request.snapshotRetentionLimit());
+                if (request.snapshotRetentionLimit() != null || request.resetUnset()) {
+                    updated.setSnapshotRetentionLimit(
+                            request.snapshotRetentionLimit() == null ? 0 : request.snapshotRetentionLimit());
                 }
-                if (request.dailySnapshotTime() != null) {
+                if (request.dailySnapshotTime() != null || request.resetUnset()) {
                     updated.setDailySnapshotTime(request.dailySnapshotTime());
                 }
                 caches.put(key(name), updated);
@@ -206,7 +216,7 @@ public class ElastiCacheServerlessService implements Resettable {
                     try {
                         runtime.updateServerlessUserGroup(previous.getBackingCacheClusterId(), previous.getAccountId(), previous.getUserGroupId());
                         if (group != null) {
-                            groups.detachServerlessCache(group, key(name));
+                            runtime.detachServerlessCache(group, key(name));
                         }
                     } catch (RuntimeException rollbackFailure) {
                         exception.addSuppressed(rollbackFailure);
@@ -215,9 +225,27 @@ public class ElastiCacheServerlessService implements Resettable {
                 throw exception;
             }
             if (changedGroup && previous.getUserGroupId() != null) {
-                groups.detachServerlessCache(previous.getUserGroupId(), key(name));
+                runtime.detachServerlessCache(previous.getUserGroupId(), key(name));
             }
             return current(updated);
+        }
+    }
+
+    /** Drives the tags to exactly the given set, the way CloudFormation reconciles a resource on update. */
+    public ServerlessCache replaceTags(String name, Map<String, String> tags) {
+        validateTagCount(tags);
+        String normalized = normalizedName(name);
+        synchronized (lockFor(normalized)) {
+            ServerlessCache updated = copy(requireCache(normalized));
+            updated.setTags(tags);
+            caches.put(key(normalized), updated);
+            return current(updated);
+        }
+    }
+
+    private static void validateTagCount(Map<String, String> tags) {
+        if (tags != null && tags.size() > 50) {
+            throw new AwsException("TagQuotaPerResourceExceeded", "At most 50 tags are supported.", 400);
         }
     }
 
@@ -242,7 +270,7 @@ public class ElastiCacheServerlessService implements Resettable {
                         cache.getBackingCacheClusterId(), normalized);
             }
             if (cache.getUserGroupId() != null) {
-                groups.detachServerlessCache(cache.getUserGroupId(), key(normalized));
+                runtime.detachServerlessCache(cache.getUserGroupId(), key(normalized));
             }
             caches.delete(key(normalized));
             ServerlessCache deleted = copy(cache);
@@ -300,7 +328,7 @@ public class ElastiCacheServerlessService implements Resettable {
         if ("memcached".equals(engine)) {
             throw new AwsException("InvalidParameterCombination", "Memcached does not support user groups.", 400);
         }
-        groups.validateServerlessAssociation(group, engine);
+        runtime.validateServerlessAssociation(group, engine);
     }
 
     private static String normalizedName(String name) {
@@ -375,7 +403,7 @@ public class ElastiCacheServerlessService implements Resettable {
                         cache.getBackingCacheClusterId(), cache.getServerlessCacheName());
             }
             if (cache.getUserGroupId() != null) {
-                groups.detachServerlessCache(cache.getUserGroupId(),
+                runtime.detachServerlessCache(cache.getUserGroupId(),
                         cache.getRegion() + "/" + cache.getServerlessCacheName());
             }
         }

@@ -92,6 +92,12 @@ public class RdsQueryHandler {
                 case "PromoteReadReplica" -> handlePromoteReadReplica(params, region);
                 case "SwitchoverReadReplica" -> handleSwitchoverReadReplica(params, region);
                 case "PromoteReadReplicaDBCluster" -> handlePromoteReadReplicaDbCluster(params, region);
+                case "DescribeDBEngineVersions" -> handleDescribeDbEngineVersions(params);
+                case "DescribeEngineDefaultParameters" -> handleDescribeEngineDefaultParameters(params,
+                        "DescribeEngineDefaultParameters");
+                case "DescribeEngineDefaultClusterParameters" -> handleDescribeEngineDefaultParameters(params,
+                        "DescribeEngineDefaultClusterParameters");
+                case "DescribeValidDBInstanceModifications" -> handleDescribeValidDbInstanceModifications(params, region);
                 case "DescribeOrderableDBInstanceOptions" -> handleDescribeOrderableDbInstanceOptions(params);
                 case "DescribeEvents" -> handleDescribeEvents(params, region);
                 case "CreateEventSubscription" -> handleCreateEventSubscription(params, region);
@@ -713,6 +719,109 @@ public class RdsQueryHandler {
             throw new AwsException("InvalidParameterValue",
                     "Value " + value + " is not a valid integer.", 400);
         }
+    }
+
+    private Response handleDescribeDbEngineVersions(MultivaluedMap<String, String> params) {
+        Map<String, List<String>> filters = new LinkedHashMap<>();
+        for (String name : List.of("db-parameter-group-family", "engine", "engine-mode", "engine-version", "status")) {
+            List<String> values = extractRdsFilterValues(params, name);
+            if (!values.isEmpty()) {
+                filters.put(name, values);
+            }
+        }
+        RdsService.EngineVersionPage page = service.describeDbEngineVersions(
+                params.getFirst("Engine"),
+                params.getFirst("EngineVersion"),
+                params.getFirst("DBParameterGroupFamily"),
+                Boolean.parseBoolean(params.getFirst("DefaultOnly")),
+                filters,
+                optionalInt(params.getFirst("MaxRecords")),
+                params.getFirst("Marker"));
+        XmlBuilder xml = new XmlBuilder().start("DBEngineVersions");
+        for (RdsEngineCatalog.EngineVersion v : page.versions()) {
+            xml.start("DBEngineVersion")
+               .elem("Engine", v.engine())
+               .elem("MajorEngineVersion", v.majorVersion())
+               .elem("EngineVersion", v.version())
+               .elem("DBParameterGroupFamily", v.family())
+               .elem("DBEngineDescription", v.engineDescription())
+               .elem("DBEngineVersionDescription", v.versionDescription())
+               .start("ValidUpgradeTarget");
+            for (RdsEngineCatalog.EngineVersion target : RdsEngineCatalog.upgradeTargets(v)) {
+                xml.start("UpgradeTarget")
+                   .elem("Engine", target.engine())
+                   .elem("EngineVersion", target.version())
+                   .elem("Description", target.versionDescription())
+                   .elem("AutoUpgrade", false)
+                   .elem("IsMajorVersionUpgrade", !target.majorVersion().equals(v.majorVersion()))
+                   .end("UpgradeTarget");
+            }
+            xml.end("ValidUpgradeTarget").start("ExportableLogTypes");
+            RdsEngineCatalog.exportableLogTypes(v).forEach(type -> xml.elem("member", type));
+            xml.end("ExportableLogTypes")
+               .elem("SupportsLogExportsToCloudwatchLogs", !RdsEngineCatalog.exportableLogTypes(v).isEmpty())
+               .elem("SupportsReadReplica", RdsEngineCatalog.supportsReadReplica(v))
+               .start("SupportedEngineModes");
+            v.engineModes().forEach(mode -> xml.elem("member", mode));
+            xml.end("SupportedEngineModes").start("SupportedFeatureNames");
+            RdsEngineCatalog.supportedFeatureNames(v).forEach(name -> xml.elem("member", name));
+            xml.end("SupportedFeatureNames")
+               .elem("Status", "available")
+               .elem("SupportsParallelQuery", false)
+               .elem("SupportsGlobalDatabases", RdsEngineCatalog.supportsGlobalDatabases(v))
+               .elem("SupportsBabelfish", false)
+               .end("DBEngineVersion");
+        }
+        xml.end("DBEngineVersions");
+        if (page.marker() != null) {
+            xml.elem("Marker", page.marker());
+        }
+        return Response.ok(AwsQueryResponse.envelope("DescribeDBEngineVersions", AwsNamespaces.RDS,
+                xml.build())).build();
+    }
+
+    /** Serves both engine default calls; they share the request and the EngineDefaults shape. */
+    private Response handleDescribeEngineDefaultParameters(MultivaluedMap<String, String> params, String action) {
+        String family = params.getFirst("DBParameterGroupFamily");
+        List<Map<String, String>> parameters = service.describeEngineDefaultParameters(family);
+        XmlBuilder xml = new XmlBuilder().start("EngineDefaults")
+                .elem("DBParameterGroupFamily", family)
+                .start("Parameters");
+        for (Map<String, String> parameter : parameters) {
+            xml.start("Parameter")
+               .elem("ParameterName", parameter.get("name"))
+               .elem("ParameterValue", parameter.get("value"))
+               .end("Parameter");
+        }
+        xml.end("Parameters").end("EngineDefaults");
+        return Response.ok(AwsQueryResponse.envelope(action, AwsNamespaces.RDS, xml.build())).build();
+    }
+
+    private Response handleDescribeValidDbInstanceModifications(MultivaluedMap<String, String> params, String region) {
+        List<RdsService.StorageModification> storage = service.describeValidDbInstanceModifications(
+                params.getFirst("DBInstanceIdentifier"), region);
+        XmlBuilder xml = new XmlBuilder().start("ValidDBInstanceModificationsMessage").start("Storage");
+        for (RdsService.StorageModification option : storage) {
+            xml.start("ValidStorageOptions")
+               .elem("StorageType", option.storageType())
+               .start("StorageSize");
+            for (RdsService.SizeRange range : option.sizes()) {
+                xml.start("Range")
+                   .elem("From", range.from())
+                   .elem("To", range.to())
+                   .elem("Step", 1)
+                   .end("Range");
+            }
+            xml.end("StorageSize")
+               .elem("SupportsStorageAutoscaling", true)
+               .end("ValidStorageOptions");
+        }
+        xml.end("Storage")
+           .start("ValidProcessorFeatures").end("ValidProcessorFeatures")
+           .elem("SupportsDedicatedLogVolume", false)
+           .end("ValidDBInstanceModificationsMessage");
+        return Response.ok(AwsQueryResponse.envelope("DescribeValidDBInstanceModifications", AwsNamespaces.RDS,
+                xml.build())).build();
     }
 
     private Response handleDescribeOrderableDbInstanceOptions(MultivaluedMap<String, String> params) {
@@ -3206,16 +3315,9 @@ public class RdsQueryHandler {
         }
     }
 
+    /** The catalogue's default for the engine, or {@code 1.0} for an engine it does not list. */
     private static String defaultEngineVersion(String engine) {
-        if (engine == null) {
-            return "16.3";
-        }
-        return switch (engine.toLowerCase()) {
-            case "postgres", "aurora-postgresql" -> "16.3";
-            case "mysql", "aurora-mysql", "aurora" -> "8.0.36";
-            case "mariadb" -> "11.2";
-            case "sqlserver-ee", "sqlserver-se", "sqlserver-ex", "sqlserver-web" -> "15.00";
-            default -> "1.0";
-        };
+        String version = RdsEngineCatalog.defaultVersion(engine);
+        return version != null ? version : "1.0";
     }
 }
