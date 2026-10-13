@@ -1300,7 +1300,7 @@ class ApiGatewayOpenApiImportTest {
                 .post("/execute-api/" + apiId + "/test/items")
                 .then()
                 .statusCode(400)
-                .body(containsString("price"));
+                .body("message", equalTo("Invalid request body"));
 
         // Wrong type for "price" — should fail
         given()
