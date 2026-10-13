@@ -51,14 +51,13 @@ class CloudWatchQueryGetIamEnforcementIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"Action", "Operation"})
-    void deniedSignedReadsReturnQueryAuthorizationErrors(String actionParameter) {
+    @CsvSource({"Action,false", "Operation,false", "Action,true", "Operation,true"})
+    void deniedSignedReadsReturnQueryAuthorizationErrors(String actionParameter, boolean presigned) {
         String user = "query-denied-" + UUID.randomUUID();
         String accessKey = EnforcementFixtures.createUser(
                 cleanup, baseUri.getPort(), auth("000000000000", "iam"), user).accessKeyId();
 
-        given()
-                .header("Authorization", auth(accessKey, "monitoring"))
+        signedRequest(accessKey, presigned)
                 .queryParam(actionParameter, "ListMetrics")
                 .queryParam("Version", "2010-08-01")
         .when().get("/")
@@ -69,7 +68,8 @@ class CloudWatchQueryGetIamEnforcementIntegrationTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"GET,Action", "GET,Operation", "POST,Action", "JSON,Action"})
+    @CsvSource({"GET,Action", "GET,Operation", "PRESIGNED,Action", "PRESIGNED,Operation",
+            "POST,Action", "JSON,Action"})
     void anAllowedSignedReadStillReachesCloudWatch(String protocol, String actionParameter) {
         String user = "query-allowed-" + UUID.randomUUID();
         String admin = auth("000000000000", "iam");
@@ -90,7 +90,7 @@ class CloudWatchQueryGetIamEnforcementIntegrationTest {
         .when().post("/")
         .then().statusCode(200);
 
-        RequestSpecification request = given().header("Authorization", auth(accessKey, "monitoring"));
+        RequestSpecification request = signedRequest(accessKey, "PRESIGNED".equals(protocol));
         Response response = switch (protocol) {
             case "JSON" -> request.contentType("application/x-amz-json-1.0")
                     .config(config().encoderConfig(EncoderConfig.encoderConfig()
@@ -107,5 +107,11 @@ class CloudWatchQueryGetIamEnforcementIntegrationTest {
         } else {
             response.then().contentType(containsString("xml")).body(containsString("ListMetricsResponse"));
         }
+    }
+
+    private static RequestSpecification signedRequest(String accessKey, boolean presigned) {
+        return presigned
+                ? given().queryParam("X-Amz-Credential", accessKey + "/20261013/us-east-1/monitoring/aws4_request")
+                : given().header("Authorization", auth(accessKey, "monitoring"));
     }
 }

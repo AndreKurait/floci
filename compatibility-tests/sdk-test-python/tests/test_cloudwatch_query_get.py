@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from contextlib import closing
 
 import boto3
-from botocore.auth import SigV4Auth
+from botocore.auth import SigV4Auth, SigV4QueryAuth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 
@@ -21,17 +21,21 @@ def test_cloudwatch_query_get(aws_config):
     credentials = Credentials(aws_config["aws_access_key_id"], aws_config["aws_secret_access_key"],
                               aws_config.get("aws_session_token"))
 
-    def request(method, parameters, authorization_header="Authorization"):
-        encoded = urllib.parse.urlencode({"Version": "2010-08-01", **parameters})
+    def request(method, parameters, authorization_header="Authorization", *,
+                presigned=False, headers=None, version="2010-08-01"):
+        query = {} if version is None else {"Version": version}
+        encoded = urllib.parse.urlencode({**query, **parameters})
         url = endpoint + ("/?" + encoded if method == "GET" else "/")
         body = None if method == "GET" else encoded
         signed = AWSRequest(method=method, url=url, data=body,
-                            headers={"Content-Type": "application/x-www-form-urlencoded"})
-        SigV4Auth(credentials, "monitoring", region).add_auth(signed)
+                            headers={"Content-Type": "application/x-www-form-urlencoded", **(headers or {})})
+        signer = (SigV4QueryAuth(credentials, "monitoring", region, expires=60) if presigned
+                  else SigV4Auth(credentials, "monitoring", region))
+        signer.add_auth(signed)
         headers = dict(signed.headers.items())
-        authorization = headers.pop("Authorization")
-        headers[authorization_header] = authorization
-        parsed = urllib.parse.urlsplit(url)
+        if not presigned:
+            headers[authorization_header] = headers.pop("Authorization")
+        parsed = urllib.parse.urlsplit(signed.url)
         connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
         with closing(connection_type(parsed.hostname, parsed.port, timeout=30)) as connection:
             connection.request(method, parsed.path + ("?" + parsed.query if parsed.query else ""),
@@ -84,3 +88,18 @@ def test_cloudwatch_query_get(aws_config):
     status, result = request("GET", {})
     assert status == 404
     assert result.tag.endswith("UnknownOperationException")
+    for presigned in [False, True]:
+        for headers in [{}, {"Accept": "text/html"}, {"X-Amz-Target": "AmazonSSM.GetParameter"}]:
+            status, result = request("GET", {"Action": "ListMetrics", "Namespace": namespace},
+                                     presigned=presigned, headers=headers)
+            assert status == 200
+            assert result.tag.endswith("ListMetricsResponse")
+    for action, version, expected in [
+        ("ListMetrics", None, 200), ("ListMetrics", "2009-05-15", 200),
+        ("ListMetrics", "", 404), ("ListMetrics", "2000-01-01", 404),
+        ("ListMetricStreams", None, 404), ("ListMetricStreams", "2009-05-15", 404),
+        ("ListMetricStreams", "2010-08-01", 200),
+    ]:
+        status, result = request("GET", {"Action": action}, version=version)
+        assert status == expected
+        assert result.tag.endswith(action + "Response" if expected == 200 else "ErrorResponse")

@@ -330,22 +330,21 @@ aws logs put-retention-policy \
 
 ## CloudWatch Metrics {#metrics}
 
-**Protocol:** Query (XML) and JSON 1.1 (both supported)
+**Protocol:** Query (XML) and JSON 1.0 (both supported)
 
 CloudWatch Query operations accept form-encoded POST requests and root GET requests with
-URL query parameters. GET uses the same handler, validation, XML response and IAM action
-classification as POST. Requests signed with the `monitoring` scope select CloudWatch;
-unsigned GET requests select it only for unambiguous supported CloudWatch actions.
-S3-scoped requests, SigV4 presigned URLs, unrelated query parameters and browser
-landing-page requests retain their existing routing. `Action` takes precedence over the
-legacy `Operation` fallback.
+URL query parameters. GET uses the existing handlers and IAM policy checks. A `monitoring`
+credential in the Authorization header or presigned URL selects CloudWatch, including
+requests with browser Accept headers or unrelated target headers. Unsigned GET requests
+select it only for unambiguous supported actions; ordinary S3, SNS and browser requests
+retain their existing routing. `Action` takes precedence over `Operation`.
 
-For requests signed with the `monitoring` scope, unknown or empty actions return HTTP 404
-`InvalidAction`; an absent action returns HTTP 404 `UnknownOperationException`. Authorization
-header names are case-insensitive. GET query parameters supply the API version used for both
-dispatch and IAM action classification.
+Use `Version=2010-08-01` for current GET operations. Omitting the version selects the
+legacy `2009-05-15` API, which supports only `ListMetrics` and `GetMetricStatistics`.
+An invalid version or action returns HTTP 404 `InvalidAction`; an absent action returns
+HTTP 404 `UnknownOperationException`. IAM policies use the `cloudwatch` action prefix.
 
-**Endpoint:** `http://localhost:4566/` — Query: GET or POST; JSON: POST.
+**Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
 
 ### Supported Actions
 

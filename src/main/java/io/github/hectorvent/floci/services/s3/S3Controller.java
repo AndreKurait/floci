@@ -212,10 +212,14 @@ public class S3Controller {
                                 @HeaderParam("Accept") String accept,
                                 @Context HttpHeaders httpHeaders,
                                 @Context UriInfo uriInfo) {
+        MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
+        String authorization = httpHeaders.getHeaderString("Authorization");
+        if (AwsQueryController.isCloudWatchQueryGet(authorization, target, accept, queryParams)) {
+            return awsQueryController.dispatchCloudWatchQueryGet(authorization, httpHeaders, queryParams);
+        }
         if (target != null) {
             return null;
         }
-        MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
         String action = queryParams.getFirst("Action");
         // SNS emits SubscribeURL/UnsubscribeURL as plain GET links against the
         // service root, which collides with the S3 ListBuckets endpoint. Delegate
@@ -234,10 +238,6 @@ public class S3Controller {
         // through to the normal S3 ListBuckets behavior untouched.
         if (accept != null && accept.contains(MediaType.TEXT_HTML)) {
             return Response.ok(uiPages.landingHtml(), MediaType.TEXT_HTML).build();
-        }
-        String authorization = httpHeaders.getHeaderString("Authorization");
-        if (AwsQueryController.isCloudWatchQueryGet(authorization, target, accept, queryParams)) {
-            return awsQueryController.dispatchCloudWatchQueryGet(authorization, httpHeaders, queryParams);
         }
         try {
             List<Bucket> buckets = s3Service.listBuckets();
