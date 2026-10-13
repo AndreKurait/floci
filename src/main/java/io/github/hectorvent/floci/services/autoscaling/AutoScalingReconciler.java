@@ -516,7 +516,7 @@ public class AutoScalingReconciler {
                 tags.put(key, value);
             }
         });
-        tags.put("aws:autoscaling:groupName", asg.getAutoScalingGroupName());
+        tags.put(AutoScalingService.GROUP_NAME_TAG, asg.getAutoScalingGroupName());
         return tags.entrySet().stream()
                 .map(entry -> new io.github.hectorvent.floci.services.ec2.model.Tag(entry.getKey(), entry.getValue()))
                 .toList();

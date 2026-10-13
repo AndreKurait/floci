@@ -21,6 +21,8 @@ import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 import java.util.Map;
@@ -119,6 +121,22 @@ class AutoScalingServiceTest {
         assertEquals("lt-updated", group.getLaunchTemplateId());
         assertEquals("2", group.getLaunchTemplateVersion());
         assertNull(group.getLaunchConfigurationName());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void detachInstancesRemovesOnlyTheDetachedInstancesMembershipTag(boolean decrementDesiredCapacity) {
+        service.ec2Service = mock(Ec2Service.class);
+        service.attachInstances(REGION, "test-asg", List.of("i-detached", "i-retained"));
+
+        service.detachInstances(REGION, "test-asg", List.of("i-detached"), decrementDesiredCapacity);
+
+        verify(service.ec2Service).deleteSystemTag(
+                REGION, List.of("i-detached"), "aws:autoscaling:groupName");
+        AutoScalingGroup group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
+        assertEquals(List.of("i-retained"),
+                group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals(decrementDesiredCapacity ? 1 : 2, group.getDesiredCapacity());
     }
 
     @Test

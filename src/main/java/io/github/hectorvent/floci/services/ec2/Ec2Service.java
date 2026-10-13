@@ -8403,6 +8403,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // ─── Tags ──────────────────────────────────────────────────────────────────
 
     public void createTags(String region, List<String> resourceIds, List<Tag> tagList) {
+        validateUserTagKeys(tagList);
         ensureDefaultResources(region);
         for (String resourceId : resourceIds) {
             withTopologyLockIfNeeded(region, resourceId, () -> {
@@ -8440,6 +8441,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public void deleteTags(String region, List<String> resourceIds, List<Tag> tagList) {
+        validateUserTagKeys(tagList);
+        deleteResourceTags(region, resourceIds, tagList);
+    }
+
+    /** Service-owned tag cleanup, separate from the public EC2 DeleteTags operation. */
+    public void deleteSystemTag(String region, List<String> resourceIds, String tagKey) {
+        deleteResourceTags(region, resourceIds, List.of(new Tag(tagKey, null)));
+    }
+
+    private void deleteResourceTags(String region, List<String> resourceIds, List<Tag> tagList) {
         ensureDefaultResources(region);
         for (String resourceId : resourceIds) {
             withTopologyLockIfNeeded(region, resourceId, () -> {
@@ -8450,6 +8461,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 });
                 if (stored != null) {
                     List<Tag> existing = new ArrayList<>(stored);
+                    if (tagList.isEmpty()) {
+                        existing.removeIf(tag -> !isAwsTagKey(tag.getKey()));
+                    }
                     for (Tag tag : tagList) {
                         existing.removeIf(t -> t.getKey().equals(tag.getKey())
                                 && (tag.getValue() == null || tag.getValue().equals(t.getValue())));
@@ -8460,6 +8474,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             });
         }
+    }
+
+    private static void validateUserTagKeys(List<Tag> tagList) {
+        for (Tag tag : tagList) {
+            if (isAwsTagKey(tag.getKey())) {
+                throw new AwsException("InvalidParameterValue",
+                        "Value ( " + tag.getKey() + " ) for parameter key is invalid. "
+                                + "Tag keys starting with 'aws:' are reserved for internal use", 400);
+            }
+        }
+    }
+
+    private static boolean isAwsTagKey(String key) {
+        return key != null && key.toLowerCase(Locale.ROOT).startsWith("aws:");
     }
 
     private void updateResourceTags(String region, String resourceId, List<Tag> tagList) {

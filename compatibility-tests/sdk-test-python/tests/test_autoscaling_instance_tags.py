@@ -6,6 +6,7 @@ from contextlib import ExitStack, closing
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 
 
 @pytest.mark.parametrize("group_tags", [False, True])
@@ -59,3 +60,54 @@ def test_launched_instances_include_group_name(ec2_client, aws_config, group_tag
         assert observed["Shared"] == ("group" if group_tags else "template")
         assert ("GroupOnly" in observed) == group_tags
         assert "NotPropagated" not in observed
+
+        for operation, normal_value in [
+                (ec2_client.create_tags, "changed"),
+                (ec2_client.delete_tags, observed["Shared"])]:
+            for key in ["aws:autoscaling:groupName", "AWS:custom", "aWs:custom"]:
+                with pytest.raises(ClientError) as error:
+                    operation(Resources=[instance_id], Tags=[
+                        {"Key": "Shared", "Value": normal_value},
+                        {"Key": key, "Value": "spoofed"},
+                    ])
+                assert error.value.response["Error"]["Code"] == "InvalidParameterValue"
+                assert error.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+                assert error.value.response["Error"]["Message"] == (
+                    f"Value ( {key} ) for parameter key is invalid. "
+                    "Tag keys starting with 'aws:' are reserved for internal use"
+                )
+                current = ec2_client.describe_instances(
+                    InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]
+                assert {tag["Key"]: tag["Value"] for tag in current["Tags"]} == observed
+
+        with pytest.raises(ClientError) as error:
+            ec2_client.delete_tags(Resources=[instance_id], Tags=[
+                {"Key": "aws:autoscaling:groupName"}])
+        assert error.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+        for delete_args in [{"Tags": []}, {}]:
+            ec2_client.create_tags(Resources=[instance_id], Tags=[
+                {"Key": "Editable", "Value": "normal"}])
+            ec2_client.delete_tags(Resources=[instance_id], **delete_args)
+            current = ec2_client.describe_instances(
+                InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]
+            remaining = {tag["Key"]: tag["Value"] for tag in current["Tags"]}
+            assert remaining["aws:autoscaling:groupName"] == name
+            assert all(key.lower().startswith("aws:") for key in remaining)
+
+        ec2_client.create_tags(Resources=[instance_id], Tags=[{"Key": "Kept", "Value": "after-detach"}])
+        cleanup.callback(ec2_client.terminate_instances, InstanceIds=[instance_id])
+        autoscaling.detach_instances(
+            AutoScalingGroupName=name, InstanceIds=[instance_id], ShouldDecrementDesiredCapacity=True)
+        detached = ec2_client.describe_instances(
+            InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]
+        detached_tags = {tag["Key"]: tag["Value"] for tag in detached.get("Tags", [])}
+        assert "aws:autoscaling:groupName" not in detached_tags
+        assert detached_tags["Kept"] == "after-detach"
+        assert not ec2_client.describe_tags(Filters=[
+            {"Name": "resource-id", "Values": [instance_id]},
+            {"Name": "key", "Values": ["aws:autoscaling:groupName"]},
+        ])["Tags"]
+        assert not ec2_client.describe_instances(Filters=[
+            {"Name": "tag:aws:autoscaling:groupName", "Values": [name]},
+        ])["Reservations"]
