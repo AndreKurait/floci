@@ -7786,6 +7786,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public void createTags(String region, List<String> resourceIds, List<Tag> tagList) {
         validateUserTagKeys(tagList);
+        createSystemTags(region, resourceIds, tagList);
+    }
+
+    /** Service-owned tags, separate from the public EC2 CreateTags operation. */
+    public void createSystemTags(String region, List<String> resourceIds, List<Tag> tagList) {
         ensureDefaultResources(region);
         for (String resourceId : resourceIds) {
             withTopologyLockIfNeeded(region, resourceId, () -> {
