@@ -14,7 +14,6 @@ import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
-import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -55,8 +54,6 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
 
     private volatile Boolean dockerAvailableCached;
     private volatile long dockerAvailableCheckTime;
-    private String helperContainerId;
-    private volatile boolean stopping;
 
     @Inject
     public Ec2VolumeBlockDeviceManager(DockerClient dockerClient,
@@ -73,9 +70,6 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
      * Checks if volume block device support is configured and Docker is reachable.
      */
     public boolean isAvailable() {
-        if (stopping) {
-            return false;
-        }
         if (config == null || config.services() == null || config.services().ec2() == null) {
             return false;
         }
@@ -428,17 +422,14 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
     }
 
     private synchronized String ensureHelperContainer() {
-        if (stopping) {
-            return null;
-        }
         String helperName = ContainerStorageHelper.resourceName(config, "ec2", null, "volume-helper");
         try {
             InspectContainerResponse inspect = dockerClient.inspectContainerCmd(helperName).exec();
-            if (!Boolean.TRUE.equals(inspect.getState().getRunning())) {
-                dockerClient.startContainerCmd(helperName).exec();
+            if (Boolean.TRUE.equals(inspect.getState().getRunning())) {
+                return inspect.getId();
             }
-            helperContainerId = inspect.getId();
-            return helperContainerId;
+            dockerClient.startContainerCmd(helperName).exec();
+            return inspect.getId();
         } catch (NotFoundException e) {
             // Container does not exist yet; proceed to create it
         } catch (Exception e) {
@@ -465,21 +456,10 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
             }
 
             ContainerSpec spec = builder.build();
-            helperContainerId = lifecycleManager.createAndStart(spec).containerId();
-            return helperContainerId;
+            return lifecycleManager.createAndStart(spec).containerId();
         } catch (Exception e) {
             LOG.warnv("Failed to create and start EC2 volume helper container {0}: {1}", helperName, e.getMessage());
             return null;
-        }
-    }
-
-    @PreDestroy
-    synchronized void stop() {
-        stopping = true;
-        if (helperContainerId != null) {
-            // The remembered ID cannot select a replacement or remove persisted volume data.
-            lifecycleManager.removeIfExistsStrict(helperContainerId);
-            helperContainerId = null;
         }
     }
 
@@ -526,7 +506,6 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
         }
         // The helper only sleeps and would ignore SIGTERM as PID 1, so do not wait on a graceful stop.
         lifecycleManager.stopAndRemove(helper.getId(), null, 0);
-        helperContainerId = null;
         activeLoopDevices.clear();
     }
 
@@ -560,7 +539,6 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
             // The helper was only needed to delete the files, so a reset ends as a shutdown does:
             // without one.
             lifecycleManager.stopAndRemove(helperId, null, 0);
-            helperContainerId = null;
         }
         activeLoopDevices.clear();
     }

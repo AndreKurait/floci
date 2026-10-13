@@ -15,19 +15,15 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
-import static org.mockito.Mockito.clearInvocations;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
-import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -213,43 +209,5 @@ class Ec2VolumeBlockDeviceManagerTest {
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), config);
 
         assertFalse(disabledManager.resizeVolume("vol-1", 16));
-    }
-
-    @Test
-    void shutdownBeforeUsingVolumesDoesNotCreateOrRemoveAHelper() {
-        clearInvocations(dockerClient, lifecycleManager);
-
-        manager.stop();
-
-        verifyNoInteractions(dockerClient, lifecycleManager);
-    }
-
-    @Test
-    void shutdownRemovesOnlyTheUsedHelperAndCannotRecreateIt() {
-        ContainerExecStubs.completeEveryExec(dockerClient, HELPER_ID, 0, "", "");
-        manager.createVolume("vol-1", 8);
-        InspectContainerResponse replacement = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
-        when(replacement.getId()).thenReturn("replacement");
-        when(dockerClient.inspectContainerCmd(anyString()).exec()).thenReturn(replacement);
-        clearInvocations(dockerClient, lifecycleManager);
-
-        manager.stop();
-        manager.stop();
-        manager.createVolume("vol-2", 8);
-
-        verify(lifecycleManager).removeIfExistsStrict(HELPER_ID);
-        verifyNoMoreInteractions(lifecycleManager);
-        verifyNoInteractions(dockerClient);
-    }
-
-    @Test
-    void failedShutdownPreservesTheHelperIdForRetry() {
-        ContainerExecStubs.completeEveryExec(dockerClient, HELPER_ID, 0, "", "");
-        manager.createVolume("vol-1", 8);
-        doThrow(new IllegalStateException("daemon unavailable"))
-                .doNothing().when(lifecycleManager).removeIfExistsStrict(HELPER_ID);
-
-        assertThrows(IllegalStateException.class, manager::stop);
-        assertDoesNotThrow(manager::stop);
     }
 }
