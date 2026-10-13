@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.autoscaling.model.*;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -163,6 +164,26 @@ public class AutoScalingService {
                                                           Boolean associatePublicIpAddress,
                                                           Boolean instanceMonitoringEnabled,
                                                           List<LaunchConfigurationBlockDeviceMapping> blockDeviceMappings) {
+        return createLaunchConfiguration(region, name, instanceId, imageId, instanceType, keyName,
+                securityGroups, userData, iamInstanceProfile, associatePublicIpAddress,
+                instanceMonitoringEnabled, blockDeviceMappings, null);
+    }
+
+    public LaunchConfiguration createLaunchConfiguration(String region, String name, String instanceId,
+                                                          String imageId, String instanceType, String keyName,
+                                                          List<String> securityGroups, String userData,
+                                                          String iamInstanceProfile, Boolean associatePublicIpAddress,
+                                                          Boolean instanceMonitoringEnabled,
+                                                          List<LaunchConfigurationBlockDeviceMapping> blockDeviceMappings,
+                                                          LaunchTemplateData.MetadataOptions metadataOptions) {
+        try {
+            Ec2Service.validateMetadataOptions(metadataOptions);
+        } catch (AwsException error) {
+            if (!"InvalidParameterValue".equals(error.getErrorCode())) {
+                throw error;
+            }
+            throw new AwsException("ValidationError", error.getMessage(), 400);
+        }
         String key = lcKey(region, name);
         if (launchConfigs.containsKey(key)) {
             throw new AwsException("AlreadyExists",
@@ -202,6 +223,7 @@ public class AutoScalingService {
                 }
             }
         }
+        resolveLaunchConfigurationProfile(iamInstanceProfile);
         LaunchConfiguration lc = new LaunchConfiguration();
         lc.setLaunchConfigurationName(name);
         lc.setLaunchConfigurationArn(
@@ -213,6 +235,7 @@ public class AutoScalingService {
         lc.setSecurityGroups(securityGroups != null ? new ArrayList<>(securityGroups) : new ArrayList<>());
         lc.setUserData(userData);
         lc.setIamInstanceProfile(iamInstanceProfile);
+        lc.setMetadataOptions(metadataOptions);
         lc.setAssociatePublicIpAddress(associatePublicIpAddress);
         // AWS documents InstanceMonitoring as enabled by default and always returns the
         // structure from Describe, unlike AssociatePublicIpAddress whose absence is meaningful.
@@ -222,6 +245,26 @@ public class AutoScalingService {
         lc.setRegion(region);
         launchConfigs.put(key, lc);
         return lc;
+    }
+
+    String resolveLaunchConfigurationProfile(String profile) {
+        if (isBlank(profile)) {
+            return null;
+        }
+        boolean arn = AwsArnUtils.isArn(profile);
+        String name = arn ? profile.substring(profile.lastIndexOf('/') + 1) : profile;
+        try {
+            String resolved = ec2Service.resolveIamInstanceProfileName(name);
+            if (arn && !profile.equals(resolved)) {
+                throw new AwsException("ValidationError", "Invalid IamInstanceProfile: " + profile, 400);
+            }
+            return resolved;
+        } catch (AwsException error) {
+            if (!"InvalidParameterValue".equals(error.getErrorCode())) {
+                throw error;
+            }
+            throw new AwsException("ValidationError", "Invalid IamInstanceProfile: " + profile, 400);
+        }
     }
 
     public List<LaunchConfiguration> describeLaunchConfigurations(String region, List<String> names) {
