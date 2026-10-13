@@ -22,6 +22,24 @@ def test_launched_instances_include_group_name(ec2_client, aws_config, group_tag
         image = ec2_client.register_image(
             Name=name, Architecture="x86_64", RootDeviceName="/dev/sda1")["ImageId"]
         cleanup.callback(ec2_client.deregister_image, ImageId=image)
+        before_instances = ec2_client.describe_instances(Filters=[
+            {"Name": "subnet-id", "Values": [subnet]}])["Reservations"]
+        before_interfaces = ec2_client.describe_network_interfaces(Filters=[
+            {"Name": "subnet-id", "Values": [subnet]}])["NetworkInterfaces"]
+        with pytest.raises(ClientError) as error:
+            ec2_client.run_instances(
+                ImageId=image, InstanceType="t3.nano", SubnetId=subnet, MinCount=1, MaxCount=1,
+                TagSpecifications=[{"ResourceType": "network-interface", "Tags": [
+                    {"Key": "Name", "Value": name}, {"Key": "aWs:reserved", "Value": "invalid"},
+                ]}])
+        assert error.value.response["Error"] == {
+            "Code": "InvalidParameterValue",
+            "Message": "Tag keys starting with 'aws:' are reserved for internal use",
+        }
+        assert ec2_client.describe_instances(Filters=[
+            {"Name": "subnet-id", "Values": [subnet]}])["Reservations"] == before_instances
+        assert ec2_client.describe_network_interfaces(Filters=[
+            {"Name": "subnet-id", "Values": [subnet]}])["NetworkInterfaces"] == before_interfaces
         template = ec2_client.create_launch_template(
             LaunchTemplateName=name,
             LaunchTemplateData={
@@ -111,3 +129,23 @@ def test_launched_instances_include_group_name(ec2_client, aws_config, group_tag
         assert not ec2_client.describe_instances(Filters=[
             {"Name": "tag:aws:autoscaling:groupName", "Values": [name]},
         ])["Reservations"]
+
+        autoscaling.attach_instances(AutoScalingGroupName=name, InstanceIds=[instance_id])
+        attached = ec2_client.describe_instances(
+            InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]
+        attached_tags = {tag["Key"]: tag["Value"] for tag in attached["Tags"]}
+        assert attached_tags["aws:autoscaling:groupName"] == name
+        assert attached_tags["Kept"] == "after-detach"
+        assert ("GroupOnly" in attached_tags) == group_tags
+        assert "NotPropagated" not in attached_tags
+        with pytest.raises(ClientError) as error:
+            autoscaling.attach_instances(AutoScalingGroupName=name, InstanceIds=[instance_id])
+        assert error.value.response["Error"]["Code"] == "ValidationError"
+        assert error.value.response["Error"]["Message"] == (
+            f"[The Instance: {instance_id} is already part of AutoScalingGroup:{name}]"
+        )
+        ec2_client.terminate_instances(InstanceIds=[instance_id])
+        assert ec2_client.describe_tags(Filters=[
+            {"Name": "resource-id", "Values": [instance_id]},
+            {"Name": "key", "Values": ["aws:autoscaling:groupName"]},
+        ])["Tags"][0]["Value"] == name

@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.autoscaling.model.*;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -652,25 +653,53 @@ public class AutoScalingService {
         groups.put(asgKey(region, asg.getAutoScalingGroupName()), asg);
     }
 
+    static List<Tag> propagatedInstanceTags(AutoScalingGroup asg, List<Tag> templateTags) {
+        Map<String, String> tags = new LinkedHashMap<>();
+        templateTags.forEach(tag -> tags.put(tag.getKey(), tag.getValue()));
+        asg.getTags().forEach((key, value) -> {
+            if (asg.getTagPropagateAtLaunch().getOrDefault(key, false)) {
+                tags.put(key, value);
+            }
+        });
+        tags.put(GROUP_NAME_TAG, asg.getAutoScalingGroupName());
+        return tags.entrySet().stream().map(entry -> new Tag(entry.getKey(), entry.getValue())).toList();
+    }
+
     public void attachInstances(String region, String name, List<String> instanceIds) {
-        AutoScalingGroup asg = requireGroup(region, name);
-        for (String id : instanceIds) {
-            AsgInstance inst = new AsgInstance();
-            inst.setInstanceId(id);
-            inst.setLifecycleState("InService");
-            inst.setHealthStatus("Healthy");
-            inst.setAvailabilityZone(
-                    asg.getAvailabilityZones().isEmpty() ? region + "a" : asg.getAvailabilityZones().get(0));
-            inst.setLaunchConfigurationName(asg.getLaunchConfigurationName());
-            inst.setLaunchTemplateId(asg.getLaunchTemplateId());
-            inst.setLaunchTemplateName(asg.getLaunchTemplateName());
-            inst.setLaunchTemplateVersion(asg.getLaunchTemplateVersion());
-            asg.getInstances().add(inst);
+        // Serialize ownership checks across groups in the same account and region.
+        synchronized (lockFor(region)) {
+            synchronized (lockFor(asgKey(region, name))) {
+                AutoScalingGroup asg = requireGroup(region, name);
+                List<String> conflicts = groups.values().stream()
+                        .filter(group -> region.equals(group.getRegion()))
+                        .flatMap(group -> group.getInstances().stream()
+                                .filter(instance -> instanceIds.contains(instance.getInstanceId()))
+                                .map(instance -> "The Instance: " + instance.getInstanceId()
+                                        + " is already part of AutoScalingGroup:" + group.getAutoScalingGroupName()))
+                        .toList();
+                if (!conflicts.isEmpty()) {
+                    throw new AwsException("ValidationError", conflicts.toString(), 400);
+                }
+                ec2Service.createSystemTags(region, instanceIds, propagatedInstanceTags(asg, List.of()));
+                for (String id : instanceIds) {
+                    AsgInstance inst = new AsgInstance();
+                    inst.setInstanceId(id);
+                    inst.setLifecycleState("InService");
+                    inst.setHealthStatus("Healthy");
+                    inst.setAvailabilityZone(
+                            asg.getAvailabilityZones().isEmpty() ? region + "a" : asg.getAvailabilityZones().get(0));
+                    inst.setLaunchConfigurationName(asg.getLaunchConfigurationName());
+                    inst.setLaunchTemplateId(asg.getLaunchTemplateId());
+                    inst.setLaunchTemplateName(asg.getLaunchTemplateName());
+                    inst.setLaunchTemplateVersion(asg.getLaunchTemplateVersion());
+                    asg.getInstances().add(inst);
+                }
+                if (asg.getInstances().size() > asg.getDesiredCapacity()) {
+                    asg.setDesiredCapacity(asg.getInstances().size());
+                }
+                groups.put(asgKey(region, name), asg);
+            }
         }
-        if (asg.getInstances().size() > asg.getDesiredCapacity()) {
-            asg.setDesiredCapacity(asg.getInstances().size());
-        }
-        groups.put(asgKey(region, name), asg);
     }
 
     public void detachInstances(String region, String name, List<String> instanceIds,
@@ -681,7 +710,7 @@ public class AutoScalingService {
                 .filter(instanceIds::contains)
                 .toList();
         if (!detachedIds.isEmpty()) {
-            ec2Service.deleteSystemTag(region, detachedIds, GROUP_NAME_TAG);
+            ec2Service.deleteSystemTag(region, detachedIds, GROUP_NAME_TAG, name);
         }
         asg.getInstances().removeIf(i -> instanceIds.contains(i.getInstanceId()));
         if (decrementDesiredCapacity) {

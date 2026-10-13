@@ -362,7 +362,7 @@ public class AutoScalingReconciler {
                     launchSource.securityGroupIds(),
                     subnetId,
                     null,
-                    propagatedInstanceTags(asg, launchSource),
+                    AutoScalingService.propagatedInstanceTags(asg, launchSource.instanceTags()),
                     launchSource.userData(),
                     launchSource.iamInstanceProfile(),
                     launchSource.associatePublicIpAddress());
@@ -396,24 +396,6 @@ public class AutoScalingReconciler {
             LOG.warnv("ASG {0}: failed to launch instances: {1}",
                     asg.getAutoScalingGroupName(), e.getMessage());
         }
-    }
-
-    private static List<io.github.hectorvent.floci.services.ec2.model.Tag> propagatedInstanceTags(
-            AutoScalingGroup asg,
-            LaunchSource launchSource) {
-        Map<String, String> tags = new LinkedHashMap<>();
-        for (io.github.hectorvent.floci.services.ec2.model.Tag tag : launchSource.instanceTags()) {
-            tags.put(tag.getKey(), tag.getValue());
-        }
-        asg.getTags().forEach((key, value) -> {
-            if (asg.getTagPropagateAtLaunch().getOrDefault(key, false)) {
-                tags.put(key, value);
-            }
-        });
-        tags.put(AutoScalingService.GROUP_NAME_TAG, asg.getAutoScalingGroupName());
-        return tags.entrySet().stream()
-                .map(entry -> new io.github.hectorvent.floci.services.ec2.model.Tag(entry.getKey(), entry.getValue()))
-                .toList();
     }
 
     private void scaleIn(AutoScalingGroup asg, int count) {
