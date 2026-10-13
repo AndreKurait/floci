@@ -600,6 +600,15 @@ fixed socket/core/vCPU shape rather than one derived from the instance family.
 | DisassociateAddress | Removes an Elastic IP address association. |
 | ReleaseAddress | Releases an Elastic IP address record. |
 
+`ReleaseAddress` automatically disassociates an instance's Elastic IP only in the default VPC.
+In a nondefault VPC it returns `InvalidIPAddress.InUse` without changing the association;
+call `DisassociateAddress` first, as specified by the
+[EC2 API reference](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ReleaseAddress.html).
+
+Deleting an interface, including deletion on instance termination, disassociates its
+Elastic IP without releasing the allocation. A retained interface keeps its association
+after termination; release still follows that interface's VPC rules.
+
 An allocated Elastic IP's `54.x.x.x` address is invented and routes nowhere, so associating
 it re-points it at the address the instance is actually reachable on — the same value
 DescribeInstances reports. This is a deliberate deviation from AWS, where an EIP's public IP
@@ -753,7 +762,7 @@ A standalone ENI created via `CreateNetworkInterface` can also be handed to `Run
 | DetachVolume | Detaches a volume from an instance, optionally forced; returns the attachment in `detaching` state. |
 
 When `floci.services.ec2.volume-block-devices` is enabled (the default), attached EBS volumes are backed by real Linux loop devices inside running instance containers and synthesized EKS cluster node containers:
-- **Storage mechanism**: Backing sparse raw image files are allocated in Floci storage under `floci-aws-ec2-volumes` (named volume or host path). A privileged helper container (`floci-aws-ec2-volume-helper`, running `floci.services.ec2.volume-helper-image`, default `alpine:3.21`) manages Linux loop devices via `losetup`.
+- **Storage mechanism**: Backing sparse raw image files are allocated in Floci storage under `floci-aws-ec2-volumes` (named volume or host path). A privileged helper container (`floci-aws-ec2-volume-helper`, running `floci.services.ec2.volume-helper-image`, default `alpine:3.21`) manages Linux loop devices via `losetup`. It starts on the first volume operation and is removed when Floci shuts down; the backing files stay in storage.
 - **Target device nodes**: Inside privileged target instance containers, the corresponding device node is created at the requested path (for example `/dev/xvdf` or `/dev/sdf`) using `mknod` or a symlink to the loop device, matching the exact size specified during volume creation. Target containers can format filesystems (such as ext4 or xfs), mount them, and persist data across detach and reattach.
 - **Restart reconciliation**: When an instance container stops and starts, or when Floci restarts, attached volume device nodes are automatically restored inside the target container. Backing raw files remain preserved across reboots in persistent storage.
 - **Graceful degradation**: If Docker is unavailable, the target instance container is not running, or the container is not privileged, volume attachments degrade gracefully to metadata-only tracking without failing the API call.

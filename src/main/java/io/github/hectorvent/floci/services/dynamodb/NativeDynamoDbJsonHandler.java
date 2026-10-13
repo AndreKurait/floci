@@ -1209,7 +1209,7 @@ public class NativeDynamoDbJsonHandler {
 
         ObjectNode response = objectMapper.createObjectNode();
         if ("COUNT".equals(select)) {
-            response.put("Count", result.items().size());
+            response.put("Count", queryItems.size());
             response.put("ScannedCount", result.scannedCount());
         } else {
             ArrayNode itemsArray = objectMapper.createArrayNode();

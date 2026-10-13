@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.services.acm.model.CertificateStatus;
 import io.github.hectorvent.floci.services.cognito.model.CognitoGroup;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
 import io.github.hectorvent.floci.services.cognito.model.IdentityProvider;
+import io.github.hectorvent.floci.services.cognito.model.ResourceServer;
 import io.github.hectorvent.floci.services.cognito.model.ResourceServerScope;
 import io.github.hectorvent.floci.services.cognito.model.RevokedTokenInfo;
 import io.github.hectorvent.floci.services.cognito.model.UserPool;
@@ -35,6 +36,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
@@ -44,13 +48,16 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
@@ -110,6 +117,123 @@ class CognitoServiceTest {
                 null,
                 acmService
         );
+    }
+
+    @Test
+    void concurrentResourceServerCreatesPreserveTheWinningRequest() throws Exception {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "ConcurrentResourceServers"), "us-east-1");
+        String identifier = "https://resource-server.floci.test";
+        String targetKey = pool.getId() + "::" + identifier;
+        CountDownLatch firstEmptyLookup = new CountDownLatch(1);
+        CountDownLatch secondEmptyLookup = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        AtomicInteger emptyLookups = new AtomicInteger();
+        AtomicReference<Thread> firstWorker = new AtomicReference<>();
+        AtomicReference<Thread> secondWorker = new AtomicReference<>();
+        InMemoryStorage<String, ResourceServer> resourceServers = new InMemoryStorage<>() {
+            @Override
+            public Optional<ResourceServer> get(String key) {
+                Optional<ResourceServer> snapshot = super.get(key);
+                if (!targetKey.equals(key) || snapshot.isPresent()) {
+                    return snapshot;
+                }
+                int lookup = emptyLookups.incrementAndGet();
+                if (lookup == 1) {
+                    firstEmptyLookup.countDown();
+                    try {
+                        assertTrue(releaseFirst.await(10, TimeUnit.SECONDS), "first lookup was not released");
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError("first lookup was interrupted", interrupted);
+                    }
+                } else if (lookup == 2) {
+                    secondEmptyLookup.countDown();
+                }
+                return snapshot;
+            }
+        };
+        CognitoService concurrentService = new CognitoService(poolStore, new InMemoryStorage<>(), resourceServers,
+                userStore, groupStore, revokedTokenStore, "http://localhost:4566", "cloudfront.net",
+                regionResolver, null, acmService);
+        ResourceServerScope firstScope = new ResourceServerScope();
+        firstScope.setScopeName("first-read");
+        firstScope.setScopeDescription("First request scope");
+        ResourceServerScope secondScope = new ResourceServerScope();
+        secondScope.setScopeName("second-read");
+        secondScope.setScopeDescription("Second request scope");
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<ResourceServer> first = executor.submit(() -> {
+                firstWorker.set(Thread.currentThread());
+                return concurrentService.createResourceServer(pool.getId(), identifier, "First", List.of(firstScope));
+            });
+            assertTrue(firstEmptyLookup.await(5, TimeUnit.SECONDS), "first create did not capture an empty lookup");
+            Future<ResourceServer> second = executor.submit(() -> {
+                secondWorker.set(Thread.currentThread());
+                return concurrentService.createResourceServer(pool.getId(), identifier, "Second", List.of(secondScope));
+            });
+            ThreadMXBean threads = ManagementFactory.getThreadMXBean();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            boolean overlappingCreatesObserved = false;
+            while (System.nanoTime() < deadline) {
+                if (secondEmptyLookup.getCount() == 0) {
+                    overlappingCreatesObserved = true;
+                    break;
+                }
+                Thread worker = secondWorker.get();
+                ThreadInfo info = worker == null ? null : threads.getThreadInfo(worker.threadId(), 32);
+                if (info != null && info.getThreadState() == Thread.State.BLOCKED
+                        && info.getLockOwnerId() == firstWorker.get().threadId()) {
+                    for (StackTraceElement frame : info.getStackTrace()) {
+                        if (CognitoService.class.getName().equals(frame.getClassName())
+                                && "createResourceServer".equals(frame.getMethodName())) {
+                            overlappingCreatesObserved = true;
+                            break;
+                        }
+                    }
+                    if (overlappingCreatesObserved) {
+                        break;
+                    }
+                }
+                Thread.sleep(1L);
+            }
+            assertTrue(overlappingCreatesObserved, "second create neither captured empty nor blocked on the first create");
+            releaseFirst.countDown();
+            List<ResourceServer> created = new ArrayList<>();
+            int conflicts = 0;
+            for (Future<ResourceServer> result : List.of(first, second)) {
+                try {
+                    created.add(result.get(5, TimeUnit.SECONDS));
+                } catch (ExecutionException failure) {
+                    AwsException conflict = assertInstanceOf(AwsException.class, failure.getCause());
+                    assertEquals("ResourceConflictException", conflict.getErrorCode());
+                    assertEquals(400, conflict.getHttpStatus());
+                    conflicts++;
+                }
+            }
+            assertEquals(1, created.size(), "Concurrent empty lookup snapshots: " + emptyLookups.get());
+            assertEquals(1, conflicts);
+            ResourceServer winner = created.getFirst();
+            assertEquals("First", winner.getName());
+            assertEquals("first-read", winner.getScopes().getFirst().getScopeName());
+            assertEquals("First request scope", winner.getScopes().getFirst().getScopeDescription());
+            ResourceServer stored = concurrentService.describeResourceServer(pool.getId(), identifier);
+            assertEquals(pool.getId(), stored.getUserPoolId());
+            assertEquals(identifier, stored.getIdentifier());
+            assertEquals(winner.getName(), stored.getName());
+            assertEquals(1, stored.getScopes().size());
+            assertEquals(winner.getScopes().getFirst().getScopeName(), stored.getScopes().getFirst().getScopeName());
+            assertEquals(winner.getScopes().getFirst().getScopeDescription(),
+                    stored.getScopes().getFirst().getScopeDescription());
+            List<ResourceServer> listed = concurrentService.listResourceServers(pool.getId());
+            assertEquals(1, listed.size());
+            assertEquals(winner.getName(), listed.getFirst().getName());
+            assertEquals(winner.getScopes().getFirst().getScopeName(), listed.getFirst().getScopes().getFirst().getScopeName());
+        } finally {
+            releaseFirst.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "create workers did not terminate");
+        }
     }
 
     private UserPool createPoolAndUser() {

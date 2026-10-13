@@ -19,7 +19,6 @@ import software.amazon.awssdk.services.eventbridge.model.ResourceNotFoundExcepti
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.BooleanSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -297,14 +296,14 @@ class CloudFormationEventsArchiveTest {
 
     /** Waits for {@code expected}, failing as soon as the stack settles on any other status. */
     private void awaitStatus(String expected) throws InterruptedException {
-        await(() -> {
+        TestFixtures.await(() -> {
             Stack stack = cfn.describeStacks(r -> r.stackName(stackName)).stacks().get(0);
             String status = stack.stackStatusAsString();
             if (!expected.equals(status) && !status.endsWith("_IN_PROGRESS")) {
                 throw new AssertionError(stackName + " reached " + status + ": " + stack.stackStatusReason());
             }
             return expected.equals(status);
-        }, expected);
+        }, stackName, expected, 60_000_000_000L, 100);
     }
 
     private void deleteStack() throws InterruptedException {
@@ -312,7 +311,7 @@ class CloudFormationEventsArchiveTest {
             return;
         }
         cfn.deleteStack(r -> r.stackName(stackName));
-        await(() -> {
+        TestFixtures.await(() -> {
             try {
                 List<Stack> stacks = cfn.describeStacks(r -> r.stackName(stackName)).stacks();
                 if (stacks.isEmpty()) {
@@ -330,18 +329,9 @@ class CloudFormationEventsArchiveTest {
                 }
                 throw e;
             }
-        }, "stack deletion");
+        }, stackName, "stack deletion", 60_000_000_000L, 100);
         stackCreated = false;
     }
 
-    private void await(BooleanSupplier condition, String expected) throws InterruptedException {
-        long deadline = System.nanoTime() + 60_000_000_000L;
-        while (System.nanoTime() < deadline) {
-            if (condition.getAsBoolean()) {
-                return;
-            }
-            Thread.sleep(100);
-        }
-        throw new AssertionError(stackName + " timed out waiting for " + expected);
-    }
+
 }

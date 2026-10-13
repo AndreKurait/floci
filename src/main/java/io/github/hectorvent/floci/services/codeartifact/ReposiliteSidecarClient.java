@@ -337,6 +337,14 @@ public class ReposiliteSidecarClient implements RepositorySidecarManager {
     }
 
     /**
+     * {@code wroteNewContent} is {@code false} for the idempotent-match short-circuit (nothing was
+     * actually sent to Reposilite) and {@code true} only when the real {@code PUT} below got back
+     * a success status; a genuine conflict (Reposilite's own {@code redeployment: false} rejection)
+     * or any other non-2xx status wrote nothing either, despite having been attempted.
+     */
+    public record DeployOutcome(int status, boolean wroteNewContent) {}
+
+    /**
      * Deploys {@code content} to {@code repoId}'s {@code gav} path, returning the HTTP status.
      *
      * <p>Reposilite's own {@code redeployment: false} setting (set in {@link #ensureRepository})
@@ -352,15 +360,16 @@ public class ReposiliteSidecarClient implements RepositorySidecarManager {
      * the deploy outright, since Reposilite's own redeployment check is still there to catch a
      * genuine conflict either way.
      */
-    public int deployArtifact(String repoId, String gav, byte[] content) {
+    public DeployOutcome deployArtifact(String repoId, String gav, byte[] content) {
         String baseUrl = manager.ensureReady();
         if (existingArtifactMatches(baseUrl, repoId, gav, content)) {
-            return 200;
+            return new DeployOutcome(200, false);
         }
         HttpRequest request = authenticated(baseUrl, repoId, gav)
                 .PUT(BodyPublishers.ofByteArray(content))
                 .build();
-        return send(request, BodyHandlers.discarding()).statusCode();
+        int status = send(request, BodyHandlers.discarding()).statusCode();
+        return new DeployOutcome(status, status == 200 || status == 201);
     }
 
     /**

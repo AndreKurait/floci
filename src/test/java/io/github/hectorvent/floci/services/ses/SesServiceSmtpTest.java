@@ -48,6 +48,7 @@ class SesServiceSmtpTest {
         suppression = builder.suppressionService();
         cvetTemplates = builder.cvetService();
         identities = builder.identityService();
+        identities.verifyEmailIdentity("from@example.com", "us-east-1");
     }
 
     private void cvetTemplate(String name, String subject, String content) {
@@ -239,6 +240,7 @@ class SesServiceSmtpTest {
 
     @Test
     void sendEmail_explicitReturnPath_isRelayedAndStored() {
+        identities.verifyEmailIdentity("bounces@example.com", "us-east-1");
         String messageId = service.sendEmail(SendEmailRequest.builder()
                 .source("from@example.com")
                 .toAddresses(List.of("to@example.com"))
@@ -254,7 +256,10 @@ class SesServiceSmtpTest {
     @Test
     void sendRawEmail_rejectedMessage_keepsNoReturnPathFromItsHeaders() {
         // The scan trips on the subject; the Return-Path header, read off the same message, must
-        // not survive on the record either, so the request's return path is used.
+        // not survive on the record either, so the request's return path is used. Both return paths
+        // are verified, so the send gets past the sender check to the scan.
+        identities.verifyEmailIdentity("bounces@example.com", "us-east-1");
+        identities.verifyEmailIdentity("bounces@evil.example", "us-east-1");
         String raw = "From: from@example.com\r\nTo: to@example.com\r\nReturn-Path: <bounces@evil.example>\r\n"
                 + "Subject: " + SesContentScan.signature() + "\r\n\r\nbody\r\n";
 
@@ -307,6 +312,8 @@ class SesServiceSmtpTest {
 
     @Test
     void sendRawEmail_returnPathHeader_winsOverRequestField() {
+        identities.verifyEmailIdentity("request-bounces@example.com", "us-east-1");
+        identities.verifyEmailIdentity("mime-bounces@example.com", "us-east-1");
         String raw = "From: from@example.com\r\n"
                 + "To: to@example.com\r\n"
                 + "Return-Path: <mime-bounces@example.com>\r\n"
@@ -326,6 +333,7 @@ class SesServiceSmtpTest {
 
     @Test
     void sendRawEmail_noReturnPathHeader_usesRequestField() {
+        identities.verifyEmailIdentity("request-bounces@example.com", "us-east-1");
         String raw = "From: from@example.com\r\nTo: to@example.com\r\nSubject: x\r\n\r\nbody";
 
         service.sendEmail(SendEmailRequest.builder()

@@ -116,6 +116,30 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void iamPolicyContextKeepsEmptyValuesAndOmitsMissingValues() {
+        assertNull(resolver.resolve("iam", "iam:AttachRolePolicy", formRequest("RoleName=role")));
+        assertEquals(Map.of("iam:PolicyARN", List.of("")),
+                resolver.resolve("iam", "iam:AttachRolePolicy", formRequest("PolicyArn=")));
+        assertEquals(Map.of("iam:PolicyARN", List.of("")),
+                resolver.resolve("iam", "iam:AttachRolePolicy", formRequest("PolicyArn")));
+    }
+
+    @Test
+    void iamPolicyContextIsNotLeakedToOtherActions() {
+        for (String action : List.of("iam:GetPolicy", "iam:DeletePolicy", "iam:PutRolePolicy",
+                "iam:PutRolePermissionsBoundary")) {
+            assertNull(resolver.resolve("iam", action, formRequest("PolicyArn=example")));
+        }
+    }
+
+    @Test
+    void iamPolicyContextDecodesOnceAndPreservesCase() {
+        assertEquals(Map.of("iam:PolicyARN", List.of("arn:aws:iam::123456789012:policy/Team/A+B%2F")),
+                resolver.resolve("iam", "iam:AttachGroupPolicy",
+                        formRequest("PolicyArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Apolicy%2FTeam%2FA%2BB%252F")));
+    }
+
+    @Test
     void resolvesS3ListBucketQueryConditionContext() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
         UriInfo uriInfo = mock(UriInfo.class);

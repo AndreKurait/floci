@@ -833,7 +833,8 @@
         "us-east-2",
         "us-west-1",
         "us-west-2"
-      ]
+      ],
+      "signinHost": "{region}.signin.aws.amazon.com"
     },
     {
       "id": "aws-cn",
@@ -1071,7 +1072,8 @@
       "s3DualStackRegions": [
         "cn-north-1",
         "cn-northwest-1"
-      ]
+      ],
+      "signinHost": "{region}.signin.amazonaws.cn"
     },
     {
       "id": "aws-eusc",
@@ -1217,7 +1219,8 @@
         "route53"
       ],
       "globalServices": {},
-      "s3DualStackRegions": []
+      "s3DualStackRegions": [],
+      "signinHost": "{region}.signin.amazonaws-eusc.eu"
     },
     {
       "id": "aws-iso",
@@ -1387,7 +1390,8 @@
       "s3DualStackRegions": [
         "us-iso-east-1",
         "us-iso-west-1"
-      ]
+      ],
+      "signinHost": "{region}.signin.c2shome.ic.gov"
     },
     {
       "id": "aws-iso-b",
@@ -1548,7 +1552,8 @@
       },
       "s3DualStackRegions": [
         "us-isob-east-1"
-      ]
+      ],
+      "signinHost": "{region}.signin.sc2shome.sgov.gov"
     },
     {
       "id": "aws-iso-e",
@@ -1682,7 +1687,8 @@
           "regionalized": false
         }
       },
-      "s3DualStackRegions": []
+      "s3DualStackRegions": [],
+      "signinHost": "{region}.signin.csphome.adc-e.uk"
     },
     {
       "id": "aws-iso-f",
@@ -1842,7 +1848,8 @@
           "regionalized": false
         }
       },
-      "s3DualStackRegions": []
+      "s3DualStackRegions": [],
+      "signinHost": "{region}.signin.csphome.hci.ic.gov"
     },
     {
       "id": "aws-us-gov",
@@ -2095,7 +2102,8 @@
       "s3DualStackRegions": [
         "us-gov-east-1",
         "us-gov-west-1"
-      ]
+      ],
+      "signinHost": "{region}.signin.amazonaws-us-gov.com"
     }
   ]
 }
