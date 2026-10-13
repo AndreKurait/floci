@@ -274,6 +274,47 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void legacyQueryConditionsRequireTheLegacyJsonTarget() {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json("""
+                {"TableName":"FgacTable","HashKeyValue":{"S":"USER_bob"},
+                 "RangeKeyCondition":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"private"}]},
+                 "Count":true,"AttributesToGet":["secret"],
+                 "KeyConditions":{"PK":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"USER_alice"}]}}}
+                """));
+        when(request.getMediaType()).thenReturn(MediaType.valueOf("application/x-amz-json-1.0"));
+        when(request.getHeaderString("X-Amz-Target")).thenReturn("DynamoDB_20111205.Query");
+        TableDefinition table = fgacTable();
+        table.setKeySchema(List.of(new KeySchemaElement("PK", "HASH"), new KeySchemaElement("SK", "RANGE")));
+        when(dynamoDbService.findTable("FgacTable", "us-east-1")).thenReturn(Optional.of(table));
+        Map<String, List<String>> legacy = resolver.resolve("dynamodb", "dynamodb:Query", request);
+        assertEquals(List.of("USER_bob"), legacy.get("dynamodb:LeadingKeys"));
+        assertEquals(Set.of("PK", "SK", "secret"), new HashSet<>(legacy.get("dynamodb:Attributes")));
+        assertEquals(List.of("COUNT"), legacy.get("dynamodb:Select"));
+        when(request.getHeaderString("X-Amz-Target")).thenReturn("DynamoDB_20120810.Query");
+        Map<String, List<String>> modern = resolver.resolve("dynamodb", "dynamodb:Query", request);
+        assertEquals(List.of("USER_alice"), modern.get("dynamodb:LeadingKeys"));
+        assertFalse(modern.containsKey("dynamodb:Select"));
+    }
+
+    @Test
+    void legacyBatchDeleteCannotHidePartitionOrAttributeNames() {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json("""
+                {"RequestItems":{"FgacTable":[{"DeleteRequest":{"Key":{
+                  "HashKeyElement":{"S":"USER_bob"},"RangeKeyElement":{"S":"private"}}}}]}}
+                """));
+        when(request.getMediaType()).thenReturn(MediaType.valueOf("application/x-amz-json-1.0"));
+        when(request.getHeaderString("X-Amz-Target")).thenReturn("DynamoDB_20111205.BatchWriteItem");
+        TableDefinition table = fgacTable();
+        table.setKeySchema(List.of(new KeySchemaElement("PK", "HASH"), new KeySchemaElement("SK", "RANGE")));
+        when(dynamoDbService.findTable("FgacTable", "us-east-1")).thenReturn(Optional.of(table));
+        Map<String, List<String>> conditions = resolver.resolve("dynamodb", "dynamodb:BatchWriteItem", request);
+        assertEquals(List.of("USER_bob"), conditions.get("dynamodb:LeadingKeys"));
+        assertEquals(Set.of("PK", "SK"), new HashSet<>(conditions.get("dynamodb:Attributes")));
+    }
+
+    @Test
     void returnsNullWhenNoBodyWasBuffered() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
         when(containerRequest.getProperty("floci.bufferedJsonBody")).thenReturn(null);

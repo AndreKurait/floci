@@ -134,7 +134,7 @@ public class ResolvedServiceCatalog {
                         "dynamodb", storageMode(config.storage().services().dynamodb().mode(), config.storage().mode()),
                         config.storage().services().dynamodb().flushIntervalMs(), null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON, ServiceProtocol.CBOR),
-                        Set.of("DynamoDB_20120810.", "DynamoDBStreams_20120810."),
+                    Set.of("DynamoDB_20111205.", "DynamoDB_20120810.", "DynamoDBStreams_20120810."),
                         Set.of("dynamodb"), Set.of("DynamoDB", "DynamoDB Streams"), Set.of()),
                 descriptor("sns", "sns", config.services().sns().enabled(), true,
                         "sns", storageMode(config.storage().services().sns().mode(), config.storage().mode()),

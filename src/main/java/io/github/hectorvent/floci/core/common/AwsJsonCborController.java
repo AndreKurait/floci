@@ -392,7 +392,7 @@ public class AwsJsonCborController {
         // resolve is an unknown operation, not an empty 204. The 204 fallback now applies
         // only to a resolved service whose action this handler does not dispatch.
         ServiceCatalog.TargetMatch targetMatch = catalog.matchTarget(target).orElse(null);
-        if (targetMatch == null) {
+        if (targetMatch == null || "DynamoDB_20111205.".equals(targetMatch.prefix())) {
             return cborUnknownOperationError("Unknown operation: " + target, httpHeaders);
         }
 

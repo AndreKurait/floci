@@ -1,6 +1,6 @@
 # DynamoDB
 
-**Protocol:** JSON 1.1 (`X-Amz-Target: DynamoDB_20120810.*`)
+**Protocol:** JSON 1.0 (`X-Amz-Target: DynamoDB_20120810.*`)
 **Endpoint:** `POST http://localhost:4566/`
 
 ## Supported Actions
@@ -43,6 +43,24 @@
 | `ImportTable` | Create a table and load DynamoDB JSON from S3 into it |
 | `DescribeImport` | Get import status and metadata |
 | `ListImports` | List imports, optionally filtered by table ARN |
+
+## Legacy 2011-12-05 clients
+
+The JSON 1.0 target `DynamoDB_20111205` supports `DescribeTable`, `Query` and
+`BatchWriteItem`. These operations use the selected DynamoDB backend and the
+caller's account and region. Table schemas, query conditions and continuation
+keys, batch delete keys, unprocessed writes and consumed capacity are translated
+between the two API versions. Missing tables return `ResourceNotFoundException`.
+Other operations under this legacy target return `UnknownOperationException`;
+the modern target remains the full API.
+
+The explicit Boto 2 suite in `compatibility-tests/sdk-test-python/legacy/`
+exercises table discovery, paginated key queries and
+batch deletion against the same tables used by Boto 3. The wire contracts follow
+the AWS [2011-12-05 DescribeTable](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/API_DescribeTables_v20111205.html),
+[Query](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/API_Query_v20111205.html)
+and [BatchWriteItem](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/API_BatchWriteItem_v20111205.html)
+documentation.
 
 ## Legacy conditional requests
 
