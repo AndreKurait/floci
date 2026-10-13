@@ -45,6 +45,15 @@
 | `ListStackSetAutoDeploymentTargets` | - |
 <!-- floci:actions:end -->
 
+## SSM parameter updates
+
+`AWS::SSM::Parameter` updates restore the prior value and the affected template tags when a later
+resource fails. Rollback writes a new SSM version with the prior value; it does not rewind version
+history. Tags unrelated to the template are preserved. Changing `Name` creates a replacement and
+keeps the prior parameter until the update commits. `UpdateReplacePolicy: Retain` preserves that
+prior parameter. A name already occupied by an unmanaged parameter is rejected without overwriting
+or adopting it. Failed replacement cleanup remains visible and retryable through stack deletion.
+
 ## StackSets compatibility
 
 StackSets support both `SELF_MANAGED` and the Cloud Launchpad `SERVICE_MANAGED` workflow. `ActivateOrganizationsAccess` requires an Organizations management account with all features enabled and enables trusted access for `stacksets.cloudformation.amazonaws.com`. Service-managed organizational-unit deployment targets are resolved from the caller's actual Organizations state rather than converted into synthetic account IDs. Targeting an OU includes eligible accounts directly in that OU and in all descendant OUs, while excluding the organization management account, matching AWS StackSets targeting semantics.
@@ -422,6 +431,19 @@ macro co-declared beside SAM is absent from `Processed` as well.
 Real AWS's answer for these shapes is unmeasured, co-declared with SAM or not. `StagesAvailable`
 always lists both stages, matching AWS.
 
+## S3 ownership controls
+
+`AWS::S3::Bucket.OwnershipControls` supports one rule using `BucketOwnerEnforced`,
+`BucketOwnerPreferred`, or `ObjectWriter`. Updates apply the new mode; removing a previously
+declared property removes the controls. An unrelated update preserves controls managed outside
+the template when neither the prior nor the new template declares them.
+
+## SAM published aliases
+
+`AutoPublishAlias` creates a version and points the generated alias at that version's
+numeric `Version` attribute. CloudFormation resolves the version before creating the
+alias. Later changes to `$LATEST` do not change the alias's published code or configuration.
+
 ## Conditions
 
 Template `Conditions` are evaluated before provisioning. A resource whose `Condition` evaluates to
@@ -683,3 +705,8 @@ aws cloudformation create-stack \
 !!! note "Dependency ordering"
     Use `!Ref MyFunction` (not a plain string) for `FunctionName` so CloudFormation
     provisions the function before the event source mapping.
+
+Slow stack operations return their accepted response after a short initial wait;
+provisioning continues asynchronously. Use `DescribeStacks` and `DescribeStackEvents`
+to observe completion or failure. A client response does not cancel or repeat the
+accepted operation. Template validation errors still fail before acceptance.

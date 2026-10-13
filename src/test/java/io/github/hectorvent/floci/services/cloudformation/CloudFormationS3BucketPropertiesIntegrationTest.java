@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -22,6 +24,76 @@ import static org.junit.jupiter.api.Assertions.fail;
  */
 @QuarkusTest
 class CloudFormationS3BucketPropertiesIntegrationTest {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void replacementUsesTheDeclaredRetentionPolicy(boolean retain) {
+        String name = "cfn-bucket-replace-" + Long.toString(System.nanoTime(), 36);
+        String original = name + "-old";
+        String replacement = name + "-new";
+        stack("CreateStack", name, replacementTemplate(original, retain, false));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(name).status());
+        stack("UpdateStack", name, replacementTemplate(replacement, retain, false));
+        assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(name).status());
+        given().when().head("/" + replacement).then().statusCode(200);
+        given().when().head("/" + original).then().statusCode(retain ? 200 : 404);
+
+        given().contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteStack").formParam("StackName", name)
+                .post("/").then().statusCode(200);
+        CfnStackWaits.awaitStackDeleted(name);
+        given().when().head("/" + replacement).then().statusCode(404);
+        given().when().head("/" + original).then().statusCode(retain ? 200 : 404);
+        if (retain) {
+            given().when().delete("/" + original).then().statusCode(204);
+        }
+    }
+
+    @Test
+    void failedReplacementRestoresTheOriginalBucketAndItsObjects() {
+        String name = "cfn-bucket-rollback-" + Long.toString(System.nanoTime(), 36);
+        String original = name + "-old";
+        String replacement = name + "-new";
+        stack("CreateStack", name, replacementTemplate(original, false, false));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(name).status());
+        given().body("retained document").put("/" + original + "/document").then().statusCode(200);
+        stack("UpdateStack", name, replacementTemplate(replacement, false, true));
+        assertEquals("UPDATE_ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(name).status());
+        given().get("/" + original + "/document").then().statusCode(200).body(containsString("retained document"));
+        given().head("/" + replacement).then().statusCode(404);
+        given().contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DescribeStackResources").formParam("StackName", name)
+                .post("/").then().statusCode(200)
+                .body(containsString("<PhysicalResourceId>" + original + "</PhysicalResourceId>"));
+
+        given().delete("/" + original + "/document").then().statusCode(204);
+        given().contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteStack").formParam("StackName", name)
+                .post("/").then().statusCode(200);
+        CfnStackWaits.awaitStackDeleted(name);
+        given().head("/" + original).then().statusCode(404);
+        given().head("/" + replacement).then().statusCode(404);
+    }
+
+    private static String replacementTemplate(String bucket, boolean retain, boolean fail) {
+        String failure = fail ? """
+                , "Failure": {
+                  "Type": "AWS::SecretsManager::Secret",
+                  "DependsOn": "Bucket",
+                  "Properties": {
+                    "SecretString": "explicit", "GenerateSecretString": {"PasswordLength": 32}
+                  }
+                }
+                """ : "";
+        return """
+                {"Resources": {
+                  "Bucket": {
+                    "Type": "AWS::S3::Bucket", "UpdateReplacePolicy": "%s",
+                    "Properties": {"BucketName": "%s"}
+                  }%s
+                }}
+                """.formatted(retain ? "Retain" : "Delete", bucket, failure);
+    }
 
     private static String template(String bucket, int noncurrentDays) {
         return """

@@ -2692,10 +2692,15 @@ public class CloudFormationService implements ResourceProvider {
         if (!condNode.isObject()) {
             return conditions;
         }
-        // Two-pass: collect all names first, then evaluate (handles forward references)
+        Map<String, JsonNode> mappings = new HashMap<>();
+        template.path("Mappings").fields().forEachRemaining(e -> mappings.put(e.getKey(), e.getValue()));
+        CloudFormationTemplateEngine engine = new CloudFormationTemplateEngine(
+                accountId, region, stack == null ? "" : stack.getStackName(),
+                stack == null ? "" : stack.getStackId(), params, Map.of(), Map.of(),
+                conditions, mappings, objectMapper, name -> null);
         condNode.fields().forEachRemaining(e -> conditions.put(e.getKey(), false));
         condNode.fields().forEachRemaining(e ->
-                conditions.put(e.getKey(), evaluateCondition(e.getValue(), params, conditions, region, accountId)));
+                conditions.put(e.getKey(), evaluateCondition(e.getValue(), conditions, engine)));
         return conditions;
     }
 
@@ -2767,8 +2772,8 @@ public class CloudFormationService implements ResourceProvider {
         topologicalSort(resources, conditions);
     }
 
-    private boolean evaluateCondition(JsonNode expr, Map<String, String> params,
-                                      Map<String, Boolean> conditions, String region, String accountId) {
+    private boolean evaluateCondition(JsonNode expr, Map<String, Boolean> conditions,
+                                      CloudFormationTemplateEngine engine) {
         if (expr == null || expr.isNull()) {
             return false;
         }
@@ -2782,20 +2787,20 @@ public class CloudFormationService implements ResourceProvider {
             if (expr.has("Fn::Equals")) {
                 JsonNode args = expr.get("Fn::Equals");
                 if (args.isArray() && args.size() == 2) {
-                    String left = resolveConditionValue(args.get(0), params, region, accountId);
-                    String right = resolveConditionValue(args.get(1), params, region, accountId);
+                    String left = engine.resolve(args.get(0));
+                    String right = engine.resolve(args.get(1));
                     return left.equals(right);
                 }
             }
             if (expr.has("Fn::Not")) {
                 JsonNode args = expr.get("Fn::Not");
                 if (args.isArray() && !args.isEmpty()) {
-                    return !evaluateCondition(args.get(0), params, conditions, region, accountId);
+                    return !evaluateCondition(args.get(0), conditions, engine);
                 }
             }
             if (expr.has("Fn::And")) {
                 for (JsonNode item : expr.get("Fn::And")) {
-                    if (!evaluateCondition(item, params, conditions, region, accountId)) {
+                    if (!evaluateCondition(item, conditions, engine)) {
                         return false;
                     }
                 }
@@ -2803,7 +2808,7 @@ public class CloudFormationService implements ResourceProvider {
             }
             if (expr.has("Fn::Or")) {
                 for (JsonNode item : expr.get("Fn::Or")) {
-                    if (evaluateCondition(item, params, conditions, region, accountId)) {
+                    if (evaluateCondition(item, conditions, engine)) {
                         return true;
                     }
                 }
@@ -2811,23 +2816,6 @@ public class CloudFormationService implements ResourceProvider {
             }
         }
         return false;
-    }
-
-    private String resolveConditionValue(JsonNode node, Map<String, String> params,
-                                         String region, String accountId) {
-        if (node.isTextual()) {
-            return node.textValue();
-        }
-        if (node.isObject() && node.has("Ref")) {
-            String name = node.get("Ref").asText();
-            return switch (name) {
-                case "AWS::AccountId" -> accountId;
-                case "AWS::Region" -> region;
-                case "AWS::NoValue" -> "";
-                default -> params.getOrDefault(name, "");
-            };
-        }
-        return node.asText();
     }
 
     private JsonNode parseTemplate(String templateBody) throws Exception {

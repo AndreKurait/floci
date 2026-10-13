@@ -20,6 +20,7 @@ import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -28,17 +29,17 @@ import java.util.Set;
  * <p>A property this class covers is translated into the XML its own S3 API call takes and handed
  * to the same service method, so the service validates and stores it exactly as it would a direct
  * {@code PutBucket*} request. A property the template does not declare is left alone, except that
- * an update removing {@code NotificationConfiguration} clears it.
+ * an update removing {@code NotificationConfiguration} or {@code OwnershipControls} clears it.
  *
  * <p>Covered on {@code AWS::S3::Bucket}: {@code BucketName}, {@code CorsConfiguration},
  * {@code VersioningConfiguration}, {@code PublicAccessBlockConfiguration},
- * {@code BucketEncryption}, {@code LifecycleConfiguration}, {@code NotificationConfiguration} and
- * {@code Tags}. {@code NotificationConfiguration} is the exception to the XML translation: its
+ * {@code BucketEncryption}, {@code LifecycleConfiguration}, {@code OwnershipControls},
+ * {@code NotificationConfiguration} and {@code Tags}. {@code NotificationConfiguration} is the exception to the XML translation: its
  * service method takes the parsed model, so the provisioner builds that model instead.
  *
  * <p><b>Silently dropped</b>, each of which has a service method waiting for it:
  * {@code WebsiteConfiguration}, {@code LoggingConfiguration},
- * {@code ObjectLockConfiguration}, {@code OwnershipControls}, {@code ReplicationConfiguration},
+ * {@code ObjectLockConfiguration}, {@code ReplicationConfiguration},
  * {@code AccelerateConfiguration}, {@code AccessControl}, and the four numbered configuration
  * lists ({@code AnalyticsConfigurations}, {@code IntelligentTieringConfigurations},
  * {@code InventoryConfigurations}, {@code MetricsConfigurations}). Declaring one of these still
@@ -79,6 +80,7 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void provisionBucket(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Map<String, String> previousAttributes = Map.copyOf(r.getAttributes());
         String bucketName = ctx.stablePhysicalName(ctx.resolveOptional(props, "BucketName"),
                 r.getLogicalId(), BUCKET_NAME_MAX_LENGTH, true);
         // provision is also the update path. CreateBucket on a bucket this account already owns is
@@ -113,6 +115,7 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
             applyBucketEncryption(bucketName, props, ctx);
             applyLifecycleConfiguration(bucketName, props, ctx);
             applyBucketTags(bucketName, props, ctx);
+            applyOwnershipControls(bucketName, props, ctx);
         } catch (RuntimeException failure) {
             unwind(r, bucketName, unwind, ctx, failure);
             throw failure;
@@ -130,6 +133,7 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
         }
         r.getAttributes().put("WebsiteURL", AwsEndpoints.s3WebsiteUrl(bucketName, ctx.region()));
         r.getAttributes().put("BucketName", bucketName);
+        ReplacementCleanup.record(r, ctx, previousAttributes);
     }
 
     private void applyBucketCorsConfiguration(String bucketName, JsonNode props, ProvisionContext ctx) {
@@ -233,6 +237,30 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
             return;
         }
         s3Service.putBucketTagging(bucketName, ctx.resolveTags(props, "Tags"));
+    }
+
+    private void applyOwnershipControls(String bucketName, JsonNode props, ProvisionContext ctx) {
+        JsonNode declaredControls = declared(props, "OwnershipControls");
+        JsonNode controls = declaredControls == null
+                ? null : ctx.engine().resolveNodeOmittingNoValue(declaredControls);
+        if (controls == null || controls.isNull() || controls.isMissingNode()) {
+            if (ctx.reusesPriorEntity(bucketName) && ctx.previouslyDeclared("OwnershipControls")) {
+                s3Service.deleteBucketOwnershipControls(bucketName);
+            }
+            return;
+        }
+        JsonNode rules = controls.get("Rules");
+        if (rules == null || !rules.isArray() || rules.size() != 1) {
+            throw new AwsException("InvalidRequest", "OwnershipControls requires exactly one rule", 400);
+        }
+        String ownership = ctx.resolveOptional(rules.get(0), "ObjectOwnership");
+        if (ownership == null
+                || !Set.of("BucketOwnerEnforced", "BucketOwnerPreferred", "ObjectWriter").contains(ownership)) {
+            throw new AwsException("InvalidRequest", "Invalid ObjectOwnership", 400);
+        }
+        String xml = new XmlBuilder().start("OwnershipControls", AwsNamespaces.S3)
+                .start("Rule").elem("ObjectOwnership", ownership).end("Rule").end("OwnershipControls").build();
+        s3Service.putBucketOwnershipControls(bucketName, xml);
     }
 
     /** What a provision changed that a failure has to undo. */
@@ -553,11 +581,37 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
     }
 
     @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        return ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return ReplacementCleanup.cleanupPhysicalId(resource);
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        return ReplacementCleanup.complete(resource, this::delete);
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        ReplacementCleanup.clear(resource);
+    }
+
+    @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        return ReplacementCleanup.rollback(resource, this::delete);
+    }
+
+    @Override
     public void delete(String resourceType, String physicalId, String region) {
         if (BUCKET.equals(resourceType)) {
             // Deleting a non-empty bucket raises BucketNotEmpty, which propagates so the stack
             // reports DELETE_FAILED as AWS does.
-            s3Service.deleteBucket(physicalId);
+            CfnDeletes.safeDelete("S3 bucket", physicalId,
+                    () -> s3Service.deleteBucket(physicalId), "NoSuchBucket");
             return;
         }
         if (BUCKET_POLICY.equals(resourceType)) {

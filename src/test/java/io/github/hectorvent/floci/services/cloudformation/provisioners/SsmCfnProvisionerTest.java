@@ -3,9 +3,11 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.ssm.SsmService;
+import io.github.hectorvent.floci.services.ssm.model.Parameter;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
@@ -14,11 +16,15 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -52,6 +58,8 @@ class SsmCfnProvisionerTest {
 
     private ProvisionContext updateCtx() {
         ProvisionContext create = ctx();
+        Parameter prior = new Parameter(NAME, "old", "String");
+        when(ssm.getParameter(NAME, REGION)).thenReturn(prior);
         return new ProvisionContext(create.engine(), create.region(), create.accountId(),
                 create.stackName(), NAME);
     }
@@ -90,7 +98,7 @@ class SsmCfnProvisionerTest {
 
         provisioner.provision(r, props("team", "a", "env", "dev"), ctx());
 
-        verify(ssm).putParameter(NAME, "v", "String", null, true, REGION);
+        verify(ssm).putParameter(NAME, "v", "String", null, false, REGION);
         verify(ssm).addTagsToResource(NAME, Map.of("team", "a", "env", "dev"), REGION);
         verify(ssm, never()).removeTagsFromResource(anyString(), any(), anyString());
         assertEquals("env,team", r.getAttributes().get(TEMPLATE_TAG_KEYS_ATTR));
@@ -102,7 +110,7 @@ class SsmCfnProvisionerTest {
 
         provisioner.provision(r, props(), ctx());
 
-        verify(ssm).putParameter(NAME, "v", "String", null, true, REGION);
+        verify(ssm).putParameter(NAME, "v", "String", null, false, REGION);
         verify(ssm, never()).addTagsToResource(anyString(), anyMap(), anyString());
         verify(ssm, never()).removeTagsFromResource(anyString(), any(), anyString());
         assertFalse(r.getAttributes().containsKey(TEMPLATE_TAG_KEYS_ATTR));
@@ -137,5 +145,41 @@ class SsmCfnProvisionerTest {
 
         verify(ssm, never()).removeTagsFromResource(anyString(), any(), anyString());
         verify(ssm).addTagsToResource(NAME, Map.of("team", "b"), REGION);
+    }
+
+    @Test
+    void failedReplacementTagsKeepTheCreatedParameterAddressableForRollbackAndDelete() {
+        StackResource resource = parameter(NAME, "team");
+        ProvisionContext context = updateCtx();
+        String replacement = NAME + "-replacement";
+        doThrow(new AwsException("AccessDeniedException", "denied", 403))
+                .when(ssm).addTagsToResource(replacement, Map.of("team", "new"), REGION);
+        ObjectNode desired = props("team", "new").put("Name", replacement);
+        assertThrows(AwsException.class, () -> provisioner.provision(resource, desired, context));
+        assertEquals(replacement, resource.getPhysicalId());
+        assertTrue(provisioner.retainsFailedUpdateState(resource));
+        doThrow(new AwsException("AccessDeniedException", "denied", 403))
+                .when(ssm).deleteParameter(replacement, REGION);
+        assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(resource));
+        assertEquals(replacement, resource.getPhysicalId());
+        assertTrue(provisioner.completeDeleteCleanup(resource).complete());
+        doNothing().when(ssm).deleteParameter(replacement, REGION);
+        provisioner.delete(resource, REGION);
+        verify(ssm).deleteParameter(NAME, REGION);
+    }
+
+    @Test
+    void failedDisplacedParameterCleanupRemainsAvailableForRetry() {
+        StackResource resource = parameter(NAME, null);
+        provisioner.provision(resource, props().put("Name", NAME + "-new"), updateCtx());
+        doThrow(new AwsException("AccessDeniedException", "denied", 403)).when(ssm).deleteParameter(NAME, REGION);
+        UpdateCleanupResult failed = provisioner.completeUpdate(resource);
+        assertFalse(failed.complete());
+        assertEquals(NAME, failed.previousPhysicalId());
+        provisioner.clearUpdate(resource);
+        assertEquals(NAME, provisioner.updateCleanupPhysicalId(resource));
+        doNothing().when(ssm).deleteParameter(NAME, REGION);
+        assertTrue(provisioner.completeUpdate(resource).complete());
+        assertFalse(provisioner.hasReplacementUpdate(resource));
     }
 }
