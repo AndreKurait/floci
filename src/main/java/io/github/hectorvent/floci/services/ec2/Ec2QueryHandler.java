@@ -806,7 +806,24 @@ public class Ec2QueryHandler {
 
         LaunchTemplateData launchTemplateData = resolveRunInstancesLaunchTemplateData(
                 p, region, userDataEncoded == null || userDataEncoded.isBlank());
+        boolean suppliedInterfaces = p.keySet().stream().anyMatch(name -> name.startsWith("NetworkInterface."));
+        if (p.getFirst("SubnetId") != null && (suppliedInterfaces
+                || launchTemplateData != null && !launchTemplateData.getNetworkInterfaces().isEmpty())) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Network interfaces and an instance-level subnet ID may not be specified on the same request", 400);
+        }
         if (launchTemplateData != null) {
+            if (!suppliedInterfaces) {
+                LaunchTemplateData.NetworkInterface primary = launchTemplateData.getNetworkInterfaces().stream()
+                        .filter(networkInterface -> Integer.valueOf(0).equals(networkInterface.getDeviceIndex()))
+                        .findFirst().orElse(null);
+                if (primary != null) {
+                    subnetId = firstNonBlank(subnetId, primary.getSubnetId());
+                    if (associatePublicIp == null) {
+                        associatePublicIp = primary.getAssociatePublicIpAddress();
+                    }
+                }
+            }
             if (launchTemplateData.getMetadataOptions() != null) {
                 metadataOptions = LaunchTemplateData.MetadataOptions.merge(
                         launchTemplateData.getMetadataOptions(), metadataOptions);

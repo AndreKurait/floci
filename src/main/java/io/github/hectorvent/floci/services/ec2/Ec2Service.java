@@ -3893,7 +3893,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             instances.scan(k -> true).stream()
                     .filter(i -> i.getRegion().equals(region) && "pending".equals(i.getState().getName()))
                     .forEach(i -> {
-                        i.setState(InstanceState.running());
+                        completeMockLaunch(i);
                         instances.put(key(i.getRegion(), i.getInstanceId()), i);
                     });
         }
@@ -3921,6 +3921,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             reservationMap.put(inst.getInstanceId(), res);
         }
         return new ArrayList<>(reservationMap.values());
+    }
+
+    private void completeMockLaunch(Instance instance) {
+        synchronized (instance) {
+            if (instance.isAssociatePublicIp() && instance.getPublicIpAddress() == null) {
+                Random random = new Random();
+                String publicIp = "54." + random.nextInt(256) + "."
+                        + random.nextInt(256) + "." + random.nextInt(256);
+                instance.setPublicIpAddress(publicIp);
+                instance.setPublicDnsName(publicIp);
+            }
+            instance.setState(InstanceState.running());
+        }
+    }
+
+    private void releaseMockPublicAddress(String region, Instance instance) {
+        boolean elastic = addresses.scan(k -> true).stream()
+                .anyMatch(address -> region.equals(address.getRegion())
+                        && instance.getInstanceId().equals(address.getInstanceId()));
+        if (!elastic) {
+            instance.setPublicIpAddress(null);
+            instance.setPublicDnsName(null);
+        }
     }
 
     public String platformDetailsForInstance(Instance instance) {
@@ -3953,6 +3976,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             InstanceState prev = inst.getState();
             if (config.services().ec2().mock()) {
                 inst.setState(InstanceState.terminated());
+                releaseMockPublicAddress(region, inst);
                 inst.setTerminatedAt(System.currentTimeMillis());
             } else {
                 // Also attempt the reclaim once this container is really gone. The synchronous
@@ -4065,6 +4089,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             InstanceState prev = inst.getState();
             if (config.services().ec2().mock()) {
                 inst.setState(InstanceState.stopped());
+                releaseMockPublicAddress(region, inst);
             } else {
                 containerManager.stop(inst);
             }
@@ -4096,7 +4121,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             InstanceState prev = inst.getState();
             if (config.services().ec2().mock()) {
-                inst.setState(InstanceState.running());
+                completeMockLaunch(inst);
             } else {
                 restoreInstanceFirewall(inst);
                 String accountId = callerAccountId();

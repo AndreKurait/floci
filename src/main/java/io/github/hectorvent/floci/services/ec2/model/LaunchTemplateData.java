@@ -348,6 +348,15 @@ public class LaunchTemplateData {
         return fromInterfaces;
     }
 
+    @JsonIgnore
+    public Boolean effectiveAssociatePublicIpAddress() {
+        return networkInterfaces.stream()
+                .filter(networkInterface -> Integer.valueOf(0).equals(networkInterface.getDeviceIndex()))
+                .findFirst()
+                .map(NetworkInterface::getAssociatePublicIpAddress)
+                .orElse(null);
+    }
+
     @RegisterForReflection
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class IamInstanceProfile {
