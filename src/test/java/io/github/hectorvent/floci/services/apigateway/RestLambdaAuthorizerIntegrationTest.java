@@ -161,7 +161,7 @@ class RestLambdaAuthorizerIntegrationTest {
         given().contentType(ContentType.JSON).body(Map.of("type", "AWS_PROXY", "httpMethod", "POST",
                         "uri", AUTHORIZER_URI.replace(FUNCTION, "context-proxy")))
                 .put(methodPath(resourceId) + "/integration").then().statusCode(201);
-        when(lambdaService.invoke(eq("us-east-1"), eq("context-proxy"), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + "context-proxy"), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenAnswer(invocation -> {
                     ObjectMapper mapper = new ObjectMapper();
                     String context = mapper.readTree((byte[]) invocation.getArgument(2))
@@ -230,7 +230,7 @@ class RestLambdaAuthorizerIntegrationTest {
         CountDownLatch started = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         AtomicInteger invocations = new AtomicInteger();
-        when(lambdaService.invoke(eq("us-east-1"), eq(FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenAnswer(invocation -> {
                     boolean first = invocations.incrementAndGet() == 1;
                     if (first) {
@@ -308,7 +308,7 @@ class RestLambdaAuthorizerIntegrationTest {
     void lambdaErrorsDistinguishUnauthorizedFromFailure(String message) throws Exception {
         configure("TOKEN", 300, "method.request.header.Authorization");
         byte[] payload = new ObjectMapper().writeValueAsBytes(Map.of("errorMessage", message));
-        when(lambdaService.invoke(eq("us-east-1"), eq(FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, "Unhandled", payload, null, "lambda-error"));
         for (int i = 0; i < 2; i++) {
             given().header("Authorization", "token").get(execute("allowed"))
@@ -355,15 +355,15 @@ class RestLambdaAuthorizerIntegrationTest {
 
     private void respond(Map<String, Object> output) throws Exception {
         byte[] payload = new ObjectMapper().writeValueAsBytes(output);
-        when(lambdaService.invoke(eq("us-east-1"), eq(FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, null, payload, null, "lambda-request"));
     }
 
     private void verifyInvocation(int count) {
         if (count == 0) {
-            verify(lambdaService, never()).invoke(eq("us-east-1"), eq(FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse));
+            verify(lambdaService, never()).invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse));
         } else {
-            verify(lambdaService, times(count)).invoke(eq("us-east-1"), eq(FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse));
+            verify(lambdaService, times(count)).invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse));
         }
     }
 

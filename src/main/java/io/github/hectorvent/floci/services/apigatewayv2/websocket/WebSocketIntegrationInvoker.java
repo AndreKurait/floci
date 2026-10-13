@@ -160,7 +160,7 @@ public class WebSocketIntegrationInvoker {
 
         LOG.debugv("Invoking Lambda function {0} for AWS_PROXY integration", functionName);
 
-        InvokeResult result = lambdaService.invoke(region, functionName,
+        InvokeResult result = lambdaService.invokeTarget(region, functionName,
                 eventJson.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
 
         int statusCode = 200;
@@ -230,7 +230,7 @@ public class WebSocketIntegrationInvoker {
 
         LOG.debugv("Invoking Lambda function {0} for AWS integration", functionName);
 
-        InvokeResult result = lambdaService.invoke(region, functionName,
+        InvokeResult result = lambdaService.invokeTarget(region, functionName,
                 transformedPayload.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
 
         int statusCode = 200;
@@ -544,13 +544,13 @@ public class WebSocketIntegrationInvoker {
 
     /**
      * Extract Lambda function name from an integration URI.
-     * Delegates to {@link LambdaArnUtils#extractFunctionNameFromUri(String)}.
+     * Delegates to {@link LambdaArnUtils#extractFunctionReferenceFromUri(String)}.
      *
      * @param uri the integration URI (Lambda ARN or function name)
      * @return the extracted function name, or null if not parseable
      */
     String extractFunctionName(String uri) {
-        return LambdaArnUtils.extractFunctionNameFromUri(uri);
+        return LambdaArnUtils.extractFunctionReferenceFromUri(uri);
     }
 
     /**

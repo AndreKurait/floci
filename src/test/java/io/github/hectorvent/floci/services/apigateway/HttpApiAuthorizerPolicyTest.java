@@ -67,7 +67,7 @@ class HttpApiAuthorizerPolicyTest {
         when(headers.getRequestHeaders()).thenReturn(new MultivaluedHashMap<>());
         when(uri.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
         when(uri.getRequestUri()).thenReturn(URI.create("http://localhost/execute-api/api/test/items"));
-        when(lambda.invoke(eq("us-east-1"), eq("backend"), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(lambda.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + "backend"), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenAnswer(invocation -> {
                     JsonNode event = mapper.readTree((byte[]) invocation.getArgument(2));
                     assertEquals(7, event.at("/requestContext/authorizer/lambda/tenant/id").asInt());
@@ -89,7 +89,7 @@ class HttpApiAuthorizerPolicyTest {
     }
 
     private void assertPolicy(String version, String statements, int expectedStatus) {
-        when(lambda.invoke(eq("us-east-1"), eq("authorizer"), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(lambda.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + "authorizer"), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenAnswer(invocation -> {
                     JsonNode event = mapper.readTree((byte[]) invocation.getArgument(2));
                     String arn = event.path("1.0".equals(version) ? "methodArn" : "routeArn").asText();
@@ -103,7 +103,7 @@ class HttpApiAuthorizerPolicyTest {
             assertEquals(expectedStatus, response.getStatus(), "payload version " + version);
         }
         verify(lambda, times(expectedStatus == 200 ? 1 : 0))
-                .invoke(eq("us-east-1"), eq("backend"), any(byte[].class), eq(InvocationType.RequestResponse));
+                .invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + "backend"), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
     @ParameterizedTest
@@ -149,13 +149,13 @@ class HttpApiAuthorizerPolicyTest {
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void simpleResponsesUseIsAuthorized(boolean authorized) {
-        when(lambda.invoke(eq("us-east-1"), eq("authorizer"), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(lambda.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + "authorizer"), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(result("{\"isAuthorized\":" + authorized + ",\"context\":{\"tenant\":{\"id\":7}}}"));
         try (Response response = controller("2.0", true).handleGet(headers, uri, "api", "test", "items")) {
             assertEquals(authorized ? 200 : 403, response.getStatus());
         }
         verify(lambda, times(authorized ? 1 : 0))
-                .invoke(eq("us-east-1"), eq("backend"), any(byte[].class), eq(InvocationType.RequestResponse));
+                .invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + "backend"), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
     private ApiGatewayExecuteController controller(String version, boolean simpleResponses) {
