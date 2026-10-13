@@ -24,14 +24,14 @@ class ApiGatewayV2UnsignedAccountRoutingTest {
                 .when().get("/execute-api/" + apiA + "/$default/health")
                 .then()
                 .statusCode(404)
-                .body(containsString("Function not found: account-a-function"));
+                .body(containsString("Function not found: arn:aws:lambda:us-east-1:123456789012:function:account-a-function"));
 
         given()
                 .header("Host", apiB + ".execute-api.localhost.floci.io")
                 .when().get("/health")
                 .then()
                 .statusCode(404)
-                .body(containsString("Function not found: account-b-function"));
+                .body(containsString("Function not found: arn:aws:lambda:us-east-1:210987654321:function:account-b-function"));
     }
 
     @Test

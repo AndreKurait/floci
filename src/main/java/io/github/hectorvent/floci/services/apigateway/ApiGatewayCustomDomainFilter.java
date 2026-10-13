@@ -2,7 +2,6 @@ package io.github.hectorvent.floci.services.apigateway;
 
 import io.github.hectorvent.floci.core.common.RequestHost;
 import io.github.hectorvent.floci.services.apigateway.model.BasePathMapping;
-import io.github.hectorvent.floci.services.apigateway.model.CustomDomain;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -62,7 +61,7 @@ public class ApiGatewayCustomDomainFilter implements ContainerRequestFilter {
         String hostname = stripPort(host);
 
         // Try matching by regionalDomainName first, then by bare domain name
-        CustomDomain domain = null;
+        ApiGatewayService.CustomDomainRoute domain = null;
         if (hostname.endsWith(REGIONAL_SUFFIX)) {
             domain = apiGatewayService.findDomainByRegionalHostname(hostname);
         }
@@ -80,9 +79,9 @@ public class ApiGatewayCustomDomainFilter implements ContainerRequestFilter {
         }
 
         // Resolve the base path mapping for this domain + path
-        BasePathMapping mapping = apiGatewayService.resolveBasePathMapping(domain.getDomainName(), path);
+        BasePathMapping mapping = apiGatewayService.resolveBasePathMapping(domain, path);
         if (mapping == null) {
-            LOG.debugv("No base path mapping found for domain {0} path {1}", domain.getDomainName(), path);
+            LOG.debugv("No base path mapping found for domain {0} path {1}", domain.domainName(), path);
             return;
         }
 

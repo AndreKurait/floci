@@ -81,7 +81,7 @@ class WebSocketAuthorizerPolicyTest {
         WebSocketProxyEventBuilder builder = new WebSocketProxyEventBuilder();
         builder.objectMapper = mapper;
         builder.regionResolver = new RegionResolver("us-east-1", "000000000000");
-        when(lambda.invoke(eq("us-east-1"), eq("authorizer"), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(lambda.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + "authorizer"), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenAnswer(invocation -> {
                     JsonNode event = mapper.readTree((byte[]) invocation.getArgument(2));
                     String arn = event.path("methodArn").asText();

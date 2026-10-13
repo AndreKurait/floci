@@ -325,7 +325,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
                     () -> assertEquals("COGNITO_USER_POOLS", authorizer.path("type").asText()),
                     () -> assertEquals(AUTHORIZER_URI, authorizer.path("authorizerUri").asText()));
 
-            when(lambdaService.invoke(eq("us-east-1"), eq(AUTHORIZER_FUNCTION), any(byte[].class),
+            when(lambdaService.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + AUTHORIZER_FUNCTION), any(byte[].class),
                     eq(InvocationType.RequestResponse)))
                     .thenReturn(new InvokeResult(200, null, ALLOW_POLICY, null, "authorizer-request"));
             deploy(apiId, "mismatched-type");
@@ -878,7 +878,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
     }
 
     private void denyAuthorizerRequests(String function) {
-        when(lambdaService.invoke(eq("us-east-1"), eq(function), any(byte[].class),
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + function), any(byte[].class),
                 eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, null, DENY_POLICY, null, "authorizer-request"));
     }
@@ -888,7 +888,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
     }
 
     private void verifyDenyInvocations(String function, int count) {
-        verify(lambdaService, times(count)).invoke(eq("us-east-1"), eq(function),
+        verify(lambdaService, times(count)).invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + function),
                 any(byte[].class), eq(InvocationType.RequestResponse));
     }
 }
