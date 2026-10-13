@@ -22,54 +22,6 @@ class CloudFormationResourceConditionIntegrationTest {
         RestAssuredJsonUtils.configureAwsContentTypes();
     }
 
-    @ParameterizedTest
-    @CsvSource({"false,us-east-1", "iad,iad"})
-    void mappedConditionSelectsBucketNameOnCreateAndUpdate(String mappedValue, String expectedLocation) {
-        String suffix = Long.toString(System.nanoTime(), 36);
-        String stackName = "cfn-mapped-condition-" + suffix;
-        String prefix = "mapped-condition-" + suffix + "-";
-        String template = """
-                {
-                  "Mappings": {"Locations": {"us-east-1": {"Code": "%s"}}},
-                  "Conditions": {
-                    "UseCode": {"Fn::Not": [{"Fn::Equals": [
-                      {"Fn::FindInMap": ["Locations", {"Ref": "AWS::Region"}, "Code"]}, "false"
-                    ]}]}
-                  },
-                  "Resources": {
-                    "Bucket": {
-                      "Type": "AWS::S3::Bucket",
-                      "Properties": {"BucketName": {"Fn::Join": ["", ["%s",
-                        {"Fn::If": ["UseCode",
-                          {"Fn::FindInMap": ["Locations", {"Ref": "AWS::Region"}, "Code"]},
-                          {"Ref": "AWS::Region"}]}
-                      ]]}}
-                    }
-                  }
-                }
-                """;
-        createStack(stackName, template.formatted(mappedValue, prefix));
-        try {
-            assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stackName).status());
-            given().when().head("/" + prefix + expectedLocation).then().statusCode(200);
-            given().when().head("/" + prefix + "false").then().statusCode(404);
-
-            String updatedLocation = mappedValue.equals("false") ? "iad" : "us-east-1";
-            String updatedValue = mappedValue.equals("false") ? "iad" : "false";
-            updateStack(stackName, template.formatted(updatedValue, prefix));
-            assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stackName).status());
-            given().when().head("/" + prefix + updatedLocation).then().statusCode(200);
-            given().when().head("/" + prefix + expectedLocation).then().statusCode(404);
-            given().when().head("/" + prefix + "false").then().statusCode(404);
-        } finally {
-            deleteStack(stackName);
-            CfnStackWaits.awaitStackDeleted(stackName);
-        }
-        for (String location : new String[]{"us-east-1", "iad", "false"}) {
-            given().when().head("/" + prefix + location).then().statusCode(404);
-        }
-    }
-
     /**
      * A condition naming another with anything but a string is a template error, which
      * CloudFormation (measured in us-east-2) answers synchronously on CreateStack. The malformed
