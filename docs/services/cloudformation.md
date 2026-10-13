@@ -424,6 +424,13 @@ macro co-declared beside SAM is absent from `Processed` as well.
 Real AWS's answer for these shapes is unmeasured, co-declared with SAM or not. `StagesAvailable`
 always lists both stages, matching AWS.
 
+## S3 ownership controls
+
+`AWS::S3::Bucket.OwnershipControls` supports one rule using `BucketOwnerEnforced`,
+`BucketOwnerPreferred`, or `ObjectWriter`. Updates apply the new mode; removing a previously
+declared property removes the controls. An unrelated update preserves controls managed outside
+the template when neither the prior nor the new template declares them.
+
 ## SAM published aliases
 
 `AutoPublishAlias` creates a version and points the generated alias at that version's
@@ -712,3 +719,8 @@ aws cloudformation create-stack \
 !!! note "Dependency ordering"
     Use `!Ref MyFunction` (not a plain string) for `FunctionName` so CloudFormation
     provisions the function before the event source mapping.
+
+Slow stack operations return their accepted response after a short initial wait;
+provisioning continues asynchronously. Use `DescribeStacks` and `DescribeStackEvents`
+to observe completion or failure. A client response does not cancel or repeat the
+accepted operation. Template validation errors still fail before acceptance.

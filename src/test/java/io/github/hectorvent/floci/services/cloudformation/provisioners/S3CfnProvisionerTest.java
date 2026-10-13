@@ -15,6 +15,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 import java.util.List;
@@ -79,6 +80,49 @@ class S3CfnProvisionerTest {
         StackResource r = resource("Bucket", "AWS::S3::Bucket");
         provisioner.provision(r, props(json), ctx);
         return r;
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"BucketOwnerEnforced", "BucketOwnerPreferred", "ObjectWriter"})
+    void ownershipControlsUseTheSameBucketConfigurationAsTheS3Api(String ownership) {
+        provisionBucket("""
+                {"BucketName":"my-bucket","OwnershipControls":{"Rules":[
+                  {"ObjectOwnership":"%s"}]}}
+                """.formatted(ownership));
+        verify(s3).putBucketOwnershipControls("my-bucket",
+                "<OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+                + "<Rule><ObjectOwnership>" + ownership + "</ObjectOwnership></Rule></OwnershipControls>");
+    }
+
+    @Test
+    void malformedOwnershipCannotReceiveSuccessfulConfiguration() {
+        for (String controls : new String[]{"{}", "{\"Rules\":[]}", "{\"Rules\":[{}]}",
+                "{\"Rules\":[{\"ObjectOwnership\":\"public\"}]}",
+                "{\"Rules\":[{\"ObjectOwnership\":\"ObjectWriter\"},{\"ObjectOwnership\":\"BucketOwnerPreferred\"}]}"}) {
+            assertThrows(AwsException.class, () -> provisionBucket(
+                    "{\"BucketName\":\"my-bucket\",\"OwnershipControls\":" + controls + "}"));
+        }
+        verify(s3, never()).putBucketOwnershipControls(anyString(), anyString());
+    }
+
+    @Test
+    void removingPreviouslyDeclaredOwnershipClearsTheExistingBucket() {
+        ctx = new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack",
+                "my-bucket", event -> {}, props("""
+                {"OwnershipControls":{"Rules":[{"ObjectOwnership":"ObjectWriter"}]}}
+                """));
+        provisionBucket("{\"BucketName\":\"my-bucket\"}");
+        verify(s3).deleteBucketOwnershipControls("my-bucket");
+    }
+
+    @Test
+    void omittedOwnershipDoesNotChangeANewOrUnmanagedBucket() {
+        provisionBucket("{\"BucketName\":\"my-bucket\"}");
+        ctx = new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack",
+                "my-bucket", event -> {}, props("{}"));
+        provisionBucket("{\"BucketName\":\"my-bucket\"}");
+        verify(s3, never()).deleteBucketOwnershipControls(anyString());
+        verify(s3, never()).putBucketOwnershipControls(anyString(), anyString());
     }
 
     @Test

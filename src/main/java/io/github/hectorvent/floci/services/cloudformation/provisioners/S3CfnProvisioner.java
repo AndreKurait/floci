@@ -29,7 +29,7 @@ import java.util.Set;
  * <p>A property this class covers is translated into the XML its own S3 API call takes and handed
  * to the same service method, so the service validates and stores it exactly as it would a direct
  * {@code PutBucket*} request. A property the template does not declare is left alone, except that
- * an update removing {@code NotificationConfiguration} clears it.
+ * an update removing {@code NotificationConfiguration} or {@code OwnershipControls} clears it.
  *
  * <p>Covered on {@code AWS::S3::Bucket}: {@code BucketName}, {@code CorsConfiguration},
  * {@code VersioningConfiguration}, {@code PublicAccessBlockConfiguration},
@@ -241,8 +241,13 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void applyOwnershipControls(String bucketName, JsonNode props, ProvisionContext ctx) {
-        JsonNode controls = declared(props, "OwnershipControls");
-        if (controls == null) {
+        JsonNode declaredControls = declared(props, "OwnershipControls");
+        JsonNode controls = declaredControls == null
+                ? null : ctx.engine().resolveNodeOmittingNoValue(declaredControls);
+        if (controls == null || controls.isNull() || controls.isMissingNode()) {
+            if (ctx.reusesPriorEntity(bucketName) && ctx.previouslyDeclared("OwnershipControls")) {
+                s3Service.deleteBucketOwnershipControls(bucketName);
+            }
             return;
         }
         JsonNode rules = controls.get("Rules");
