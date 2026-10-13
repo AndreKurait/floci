@@ -1044,3 +1044,7 @@ The file uses the same schema as `src/main/resources/ec2/image-catalog.yaml` and
 include every image that process should expose. Missing or invalid files fail on first
 catalog use; leaving the setting unset preserves the bundled catalog. Containerized
 Floci needs the file mounted at the configured container path.
+
+`DescribeKeyPairs` omits the public key unless `IncludePublicKey=true`. When requested,
+it returns the OpenSSH public key with the key-pair name as its comment, including
+for imported keys. It never returns private key material.
