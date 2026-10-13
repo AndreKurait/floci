@@ -3386,7 +3386,14 @@ public class Ec2QueryHandler {
                     .elem("keyName", kp.getKeyName())
                     .elem("keyFingerprint", kp.getKeyFingerprint());
             if (includePublicKey) {
-                xml.elem("publicKey", kp.getPublicKey());
+                String publicKey = kp.getPublicKey();
+                if (publicKey != null) {
+                    String[] fields = publicKey.strip().split("\\s+", 3);
+                    if (fields.length >= 2) {
+                        publicKey = fields[0] + " " + fields[1] + " " + kp.getKeyName();
+                    }
+                }
+                xml.elem("publicKey", publicKey);
             }
             xml.raw(tagSetXml(kp.getTags())).end("item");
         }

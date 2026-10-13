@@ -30,7 +30,7 @@ class Ec2KeyPairPublicKeyIntegrationTest {
                 .formParam("KeyName", name);
         if (imported) {
             create.formParam("PublicKeyMaterial", Base64.getEncoder().encodeToString(
-                    generated.openSshPublicKey().getBytes(StandardCharsets.UTF_8)));
+                    (generated.openSshPublicKey() + " supplied-comment").getBytes(StandardCharsets.UTF_8)));
         }
         String responseName = imported ? "ImportKeyPairResponse" : "CreateKeyPairResponse";
         String id = create.post("/").then().statusCode(200)
@@ -55,7 +55,7 @@ class Ec2KeyPairPublicKeyIntegrationTest {
                                 "DescribeKeyPairsResponse.keySet.item.publicKey");
                         assertFalse(publicKey.isBlank());
                         if (imported) {
-                            assertEquals(generated.openSshPublicKey(), publicKey);
+                            assertEquals(generated.openSshPublicKey() + " " + name, publicKey);
                         } else {
                             assertFalse(Ec2KeyMaterial.fingerprintOf(publicKey).isBlank());
                         }
