@@ -20,6 +20,17 @@ follows the AWS Sign-In `AuthorizeOAuth2Access` and `CreateOAuth2Token` wire sha
 one-time codes, PKCE verification, refresh-token expiry, and the `aws_sigv4` temporary credential
 type.
 
+The cross-device flow works too, for a CLI that cannot open a browser on the same machine:
+
+```bash
+aws login --remote --endpoint-url http://localhost:4566 --region us-east-1
+```
+
+The CLI prints the authorize URL and waits for a code. After the consent page, Floci lands on
+`/v1/sessions/confirmation` on the same endpoint, the path AWS Sign-In uses, and shows the
+verification code to paste back. The redirect must point at the endpoint the request arrived on
+or at an AWS Sign-In host; any other origin is refused.
+
 ## Supported Actions
 
 ### Users

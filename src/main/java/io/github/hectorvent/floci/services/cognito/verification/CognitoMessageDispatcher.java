@@ -185,7 +185,7 @@ public final class CognitoMessageDispatcher {
 
     private void sendEmail(UserPool pool, String region, String email, String subject, String body) {
         Sender sender = sender(pool, region);
-        ses.sendEmail(SendEmailRequest.builder()
+        ses.sendServiceEmail(SendEmailRequest.builder()
             .source(sender.from())
             // SES takes Source as the default return path, the envelope sender it records
             // and hands to the SMTP relay, which takes a bare address.

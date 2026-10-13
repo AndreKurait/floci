@@ -13,12 +13,14 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import java.net.URI;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Base64;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
@@ -39,6 +41,7 @@ public class SigninService {
     // how the China or GovCloud consoles spell theirs, so they stay literal (see docs/configuration/partitions.md).
     static final String SAME_DEVICE_CLIENT = "arn:aws:signin:::devtools/same-device"; // partition-literal: console client id, non-commercial spelling unknown
     static final String CROSS_DEVICE_CLIENT = "arn:aws:signin:::devtools/cross-device"; // partition-literal: console client id, non-commercial spelling unknown
+    static final String CONFIRMATION_PATH = "/v1/sessions/confirmation";
     static final int ACCESS_TOKEN_TTL_SECONDS = 900;
     private static final long AUTHORIZATION_CODE_TTL_SECONDS = 300;
     private static final long REFRESH_TOKEN_TTL_SECONDS = 12 * 60 * 60;
@@ -74,6 +77,18 @@ public class SigninService {
     public String beginAuthorization(String clientId, String codeChallenge, String codeChallengeMethod,
                                      String redirectUri, String responseType, String scope, String state,
                                      String resource) {
+        return beginAuthorization(clientId, codeChallenge, codeChallengeMethod, redirectUri, responseType,
+                scope, state, resource, null);
+    }
+
+    /**
+     * @param requestOrigin the base URI the authorize request arrived on, or null when unknown. The
+     *        AWS CLI builds the cross-device redirect from the Sign-In endpoint it resolved, so
+     *        with an endpoint override that redirect is this emulator's own confirmation page.
+     */
+    public String beginAuthorization(String clientId, String codeChallenge, String codeChallengeMethod,
+                                     String redirectUri, String responseType, String scope, String state,
+                                     String resource, URI requestOrigin) {
         validateClient(clientId);
         if (!"SHA-256".equals(codeChallengeMethod)) {
             throw new SigninException("invalid_request", "code_challenge_method must be SHA-256");
@@ -85,7 +100,7 @@ public class SigninService {
         if (!"code".equals(responseType) || !"openid".equals(scope)) {
             throw new SigninException("invalid_request", "response_type=code and scope=openid are required");
         }
-        validateRedirectUri(clientId, redirectUri);
+        validateRedirectUri(clientId, redirectUri, requestOrigin);
         if (state == null || state.isEmpty() || state.length() > MAX_STATE_LENGTH) {
             throw new SigninException("invalid_request", "state must be 1-128 characters");
         }
@@ -310,7 +325,7 @@ public class SigninService {
         return value != null && PKCE_VALUE_PATTERN.matcher(value).matches();
     }
 
-    private static void validateRedirectUri(String clientId, String redirectUri) {
+    private static void validateRedirectUri(String clientId, String redirectUri, URI requestOrigin) {
         if (redirectUri == null || redirectUri.isEmpty() || redirectUri.length() > MAX_REDIRECT_URI_LENGTH) {
             throw new SigninException("invalid_request", "redirect_uri must be 1-2048 characters");
         }
@@ -324,7 +339,7 @@ public class SigninService {
 
         boolean valid = SAME_DEVICE_CLIENT.equals(clientId)
                 ? isSameDeviceRedirect(uri)
-                : isCrossDeviceRedirect(uri);
+                : isCrossDeviceRedirect(uri) || isOwnConfirmationRedirect(uri, requestOrigin);
         if (!valid) {
             throw new SigninException("invalid_request", "redirect_uri is invalid for the AWS Sign-In client");
         }
@@ -445,10 +460,44 @@ public class SigninService {
                 && uri.getHost() != null
                 && AWS_SIGNIN_HOST_PATTERN.matcher(uri.getHost()).matches()
                 && uri.getPort() == -1
-                && "/v1/sessions/confirmation".equals(uri.getRawPath())
+                && CONFIRMATION_PATH.equals(uri.getRawPath())
                 && uri.getRawQuery() == null
                 && uri.getRawFragment() == null
                 && uri.getUserInfo() == null;
+    }
+
+    private static boolean isOwnConfirmationRedirect(URI uri, URI requestOrigin) {
+        return requestOrigin != null
+                && uri.getScheme() != null
+                && uri.getScheme().equalsIgnoreCase(requestOrigin.getScheme())
+                && uri.getHost() != null
+                && uri.getHost().equalsIgnoreCase(requestOrigin.getHost())
+                && effectivePort(uri) == effectivePort(requestOrigin)
+                && CONFIRMATION_PATH.equals(uri.getRawPath())
+                && uri.getRawQuery() == null
+                && uri.getRawFragment() == null
+                && uri.getUserInfo() == null;
+    }
+
+    private static int effectivePort(URI uri) {
+        if (uri.getPort() != -1) {
+            return uri.getPort();
+        }
+        return "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
+    }
+
+    /**
+     * The code the cross-device confirmation page shows, in the form the AWS CLI decodes: base64
+     * of {@code state=<state>&code=<code>}.
+     */
+    public String verificationCode(String code, String state) {
+        if (code == null || code.isEmpty() || code.length() > MAX_AUTHORIZATION_CODE_LENGTH
+                || state == null || state.isEmpty() || state.length() > MAX_STATE_LENGTH) {
+            throw new SigninException("invalid_request", "The confirmation request is invalid");
+        }
+        String query = "state=" + URLEncoder.encode(state, StandardCharsets.UTF_8)
+                + "&code=" + URLEncoder.encode(code, StandardCharsets.UTF_8);
+        return Base64.getEncoder().encodeToString(query.getBytes(StandardCharsets.UTF_8));
     }
 
     private static int remainingSeconds(Instant now, Instant expiresAt) {
