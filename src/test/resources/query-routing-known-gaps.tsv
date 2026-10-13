@@ -3,35 +3,32 @@
 # Columns: service, action, service it reaches instead.
 #
 # Routing only matters when a request arrives without a usable credential scope, since
-# otherwise the service comes from the SigV4 scope. On that path the action name is all
-# there is, and AwsQueryServiceResolver backs IamEnforcementFilter too, so an entry here
-# is also authorized under the wrong namespace.
+# otherwise the service comes from the SigV4 scope. On that path there is the action name
+# and the Version the request declares, and AwsQueryServiceResolver backs
+# IamEnforcementFilter too, so an entry here is also authorized under the wrong namespace.
 #
-# Two kinds of entry, told apart by the third column:
+# Nearly every entry is a name missing from its own service's routing set, and adding it
+# there is the fix, as #5032 did for IAM. The third column only says where the request
+# goes meanwhile: sqs when no set holds the name, since that is the default, or the
+# service whose set does. A name two services define needs nothing more than being in
+# both sets, because the Version a request carries decides between them.
 #
-#   -> sqs     The name is in no routing set, so it falls through to the sqs default.
-#              Fixable by adding the name to its service's set, as #5032 did for IAM,
-#              once checked that no service earlier in the chain claims it.
+# The exception is a request without a Version, which only a hand-rolled client sends.
+# A name two services define then goes to the one tried first, which is a gap only when
+# that one does not handle it. SNS defines AddPermission and RemovePermission, but its
+# handler does not implement them, so SQS's reach SNS that way. Implementing them in SNS
+# is the fix.
 #
-#   -> other   A service earlier in inferServiceFromAction's chain already owns the
-#              name, so adding it to the right set changes nothing. These need the
-#              Version form field to disambiguate, the way isElbClassicRequest already
-#              reads it, which is a cross-service routing change of its own.
-#
-# 189 entries: 171 unrouted, 18 claimed by another service.
+# 173 entries: 171 unrouted, 2 claimed by another service.
 #
 # Shrink this file, never grow it. Removing a line is the point; adding one needs a
 # reason in the PR that adds it. AwsQueryActionRoutingParityTest fails on an entry that
 # is no longer a gap, so a fix cannot leave the list stale.
 
-# autoscaling: 17 (13 unrouted, 4 claimed elsewhere)
+# autoscaling: 13 (13 unrouted, 0 claimed elsewhere)
 autoscaling	AttachTrafficSources	sqs
-autoscaling	DeletePolicy	iam
 autoscaling	DeleteScheduledAction	sqs
-autoscaling	DeleteTags	ec2
 autoscaling	DeleteWarmPool	sqs
-autoscaling	DescribeAccountLimits	elasticloadbalancing
-autoscaling	DescribeLoadBalancers	elasticloadbalancing
 autoscaling	DescribeScheduledActions	sqs
 autoscaling	DescribeTrafficSources	sqs
 autoscaling	DescribeWarmPool	sqs
@@ -133,39 +130,29 @@ ec2	ResetEbsDefaultKmsKeyId	sqs
 ec2	SearchTransitGatewayRoutes	sqs
 ec2	UnmonitorInstances	sqs
 
-# elasticache: 15 (12 unrouted, 3 claimed elsewhere)
+# elasticache: 12 (12 unrouted, 0 claimed elsewhere)
 elasticache	CreateCacheCluster	sqs
 elasticache	CreateCacheParameterGroup	sqs
 elasticache	CreateCacheSubnetGroup	sqs
-elasticache	CreateUser	iam
 elasticache	DeleteCacheCluster	sqs
 elasticache	DeleteCacheParameterGroup	sqs
 elasticache	DeleteCacheSubnetGroup	sqs
-elasticache	DeleteUser	iam
 elasticache	DescribeCacheClusters	sqs
 elasticache	DescribeCacheParameterGroups	sqs
 elasticache	DescribeCacheParameters	sqs
 elasticache	DescribeCacheSubnetGroups	sqs
-elasticache	ListTagsForResource	sns
 elasticache	ModifyCacheParameterGroup	sqs
 elasticache	ModifyCacheSubnetGroup	sqs
 
-# elasticloadbalancing: 4 (3 unrouted, 1 claimed elsewhere)
+# elasticloadbalancing: 3 (3 unrouted, 0 claimed elsewhere)
 elasticloadbalancing	DescribeCapacityReservation	sqs
 elasticloadbalancing	DescribeListenerAttributes	sqs
-elasticloadbalancing	DescribeTags	ec2
 elasticloadbalancing	ModifyListenerAttributes	sqs
 
-# email: 2 (1 unrouted, 1 claimed elsewhere)
-email	GetTemplate	cloudformation
+# email: 1 (1 unrouted, 0 claimed elsewhere)
 email	UpdateAccountSendingEnabled	sqs
 
-# monitoring: 3 (0 unrouted, 3 claimed elsewhere)
-monitoring	ListTagsForResource	sns
-monitoring	TagResource	sns
-monitoring	UntagResource	sns
-
-# rds: 48 (47 unrouted, 1 claimed elsewhere)
+# rds: 47 (47 unrouted, 0 claimed elsewhere)
 rds	AddSourceIdentifierToSubscription	sqs
 rds	CopyDBClusterParameterGroup	sqs
 rds	CopyDBClusterSnapshot	sqs
@@ -190,7 +177,6 @@ rds	DescribeEventSubscriptions	sqs
 rds	DescribeEvents	sqs
 rds	FailoverDBCluster	sqs
 rds	FailoverGlobalCluster	sqs
-rds	ListTagsForResource	sns
 rds	ModifyDBClusterEndpoint	sqs
 rds	ModifyDBClusterSnapshotAttribute	sqs
 rds	ModifyDBSnapshot	sqs
@@ -215,16 +201,13 @@ rds	StopDBInstance	sqs
 rds	SwitchoverGlobalCluster	sqs
 rds	SwitchoverReadReplica	sqs
 
-# redshift: 12 (9 unrouted, 3 claimed elsewhere)
+# redshift: 9 (9 unrouted, 0 claimed elsewhere)
 redshift	CreateIntegration	sqs
-redshift	CreateTags	ec2
 redshift	DeleteIntegration	sqs
-redshift	DeleteTags	ec2
 redshift	DescribeClusterVersions	sqs
 redshift	DescribeIntegrations	sqs
 redshift	DescribeLoggingStatus	sqs
 redshift	DescribeOrderableClusterOptions	sqs
-redshift	DescribeTags	ec2
 redshift	DisableLogging	sqs
 redshift	EnableLogging	sqs
 redshift	ModifyClusterIamRoles	sqs

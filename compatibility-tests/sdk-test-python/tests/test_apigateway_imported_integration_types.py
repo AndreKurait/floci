@@ -11,20 +11,25 @@ def test_imported_integration_types(aws_config):
     expected_types = {
         "aws": "AWS", "aws_proxy": "AWS_PROXY", "http": "HTTP",
         "http_proxy": "HTTP_PROXY", "mock": "MOCK", "any": "MOCK",
+        "AWS": "AWS", "AWS_PROXY": "AWS_PROXY", "HTTP": "HTTP",
+        "HTTP_PROXY": "HTTP_PROXY", "MOCK": "MOCK",
+        "Aws": "AWS", "Aws_Proxy": "AWS_PROXY", "Http": "HTTP",
+        "Http_Proxy": "HTTP_PROXY", "Mock": "MOCK",
     }
     paths = {}
     for name in expected_types:
         integration_type = "mock" if name == "any" else name
         integration = {"type": integration_type, "timeoutInMillis": 12000}
-        if integration_type != "mock":
+        normalized_type = integration_type.lower()
+        if normalized_type != "mock":
             integration["httpMethod"] = "POST"
-        if integration_type.startswith("aws"):
+        if normalized_type.startswith("aws"):
             integration["uri"] = (
                 "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/"
                 "functions/arn:aws:lambda:us-east-1:000000000000:function:fixture:live/invocations")
-        elif integration_type.startswith("http"):
+        elif normalized_type.startswith("http"):
             integration["uri"] = "https://example.com/original"
-        if integration_type in ("aws", "http", "mock"):
+        if normalized_type in ("aws", "http", "mock"):
             integration["responses"] = {"default": {"statusCode": "200"}}
         operation = "x-amazon-apigateway-any-method" if name == "any" else "get"
         paths["/" + name] = {operation: {

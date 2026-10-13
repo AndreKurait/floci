@@ -6,8 +6,10 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.regex.Matcher;
@@ -23,15 +25,22 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * services, which is what this test makes visible and stops growing.
  *
  * <p>Routing only decides anything when a request arrives without a usable credential scope,
- * because otherwise the service comes from the SigV4 scope. On that path the action name is all
- * there is, and {@code inferServiceFromAction}'s chain ends in {@code return "sqs"}, so a missing
- * name answers {@code UnsupportedOperation} in the SQS namespace rather than failing visibly.
- * {@code AwsQueryServiceResolver} backs {@code IamEnforcementFilter} through the same code, so the
- * same operation is also authorized under the wrong namespace, which is the part worth a test.
+ * because otherwise the service comes from the SigV4 scope. On that path there is the action name
+ * and the {@code Version} the request declares, and {@code inferServiceFromAction} falls back to
+ * SQS, so a missing name answers {@code UnsupportedOperation} in the SQS namespace rather than
+ * failing visibly. {@code AwsQueryServiceResolver} backs {@code IamEnforcementFilter}
+ * through the same code, so the same operation is also authorized under the wrong namespace, which
+ * is the part worth a test.
+ *
+ * <p>Each action is routed with its own service's {@code Version}, as any Query client sends it,
+ * and again without one, as a hand-rolled request may leave it out. Without it a name two services
+ * share goes to whichever is tried first, so that path is only held to reaching a service that
+ * dispatches the name.
  *
  * <p>The known gaps live in {@code src/test/resources/query-routing-known-gaps.tsv} rather than
  * here, so that fixing one is a line removed from a data file. The list is checked both ways: a new
- * gap fails {@link #everyDispatchedActionRoutesToItsOwnService}, and a gap that has been fixed
+ * gap fails {@link #everyDispatchedActionRoutesToItsOwnService} or
+ * {@link #withoutAVersionEveryActionReachesAServiceThatDispatchesIt}, and a gap that has been fixed
  * without delisting fails {@link #theKnownGapListHasNoStaleEntries}.
  */
 class AwsQueryActionRoutingParityTest {
@@ -41,6 +50,27 @@ class AwsQueryActionRoutingParityTest {
 
         private QueryHandler(String service, String path) {
             this(service, Path.of(path), "action");
+        }
+    }
+
+    /** A heading in the gap file: what it labels, and the three counts it claims for its rows. */
+    private record GapHeading(String label, String line, int total, int unrouted, int claimed) {
+
+        private static GapHeading of(String label, Matcher heading, int firstCount) {
+            return new GapHeading(label, heading.group(),
+                    Integer.parseInt(heading.group(firstCount)),
+                    Integer.parseInt(heading.group(firstCount + 1)),
+                    Integer.parseInt(heading.group(firstCount + 2)));
+        }
+
+        /** Records a mismatch when the unrouted and claimed rows counted under it disagree with it. */
+        private void check(int[] rows, List<String> wrong) {
+            int rowTotal = rows[0] + rows[1];
+            if (total != rowTotal || unrouted != rows[0] || claimed != rows[1]) {
+                wrong.add("the " + label + " heading says " + total + " (" + unrouted + " unrouted, "
+                        + claimed + " claimed) but the rows under it are " + rowTotal + " ("
+                        + rows[0] + " unrouted, " + rows[1] + " claimed): " + line);
+            }
         }
     }
 
@@ -55,7 +85,7 @@ class AwsQueryActionRoutingParityTest {
      * their sets are checked as one and why {@code isElbClassicRequest} exists to split them on
      * {@code Version} afterwards.
      *
-     * <p>SQS is listed even though it is the fallback the chain ends in, because being the default
+     * <p>SQS is listed even though it is the fallback routing ends in, because being the default
      * does not make it safe: a name an earlier service claims never reaches it.
      */
     private static final List<QueryHandler> HANDLERS = List.of(
@@ -85,6 +115,28 @@ class AwsQueryActionRoutingParityTest {
             new QueryHandler("redshift", HANDLERS_ROOT + "redshift/RedshiftQueryHandler.java"),
             new QueryHandler("sqs", HANDLERS_ROOT + "sqs/SqsQueryHandler.java"));
 
+    /**
+     * The {@code Version} each service's clients send, which is the {@code apiVersion} in its
+     * botocore model. Stated here rather than read back from the controller, so a wrong version
+     * there fails this test instead of agreeing with it. ELBv2's stands for both load balancing
+     * APIs, since they route to one service by either version and are only split afterwards.
+     */
+    private static final Map<String, String> API_VERSIONS = Map.ofEntries(
+            Map.entry("sts", "2011-06-15"),
+            Map.entry("iam", "2010-05-08"),
+            Map.entry("sns", "2010-03-31"),
+            Map.entry("sqs", "2012-11-05"),
+            Map.entry("elasticache", "2015-02-02"),
+            Map.entry("rds", "2014-10-31"),
+            Map.entry("monitoring", "2010-08-01"),
+            Map.entry("cloudformation", "2010-05-15"),
+            Map.entry("email", "2010-12-01"),
+            Map.entry("ec2", "2016-11-15"),
+            Map.entry("elasticloadbalancing", "2015-12-01"),
+            Map.entry("autoscaling", "2011-01-01"),
+            Map.entry("elasticbeanstalk", "2010-12-01"),
+            Map.entry("redshift", "2012-12-01"));
+
     private static final Path KNOWN_GAPS = Path.of("src/test/resources/query-routing-known-gaps.tsv");
 
     /**
@@ -95,6 +147,13 @@ class AwsQueryActionRoutingParityTest {
             Pattern.compile("case\\s+((?:\"[A-Za-z0-9]+\"\\s*,?\\s*)+)\\s*(?:->|:)");
     private static final Pattern QUOTED_LABEL = Pattern.compile("\"([A-Za-z0-9]+)\"");
 
+    /** {@code # 189 entries: 171 unrouted, 18 claimed by another service.} */
+    private static final Pattern TOTAL_HEADING = Pattern.compile(
+            "^#\\s*(\\d+) entries: (\\d+) unrouted, (\\d+) claimed by another service\\.?$");
+    /** {@code # autoscaling: 17 (13 unrouted, 4 claimed elsewhere)} */
+    private static final Pattern SERVICE_HEADING = Pattern.compile(
+            "^#\\s*([a-z0-9-]+): (\\d+) \\((\\d+) unrouted, (\\d+) claimed elsewhere\\)$");
+
     @Test
     void everyDispatchedActionRoutesToItsOwnService() throws IOException {
         Set<String> known = knownGaps();
@@ -102,11 +161,11 @@ class AwsQueryActionRoutingParityTest {
 
         for (QueryHandler handler : HANDLERS) {
             for (String action : dispatchedActions(handler)) {
-                String reached = AwsQueryController.inferServiceFromAction(action);
+                String reached = reached(handler, action);
                 if (!handler.service().equals(reached)
                         && !known.contains(gapKey(handler.service(), action, reached))) {
                     unexpected.add(handler.service() + " dispatches " + action
-                            + " but the name reaches " + reached);
+                            + " but a request for it reaches " + reached);
                 }
             }
         }
@@ -114,11 +173,40 @@ class AwsQueryActionRoutingParityTest {
         assertTrue(unexpected.isEmpty(),
                 "An action a handler dispatches has to route to that handler, or a request without "
                         + "a credential scope answers in the wrong namespace and is authorized "
-                        + "under it too. Add the name to its service's set in AwsQueryController, "
-                        + "having checked that no service earlier in inferServiceFromAction's "
-                        + "chain already claims it. If an earlier service does claim it, the name "
-                        + "needs the Version discriminator instead, and belongs in " + KNOWN_GAPS
-                        + " with that noted. New: " + unexpected);
+                        + "under it too. Add the name to its service's set in AwsQueryController; "
+                        + "a name another service also defines is then told apart by the request's "
+                        + "Version. New: " + unexpected);
+    }
+
+    /**
+     * Without a {@code Version} the name decides alone, and a name two services define goes to the
+     * one tried first, which is right for either of them. What is wrong is reaching a service that
+     * does not dispatch the name at all, and the check above cannot see it, because a
+     * {@code Version} goes straight to the service it names: a set claiming a name its handler
+     * lacks, tried ahead of the service that has it, takes every such request.
+     */
+    @Test
+    void withoutAVersionEveryActionReachesAServiceThatDispatchesIt() throws IOException {
+        Set<String> known = knownGaps();
+        Map<String, Set<String>> dispatched = dispatchedByService();
+        List<String> unexpected = new ArrayList<>();
+
+        for (QueryHandler handler : HANDLERS) {
+            for (String action : dispatchedActions(handler)) {
+                String reached = reachedWithoutVersion(action);
+                if (!dispatched.getOrDefault(reached, Set.of()).contains(action)
+                        && !known.contains(gapKey(handler.service(), action, reached))) {
+                    unexpected.add(handler.service() + " dispatches " + action
+                            + " but without a Version a request for it reaches " + reached);
+                }
+            }
+        }
+
+        assertTrue(unexpected.isEmpty(),
+                "Without a Version an action has to reach a service that dispatches it, or the "
+                        + "request answers UnsupportedOperation in a namespace it was never for. "
+                        + "A set in AwsQueryController claims a name its handler does not "
+                        + "dispatch, ahead of the service that does: " + unexpected);
     }
 
     /**
@@ -128,12 +216,17 @@ class AwsQueryActionRoutingParityTest {
      */
     @Test
     void theKnownGapListHasNoStaleEntries() throws IOException {
+        Map<String, Set<String>> dispatched = dispatchedByService();
         Set<String> live = new LinkedHashSet<>();
         for (QueryHandler handler : HANDLERS) {
             for (String action : dispatchedActions(handler)) {
-                String reached = AwsQueryController.inferServiceFromAction(action);
+                String reached = reached(handler, action);
                 if (!handler.service().equals(reached)) {
                     live.add(gapKey(handler.service(), action, reached));
+                }
+                String reachedWithoutVersion = reachedWithoutVersion(action);
+                if (!dispatched.getOrDefault(reachedWithoutVersion, Set.of()).contains(action)) {
+                    live.add(gapKey(handler.service(), action, reachedWithoutVersion));
                 }
             }
         }
@@ -169,6 +262,105 @@ class AwsQueryActionRoutingParityTest {
                 "Every *QueryHandler.java has to be registered in this test with the service its "
                         + "actions must reach, so its dispatch list is compared against routing. "
                         + "Unregistered: " + unregistered);
+    }
+
+    /**
+     * The headings in the gap file count the rows under them, and a fix that removes rows makes
+     * them wrong. They are worth keeping, because the scale and the split between the two kinds of
+     * gap are the first thing a reader wants, so the test keeps them honest instead.
+     *
+     * <p>Every heading is checked, not just the total: a per-service fix is exactly the change that
+     * invalidates its own service heading. The headings must also be present, so deleting one
+     * cannot make this pass by having nothing left to compare.
+     *
+     * <p>The file is walked in order, so a service heading is held to the rows physically below it,
+     * up to the next heading, rather than to its service's rows wherever they sit. Each row has to
+     * sit under its own service's heading, and a service gets one heading, so a misplaced row or a
+     * section split in two fails even when every service's overall count still adds up.
+     */
+    @Test
+    void theKnownGapHeadingsCountTheRowsBelowThem() throws IOException {
+        List<String> wrong = new ArrayList<>();
+        Set<String> headed = new TreeSet<>();
+        int[] allRows = new int[2];
+        GapHeading total = null;
+        GapHeading section = null;
+        int[] sectionRows = new int[2];
+
+        for (String raw : Files.readAllLines(KNOWN_GAPS)) {
+            String line = raw.strip();
+            Matcher totalHeading = TOTAL_HEADING.matcher(line);
+            Matcher serviceHeading = SERVICE_HEADING.matcher(line);
+            if (totalHeading.matches()) {
+                if (total != null) {
+                    wrong.add("the total heading appears twice: " + line);
+                }
+                total = GapHeading.of("total", totalHeading, 1);
+            } else if (serviceHeading.matches()) {
+                if (section != null) {
+                    section.check(sectionRows, wrong);
+                }
+                section = GapHeading.of(serviceHeading.group(1), serviceHeading, 2);
+                sectionRows = new int[2];
+                if (!headed.add(section.label())) {
+                    wrong.add("the " + section.label() + " heading appears twice, splitting its rows: " + line);
+                }
+            } else if (!line.isEmpty() && !line.startsWith("#")) {
+                String[] columns = line.split("\t");
+                int column = "sqs".equals(columns[2]) ? 0 : 1;
+                allRows[column]++;
+                if (section == null) {
+                    wrong.add(line + " comes before any service heading");
+                } else {
+                    sectionRows[column]++;
+                    if (!section.label().equals(columns[0])) {
+                        wrong.add(line + " sits under the " + section.label() + " heading, not its own");
+                    }
+                }
+            }
+        }
+        if (section != null) {
+            section.check(sectionRows, wrong);
+        }
+
+        if (total == null) {
+            wrong.add("the total heading is missing, so nothing states the overall count");
+        } else {
+            total.check(allRows, wrong);
+        }
+
+        assertTrue(wrong.isEmpty(),
+                "A heading in " + KNOWN_GAPS + " no longer counts the rows under it, or a row is not "
+                        + "under its own service's heading. Removing a gap means updating the heading "
+                        + "that counted it, including the total. " + wrong);
+    }
+
+    /**
+     * Where an unsigned request for the action goes, carrying the handler's own {@code Version} the
+     * way every Query client sends it.
+     */
+    private static String reached(QueryHandler handler, String action) {
+        String version = API_VERSIONS.get(handler.service());
+        assertTrue(version != null, "No API version listed for " + handler.service());
+        return AwsQueryController.inferServiceFromAction(action, version);
+    }
+
+    /** Where an unsigned request for the action goes when it carries no {@code Version} at all. */
+    private static String reachedWithoutVersion(String action) {
+        return AwsQueryController.inferServiceFromAction(action, null);
+    }
+
+    /**
+     * Every name each service dispatches, across all of its handlers. A service with no Query
+     * handler, as Cognito has none, dispatches nothing.
+     */
+    private static Map<String, Set<String>> dispatchedByService() throws IOException {
+        Map<String, Set<String>> dispatched = new HashMap<>();
+        for (QueryHandler handler : HANDLERS) {
+            dispatched.computeIfAbsent(handler.service(), service -> new TreeSet<>())
+                    .addAll(dispatchedActions(handler));
+        }
+        return dispatched;
     }
 
     /** One line of the known-gap file: the service, the action, and what it reaches instead. */

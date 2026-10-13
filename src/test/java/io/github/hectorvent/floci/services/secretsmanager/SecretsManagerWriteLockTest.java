@@ -10,14 +10,19 @@ import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.secretsmanager.model.Secret;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -45,6 +50,238 @@ class SecretsManagerWriteLockTest {
         storage = new ParkingStorage();
         service = new SecretsManagerService(storage, 30);
         service.createSecret(SECRET_NAME, "v1", null, "original", null, null, REGION);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void backendReleaseDoesNotBlockAnotherSecretOnTheSameStripe(boolean failBackend) throws Exception {
+        Map<Integer, String> stripes = new HashMap<>();
+        String primary = null;
+        String unrelated = null;
+        for (int index = 0; index <= 32; index++) {
+            String arn = service.createSecret("collision-" + index, "v1", null, "original", null, null, REGION).getArn();
+            String previous = stripes.putIfAbsent(Math.floorMod(arn.hashCode(), 32), arn);
+            if (previous != null) {
+                primary = previous;
+                unrelated = arn;
+                break;
+            }
+        }
+        assertTrue(primary != null && unrelated != null);
+        String releasingArn = primary;
+        String otherArn = unrelated;
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch unrelatedUpdated = new CountDownLatch(1);
+        Watched deletion = start("managed-release", () -> {
+            Runnable credentials = () -> {
+                entered.countDown();
+                try {
+                    assertTrue(release.await(10, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(e);
+                }
+                if (failBackend) {
+                    throw new IllegalStateException("backend failed");
+                }
+            };
+            if (failBackend) {
+                assertThrows(IllegalStateException.class,
+                        () -> service.deleteManagedSecretAfter(releasingArn, REGION, credentials));
+            } else {
+                assertTrue(service.deleteManagedSecretAfter(releasingArn, REGION, credentials));
+            }
+        });
+        Watched other = null;
+        try {
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            other = start("unrelated-update", () -> {
+                service.updateSecret(otherArn, "independent", null, REGION);
+                unrelatedUpdated.countDown();
+            });
+            assertTrue(unrelatedUpdated.await(2, TimeUnit.SECONDS), "Backend I/O blocked an unrelated secret");
+        } finally {
+            release.countDown();
+            deletion.awaitSuccess();
+            if (other != null) {
+                other.awaitSuccess();
+            }
+        }
+        assertEquals("independent", service.describeSecret(otherArn, REGION).getDescription());
+        if (failBackend) {
+            assertEquals("v1", service.getSecretValue(releasingArn, null, null, REGION).getSecretString());
+            service.replicateSecretToRegions(releasingArn,
+                    List.of(new SecretsManagerService.ReplicaRegion(REPLICA_REGION, null)), false, REGION);
+            assertEquals(1, service.describeSecret(releasingArn, REGION).getReplicationStatus().size());
+        } else {
+            assertThrows(AwsException.class, () -> service.describeSecret(releasingArn, REGION));
+        }
+    }
+
+    @Test
+    void managedDeletionWaitsForReplicationAndPreservesCredentials() throws Exception {
+        String arn = service.describeSecret(SECRET_NAME, REGION).getArn();
+        storage.parkOn(REPLICA_REGION + "::" + SECRET_NAME);
+        Watched replication = start("replication", () -> service.replicateSecretToRegions(arn,
+                List.of(new SecretsManagerService.ReplicaRegion(REPLICA_REGION, null)), false, REGION));
+        AtomicReference<Boolean> changed = new AtomicReference<>(false);
+        AtomicReference<Boolean> deleted = new AtomicReference<>();
+        Watched deletion = null;
+        try {
+            assertTrue(storage.awaitEntered());
+            deletion = start("managed-deletion", () -> deleted.set(
+                    service.deleteManagedSecretAfter(arn, REGION, () -> changed.set(true))));
+            assertTrue(deletion.awaitBlocked());
+        } finally {
+            storage.release();
+            replication.awaitSuccess();
+            if (deletion != null) {
+                deletion.awaitSuccess();
+            }
+        }
+        assertFalse(deleted.get());
+        assertFalse(changed.get());
+        assertEquals(1, service.describeSecret(arn, REGION).getReplicationStatus().size());
+        assertEquals("v1", service.getSecretValue(SECRET_NAME, null, null, REPLICA_REGION).getSecretString());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void replicationChangesCannotResurrectAReleasedManagedSecret(boolean removeReplica) throws Exception {
+        String arn = service.describeSecret(SECRET_NAME, REGION).getArn();
+        if (removeReplica) {
+            service.replicateSecretToRegions(arn,
+                    List.of(new SecretsManagerService.ReplicaRegion(REPLICA_REGION, null)), false, REGION);
+            service.removeRegionsFromReplication(arn, List.of(REPLICA_REGION), REGION);
+        }
+        CountDownLatch changing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Watched deletion = start("managed-deletion", () -> assertTrue(
+                service.deleteManagedSecretAfter(arn, REGION, () -> {
+                    changing.countDown();
+                    try {
+                        assertTrue(release.await(5, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(e);
+                    }
+                })));
+        Watched replication = null;
+        try {
+            assertTrue(changing.await(5, TimeUnit.SECONDS));
+            replication = start("replication", () -> {
+                AwsException missing = assertThrows(AwsException.class, () -> {
+                    if (removeReplica) {
+                        service.removeRegionsFromReplication(arn, List.of(REPLICA_REGION), REGION);
+                    } else {
+                        service.replicateSecretToRegions(arn,
+                                List.of(new SecretsManagerService.ReplicaRegion(REPLICA_REGION, null)), false, REGION);
+                    }
+                });
+                assertEquals("InvalidRequestException", missing.getErrorCode());
+            });
+            replication.awaitSuccess();
+        } finally {
+            release.countDown();
+            deletion.awaitSuccess();
+            if (replication != null) {
+                replication.awaitSuccess();
+            }
+        }
+        assertThrows(AwsException.class, () -> service.describeSecret(arn, REGION));
+        assertThrows(AwsException.class, () -> service.describeSecret(SECRET_NAME, REPLICA_REGION));
+    }
+
+    @Test
+    void queuedPromotionCannotRestoreSecretsAfterManagedRelease() throws Exception {
+        String arn = service.describeSecret(SECRET_NAME, REGION).getArn();
+        service.replicateSecretToRegions(arn,
+                List.of(new SecretsManagerService.ReplicaRegion(REPLICA_REGION, null)), false, REGION);
+        storage.parkOn(REGION + "::" + SECRET_NAME);
+        storage.afterParkedWrite = () -> {
+            service.removeRegionsFromReplication(arn, List.of(REPLICA_REGION), REGION);
+            assertTrue(service.deleteManagedSecretAfter(arn, REGION, () -> { }));
+        };
+        Watched writer = start("primary-writer", () -> service.updateSecret(arn, "updated", null, REGION));
+        Watched promotion = null;
+        try {
+            assertTrue(storage.awaitEntered());
+            promotion = start("queued-promotion", () -> {
+                AwsException missing = assertThrows(AwsException.class,
+                        () -> service.stopReplicationToReplica(SECRET_NAME, REPLICA_REGION));
+                assertEquals("ResourceNotFoundException", missing.getErrorCode());
+            });
+            assertTrue(promotion.awaitBlocked());
+        } finally {
+            storage.release();
+            writer.awaitSuccess();
+            if (promotion != null) {
+                promotion.awaitSuccess();
+            }
+        }
+        assertThrows(AwsException.class, () -> service.describeSecret(arn, REGION));
+        assertThrows(AwsException.class, () -> service.describeSecret(SECRET_NAME, REPLICA_REGION));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void activeReleaseRejectsDeletionAndDuplicateReleaseUntilBackendFailure(boolean forceDelete) throws Exception {
+        String arn = service.describeSecret(SECRET_NAME, REGION).getArn();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Watched owner = start("failing-release", () -> assertThrows(IllegalStateException.class,
+                () -> service.deleteManagedSecretAfter(arn, REGION, () -> {
+                    entered.countDown();
+                    try {
+                        assertTrue(release.await(10, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(e);
+                    }
+                    throw new IllegalStateException("backend failed");
+                })));
+        Watched concurrent = null;
+        try {
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            concurrent = start("concurrent-release", () -> {
+                AwsException deletion = assertThrows(AwsException.class,
+                        () -> service.deleteSecret(arn, null, forceDelete, REGION));
+                assertEquals("InvalidRequestException", deletion.getErrorCode());
+                AwsException duplicate = assertThrows(AwsException.class,
+                        () -> service.deleteManagedSecretAfter(arn, REGION,
+                                () -> { throw new AssertionError("Duplicate backend call"); }));
+                assertEquals("InvalidRequestException", duplicate.getErrorCode());
+            });
+            concurrent.awaitSuccess();
+        } finally {
+            release.countDown();
+            owner.awaitSuccess();
+            if (concurrent != null) {
+                concurrent.awaitSuccess();
+            }
+        }
+        assertEquals("v1", service.getSecretValue(arn, null, null, REGION).getSecretString());
+        assertTrue(service.deleteManagedSecretAfter(arn, REGION, () -> { }));
+        assertThrows(AwsException.class, () -> service.describeSecret(arn, REGION));
+    }
+
+    @Test
+    void failedCredentialChangeRetainsTheSecret() {
+        String arn = service.describeSecret(SECRET_NAME, REGION).getArn();
+        assertThrows(IllegalStateException.class, () -> service.deleteManagedSecretAfter(arn, REGION, () -> {
+            throw new IllegalStateException("backend refused rotation");
+        }));
+        assertEquals("v1", service.getSecretValue(arn, null, null, REGION).getSecretString());
+    }
+
+    @Test
+    void alreadyRemovedManagedSecretStillAllowsCredentialChange() {
+        String arn = service.describeSecret(SECRET_NAME, REGION).getArn();
+        service.deleteSecret(arn, null, true, REGION);
+        AtomicReference<Boolean> changed = new AtomicReference<>(false);
+        assertTrue(service.deleteManagedSecretAfter(arn, REGION, () -> changed.set(true)));
+        assertTrue(changed.get());
     }
 
     @Test
@@ -155,6 +392,7 @@ class SecretsManagerWriteLockTest {
         private final CountDownLatch entered = new CountDownLatch(1);
         private final CountDownLatch released = new CountDownLatch(1);
         private volatile BiPredicate<String, Secret> parkWhen;
+        private Runnable afterParkedWrite;
 
         void parkOn(String key) {
             parkOn((written, secret) -> written.equals(key));
@@ -185,6 +423,11 @@ class SecretsManagerWriteLockTest {
                 }
             }
             super.put(key, value);
+            Runnable afterWrite = afterParkedWrite;
+            if (afterWrite != null) {
+                afterParkedWrite = null;
+                afterWrite.run();
+            }
         }
     }
 

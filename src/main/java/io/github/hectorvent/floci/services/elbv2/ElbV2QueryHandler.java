@@ -124,11 +124,17 @@ public class ElbV2QueryHandler {
         String type = p.getFirst("Type");
         String ipAddressType = p.getFirst("IpAddressType");
         List<String> subnets = memberList(p, "Subnets");
+        List<String> subnetMappings = subnetMappingSubnetIds(p);
+        if (!subnets.isEmpty() && !subnetMappings.isEmpty()) {
+            throw new AwsException("ValidationError",
+                    "You can specify either subnets or subnet mappings, not both", 400);
+        }
+        List<String> effectiveSubnets = subnetMappings.isEmpty() ? subnets : subnetMappings;
         List<String> securityGroups = memberList(p, "SecurityGroups");
         Map<String, String> tags = parseTags(p);
 
         LoadBalancer lb = service.createLoadBalancer(region, name, scheme, type, ipAddressType,
-                subnets, securityGroups, tags);
+                effectiveSubnets, securityGroups, tags);
 
         // return provisioning state in create response only
         LoadBalancer provisioning = shallowCopy(lb);
@@ -256,7 +262,12 @@ public class ElbV2QueryHandler {
     private Response handleSetSubnets(MultivaluedMap<String, String> p, String region) {
         String arn = p.getFirst("LoadBalancerArn");
         List<String> subnets = memberList(p, "Subnets");
-        service.setSubnets(region, arn, subnets);
+        List<String> subnetMappings = subnetMappingSubnetIds(p);
+        if (!subnets.isEmpty() && !subnetMappings.isEmpty()) {
+            throw new AwsException("ValidationError",
+                    "You can specify either subnets or subnet mappings, not both", 400);
+        }
+        service.setSubnets(region, arn, subnetMappings.isEmpty() ? subnets : subnetMappings);
         return voidResponse("SetSubnetsResponse");
     }
 
@@ -1064,12 +1075,43 @@ public class ElbV2QueryHandler {
     // ── Parsing helpers ───────────────────────────────────────────────────────
 
     private List<String> memberList(MultivaluedMap<String, String> p, String prefix) {
+        return memberList(p, prefix, "");
+    }
+
+    private List<String> memberList(MultivaluedMap<String, String> p, String prefix, String suffix) {
         List<String> result = new ArrayList<>();
         int i = 1;
         while (true) {
-            String val = p.getFirst(prefix + ".member." + i);
-            if (val == null) break;
+            String val = p.getFirst(prefix + ".member." + i + suffix);
+            if (val == null) {
+                break;
+            }
             result.add(val);
+            i++;
+        }
+        return result;
+    }
+
+    private List<String> subnetMappingSubnetIds(MultivaluedMap<String, String> p) {
+        List<String> result = new ArrayList<>();
+        int i = 1;
+        while (true) {
+            boolean memberPresent = false;
+            for (String key : p.keySet()) {
+                if (key.startsWith("SubnetMappings.member." + i + ".")) {
+                    memberPresent = true;
+                    break;
+                }
+            }
+            if (!memberPresent) {
+                break;
+            }
+            String subnetId = p.getFirst("SubnetMappings.member." + i + ".SubnetId");
+            if (subnetId == null) {
+                throw new AwsException("ValidationError",
+                        "You must specify a subnet ID for each subnet mapping.", 400);
+            }
+            result.add(subnetId);
             i++;
         }
         return result;

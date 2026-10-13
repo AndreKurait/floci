@@ -406,6 +406,30 @@ class S3ServiceTest {
     }
 
     @Test
+    void refusedDeletePreservesVersionBytesAndPurgeRemovesThem() throws IOException {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        s3Service.putBucketVersioning("test-bucket", "Enabled");
+        S3Object version = s3Service.putObject("test-bucket", "file.txt",
+                "version data".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        S3Object marker = s3Service.deleteObject("test-bucket", "file.txt");
+        Path versionDirectory = tempDir.resolve("s3/.accounts/000000000000/.versions/test-bucket");
+
+        AwsException error = assertThrows(AwsException.class, () -> s3Service.deleteBucket("test-bucket"));
+        assertEquals("BucketNotEmpty", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        assertArrayEquals("version data".getBytes(StandardCharsets.UTF_8),
+                s3Service.getObject("test-bucket", "file.txt", version.getVersionId()).getData());
+        assertTrue(Files.exists(versionDirectory));
+
+        s3Service.deleteObject("test-bucket", "file.txt", marker.getVersionId());
+        s3Service.deleteObject("test-bucket", "file.txt", version.getVersionId());
+        s3Service.deleteBucket("test-bucket");
+        try (Stream<Path> paths = Files.walk(versionDirectory)) {
+            assertTrue(paths.noneMatch(Files::isRegularFile));
+        }
+    }
+
+    @Test
     void getObjectNotFoundThrows() {
         s3Service.createBucket("test-bucket", "us-east-1");
         AwsException ex = assertThrows(AwsException.class, () ->

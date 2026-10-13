@@ -98,10 +98,17 @@ class CodeArtifactNpmDockerIntegrationTest {
     @Test
     @Order(1)
     void publishThenFetchRoundTripsTheRealNpmEnvelope() throws IOException {
+        long assetSizeBytesBeforePublish = describeDomainAssetSizeBytes();
+
         given().header("Authorization", "Bearer " + bearerToken).contentType("application/json")
                 .body(publishFixture)
                 .put("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + PACKAGE_NAME)
                 .then().statusCode(anyOf201Or200());
+
+        // assetSizeBytes used to be hardcoded to 0 regardless of what was actually published; this
+        // is the real Verdaccio round trip proving a real npm publish now counts, by exactly the
+        // tarball's own decoded byte count (not the envelope's base64-and-JSON-wrapped size).
+        assertEquals(assetSizeBytesBeforePublish + expectedTarballBytes.length, describeDomainAssetSizeBytes());
 
         String metadataBody = given().header("Authorization", "Bearer " + bearerToken)
                 .get("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + PACKAGE_NAME)
@@ -139,10 +146,23 @@ class CodeArtifactNpmDockerIntegrationTest {
     @Test
     @Order(2)
     void republishingTheSameEnvelopeASecondTimeIsStillIdempotent() {
+        long assetSizeBytesBeforeRepublish = describeDomainAssetSizeBytes();
+
         given().header("Authorization", "Bearer " + bearerToken).contentType("application/json")
                 .body(publishFixture)
                 .put("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + PACKAGE_NAME)
                 .then().statusCode(anyOf201Or200());
+
+        // The confirmed-republish short-circuit never reaches Verdaccio, so no new bytes were
+        // written; assetSizeBytes must not count this tarball a second time.
+        assertEquals(assetSizeBytesBeforeRepublish, describeDomainAssetSizeBytes());
+    }
+
+    private static long describeDomainAssetSizeBytes() {
+        return given().header("Authorization", AUTH)
+                .get("/v1/domain?domain=" + DOMAIN)
+                .then().statusCode(200)
+                .extract().jsonPath().getLong("domain.assetSizeBytes");
     }
 
     @Test
@@ -371,6 +391,48 @@ class CodeArtifactNpmDockerIntegrationTest {
         given().header("Authorization", AUTH)
                 .get("/v1/package?domain=" + DOMAIN + "&repository=" + REPO + "&format=npm&package=" + packageName)
                 .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
+    }
+
+    /**
+     * The fix for a real finding (hectorvent, PR #5484): the pinned Verdaccio image is configured
+     * with {@code unpublish: $all}, so a real npm client's native {@code DELETE} straight to the
+     * packument ({@code npm unpublish <pkg> --force}) bypasses {@code DeletePackage} entirely and
+     * goes straight through this proxy's own transparent passthrough for any non-publish request.
+     * Without detecting this one wire shape, the byte count this package's publish added would
+     * survive the unpublish forever, with nothing to ever clean it up ({@code DeletePackage} never
+     * runs; {@code DeleteRepository} only cleans it up if the whole repository is later deleted
+     * too). A throwaway package, not {@link #PACKAGE_NAME}, for the same reason as the test above.
+     */
+    @Test
+    @Order(12)
+    void nativeNpmUnpublishCleansUpTheByteCountToo() {
+        String packageName = "unpublish-me-pkg";
+        byte[] tarball = "unpublish throwaway tarball".getBytes(StandardCharsets.UTF_8);
+        String envelope = "{\"name\":\"" + packageName + "\",\"versions\":{\"1.0.0\":{\"name\":\"" + packageName
+                + "\",\"version\":\"1.0.0\",\"dist\":{\"tarball\":\"http://ignored/" + packageName + "-1.0.0.tgz\""
+                + "}}},\"_attachments\":{\"" + packageName + "-1.0.0.tgz\":{\"content_type\":"
+                + "\"application/octet-stream\",\"data\":\""
+                + Base64.getEncoder().encodeToString(tarball) + "\",\"length\":" + tarball.length + "}}}";
+
+        long assetSizeBytesBeforePublish = describeDomainAssetSizeBytes();
+        given().header("Authorization", "Bearer " + bearerToken).contentType("application/json").body(envelope)
+                .put("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + packageName)
+                .then().statusCode(anyOf201Or200());
+        assertEquals(assetSizeBytesBeforePublish + tarball.length, describeDomainAssetSizeBytes());
+
+        String rev = given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + packageName)
+                .then().statusCode(200)
+                .extract().jsonPath().getString("_rev");
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .delete("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + packageName + "/-rev/" + rev)
+                .then().statusCode(anyOf201Or200());
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + packageName)
+                .then().statusCode(404);
+        assertEquals(assetSizeBytesBeforePublish, describeDomainAssetSizeBytes());
     }
 
     /**

@@ -387,6 +387,15 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private final String seededAccountAlias;
     /** Guards case-insensitive IAM name uniqueness checks and their corresponding writes. */
     private final Object resourceNameLock = new Object();
+    /**
+     * Guards every check-then-write on a login profile. ChangePassword is the reason it has to
+     * exist: it reads the profile to compare the old password, then writes the new one, so two
+     * requests presenting the same valid old password would otherwise both pass the comparison
+     * and both report success while only the later write survived. Every writer takes it, since a
+     * guard one writer skips guarantees nothing: a racing UpdateLoginProfile would overwrite the
+     * password a ChangePassword had just been told it could set.
+     */
+    private final Object loginProfileLock = new Object();
 
     /**
      * AWS-managed policies ({@code arn:<partition>:iam::aws:policy/...}), keyed by ARN, one map
@@ -888,11 +897,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                                 credential.getServiceSpecificCredentialId(), credential);
                     }
                 }
-                loginProfiles.get(userName).ifPresent(profile -> {
-                    loginProfiles.delete(userName);
-                    profile.setUserName(newUserName);
-                    loginProfiles.put(newUserName, profile);
-                });
+                synchronized (loginProfileLock) {
+                    loginProfiles.get(userName).ifPresent(profile -> {
+                        loginProfiles.delete(userName);
+                        profile.setUserName(newUserName);
+                        loginProfiles.put(newUserName, profile);
+                    });
+                }
                 for (AccessKey key : keysToMove) {
                     key.setUserName(newUserName);
                     accessKeys.put(key.getAccessKeyId(), key);
@@ -2338,13 +2349,19 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     /** A user holds at most one login profile: creating a second is EntityAlreadyExists. */
     public LoginProfile createLoginProfile(String userName, String password, boolean passwordResetRequired) {
         getUser(userName);
-        if (loginProfiles.get(userName).isPresent()) {
-            throw new AwsException("EntityAlreadyExists",
-                    "Login Profile for User " + userName + " already exists.", 409);
+        LoginProfile profile;
+        synchronized (loginProfileLock) {
+            if (loginProfiles.get(userName).isPresent()) {
+                throw new AwsException("EntityAlreadyExists",
+                        "Login Profile for User " + userName + " already exists.", 409);
+            }
+            validatePassword(password, "password");
+            // No profile to pass: a password being set for the first time replaces nothing, and a
+            // profile deleted and recreated takes its history with it.
+            checkPasswordPolicy(password, null);
+            profile = new LoginProfile(userName, password, passwordResetRequired);
+            loginProfiles.put(userName, profile);
         }
-        validateLoginProfilePassword(password);
-        LoginProfile profile = new LoginProfile(userName, password, passwordResetRequired);
-        loginProfiles.put(userName, profile);
         LOG.infov("Created IAM login profile for user: {0}", userName);
         return profile;
     }
@@ -2364,42 +2381,166 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * clear the reset-required flag, and vice versa.
      */
     public void updateLoginProfile(String userName, String password, Boolean passwordResetRequired) {
-        LoginProfile profile = getLoginProfile(userName);
-        if (password != null) {
-            validateLoginProfilePassword(password);
-            profile.setPassword(password);
-            profile.setPasswordLastChanged(Instant.now());
+        synchronized (loginProfileLock) {
+            LoginProfile profile = getLoginProfile(userName);
+            if (password != null) {
+                validatePassword(password, "password");
+                checkPasswordPolicy(password, profile);
+                recordSupersededPassword(profile);
+                profile.setPassword(password);
+                profile.setPasswordLastChanged(Instant.now());
+            }
+            if (passwordResetRequired != null) {
+                profile.setPasswordResetRequired(passwordResetRequired);
+            }
+            loginProfiles.put(userName, profile);
         }
-        if (passwordResetRequired != null) {
-            profile.setPasswordResetRequired(passwordResetRequired);
-        }
-        loginProfiles.put(userName, profile);
         LOG.infov("Updated IAM login profile for user: {0}", userName);
     }
 
     public void deleteLoginProfile(String userName) {
         getUser(userName);
-        if (loginProfiles.get(userName).isEmpty()) {
-            throw new AwsException("NoSuchEntity",
-                    "Login Profile for User " + userName + " cannot be found.", 404);
+        synchronized (loginProfileLock) {
+            if (loginProfiles.get(userName).isEmpty()) {
+                throw new AwsException("NoSuchEntity",
+                        "Login Profile for User " + userName + " cannot be found.", 404);
+            }
+            loginProfiles.delete(userName);
         }
-        loginProfiles.delete(userName);
         LOG.infov("Deleted IAM login profile for user: {0}", userName);
     }
 
     /**
-     * Base wire validation shared by Create/UpdateLoginProfile, then, only when the account has
-     * ever set one (matching {@link #getAccountPasswordPolicy}'s own NoSuchEntity-by-default
-     * semantics), the account's password policy.
+     * Changes the password of the IAM user who is calling, which is the only user
+     * {@code ChangePassword} can act on: the reference says it "changes the password of the IAM
+     * user who is calling this operation" and that "the AWS account root user password is not
+     * affected by this operation". The caller is resolved from the signing access key before this
+     * is reached, so the user name here is already that user.
+     *
+     * <p>The old password is checked before the new one is held to the account's policy, so a
+     * caller who cannot prove the current password is refused on that alone and learns nothing
+     * about what the policy would have required.
+     *
+     * <p>The comparison and the write are one step under {@code loginProfileLock}, which is what
+     * makes the refusal above mean anything: read apart from the write, two requests presenting
+     * the same valid old password would both pass the comparison and both be told they had set
+     * the password, while only the later write survived.
+     *
+     * <p>A successful change clears {@code PasswordResetRequired}. The user guide's own reason for
+     * the "Password expiration requires administrator reset" option is that it stops users
+     * updating their own password through the console, and says that even then "IAM users with
+     * iam:ChangePassword permission and active access keys can reset their own IAM user console
+     * password programmatically", which is only true if the change itself clears the state the
+     * reset left behind.
+     *
+     * <p>An old password that does not match is the one refusal the reference leaves unnamed:
+     * every error it publishes for this operation describes something else, and the error it
+     * documents for a caller that is not an IAM user is {@code InvalidUserType}, raised by the
+     * handler. The common error types are additive per action, so this answers
+     * {@code InvalidParameterValue}, which is the published one for a parameter value the service
+     * cannot accept, with the same 400 as the operation's other sender faults.
      */
-    private void validateLoginProfilePassword(String password) {
-        if (password == null || !LOGIN_PROFILE_PASSWORD_PATTERN.matcher(password).matches()) {
-            throw new AwsException("ValidationError",
-                    "1 validation error detected: Value at 'password' failed to satisfy constraint: "
-                            + "Member must have length less than or equal to 128 and greater than or "
-                            + "equal to 1", 400);
+    public void changePassword(String userName, String oldPassword, String newPassword) {
+        validatePassword(oldPassword, "oldPassword");
+        validatePassword(newPassword, "newPassword");
+        synchronized (loginProfileLock) {
+            LoginProfile profile = getLoginProfile(userName);
+            if (!oldPassword.equals(profile.getPassword())) {
+                throw new AwsException("InvalidParameterValue",
+                        "The old password supplied is not the current password for user "
+                                + userName + ".", 400);
+            }
+            checkPasswordPolicy(newPassword, profile);
+            recordSupersededPassword(profile);
+            profile.setPassword(newPassword);
+            profile.setPasswordLastChanged(Instant.now());
+            profile.setPasswordResetRequired(false);
+            loginProfiles.put(userName, profile);
         }
-        getAccountPasswordPolicy().ifPresent(policy -> checkPasswordAgainstPolicy(password, policy));
+        LOG.infov("Changed the IAM console password of user: {0}", userName);
+    }
+
+    /**
+     * The account's password policy applied to a password about to be stored, and only when the
+     * account has ever set one, matching {@link #getAccountPasswordPolicy}'s own
+     * NoSuchEntity-by-default semantics. {@code replacing} is the profile the password is being
+     * written over, or null when there is none to reuse a password from.
+     */
+    private void checkPasswordPolicy(String password, LoginProfile replacing) {
+        getAccountPasswordPolicy().ifPresent(policy -> {
+            checkPasswordAgainstPolicy(password, policy);
+            if (replacing != null) {
+                checkPasswordNotReused(replacing, password, policy);
+            }
+        });
+    }
+
+    /**
+     * Refuses a password the account's reuse window still holds. The reference defines
+     * {@code PasswordReusePrevention} as "the number of previous passwords that IAM users are
+     * prevented from reusing", with no value meaning "IAM users are not prevented from reusing
+     * previous passwords", so the window is that many superseded passwords.
+     *
+     * <p>The password the profile currently holds is refused alongside them, which the reference
+     * does not spell out. Reading it the other way makes a window of 1 refuse nothing a user
+     * would attempt: it would leave setting a password to the value it already has allowed, and
+     * that is reuse in the only sense the setting exists to stop. Counting the current password
+     * first is also what makes the A to B and back to A case refusable at the smallest window the
+     * policy accepts.
+     */
+    private static void checkPasswordNotReused(LoginProfile profile, String password,
+                                               AccountPasswordPolicy policy) {
+        Integer window = policy.getPasswordReusePrevention();
+        if (window == null) {
+            return;
+        }
+        List<String> held = profile.getPreviousPasswords();
+        List<String> refused = new ArrayList<>();
+        refused.add(profile.getPassword());
+        refused.addAll(held.subList(0, Math.min(window, held.size())));
+        if (refused.contains(password)) {
+            throw new AwsException("PasswordPolicyViolation",
+                    "Password does not conform to the account password policy. It must not be the "
+                            + "current password or one of the previous " + window
+                            + " passwords.", 400);
+        }
+    }
+
+    /**
+     * Moves the password a profile is about to lose into its history, newest first. Bounded at the
+     * largest window {@code PasswordReusePrevention} accepts, since nothing can be asked about a
+     * password further back than that.
+     */
+    private static void recordSupersededPassword(LoginProfile profile) {
+        List<String> held = profile.getPreviousPasswords();
+        held.add(0, profile.getPassword());
+        while (held.size() > PASSWORD_REUSE_PREVENTION_CEILING) {
+            held.remove(held.size() - 1);
+        }
+    }
+
+    /**
+     * {@code passwordType}, which every password member on every one of these operations shares.
+     * The member is named so the message is the one AWS gives for the parameter that failed:
+     * {@code ChangePassword} has two of them, and a caller told that 'password' failed has to
+     * guess which.
+     *
+     * <p>An absent member and an empty one are different answers. The pattern requires at least
+     * one character, so an empty value fails the constraint, where an absent one was never
+     * supplied at all.
+     */
+    private static void validatePassword(String password, String member) {
+        if (password == null) {
+            throw new AwsException("ValidationError",
+                    "1 validation error detected: Value null at '" + member
+                            + "' failed to satisfy constraint: Member must not be null", 400);
+        }
+        if (!LOGIN_PROFILE_PASSWORD_PATTERN.matcher(password).matches()) {
+            throw new AwsException("ValidationError",
+                    "1 validation error detected: Value at '" + member
+                            + "' failed to satisfy constraint: Member must have length less than "
+                            + "or equal to 128 and greater than or equal to 1", 400);
+        }
     }
 
     private void checkPasswordAgainstPolicy(String password, AccountPasswordPolicy policy) {
@@ -3476,7 +3617,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * <p>The API Reference publishes a length of 20 to 128 as well as the pattern, so both are
      * checked, and both are reported when both are broken, in the order it prints them. The
      * pattern message is the one recorded against AWS; the length wording is the form AWS uses for
-     * a member carrying both bounds, which {@link #validateLoginProfilePassword} spells the same
+     * a member carrying both bounds, which {@link #validatePassword} spells the same
      * way.
      */
     private void requireCredentialIdFormat(String credentialId) {

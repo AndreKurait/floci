@@ -679,7 +679,7 @@ class ElastiCacheCfnProvisionerTest {
 
     @Test
     void deleteToleratesAlreadyDeletedButPropagatesOtherFailures() {
-        doThrow(new AwsException("UserNotFoundFault", "gone", 404))
+        doThrow(new AwsException("UserNotFound", "gone", 404))
                 .when(cache).deleteUser("gone");
         provisioner.delete("AWS::ElastiCache::User", "gone", "us-east-1");
 

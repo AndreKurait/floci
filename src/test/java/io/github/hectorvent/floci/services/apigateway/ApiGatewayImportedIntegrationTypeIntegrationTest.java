@@ -9,6 +9,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
@@ -28,6 +29,16 @@ class ApiGatewayImportedIntegrationTypeIntegrationTest {
         "http, HTTP, get, GET",
         "http_proxy, HTTP_PROXY, get, GET",
         "mock, MOCK, get, GET",
+        "AWS, AWS, get, GET",
+        "AWS_PROXY, AWS_PROXY, get, GET",
+        "HTTP, HTTP, get, GET",
+        "HTTP_PROXY, HTTP_PROXY, get, GET",
+        "MOCK, MOCK, get, GET",
+        "Aws, AWS, get, GET",
+        "Aws_Proxy, AWS_PROXY, get, GET",
+        "Http, HTTP, get, GET",
+        "Http_Proxy, HTTP_PROXY, get, GET",
+        "Mock, MOCK, get, GET",
         "mock, MOCK, x-amazon-apigateway-any-method, ANY"
     })
     void importMergeAndOverwriteExposeCanonicalMetadataWithoutChangingOtherFields(
@@ -57,16 +68,17 @@ class ApiGatewayImportedIntegrationTypeIntegrationTest {
     private static Map<String, Object> integration(String type) {
         Map<String, Object> integration = new LinkedHashMap<>();
         integration.put("type", type);
+        String normalizedType = type.toLowerCase(Locale.ROOT);
         integration.put("timeoutInMillis", 12000);
-        if (!"mock".equals(type)) {
+        if (!"mock".equals(normalizedType)) {
             integration.put("httpMethod", "POST");
         }
-        if ("aws".equals(type) || "aws_proxy".equals(type)) {
+        if ("aws".equals(normalizedType) || "aws_proxy".equals(normalizedType)) {
             integration.put("uri", LAMBDA_URI);
-        } else if (!"mock".equals(type)) {
+        } else if (!"mock".equals(normalizedType)) {
             integration.put("uri", "https://example.com/original");
         }
-        if (List.of("aws", "http", "mock").contains(type)) {
+        if (List.of("aws", "http", "mock").contains(normalizedType)) {
             integration.put("responses", Map.of("default", Map.of("statusCode", "200")));
         }
         return integration;

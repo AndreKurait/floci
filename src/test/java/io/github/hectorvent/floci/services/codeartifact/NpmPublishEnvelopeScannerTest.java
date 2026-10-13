@@ -33,7 +33,7 @@ class NpmPublishEnvelopeScannerTest {
         NpmPublishEnvelopeScanner.Version version = envelope.versions().get("1.0.0");
         assertEquals(raw.at("/versions/1.0.0/dist/integrity").asText(), version.integrity());
         String filename = raw.at("/versions/1.0.0/dist/tarball").asText().replaceAll(".*/", "");
-        assertEquals(version.integrity(), envelope.attachmentIntegrity().get(filename));
+        assertEquals(version.integrity(), envelope.attachments().get(filename).integrity());
     }
 
     @Test
@@ -55,7 +55,8 @@ class NpmPublishEnvelopeScannerTest {
         NpmPublishEnvelopeScanner.Envelope envelope = scan(json);
 
         assertEquals("sha512-" + Base64.getEncoder().encodeToString(sha512(tarball)),
-                envelope.attachmentIntegrity().get("a.tgz"));
+                envelope.attachments().get("a.tgz").integrity());
+        assertEquals(tarball.length, envelope.attachments().get("a.tgz").size());
     }
 
     @Test
@@ -68,7 +69,8 @@ class NpmPublishEnvelopeScannerTest {
         NpmPublishEnvelopeScanner.Envelope envelope = scan(json);
 
         assertEquals("sha512-" + Base64.getEncoder().encodeToString(sha512(tarball)),
-                envelope.attachmentIntegrity().get("big.tgz"));
+                envelope.attachments().get("big.tgz").integrity());
+        assertEquals(tarball.length, envelope.attachments().get("big.tgz").size());
     }
 
     @Test
@@ -110,9 +112,43 @@ class NpmPublishEnvelopeScannerTest {
         assertInvalid("{\"_attachments\":{\"a.tgz\":{\"data\":\"abcde\"}}}");
     }
 
+    /**
+     * A real finding turned out not to be one: a review raised whether a JSON-escaped attachment
+     * (most plausibly {@code \/}, the one base64 character JSON permits escaping, though no real
+     * npm client's own {@code JSON.stringify} ever actually produces one) would be silently
+     * undercounted here. Checked directly rather than assumed either way: {@code
+     * JsonParser#readBinaryValue} already resolves the escape before decoding, so a validly
+     * escaped, valid-length attachment decodes correctly, digest and byte count both exactly
+     * right. {@code 0xFF 0xFF 0xFF} is a deliberately chosen fixture: its base64 encoding is
+     * exactly {@code "////"}, four real {@code /} characters with no padding, so every character
+     * of the escaped payload below actually exercises the escape-resolution path, not just one
+     * character buried among ordinary ones.
+     */
     @Test
-    void attachmentDataContainingAnEscapeIsRejected() {
-        assertInvalid("{\"_attachments\":{\"a.tgz\":{\"data\":\"ab\\/cd\"}}}");
+    void attachmentDataContainingAnEscapedSlashIsDecodedCorrectly() throws Exception {
+        byte[] tarball = {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
+        String base64 = Base64.getEncoder().encodeToString(tarball);
+        assertEquals("////", base64);
+        String escaped = base64.replace("/", "\\/");
+        String json = "{\"_attachments\":{\"a.tgz\":{\"data\":\"" + escaped + "\"}}}";
+
+        NpmPublishEnvelopeScanner.Envelope envelope = scan(json);
+
+        assertEquals("sha512-" + Base64.getEncoder().encodeToString(sha512(tarball)),
+                envelope.attachments().get("a.tgz").integrity());
+        assertEquals(tarball.length, envelope.attachments().get("a.tgz").size());
+    }
+
+    /**
+     * An escape sequence present is not, on its own, a pass: decoded, this is {@code "a/bcd"},
+     * 5 characters, not a multiple of 4, so still genuinely invalid base64 regardless of the
+     * escape. (This is also what the older, differently-reasoned version of this test actually
+     * exercised: {@code "ab\/cd"} decodes to {@code "ab/cd"}, 5 characters, rejected for the same
+     * length reason, not because it contained an escape at all.)
+     */
+    @Test
+    void attachmentDataContainingAnEscapeButStillInvalidBase64IsRejected() {
+        assertInvalid("{\"_attachments\":{\"a.tgz\":{\"data\":\"a\\/bcd\"}}}");
     }
 
     @Test
