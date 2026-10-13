@@ -601,7 +601,9 @@ class Ec2ServiceTest {
             "true,true,true", "true,false,false", "true,true,false"})
     void terminationKeepsAddressesOnlyOnRetainedInterfaces(boolean suppliedInterface, boolean defaultVpc,
                                                           boolean deleteOnTermination) {
-        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        when(containerManager.reachablePublicAddress(any())).thenReturn("192.0.2.10");
+        Ec2Service service = new Ec2Service(mockConfig(true), containerManager,
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
                 new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
         String region = "us-east-1";
@@ -634,6 +636,7 @@ class Ec2ServiceTest {
                     Map.of("association.public-ip", List.of("*")), 0, null).networkInterfaces().isEmpty());
         } else {
             assertEquals(associationId, remaining.getAssociationId());
+            assertEquals("192.0.2.10", remaining.getPublicIp());
             assertEquals(interfaceId, remaining.getNetworkInterfaceId());
             NetworkInterface retained = service.describeNetworkInterfaces(region, List.of(interfaceId),
                     Map.of("association.public-ip", List.of(remaining.getPublicIp())), 0, null)
