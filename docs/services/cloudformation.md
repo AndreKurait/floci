@@ -399,6 +399,12 @@ macro co-declared beside SAM is absent from `Processed` as well.
 Real AWS's answer for these shapes is unmeasured, co-declared with SAM or not. `StagesAvailable`
 always lists both stages, matching AWS.
 
+## SAM published aliases
+
+`AutoPublishAlias` creates a version and points the generated alias at that version's
+numeric `Version` attribute. CloudFormation resolves the version before creating the
+alias. Later changes to `$LATEST` do not change the alias's published code or configuration.
+
 ## Conditions
 
 Template `Conditions` are evaluated before provisioning. A resource whose `Condition` evaluates to

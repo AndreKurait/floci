@@ -141,11 +141,38 @@ class SamTransformProcessorTest {
         assertEquals("production", aliasProps.path("Name").asText());
         assertEquals("MyFunc", aliasProps.path("FunctionName").path("Ref").asText());
 
-        // The alias deliberately targets $LATEST rather than the published version real SAM points
-        // at: Floci cannot invoke a published version (#1987 cold-start timeout, #1988 warm-pool
-        // keying), so the faithful form would break the alias-qualified invoke this expansion
-        // exists to enable.
-        assertEquals("$LATEST", aliasProps.path("FunctionVersion").asText());
+        assertEquals(objectMapper.readTree("[\"MyFuncVersion\",\"Version\"]"),
+                aliasProps.path("FunctionVersion").path("Fn::GetAtt"));
+    }
+
+    @Test
+    void expandSamTemplate_autoPublishAliasUsesGeneratedVersionWhenLogicalIdCollides() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyFuncVersion": {"Type": "AWS::S3::Bucket"},
+                "MyFunc": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "Handler": "index.handler", "Runtime": "nodejs20.x",
+                    "AutoPublishAlias": {"Ref": "StageName"},
+                    "InlineCode": "exports.handler = async () => ({});"
+                  }
+                }
+              }
+            }
+            """);
+
+        JsonNode resources = processor.expandSamTemplate(template).path("Resources");
+        JsonNode versionRef = resources.path("MyFuncAlias").path("Properties")
+                .path("FunctionVersion").path("Fn::GetAtt");
+        String generatedVersion = versionRef.get(0).asText();
+        assertNotEquals("MyFuncVersion", generatedVersion);
+        assertEquals("AWS::Lambda::Version", resources.path(generatedVersion).path("Type").asText());
+        assertEquals("Version", versionRef.get(1).asText());
+        assertEquals("StageName", resources.path("MyFuncAlias").path("Properties")
+                .path("Name").path("Ref").asText());
     }
 
     @Test
