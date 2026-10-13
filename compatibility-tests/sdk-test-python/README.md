@@ -44,6 +44,20 @@ pytest tests/test_s3.py
 just test-python
 ```
 
+## Legacy DynamoDB client
+
+`legacy/test_dynamodb_20111205.py` exercises the 2011-12-05 API with Boto 2,
+including paginated queries and batch cleanup of tables created by Boto 3.
+Public Boto 2.49.0 needs Python 3.9: it uses retired collections and import
+interfaces. Run this suite in a separate environment; the ordinary Python
+3.12 suite retains its existing dependencies.
+
+```bash
+python3.9 -m venv .venv-legacy
+.venv-legacy/bin/pip install -r requirements-legacy.txt
+FLOCI_ENDPOINT=http://localhost:4566 .venv-legacy/bin/python -m pytest legacy/
+```
+
 ## Configuration
 
 | Variable         | Default                 | Description             |

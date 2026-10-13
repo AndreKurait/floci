@@ -158,6 +158,9 @@ public class AwsJsonController {
                     if (targetMatch.prefix().startsWith("DynamoDBStreams_")) {
                         yield dynamoDbStreamsJsonHandler.handle(action, request, region);
                     }
+                    if ("DynamoDB_20111205.".equals(targetMatch.prefix())) {
+                        yield dynamoDbJsonHandler.handleLegacy(action, request, region);
+                    }
                     DynamoDbRequestShapes.check(action, request);
                     yield dynamoDbJsonHandler.handle(action, request, region);
                 }

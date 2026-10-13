@@ -56,7 +56,10 @@ public class ServiceCatalog {
                 String rpcV2ServiceName = prefix.endsWith(".")
                         ? prefix.substring(0, prefix.length() - 1)
                         : prefix;
-                cborSdkServiceIds.putIfAbsent(rpcV2ServiceName, descriptor);
+                // The retired DynamoDB API is JSON-only and has different request shapes.
+                if (!"DynamoDB_20111205".equals(rpcV2ServiceName)) {
+                    cborSdkServiceIds.putIfAbsent(rpcV2ServiceName, descriptor);
+                }
             }
         }
         targets.sort(Comparator.comparingInt((Map.Entry<String, ServiceDescriptor> entry) -> entry.getKey().length())

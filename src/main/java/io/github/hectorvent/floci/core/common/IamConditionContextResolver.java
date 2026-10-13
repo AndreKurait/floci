@@ -548,7 +548,7 @@ public class IamConditionContextResolver {
             return dynamoDbBatchConditionContext(action, ctx, null);
         }
         TableDefinition table = describeTargetTable(targetTableName(body));
-        DynamoDbConditionKeys.Result keys = DynamoDbConditionKeys.extract(action, body, table);
+        DynamoDbConditionKeys.Result keys = dynamoDbKeys(action, body, table, ctx);
 
         Map<String, List<String>> conditions = new LinkedHashMap<>();
         if (!keys.leadingKeys().isEmpty()) {
@@ -640,8 +640,8 @@ public class IamConditionContextResolver {
             ObjectNode single = ((ObjectNode) body).objectNode();
             single.setAll((ObjectNode) body);
             single.putObject("RequestItems").set(entry.getKey(), entry.getValue());
-            DynamoDbConditionKeys.Result keys = DynamoDbConditionKeys.extract(
-                    action, single, describeTargetTable(reference));
+            DynamoDbConditionKeys.Result keys = dynamoDbKeys(
+                    action, single, describeTargetTable(reference), ctx);
             leadingKeys.addAll(keys.leadingKeys());
             attributes.addAll(keys.attributes());
         });
@@ -668,6 +668,17 @@ public class IamConditionContextResolver {
     private JsonNode bufferedJsonBody(ContainerRequestContext ctx) {
         Object cached = ctx.getProperty(BUFFERED_JSON_BODY);
         return cached instanceof JsonNode node ? node : null;
+    }
+
+    private static DynamoDbConditionKeys.Result dynamoDbKeys(
+            String action, JsonNode body, TableDefinition table, ContainerRequestContext ctx) {
+        String target = ctx.getHeaderString("X-Amz-Target");
+        boolean legacy = action != null && action.startsWith("dynamodb:")
+                && ("DynamoDB_20111205." + action.substring("dynamodb:".length())).equals(target)
+                && ctx.getMediaType() != null
+                && ctx.getMediaType().isCompatible(MediaType.valueOf("application/x-amz-json-1.0"));
+        return legacy ? DynamoDbConditionKeys.extractLegacy(action, body, table)
+                : DynamoDbConditionKeys.extract(action, body, table);
     }
 
     /**
