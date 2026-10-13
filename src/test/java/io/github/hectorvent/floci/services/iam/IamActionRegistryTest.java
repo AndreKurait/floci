@@ -37,11 +37,13 @@ class IamActionRegistryTest {
         MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
         query.add("Action", "GetMetricStatistics");
         query.add("Operation", "ListMetrics");
+        query.add("Version", "2010-08-01");
         ContainerRequestContext ctx = mockCtx("GET", "/", query, null, "");
         when(ctx.getHeaderString("Authorization")).thenReturn(
                 "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/monitoring/aws4_request");
         assertEquals("monitoring:GetMetricStatistics", registry.resolve("monitoring", ctx));
         assertEquals("GetMetricStatistics", registry.queryAction(ctx));
+        assertEquals("2010-08-01", registry.queryVersion(ctx));
         query.remove("Action");
         assertEquals("monitoring:ListMetrics", registry.resolve("monitoring", ctx));
     }
@@ -49,7 +51,7 @@ class IamActionRegistryTest {
     @ParameterizedTest
     @CsvSource({
             "s3,GetMetricStatistics,false", "sns,TagResource,false", "monitoring,TagResource,true",
-            "monitoring,UnknownAction,false", "unknown,GetMetricStatistics,false"
+            "monitoring,UnknownAction,true", "unknown,GetMetricStatistics,false"
     })
     void getClassificationRespectsSigningScope(String scope, String action, boolean expected) {
         MultivaluedMap<String, String> query = new MultivaluedHashMap<>();

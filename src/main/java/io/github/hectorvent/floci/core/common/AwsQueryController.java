@@ -535,6 +535,8 @@ public class AwsQueryController {
             "ListTagsForResource"
     );
 
+    private static final String CLOUDWATCH_API_VERSION = "2010-08-01";
+
     private static final Set<String> CLOUDWATCH_ACTIONS = Set.of(
             "PutMetricData", "ListMetrics", "GetMetricStatistics", "GetMetricData",
             "PutMetricAlarm", "DescribeAlarms", "DeleteAlarms", "SetAlarmState",
@@ -658,13 +660,28 @@ public class AwsQueryController {
                 || (accept != null && accept.contains(MediaType.TEXT_HTML))) {
             return false;
         }
-        String action = AwsQueryServiceResolver.action(queryParams);
-        if (action == null || !CLOUDWATCH_ACTIONS.contains(action)) {
-            return false;
+        String service = SigV4CredentialScope.serviceName(authorization).orElse(null);
+        if (service != null) {
+            return "monitoring".equals(service);
         }
-        return SigV4CredentialScope.serviceName(authorization)
-                .map("monitoring"::equals)
-                .orElseGet(() -> authorization == null && "monitoring".equals(inferServiceFromAction(action, queryParams.getFirst("Version"))));
+        String action = AwsQueryServiceResolver.action(queryParams);
+        return authorization == null && action != null && CLOUDWATCH_ACTIONS.contains(action)
+                && "monitoring".equals(inferServiceFromAction(action, queryParams.getFirst("Version")));
+    }
+
+    public Response dispatchCloudWatchQueryGet(String authorization, HttpHeaders headers,
+                                               MultivaluedMap<String, String> queryParams) {
+        String action = AwsQueryServiceResolver.action(queryParams);
+        if (action == null) {
+            return Response.status(404).type(MediaType.APPLICATION_XML)
+                    .entity("<UnknownOperationException/>").build();
+        }
+        if (!CLOUDWATCH_ACTIONS.contains(action)) {
+            String version = queryParams.getFirst("Version");
+            return xmlErrorResponse("InvalidAction", "Could not find operation " + action + " for version "
+                    + (version != null ? version : CLOUDWATCH_API_VERSION), 404);
+        }
+        return dispatch(authorization, headers, queryParams);
     }
 
     /**
@@ -707,7 +724,7 @@ public class AwsQueryController {
             new QueryService("sns", Set.of("2010-03-31"), SNS_ACTIONS),
             new QueryService("elasticache", Set.of("2015-02-02"), ELASTICACHE_ACTIONS),
             new QueryService("rds", Set.of("2014-10-31"), RDS_ACTIONS),
-            new QueryService("monitoring", Set.of("2010-08-01"), CLOUDWATCH_ACTIONS),
+            new QueryService("monitoring", Set.of(CLOUDWATCH_API_VERSION), CLOUDWATCH_ACTIONS),
             new QueryService("cloudformation", Set.of("2010-05-15"), CLOUDFORMATION_ACTIONS),
             new QueryService("email", Set.of("2010-12-01"), SES_ACTIONS),
             new QueryService("cognito-idp", Set.of(), COGNITO_ACTIONS),
