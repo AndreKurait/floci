@@ -494,7 +494,7 @@ class ApiGatewayAwsIntegrationTest {
                 null,  // no request template — passthrough
                 Map.of(
                         "200", new IntegrationResponseConfig("", ""),
-                        "400", new IntegrationResponseConfig(".*ResourceNotFoundException.*", "")
+                        "400", new IntegrationResponseConfig("4\\d{2}", "")
                 ));
 
         redeploy();

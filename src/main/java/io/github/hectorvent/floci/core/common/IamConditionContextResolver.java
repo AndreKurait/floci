@@ -83,6 +83,18 @@ public class IamConditionContextResolver {
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
+            case "iam" -> iamConditionContext(action, ctx);
+            default -> null;
+        };
+    }
+
+    private static Map<String, List<String>> iamConditionContext(String action, ContainerRequestContext ctx) {
+        return switch (action) {
+            case "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:AttachUserPolicy",
+                    "iam:DetachUserPolicy", "iam:AttachGroupPolicy", "iam:DetachGroupPolicy" -> {
+                String policyArn = formParameters(ctx).get("PolicyArn");
+                yield policyArn == null ? null : Map.of("iam:PolicyARN", List.of(policyArn));
+            }
             default -> null;
         };
     }

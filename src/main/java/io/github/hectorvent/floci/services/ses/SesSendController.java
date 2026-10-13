@@ -108,6 +108,9 @@ public class SesSendController {
             List<String> replyToAddresses = addressList(request, "ReplyToAddresses");
             String feedbackForwardingAddress =
                     request.path("FeedbackForwardingEmailAddress").asText(null);
+            // "For Raw emails, the FromEmailAddressIdentityArn value overrides the X-SES-SOURCE-ARN
+            // and X-SES-FROM-ARN headers", so it stands for both ARNs of a raw send.
+            String fromIdentityArn = request.path("FromEmailAddressIdentityArn").asText(null);
             String configurationSetName = request.path("ConfigurationSetName").asText(null);
             String tenantName = stringMemberOrAbsent(request, "TenantName");
             List<MessageTag> emailTags = parseEmailTagsArray(request.path("EmailTags"), "EmailTags");
@@ -121,6 +124,9 @@ public class SesSendController {
                     .bccAddresses(bccAddresses)
                     .replyToAddresses(replyToAddresses)
                     .returnPath(feedbackForwardingAddress)
+                    .sourceArn(fromIdentityArn)
+                    .fromArn(fromIdentityArn)
+                    .returnPathArn(request.path("FeedbackForwardingEmailAddressIdentityArn").asText(null))
                     .configurationSetName(configurationSetName)
                     .emailTags(emailTags)
                     .listManagement(listManagement)

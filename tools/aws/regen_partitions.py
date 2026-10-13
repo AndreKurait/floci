@@ -28,6 +28,11 @@ from two sources and a rule:
   `endpoints.json` omits some of those, so each partition's `services` adds them, recorded again
   under `servicesFromRulesets`. Only a service `endpoints.json` lists in some partition is added:
   a service it lists nowhere stays unknown everywhere rather than present in a few partitions.
+- botocore's `signin` endpoint ruleset, for `signinHost`: the host AWS Sign-In's data plane is
+  served on in each partition (`{region}.signin.amazonaws.cn`), which no partition output can
+  build because the domain is not the DNS suffix. Only the plain branches count (no FIPS, no
+  dual-stack, not the control plane and not the OAuth endpoint); a partition the ruleset names in
+  none of them gets no `signinHost`.
 - The AWS CDK's `region-info/lib/aws-entities.ts` (Apache-2.0), whose ordered region list
   carries two rule markers: regions before `RULE_S3_WEBSITE_REGIONAL_SUBDOMAIN` use the
   legacy `s3-website-<region>` endpoint form, and commercial regions after
@@ -247,11 +252,65 @@ def collect_ruleset_partitions(botocore_data: Path) -> dict[str, list[str]]:
     return {prefix: sorted(partitions) for prefix, partitions in sorted(by_prefix.items())}
 
 
+SIGNIN_SERVICE = "signin"
+SIGNIN_URL_RE = re.compile(r"https://\{Region\}\.([a-z0-9-]+(?:\.[a-z0-9-]+)+)")
+
+
+def boolean_condition(condition: dict) -> tuple[str, bool] | None:
+    """The `(parameter, value)` a `booleanEquals(<parameter>, <literal>)` condition tests."""
+    if condition.get("fn") != "booleanEquals":
+        return None
+    argv = condition.get("argv", [])
+    if len(argv) != 2:
+        return None
+    for parameter, value in ((argv[0], argv[1]), (argv[1], argv[0])):
+        if isinstance(parameter, dict) and isinstance(parameter.get("ref"), str) and isinstance(value, bool):
+            return parameter["ref"], value
+    return None
+
+
+def signin_hosts(rules: list[dict], inherited: tuple[dict, ...] = ()) -> dict[str, str]:
+    """Partition id -> `{region}.signin.<domain>`, from the ruleset branches a plain data-plane
+    call resolves through: one partition named, FIPS and dual-stack both tested false, and a URL
+    that is the region followed by a literal domain. The control-plane and OAuth branches test
+    neither flag false, so they never match."""
+    hosts: dict[str, str] = {}
+    for rule in rules:
+        conditions = inherited + tuple(rule.get("conditions", []))
+        if rule.get("type") == "tree":
+            found = signin_hosts(rule.get("rules", []), conditions)
+        elif rule.get("type") == "endpoint":
+            url = rule.get("endpoint", {}).get("url")
+            match = SIGNIN_URL_RE.fullmatch(url) if isinstance(url, str) else None
+            named = {partition_name_condition(c) for c in conditions} - {None}
+            flags = dict(filter(None, (boolean_condition(c) for c in conditions)))
+            plain = flags.get("UseFIPS") is False and flags.get("UseDualStack") is False
+            found = {named.pop(): "{region}." + match.group(1)} if match and plain and len(named) == 1 else {}
+        else:
+            found = {}
+        for partition_id, host in found.items():
+            if hosts.setdefault(partition_id, host) != host:
+                raise ValueError(f"signin ruleset: {partition_id} resolves to both {hosts[partition_id]} and {host}")
+    return hosts
+
+
+def collect_signin_hosts(botocore_data: Path) -> dict[str, str]:
+    """Partition id -> AWS Sign-In data-plane host template, or {} when botocore has no model."""
+    service_dir = botocore_data / SIGNIN_SERVICE
+    if not service_dir.is_dir():
+        return {}
+    versions = sorted(v for v in service_dir.iterdir() if ruleset_file(v) is not None)
+    if not versions:
+        return {}
+    return signin_hosts(load_model(ruleset_file(versions[-1])).get("rules", []))
+
+
 def build(partitions_doc: dict, endpoints_doc: dict, entities: list[str] | None,
           carried: dict | None, provenance: str,
           signing_names: dict[str, list[str]] | None = None,
           rulesets: dict[str, list[str]] | None = None,
-          self_signed: set[str] | None = None) -> dict:
+          self_signed: set[str] | None = None,
+          signin: dict[str, str] | None = None) -> dict:
     endpoint_partitions = {p["partition"]: p for p in endpoints_doc["partitions"]}
     listed_anywhere = {service for p in endpoints_doc["partitions"] for service in p.get("services", {})}
     if signing_names is not None and self_signed is not None:
@@ -335,6 +394,8 @@ def build(partitions_doc: dict, endpoints_doc: dict, entities: list[str] | None,
             "globalServices": global_services,
             "s3DualStackRegions": s3_dualstack_regions,
         })
+        if partition_id in (signin or {}):
+            result_partitions[-1]["signinHost"] = signin[partition_id]
     result_partitions.sort(key=lambda p: (p["id"] != COMMERCIAL, p["id"]))
     return {
         "_source": {
@@ -362,7 +423,8 @@ def generate(botocore_data: Path, provenance: str, cdk_root: Path | None, existi
         entities = parse_cdk_entities((cdk_root / CDK_ENTITIES).read_text(encoding="utf-8"))
     carried = load_json(existing) if existing.exists() else None
     return build(partitions_doc, endpoints_doc, entities, carried, provenance, collect_signing_names(botocore_data),
-                 collect_ruleset_partitions(botocore_data), collect_self_signed_prefixes(botocore_data))
+                 collect_ruleset_partitions(botocore_data), collect_self_signed_prefixes(botocore_data),
+                 collect_signin_hosts(botocore_data))
 
 
 def main(argv: list[str] | None = None) -> int:

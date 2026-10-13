@@ -1122,6 +1122,44 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     @Test
+    void scanPrefixesTheSelectConflicts() {
+        createUsersTable("eu-west-1");
+
+        AwsException count = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Select": "COUNT", "ProjectionExpression": "userId"}
+                """));
+        assertEquals("1 validation error detected: Cannot specify the ProjectionExpression "
+                + "when choosing to get only the Count", count.getMessage());
+
+        AwsException allProjected = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Select": "ALL_PROJECTED_ATTRIBUTES"}
+                """));
+        assertEquals("1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only "
+                + "when Querying using an IndexName", allProjected.getMessage());
+    }
+
+    @Test
+    void queryPrefixesTheSelectConflicts() {
+        createUsersTable("eu-west-1");
+
+        AwsException allAttributes = expectValidationException("Query", json("""
+                {"TableName": "Users", "KeyConditionExpression": "userId = :u",
+                 "ExpressionAttributeValues": {":u": {"S": "a"}},
+                 "Select": "ALL_ATTRIBUTES", "ProjectionExpression": "userId"}
+                """));
+        assertEquals("1 validation error detected: Cannot specify the ProjectionExpression "
+                + "when choosing to get ALL_ATTRIBUTES", allAttributes.getMessage());
+
+        AwsException allProjected = expectValidationException("Query", json("""
+                {"TableName": "Users", "KeyConditionExpression": "userId = :u",
+                 "ExpressionAttributeValues": {":u": {"S": "a"}},
+                 "Select": "ALL_PROJECTED_ATTRIBUTES"}
+                """));
+        assertEquals("1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only "
+                + "when Querying using an IndexName", allProjected.getMessage());
+    }
+
+    @Test
     void scanAcceptsSegmentsAtTheBounds() throws Exception {
         createUsersTable("eu-west-1");
 
