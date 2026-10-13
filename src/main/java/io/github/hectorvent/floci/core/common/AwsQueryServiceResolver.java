@@ -19,14 +19,19 @@ public class AwsQueryServiceResolver {
         this.catalog = catalog;
     }
 
-    public String resolve(String authorization, String action) {
+    /**
+     * The service named by a Query-capable signing scope, else the one the action and the request's
+     * declared {@code Version} lead to. Both callers read {@code Version} from the form body, as they
+     * do the action, so they cannot disagree about which service a request is for.
+     */
+    public String resolve(String authorization, String action, String version) {
         ServiceDescriptor descriptor = SigV4CredentialScope.serviceName(authorization)
                 .flatMap(catalog::byCredentialScope)
                 .orElse(null);
         if (descriptor != null && descriptor.supportsProtocol(ServiceProtocol.QUERY)) {
             return descriptor.externalKey();
         }
-        return AwsQueryController.inferServiceFromAction(action);
+        return AwsQueryController.inferServiceFromAction(action, version);
     }
 
     /** Returns the operation the Query controller will dispatch from a form request. */

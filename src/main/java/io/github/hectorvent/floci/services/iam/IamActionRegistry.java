@@ -328,6 +328,14 @@ public class IamActionRegistry {
                 RequestBodyReader.formField(ctx, "Operation"));
     }
 
+    /**
+     * Returns the API version a Query request declares, from the form body for the same reason as
+     * {@link #queryAction}: it is the value the controller routes on.
+     */
+    public String queryVersion(ContainerRequestContext ctx) {
+        return RequestBodyReader.formField(ctx, "Version");
+    }
+
     /** The same form POST at the root that the Query controller dispatches. */
     public static boolean isQueryRequest(ContainerRequestContext ctx) {
         if (!"POST".equalsIgnoreCase(ctx.getMethod()) || ctx.getUriInfo() == null) {

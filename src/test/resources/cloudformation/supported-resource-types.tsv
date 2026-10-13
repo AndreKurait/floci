@@ -36,6 +36,9 @@ AWS::Backup::BackupVault	BackupVaultCfnProvisioner
 AWS::Batch::ComputeEnvironment	BatchCfnProvisioner
 AWS::Batch::JobDefinition	BatchCfnProvisioner
 AWS::Batch::JobQueue	BatchCfnProvisioner
+AWS::BedrockAgentCore::Memory	BedrockAgentCoreCfnProvisioner
+AWS::BedrockAgentCore::Runtime	BedrockAgentCoreCfnProvisioner
+AWS::BedrockAgentCore::RuntimeEndpoint	BedrockAgentCoreCfnProvisioner
 AWS::CDK::Metadata	CdkMetadataCfnProvisioner
 AWS::CertificateManager::Certificate	AcmCfnProvisioner
 AWS::CloudFormation::CustomResource	CustomResourceCfnProvisioner
@@ -58,6 +61,7 @@ AWS::Cognito::UserPool	CognitoCfnProvisioner
 AWS::Cognito::UserPoolClient	CognitoCfnProvisioner
 AWS::Cognito::UserPoolDomain	CognitoCfnProvisioner
 AWS::Cognito::UserPoolGroup	CognitoUserPoolGroupCfnProvisioner
+AWS::Cognito::UserPoolResourceServer	CognitoResourceServerCfnProvisioner
 AWS::Cognito::UserPoolUser	CognitoUserPoolUserCfnProvisioner
 AWS::Cognito::UserPoolUserToGroupAttachment	CognitoUserPoolUserToGroupAttachmentCfnProvisioner
 AWS::Config::ConfigRule	ConfigCfnProvisioner
@@ -91,6 +95,7 @@ AWS::ECS::TaskDefinition	EcsCfnProvisioner
 AWS::EKS::Cluster	EksCfnProvisioner
 AWS::EKS::Nodegroup	EksCfnProvisioner
 AWS::ElastiCache::CacheCluster	ElastiCacheCfnProvisioner
+AWS::ElastiCache::ServerlessCache	ElastiCacheServerlessCfnProvisioner
 AWS::ElastiCache::SubnetGroup	ElastiCacheCfnProvisioner
 AWS::ElastiCache::User	ElastiCacheCfnProvisioner
 AWS::ElastiCache::UserGroup	ElastiCacheCfnProvisioner
@@ -103,6 +108,7 @@ AWS::Events::Archive	EventsArchiveCfnProvisioner
 AWS::Events::EventBus	EventsCfnProvisioner
 AWS::Events::EventBusPolicy	EventsCfnProvisioner
 AWS::Events::Rule	EventsCfnProvisioner
+AWS::GuardDuty::MalwareProtectionPlan	GuardDutyMalwareProtectionPlanCfnProvisioner
 AWS::IAM::AccessKey	IamAccessKeyCfnProvisioner
 AWS::IAM::InstanceProfile	IamInstanceProfileCfnProvisioner
 AWS::IAM::ManagedPolicy	IamManagedPolicyCfnProvisioner

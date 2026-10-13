@@ -10,7 +10,7 @@ import java.util.regex.Pattern;
 /**
  * One AWS partition as AWS publishes it: {@code aws}, {@code aws-cn}, {@code aws-us-gov}, the
  * classified {@code aws-iso*} family and {@code aws-eusc}. Every field is vendored from botocore's
- * {@code partitions.json} and {@code endpoints.json} into {@code aws/partitions.json} by
+ * {@code partitions.json}, {@code endpoints.json} and endpoint rulesets into {@code aws/partitions.json} by
  * {@code tools/aws/regen_partitions.py}; nothing here is hand-typed. See {@link AwsPartitions}
  * for the catalog and the region-to-partition lookup.
  *
@@ -30,6 +30,9 @@ import java.util.regex.Pattern;
  * @param supportsDualStack    whether the partition publishes dual-stack endpoints
  * @param supportsFips         whether the partition publishes FIPS endpoints
  * @param s3DualStackRegions   the regions whose S3 endpoint publishes a dual-stack variant
+ * @param signinHost           the AWS Sign-In data-plane host with a {@code {region}} placeholder
+ *                             ({@code {region}.signin.amazonaws.cn}), or {@code null} where
+ *                             botocore's ruleset names none; its domain is not the DNS suffix
  */
 public record AwsPartition(
         String id,
@@ -44,7 +47,8 @@ public record AwsPartition(
         Map<String, GlobalEndpoint> globalServices,
         boolean supportsDualStack,
         boolean supportsFips,
-        Set<String> s3DualStackRegions) {
+        Set<String> s3DualStackRegions,
+        String signinHost) {
 
     /**
      * A published region.
@@ -150,6 +154,11 @@ public record AwsPartition(
     /** True when {@code id} has the shape botocore gives this partition's regions. */
     public boolean matchesRegionRegex(String id) {
         return id != null && regionRegex.matcher(id.trim().toLowerCase(Locale.ROOT)).matches();
+    }
+
+    /** The host AWS Sign-In's data plane is served on for {@code region}, when AWS publishes one. */
+    public Optional<String> signinHostname(String region) {
+        return Optional.ofNullable(signinHost).map(host -> host.replace("{region}", region));
     }
 
     /** The regional endpoint host, {@code <service>.<region>.<dnsSuffix>}. */

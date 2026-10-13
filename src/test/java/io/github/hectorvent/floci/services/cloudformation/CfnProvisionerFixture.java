@@ -12,6 +12,8 @@ import io.github.hectorvent.floci.services.appsync.AppSyncService;
 import io.github.hectorvent.floci.services.autoscaling.AutoScalingService;
 import io.github.hectorvent.floci.services.backup.BackupService;
 import io.github.hectorvent.floci.services.batch.BatchService;
+import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreControlService;
+import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreMemoryService;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AcmCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayAccountCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayApiKeyCfnProvisioner;
@@ -28,6 +30,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.AutoScali
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AutoScalingScalingPolicyCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.BackupVaultCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.BatchCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.BedrockAgentCoreCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CdkMetadataCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnDynamicReferences;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
@@ -39,6 +42,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudTrai
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchDashboardCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoResourceServerCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoUserPoolGroupCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoUserPoolUserCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoUserPoolUserToGroupAttachmentCfnProvisioner;
@@ -60,10 +64,12 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCapaci
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EksCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ElastiCacheCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.ElastiCacheServerlessCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ElbV2CfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EventsArchiveCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EventsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.FirehoseCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.GuardDutyMalwareProtectionPlanCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamAccessKeyCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamInstanceProfileCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamManagedPolicyCfnProvisioner;
@@ -119,10 +125,12 @@ import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheMemcachedService;
+import io.github.hectorvent.floci.services.elasticache.ElastiCacheServerlessService;
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
 import io.github.hectorvent.floci.services.firehose.FirehoseService;
+import io.github.hectorvent.floci.services.guardduty.GuardDutyService;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iot.IotAuthorizerService;
 import io.github.hectorvent.floci.services.iot.IotDomainConfigurationService;
@@ -232,9 +240,13 @@ final class CfnProvisionerFixture {
         private BackupService backupService;
         private ElastiCacheService elastiCacheService;
         private ElastiCacheMemcachedService elastiCacheMemcachedService;
+        private ElastiCacheServerlessService elastiCacheServerlessService;
         private RedshiftService redshiftService;
         private RedshiftServerlessService redshiftServerlessService;
         private CloudMapService cloudMapService;
+        private GuardDutyService guardDutyService;
+        private BedrockAgentCoreControlService bedrockAgentCoreControlService;
+        private BedrockAgentCoreMemoryService bedrockAgentCoreMemoryService;
         private CloudFormationResourceRegistry resourceRegistry;
         private boolean registryChosenByTest;
         private CfnDynamicReferences dynamicReferences;
@@ -310,6 +322,7 @@ final class CfnProvisionerFixture {
             }
             if (cognitoService != null) {
                 discovered.add(new CognitoCfnProvisioner(cognitoService));
+                discovered.add(new CognitoResourceServerCfnProvisioner(cognitoService));
                 discovered.add(new CognitoUserPoolGroupCfnProvisioner(cognitoService));
                 discovered.add(new CognitoUserPoolUserCfnProvisioner(cognitoService));
                 discovered.add(new CognitoUserPoolUserToGroupAttachmentCfnProvisioner(cognitoService));
@@ -457,6 +470,9 @@ final class CfnProvisionerFixture {
             if (elastiCacheService != null && elastiCacheMemcachedService != null) {
                 discovered.add(new ElastiCacheCfnProvisioner(elastiCacheService, elastiCacheMemcachedService));
             }
+            if (elastiCacheServerlessService != null) {
+                discovered.add(new ElastiCacheServerlessCfnProvisioner(elastiCacheServerlessService));
+            }
             if (redshiftService != null) {
                 discovered.add(new RedshiftClusterCfnProvisioner(redshiftService));
             }
@@ -465,6 +481,13 @@ final class CfnProvisionerFixture {
             }
             if (cloudMapService != null) {
                 discovered.add(new CloudMapCfnProvisioner(cloudMapService));
+            }
+            if (guardDutyService != null) {
+                discovered.add(new GuardDutyMalwareProtectionPlanCfnProvisioner(guardDutyService));
+            }
+            if (bedrockAgentCoreControlService != null && bedrockAgentCoreMemoryService != null) {
+                discovered.add(new BedrockAgentCoreCfnProvisioner(bedrockAgentCoreControlService,
+                        bedrockAgentCoreMemoryService));
             }
             return discovered;
         }
@@ -735,6 +758,11 @@ final class CfnProvisionerFixture {
             return this;
         }
 
+        public Builder elastiCacheServerless(ElastiCacheServerlessService s) {
+            this.elastiCacheServerlessService = s;
+            return this;
+        }
+
         public Builder redshiftService(RedshiftService s) {
             this.redshiftService = s;
             return this;
@@ -751,6 +779,21 @@ final class CfnProvisionerFixture {
 
         public Builder cloudMap(CloudMapService v) {
             this.cloudMapService = v;
+            return this;
+        }
+
+        public Builder guardDuty(GuardDutyService v) {
+            this.guardDutyService = v;
+            return this;
+        }
+
+        public Builder bedrockAgentCoreControl(BedrockAgentCoreControlService v) {
+            this.bedrockAgentCoreControlService = v;
+            return this;
+        }
+
+        public Builder bedrockAgentCoreMemory(BedrockAgentCoreMemoryService v) {
+            this.bedrockAgentCoreMemoryService = v;
             return this;
         }
 

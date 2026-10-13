@@ -88,6 +88,30 @@ class CodeArtifactAssetPersistenceTest {
     }
 
     /**
+     * The fix for a real finding (hectorvent, PR #5484): {@code containerBackedAssetBytes} used
+     * to be wired through {@code StorageFactory} like every other durable store here, but the
+     * Maven/npm/pypi content it counts lives only in the sidecar containers themselves, which do
+     * not survive a Floci restart either (no volume attached, removed on shutdown; see this
+     * service's own Known limitations doc). A persisted count surviving a restart the content
+     * itself does not would leave a stale total with nothing to ever clean it up.
+     */
+    @Test
+    void containerBackedAssetBytesDoesNotSurviveRestart(@TempDir Path dir) {
+        CodeArtifactService first = newService(dir);
+        first.createDomain(REGION, "dom", null, Map.of());
+        first.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        long fence = first.currentContainerBackedPackageFence(REGION, "dom", null, "repo", "maven", "com.example",
+                "my-pkg");
+        first.recordContainerBackedAssetBytes(REGION, "dom", null, "repo", "maven", "com.example", "my-pkg", 4096L,
+                fence);
+        assertEquals(4096L, first.describeDomain(REGION, "dom", null).assetSizeBytes());
+
+        CodeArtifactService restarted = newService(dir);
+
+        assertEquals(0L, restarted.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
      * {@code packageOriginConfigs} is wired through {@code StorageFactory} the same way
      * {@code domains}/{@code repositories}/{@code packageVersions} are, but that similarity had
      * never actually been exercised: this confirms a stored origin configuration, including one

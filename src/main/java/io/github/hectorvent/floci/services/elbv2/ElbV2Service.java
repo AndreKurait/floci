@@ -607,7 +607,6 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                     String sslPolicy, List<String> certificates,
                                     List<Action> defaultActions, List<String> alpnPolicy) {
         Listener listener = requireListener(region, listenerArn);
-        boolean restartDataPlane = false;
         boolean recompileRules = false;
 
         boolean portChanges = port != null && !Objects.equals(listener.getPort(), port);
@@ -632,22 +631,37 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         // protocol needs, and one that changes the protocol alone puts the certificates the
         // listener already holds into service, where they have to be certificates the account has.
         String effectiveProtocol = protocol != null ? protocol : listener.getProtocol();
-        requireCertificates(region, effectiveProtocol,
-                certificates != null ? certificates : listener.getCertificates());
+        List<String> effectiveCertificates =
+                certificates != null ? certificates : listener.getCertificates();
+        requireCertificates(region, effectiveProtocol, effectiveCertificates);
 
-        if (portChanges) {
-            listener.setPort(port);
-            restartDataPlane = true;
-        }
-        if (protocol != null)      listener.setProtocol(protocol);
-        if (sslPolicy != null)     listener.setSslPolicy(sslPolicy);
-        if (certificates != null) {
-            whileCertificatesHeld(certificates, () -> {
-                requireCertificates(region, effectiveProtocol, certificates);
+        // Every setter runs inside the guard, behind the re-check, which is what makes the
+        // comment above hold for that refusal too: the check made outside the guard says nothing
+        // about the moment of the write, so a delete landing between the two has to answer 400 on
+        // a listener that has not moved rather than one already on its new port.
+        //
+        // The guard is taken for the certificates the request records, which are the only ones a
+        // delete can race: a certificate the listener already holds is one
+        // DeleteServerCertificate finds among the references and refuses to delete. The re-check
+        // covers the effective list all the same, so the refusal is the same one either way.
+        whileCertificatesHeld(certificates, () -> {
+            requireCertificates(region, effectiveProtocol, effectiveCertificates);
+            if (portChanges) {
+                listener.setPort(port);
+            }
+            if (protocol != null) {
+                listener.setProtocol(protocol);
+            }
+            if (sslPolicy != null) {
+                listener.setSslPolicy(sslPolicy);
+            }
+            if (certificates != null) {
                 listener.setCertificates(new ArrayList<>(certificates));
-            });
+            }
+        });
+        if (alpnPolicy != null) {
+            listener.setAlpnPolicy(new ArrayList<>(alpnPolicy));
         }
-        if (alpnPolicy != null)    listener.setAlpnPolicy(new ArrayList<>(alpnPolicy));
         if (defaultActions != null) {
             listener.setDefaultActions(new ArrayList<>(defaultActions));
             // update the default rule's actions
@@ -663,7 +677,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         }
         persistRegion(listeners, region);
         persistRegion(rules, region);
-        if (restartDataPlane) {
+        if (portChanges) {
             dataPlane.restartListener(requireListener(region, listenerArn), region, getListenerRules(region, listenerArn));
         } else if (recompileRules) {
             dataPlane.recompileRules(listenerArn, getListenerRules(region, listenerArn));

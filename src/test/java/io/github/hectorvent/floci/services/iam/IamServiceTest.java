@@ -872,6 +872,194 @@ class IamServiceTest {
     }
 
     @Test
+    void changePasswordReplacesThePasswordAndClearsTheResetFlag() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", true);
+
+        iamService.changePassword("alice", "Sup3r$ecret!", "An0ther$ecret!");
+
+        LoginProfile profile = iamService.getLoginProfile("alice");
+        assertFalse(profile.isPasswordResetRequired(),
+                "a self-service change is what clears the reset an administrator required");
+        assertNotNull(profile.getPasswordLastChanged());
+        // The proof the write took is behavioural rather than a read of the stored field: the
+        // new password is now the current one and the old one is not.
+        iamService.changePassword("alice", "An0ther$ecret!", "Th1rd$ecret!");
+        assertEquals("InvalidParameterValue", assertThrows(AwsException.class,
+                () -> iamService.changePassword("alice", "An0ther$ecret!", "F0urth$ecret!"))
+                .getErrorCode());
+    }
+
+    @Test
+    void changePasswordWithTheWrongOldPasswordChangesNothing() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.changePassword("alice", "N0tTheOne!", "An0ther$ecret!"));
+
+        assertEquals("InvalidParameterValue", ex.getErrorCode());
+        assertEquals(400, ex.getHttpStatus());
+        // The refusal left the password alone, so the original still changes it.
+        iamService.changePassword("alice", "Sup3r$ecret!", "An0ther$ecret!");
+    }
+
+    @Test
+    void changePasswordChecksTheOldPasswordBeforeTheAccountPolicy() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+        AccountPasswordPolicy policy = new AccountPasswordPolicy();
+        policy.setMinimumPasswordLength(12);
+        iamService.updateAccountPasswordPolicy(policy);
+
+        // Both halves of the request are wrong. A caller who cannot prove the current password is
+        // told that and nothing about what the policy would have required.
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.changePassword("alice", "N0tTheOne!", "short"));
+
+        assertEquals("InvalidParameterValue", ex.getErrorCode());
+    }
+
+    @Test
+    void changePasswordHoldsTheNewPasswordToTheAccountPolicy() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+        AccountPasswordPolicy policy = new AccountPasswordPolicy();
+        policy.setMinimumPasswordLength(12);
+        policy.setRequireSymbols(true);
+        policy.setRequireNumbers(true);
+        iamService.updateAccountPasswordPolicy(policy);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.changePassword("alice", "Sup3r$ecret!", "short"));
+
+        assertEquals("PasswordPolicyViolation", ex.getErrorCode());
+        assertEquals(400, ex.getHttpStatus());
+        iamService.changePassword("alice", "Sup3r$ecret!", "An0ther$ecret!");
+    }
+
+    @Test
+    void changePasswordNamesTheMemberThatFailedItsConstraint() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+
+        AwsException missing = assertThrows(AwsException.class,
+                () -> iamService.changePassword("alice", null, "An0ther$ecret!"));
+        assertEquals("ValidationError", missing.getErrorCode());
+        assertTrue(missing.getMessage().contains("Value null at 'oldPassword'"), missing.getMessage());
+
+        // An empty member is a value that fails the pattern rather than a member never supplied,
+        // and the message names the one that failed, there being two password members here.
+        AwsException empty = assertThrows(AwsException.class,
+                () -> iamService.changePassword("alice", "Sup3r$ecret!", ""));
+        assertEquals("ValidationError", empty.getErrorCode());
+        assertTrue(empty.getMessage().contains("Value at 'newPassword'"), empty.getMessage());
+    }
+
+    @Test
+    void changePasswordRefusesAPasswordTheReuseWindowStillHolds() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+        AccountPasswordPolicy policy = new AccountPasswordPolicy();
+        policy.setPasswordReusePrevention(1);
+        iamService.updateAccountPasswordPolicy(policy);
+
+        iamService.changePassword("alice", "Sup3r$ecret!", "An0ther$ecret!");
+
+        // The window is one superseded password, and the one in hand counts alongside it, so
+        // neither going back nor standing still is allowed.
+        assertEquals("PasswordPolicyViolation", assertThrows(AwsException.class,
+                () -> iamService.changePassword("alice", "An0ther$ecret!", "Sup3r$ecret!"))
+                .getErrorCode());
+        assertEquals("PasswordPolicyViolation", assertThrows(AwsException.class,
+                () -> iamService.changePassword("alice", "An0ther$ecret!", "An0ther$ecret!"))
+                .getErrorCode());
+    }
+
+    @Test
+    void changePasswordAllowsAPasswordThatHasLeftTheReuseWindow() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+        AccountPasswordPolicy policy = new AccountPasswordPolicy();
+        policy.setPasswordReusePrevention(1);
+        iamService.updateAccountPasswordPolicy(policy);
+
+        iamService.changePassword("alice", "Sup3r$ecret!", "An0ther$ecret!");
+        iamService.changePassword("alice", "An0ther$ecret!", "Th1rd$ecret!");
+
+        // A window of one reaches the current password and the one before it, and the first is
+        // now two back, so it is reachable again.
+        iamService.changePassword("alice", "Th1rd$ecret!", "Sup3r$ecret!");
+        assertNotNull(iamService.getLoginProfile("alice").getPasswordLastChanged());
+    }
+
+    @Test
+    void changePasswordWithNoReusePolicyTakesTheOldPasswordBack() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+        AccountPasswordPolicy policy = new AccountPasswordPolicy();
+        policy.setMinimumPasswordLength(8);
+        iamService.updateAccountPasswordPolicy(policy);
+
+        // A policy that sets no window prevents nothing: the reference's default is that users
+        // "are not prevented from reusing previous passwords".
+        iamService.changePassword("alice", "Sup3r$ecret!", "An0ther$ecret!");
+        iamService.changePassword("alice", "An0ther$ecret!", "Sup3r$ecret!");
+    }
+
+    @Test
+    void updateLoginProfileIsHeldToTheSameReuseWindow() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Sup3r$ecret!", false);
+        AccountPasswordPolicy policy = new AccountPasswordPolicy();
+        policy.setPasswordReusePrevention(2);
+        iamService.updateAccountPasswordPolicy(policy);
+        iamService.updateLoginProfile("alice", "An0ther$ecret!", null);
+
+        // An administrator reset is a password the policy applies to as much as a self-service
+        // change, and the two share one history.
+        assertEquals("PasswordPolicyViolation", assertThrows(AwsException.class,
+                () -> iamService.updateLoginProfile("alice", "Sup3r$ecret!", null)).getErrorCode());
+        assertEquals("PasswordPolicyViolation", assertThrows(AwsException.class,
+                () -> iamService.changePassword("alice", "An0ther$ecret!", "Sup3r$ecret!"))
+                .getErrorCode());
+    }
+
+    @Test
+    void loginProfileHistoryStopsAtTheWidestWindowThePolicyAccepts() {
+        iamService.createUser("alice", "/");
+        iamService.createLoginProfile("alice", "Passw0rd$0", false);
+        for (int i = 1; i <= 30; i++) {
+            iamService.updateLoginProfile("alice", "Passw0rd$" + i, null);
+        }
+
+        // Nothing can be asked about a password further back than the largest window, so the
+        // history stops there rather than growing with every change.
+        assertEquals(24, iamService.getLoginProfile("alice").getPreviousPasswords().size());
+        assertEquals("Passw0rd$29",
+                iamService.getLoginProfile("alice").getPreviousPasswords().get(0));
+    }
+
+    @Test
+    void changePasswordForAUserWithoutAConsolePasswordIsNoSuchEntity() {
+        iamService.createUser("alice", "/");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.changePassword("alice", "Sup3r$ecret!", "An0ther$ecret!"));
+
+        assertEquals("NoSuchEntity", ex.getErrorCode());
+        assertEquals(404, ex.getHttpStatus());
+    }
+
+    @Test
+    void changePasswordForAnUnknownUserIsNoSuchEntity() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> iamService.changePassword("nobody", "Sup3r$ecret!", "An0ther$ecret!"));
+
+        assertEquals("NoSuchEntity", ex.getErrorCode());
+    }
+
+    @Test
     void deleteUserWithLoginProfileIsDeleteConflict() {
         iamService.createUser("alice", "/");
         iamService.createLoginProfile("alice", "Sup3r$ecret!", false);

@@ -33,6 +33,7 @@ import java.util.Optional;
 import java.util.UUID;
 
 import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -476,6 +477,45 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
         ContainerExec.Result writeBeyond = execIn(targetContainerId,
                 "dd if=/dev/zero of=/dev/xvdf bs=1M count=10 seek=1500 conv=notrunc");
         assertEquals(0, writeBeyond.exitCode(), "Writing beyond original capacity should succeed: " + writeBeyond.summary());
+    }
+
+    @Test
+    void stopManagedContainersRemovesHelperAndKeepsBackingFile() {
+        Volume volume = ec2Service.createVolume("us-east-1", "us-east-1a", "gp3", 1, false, 3000, 125, null, null);
+        volumesToClean.add(volume.getVolumeId());
+
+        String helperName = ContainerStorageHelper.resourceName(config, "ec2", null, "volume-helper");
+        assertTrue(lifecycleManager.findByName(helperName).isPresent());
+
+        volumeBlockDeviceManager.stopManagedContainers();
+
+        assertTrue(lifecycleManager.findByName(helperName).isEmpty(),
+                "Helper container should be removed, not just stopped");
+        assertDoesNotThrow(() -> volumeBlockDeviceManager.stopManagedContainers());
+
+        // The next volume operation recreates the helper against the surviving backing file.
+        assertTrue(volumeBlockDeviceManager.resizeVolume(volume.getVolumeId(), 2));
+        ContainerExec.Result checkSize = execIn(helperName, "stat -c %s /volumes/" + volume.getVolumeId() + ".raw");
+        assertEquals(0, checkSize.exitCode());
+        assertEquals("2147483648", checkSize.stdout().trim());
+    }
+
+    @Test
+    void clearDeletesBackingFilesAndLeavesNoHelper() {
+        Volume volume = ec2Service.createVolume("us-east-1", "us-east-1a", "gp3", 1, false, 3000, 125, null, null);
+        volumesToClean.add(volume.getVolumeId());
+        String helperName = ContainerStorageHelper.resourceName(config, "ec2", null, "volume-helper");
+
+        volumeBlockDeviceManager.stopManagedContainers();
+        volumeBlockDeviceManager.clear();
+
+        assertTrue(lifecycleManager.findByName(helperName).isEmpty(),
+                "A reset should end without a helper container");
+        // The next volume operation recreates the helper, which shows the old file is gone.
+        Volume next = ec2Service.createVolume("us-east-1", "us-east-1a", "gp3", 1, false, 3000, 125, null, null);
+        volumesToClean.add(next.getVolumeId());
+        ContainerExec.Result wiped = execIn(helperName, "test -e /volumes/" + volume.getVolumeId() + ".raw");
+        assertEquals(1, wiped.exitCode(), "The reset should have deleted the backing file");
     }
 
     @Test

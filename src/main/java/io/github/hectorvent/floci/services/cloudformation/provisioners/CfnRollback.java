@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
+import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import org.jboss.logging.Logger;
 
 /**
@@ -129,6 +130,15 @@ public final class CfnRollback {
     public static final String API_KEY_UPDATE_SNAPSHOT_ATTR = "__FlociApiKeyUpdateSnapshot";
 
     /**
+     * Holds the role, object prefixes, tagging action and tags a GuardDuty Malware Protection plan
+     * carried before an in-place update changed them, or the plan an update created because the one
+     * the stack held was gone, so a failed stack update can put the plan back or delete the created
+     * one. Written by {@code GuardDutyMalwareProtectionPlanCfnProvisioner} before its first mutating
+     * call or right after that creation, and spent by its {@code rollbackUpdate}.
+     */
+    public static final String GUARDDUTY_PLAN_UPDATE_SNAPSHOT_ATTR = "__FlociGuardDutyPlanUpdateSnapshot";
+
+    /**
      * Holds the name and tags an API Gateway V2 VPC link carried before an in-place update changed
      * them, so a failed stack update can put them back. Written by {@code ApiGatewayV2CfnProvisioner}
      * before its update call and spent by its {@code rollbackUpdate}.
@@ -200,6 +210,13 @@ public final class CfnRollback {
     public static final String COGNITO_UPDATE_SNAPSHOT_ATTR = "__FlociCognitoUpdateSnapshot";
 
     /**
+     * Holds the settings and tags a serverless cache had before an in-place update changed them,
+     * so a failed stack update can put them back. Written by {@code ElastiCacheServerlessCfnProvisioner}
+     * before its modify call and spent by its {@code rollbackUpdate}.
+     */
+    public static final String SERVERLESS_CACHE_UPDATE_SNAPSHOT_ATTR = "__FlociServerlessCacheUpdateSnapshot";
+
+    /**
      * Holds the configuration an Auto Scaling group carried before an in-place update changed it,
      * so a failed stack update can restore it.
      */
@@ -236,6 +253,63 @@ public final class CfnRollback {
             LOG.warnv("IAM rollback cleanup failed while attempting to {0}: {1}",
                     description, cleanupFailure.getMessage());
             return false;
+        }
+    }
+
+    /**
+     * Runs the steps that follow a create or change a reused entity in place. If one of them
+     * throws, what this provision did is undone before the failure propagates: a created entity is
+     * deleted again by {@code undoCreate}, a reused one is put back by {@code undoInPlace}, which
+     * restores the provisioner's snapshot and is a no-op when there is none. The engine only removes
+     * a failed create it can see, and on a failed update it restores the previous resource metadata
+     * and discards the attempted one, snapshot included, so the undo has to happen here.
+     *
+     * <p>A compensation that fails is reported, never hidden. A created entity carries
+     * {@link #ROLLBACK_OWNED_ATTR} while the steps run, so the engine's create rollback deletes it
+     * (and reports that failing) if the undo here could not, and during an update the entity is
+     * also listed in the cleanup record, which the engine carries onto the restored resource and
+     * runs before the next committed update or the stack delete; a reused entity keeps its snapshot
+     * and the reason lands in {@link #UPDATE_ROLLBACK_FAILURE_ATTR}, which the engine copies onto
+     * the committed resource so the rollback walker reports UPDATE_ROLLBACK_FAILED instead of
+     * claiming the prior state is live.
+     */
+    public static void guarded(StackResource r, ProvisionContext ctx, boolean created, Runnable undoCreate,
+                               Runnable undoInPlace, Runnable steps) {
+        if (created) {
+            r.getAttributes().put(ROLLBACK_OWNED_ATTR, "true");
+        }
+        try {
+            steps.run();
+            r.getAttributes().remove(ROLLBACK_OWNED_ATTR);
+        } catch (RuntimeException e) {
+            if (created) {
+                try {
+                    undoCreate.run();
+                    r.getAttributes().remove(ROLLBACK_OWNED_ATTR);
+                } catch (RuntimeException undo) {
+                    e.addSuppressed(undo);
+                    String reason = "Could not remove " + r.getPhysicalId() + ", created for " + r.getLogicalId()
+                            + " by a failed update: " + undo.getMessage();
+                    LOG.warn(reason);
+                    r.getAttributes().put(UPDATE_ROLLBACK_FAILURE_ATTR, reason);
+                    if (ctx.isUpdate()) {
+                        // The engine restores the previous resource and keeps only what the cleanup
+                        // record carries, so the replacement is listed there for the next cleanup.
+                        ReplacementCleanup.recordOrphan(r, r.getPhysicalId(), r.getResourceType(), ctx.region());
+                    }
+                }
+            } else {
+                try {
+                    undoInPlace.run();
+                } catch (RuntimeException undo) {
+                    e.addSuppressed(undo);
+                    String reason = "Could not restore " + r.getPhysicalId() + " for " + r.getLogicalId()
+                            + " after a failed update: " + undo.getMessage();
+                    LOG.warn(reason);
+                    r.getAttributes().put(UPDATE_ROLLBACK_FAILURE_ATTR, reason);
+                }
+            }
+            throw e;
         }
     }
 }

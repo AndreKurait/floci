@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
@@ -39,6 +40,7 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -53,6 +55,11 @@ class ElbV2ServiceTest {
 
     // Application Load Balancers require subnets in at least two Availability Zones.
     private static final List<String> ALB_SUBNETS = List.of("subnet-a", "subnet-b");
+
+    private static final String HELD_CERTIFICATE =
+            "arn:aws:iam::000000000000:server-certificate/held";
+    private static final String OTHER_CERTIFICATE =
+            "arn:aws:iam::000000000000:server-certificate/other";
 
     @Mock
     ElbV2DataPlane dataPlane;
@@ -125,6 +132,66 @@ class ElbV2ServiceTest {
         verify(dataPlane).restartListener(any(Listener.class), eq(REGION), anyList());
         verify(dataPlane, never()).stopListener(anyString());
         verify(dataPlane, never()).startListener(any(Listener.class), anyString(), anyList());
+    }
+
+    @Test
+    void modifyListenerRefusedUnderTheCertificateGuardLeavesTheListenerWhereItWas() {
+        String lbArn = service.createLoadBalancer(
+                REGION, "sample-lb", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of("sg-a"), Map.of()).getLoadBalancerArn();
+        String tgArn = createTargetGroup("sample-tg");
+        String listenerArn = service.createListener(
+                REGION, lbArn, "HTTPS", 443, "ELBSecurityPolicy-2016-08", List.of(HELD_CERTIFICATE),
+                List.of(forwardAction(tgArn)), List.of(), Map.of()).getListenerArn();
+        clearInvocations(dataPlane);
+        service.certificateResolver = deletedOnTheSecondLook();
+
+        AwsException e = assertThrows(AwsException.class, () -> service.modifyListener(
+                REGION, listenerArn, "TLS", 8443, "ELBSecurityPolicy-TLS13-1-2-2021-06",
+                List.of(OTHER_CERTIFICATE), null, null));
+
+        assertEquals("CertificateNotFound", e.getErrorCode());
+        Listener listener = service.describeListeners(REGION, lbArn, List.of(listenerArn)).getFirst();
+        assertEquals(Integer.valueOf(443), listener.getPort());
+        assertEquals("HTTPS", listener.getProtocol());
+        assertEquals("ELBSecurityPolicy-2016-08", listener.getSslPolicy());
+        assertEquals(List.of(HELD_CERTIFICATE), listener.getCertificates());
+        verify(dataPlane, never()).restartListener(any(Listener.class), anyString(), anyList());
+    }
+
+    @Test
+    void modifyListenerProtocolAloneTakesTheGuardForTheCertificatesItPutsIntoService() {
+        String lbArn = service.createLoadBalancer(
+                REGION, "sample-lb", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of("sg-a"), Map.of()).getLoadBalancerArn();
+        String tgArn = createTargetGroup("sample-tg");
+        String listenerArn = service.createListener(
+                REGION, lbArn, "HTTP", 80, null, List.of(HELD_CERTIFICATE),
+                List.of(forwardAction(tgArn)), List.of(), Map.of()).getListenerArn();
+        clearInvocations(dataPlane);
+        service.certificateResolver = deletedOnTheSecondLook();
+
+        AwsException e = assertThrows(AwsException.class, () -> service.modifyListener(
+                REGION, listenerArn, "HTTPS", null, null, null, null, null));
+
+        assertEquals("CertificateNotFound", e.getErrorCode());
+        assertEquals("HTTP", service.describeListeners(REGION, lbArn, List.of(listenerArn))
+                .getFirst().getProtocol());
+    }
+
+    /**
+     * A resolver that finds the certificate once and not again, which is what a
+     * {@code DeleteServerCertificate} landing between the check outside the guard and the one
+     * under it looks like from inside the call.
+     */
+    private static CertificateReferenceResolver deletedOnTheSecondLook() {
+        CertificateReferenceResolver resolver = mock(CertificateReferenceResolver.class);
+        when(resolver.exists(anyString(), anyString())).thenReturn(true, false);
+        doAnswer(invocation -> {
+            invocation.getArgument(1, Runnable.class).run();
+            return null;
+        }).when(resolver).runWhileHeld(any(), any());
+        return resolver;
     }
 
     @Test

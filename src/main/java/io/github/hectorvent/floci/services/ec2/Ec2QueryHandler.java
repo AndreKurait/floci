@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.ec2.model.*;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -45,18 +46,20 @@ public class Ec2QueryHandler {
     private final Ec2EbsEncryptionService ebsEncryptionService;
     private final Ec2SnapshotBlockPublicAccessService snapshotBlockPublicAccessService;
     private final Ec2IpamService ipamService;
+    private final RegionResolver regionResolver;
 
     @Inject
     public Ec2QueryHandler(Ec2Service service, EmulatorConfig config, FlowLogService flowLogService,
                            Ec2EbsEncryptionService ebsEncryptionService,
                            Ec2SnapshotBlockPublicAccessService snapshotBlockPublicAccessService,
-                           Ec2IpamService ipamService) {
+                           Ec2IpamService ipamService, RegionResolver regionResolver) {
         this.service = service;
         this.config = config;
         this.flowLogService = flowLogService;
         this.ebsEncryptionService = ebsEncryptionService;
         this.snapshotBlockPublicAccessService = snapshotBlockPublicAccessService;
         this.ipamService = ipamService;
+        this.regionResolver = regionResolver;
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params, String region) {
@@ -4408,7 +4411,9 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDescribeRegions(MultivaluedMap<String, String> p, String region) {
-        AwsPartition partition = AwsPartitions.forRegionOrCommercial(region);
+        // The partition the request is scoped to, not the region's own: a region no partition
+        // publishes is served in the deployment's partition, where its ARNs are minted too.
+        AwsPartition partition = AwsPartitions.byId(regionResolver.partitionForRegion(region));
         boolean allRegions = Boolean.parseBoolean(p.getFirst("AllRegions"));
         Set<String> requested = new HashSet<>(getList(p, "RegionName"));
         XmlBuilder xml = new XmlBuilder()
@@ -4673,6 +4678,10 @@ public class Ec2QueryHandler {
         }
         xml.end("groupSet");
         xml.raw(tagSetXml(ni.getTagSet()));
+        ni.getPrivateIpAddresses().stream()
+                .filter(ip -> ip.isPrimary() && ip.getAssociation() != null)
+                .findFirst()
+                .ifPresent(ip -> xml.raw(networkInterfaceAssociationXml(ip.getAssociation())));
         if (ni.getAttachment() != null) {
             xml.start("attachment")
                     .elem("attachmentId", ni.getAttachment().getAttachmentId())
@@ -4692,18 +4701,22 @@ public class Ec2QueryHandler {
                         .elem("privateDnsName", ip.getPrivateDnsName())
                         .elem("primary", String.valueOf(ip.isPrimary()));
                 if (ip.getAssociation() != null) {
-                    xml.start("association")
-                            .elem("publicIp", ip.getAssociation().getPublicIp())
-                            .elem("allocationId", ip.getAssociation().getAllocationId())
-                            .elem("associationId", ip.getAssociation().getAssociationId())
-                            .elem("ipOwnerId", ip.getAssociation().getIpOwnerId())
-                            .end("association");
+                    xml.raw(networkInterfaceAssociationXml(ip.getAssociation()));
                 }
                 xml.end("item");
             }
             xml.end("privateIpAddressesSet");
         }
         return xml.build();
+    }
+
+    private static String networkInterfaceAssociationXml(NetworkInterfaceAssociation association) {
+        return new XmlBuilder().start("association")
+                .elem("publicIp", association.getPublicIp())
+                .elem("allocationId", association.getAllocationId())
+                .elem("associationId", association.getAssociationId())
+                .elem("ipOwnerId", association.getIpOwnerId())
+                .end("association").build();
     }
 
     private Response handleCreateNetworkInterface(MultivaluedMap<String, String> p, String region) {

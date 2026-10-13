@@ -129,6 +129,19 @@ Floci runs a background reconciler (10 s fixed rate) that keeps each group's InS
 - **Scale-in**: selects InService instances not protected from scale-in, deregisters them from target groups, then calls `TerminateInstances`.
 - Activity records are written on each scale-out and scale-in event.
 
+`SuspendProcesses` pauses desired-capacity scale-out for `Launch` and scale-in for
+`Terminate`. The desired count remains stored, and `ResumeProcesses` allows the
+next reconciliation pass to continue toward it. Omitting process names suspends
+or resumes all processes. Suspending another process does not pause these capacity
+adjustments. Suspension and resumption wait for any desired-capacity adjustment already
+in progress for that group, so a completed suspension cannot be bypassed by an earlier
+reconciliation check.
+
+Suspension does not yet pause instance-refresh selection or replacement cleanup.
+Explicitly requested termination and stale-instance cleanup continue independently.
+Other suspended process names are stored and returned but do not pause their
+associated activities.
+
 ## Launch Source Compatibility
 
 Auto Scaling groups preserve either a launch configuration, a top-level launch template, or a `MixedInstancesPolicy`. These launch sources are mutually exclusive in create/update requests. When a mixed instances policy is supplied, Floci stores and returns:

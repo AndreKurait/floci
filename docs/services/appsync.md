@@ -286,8 +286,7 @@ and RDS resolvers are not blocked by local IAM role checks. When it is on, Floci
 configured `serviceRoleArn` before invoking a backing resource. A valid same-account role ARN
 not present in Floci's IAM store remains permissive, as with STS AssumeRole. A known role must
 belong to the data source's account and partition, trust
-the partition's AppSync service principal (for example, `appsync.amazonaws.com` in commercial
-Regions), and have identity-policy permission for the requested operation and
+the AppSync service principal (`appsync.amazonaws.com`, the same in every partition), and have identity-policy permission for the requested operation and
 resource. An indexed DynamoDB Query or Scan checks the index ARN. RDS execution checks both
 `rds-data:ExecuteStatement` on the cluster and `secretsmanager:GetSecretValue` on the secret.
 Missing roles, missing trust, and insufficient permissions fail the field instead of calling

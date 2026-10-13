@@ -260,6 +260,91 @@ class ElbV2IntegrationTest {
                         hasItems(Ec2Service.defaultSubnetId("us-east-1", "b"), Ec2Service.defaultSubnetId("us-east-1", "c")));
     }
 
+    @Test
+    @Order(17)
+    void createAndSetSubnetMappingsDriveSubnetsAndVpcId() {
+        // The AWS Load Balancer Controller sends SubnetMappings rather than Subnets; both actions
+        // must treat the mappings' SubnetId values as the subnet list (address pinning is not modelled).
+        String subnetMappedArn = given()
+                .formParam("Action", "CreateLoadBalancer")
+                .formParam("Name", "nlb-with-subnet-mappings")
+                .formParam("Type", "network")
+                .formParam("SubnetMappings.member.1.SubnetId", Ec2Service.defaultSubnetId("us-east-1", "a"))
+                .formParam("SubnetMappings.member.2.SubnetId", Ec2Service.defaultSubnetId("us-east-1", "b"))
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.VpcId",
+                        equalTo(Ec2Service.defaultVpcId("us-east-1")))
+                .body("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.AvailabilityZones.member.size()",
+                        equalTo(2))
+                .body("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.AvailabilityZones.member.SubnetId",
+                        hasItems(Ec2Service.defaultSubnetId("us-east-1", "a"), Ec2Service.defaultSubnetId("us-east-1", "b")))
+                .extract()
+                .path("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn");
+
+        given()
+                .formParam("Action", "SetSubnets")
+                .formParam("LoadBalancerArn", subnetMappedArn)
+                .formParam("SubnetMappings.member.1.SubnetId", Ec2Service.defaultSubnetId("us-east-1", "b"))
+                .formParam("SubnetMappings.member.2.SubnetId", Ec2Service.defaultSubnetId("us-east-1", "c"))
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
+
+        given()
+                .formParam("Action", "DescribeLoadBalancers")
+                .formParam("LoadBalancerArns.member.1", subnetMappedArn)
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeLoadBalancersResponse.DescribeLoadBalancersResult.LoadBalancers.member.AvailabilityZones.member.size()",
+                        equalTo(2))
+                .body("DescribeLoadBalancersResponse.DescribeLoadBalancersResult.LoadBalancers.member.AvailabilityZones.member.SubnetId",
+                        hasItems(Ec2Service.defaultSubnetId("us-east-1", "b"), Ec2Service.defaultSubnetId("us-east-1", "c")));
+    }
+
+    @Test
+    @Order(18)
+    void createLoadBalancerRejectsBothSubnetsAndSubnetMappings() {
+        given()
+                .formParam("Action", "CreateLoadBalancer")
+                .formParam("Name", "both-subnet-forms")
+                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a"))
+                .formParam("SubnetMappings.member.1.SubnetId", Ec2Service.defaultSubnetId("us-east-1", "b"))
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("ValidationError"))
+                .body("ErrorResponse.Error.Message",
+                        equalTo("You can specify either subnets or subnet mappings, not both"));
+    }
+
+    @Test
+    @Order(19)
+    void createLoadBalancerRejectsMappingWithoutSubnetId() {
+        given()
+                .formParam("Action", "CreateLoadBalancer")
+                .formParam("Name", "mapping-without-subnet-id")
+                .formParam("SubnetMappings.member.1.AllocationId", "eipalloc-12345678")
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("ValidationError"))
+                .body("ErrorResponse.Error.Message",
+                        equalTo("You must specify a subnet ID for each subnet mapping."));
+    }
+
     // ── Target Groups ─────────────────────────────────────────────────────────
 
     @Test

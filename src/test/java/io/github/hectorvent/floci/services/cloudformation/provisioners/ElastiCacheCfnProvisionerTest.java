@@ -334,6 +334,16 @@ class ElastiCacheCfnProvisionerTest {
     }
 
     @Test
+    void userRejectsMalformedNoPasswordRequiredFlag() {
+        StackResource r = resource("AWS::ElastiCache::User", "Bad");
+        AwsException ex = assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"UserId":"u","UserName":"u","Engine":"redis","NoPasswordRequired":"yes"}
+                """), ctx(null)));
+        assertEquals("ValidationException", ex.getErrorCode());
+        verify(cache, never()).createUser(any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
     void userRejectsConflictingNoPasswordRequiredAndPasswords() {
         StackResource r = resource("AWS::ElastiCache::User", "Bad");
         AwsException ex = assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
@@ -679,7 +689,7 @@ class ElastiCacheCfnProvisionerTest {
 
     @Test
     void deleteToleratesAlreadyDeletedButPropagatesOtherFailures() {
-        doThrow(new AwsException("UserNotFoundFault", "gone", 404))
+        doThrow(new AwsException("UserNotFound", "gone", 404))
                 .when(cache).deleteUser("gone");
         provisioner.delete("AWS::ElastiCache::User", "gone", "us-east-1");
 
