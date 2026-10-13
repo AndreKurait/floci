@@ -98,6 +98,7 @@ public class ApiGatewayService implements ResourceProvider {
     private final StorageBackend<String, RestApi> apiStore;
     private final StorageBackend<String, ApiGatewayResource> resourceStore;
     private final StorageBackend<String, Deployment> deploymentStore;
+    private final StorageBackend<String, Map<String, String>> deploymentModelStore;
     private final StorageBackend<String, Stage> stageStore;
     private final StorageBackend<String, Authorizer> authorizerStore;
     private final StorageBackend<String, ApiKey> apiKeyStore;
@@ -172,6 +173,9 @@ public class ApiGatewayService implements ResourceProvider {
                 new TypeReference<>() {
                 });
         this.deploymentStore = storageFactory.create("apigateway", "apigateway-deployments.json",
+                new TypeReference<>() {
+                });
+        this.deploymentModelStore = storageFactory.create("apigateway", "apigateway-deployment-models.json",
                 new TypeReference<>() {
                 });
         this.stageStore = storageFactory.create("apigateway", "apigateway-stages.json",
@@ -404,6 +408,7 @@ public class ApiGatewayService implements ResourceProvider {
         String prefix = region + "::" + apiId + "::";
         resourceStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(resourceStore::delete);
         deploymentStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(deploymentStore::delete);
+        deploymentModelStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(deploymentModelStore::delete);
         stageStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(stageStore::delete);
         modelStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(modelStore::delete);
         requestValidatorStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(requestValidatorStore::delete);
@@ -776,6 +781,7 @@ public class ApiGatewayService implements ResourceProvider {
         getRestApi(region, apiId);
         String description = (String) request.getOrDefault("description", "");
         Deployment deployment = new Deployment(shortId(10), description, System.currentTimeMillis() / 1000L);
+        deploymentModelStore.put(deploymentKey(region, apiId, deployment.id()), currentModelSchemas(region, apiId));
         deploymentStore.put(deploymentKey(region, apiId, deployment.id()), deployment);
         LOG.infov("Created deployment {0} for API {1}", deployment.id(), apiId);
 
@@ -830,6 +836,28 @@ public class ApiGatewayService implements ResourceProvider {
     public void deleteDeployment(String region, String apiId, String deploymentId) {
         getDeployment(region, apiId, deploymentId);
         deploymentStore.delete(deploymentKey(region, apiId, deploymentId));
+        deploymentModelStore.delete(deploymentKey(region, apiId, deploymentId));
+    }
+
+    Map<String, String> getDeploymentModelSchemas(String region, String apiId, String deploymentId) {
+        if (deploymentId != null) {
+            Optional<Map<String, String>> schemas = deploymentModelStore.get(deploymentKey(region, apiId, deploymentId));
+            if (schemas.isPresent()) {
+                return schemas.get();
+            }
+        }
+        // Deployments persisted before model snapshots were introduced retain their existing behavior.
+        return currentModelSchemas(region, apiId);
+    }
+
+    private Map<String, String> currentModelSchemas(String region, String apiId) {
+        Map<String, String> schemas = new HashMap<>();
+        for (Model model : getModels(region, apiId)) {
+            if (model.getSchema() != null) {
+                schemas.put(model.getName(), model.getSchema());
+            }
+        }
+        return Map.copyOf(schemas);
     }
 
     public Deployment updateDeployment(String region, String apiId, String deploymentId, List<Map<String, String>> patchOperations) {

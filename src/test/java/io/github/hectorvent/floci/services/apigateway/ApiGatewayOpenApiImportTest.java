@@ -1140,6 +1140,11 @@ class ApiGatewayOpenApiImportTest {
                     + mapper.writeValueAsString(schema) + "}]}";
             given().contentType(ContentType.JSON).body(patch)
                     .patch("/restapis/" + apiId + "/models/Status").then().statusCode(200);
+            given().contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(200);
+            given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
+                    .post(endpoint).then().statusCode(400);
+            given().contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
+                    .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
             given().contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(400);
             given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
                     .post(endpoint).then().statusCode(200);
@@ -1156,6 +1161,8 @@ class ApiGatewayOpenApiImportTest {
                     .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
                             + mapper.writeValueAsString(annotated.toString()) + "}]}")
                     .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
+            given().contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
+                    .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
             given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
                     .post(endpoint).then().statusCode(200);
             String otherApi = given().contentType(ContentType.JSON).body("{\"name\":\"OtherModelOwner\"}")
@@ -1170,6 +1177,8 @@ class ApiGatewayOpenApiImportTest {
                         .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
                                 + mapper.writeValueAsString(missing) + "}]}")
                         .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
+                given().contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
+                        .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
                 given().contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(400);
             } finally {
                 given().delete("/restapis/" + otherApi).then().statusCode(202);
@@ -1191,6 +1200,8 @@ class ApiGatewayOpenApiImportTest {
                         .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
                                 + mapper.writeValueAsString(externalSchema) + "}]}")
                         .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
+                given().contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
+                        .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
                 given().contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(400);
                 assertEquals(0, externalReads.get(), "Request validation must not fetch external schemas");
             } finally {
