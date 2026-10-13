@@ -17,7 +17,6 @@ import software.amazon.awssdk.services.cloudformation.model.UpdateStackResponse;
 import software.amazon.awssdk.services.ssm.SsmClient;
 
 import java.util.List;
-import java.util.function.BooleanSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -96,8 +95,8 @@ class CloudFormationStackIdTest {
                 .templateBody(TEMPLATE).parameters(parameters("second")));
 
         assertThat(created.stackId()).isEqualTo(stackId);
-        await(() -> "CREATE_COMPLETE".equals(describeChangeSet(created.id(), stackId).statusAsString()),
-                "change set CREATE_COMPLETE");
+        TestFixtures.await(() -> "CREATE_COMPLETE".equals(describeChangeSet(created.id(), stackId).statusAsString()),
+                stackName, "change set CREATE_COMPLETE", TestFixtures.isRealAws() ? 600_000_000_000L : 60_000_000_000L, TestFixtures.isRealAws() ? 5_000 : 100);
         DescribeChangeSetResponse described = describeChangeSet(created.id(), stackId);
         assertThat(described.stackName()).isEqualTo(stackName);
         assertThat(described.stackId()).isEqualTo(stackId);
@@ -166,14 +165,14 @@ class CloudFormationStackIdTest {
     }
 
     private void awaitStatus(String expected) throws InterruptedException {
-        await(() -> {
+        TestFixtures.await(() -> {
             Stack stack = cfn.describeStacks(r -> r.stackName(stackName)).stacks().get(0);
             String status = stack.stackStatusAsString();
             if (status.endsWith("_FAILED") || status.contains("ROLLBACK")) {
                 throw new AssertionError(stackName + " reached " + status + ": " + stack.stackStatusReason());
             }
             return expected.equals(status);
-        }, expected);
+        }, stackName, expected, TestFixtures.isRealAws() ? 600_000_000_000L : 60_000_000_000L, TestFixtures.isRealAws() ? 5_000 : 100);
     }
 
     private void deleteStack() throws InterruptedException {
@@ -181,7 +180,7 @@ class CloudFormationStackIdTest {
             return;
         }
         cfn.deleteStack(r -> r.stackName(stackName));
-        await(() -> {
+        TestFixtures.await(() -> {
             try {
                 List<Stack> stacks = cfn.describeStacks(r -> r.stackName(stackName)).stacks();
                 if (stacks.isEmpty()) {
@@ -200,18 +199,9 @@ class CloudFormationStackIdTest {
                 }
                 throw e;
             }
-        }, "stack deletion");
+        }, stackName, "stack deletion", TestFixtures.isRealAws() ? 600_000_000_000L : 60_000_000_000L, TestFixtures.isRealAws() ? 5_000 : 100);
         stackCreated = false;
     }
 
-    private void await(BooleanSupplier condition, String expected) throws InterruptedException {
-        long deadline = System.nanoTime() + (TestFixtures.isRealAws() ? 600_000_000_000L : 60_000_000_000L);
-        while (System.nanoTime() < deadline) {
-            if (condition.getAsBoolean()) {
-                return;
-            }
-            Thread.sleep(TestFixtures.isRealAws() ? 5_000 : 100);
-        }
-        throw new AssertionError(stackName + " timed out waiting for " + expected);
-    }
+
 }

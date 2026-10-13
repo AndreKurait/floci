@@ -19,7 +19,7 @@ the remaining formats (NuGet, etc.) have no real proxy behind them yet.
 | --- | --- |
 | `CreateDomain` | Creates a domain (max 10 per account per Region), optionally with a KMS encryption key and initial tags. |
 | `DeleteDomain` | Deletes a domain; fails with `ConflictException` while it still contains repositories, and with `ResourceNotFoundException` for a missing domain (as AWS does, although the API reference does not list it). |
-| `DescribeDomain` | Returns a domain's full description, including its repository count. |
+| `DescribeDomain` | Returns a domain's full description, including its repository count and the total size of its assets (generic, Maven, npm, and pypi; see Known limitations). |
 | `ListDomains` | Lists domain summaries for the account and Region, paginated. |
 | `GetAuthorizationToken` | Issues a bearer token scoped to a domain, valid for 0 (12 hours) or 900-43200 seconds, required by the `maven` and `npm` repository endpoints. |
 | `PutDomainPermissionsPolicy` | Attaches or replaces a domain's resource policy, versioned by `policyRevision`. |
@@ -294,6 +294,35 @@ state.
   yet check this setting. `upstream` is stored and reported faithfully for every format but is
   never enforced for any of them, since Floci has no upstream ingestion path to block in the first
   place.
+- **`DescribeDomain`'s `assetSizeBytes` only counts what was published after this field started
+  being computed.** Generic-format bytes are summed live from the still-existing
+  `PublishPackageVersion` records, so they're always current. Maven, npm, and pypi have no such
+  record to sum (the same gap `DescribePackageVersion` has), so each proxy reports its own
+  successfully-written byte count directly; a package published through one of those three formats
+  before this accounting existed was never reported and is not retroactively counted. A genuine
+  conflict or an idempotent no-op retry (any of the three formats' own duplicate-publish
+  protection) correctly adds nothing either way. Both `DeleteRepository` and `DeletePackage` clean
+  up every format's own records and byte counts (and, for `DeleteRepository`, the per-version
+  asset content underneath them), so a repository or package recreated under the same name never
+  inherits a predecessor's bytes. Maven/npm/pypi byte counts live only in memory, the same as the
+  sidecar content they describe (see the restart limitation below), not through `StorageFactory`
+  like every durable store here: the content these bytes count does not survive a restart either,
+  so neither does the count.
+- **A whole-package `npm unpublish` is accounted for; unpublishing a single version of a
+  multi-version package is not.** The pinned Verdaccio image is configured to honor `npm
+  unpublish` natively (`unpublish: $all`), bypassing `DeletePackage` entirely; the npm data plane
+  detects that one specific wire shape (`DELETE .../-rev/<revision>`) and cleans up this service's
+  own byte count and deletion fence once Verdaccio confirms it. Removing a single version from a
+  multi-version package is a different, harder-to-detect shape (a `PUT` carrying an updated
+  packument, indistinguishable at the wire level from an ordinary republish), and is not detected;
+  since this accounting is per-package, not per-version, there is no narrower count a single
+  version's removal could subtract from in the first place.
+- **A `maven-metadata.xml` upload for a versioned snapshot (`.../<artifact>/<version>/
+  maven-metadata.xml`) is counted under a package name built from its version string, not its real
+  artifact name.** Every real `mvn deploy` writes a group/artifact-level `maven-metadata.xml`
+  too, which this correctly attributes to the real artifact; only the rarer, version-scoped
+  snapshot form gets a package name this way. The bytes are still counted toward the domain total
+  either way, just under an internal accounting bucket nothing else ever looks up by name.
 
 See the [CodeArtifact API Reference](https://docs.aws.amazon.com/codeartifact/latest/APIReference/Welcome.html).
 

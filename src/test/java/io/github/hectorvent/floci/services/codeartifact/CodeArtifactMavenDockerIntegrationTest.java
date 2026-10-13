@@ -439,6 +439,62 @@ class CodeArtifactMavenDockerIntegrationTest {
     }
 
     /**
+     * Asserts the delta rather than an absolute total: this class shares one domain across every
+     * ordered test, so other artifacts already contribute to the running total by this point.
+     * {@code assetSizeBytes} used to be hardcoded to {@code 0} regardless of what was actually
+     * published; this is the real Reposilite round trip proving a Maven deploy now counts.
+     */
+    @Test
+    @Order(14)
+    void describeDomainAssetSizeBytesIncreasesByExactlyWhatWasDeployed() {
+        long before = given().header("Authorization", AUTH)
+                .get("/v1/domain?domain=" + DOMAIN)
+                .then().statusCode(200)
+                .extract().jsonPath().getLong("domain.assetSizeBytes");
+
+        byte[] content = "asset-size-accounting-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(content)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/sizecheck/1.0.0/sizecheck-1.0.0.jar")
+                .then().statusCode(200);
+
+        long after = given().header("Authorization", AUTH)
+                .get("/v1/domain?domain=" + DOMAIN)
+                .then().statusCode(200)
+                .extract().jsonPath().getLong("domain.assetSizeBytes");
+
+        assertEquals(before + content.length, after);
+    }
+
+    /**
+     * {@code mvn deploy} always PUTs a {@code maven-metadata.xml} straight to the group/artifact
+     * directory too, with no version segment: {@code com/example/metacheck/maven-metadata.xml} is
+     * only one segment shorter than a real versioned asset path, the same four segments as the
+     * shortest real GAV ({@code group/artifact/version/filename}). It must not be mistaken for
+     * one and misattributed one groupId component too shallow; it is still a real, successful
+     * write, so its bytes still belong in the total.
+     */
+    @Test
+    @Order(15)
+    void describeDomainAssetSizeBytesCountsAGroupLevelMavenMetadataUpload() {
+        long before = given().header("Authorization", AUTH)
+                .get("/v1/domain?domain=" + DOMAIN)
+                .then().statusCode(200)
+                .extract().jsonPath().getLong("domain.assetSizeBytes");
+
+        byte[] metadata = "<metadata><groupId>com.example</groupId></metadata>".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(metadata)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/metacheck/maven-metadata.xml")
+                .then().statusCode(200);
+
+        long after = given().header("Authorization", AUTH)
+                .get("/v1/domain?domain=" + DOMAIN)
+                .then().statusCode(200)
+                .extract().jsonPath().getLong("domain.assetSizeBytes");
+
+        assertEquals(before + metadata.length, after);
+    }
+
+    /**
      * Reads the real Reposilite instance's own {@code maven} settings domain directly (the same
      * shared container {@link ReposiliteSidecarManager} started for every test in this class).
      */

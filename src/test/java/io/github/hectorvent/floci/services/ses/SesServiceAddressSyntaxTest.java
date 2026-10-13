@@ -46,6 +46,7 @@ class SesServiceAddressSyntaxTest {
         service = builder.build();
         sentEmails = builder.sentEmailService();
         identityService = builder.identityService();
+        identityService.verifyEmailIdentity(SENDER, REGION);
     }
 
     @Test

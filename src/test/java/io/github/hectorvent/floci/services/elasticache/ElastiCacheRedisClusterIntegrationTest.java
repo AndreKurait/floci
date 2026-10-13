@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.elasticache;
 
+import io.github.hectorvent.floci.testing.DockerAvailability;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
 import org.junit.jupiter.api.AfterAll;
@@ -40,8 +41,8 @@ class ElastiCacheRedisClusterIntegrationTest {
     private static int nodePort;
 
     @BeforeAll
-    static void requireDocker() {
-        Assumptions.assumeTrue(isDockerAvailable(), "Docker daemon must be available for ElastiCache integration tests");
+    static void requireDocker() throws InterruptedException {
+        Assumptions.assumeTrue(DockerAvailability.isAvailable(), "Docker daemon must be available for ElastiCache integration tests");
     }
 
     @AfterAll
@@ -173,15 +174,6 @@ class ElastiCacheRedisClusterIntegrationTest {
             .post("/")
         .then()
             .statusCode(404);
-    }
-
-    private static boolean isDockerAvailable() {
-        try {
-            Process process = new ProcessBuilder("docker", "info").start();
-            return process.waitFor() == 0;
-        } catch (Exception e) {
-            return false;
-        }
     }
 
     private static Socket openSocket(String host, int port) throws IOException {

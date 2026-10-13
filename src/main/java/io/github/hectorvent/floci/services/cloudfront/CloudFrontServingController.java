@@ -34,6 +34,7 @@ import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.StreamingOutput;
 import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
+import org.jboss.resteasy.reactive.server.core.CurrentRequestManager;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -1022,6 +1023,9 @@ public class CloudFrontServingController {
                 }
             }
             if (includeBody && origin.stream() != null) {
+                // A disconnected viewer can skip StreamingOutput entirely, so its finally block
+                // alone cannot release the origin connection.
+                CurrentRequestManager.get().registerCompletionCallback(ignored -> origin.closeStream());
                 InputStream body = origin.stream();
                 StreamingOutput entity = output -> {
                     try (InputStream in = body) {

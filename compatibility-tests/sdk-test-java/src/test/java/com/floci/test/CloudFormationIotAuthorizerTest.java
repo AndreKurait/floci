@@ -32,7 +32,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -336,14 +335,14 @@ class CloudFormationIotAuthorizerTest {
     }
 
     private void awaitStatus(String expected) throws InterruptedException {
-        await(() -> {
+        TestFixtures.await(() -> {
             Stack stack = cfn.describeStacks(r -> r.stackName(stackName)).stacks().get(0);
             String status = stack.stackStatusAsString();
             if (status.endsWith("_FAILED") || status.contains("ROLLBACK")) {
                 throw new AssertionError(stackName + " reached " + status + ": " + stack.stackStatusReason());
             }
             return expected.equals(status);
-        }, expected);
+        }, stackName, expected, TIMEOUT_NANOS, TestFixtures.isRealAws() ? 2_000 : 100);
     }
 
     private void deleteStack() throws InterruptedException {
@@ -351,7 +350,7 @@ class CloudFormationIotAuthorizerTest {
             return;
         }
         cfn.deleteStack(r -> r.stackName(stackId));
-        await(() -> {
+        TestFixtures.await(() -> {
             try {
                 List<Stack> stacks = cfn.describeStacks(r -> r.stackName(stackId)).stacks();
                 if (stacks.isEmpty()) {
@@ -369,19 +368,9 @@ class CloudFormationIotAuthorizerTest {
                 }
                 throw e;
             }
-        }, "stack deletion");
+        }, stackName, "stack deletion", TIMEOUT_NANOS, TestFixtures.isRealAws() ? 2_000 : 100);
         stackId = null;
     }
 
-    private void await(BooleanSupplier condition, String expected) throws InterruptedException {
-        long pollMillis = TestFixtures.isRealAws() ? 2_000 : 100;
-        long deadline = System.nanoTime() + TIMEOUT_NANOS;
-        while (System.nanoTime() < deadline) {
-            if (condition.getAsBoolean()) {
-                return;
-            }
-            Thread.sleep(pollMillis);
-        }
-        throw new AssertionError(stackName + " timed out waiting for " + expected);
-    }
+
 }
