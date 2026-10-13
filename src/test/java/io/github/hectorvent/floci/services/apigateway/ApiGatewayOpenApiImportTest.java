@@ -1090,7 +1090,7 @@ class ApiGatewayOpenApiImportTest {
 
     @Test
     @Order(95)
-    void importedModelReferencesValidateCurrentSiblingModelsAndRecursiveBodies() throws Exception {
+    void importedModelReferencesValidateDeployedSiblingModelsAndRecursiveBodies() throws Exception {
         String spec = """
                 {
                   "openapi":"3.0.1", "info":{"title":"ReferencedWorkflowModels","version":"1"},
@@ -1131,7 +1131,7 @@ class ApiGatewayOpenApiImportTest {
                     .body("{\"workflowCategory\":\"DMS\",\"status\":\"RUNNING\",\"child\":" + valid + "}")
                     .post(endpoint).then().statusCode(200);
             given().contentType(ContentType.JSON).body("{\"status\":\"RUNNING\"}")
-                    .post(endpoint).then().statusCode(400);
+                    .post(endpoint).then().statusCode(400).body("message", equalTo("Invalid request body"));
             given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "INVALID"))
                     .post(endpoint).then().statusCode(400);
 
