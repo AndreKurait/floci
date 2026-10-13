@@ -20,6 +20,7 @@ import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -79,6 +80,7 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void provisionBucket(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Map<String, String> previousAttributes = Map.copyOf(r.getAttributes());
         String bucketName = ctx.stablePhysicalName(ctx.resolveOptional(props, "BucketName"),
                 r.getLogicalId(), BUCKET_NAME_MAX_LENGTH, true);
         // provision is also the update path. CreateBucket on a bucket this account already owns is
@@ -131,6 +133,7 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
         }
         r.getAttributes().put("WebsiteURL", AwsEndpoints.s3WebsiteUrl(bucketName, ctx.region()));
         r.getAttributes().put("BucketName", bucketName);
+        ReplacementCleanup.record(r, ctx, previousAttributes);
     }
 
     private void applyBucketCorsConfiguration(String bucketName, JsonNode props, ProvisionContext ctx) {
@@ -578,11 +581,37 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
     }
 
     @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        return ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return ReplacementCleanup.cleanupPhysicalId(resource);
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        return ReplacementCleanup.complete(resource, this::delete);
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        ReplacementCleanup.clear(resource);
+    }
+
+    @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        return ReplacementCleanup.rollback(resource, this::delete);
+    }
+
+    @Override
     public void delete(String resourceType, String physicalId, String region) {
         if (BUCKET.equals(resourceType)) {
             // Deleting a non-empty bucket raises BucketNotEmpty, which propagates so the stack
             // reports DELETE_FAILED as AWS does.
-            s3Service.deleteBucket(physicalId);
+            CfnDeletes.safeDelete("S3 bucket", physicalId,
+                    () -> s3Service.deleteBucket(physicalId), "NoSuchBucket");
             return;
         }
         if (BUCKET_POLICY.equals(resourceType)) {
