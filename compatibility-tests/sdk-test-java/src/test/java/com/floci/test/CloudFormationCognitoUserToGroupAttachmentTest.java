@@ -15,7 +15,6 @@ import software.amazon.awssdk.services.cognitoidentityprovider.model.GroupType;
 import software.amazon.awssdk.services.cognitoidentityprovider.model.MessageActionType;
 
 import java.util.List;
-import java.util.function.BooleanSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -117,14 +116,14 @@ class CloudFormationCognitoUserToGroupAttachmentTest {
     }
 
     private void awaitStatus(String expected) throws InterruptedException {
-        await(() -> {
+        TestFixtures.await(() -> {
             Stack stack = cfn.describeStacks(r -> r.stackName(stackName)).stacks().get(0);
             String status = stack.stackStatusAsString();
             if (status.endsWith("_FAILED") || status.contains("ROLLBACK")) {
                 throw new AssertionError(stackName + " reached " + status + ": " + stack.stackStatusReason());
             }
             return expected.equals(status);
-        }, expected);
+        }, stackName, expected, 60_000_000_000L, 100);
     }
 
     private void deleteStack() throws InterruptedException {
@@ -132,7 +131,7 @@ class CloudFormationCognitoUserToGroupAttachmentTest {
             return;
         }
         cfn.deleteStack(r -> r.stackName(stackName));
-        await(() -> {
+        TestFixtures.await(() -> {
             try {
                 List<Stack> stacks = cfn.describeStacks(r -> r.stackName(stackName)).stacks();
                 if (stacks.isEmpty()) {
@@ -150,18 +149,9 @@ class CloudFormationCognitoUserToGroupAttachmentTest {
                 }
                 throw e;
             }
-        }, "stack deletion");
+        }, stackName, "stack deletion", 60_000_000_000L, 100);
         stackCreated = false;
     }
 
-    private void await(BooleanSupplier condition, String expected) throws InterruptedException {
-        long deadline = System.nanoTime() + 60_000_000_000L;
-        while (System.nanoTime() < deadline) {
-            if (condition.getAsBoolean()) {
-                return;
-            }
-            Thread.sleep(100);
-        }
-        throw new AssertionError(stackName + " timed out waiting for " + expected);
-    }
+
 }

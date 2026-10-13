@@ -493,8 +493,17 @@ public class AutoScalingService {
         }
     }
 
+    void adjustCapacityIfPresent(AutoScalingGroup asg, Runnable adjustment) {
+        String key = asgKey(asg.getRegion(), asg.getAutoScalingGroupName());
+        synchronized (lockFor(key)) {
+            if (groups.get(key) == asg) {
+                adjustment.run();
+            }
+        }
+    }
+
     private Object lockFor(String key) {
-        return groupLocks.computeIfAbsent(key, ignored -> new Object());
+        return groupLocks.computeIfAbsent(regionResolver.getAccountId() + "::" + key, ignored -> new Object());
     }
 
     Set<String> autoScalingGroupAccountIds() {
@@ -544,36 +553,38 @@ public class AutoScalingService {
         return requireGroup(region, resourceId);
     }
 
-    // Real AWS suspends the named scaling processes ("Launch", "Terminate", "HealthCheck", ...)
-    // so they stop running until resumed; an empty list suspends all of them. Floci has no
-    // scaling loop for these processes to pause, so this only needs to record which processes
-    // are suspended for DescribeAutoScalingGroups to report back - the same "accept and
-    // remember" shape as terminationPolicies. The AWS provider calls this unconditionally
-    // around ASG creation whenever wait_for_capacity_timeout is non-zero (the default), so an
-    // unimplemented SuspendProcesses fails ASG creation outright, not just a feature gap.
+    // An empty list suspends all processes. The reconciler honors Launch and Terminate
+    // for desired-capacity adjustments; other names remain stored state. Refresh selection
+    // and cleanup are separate paths and do not yet honor suspended processes.
     private static final List<String> ALL_SCALING_PROCESSES = List.of(
             "Launch", "Terminate", "AddToLoadBalancer", "AlarmNotification", "AZRebalance",
             "HealthCheck", "InstanceRefresh", "ReplaceUnhealthy", "ScheduledActions");
 
     public void suspendProcesses(String region, String name, List<String> processes) {
-        AutoScalingGroup asg = requireGroup(region, name);
-        List<String> toSuspend = processes.isEmpty() ? ALL_SCALING_PROCESSES : processes;
-        Set<String> suspended = new LinkedHashSet<>(asg.getSuspendedProcesses());
-        suspended.addAll(toSuspend);
-        asg.setSuspendedProcesses(new ArrayList<>(suspended));
-        groups.put(asgKey(region, name), asg);
+        String key = asgKey(region, name);
+        synchronized (lockFor(key)) {
+            AutoScalingGroup asg = requireGroup(region, name);
+            List<String> toSuspend = processes.isEmpty() ? ALL_SCALING_PROCESSES : processes;
+            Set<String> suspended = new LinkedHashSet<>(asg.getSuspendedProcesses());
+            suspended.addAll(toSuspend);
+            asg.setSuspendedProcesses(new ArrayList<>(suspended));
+            groups.put(key, asg);
+        }
     }
 
     public void resumeProcesses(String region, String name, List<String> processes) {
-        AutoScalingGroup asg = requireGroup(region, name);
-        if (processes.isEmpty()) {
-            asg.setSuspendedProcesses(new ArrayList<>());
-        } else {
-            List<String> remaining = new ArrayList<>(asg.getSuspendedProcesses());
-            remaining.removeAll(processes);
-            asg.setSuspendedProcesses(remaining);
+        String key = asgKey(region, name);
+        synchronized (lockFor(key)) {
+            AutoScalingGroup asg = requireGroup(region, name);
+            if (processes.isEmpty()) {
+                asg.setSuspendedProcesses(new ArrayList<>());
+            } else {
+                List<String> remaining = new ArrayList<>(asg.getSuspendedProcesses());
+                remaining.removeAll(processes);
+                asg.setSuspendedProcesses(remaining);
+            }
+            groups.put(key, asg);
         }
-        groups.put(asgKey(region, name), asg);
     }
 
     // ── Instance management ────────────────────────────────────────────────────

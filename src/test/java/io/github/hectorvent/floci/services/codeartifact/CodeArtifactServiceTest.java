@@ -211,6 +211,336 @@ class CodeArtifactServiceTest {
     }
 
     @Test
+    void createAndDeleteDomainReportZeroAssetSizeBytes() {
+        DomainView created = service.createDomain(REGION, "fresh", null, Map.of());
+        assertEquals(0L, created.assetSizeBytes());
+        DomainView deleted = service.deleteDomain(REGION, "fresh", null);
+        assertEquals(0L, deleted.assetSizeBytes());
+    }
+
+    @Test
+    void describeDomainAssetSizeBytesSumsGenericAssetsAcrossRepositoriesAndVersions() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo-a", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo-b", null, null, Map.of());
+        byte[] first = "first-package".getBytes(StandardCharsets.UTF_8);
+        byte[] second = "second-package-longer".getBytes(StandardCharsets.UTF_8);
+        byte[] third = "third".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "repo-a", "generic", "ns", "pkg-a", "1.0.0", "a.txt",
+                Digests.sha256Hex(first), "false", first);
+        service.publishPackageVersion(REGION, "dom", null, "repo-a", "generic", "ns", "pkg-a", "2.0.0", "a.txt",
+                Digests.sha256Hex(second), "false", second);
+        service.publishPackageVersion(REGION, "dom", null, "repo-b", "generic", "ns", "pkg-b", "1.0.0", "a.txt",
+                Digests.sha256Hex(third), "false", third);
+
+        long expected = first.length + second.length + third.length;
+        assertEquals(expected, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    @Test
+    void describeDomainAssetSizeBytesDropsByExactlyWhatDeletePackageRemoves() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        byte[] kept = "kept-package".getBytes(StandardCharsets.UTF_8);
+        byte[] removed = "removed-package-content".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "kept", "1.0.0", "a.txt",
+                Digests.sha256Hex(kept), "false", kept);
+        service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "removed", "1.0.0", "a.txt",
+                Digests.sha256Hex(removed), "false", removed);
+        assertEquals(kept.length + removed.length, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+
+        service.deletePackage(REGION, "dom", null, "repo", "generic", "ns", "removed");
+
+        assertEquals(kept.length, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
+     * {@code deleteRepository} does not clean up a generic package's {@code packageVersions}
+     * records or asset bytes today, so they are only unreachable through the normal API, not
+     * actually gone. Without scoping the sum to each still-live repository's own key prefix, the
+     * domain total would keep counting a deleted repository's orphaned bytes forever.
+     */
+    @Test
+    void describeDomainAssetSizeBytesExcludesADeletedRepositorysOrphanedBytes() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo-a", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo-b", null, null, Map.of());
+        byte[] inDeletedRepo = "goes-away-with-repo-a".getBytes(StandardCharsets.UTF_8);
+        byte[] inLiveRepo = "stays-in-repo-b".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "repo-a", "generic", "ns", "pkg-a", "1.0.0", "a.txt",
+                Digests.sha256Hex(inDeletedRepo), "false", inDeletedRepo);
+        service.publishPackageVersion(REGION, "dom", null, "repo-b", "generic", "ns", "pkg-b", "1.0.0", "a.txt",
+                Digests.sha256Hex(inLiveRepo), "false", inLiveRepo);
+
+        service.deleteRepository(REGION, "dom", null, "repo-a");
+
+        assertEquals(inLiveRepo.length, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
+     * A Maven/npm/pypi package merely existing on its sidecar (confirmed here via a stubbed
+     * {@code packageExists}) contributes nothing on its own: {@code CodeArtifactService} never
+     * queries a sidecar for size, only the running total each format's own proxy explicitly
+     * reports through {@link CodeArtifactService#recordContainerBackedAssetBytes}, which nothing
+     * in this test ever calls. The next tests below exercise that path directly.
+     */
+    @Test
+    void aContainerBackedPackageExistingWithNoRecordedBytesContributesNothing() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        byte[] generic = "generic-package".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "generic-pkg", "1.0.0", "a.txt",
+                Digests.sha256Hex(generic), "false", generic);
+        when(reposiliteClient.packageExists(anyString(), eq("dom"), eq("repo"), eq("com.example"), eq("maven-pkg")))
+                .thenReturn(true);
+
+        assertEquals(generic.length, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
+     * Mirrors exactly what each real proxy does: snapshot {@code currentContainerBackedPackageFence}
+     * before the (here, simulated) real write, then report it alongside the byte count, the way
+     * {@code CodeArtifactMavenController}/the npm data plane/{@code CodeArtifactPypiController}
+     * all do for real.
+     */
+    private void recordBytes(String domain, String repository, String format, String namespace, String packageName,
+            long bytes) {
+        long fence = service.currentContainerBackedPackageFence(REGION, domain, null, repository, format, namespace,
+                packageName);
+        service.recordContainerBackedAssetBytes(REGION, domain, null, repository, format, namespace, packageName,
+                bytes, fence);
+    }
+
+    /**
+     * {@code recordContainerBackedAssetBytes} is what each of the three sidecar-backed proxies
+     * calls after a real (non-idempotent, non-rejected) write; this is the unit-level proof that
+     * it feeds {@code assetSizeBytes} correctly across all three formats plus generic at once,
+     * accumulating repeated calls for the same package the way a multi-file Maven deploy
+     * (jar + pom as separate PUTs) needs.
+     */
+    @Test
+    void describeDomainAssetSizeBytesSumsContainerBackedBytesAcrossEveryFormat() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        byte[] generic = "generic".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "generic-pkg", "1.0.0", "a.txt",
+                Digests.sha256Hex(generic), "false", generic);
+        recordBytes("dom", "repo", "maven", "com.example", "maven-pkg", 100L);
+        recordBytes("dom", "repo", "maven", "com.example", "maven-pkg", 50L);
+        recordBytes("dom", "repo", "npm", null, "npm-pkg", 200L);
+        recordBytes("dom", "repo", "pypi", null, "pypi-pkg", 300L);
+
+        long expected = generic.length + 100L + 50L + 200L + 300L;
+        assertEquals(expected, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
+     * Unlike every JSON-API package operation's own namespace/packageName, the wire-protocol
+     * proxies (Maven's GAV path, npm's scope/name, twine's form field) never validate theirs
+     * before calling this: a crafted namespace spelling out another namespace's already-escaped
+     * form (here, raw {@code "a#cb"} vs. legitimate {@code "a:b"}, see
+     * {@code newEscapedKeysNeverCollideWithAPreExistingRawKeyThatHappenedToContainABackslash} for
+     * the same invariant proven on the JSON API side) must not be allowed to land in
+     * {@code containerBackedAssetBytes} under the legitimate package's own key at all.
+     */
+    @Test
+    void recordContainerBackedAssetBytesIgnoresANamespaceContainingTheEscapeCharacter() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        recordBytes("dom", "repo", "maven", "a:b", "legit", 10L);
+
+        recordBytes("dom", "repo", "maven", "a#cb", "legit", 999L);
+
+        assertEquals(10L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    @Test
+    void recordContainerBackedAssetBytesIgnoresAPackageNameContainingTheEscapeCharacter() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+
+        recordBytes("dom", "repo", "pypi", null, "bad#name", 999L);
+
+        assertEquals(0L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    @Test
+    void describeDomainAssetSizeBytesDropsWhenDeletePackageRemovesAContainerBackedPackage() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        when(reposiliteClient.packageExists(anyString(), eq("dom"), eq("repo"), eq("com.example"), eq("removed")))
+                .thenReturn(true);
+        recordBytes("dom", "repo", "maven", "com.example", "kept", 40L);
+        recordBytes("dom", "repo", "maven", "com.example", "removed", 60L);
+        assertEquals(100L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+
+        service.deletePackage(REGION, "dom", null, "repo", "maven", "com.example", "removed");
+
+        assertEquals(40L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
+     * Same orphan-exclusion property as generic (see the backslash/collision test above), proven
+     * here for the sidecar ledger: {@code deleteRepository} actually does clean this one up (unlike
+     * {@code packageVersions}), but the sum is scoped per live repository regardless, so this holds
+     * either way.
+     */
+    @Test
+    void describeDomainAssetSizeBytesExcludesADeletedRepositorysContainerBackedBytes() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo-a", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo-b", null, null, Map.of());
+        recordBytes("dom", "repo-a", "npm", null, "pkg-a", 70L);
+        recordBytes("dom", "repo-b", "npm", null, "pkg-b", 30L);
+
+        service.deleteRepository(REGION, "dom", null, "repo-a");
+
+        assertEquals(30L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
+     * {@code assetSizeBytesForDomain} scans generic {@code packageVersions} by each live
+     * repository's name-based prefix, not by a freshly minted id, so a repository recreated under
+     * this same name would otherwise sum right back into any orphaned record
+     * {@code deleteRepository} failed to clean up: unlike {@code containerBackedAssetBytes}, there
+     * was never any cleanup of {@code packageVersions} on {@code deleteRepository} before this,
+     * since nothing before {@code assetSizeBytes} existed ever looked an old repository's
+     * generic-format records up by name alone the way this domain-wide sum does.
+     */
+    @Test
+    void describeDomainAssetSizeBytesDoesNotResurrectAGenericPackagesBytesAfterRepositoryRecreation() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        byte[] content = "generic content".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "repo", "generic", "ns", "generic-pkg", "1.0.0", "a.txt",
+                Digests.sha256Hex(content), "false", content);
+        assertEquals(content.length, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+
+        service.deleteRepository(REGION, "dom", null, "repo");
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+
+        assertEquals(0L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
+     * Reproduces the one window where a real publish and a real {@code DeleteRepository} could
+     * interleave: the sidecar-backed proxies check the repository exists in one {@code
+     * synchronized} call ({@code ensureFormatContainerId}), then do the real HTTP write to the
+     * sidecar with no lock held at all, and only then call this method in a second, separate
+     * {@code synchronized} call. A {@code DeleteRepository} landing in that gap would otherwise
+     * resurrect a key it just cleaned up. Calling {@code recordContainerBackedAssetBytes} after
+     * {@code deleteRepository} reproduces exactly that interleaving deterministically (both methods
+     * are themselves {@code synchronized}, so there is no actual race to simulate, only the order
+     * the two calls land in): the resurrected entry must not survive, and in particular must not
+     * be inherited by a same-named repository created afterward, the same invariant
+     * {@code deleteRepository}'s own cleanup already protects against for every ordering but this
+     * one.
+     */
+    @Test
+    void recordContainerBackedAssetBytesAfterTheRepositoryIsAlreadyDeletedIsIgnored() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        long fence = service.currentContainerBackedPackageFence(REGION, "dom", null, "repo", "maven", "com.example",
+                "late");
+        service.deleteRepository(REGION, "dom", null, "repo");
+
+        service.recordContainerBackedAssetBytes(REGION, "dom", null, "repo", "maven", "com.example", "late", 999L,
+                fence);
+
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        assertEquals(0L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
+     * The same window, but for {@code DeletePackage} instead of {@code DeleteRepository}: the
+     * repository stays alive, only the package underneath it is gone, so a resurrected entry
+     * would be counted by {@code DescribeDomain} immediately rather than only after a repository
+     * is recreated. Snapshotting the fence before the delete, exactly like a real proxy snapshots
+     * it before its real write, reproduces exactly the interleaving a delayed accounting callback
+     * racing a concurrent {@code DeletePackage} would see.
+     */
+    @Test
+    void recordContainerBackedAssetBytesAfterAConcurrentDeletePackageIsIgnored() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        long fence = service.currentContainerBackedPackageFence(REGION, "dom", null, "repo", "maven", "com.example",
+                "late");
+        when(reposiliteClient.packageExists(anyString(), eq("dom"), eq("repo"), eq("com.example"), eq("late")))
+                .thenReturn(true);
+        service.deletePackage(REGION, "dom", null, "repo", "maven", "com.example", "late");
+
+        service.recordContainerBackedAssetBytes(REGION, "dom", null, "repo", "maven", "com.example", "late", 999L,
+                fence);
+
+        assertEquals(0L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
+     * The harder version of the same race: the package is deleted {@code and} a different publish
+     * recreates it under the same name, both completing before the first publish's own delayed
+     * accounting call runs. A sidecar existence check alone could not tell these two packages
+     * apart (the name exists either way); the fence can, since only an actual deletion bumps it.
+     */
+    @Test
+    void recordContainerBackedAssetBytesAfterDeleteAndRepublishUnderTheSameNameIsIgnored() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        long fence = service.currentContainerBackedPackageFence(REGION, "dom", null, "repo", "maven", "com.example",
+                "late");
+        when(reposiliteClient.packageExists(anyString(), eq("dom"), eq("repo"), eq("com.example"), eq("late")))
+                .thenReturn(true);
+        service.deletePackage(REGION, "dom", null, "repo", "maven", "com.example", "late");
+        // The republish: a different publish, same coordinates, after the first one's snapshot.
+        recordBytes("dom", "repo", "maven", "com.example", "late", 10L);
+
+        service.recordContainerBackedAssetBytes(REGION, "dom", null, "repo", "maven", "com.example", "late", 999L,
+                fence);
+
+        assertEquals(10L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    /**
+     * {@code currentContainerBackedPackageFence}/{@code recordContainerBackedAssetBytes} never
+     * touch a sidecar at all, so there is no failure mode left to fail open on: the fence
+     * comparison is a plain in-memory read, always available, closing the same race the sidecar
+     * round trip this replaced used to close, at the cost of a thrown exception whenever it
+     * couldn't reach the sidecar.
+     */
+    @Test
+    void recordContainerBackedAssetBytesNeverNeedsTheSidecarAtAll() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        when(reposiliteClient.packageExists(any(), any(), any(), any(), any()))
+                .thenThrow(new IllegalStateException("sidecar unreachable"));
+
+        recordBytes("dom", "repo", "maven", "com.example", "never-asked", 55L);
+
+        assertEquals(55L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+        verify(reposiliteClient, never()).packageExists(any(), any(), any(), any(), any());
+    }
+
+    /**
+     * {@code packageOriginConfigs} keeps the caller's raw spelling (pre-existing, unrelated to byte
+     * accounting); {@code containerBackedAssetBytes}/the fence use pypiserver's own PEP 503
+     * normalization instead, so an upload spelled one way and a {@code DeletePackage} spelled a
+     * case/punctuation-equivalent way still address the one byte count pypiserver itself would
+     * treat as a single package.
+     */
+    @Test
+    void pypiAccountingNormalizesThePackageNameLikePypiserverItself() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        recordBytes("dom", "repo", "pypi", null, "My.Package", 42L);
+        assertEquals(42L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+        when(pypiserverClient.packageExists(anyString(), eq("dom"), eq("repo"), isNull(), eq("my_package")))
+                .thenReturn(true);
+
+        service.deletePackage(REGION, "dom", null, "repo", "pypi", null, "my_package");
+
+        assertEquals(0L, service.describeDomain(REGION, "dom", null).assetSizeBytes());
+    }
+
+    @Test
     void concurrentCreateDomainWithSameNameOnlyOneWins() throws InterruptedException {
         int attempts = 8;
         ExecutorService pool = Executors.newFixedThreadPool(attempts);

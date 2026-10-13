@@ -145,59 +145,7 @@ class SesV2IntegrationTest {
             .jsonPath()
             .getList("DkimAttributes.Tokens", String.class);
 
-        String locationHeader = given()
-            .contentType("application/xml")
-            .body("""
-                <?xml version="1.0" encoding="UTF-8"?>
-                <CreateHostedZoneRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">
-                  <Name>floci.test</Name>
-                  <CallerReference>ses-v2-dkim-success</CallerReference>
-                </CreateHostedZoneRequest>
-                """)
-        .when()
-            .post("/2013-04-01/hostedzone")
-        .then()
-            .statusCode(201)
-            .extract()
-            .header("Location");
-
-        String zoneId = locationHeader.substring(locationHeader.lastIndexOf('/') + 1);
-        StringBuilder body = new StringBuilder("""
-                <?xml version="1.0" encoding="UTF-8"?>
-                <ChangeResourceRecordSetsRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">
-                  <ChangeBatch>
-                    <Changes>
-                """);
-        for (String token : tokens) {
-            body.append("""
-                      <Change>
-                        <Action>CREATE</Action>
-                        <ResourceRecordSet>
-                          <Name>""").append(token).append("._domainkey.v2dkim-success.floci.test.</Name>\n")
-                    .append("""
-                          <Type>CNAME</Type>
-                          <TTL>300</TTL>
-                          <ResourceRecords>
-                            <ResourceRecord><Value>""").append(token).append(".dkim.amazonses.com.</Value></ResourceRecord>\n")
-                    .append("""
-                          </ResourceRecords>
-                        </ResourceRecordSet>
-                      </Change>
-                    """);
-        }
-        body.append("""
-                    </Changes>
-                  </ChangeBatch>
-                </ChangeResourceRecordSetsRequest>
-                """);
-
-        given()
-            .contentType("application/xml")
-            .body(body.toString())
-        .when()
-            .post("/2013-04-01/hostedzone/" + zoneId + "/rrset")
-        .then()
-            .statusCode(200);
+        SesDomainIdentityTestHelper.publishDkimRecords("v2dkim-success.floci.test", tokens);
 
         given()
             .contentType("application/json")
@@ -1002,6 +950,17 @@ class SesV2IntegrationTest {
             .contentType("application/json")
             .header("Authorization", AUTH_HEADER)
             .body("""
+                {"EmailIdentity": "raw-from@floci.test"}
+                """)
+        .when()
+            .post("/v2/email/identities")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", AUTH_HEADER)
+            .body("""
                 {
                     "Destination": {"ToAddresses": ["r@example.com"]},
                     "Content": {"Raw": {"Data": "From: raw-from@floci.test\\r\\nTo: r@example.com\\r\\nSubject: s\\r\\n\\r\\nbody"}}
@@ -1304,17 +1263,19 @@ class SesV2IntegrationTest {
     void inspectionEndpoint_returnsEmailsFromAllRegions() {
         given().delete("/_aws/ses").then().statusCode(200);
 
-        // Create identity usable in both regions (domain covers all addresses)
-        given()
-            .contentType("application/json")
-            .header("Authorization", AUTH_HEADER)
-            .body("""
-                {"EmailIdentity": "example.com"}
-                """)
-        .when()
-            .post("/v2/email/identities")
-        .then()
-            .statusCode(200);
+        // Identities are regional, so the sender is verified in each region it sends from.
+        for (String region : List.of("us-east-1", "ap-northeast-1")) {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .header("Authorization",
+                        "AWS4-HMAC-SHA256 Credential=AKID/20260101/" + region + "/email/aws4_request")
+                .formParam("Action", "VerifyEmailIdentity")
+                .formParam("EmailAddress", "multi@example.com")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
+        }
 
         // Send from us-east-1
         given()

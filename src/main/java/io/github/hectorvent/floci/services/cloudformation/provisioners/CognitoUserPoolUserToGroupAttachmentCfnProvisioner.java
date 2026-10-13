@@ -62,9 +62,7 @@ public class CognitoUserPoolUserToGroupAttachmentCfnProvisioner implements CfnRe
         if (ctx.reusesPriorEntity(physicalId)) {
             JsonNode prior = memberships(attributesBefore).get(physicalId);
             if (prior != null && !prior.equals(membership)) {
-                throw new AwsException("ValidationError",
-                        "CloudFormation cannot update a stack when a custom-named resource requires replacing. Rename "
-                                + physicalId + " and update the stack again.", 400);
+                throw CfnExceptions.customNamedReplacement(physicalId);
             }
         } else {
             String member = cognitoService.adminGetUser(userPoolId, username).getUsername();
