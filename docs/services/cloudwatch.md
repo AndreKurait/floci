@@ -331,7 +331,16 @@ aws logs put-retention-policy \
 ## CloudWatch Metrics {#metrics}
 
 **Protocol:** Query (XML) and JSON 1.0 (both supported)
-**Endpoint:** `POST http://localhost:4566/`
+
+CloudWatch Query operations accept form-encoded POST requests and root GET requests with
+URL query parameters. GET uses the same handler, validation, XML response and IAM action
+classification as POST. Requests signed with the `monitoring` scope select CloudWatch;
+unsigned GET requests select it only for unambiguous supported CloudWatch actions.
+S3-scoped requests, SigV4 presigned URLs, unrelated query parameters and browser
+landing-page requests retain their existing routing. `Action` takes precedence over the
+legacy `Operation` fallback.
+
+**Endpoint:** `http://localhost:4566/` — Query: GET or POST; JSON: POST.
 
 ### Supported Actions
 
