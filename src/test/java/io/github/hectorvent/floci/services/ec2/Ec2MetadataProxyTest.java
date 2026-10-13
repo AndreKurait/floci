@@ -346,7 +346,7 @@ class Ec2MetadataProxyTest {
                 + "shift\n"
                 + "case \"$operation\" in\n"
                 + "  -S) /bin/cat \"$TEST_RULES\" ;;\n"
-                + "  -C) /bin/grep -Fx -- \"-A OUTPUT $*\" \"$TEST_RULES\" >/dev/null ;;\n"
+                + "  -C) grep -Fx -- \"-A OUTPUT $*\" \"$TEST_RULES\" >/dev/null ;;\n"
                 + "  -I) [ \"$1\" = 1 ] || exit 83; shift; printf '%s\\n' \"-A OUTPUT $*\" >> \"$TEST_RULES\" ;;\n"
                 + "  *) exit 84 ;;\nesac\n");
         writeTool(bin, "curl", checkedToolEnvironment()

@@ -1,6 +1,5 @@
 package io.github.hectorvent.floci.services.autoscaling;
 
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
@@ -734,20 +733,11 @@ public class AutoScalingReconciler {
                         specification.getLaunchTemplateName(),
                         resolvedVersion,
                         version.getData().effectiveAssociatePublicIpAddress(), version.getData().getBlockDeviceMappings(),
-                    version.getData().getMetadataOptions());
+                        version.getData().getMetadataOptions());
             }
         }
 
         return null;
-    }
-
-    private String resolveLaunchConfigurationProfile(String profile) {
-        if (profile == null || profile.isBlank()) {
-            return null;
-        }
-        return AwsArnUtils.isArn(profile)
-                ? ec2Service.resolveIamInstanceProfileArn(null, profile)
-                : ec2Service.resolveIamInstanceProfileName(profile);
     }
 
     private LaunchConfiguration resolveLaunchConfiguration(AutoScalingGroup asg) {
