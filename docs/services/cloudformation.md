@@ -400,6 +400,13 @@ macro co-declared beside SAM is absent from `Processed` as well.
 Real AWS's answer for these shapes is unmeasured, co-declared with SAM or not. `StagesAvailable`
 always lists both stages, matching AWS.
 
+## S3 ownership controls
+
+`AWS::S3::Bucket.OwnershipControls` supports one rule using `BucketOwnerEnforced`,
+`BucketOwnerPreferred`, or `ObjectWriter`. Updates apply the new mode; removing a previously
+declared property removes the controls. An unrelated update preserves controls managed outside
+the template when neither the prior nor the new template declares them.
+
 ## Conditions
 
 Template `Conditions` are evaluated before provisioning. A resource whose `Condition` evaluates to
