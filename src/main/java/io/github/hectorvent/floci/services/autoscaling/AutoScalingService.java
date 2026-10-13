@@ -24,6 +24,7 @@ import java.util.stream.Collectors;
 @ApplicationScoped
 public class AutoScalingService {
 
+    static final String GROUP_NAME_TAG = "aws:autoscaling:groupName";
     static final String MISSING_LAUNCH_TEMPLATE_IMAGE_ID_MESSAGE =
             "You must use a valid fully-formed launch template. The request must contain the parameter ImageId";
     static final String INVALID_LAUNCH_TEMPLATE_MESSAGE =
@@ -675,6 +676,13 @@ public class AutoScalingService {
     public void detachInstances(String region, String name, List<String> instanceIds,
                                  boolean decrementDesiredCapacity) {
         AutoScalingGroup asg = requireGroup(region, name);
+        List<String> detachedIds = asg.getInstances().stream()
+                .map(AsgInstance::getInstanceId)
+                .filter(instanceIds::contains)
+                .toList();
+        if (!detachedIds.isEmpty()) {
+            ec2Service.deleteSystemTag(region, detachedIds, GROUP_NAME_TAG);
+        }
         asg.getInstances().removeIf(i -> instanceIds.contains(i.getInstanceId()));
         if (decrementDesiredCapacity) {
             int newDesired = Math.max(asg.getMinSize(), asg.getDesiredCapacity() - instanceIds.size());
