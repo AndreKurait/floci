@@ -9320,6 +9320,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ensureDefaultResources(region);
         Address address = getRequiredAddress(region, allocationId);
         if (address.getAssociationId() != null) {
+            Instance instance = getRequiredInstance(region, address.getInstanceId());
+            if (!getRequiredVpc(region, instance.getVpcId()).isDefault()) {
+                throw new AwsException("InvalidIPAddress.InUse",
+                        "Address " + address.getPublicIp() + " is in use.", 400);
+            }
             disassociateAddress(region, address.getAssociationId());
         }
         addresses.delete(key(region, allocationId));

@@ -1,19 +1,25 @@
-"""Primary ENI association filters verified against live EC2 on 2026-10-12."""
+"""Primary ENI filters and VPC-dependent EIP release verified against live EC2."""
 
 import uuid
 from contextlib import ExitStack
 
 import pytest
+from botocore.exceptions import ClientError
 
 
 @pytest.mark.parametrize("supplied_interface", [False, True])
-def test_network_interface_association_filters(ec2_client, supplied_interface):
+@pytest.mark.parametrize("default_vpc", [False, True])
+def test_network_interface_association_filters(ec2_client, supplied_interface, default_vpc):
     with ExitStack() as cleanup:
-        vpc = ec2_client.create_vpc(CidrBlock="10.237.0.0/24")["Vpc"]["VpcId"]
-        cleanup.callback(ec2_client.delete_vpc, VpcId=vpc)
-        subnet = ec2_client.create_subnet(
-            VpcId=vpc, CidrBlock="10.237.0.0/26")["Subnet"]["SubnetId"]
-        cleanup.callback(ec2_client.delete_subnet, SubnetId=subnet)
+        if default_vpc:
+            subnet = ec2_client.describe_subnets(
+                Filters=[{"Name": "default-for-az", "Values": ["true"]}])["Subnets"][0]["SubnetId"]
+        else:
+            vpc = ec2_client.create_vpc(CidrBlock="10.237.0.0/24")["Vpc"]["VpcId"]
+            cleanup.callback(ec2_client.delete_vpc, VpcId=vpc)
+            subnet = ec2_client.create_subnet(
+                VpcId=vpc, CidrBlock="10.237.0.0/26")["Subnet"]["SubnetId"]
+            cleanup.callback(ec2_client.delete_subnet, SubnetId=subnet)
         image = ec2_client.register_image(
             Name="eni-filter-" + uuid.uuid4().hex, Architecture="x86_64",
             RootDeviceName="/dev/sda1")["ImageId"]
@@ -34,9 +40,12 @@ def test_network_interface_association_filters(ec2_client, supplied_interface):
         eni_ids = [instance["NetworkInterfaces"][0]["NetworkInterfaceId"]
                    for instance in instances]
         allocation = ec2_client.allocate_address(Domain="vpc")["AllocationId"]
-        cleanup.callback(ec2_client.release_address, AllocationId=allocation)
+        allocation_cleanup = cleanup.enter_context(ExitStack())
+        allocation_cleanup.callback(ec2_client.release_address, AllocationId=allocation)
         association = ec2_client.associate_address(
             AllocationId=allocation, InstanceId=instances[0]["InstanceId"])["AssociationId"]
+        association_cleanup = cleanup.enter_context(ExitStack())
+        association_cleanup.callback(ec2_client.disassociate_address, AssociationId=association)
         # Floci resolves a reachable address on association; read the actual association.
         interface = ec2_client.describe_network_interfaces(
             NetworkInterfaceIds=[eni_ids[0]])["NetworkInterfaces"][0]
@@ -49,15 +58,25 @@ def test_network_interface_association_filters(ec2_client, supplied_interface):
                 Filters=[{"Name": key, "Values": value} for key, value in filters.items()])
             return [item["NetworkInterfaceId"] for item in result["NetworkInterfaces"]]
 
-        try:
-            assert matched(**{"association.public-ip": [public_ip]}) == [eni_ids[0]]
-            assert matched(**{"association.public-ip": ["192.0.2.1"]}) == []
-            assert matched(**{"association.ip-owner-id": [owner]}) == [eni_ids[0]]
-            assert matched(**{"association.ip-owner-id": ["wrong-owner"]}) == []
-            assert matched(**{"association.public-ip": ["192.0.2.1", public_ip]}) == [eni_ids[0]]
-            assert matched(**{"association.public-ip": ["*"],
-                              "association.ip-owner-id": ["wrong-owner"]}) == []
-        finally:
-            ec2_client.disassociate_address(AssociationId=association)
-        assert matched(**{"association.public-ip": ["*"]}) == []
+        assert matched(**{"association.public-ip": [public_ip]}) == [eni_ids[0]]
+        assert matched(**{"association.public-ip": ["192.0.2.1"]}) == []
+        assert matched(**{"association.ip-owner-id": [owner]}) == [eni_ids[0]]
+        assert matched(**{"association.ip-owner-id": ["wrong-owner"]}) == []
+        assert matched(**{"association.public-ip": ["192.0.2.1", public_ip]}) == [eni_ids[0]]
+        assert matched(**{"association.public-ip": ["*"],
+                          "association.ip-owner-id": ["wrong-owner"]}) == []
+        if not default_vpc:
+            with pytest.raises(ClientError) as error:
+                ec2_client.release_address(AllocationId=allocation)
+            assert error.value.response["Error"]["Code"] == "InvalidIPAddress.InUse"
+            assert error.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+            assert ec2_client.describe_addresses(
+                AllocationIds=[allocation])["Addresses"][0]["AssociationId"] == association
+            assert matched(**{"association.public-ip": [public_ip],
+                              "association.ip-owner-id": [owner]}) == [eni_ids[0]]
+            association_cleanup.close()
+        ec2_client.release_address(AllocationId=allocation)
+        association_cleanup.pop_all()
+        allocation_cleanup.pop_all()
+        assert matched(**{"association.public-ip": [public_ip]}) == []
         assert matched(**{"association.ip-owner-id": [owner]}) == []
