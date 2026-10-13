@@ -29,6 +29,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
@@ -63,6 +64,22 @@ class ContainerLifecycleManagerVolumeTest {
     void setUp() {
         manager = new ContainerLifecycleManager(
                 dockerClient, imageCacheService, containerDetector, portAllocator, config);
+    }
+
+    @Test
+    void ensureVolumePersistsOwnershipLabelsAndTheirLegacyAliases() {
+        InspectVolumeCmd inspect = mock(InspectVolumeCmd.class);
+        when(dockerClient.inspectVolumeCmd("task-volume")).thenReturn(inspect);
+        when(inspect.exec()).thenThrow(new NotFoundException("missing"));
+        CreateVolumeCmd create = mock(CreateVolumeCmd.class, RETURNS_SELF);
+        when(dockerClient.createVolumeCmd()).thenReturn(create);
+        manager.ensureVolume("task-volume", Map.of("io.floci.service", "ecs",
+                "io.floci.owner", "alpha/4566", "io.floci.ecs.run", "run-id"));
+        verify(create).withLabels(argThat(labels -> "ecs".equals(labels.get("io.floci.service"))
+                && "alpha/4566".equals(labels.get("io.floci.owner"))
+                && "alpha/4566".equals(labels.get("floci_owner_port"))
+                && "run-id".equals(labels.get("io.floci.ecs.run"))
+                && "run-id".equals(labels.get("floci.ecs-run"))));
     }
 
     @Test

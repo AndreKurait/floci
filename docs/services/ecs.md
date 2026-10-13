@@ -862,6 +862,23 @@ for reasons that have nothing to do with the role's policy.
 
 Each of these logs a warning naming the task and the role it asked for.
 
+### Ephemeral task volumes
+
+A volume declared with only a `name`, or with an empty `host` and no `sourcePath`, supplies
+ephemeral storage shared by the containers in that task. Each container's `mountPoints` selects
+the volume, mount path and read-only mode. Floci creates a Docker volume for each mounted task
+volume; different tasks get separate storage even when they use the same task definition.
+
+Task teardown removes this storage after the containers have been removed. Cleanup also runs
+when a task exits naturally or fails to launch. The task reconciler retries failed removals,
+including cleanup left pending by a failed launch or a state reset.
+With `reconcile-containers-on-startup` enabled, Floci also removes task volumes left by a previous
+run after their containers are gone. Failed volume cleanup retries on reconciler ticks without
+blocking new task launches. The sweep matches the emulator owner and run labels; it
+leaves current-run volumes and other emulator instances alone. Unlike AWS's configurable delayed
+EC2 agent cleanup, Floci attempts removal during teardown. EFS-backed volumes remain shared and persistent, and the
+unsupported external volume configurations listed above remain unimplemented.
+
 ### Host volume safety
 
 A task definition's `volumes[].host.sourcePath` is a caller-controlled filesystem path that Floci bind-mounts straight into the launched container, so both `RegisterTaskDefinition` and the actual bind mount at `RunTask` time validate it (the second check narrows the window between validation and mount, and also covers task definitions registered before this policy existed).
@@ -886,7 +903,7 @@ Always rejected, regardless of configuration:
 
 - `FLOCI_SERVICES_ECS_ALLOW_UNSAFE_HOST_VOLUMES=true`: allow any host path (for local development where any host path should be mountable). The traversal, bare-root, and Docker socket blocks above are never bypassed by this flag.
 
-A rejected `sourcePath` fails `RegisterTaskDefinition` with `InvalidParameterException`; a rejection caught again at `RunTask` time (e.g. a task definition registered before this policy existed) stops the task with that message as its `stoppedReason`. Named Docker volumes, EFS volumes, and host volumes with no `sourcePath` (ephemeral, container-local storage) are unaffected by these checks.
+A rejected `sourcePath` fails `RegisterTaskDefinition` with `InvalidParameterException`; a rejection caught again at `RunTask` time (e.g. a task definition registered before this policy existed) stops the task with that message as its `stoppedReason`. Named Docker volumes, EFS volumes, and host volumes with no `sourcePath` (ephemeral storage shared within a task) are unaffected by these checks.
 
 ### EFS volume ownership
 
