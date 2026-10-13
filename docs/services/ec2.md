@@ -118,6 +118,19 @@ CloudFormation `AWS::EC2::VPCEndpoint` resolves `IpAddressType` on create and up
 
 Floci runs an IMDS-compatible HTTP server on port `9169` of the host. Each launched container receives the environment variable `AWS_EC2_METADATA_SERVICE_ENDPOINT` pointing to this server.
 
+The proxy installation and startup helper shells clear `LD_LIBRARY_PATH`,
+`PYTHONPATH` and `PYTHONHOME` before running system tools. This prevents an
+application's bundled libraries or Python installation from replacing the
+system dependencies used by the package manager, proxy and HTTP probe. The
+container configuration and application process environment remain unchanged.
+The readiness probe requests an IMDSv2 token with a 60-second lifetime, then
+uses it to read the instance ID. A failed or empty token response does not
+fall back to a tokenless request.
+
+When `HttpTokens=required`, metadata reads without a valid IMDSv2 token return 401
+before resolving the requested data. `iam/info` returns the attached IAM profile's
+stored ARN and ID rather than an ID derived from the instance.
+
 Both IMDSv1 (no token) and IMDSv2 (token-based) flows are supported:
 
 ```bash
@@ -735,6 +748,18 @@ prefix lists, `EnaSrdSpecification`, `PrimaryIpv6` and `EnaQueueCount` are likew
 | ReplaceIamInstanceProfileAssociation | Swaps the profile behind an existing association id; an unknown id answers `InvalidAssociationID.NotFound`. |
 | DisassociateIamInstanceProfile | Detaches the profile behind an association id. |
 
+Launches and association changes resolve both names and ARNs against IAM in the
+caller's account. Unknown profiles and foreign-account ARNs fail with
+`InvalidParameterValue` before allocation or association changes. Launches and launch
+template creation reject simultaneous name/ARN selectors with
+`InvalidParameterCombination`; association replacement uses the ARN when both are
+provided. Launch templates reject malformed profile ARNs at creation with
+`InvalidIamInstanceProfileArn.Malformed`.
+EC2 stores and returns IAM's profile ID, including for launch-template and Auto Scaling
+instances. Persisted instances from older versions omit the unknown ID until the
+profile is reassociated; looking up the ARN could misidentify a deleted and recreated
+profile. The `client-token` instance filter selects only matching launches.
+
 ### Network Interfaces
 
 | Action | Description |
@@ -1053,3 +1078,14 @@ The file uses the same schema as `src/main/resources/ec2/image-catalog.yaml` and
 include every image that process should expose. Missing or invalid files fail on first
 catalog use; leaving the setting unset preserves the bundled catalog. Containerized
 Floci needs the file mounted at the configured container path.
+
+### Public IPv4 addresses in mock mode
+
+Mock instances apply `MapPublicIpOnLaunch` unless the primary launch interface explicitly
+sets `AssociatePublicIpAddress`. Direct launches and Auto Scaling launch templates preserve
+both `true` and `false` overrides. An automatically assigned public address remains stable
+while running, is released on stop or termination, and is replaced on restart; the private
+address remains unchanged.
+
+A launch template with network interfaces cannot be combined with an instance-level
+`SubnetId`; place the subnet on the primary network interface instead.

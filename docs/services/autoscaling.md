@@ -16,7 +16,7 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 
 | Operation | Notes |
 |---|---|
-| `CreateLaunchConfiguration` | Stores template: `ImageId`, `InstanceType`, `KeyName`, `SecurityGroups`, `UserData`, `IamInstanceProfile`, `InstanceMonitoring`, `BlockDeviceMappings` |
+| `CreateLaunchConfiguration` | Stores template: `ImageId`, `InstanceType`, `KeyName`, `SecurityGroups`, `UserData`, `IamInstanceProfile`, `InstanceMonitoring`, `BlockDeviceMappings`, `MetadataOptions` |
 | `DescribeLaunchConfigurations` | Filtered by name list; returns all if no filter |
 | `DeleteLaunchConfiguration` | Removes the named launch configuration |
 
@@ -235,3 +235,7 @@ aws autoscaling set-desired-capacity \
   --auto-scaling-group-name my-asg \
   --desired-capacity 3
 ```
+
+Launch configurations accept an IAM instance profile name or ARN. Unknown and foreign profiles fail creation with `ValidationError`. At launch, the reconciler resolves a stored name to its ARN in the owning account.
+
+Launch-configuration metadata options (`HttpTokens`, `HttpEndpoint`, and `HttpPutResponseHopLimit`) round-trip through Query and CloudFormation and reach EC2 launches. When the structure is omitted it stays absent from `DescribeLaunchConfigurations`; a supplied partial structure reports defaults for unspecified fields. Launch templates and mixed-instance templates likewise forward their existing metadata options.

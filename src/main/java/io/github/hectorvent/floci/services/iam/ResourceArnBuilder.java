@@ -828,7 +828,7 @@ public class ResourceArnBuilder {
         return io.github.hectorvent.floci.services.dynamodb.DynamoDbPartiQLParser.extractTable(statement);
     }
 
-    private String toDynamoDbTableArn(String tableName, String region, String accountId) {
+    public static String toDynamoDbTableArn(String tableName, String region, String accountId) {
         if (AwsArnUtils.isArnFor(tableName, "dynamodb")) {
             return tableName;
         }

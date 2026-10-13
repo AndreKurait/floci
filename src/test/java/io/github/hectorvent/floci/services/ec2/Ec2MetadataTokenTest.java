@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -98,6 +99,70 @@ class Ec2MetadataTokenTest {
         HttpResponse<String> response = getInstanceId(null);
 
         assertEquals(200, response.statusCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "/latest/meta-data/instance-id",
+            "/latest/dynamic/instance-identity/document",
+            "/latest/user-data",
+            "/latest/meta-data/iam/info",
+            "/latest/meta-data/iam/security-credentials/",
+            "/latest/meta-data/tags/instance/"
+    })
+    void requiredTokenRefusesDataBeforeResolvingItsContents(String path) throws Exception {
+        setTokenRequirement("required");
+        instance.setUserData("private-user-data");
+
+        HttpResponse<String> response = getWithoutToken(path);
+
+        assertEquals(401, response.statusCode());
+        assertEquals("", response.body());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " "})
+    void blankTokenDoesNotBypassRequiredTokens(String token) throws Exception {
+        setTokenRequirement("required");
+
+        assertEquals(401, getInstanceId(token).statusCode());
+    }
+
+    @Test
+    void requiredTokenPreservesIssuanceValidationAndExpiry() throws Exception {
+        setTokenRequirement("required");
+        HttpResponse<String> issued = fixture.putToken("60");
+        assertEquals(200, issued.statusCode());
+
+        HttpResponse<String> accepted = getInstanceId(issued.body());
+        assertEquals(200, accepted.statusCode());
+        assertEquals(instance.getInstanceId(), accepted.body());
+        assertEquals(401, getInstanceId("invalid-token").statusCode());
+
+        fixture.clock().advance(Duration.ofSeconds(60));
+        assertEquals(401, getInstanceId(issued.body()).statusCode());
+    }
+
+    @Test
+    void tokenRequirementTracksTheRegisteredInstancesCurrentOptions() throws Exception {
+        setTokenRequirement("optional");
+        assertEquals(200, getWithoutToken("/latest/meta-data/instance-id").statusCode());
+
+        setTokenRequirement("required");
+        assertEquals(401, getWithoutToken("/latest/meta-data/instance-id").statusCode());
+
+        setTokenRequirement("optional");
+        assertEquals(200, getWithoutToken("/latest/meta-data/instance-id").statusCode());
+    }
+
+    private void setTokenRequirement(String value) {
+        LaunchTemplateData.MetadataOptions options = LaunchTemplateData.MetadataOptions.launchDefaults();
+        options.setHttpTokens(value);
+        instance.setMetadataOptions(options);
+    }
+
+    private HttpResponse<String> getWithoutToken(String path) throws Exception {
+        return fixture.get(path, null, HttpResponse.BodyHandlers.ofString());
     }
 
     private HttpResponse<String> getInstanceId(String token) throws Exception {
