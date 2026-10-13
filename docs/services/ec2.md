@@ -127,6 +127,10 @@ The readiness probe requests an IMDSv2 token with a 60-second lifetime, then
 uses it to read the instance ID. A failed or empty token response does not
 fall back to a tokenless request.
 
+When `HttpTokens=required`, metadata reads without a valid IMDSv2 token return 401
+before resolving the requested data. `iam/info` returns the attached IAM profile's
+stored ARN and ID rather than an ID derived from the instance.
+
 Both IMDSv1 (no token) and IMDSv2 (token-based) flows are supported:
 
 ```bash
@@ -1072,7 +1076,7 @@ Mock instances apply `MapPublicIpOnLaunch` unless the primary launch interface e
 sets `AssociatePublicIpAddress`. Direct launches and Auto Scaling launch templates preserve
 both `true` and `false` overrides. An automatically assigned public address remains stable
 while running, is released on stop or termination, and is replaced on restart; the private
-address remains unchanged. Elastic IP associations are preserved separately.
+address remains unchanged.
 
 A launch template with network interfaces cannot be combined with an instance-level
 `SubnetId`; place the subnet on the primary network interface instead.
