@@ -1,8 +1,7 @@
 package io.github.hectorvent.floci.services.dlm;
 
 import io.github.hectorvent.floci.core.common.ResolvedServiceCatalog;
-import io.github.hectorvent.floci.core.common.ServiceDescriptor;
-import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
+import io.github.hectorvent.floci.core.common.SignedServiceRoute;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ContainerRequestFilter;
@@ -19,36 +18,16 @@ import jakarta.ws.rs.ext.Provider;
 public class DlmRouteFilter implements ContainerRequestFilter {
 
     static final String INTERNAL_PREFIX = "/_dlm";
-    private static final String DLM = "dlm";
-    private static final String POLICIES_PATH = "/policies";
 
-    private final ResolvedServiceCatalog catalog;
+    private final SignedServiceRoute route;
 
     @Inject
     public DlmRouteFilter(ResolvedServiceCatalog catalog) {
-        this.catalog = catalog;
+        this.route = new SignedServiceRoute(catalog, "dlm", INTERNAL_PREFIX, SignedServiceRoute.under("/policies"));
     }
 
     @Override
     public void filter(ContainerRequestContext ctx) {
-        String path = ctx.getUriInfo().getPath();
-        String normalizedPath = path.startsWith("/") ? path : "/" + path;
-        if (!normalizedPath.equals(POLICIES_PATH)
-                && !normalizedPath.startsWith(POLICIES_PATH + "/")) {
-            return;
-        }
-
-        boolean targetsDlm = SigV4CredentialScope.serviceName(ctx.getHeaderString("Authorization"))
-                .flatMap(catalog::byCredentialScope)
-                .map(ServiceDescriptor::externalKey)
-                .filter(DLM::equals)
-                .isPresent();
-        if (!targetsDlm) {
-            return;
-        }
-
-        ctx.setRequestUri(ctx.getUriInfo().getRequestUriBuilder()
-                .replacePath(INTERNAL_PREFIX + normalizedPath)
-                .build());
+        route.apply(ctx);
     }
 }
