@@ -9320,14 +9320,34 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ensureDefaultResources(region);
         Address address = getRequiredAddress(region, allocationId);
         if (address.getAssociationId() != null) {
-            Instance instance = getRequiredInstance(region, address.getInstanceId());
-            if (!getRequiredVpc(region, instance.getVpcId()).isDefault()) {
+            NetworkInterface ni = networkInterfaces.get(key(region, address.getNetworkInterfaceId())).orElse(null);
+            String vpcId = ni != null ? ni.getVpcId()
+                    : getRequiredInstance(region, address.getInstanceId()).getVpcId();
+            if (!getRequiredVpc(region, vpcId).isDefault()) {
                 throw new AwsException("InvalidIPAddress.InUse",
                         "Address " + address.getPublicIp() + " is in use.", 400);
             }
             disassociateAddress(region, address.getAssociationId());
         }
         addresses.delete(key(region, allocationId));
+    }
+
+    private void releaseInterfaceAddresses(String region, String networkInterfaceId, boolean deleted) {
+        for (Address address : addresses.scan(k -> k.startsWith(region + "::"))) {
+            if (!networkInterfaceId.equals(address.getNetworkInterfaceId())) {
+                continue;
+            }
+            if (deleted) {
+                disassociateAddress(region, address.getAssociationId());
+            } else {
+                address.setInstanceId(null);
+                if (address.getAllocatedPublicIp() != null) {
+                    address.setPublicIp(address.getAllocatedPublicIp());
+                }
+                updateStoredAddressAssociation(address);
+                addresses.put(key(region, address.getAllocationId()), address);
+            }
+        }
     }
 
     public List<Address> describeAddresses(String region, List<String> allocationIds, Map<String, List<String>> filters) {
@@ -10720,6 +10740,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             throw new AwsException("InvalidParameterValue",
                     "Network interface '" + networkInterfaceId + "' is currently in use", 400);
         }
+        releaseInterfaceAddresses(region, networkInterfaceId, true);
         networkInterfaces.delete(key(region, networkInterfaceId));
     }
 
@@ -10872,17 +10893,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private void releaseStandaloneInterfacesOnTermination(String region, Instance inst) {
         for (InstanceNetworkInterface e : List.copyOf(inst.getNetworkInterfaces())) {
             NetworkInterface ni = networkInterfaces.get(key(region, e.getNetworkInterfaceId())).orElse(null);
+            NetworkInterfaceAttachment att = ni != null ? ni.getAttachment() : null;
+            boolean deleted = ni == null || (att != null && att.isDeleteOnTermination());
+            releaseInterfaceAddresses(region, e.getNetworkInterfaceId(), deleted);
+            inst.getNetworkInterfaces().remove(e);
             if (ni == null) {
                 continue;
             }
-            NetworkInterfaceAttachment att = ni.getAttachment();
-            // Either way the instance stops carrying it. A deleted interface obviously cannot stay
-            // on the record, and a released one must not either: once it is attached to something
-            // else, two instance records would claim it and DescribeInstances has no rule that
-            // picks the live one.
-            inst.getNetworkInterfaces().removeIf(
-                    carried -> ni.getNetworkInterfaceId().equals(carried.getNetworkInterfaceId()));
-            if (att != null && att.isDeleteOnTermination()) {
+            if (deleted) {
                 networkInterfaces.delete(key(region, ni.getNetworkInterfaceId()));
                 continue;
             }
