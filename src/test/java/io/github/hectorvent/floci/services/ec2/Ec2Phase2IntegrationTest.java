@@ -85,6 +85,9 @@ class Ec2Phase2IntegrationTest {
     @Order(10)
     void runInstancesWithIamInstanceProfile() {
         String profileArn = "arn:aws:iam::000000000000:instance-profile/my-app-role";
+        given().header("Authorization", AUTH_HEADER.replace("/ec2/", "/iam/"))
+                .formParam("Action", "CreateInstanceProfile").formParam("InstanceProfileName", "my-app-role")
+                .post("/").then().statusCode(200);
 
         instanceWithProfile = given()
             .formParam("Action", "RunInstances")

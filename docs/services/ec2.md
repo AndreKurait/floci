@@ -726,6 +726,18 @@ prefix lists, `EnaSrdSpecification`, `PrimaryIpv6` and `EnaQueueCount` are likew
 | ReplaceIamInstanceProfileAssociation | Swaps the profile behind an existing association id; an unknown id answers `InvalidAssociationID.NotFound`. |
 | DisassociateIamInstanceProfile | Detaches the profile behind an association id. |
 
+Launches and association changes resolve both names and ARNs against IAM in the
+caller's account. Unknown profiles and foreign-account ARNs fail with
+`InvalidParameterValue` before allocation or association changes. Launches and launch
+template creation reject simultaneous name/ARN selectors with
+`InvalidParameterCombination`; association replacement uses the ARN when both are
+provided. Launch templates reject malformed profile ARNs at creation with
+`InvalidIamInstanceProfileArn.Malformed`.
+EC2 stores and returns IAM's profile ID, including for launch-template and Auto Scaling
+instances. Persisted instances from older versions omit the unknown ID until the
+profile is reassociated; looking up the ARN could misidentify a deleted and recreated
+profile. The `client-token` instance filter selects only matching launches.
+
 ### Network Interfaces
 
 | Action | Description |
