@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Instant;
@@ -65,8 +67,58 @@ class CloudWatchQueryGetIntegrationTest {
     @Test
     void cloudWatchValidationStillReturnsQueryErrors() {
         given().header("Authorization", authorization("monitoring"))
-                .queryParam("Action", "PutDashboard")
+                .queryParam("Action", "PutDashboard").queryParam("Version", "2010-08-01")
                 .get("/").then().statusCode(400).body(containsString("ErrorResponse"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false, , ", "false, text/html, ", "false, , AmazonSSM.GetParameter",
+            "true, , ", "true, text/html, NotAService.Operation"})
+    void signingScopeSelectsCloudWatchRegardlessOfBrowserOrTargetHeaders(
+            boolean presigned, String accept, String target) {
+        RequestSpecification request = given().queryParam("Action", "ListMetrics");
+        if (presigned) {
+            request.queryParam("X-Amz-Credential", "test/20261013/us-east-1/monitoring/aws4_request");
+        } else {
+            request.header("Authorization", authorization("monitoring"));
+        }
+        if (accept != null) {
+            request.header("Accept", accept);
+        }
+        if (target != null) {
+            request.header("X-Amz-Target", target);
+        }
+        request.get("/").then().statusCode(200).body(containsString("ListMetricsResponse"));
+    }
+
+    @ParameterizedTest
+    @CsvSource(value = {
+            "ListMetrics, OMITTED, 200", "ListMetrics, 2009-05-15, 200", "ListMetrics, 2010-08-01, 200",
+            "ListMetrics, '', 404", "ListMetrics, 2000-01-01, 404",
+            "ListMetricStreams, OMITTED, 404", "ListMetricStreams, 2009-05-15, 404",
+            "ListMetricStreams, 2010-08-01, 200"
+    }, nullValues = "OMITTED")
+    void versionSelectsTheCurrentOrLegacyOperations(String action, String version, int status) {
+        RequestSpecification request = given().header("Authorization", authorization("monitoring"))
+                .queryParam("Action", action);
+        if (version != null) {
+            request.queryParam("Version", version);
+        }
+        if (status == 200) {
+            request.get("/").then().statusCode(status).body(containsString(action + "Response"));
+        } else {
+            request.get("/").then().statusCode(status)
+                    .body("ErrorResponse.Error.Code", equalTo("InvalidAction"));
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"ListMetrics,UnknownAction,200", "UnknownAction,ListMetrics,404", "ListMetrics,ListMetrics,200"})
+    void theFirstRepeatedActionWins(String first, String second, int status) {
+        given().header("Authorization", authorization("monitoring"))
+                .queryParam("Action", first, second)
+                .get("/").then().statusCode(status)
+                .body(containsString(status == 200 ? "ListMetricsResponse" : "InvalidAction"));
     }
 
     @ParameterizedTest

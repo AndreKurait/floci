@@ -658,16 +658,12 @@ public class AwsQueryController {
     /** Root GET requests that can use the CloudWatch Query handler without claiming S3 traffic. */
     public static boolean isCloudWatchQueryGet(String authorization, String target, String accept,
                                                 MultivaluedMap<String, String> queryParams) {
-        if (target != null || queryParams.containsKey("X-Amz-Credential")
-                || (accept != null && accept.contains(MediaType.TEXT_HTML))) {
-            return false;
-        }
-        String service = SigV4CredentialScope.serviceName(authorization).orElse(null);
-        if (service != null) {
-            return "monitoring".equals(service);
+        String auth = IamEnforcementFilter.requestAuthorization(authorization, queryParams);
+        if (auth != null) {
+            return SigV4CredentialScope.serviceName(auth).filter("monitoring"::equals).isPresent();
         }
         String action = AwsQueryServiceResolver.action(queryParams);
-        return authorization == null && action != null && CLOUDWATCH_ACTIONS.contains(action)
+        return target == null && (accept == null || !accept.contains(MediaType.TEXT_HTML)) && action != null
                 && "monitoring".equals(inferServiceFromAction(action, queryParams.getFirst("Version")));
     }
 
@@ -678,12 +674,18 @@ public class AwsQueryController {
             return Response.status(404).type(MediaType.APPLICATION_XML)
                     .entity("<UnknownOperationException/>").build();
         }
-        if (!CLOUDWATCH_ACTIONS.contains(action)) {
-            String version = queryParams.getFirst("Version");
+        String version = queryParams.getFirst("Version");
+        version = version == null ? "2009-05-15" : version;
+        Set<String> actions = switch (version) {
+            case "2009-05-15" -> Set.of("ListMetrics", "GetMetricStatistics");
+            case CLOUDWATCH_API_VERSION -> CLOUDWATCH_ACTIONS;
+            default -> Set.of();
+        };
+        if (!actions.contains(action)) {
             return xmlErrorResponse("InvalidAction", "Could not find operation " + action + " for version "
-                    + (version != null ? version : CLOUDWATCH_API_VERSION), 404);
+                    + version, 404);
         }
-        return dispatch(authorization, headers, queryParams);
+        return dispatch(IamEnforcementFilter.requestAuthorization(authorization, queryParams), headers, queryParams);
     }
 
     /**

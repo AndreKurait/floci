@@ -186,21 +186,14 @@ class ProtocolClaimerIntegrationTest {
 
     @ParameterizedTest
     @CsvSource({
-            "GET, /, AmazonSSM.DescribeParameters, , false",
-            "GET, /, , text/html, false",
-            "GET, /, , , true",
-            "GET, /bucket, , , false",
-            "POST, /, , , false"
+            "GET, /bucket",
+            "POST, /"
     })
-    void cloudWatchGetExclusionsRemainRest(String method, String path, String target,
-                                          String accept, boolean presigned) {
+    void cloudWatchGetClaimRequiresARootGet(String method, String path) {
         MultivaluedHashMap<String, String> query = new MultivaluedHashMap<>();
         query.putSingle("Action", "GetMetricStatistics");
-        if (presigned) {
-            query.putSingle("X-Amz-Credential", "presigned");
-        }
-        ProtocolClaim claim = claimer.claim(new ClaimSignals(method, path, null, null, target,
-                SQS_AUTH.replace("/sqs/", "/monitoring/"), accept, query)).orElseThrow();
+        ProtocolClaim claim = claimer.claim(new ClaimSignals(method, path, null, null, null,
+                SQS_AUTH.replace("/sqs/", "/monitoring/"), null, query)).orElseThrow();
         assertEquals(WireProtocol.REST, claim.protocol());
     }
 
