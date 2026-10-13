@@ -182,7 +182,7 @@ class AutoScalingReconcilerTest {
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void scaleOutUsesActualGroupNameDespiteConflictingUserTags(boolean propagateSystemTag) {
-        AutoScalingService asgService = mock(AutoScalingService.class);
+        AutoScalingService asgService = scalingService();
         Ec2Service ec2Service = mock(Ec2Service.class);
         AutoScalingReconciler reconciler =
                 new AutoScalingReconciler(asgService, ec2Service, mock(ElbV2Service.class));
