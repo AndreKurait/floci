@@ -23,7 +23,7 @@ Floci is configured exclusively through environment variables. Every option belo
 
 | Variable | Default | Description |
 |---|---|---|
-| `FLOCI_AUTH_VALIDATE_SIGNATURES` | `false` | When `true`, verifies the SigV4 signature of every signed request without evaluating policies: every S3 placement (`Authorization` header, presigned URL and presigned POST), and the `Authorization` header for every other service (see [Signature Validation](multi-account.md#signature-validation)) |
+| `FLOCI_AUTH_VALIDATE_SIGNATURES` | `false` | When `true`, verifies the SigV4 signature of every signed request without evaluating policies: every S3 placement (`Authorization` header, presigned URL and presigned POST), and header or presigned query signatures for every other service (see [Signature Validation](multi-account.md#signature-validation)) |
 | `FLOCI_AUTH_PRESIGN_SECRET` | `local-emulator-secret` | Secret used to sign and verify pre-signed URLs |
 
 ## Network Exposure

@@ -109,7 +109,7 @@ class StsSessionTokenCallerIntegrationTest {
     void blankAuthorizationDoesNotHideTemporaryQueryCredentials(String authorization) throws Exception {
         Credentials user = createUser();
         Credentials issued = credentials(request(user, "sts", "GetSessionToken", Map.of()), "GetSessionToken");
-        Response result = querySessionRequest(authorization, issued).post("/");
+        Response result = querySessionRequest(authorization, issued);
         remember(result, "GetSessionToken");
         result.then().statusCode(403).body("ErrorResponse.Error.Code", equalTo("AccessDenied"));
     }
@@ -120,22 +120,24 @@ class StsSessionTokenCallerIntegrationTest {
         Credentials user = createUser();
         String expected = request(user, "sts", "GetCallerIdentity", Map.of()).then().statusCode(200)
                 .extract().path("GetCallerIdentityResponse.GetCallerIdentityResult.Arn");
-        Credentials issued = credentials(querySessionRequest(authorization, user).post("/"), "GetSessionToken");
+        Credentials issued = credentials(querySessionRequest(authorization, user), "GetSessionToken");
         request(issued, "sts", "GetCallerIdentity", Map.of()).then().statusCode(200)
                 .body("GetCallerIdentityResponse.GetCallerIdentityResult.Arn", equalTo(expected));
     }
 
-    private RequestSpecification querySessionRequest(String authorization, Credentials caller) {
-        RequestSpecification request = given().queryParam("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
-                .queryParam("X-Amz-Credential", caller.key() + "/20261013/us-east-1/sts/aws4_request")
-                .contentType("application/x-www-form-urlencoded").body("Action=GetSessionToken");
-        if (caller.token() != null) {
-            request.queryParam("X-Amz-Security-Token", caller.token());
-        }
+    private Response querySessionRequest(String authorization, Credentials caller) throws Exception {
+        String body = "Action=GetSessionToken";
+        URI endpoint = URI.create("http://localhost:" + RestAssured.port + "/");
+        Map<String, String> query = caller.token() == null ? Map.of()
+                : Map.of("X-Amz-Security-Token", caller.token());
+        URI signed = AwsRequestSigner.signedAs(caller.key(), caller.secret(), "sts")
+                .presignedUri("POST", endpoint, query, body.getBytes(StandardCharsets.UTF_8));
+        RequestSpecification request = given().urlEncodingEnabled(false)
+                .contentType("application/x-www-form-urlencoded").body(body);
         if (!"absent".equals(authorization)) {
             request.header("Authorization", authorization);
         }
-        return request;
+        return request.post(signed);
     }
 
     private Credentials createUser() throws Exception {

@@ -464,17 +464,33 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if (callerArns.isPresent()) {
             caller = caller.withPrincipalArn(callerArns.get().callerArn());
             conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
-            conditionContext.put("aws:PrincipalArn", List.of(callerArns.get().principalArn()));
+            putPrincipalKeys(conditionContext, callerArns.get());
         }
         List<Map<String, List<String>>> targetContexts = new ArrayList<>();
         targetContexts.add(conditionContext);
         for (Map<String, List<String>> target : remainingTargets) {
             Map<String, List<String>> targetContext = new HashMap<>(target);
-            callerArns.ifPresent(arns -> targetContext.put("aws:PrincipalArn", List.of(arns.principalArn())));
+            callerArns.ifPresent(arns -> putPrincipalKeys(targetContext, arns));
             targetContexts.add(targetContext);
         }
 
         RequestPrincipal principal = RequestPrincipal.caller(callerArns.orElse(null));
+        List<IamConditionContextResolver.DynamoDbTransactionItem> transactionItems =
+                "dynamodb".equals(credentialScope)
+                        ? conditionContextResolver.dynamoDbTransactionItems(action, ctx, region, accountId)
+                        : List.of();
+        if (!transactionItems.isEmpty()) {
+            for (IamConditionContextResolver.DynamoDbTransactionItem item : transactionItems) {
+                Map<String, List<String>> itemContext = new HashMap<>(item.context());
+                callerArns.ifPresent(arns -> putPrincipalKeys(itemContext, arns));
+                if (abortIfDenied(ctx, caller, principal, item.action(), credentialScope,
+                        resolveResourceArns(credentialScope, List.of(item.resource())), List.of(itemContext),
+                        region, accountId, akid)) {
+                    return;
+                }
+            }
+            return;
+        }
         if (abortIfDenied(ctx, caller, principal, action, credentialScope, resources, targetContexts,
                 region, accountId, akid)) {
             return;
@@ -651,6 +667,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     }
 
     private record ResolvedAuthorization(String credentialScope, String action) {
+    }
+
+    private static void putPrincipalKeys(Map<String, List<String>> context, CallerArns arns) {
+        context.put("aws:PrincipalArn", List.of(arns.principalArn()));
     }
 
     /** Floci's account-root principal, which is both the caller and the request's aws:PrincipalArn. */
@@ -918,7 +938,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             if (callerArns.isPresent()) {
                 caller = caller.withPrincipalArn(callerArns.get().callerArn());
                 conditionContext = new HashMap<>();
-                conditionContext.put("aws:PrincipalArn", List.of(callerArns.get().principalArn()));
+                putPrincipalKeys(conditionContext, callerArns.get());
             }
 
             ResourcePolicyDecision effectiveDecision = resourcePolicyDecision;

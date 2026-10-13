@@ -142,6 +142,24 @@ public final class AwsRequestSigner implements Filter {
         return result;
     }
 
+    /** Presigns a body-bearing request with caller-supplied query fields, including a session token. */
+    public URI presignedUri(String method, URI uri, Map<String, String> extraQuery, byte[] body) throws Exception {
+        String date = AMZ_DATE.format(signedAt != null ? signedAt : Instant.now());
+        String scope = date.substring(0, 8) + "/us-east-1/" + service + "/aws4_request";
+        TreeMap<String, String> query = new TreeMap<>(extraQuery);
+        query.putAll(Map.of("X-Amz-Algorithm", ALGORITHM, "X-Amz-Credential", accessKeyId + "/" + scope,
+                "X-Amz-Date", date, "X-Amz-Expires", "60", "X-Amz-SignedHeaders", "host"));
+        String encoded = query.entrySet().stream()
+                .map(e -> S3RequestSigner.uriEncode(e.getKey()) + "=" + S3RequestSigner.uriEncode(e.getValue()))
+                .collect(Collectors.joining("&"));
+        String canonical = method + "\n" + doubleEncodedPath(uri.getRawPath()) + "\n" + encoded
+                + "\nhost:" + uri.getAuthority() + "\n\nhost\n" + Digests.sha256Hex(body);
+        String toSign = ALGORITHM + "\n" + date + "\n" + scope + "\n" + Digests.sha256Hex(canonical);
+        String signature = SigV4RequestValidator.hexEncode(SigV4RequestValidator.hmacSha256(
+                SigV4RequestValidator.deriveSigningKey(secretKey, date.substring(0, 8), "us-east-1", service), toSign));
+        return URI.create(uri + "?" + encoded + "&X-Amz-Signature=" + signature);
+    }
+
     private static String doubleEncodedPath(String rawPath) {
         String path = rawPath == null || rawPath.isEmpty() ? "/" : rawPath;
         String[] segments = path.split("/", -1);
