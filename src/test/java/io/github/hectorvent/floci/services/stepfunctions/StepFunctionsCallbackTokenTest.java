@@ -6,6 +6,8 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -33,9 +35,9 @@ class StepFunctionsCallbackTokenTest {
         CompletableFuture<JsonNode> future = service.registerPendingToken("owned", OWNER);
         long heartbeat = service.lastTaskHeartbeatNanos("owned");
         when(resolver.getAccountId()).thenReturn("222222222222");
-        refuses("InvalidToken", () -> service.sendTaskSuccess("owned", "{}"));
-        refuses("InvalidToken", () -> service.sendTaskFailure("owned", "cause", "error"));
-        refuses("InvalidToken", () -> service.sendTaskHeartbeat("owned"));
+        refuses("AccessDeniedException", () -> service.sendTaskSuccess("owned", "{}"));
+        refuses("AccessDeniedException", () -> service.sendTaskFailure("owned", "cause", "error"));
+        refuses("AccessDeniedException", () -> service.sendTaskHeartbeat("owned"));
         assertFalse(future.isDone());
         assertEquals(heartbeat, service.lastTaskHeartbeatNanos("owned"));
         when(resolver.getAccountId()).thenReturn(OWNER);
@@ -47,7 +49,7 @@ class StepFunctionsCallbackTokenTest {
         refuses("TaskTimedOut", () -> service.sendTaskFailure("owned", "cause", "error"));
         refuses("TaskTimedOut", () -> service.sendTaskHeartbeat("owned"));
         when(resolver.getAccountId()).thenReturn("222222222222");
-        refuses("InvalidToken", () -> service.sendTaskHeartbeat("owned"));
+        refuses("AccessDeniedException", () -> service.sendTaskHeartbeat("owned"));
     }
 
     @Test
@@ -101,6 +103,19 @@ class StepFunctionsCallbackTokenTest {
         assertEquals(1, refused.get());
         assertEquals(1, completions.get());
         assertTrue(future.get().path("once").asBoolean());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{invalid", "", "[1,"})
+    void rejectedOutputDoesNotConsumeTheToken(String output) throws Exception {
+        when(resolver.getAccountId()).thenReturn(OWNER);
+        CompletableFuture<JsonNode> future = service.registerPendingToken("output", OWNER);
+        refuses("InvalidOutput", () -> service.sendTaskSuccess("output", output));
+        assertFalse(future.isDone());
+        service.sendTaskHeartbeat("output");
+        service.sendTaskSuccess("output", "{\"accepted\":true}");
+        assertTrue(future.get(1, TimeUnit.SECONDS).path("accepted").asBoolean());
+        refuses("InvalidToken", () -> service.sendTaskSuccess("unknown", output));
     }
 
     @Test

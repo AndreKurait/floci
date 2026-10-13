@@ -538,6 +538,12 @@ the wire and the task fails with `Sfn.StateMachineDoesNotExistException`.
 | `arn:aws:states:::aws-sdk:scheduler:deleteSchedule` | `{}` | `Scheduler.ResourceNotFoundException` |
 | `arn:aws:states:::aws-sdk:sns:publish` | `{MessageId}` | `Sns.NotFoundException` when the topic does not exist |
 
+Callback tokens are owned by the execution account. Foreign callbacks return
+`AccessDeniedException`; unknown tokens return `InvalidToken`. Recently closed tokens return
+`TaskTimedOut`. Closed-token classification retains at most 1,024 tokens for five minutes; older
+or evicted tokens return `InvalidToken`. Invalid JSON output leaves a pending token available
+for a corrected callback. Token state remains in memory.
+
 Redshift Data API execution returns a statement `Id` before SQL completes. Follow the
 `executeStatement` task with `describeStatement`, a Choice on `Status`, and a Wait state
 before polling again. Read results only after `FINISHED`; route `FAILED` and `ABORTED`
@@ -810,3 +816,8 @@ aws stepfunctions get-execution-history \
   --execution-arn $EXEC_ARN \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+A missing or mismatched task role fails with `States.TaskFailed`. A target account
+that does not match the selected task account fails with
+`StepFunctions.AWSStepFunctionsException` for optimized integrations or
+`Sfn.SfnException` for SDK integrations, matching the live AWS probes.

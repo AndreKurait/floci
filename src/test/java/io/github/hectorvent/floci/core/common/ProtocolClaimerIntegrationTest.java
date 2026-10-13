@@ -129,8 +129,8 @@ class ProtocolClaimerIntegrationTest {
 
         assertTrue(claim("POST", "/", "text/plain", null, target, null).isEmpty());
         assertTrue(claim("POST", "/", "application/json", "rpc-v2-json", target, null).isEmpty());
-        assertTrue(claim("POST", "/", "application/json", null,
-                "SimpleWorkflowService.RegisterActivityType", null).isEmpty());
+        assertEquals("swf", claim("POST", "/", "application/json", null,
+                "SimpleWorkflowService.RegisterActivityType", null).orElseThrow().service().externalKey());
         assertTrue(claim("POST", "/", "application/json", null,
                 "com.amazonaws.swf.service.model.SimpleWorkflowServiceOther.RegisterActivityType", null).isEmpty());
         assertTrue(claim("POST", "/", "application/json", null,

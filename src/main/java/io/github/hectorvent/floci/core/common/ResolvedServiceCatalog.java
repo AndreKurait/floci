@@ -293,7 +293,7 @@ public class ResolvedServiceCatalog {
                 descriptor("swf", "swf", config.services().swf().enabled(), true,
                         "swf", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
-                        Set.of("SimpleWorkflowService.", SwfConstants.LEGACY_TARGET_PREFIX),
+                        Set.of(SwfConstants.TARGET_PREFIX, SwfConstants.LEGACY_TARGET_PREFIX),
                         Set.of("swf"), Set.of(), Set.of()),
                 descriptor("cloudformation", "cloudformation", config.services().cloudformation().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.QUERY,

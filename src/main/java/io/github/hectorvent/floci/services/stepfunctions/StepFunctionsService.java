@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -62,7 +63,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     private final Map<String, BlockingQueue<ActivityTask>> activityQueues = new ConcurrentHashMap<>();
     private final Map<String, PendingTask> pendingTaskTokens = new ConcurrentHashMap<>();
     // Only recent closures are classified as TaskTimedOut: five minutes, at most 1,024 tokens.
-    // Evicted/older and foreign tokens remain InvalidToken. No task payloads are retained.
+    // Evicted/older tokens remain InvalidToken. No task payloads are retained.
     private final Map<String, ClosedTask> closedTaskTokens = new LinkedHashMap<>();
     private static final long CLOSED_TOKEN_RETENTION_NANOS = TimeUnit.MINUTES.toNanos(5);
     private static final int MAX_CLOSED_TOKENS = 1024;
@@ -1211,7 +1212,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     private PendingTask requirePendingTask(String token) {
         String accountId = regionResolver.getAccountId();
         PendingTask pending = token == null ? null : pendingTaskTokens.get(token);
-        if (pending != null && pending.accountId().equals(accountId)) {
+        if (pending != null) {
+            requireTokenOwner(pending.accountId(), accountId);
             return pending;
         }
         ClosedTask closed = token == null ? null : closedTaskTokens.get(token);
@@ -1219,10 +1221,17 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             closedTaskTokens.remove(token);
             closed = null;
         }
-        if (closed != null && closed.accountId().equals(accountId)) {
+        if (closed != null) {
+            requireTokenOwner(closed.accountId(), accountId);
             throw new AwsException("TaskTimedOut", "The associated task has already been closed.", 400);
         }
         throw new AwsException("InvalidToken", "Invalid Token: 'Invalid token'", 400);
+    }
+
+    private void requireTokenOwner(String owner, String caller) {
+        if (!owner.equals(caller)) {
+            throw new AwsException("AccessDeniedException", "Not authorized to access this resource.", 400);
+        }
     }
 
     private synchronized CompletableFuture<JsonNode> claimPendingTask(String token) {
@@ -1235,12 +1244,21 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
 
     /** Claims an owned callback exactly once; completion runs outside the token lock. */
     public boolean sendTaskSuccess(String taskToken, String output) {
-        CompletableFuture<JsonNode> future = claimPendingTask(taskToken);
-        try {
-            future.complete(objectMapper.readTree(output));
-        } catch (Exception e) {
-            future.completeExceptionally(new RuntimeException("Invalid JSON output: " + e.getMessage()));
+        JsonNode result;
+        CompletableFuture<JsonNode> future;
+        synchronized (this) {
+            requirePendingTask(taskToken);
+            try {
+                result = objectMapper.readTree(output);
+            } catch (JsonProcessingException | IllegalArgumentException e) {
+                throw new AwsException("InvalidOutput", "Output is not valid JSON.", 400);
+            }
+            if (result == null || result.isMissingNode()) {
+                throw new AwsException("InvalidOutput", "Output is not valid JSON.", 400);
+            }
+            future = claimPendingTask(taskToken);
         }
+        future.complete(result);
         return true;
     }
 

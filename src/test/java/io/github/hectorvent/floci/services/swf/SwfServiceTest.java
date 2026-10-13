@@ -24,6 +24,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Mockito;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -478,8 +479,8 @@ class SwfServiceTest {
     @SuppressWarnings("unchecked")
     private RequestContext accountScopedService() {
         RequestContext context = new RequestContext();
-        Instance<RequestContext> request = org.mockito.Mockito.mock(Instance.class);
-        org.mockito.Mockito.when(request.get()).thenReturn(context);
+        Instance<RequestContext> request = Mockito.mock(Instance.class);
+        Mockito.when(request.get()).thenReturn(context);
         StorageFactory factory = new StorageFactory(null, null) {
             @Override
             public synchronized <V> AccountAwareStorageBackend<V> create(String serviceName,

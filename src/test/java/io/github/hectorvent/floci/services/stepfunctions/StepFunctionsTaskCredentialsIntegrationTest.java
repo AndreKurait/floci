@@ -88,14 +88,17 @@ class StepFunctionsTaskCredentialsIntegrationTest {
         assertEquals("SUCCEEDED", done.jsonPath().getString("status"), done.asString());
     }
 
-    @Test
-    void foreignArnAloneDoesNotGrantAccountAccess() throws Exception {
-        String child = machine(TARGET, PASS, "STANDARD");
-        ObjectNode definition = definition(child, "states:startExecution.sync:2", role());
+    @ParameterizedTest
+    @ValueSource(strings = {"states:startExecution", "states:startExecution.sync", "states:startExecution.sync:2",
+            "aws-sdk:sfn:startExecution", "aws-sdk:sfn:startSyncExecution"})
+    void foreignArnAloneDoesNotGrantAccountAccess(String resource) throws Exception {
+        String child = machine(TARGET, PASS, resource.endsWith("startSyncExecution") ? "EXPRESS" : "STANDARD");
+        ObjectNode definition = definition(child, resource, role());
         ((ObjectNode) definition.path("States").path("Child")).remove("Credentials");
         Response done = terminal(SOURCE, start(machine(SOURCE, definition.toString(), "STANDARD"), "{}"));
         assertEquals("FAILED", done.jsonPath().getString("status"), done.asString());
-        assertEquals("StepFunctions.StateMachineDoesNotExistException", done.jsonPath().getString("error"));
+        assertEquals(resource.startsWith("aws-sdk:") ? "Sfn.SfnException" : "StepFunctions.AWSStepFunctionsException",
+                done.jsonPath().getString("error"));
     }
 
     @ParameterizedTest
@@ -112,6 +115,9 @@ class StepFunctionsTaskCredentialsIntegrationTest {
         ObjectNode definition = definition(child, "states:startExecution.sync:2", value);
         Response done = terminal(SOURCE, start(machine(SOURCE, definition.toString(), "STANDARD"), "{}"));
         assertEquals("FAILED", done.jsonPath().getString("status"), done.asString());
+        if ("missing".equals(invalid) || "wrong-path".equals(invalid)) {
+            assertEquals("States.TaskFailed", done.jsonPath().getString("error"));
+        }
         request(TARGET, "ListExecutions", Map.of("stateMachineArn", child)).then()
                 .statusCode(200).body("executions.size()", org.hamcrest.Matchers.equalTo(0));
     }

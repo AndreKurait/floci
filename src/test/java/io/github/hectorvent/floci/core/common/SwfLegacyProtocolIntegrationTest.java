@@ -73,6 +73,8 @@ class SwfLegacyProtocolIntegrationTest {
     void longTargetAlsoResolvesOnModernJsonProtocol() {
         call(MODERN_JSON, LEGACY_PREFIX, "ListDomains", "{\"registrationStatus\":\"REGISTERED\"}")
                 .then().statusCode(200);
+        call(LEGACY_JSON, MODERN_PREFIX, "ListDomains", "{\"registrationStatus\":\"REGISTERED\"}")
+                .then().statusCode(200);
     }
 
     @ParameterizedTest
@@ -90,7 +92,6 @@ class SwfLegacyProtocolIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(strings = {
-            "SimpleWorkflowService.ListDomains",
             "com.amazonaws.swf.service.model.SimpleWorkflowServiceOther.ListDomains",
             "AmazonSSM.DescribeParameters"
     })

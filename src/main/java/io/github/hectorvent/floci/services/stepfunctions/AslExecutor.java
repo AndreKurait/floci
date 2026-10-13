@@ -888,6 +888,9 @@ public class AslExecutor {
                             : resolveParameters(stateDef.get("Credentials"), credentialInput, context);
                     taskAccount = nestedTaskCredentials.account(credentials, resource, sm);
                 }
+                if (mockedInvocation == null) {
+                    NestedTaskCredentials.validateTargetAccount(resource, effectiveInput, sm, taskAccount);
+                }
                 JsonNode resourceInput = effectiveInput;
                 String resourceToken = taskToken;
                 taskResult = mockedInvocation != null

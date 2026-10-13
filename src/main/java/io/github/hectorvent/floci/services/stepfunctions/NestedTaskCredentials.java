@@ -23,12 +23,7 @@ public class NestedTaskCredentials {
 
     String account(JsonNode credentials, String resource, StateMachine machine) {
         StatesIntegration integration = StatesIntegration.parse(resource).orElse(null);
-        boolean nested = integration != null
-                && ((integration.isAnySuffix("states", "startExecution")
-                    && Set.of("", ".sync", ".sync:2").contains(integration.suffix()))
-                    || integration.isSdk("sfn", "startExecution")
-                    || integration.isSdk("sfn", "startSyncExecution"));
-        if (!nested || config.services().iam().enforcementEnabled()) {
+        if (!isNested(integration) || config.services().iam().enforcementEnabled()) {
             throw new AslExecutor.FailStateException("States.Runtime",
                     "Task Credentials are supported only for nested executions with IAM enforcement disabled");
         }
@@ -52,8 +47,31 @@ public class NestedTaskCredentials {
         }
         String name = role.resource().substring(role.resource().lastIndexOf('/') + 1);
         if (iam.findRole(role.accountId(), name).filter(found -> IamService.roleArnMatches(roleArn, found)).isEmpty()) {
-            throw new AslExecutor.FailStateException("States.Permissions", "Task Credentials role does not exist");
+            throw new AslExecutor.FailStateException("States.TaskFailed",
+                    "The execution role is not authorized to assume the task state's role, " + roleArn);
         }
         return role.accountId();
+    }
+
+    static void validateTargetAccount(String resource, JsonNode input, StateMachine machine, String taskAccount) {
+        StatesIntegration integration = StatesIntegration.parse(resource).orElse(null);
+        String target = input.path("StateMachineArn").asText(null);
+        if (!isNested(integration) || !AwsArnUtils.isArn(target)) {
+            return;
+        }
+        String account = taskAccount != null ? taskAccount : AwsArnUtils.parse(machine.getStateMachineArn()).accountId();
+        if (!account.equals(AwsArnUtils.parse(target).accountId())) {
+            String error = integration.isAnySuffix("states", "startExecution")
+                    ? "StepFunctions.AWSStepFunctionsException" : "Sfn.SfnException";
+            throw new AslExecutor.FailStateException(error, "Not authorized to access this resource: " + target);
+        }
+    }
+
+    private static boolean isNested(StatesIntegration integration) {
+        return integration != null
+                && ((integration.isAnySuffix("states", "startExecution")
+                    && Set.of("", ".sync", ".sync:2").contains(integration.suffix()))
+                    || integration.isSdk("sfn", "startExecution")
+                    || integration.isSdk("sfn", "startSyncExecution"));
     }
 }

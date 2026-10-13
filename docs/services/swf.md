@@ -6,7 +6,7 @@
 The legacy SWF JSON format is also accepted: `Content-Type: application/json; charset=UTF-8`
 with `X-Amz-Target: com.amazonaws.swf.service.model.SimpleWorkflowService.<Action>`.
 It uses the same service state, validation and namespaced faults as JSON 1.0. This
-plain-JSON compatibility path is restricted to that exact SWF target prefix; it does
+plain-JSON compatibility path accepts both that prefix and `SimpleWorkflowService.`; it does
 not enable plain-JSON target dispatch for other services. Request headers are preserved.
 The contract is documented in
 [AWS Making HTTP Requests](https://docs.aws.amazon.com/amazonswf/latest/developerguide/UsingJSON-swf.html)
