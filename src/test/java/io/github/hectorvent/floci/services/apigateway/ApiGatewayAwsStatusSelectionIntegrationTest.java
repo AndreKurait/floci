@@ -28,6 +28,7 @@ class ApiGatewayAwsStatusSelectionIntegrationTest {
 
     private static final String ACCOUNT_ID = "000000000000";
     private static final String LAMBDA_FUNCTION = "aws-status-selection";
+    private static final String LAMBDA_ARN = "arn:aws:lambda:us-east-1:" + ACCOUNT_ID + ":function:" + LAMBDA_FUNCTION;
     private static final String MESSAGE = "{\"hello\":\"status-selection\"}";
 
     @InjectMock
@@ -111,7 +112,7 @@ class ApiGatewayAwsStatusSelectionIntegrationTest {
 
     @Test
     void lambdaSuccessDoesNotMatchHttpStatusPattern() {
-        when(lambdaService.invoke(eq("us-east-1"), eq(LAMBDA_FUNCTION), any(byte[].class),
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq(LAMBDA_ARN), any(byte[].class),
                 eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, null, "{}".getBytes(StandardCharsets.UTF_8), null, "success"));
         String apiId = lambdaApi(201, "2\\d{2}");
@@ -119,14 +120,14 @@ class ApiGatewayAwsStatusSelectionIntegrationTest {
         given().contentType(ContentType.JSON).body(MESSAGE)
                 .post("/execute-api/" + apiId + "/test/send")
                 .then().statusCode(200).body("result", equalTo("default"));
-        verify(lambdaService).invoke(eq("us-east-1"), eq(LAMBDA_FUNCTION),
+        verify(lambdaService).invokeTarget(eq("us-east-1"), eq(LAMBDA_ARN),
                 eq(MESSAGE.getBytes(StandardCharsets.UTF_8)), eq(InvocationType.RequestResponse));
     }
 
     @Test
     void lambdaFunctionErrorStillMatchesErrorTextPattern() {
         byte[] errorPayload = "{\"errorMessage\":\"boom\"}".getBytes(StandardCharsets.UTF_8);
-        when(lambdaService.invoke(eq("us-east-1"), eq(LAMBDA_FUNCTION), any(byte[].class),
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq(LAMBDA_ARN), any(byte[].class),
                 eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, "Unhandled", errorPayload, null, "function-error"));
         String apiId = lambdaApi(502, ".*boom.*");
@@ -134,7 +135,7 @@ class ApiGatewayAwsStatusSelectionIntegrationTest {
         given().contentType(ContentType.JSON).body(MESSAGE)
                 .post("/execute-api/" + apiId + "/test/send")
                 .then().statusCode(502).body("result", equalTo("matched"));
-        verify(lambdaService).invoke(eq("us-east-1"), eq(LAMBDA_FUNCTION),
+        verify(lambdaService).invokeTarget(eq("us-east-1"), eq(LAMBDA_ARN),
                 eq(MESSAGE.getBytes(StandardCharsets.UTF_8)), eq(InvocationType.RequestResponse));
     }
 
