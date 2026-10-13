@@ -4288,6 +4288,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     && "terminated".equals(inst.getState().getName())
                     && inst.getTerminatedAt() > 0
                     && inst.getTerminatedAt() < cutoff) {
+                tags.delete(inst.getInstanceId());
                 instances.delete(storeKey);
             }
         }
@@ -8451,8 +8452,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     /** Service-owned tag cleanup, separate from the public EC2 DeleteTags operation. */
-    public void deleteSystemTag(String region, List<String> resourceIds, String tagKey) {
-        deleteResourceTags(region, resourceIds, List.of(new Tag(tagKey, null)));
+    public void deleteSystemTag(String region, List<String> resourceIds, String tagKey, String tagValue) {
+        deleteResourceTags(region, resourceIds, List.of(new Tag(tagKey, tagValue)));
     }
 
     private void deleteResourceTags(String region, List<String> resourceIds, List<Tag> tagList) {
@@ -8491,7 +8492,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
-    private static boolean isAwsTagKey(String key) {
+    static boolean isAwsTagKey(String key) {
         return key != null && key.toLowerCase(Locale.ROOT).startsWith("aws:");
     }
 
