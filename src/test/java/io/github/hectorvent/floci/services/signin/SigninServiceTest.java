@@ -9,6 +9,8 @@ import io.github.hectorvent.floci.services.signin.model.TokenResult;
 import io.github.hectorvent.floci.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.net.URI;
 import java.net.URLDecoder;
@@ -51,6 +53,7 @@ class SigninServiceTest {
 
     private IamService iam;
     private AtomicReference<String> accountId;
+    private AtomicReference<String> partition;
     private MutableClock clock;
     private SigninService service;
 
@@ -60,6 +63,8 @@ class SigninServiceTest {
         RegionResolver region = mock(RegionResolver.class);
         accountId = new AtomicReference<>(ACCOUNT_A);
         when(region.getAccountId()).thenAnswer(ignored -> accountId.get());
+        partition = new AtomicReference<>("aws");
+        when(region.getPartition()).thenAnswer(ignored -> partition.get());
         when(region.buildGlobalArn(anyString(), anyString(), anyString())).thenAnswer(invocation ->
                 "arn:aws:" + invocation.getArgument(0) + "::" + invocation.getArgument(1) + ":" + invocation.getArgument(2));
         clock = new MutableClock();
@@ -134,6 +139,34 @@ class SigninServiceTest {
         assertInvalidRequest(() -> crossDeviceAuthorize("http://localhost:4566/v1/sessions/confirmation", null));
         assertInvalidRequest(() -> service.beginAuthorization(CLIENT_ID, challengeUnchecked(VERIFIER), "SHA-256",
                 "http://localhost:4566/v1/sessions/confirmation", "code", "openid", "state", null, origin));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "aws,        us-east-1.signin.aws.amazon.com",
+            "aws-cn,     cn-north-1.signin.amazonaws.cn",
+            "aws-us-gov, us-gov-west-1.signin.amazonaws-us-gov.com",
+            "aws-iso,    us-iso-east-1.signin.c2shome.ic.gov",
+            "aws-iso-b,  us-isob-east-1.signin.sc2shome.sgov.gov",
+            "aws-iso-e,  eu-isoe-west-1.signin.csphome.adc-e.uk",
+            "aws-iso-f,  us-isof-south-1.signin.csphome.hci.ic.gov",
+            "aws-eusc,   eusc-de-east-1.signin.amazonaws-eusc.eu"
+    })
+    void crossDeviceRedirectIsAcceptedOnTheDeploymentPartitionsSigninHostOnly(String deployment, String host) {
+        partition.set(deployment);
+
+        crossDeviceAuthorize("https://" + host + "/v1/sessions/confirmation", null);
+
+        String foreign = "aws".equals(deployment)
+                ? "cn-north-1.signin.amazonaws.cn" : "us-east-1.signin.aws.amazon.com";
+        assertInvalidRequest(() -> crossDeviceAuthorize("https://" + foreign + "/v1/sessions/confirmation", null));
+        // A region of another partition on this partition's domain is not a host AWS serves.
+        String domain = host.substring(host.indexOf('.'));
+        String strayRegion = "aws".equals(deployment) ? "cn-north-1" : "us-east-1";
+        assertInvalidRequest(() -> crossDeviceAuthorize(
+                "https://" + strayRegion + domain + "/v1/sessions/confirmation", null));
+        assertInvalidRequest(() -> crossDeviceAuthorize("http://" + host + "/v1/sessions/confirmation", null));
+        assertInvalidRequest(() -> crossDeviceAuthorize("https://" + host + ":8443/v1/sessions/confirmation", null));
     }
 
     @Test

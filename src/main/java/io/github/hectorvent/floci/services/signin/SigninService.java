@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.signin;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsPartition;
+import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -37,10 +39,10 @@ import java.util.regex.Pattern;
 @ApplicationScoped
 public class SigninService {
 
-    // The console device-auth client ids as the commercial console spells them; no source says
-    // how the China or GovCloud consoles spell theirs, so they stay literal (see docs/configuration/partitions.md).
-    static final String SAME_DEVICE_CLIENT = "arn:aws:signin:::devtools/same-device"; // partition-literal: console client id, non-commercial spelling unknown
-    static final String CROSS_DEVICE_CLIENT = "arn:aws:signin:::devtools/cross-device"; // partition-literal: console client id, non-commercial spelling unknown
+    // The device-auth client ids are these literals in every partition: the Sign-In model's ClientId
+    // pattern is arn:aws:signin:::devtools/(cross-device|same-device), and the AWS CLI sends them as is.
+    static final String SAME_DEVICE_CLIENT = "arn:aws:signin:::devtools/same-device"; // partition-literal: the model's ClientId pattern, one spelling for every partition
+    static final String CROSS_DEVICE_CLIENT = "arn:aws:signin:::devtools/cross-device"; // partition-literal: the model's ClientId pattern, one spelling for every partition
     static final String CONFIRMATION_PATH = "/v1/sessions/confirmation";
     static final int ACCESS_TOKEN_TTL_SECONDS = 900;
     private static final long AUTHORIZATION_CODE_TTL_SECONDS = 300;
@@ -52,8 +54,6 @@ public class SigninService {
     private static final int MAX_REFRESH_TOKEN_LENGTH = 2048;
     private static final int MAX_STATE_LENGTH = 128;
     private static final Pattern PKCE_VALUE_PATTERN = Pattern.compile("[A-Za-z0-9._~-]{43,128}");
-    private static final Pattern AWS_SIGNIN_HOST_PATTERN =
-            Pattern.compile("[a-z]{2}-[a-z-]+-\\d+\\.signin\\.aws\\.amazon\\.com"); // partition-literal: console sign-in host, non-commercial host has no published source
 
     private final IamService iamService;
     private final RegionResolver regionResolver;
@@ -100,7 +100,7 @@ public class SigninService {
         if (!"code".equals(responseType) || !"openid".equals(scope)) {
             throw new SigninException("invalid_request", "response_type=code and scope=openid are required");
         }
-        validateRedirectUri(clientId, redirectUri, requestOrigin);
+        validateRedirectUri(clientId, redirectUri, requestOrigin, AwsPartitions.byId(regionResolver.getPartition()));
         if (state == null || state.isEmpty() || state.length() > MAX_STATE_LENGTH) {
             throw new SigninException("invalid_request", "state must be 1-128 characters");
         }
@@ -325,7 +325,8 @@ public class SigninService {
         return value != null && PKCE_VALUE_PATTERN.matcher(value).matches();
     }
 
-    private static void validateRedirectUri(String clientId, String redirectUri, URI requestOrigin) {
+    private static void validateRedirectUri(String clientId, String redirectUri, URI requestOrigin,
+                                            AwsPartition partition) {
         if (redirectUri == null || redirectUri.isEmpty() || redirectUri.length() > MAX_REDIRECT_URI_LENGTH) {
             throw new SigninException("invalid_request", "redirect_uri must be 1-2048 characters");
         }
@@ -339,7 +340,7 @@ public class SigninService {
 
         boolean valid = SAME_DEVICE_CLIENT.equals(clientId)
                 ? isSameDeviceRedirect(uri)
-                : isCrossDeviceRedirect(uri) || isOwnConfirmationRedirect(uri, requestOrigin);
+                : isCrossDeviceRedirect(uri, partition) || isOwnConfirmationRedirect(uri, requestOrigin);
         if (!valid) {
             throw new SigninException("invalid_request", "redirect_uri is invalid for the AWS Sign-In client");
         }
@@ -455,15 +456,31 @@ public class SigninService {
                 && uri.getUserInfo() == null;
     }
 
-    private static boolean isCrossDeviceRedirect(URI uri) {
+    private static boolean isCrossDeviceRedirect(URI uri, AwsPartition partition) {
         return "https".equalsIgnoreCase(uri.getScheme())
-                && uri.getHost() != null
-                && AWS_SIGNIN_HOST_PATTERN.matcher(uri.getHost()).matches()
+                && isSigninHost(uri.getHost(), partition)
                 && uri.getPort() == -1
                 && CONFIRMATION_PATH.equals(uri.getRawPath())
                 && uri.getRawQuery() == null
                 && uri.getRawFragment() == null
                 && uri.getUserInfo() == null;
+    }
+
+    /**
+     * True when {@code host} is the AWS Sign-In host of one of {@code partition}'s regions. The
+     * authorize request is an unsigned browser navigation, so the partition is the deployment's.
+     */
+    private static boolean isSigninHost(String host, AwsPartition partition) {
+        if (host == null) {
+            return false;
+        }
+        int dot = host.indexOf('.');
+        if (dot <= 0) {
+            return false;
+        }
+        String region = host.substring(0, dot);
+        return (partition.isPublishedRegion(region) || partition.matchesRegionRegex(region))
+                && partition.signinHostname(region).filter(host::equals).isPresent();
     }
 
     private static boolean isOwnConfirmationRedirect(URI uri, URI requestOrigin) {

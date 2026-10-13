@@ -18,6 +18,7 @@ import java.util.UUID;
 import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 
 @QuarkusTest
@@ -88,6 +89,40 @@ class IamServingServiceEnforcementIntegrationTest {
         .then()
                 .statusCode(403)
                 .body(containsString("iam:CreateUser"));
+
+        adminIam("GetUser", Map.of("UserName", attempted)).statusCode(404);
+    }
+
+    @Test
+    void queryVersionMovesAuthorizationWithTheServiceItSelects() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String attempted = "version-denied-" + suffix;
+        String accessKeyId = createUserWithPolicy("version-iam-only-" + suffix, "IamCreateUserOnly", """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"iam:CreateUser","Resource":"*"}
+                ]}""");
+
+        elastiCacheCreateUser(accessKeyId, attempted)
+                .statusCode(403)
+                .body(containsString("elasticache:CreateUser"));
+
+        adminIam("GetUser", Map.of("UserName", attempted)).statusCode(404);
+        adminElastiCache("DescribeUsers", Map.of("UserId", attempted)).statusCode(404);
+    }
+
+    @Test
+    void queryVersionReachesTheServiceItsPolicyAllows() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String attempted = "version-allowed-" + suffix;
+        String accessKeyId = createUserWithPolicy("version-cache-only-" + suffix, "CacheCreateUserOnly", """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"elasticache:CreateUser","Resource":"*"}
+                ]}""");
+
+        cleanup.register(() -> adminElastiCache("DeleteUser", Map.of("UserId", attempted)).statusCode(200));
+        elastiCacheCreateUser(accessKeyId, attempted)
+                .statusCode(200)
+                .body("CreateUserResponse.CreateUserResult.UserId", equalTo(attempted));
 
         adminIam("GetUser", Map.of("UserName", attempted)).statusCode(404);
     }
@@ -173,6 +208,34 @@ class IamServingServiceEnforcementIntegrationTest {
     private static ValidatableResponse iamCall(String accessKeyId, String scope, String action,
                                                Map<String, String> params) {
         return iamCall(accessKeyId, scope, "Action", action, params);
+    }
+
+    /**
+     * An ElastiCache {@code CreateUser}, a name IAM also defines and takes by name. Signed under a
+     * scope that is not a Query service, so the scope cannot decide and the {@code Version} has to.
+     */
+    private static ValidatableResponse elastiCacheCreateUser(String accessKeyId, String userId) {
+        return given()
+                .header("Authorization", auth(accessKeyId, "lambda"))
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "CreateUser")
+                .formParam("Version", "2015-02-02")
+                .formParam("UserId", userId)
+                .formParam("UserName", userId)
+                .formParam("Engine", "redis")
+                .formParam("AccessString", "on ~* +@all")
+                .formParam("AuthenticationMode.Type", "no-password-required")
+                .when().post("/").then();
+    }
+
+    private static ValidatableResponse adminElastiCache(String action, Map<String, String> params) {
+        RequestSpecification spec = given()
+                .header("Authorization", auth(ACCOUNT_ID, "elasticache"))
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", action)
+                .formParam("Version", "2015-02-02");
+        params.forEach(spec::formParam);
+        return spec.when().post("/").then();
     }
 
     private static ValidatableResponse iamOperationCall(String accessKeyId, String scope, String operation,

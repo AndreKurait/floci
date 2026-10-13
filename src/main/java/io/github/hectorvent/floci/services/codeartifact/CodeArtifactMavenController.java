@@ -18,6 +18,9 @@ import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
+import java.util.Arrays;
+import java.util.Optional;
+
 /**
  * Serves the real Maven repository wire protocol behind the URL {@code GetRepositoryEndpoint}
  * returns for the {@code maven} format: plain GET/PUT/HEAD over a GAV path, not a CodeArtifact
@@ -60,16 +63,65 @@ public class CodeArtifactMavenController {
         if (content.length > CodeArtifactService.MAX_ASSET_FILE_SIZE_BYTES) {
             return Response.status(413).build();
         }
-        String repoId = requireRepositoryId(headers, domain, repository);
-        int status = reposilite.deployArtifact(repoId, gav, content);
-        return Response.status(status).build();
+        MavenRequestScope scope = requireScope(headers, domain, repository);
+        Optional<String[]> coordinate = parseNamespaceAndPackageName(gav);
+        // Snapshotted before the real write, not after: see
+        // CodeArtifactService#currentContainerBackedPackageFence's own javadoc for why the order
+        // matters.
+        Optional<Long> fenceSnapshot = coordinate.map(c -> service.currentContainerBackedPackageFence(
+                scope.region(), domain, scope.owner(), repository, "maven", c[0], c[1]));
+        ReposiliteSidecarClient.DeployOutcome outcome = reposilite.deployArtifact(scope.repoId(), gav, content);
+        if (outcome.wroteNewContent()) {
+            coordinate.ifPresent(c -> service.recordContainerBackedAssetBytes(scope.region(), domain, scope.owner(),
+                    repository, "maven", c[0], c[1], content.length, fenceSnapshot.get()));
+        }
+        return Response.status(outcome.status()).build();
+    }
+
+    /**
+     * Splits a GAV path ({@code <groupId-as-slashes>/<artifactId>/<version>/<filename>}, the real
+     * Maven repository layout) into CodeArtifact's Maven namespace (dot-joined groupId) and
+     * package name (artifactId), the inverse of what {@code ReposiliteSidecarClient}'s own
+     * namespace/packageName-aware methods already build. Only ever used for byte accounting, a
+     * side channel that must never fail a publish that would otherwise succeed, so a path with too
+     * few segments to be a well-formed GAV is reported as unknown rather than thrown.
+     *
+     * <p>{@code maven-metadata.xml} (and its {@code .sha1}/{@code .md5}/{@code .sha256} checksum
+     * siblings) needs its own rule, not the ordinary one below: every real {@code mvn deploy} also
+     * PUTs one straight to the group/artifact directory, with no version segment at all, e.g.
+     * {@code com/example/myartifact/maven-metadata.xml}. That path has the same segment count as
+     * the shortest real versioned GAV ({@code group/artifact/version/filename}), so segment count
+     * alone can't tell the two apart; the filename itself can, and already does, via
+     * {@link #isMavenMetadataFile}. Once that is known, the artifactId is always the segment
+     * directly before it, no version segment in between, so this takes one fewer trailing segment
+     * than the ordinary rule does. A versioned snapshot's own {@code .../<version>/
+     * maven-metadata.xml} is the one real path this still gets slightly wrong, reading the version
+     * string itself as the package name instead of skipping over it; accepted rather than chased
+     * further, since this is a byte count summed at the domain level only (never read back by
+     * package), and this one rare case still adds its real byte count to the right total under a
+     * harmless, if misnamed, bucket nothing else will ever look up by that name.
+     */
+    private static Optional<String[]> parseNamespaceAndPackageName(String gav) {
+        String[] segments = gav.split("/");
+        int packageNameIndex = isMavenMetadataFile(segments[segments.length - 1])
+                ? segments.length - 2 : segments.length - 3;
+        if (packageNameIndex < 1) {
+            return Optional.empty();
+        }
+        String packageName = segments[packageNameIndex];
+        String namespace = String.join(".", Arrays.asList(segments).subList(0, packageNameIndex));
+        return Optional.of(new String[] {namespace, packageName});
+    }
+
+    private static boolean isMavenMetadataFile(String filename) {
+        return filename.equals("maven-metadata.xml") || filename.startsWith("maven-metadata.xml.");
     }
 
     @GET
     @Produces(MediaType.WILDCARD)
     public Response fetch(@Context HttpHeaders headers, @PathParam("domain") String domain,
                            @PathParam("repository") String repository, @PathParam("gav") String gav) {
-        String repoId = requireRepositoryId(headers, domain, repository);
+        String repoId = requireScope(headers, domain, repository).repoId();
         return reposilite.fetchArtifact(repoId, gav)
                 .map(this::toResponse)
                 .orElseGet(() -> Response.status(Response.Status.NOT_FOUND).build());
@@ -78,7 +130,7 @@ public class CodeArtifactMavenController {
     @HEAD
     public Response head(@Context HttpHeaders headers, @PathParam("domain") String domain,
                           @PathParam("repository") String repository, @PathParam("gav") String gav) {
-        String repoId = requireRepositoryId(headers, domain, repository);
+        String repoId = requireScope(headers, domain, repository).repoId();
         return reposilite.artifactExists(repoId, gav)
                 ? Response.ok().build()
                 : Response.status(Response.Status.NOT_FOUND).build();
@@ -88,7 +140,9 @@ public class CodeArtifactMavenController {
         return Response.ok(artifact.content(), artifact.contentType()).build();
     }
 
-    private String requireRepositoryId(HttpHeaders headers, String domain, String repository) {
+    private record MavenRequestScope(String repoId, String region, String owner) {}
+
+    private MavenRequestScope requireScope(HttpHeaders headers, String domain, String repository) {
         String token = CodeArtifactTokenExtractor.extractToken(headers);
         AuthorizationTokenScope scope = service.resolveAuthorizationToken(token, domain)
                 .orElseThrow(() -> new NotAuthorizedException("Basic realm=\"floci-codeartifact\""));
@@ -99,6 +153,6 @@ public class CodeArtifactMavenController {
             throw new NotFoundException();
         }
         reposilite.ensureRepository(repoId);
-        return repoId;
+        return new MavenRequestScope(repoId, scope.region(), scope.owner());
     }
 }

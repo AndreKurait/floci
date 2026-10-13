@@ -88,8 +88,9 @@ the reset.
 
 With TTL enabled, a sweep runs every 60 seconds and deletes the items whose TTL attribute holds an
 epoch time in the past. Each deletion writes a `REMOVE` record to the table's stream and is
-forwarded to an active Kinesis streaming destination. Between sweeps, reads already leave expired
-items out.
+forwarded to an active Kinesis streaming destination. Between sweeps, expired items remain visible
+to reads until they are physically deleted, as on AWS. Use a filter expression on the TTL attribute
+to exclude expired items from a Query or Scan result.
 
 As in AWS, the records of a TTL deletion carry the DynamoDB service identity, which a `DeleteItem`
 removal does not. The member names depend on where the record is read. The DynamoDB Streams API

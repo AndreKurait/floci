@@ -4809,6 +4809,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // AWS stores the CIDR in canonical form: "100.68.0.18/18" becomes "100.68.0.0/18".
         String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
         rejectOutOfRangePrefix(cidrBlock, "InvalidVpc.Range");
+        rejectReservedVpcRange(cidrBlock);
         ensureDefaultResources(region);
         String vpcId = "vpc-" + randomHex(8);
         Vpc vpc = new Vpc();
@@ -5021,6 +5022,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public VpcCidrBlockAssociation associateVpcCidrBlock(String region, String vpcId, String cidrBlock) {
         rejectOutOfRangePrefix(cidrBlock, "InvalidVpc.Range");
+        rejectReservedVpcRange(cidrBlock);
         ensureDefaultResources(region);
         synchronized (attachmentTopologyLock(region)) {
             synchronized (lockFor(key(region, vpcId))) {
@@ -5921,6 +5923,25 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         int prefix = range[1];
         if (prefix < 16 || prefix > 28) {
             throw new AwsException(errorCode, "The CIDR '" + cidrBlock + "' is invalid.", 400);
+        }
+    }
+
+    /** The ranges the VPC User Guide says "You can't specify ... for your VPCs". */
+    private static final List<String> RESERVED_VPC_RANGES =
+            List.of("0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4");
+
+    /**
+     * The VPC User Guide's IPv4 VPC CIDR blocks section rules out 0.0.0.0/8, 127.0.0.0/8 (loopback),
+     * 169.254.0.0/16 (link-local) and 224.0.0.0/4 (multicast) for any VPC block, primary or
+     * secondary, and AWS answers with InvalidVpc.Range. Requests with no IPv4 CIDR, or one that
+     * does not parse, are left to the checks that already handle them.
+     */
+    private static void rejectReservedVpcRange(String cidrBlock) {
+        if (!Ipv4Cidrs.isIpv4(cidrBlock)) {
+            return;
+        }
+        if (RESERVED_VPC_RANGES.stream().anyMatch(range -> Ipv4Cidrs.overlaps(cidrBlock, range))) {
+            throw new AwsException("InvalidVpc.Range", "The CIDR '" + cidrBlock + "' is invalid.", 400);
         }
     }
 

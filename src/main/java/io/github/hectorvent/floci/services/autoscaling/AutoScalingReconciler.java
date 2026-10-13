@@ -133,19 +133,21 @@ public class AutoScalingReconciler {
         removeOrphanedTargetRegistrations(asg);
         promoteReadyInstances(asg);
 
-        long activeCapacity = activeCapacity(asg);
-        int desired = asg.getDesiredCapacity();
+        asgService.adjustCapacityIfPresent(asg, () -> {
+            long activeCapacity = activeCapacity(asg);
+            int desired = asg.getDesiredCapacity();
 
-        if (activeCapacity < desired) {
-            if (!scaleOut(asg, (int) (desired - activeCapacity))) {
-                return;
+            if (activeCapacity < desired && !asg.getSuspendedProcesses().contains("Launch")) {
+                if (!scaleOut(asg, (int) (desired - activeCapacity))) {
+                    return;
+                }
+            } else if (activeCapacity > desired && !asg.getSuspendedProcesses().contains("Terminate")) {
+                scaleIn(asg, (int) (activeCapacity - desired));
             }
-        } else if (activeCapacity > desired) {
-            scaleIn(asg, (int) (activeCapacity - desired));
-        }
-        if (asgService.saveAutoScalingGroupIfPresent(asg)) {
-            asgService.completeInstanceRefreshIfSettled(asg.getRegion(), asg.getAutoScalingGroupName());
-        }
+            if (asgService.saveAutoScalingGroupIfPresent(asg)) {
+                asgService.completeInstanceRefreshIfSettled(asg.getRegion(), asg.getAutoScalingGroupName());
+            }
+        });
     }
 
     static long activeCapacity(AutoScalingGroup asg) {

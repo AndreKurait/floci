@@ -14,7 +14,6 @@ import software.amazon.awssdk.services.wafv2.model.WebACL;
 
 import java.util.List;
 import java.util.Map;
-import java.util.function.BooleanSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -144,19 +143,19 @@ class CloudFormationWafV2WebAclAssociationTest {
     }
 
     private static void awaitStatus(String expected) throws InterruptedException {
-        await(() -> {
+        TestFixtures.await(() -> {
             Stack stack = cfn.describeStacks(r -> r.stackName(stackName)).stacks().get(0);
             String status = stack.stackStatusAsString();
             if (status.endsWith("_FAILED") || status.contains("ROLLBACK")) {
                 throw new AssertionError(stackName + " reached " + status + ": " + stack.stackStatusReason());
             }
             return expected.equals(status);
-        }, expected);
+        }, stackName, expected, 300_000_000_000L, 250);
     }
 
     private static void deleteStack() throws InterruptedException {
         cfn.deleteStack(r -> r.stackName(stackName));
-        await(() -> {
+        TestFixtures.await(() -> {
             try {
                 Stack stack = cfn.describeStacks(r -> r.stackName(stackName)).stacks().get(0);
                 if ("DELETE_FAILED".equals(stack.stackStatusAsString())) {
@@ -169,17 +168,8 @@ class CloudFormationWafV2WebAclAssociationTest {
                 }
                 throw e;
             }
-        }, "stack deletion");
+        }, stackName, "stack deletion", 300_000_000_000L, 250);
     }
 
-    private static void await(BooleanSupplier condition, String expected) throws InterruptedException {
-        long deadline = System.nanoTime() + 300_000_000_000L;
-        while (System.nanoTime() < deadline) {
-            if (condition.getAsBoolean()) {
-                return;
-            }
-            Thread.sleep(250);
-        }
-        throw new AssertionError(stackName + " timed out waiting for " + expected);
-    }
+
 }

@@ -1135,6 +1135,45 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void createVpcAndAssociateVpcCidrBlockRejectReservedRanges() {
+        // VPC User Guide: "You can't specify the following CIDR blocks for your VPCs": 0.0.0.0/8,
+        // 127.0.0.0/8, 169.254.0.0/16 and 224.0.0.0/4.
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        long vpcsBefore = service.describeVpcs("us-east-1", List.of(), Map.of()).size();
+        String vpcId = service.createVpc("us-east-1", "52.0.0.0/16", false).getVpcId();
+
+        for (String cidr : List.of("0.0.0.0/16", "0.255.0.0/28", "127.0.0.0/16", "127.255.255.0/24",
+                "169.254.0.0/16", "169.254.169.0/24", "224.0.0.0/16", "239.255.0.0/16")) {
+            AwsException createError = assertThrows(AwsException.class,
+                    () -> service.createVpc("us-east-1", cidr, false), cidr);
+            assertEquals("InvalidVpc.Range", createError.getErrorCode());
+            assertEquals("The CIDR '" + cidr + "' is invalid.", createError.getMessage());
+            assertEquals(400, createError.getHttpStatus());
+
+            AwsException associateError = assertThrows(AwsException.class,
+                    () -> service.associateVpcCidrBlock("us-east-1", vpcId, cidr), cidr);
+            assertEquals("InvalidVpc.Range", associateError.getErrorCode());
+            assertEquals(400, associateError.getHttpStatus());
+        }
+        assertEquals(vpcsBefore + 1, service.describeVpcs("us-east-1", List.of(), Map.of()).size());
+        assertEquals(1, service.describeVpcs("us-east-1", List.of(vpcId), Map.of()).getFirst()
+                .getCidrBlockAssociationSet().size());
+    }
+
+    @Test
+    void createVpcAcceptsBlocksNextToTheReservedRanges() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        for (String cidr : List.of("1.0.0.0/16", "126.255.0.0/16", "128.0.0.0/16", "169.253.0.0/16",
+                "169.255.0.0/16", "223.255.0.0/16", "240.0.0.0/16")) {
+            assertEquals(cidr, service.createVpc("us-east-1", cidr, false).getCidrBlock());
+        }
+    }
+
+    @Test
     void createVpcAndAssociateVpcCidrBlockAcceptTheSlash16AndSlash28PrefixBounds() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),

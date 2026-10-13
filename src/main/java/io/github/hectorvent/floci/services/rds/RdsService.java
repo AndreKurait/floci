@@ -4483,20 +4483,33 @@ public class RdsService implements Resettable, ResourceProvider {
         String effectiveSecretKmsKeyId = Boolean.TRUE.equals(manageMasterUserPassword)
                 && cluster.getMasterUserSecretArn() == null
                 ? resolveManagedSecretKmsKeyId(masterUserSecretKmsKeyId, effectiveRegion) : null;
-        boolean passwordRotated = false;
-        if (newPassword != null && !newPassword.isBlank()) {
-            String oldPassword = cluster.getMasterPassword();
-            boolean backendRunning = !config.services().rds().mock()
-                    && cluster.getContainerId() != null;
-            passwordRotated = backendRunning && !newPassword.equals(oldPassword);
-            // Propagate the rotation into the running backend DB before overwriting the stored
-            // password — the last moment the old credential (which the backend still holds) is
-            // known — mirroring the ModifyDBInstance path.
-            if (passwordRotated) {
+        boolean hasNewPassword = newPassword != null && !newPassword.isBlank();
+        String oldPassword = cluster.getMasterPassword();
+        boolean rotateBackend = hasNewPassword && !config.services().rds().mock()
+                && cluster.getContainerId() != null && !newPassword.equals(oldPassword);
+        Runnable changeCredentials = () -> {
+            // Keep the old credential and secret until the running backend accepts the change.
+            if (rotateBackend) {
                 containerManager.rotateMasterPassword(
                         cluster.getDockerVolumeName(), cluster.getContainerId(),
                         cluster.getEngine(), cluster.getMasterUsername(), oldPassword, newPassword);
             }
+        };
+        boolean releasesManagedSecret = Boolean.FALSE.equals(manageMasterUserPassword)
+                && cluster.getMasterUserSecretArn() != null;
+        boolean credentialsChanged = true;
+        if (releasesManagedSecret) {
+            if (secretsManagerService == null) {
+                throw new AwsException("InvalidParameterCombination",
+                        "ManageMasterUserPassword requires Secrets Manager support.", 400);
+            }
+            credentialsChanged = secretsManagerService.deleteManagedSecretAfter(
+                    cluster.getMasterUserSecretArn(), effectiveRegion, changeCredentials);
+        } else {
+            changeCredentials.run();
+        }
+        boolean passwordRotated = credentialsChanged && rotateBackend;
+        if (credentialsChanged && hasNewPassword) {
             cluster.setMasterPassword(newPassword);
         }
         if (iamEnabled != null) {
@@ -4507,8 +4520,12 @@ public class RdsService implements Resettable, ResourceProvider {
                 cluster.setMasterPassword(generatedMasterPassword());
             }
             attachManagedMasterUserSecret(cluster, effectiveRegion, masterUserSecretKmsKeyId, effectiveSecretKmsKeyId);
-        } else if (Boolean.FALSE.equals(manageMasterUserPassword) && cluster.getMasterUserSecretArn() != null) {
-            detachManagedMasterUserSecret(cluster, effectiveRegion);
+        } else if (releasesManagedSecret) {
+            if (credentialsChanged) {
+                cluster.setMasterUserSecretArn(null);
+                cluster.setMasterUserSecretStatus(null);
+                cluster.setMasterUserSecretKmsKeyId(null);
+            }
         } else if (cluster.getMasterUserSecretArn() != null
                 && masterUserSecretKmsKeyId != null
                 && !masterUserSecretKmsKeyId.equals(cluster.getMasterUserSecretKmsKeyId())) {

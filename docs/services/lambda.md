@@ -430,7 +430,7 @@ passes here and fails on deploy. The content is never mounted at `/opt` either w
 is logged at attach time and again at invoke; publish your own copy of the content locally under a
 name you control if the handler needs it at runtime.
 
-A layer ARN outside the `aws` partition is refused whatever that setting says. Partitions are
+A layer ARN outside the caller's partition is refused whatever that setting says. Partitions are
 isolated, so no resource policy can ever make such a layer readable, and `GetLayerVersionByArn`
 rejects one outright with `InvalidParameterValueException: Invalid layer version ...`.
 

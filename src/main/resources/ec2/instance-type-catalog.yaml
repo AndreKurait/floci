@@ -38,6 +38,58 @@ instanceTypes:
       - networkCardIndex: 0
         maximumNetworkInterfaces: 3
 
+  - instanceType: t2.medium
+    vcpu: 2
+    memoryMib: 4096
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 6
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 3
+
+  - instanceType: t2.large
+    vcpu: 2
+    memoryMib: 8192
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 12
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 3
+
+  - instanceType: t2.xlarge
+    vcpu: 4
+    memoryMib: 16384
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 3
+
+  - instanceType: t2.2xlarge
+    vcpu: 8
+    memoryMib: 32768
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 3
+
   - instanceType: t3.nano
     vcpu: 2
     memoryMib: 512
