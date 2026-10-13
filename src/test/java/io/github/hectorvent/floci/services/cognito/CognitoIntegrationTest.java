@@ -815,6 +815,9 @@ class CognitoIntegrationTest {
                 .matcher(body);
         assertTrue(invitation.find(), body);
         assertEquals(invitee, invitation.group(1));
+        if (temporaryPassword != null) {
+            assertEquals(temporaryPassword, invitation.group(2));
+        }
 
         cognitoAction("AdminInitiateAuth", OBJECT_MAPPER.writeValueAsString(Map.of(
                 "UserPoolId", invitePoolId,
