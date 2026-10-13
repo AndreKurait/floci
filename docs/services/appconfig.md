@@ -22,7 +22,7 @@ unsupported properties are rejected before creation.
 
 The legacy `GetConfiguration` data-plane route accepts application, environment and profile names or IDs.
 It returns only the deployed version, its content type and `Configuration-Version`; a matching
-`ClientConfigurationVersion` returns HTTP 204 with no body. `ClientId` is required.
+`ClientConfigurationVersion` returns HTTP 200 with no body. `ClientId` is required.
 
 ### Supported Operations
 

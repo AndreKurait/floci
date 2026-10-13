@@ -5,8 +5,10 @@ import io.github.hectorvent.floci.services.appconfig.AppConfigDataService.Config
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataService.LegacyConfiguration;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
@@ -42,11 +44,12 @@ public class AppConfigDataController {
                                      @PathParam("environment") String environment,
                                      @PathParam("configuration") String configuration,
                                      @QueryParam("client_id") String clientId,
-                                     @QueryParam("client_configuration_version") String clientVersion,
+                                     @Context UriInfo uriInfo,
                                      @HeaderParam("Accept") String accept) {
+        String clientVersion = uriInfo.getQueryParameters().getFirst("client_configuration_version");
         LegacyConfiguration data = service.getConfiguration(
                 application, environment, configuration, clientId, clientVersion, accept);
-        return Response.status(data.configurationVersion().equals(clientVersion) ? 204 : 200)
+        return Response.status(200)
                 .entity(data.content()).type(data.contentType())
                 .header("Configuration-Version", data.configurationVersion()).build();
     }

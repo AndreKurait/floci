@@ -152,12 +152,22 @@ public class AppConfigDataService {
         if (clientVersion != null && (clientVersion.isEmpty() || clientVersion.length() > 1024)) {
             throw new AwsException("BadRequestException", "Invalid client_configuration_version", 400);
         }
-        Application app = appConfigService.resolveApplication(application);
-        Environment env = appConfigService.resolveEnvironment(app.getId(), environment);
-        ConfigurationProfile profile = appConfigService.resolveConfigurationProfile(app.getId(), configuration);
+        Application app;
+        Environment env;
+        ConfigurationProfile profile;
+        try {
+            app = appConfigService.resolveApplication(application);
+            env = appConfigService.resolveEnvironment(app.getId(), environment);
+            profile = appConfigService.resolveConfigurationProfile(app.getId(), configuration);
+        } catch (AwsException e) {
+            if (!"ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
         String active = appConfigService.getActiveVersion(env.getId(), profile.getId());
         if (active == null) {
-            throw new AwsException("ResourceNotFoundException", "No configuration is deployed", 404);
+            throw new AwsException("BadRequestException", "No configuration is deployed", 400);
         }
         HostedConfigurationVersion version = appConfigService.getHostedConfigurationVersion(
                 app.getId(), profile.getId(), Integer.parseInt(active));

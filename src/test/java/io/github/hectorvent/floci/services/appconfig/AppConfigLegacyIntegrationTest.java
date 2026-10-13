@@ -59,7 +59,7 @@ class AppConfigLegacyIntegrationTest {
     @Test
     void unchangedVersionHasNoBodyAndDoesNotCreateAPollingSession() {
         given().queryParam("client_id", "reader").queryParam("client_configuration_version", "1")
-                .get(path()).then().statusCode(204).header("Configuration-Version", "1").body(equalTo(""));
+                .get(path()).then().statusCode(200).header("Configuration-Version", "1").body(equalTo(""));
         given().queryParam("client_id", "another-reader").get(path())
                 .then().statusCode(200).body("enabled", equalTo(true));
     }
@@ -76,7 +76,11 @@ class AppConfigLegacyIntegrationTest {
     @Test
     void refusesMissingOrOversizedClientAndVersion() {
         given().get(path()).then().statusCode(400);
+        given().queryParam("client_id", "").get(path()).then().statusCode(400);
+        given().queryParam("client_id", "x".repeat(64)).get(path()).then().statusCode(200);
         given().queryParam("client_id", "x".repeat(65)).get(path()).then().statusCode(400);
+        given().queryParam("client_id", "reader").queryParam("client_configuration_version", "")
+                .get(path()).then().statusCode(400);
         given().queryParam("client_id", "reader").queryParam("client_configuration_version", "x".repeat(1025))
                 .get(path()).then().statusCode(400);
     }
@@ -85,6 +89,6 @@ class AppConfigLegacyIntegrationTest {
     void absentEnvironmentDoesNotReceiveAnotherEnvironmentsDeployment() {
         given().queryParam("client_id", "reader")
                 .get("/applications/" + application + "/environments/absent/configurations/" + profile)
-                .then().statusCode(404);
+                .then().statusCode(400).body("__type", equalTo("BadRequestException"));
     }
 }
