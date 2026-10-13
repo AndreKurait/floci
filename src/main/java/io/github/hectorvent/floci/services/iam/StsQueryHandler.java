@@ -246,6 +246,10 @@ public class StsQueryHandler {
     }
 
     private Response handleGetSessionToken(MultivaluedMap<String, String> params) {
+        if (IamService.isTemporaryAccessKey(callerAccessKeyId())) {
+            return AwsQueryResponse.error("AccessDenied", "Cannot call GetSessionToken with session credentials",
+                    AwsNamespaces.STS, 403);
+        }
         Response durationValidation = validateDurationSeconds(params, 900, 129600);
         if (durationValidation != null) {
             return durationValidation;
@@ -523,8 +527,9 @@ public class StsQueryHandler {
 
     /** The access key that signed this request, in the header or presigned in the query. */
     private String callerAccessKeyId() {
+        String authorization = headers == null ? null : headers.getHeaderString("Authorization");
         String auth = IamEnforcementFilter.requestAuthorization(
-                headers == null ? null : headers.getHeaderString("Authorization"),
+                authorization == null || authorization.isBlank() ? null : authorization,
                 uriInfo == null ? null : uriInfo.getQueryParameters());
         return auth == null ? null : accountResolver.extractAccessKeyId(auth);
     }

@@ -48,7 +48,7 @@ public class ResourceExplorer2Controller {
     }
 
     @POST
-    @Path("/re2/ListResources")
+    @Path(ResourceExplorer2PathRewriteFilter.INTERNAL_PREFIX + "/ListResources")
     public Response listResources(@Context HttpHeaders headers, String body) throws IOException {
         JsonNode req = parseBody(body);
         String region = regionResolver.resolveRegion(headers);
@@ -89,7 +89,7 @@ public class ResourceExplorer2Controller {
     }
 
     @POST
-    @Path("/re2/CreateIndex")
+    @Path(ResourceExplorer2PathRewriteFilter.INTERNAL_PREFIX + "/CreateIndex")
     public Response createIndex(@Context HttpHeaders headers, String body) throws IOException {
         JsonNode req = parseBody(body);
         String region = regionResolver.resolveRegion(headers);
@@ -105,7 +105,7 @@ public class ResourceExplorer2Controller {
     }
 
     @POST
-    @Path("/re2/GetIndex")
+    @Path(ResourceExplorer2PathRewriteFilter.INTERNAL_PREFIX + "/GetIndex")
     public Response getIndex(@Context HttpHeaders headers) {
         String region = regionResolver.resolveRegion(headers);
         Index index = service.getIndex(region);
@@ -122,7 +122,7 @@ public class ResourceExplorer2Controller {
     }
 
     @POST
-    @Path("/re2/DeleteIndex")
+    @Path(ResourceExplorer2PathRewriteFilter.INTERNAL_PREFIX + "/DeleteIndex")
     public Response deleteIndex(String body) throws IOException {
         JsonNode req = parseBody(body);
         String indexArn = optString(req, "Arn");
@@ -138,7 +138,7 @@ public class ResourceExplorer2Controller {
     }
 
     @POST
-    @Path("/re2/ListIndexes")
+    @Path(ResourceExplorer2PathRewriteFilter.INTERNAL_PREFIX + "/ListIndexes")
     public Response listIndexes(String body) throws IOException {
         JsonNode req = parseBody(body);
         String type = optString(req, "Type");
