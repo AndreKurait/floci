@@ -740,7 +740,7 @@ public class DynamoDbService {
     }
 
     /**
-     * Every live item of the table, expired ones dropped. SearchVectors reads the whole table:
+     * Every stored item of the table, including expired items pending TTL deletion. SearchVectors reads the whole table:
      * it has no page boundary and no cursor, so it cannot go through {@link #scan}, which stops
      * at the 1 MB response cap.
      */
@@ -750,9 +750,7 @@ public class DynamoDbService {
         if (items == null) {
             return List.of();
         }
-        return items.values().stream()
-                .filter(item -> !isExpired(item, table))
-                .toList();
+        return List.copyOf(items.values());
     }
 
     /**
@@ -997,10 +995,6 @@ public class DynamoDbService {
             return null;
         }
         JsonNode item = items.get(itemKey);
-        if (item != null && isExpired(item, table)) {
-            LOG.tracev("Got item from {0}: key={1} item=<expired>", canonicalTableName, itemKey);
-            return null;
-        }
         LOG.tracev("Got item from {0}: key={1} item={2}", canonicalTableName, itemKey, item);
         return item;
     }
@@ -1385,9 +1379,6 @@ public class DynamoDbService {
                     .toList();
         }
 
-        // Filter out TTL-expired items
-        results = results.stream().filter(item -> !isExpired(item, table)).toList();
-
         // Sort by the full (possibly composite) sort key, comparing each attribute in key-schema
         // order. Using only the first sort-key attribute would ignore the remaining components
         // (e.g. a "requestStateQuery RANGE, createdAt RANGE" index would never order by createdAt),
@@ -1572,11 +1563,11 @@ public class DynamoDbService {
             totalScanned++;
             scannedItems.add(item);
             lastScanned = item;
-            if (!isExpired(item, table)) {
-                boolean matched = (filterExpression == null
-                        || matchesFilterExpression(item, filterExpression, expressionAttrNames, expressionAttrValues))
-                        && (scanFilter == null || matchesScanFilter(item, scanFilter));
-                if (matched) results.add(item);
+            boolean matched = (filterExpression == null
+                    || matchesFilterExpression(item, filterExpression, expressionAttrNames, expressionAttrValues))
+                    && (scanFilter == null || matchesScanFilter(item, scanFilter));
+            if (matched) {
+                results.add(item);
             }
             // Limit caps SCANNED items (those read), not matched items. DynamoDB does
             // not look ahead when it stops at the Limit boundary: it always surfaces a

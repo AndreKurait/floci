@@ -2,17 +2,23 @@ package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
+import io.github.hectorvent.floci.testing.EnforcementFixtures;
 import io.github.hectorvent.floci.testing.IamEnforcementProfile;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.net.URI;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
@@ -26,8 +32,13 @@ import static org.hamcrest.Matchers.equalTo;
 @TestProfile(IamEnforcementProfile.class)
 class ServerCertificateIamEnforcementIntegrationTest {
 
+    @TestHTTPResource("/")
+    static URI baseUri;
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
+
     private static final String ACCOUNT_ID = "000000000000";
-    private static final String REGION = "us-east-1";
     private static final CertificateGenerator GENERATOR = new CertificateGenerator();
 
     private static String arn(String pathAndName) {
@@ -166,7 +177,7 @@ class ServerCertificateIamEnforcementIntegrationTest {
                 .formatted(arn(name)));
 
         given()
-                .header("Authorization", auth(akid, "iam", "cn-north-1"))
+                .header("Authorization", authInRegion(akid, "iam", "cn-north-1"))
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DeleteServerCertificate")
                 .formParam("Version", "2010-05-08")
@@ -316,13 +327,13 @@ class ServerCertificateIamEnforcementIntegrationTest {
     }
 
     /** An IAM user in {@link #ACCOUNT_ID} carrying {@code policy} inline. */
-    private static String userWith(String policy) {
+    private String userWith(String policy) {
         String user = "cert-iam-" + suffix();
-        adminIam("CreateUser", Map.of("UserName", user)).statusCode(200);
+        String accessKeyId = EnforcementFixtures.createUser(cleanup, baseUri.getPort(),
+                auth(ACCOUNT_ID, "iam"), user).accessKeyId();
         adminIam("PutUserPolicy", Map.of("UserName", user, "PolicyName", "p",
                 "PolicyDocument", policy)).statusCode(200);
-        return adminIam("CreateAccessKey", Map.of("UserName", user)).statusCode(200)
-                .extract().path("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
+        return accessKeyId;
     }
 
     private static ValidatableResponse adminIam(String action, Map<String, String> params) {
@@ -343,11 +354,7 @@ class ServerCertificateIamEnforcementIntegrationTest {
         return spec.when().post("/").then();
     }
 
-    private static String auth(String accessKeyId, String service) {
-        return auth(accessKeyId, service, REGION);
-    }
-
-    private static String auth(String accessKeyId, String service, String region) {
+    private static String authInRegion(String accessKeyId, String service, String region) {
         return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260919/" + region + "/" + service
                 + "/aws4_request, SignedHeaders=host, Signature=abc";
     }

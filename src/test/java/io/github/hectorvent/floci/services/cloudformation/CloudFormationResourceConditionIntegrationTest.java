@@ -19,6 +19,49 @@ class CloudFormationResourceConditionIntegrationTest {
         RestAssuredJsonUtils.configureAwsContentTypes();
     }
 
+    /**
+     * A condition naming another with anything but a string is a template error, which
+     * CloudFormation (measured in us-east-2) answers synchronously on CreateStack. The malformed
+     * operand comes first in an Fn::And, where evaluation alone would stop and read it as false.
+     */
+    @Test
+    void aConditionReferenceThatIsNotAStringIsATemplateError() {
+        String template = """
+                {
+                  "Conditions": {
+                    "Deploy": { "Fn::Equals": ["a", "a"] },
+                    "Other": { "Fn::Equals": ["a", "b"] },
+                    "Both": { "Fn::And": [ { "Condition": { "Condition": "Deploy" } }, { "Condition": "Other" } ] }
+                  },
+                  "Resources": {
+                    "Queue": { "Type": "AWS::SQS::Queue", "Condition": "Both" },
+                    "Always": { "Type": "AWS::SQS::Queue" }
+                  }
+                }
+                """;
+        String stackName = "cfn-cond-malformed-" + Long.toString(System.nanoTime(), 36);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>ValidationError</Code>"))
+            .body(containsString("Template error: every Condition object must have a single String value."));
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400);
+    }
+
     @Test
     void createStack_skipsResourceWhenResourceLevelConditionIsFalse() {
         String suffix = Long.toString(System.nanoTime(), 36);

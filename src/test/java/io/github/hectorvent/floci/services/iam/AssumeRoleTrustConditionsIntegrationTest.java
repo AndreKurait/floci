@@ -1,17 +1,23 @@
 package io.github.hectorvent.floci.services.iam;
 
+import io.github.hectorvent.floci.testing.EnforcementFixtures;
 import io.github.hectorvent.floci.testing.IamEnforcementProfile;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.net.URI;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.UUID;
 
+import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 
@@ -23,6 +29,12 @@ import static org.hamcrest.Matchers.containsString;
 @QuarkusTest
 @TestProfile(IamEnforcementProfile.class)
 class AssumeRoleTrustConditionsIntegrationTest {
+
+    @TestHTTPResource("/")
+    static URI baseUri;
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
 
     private static final String ROLE_ACCOUNT = "222222222222";
     private static final String TRUSTED_ACCOUNT = "111111111111";
@@ -80,15 +92,12 @@ class AssumeRoleTrustConditionsIntegrationTest {
     @Test
     void userKeyCallerIsTheUsersAccountNotTheDefaultAccount() {
         String user = "trust-user-" + UUID.randomUUID().toString().substring(0, 8);
-        given().formParam("Action", "CreateUser").formParam("UserName", user)
-                .header("Authorization", auth(OTHER_ACCOUNT, "iam")).when().post("/").then().statusCode(200);
+        String accessKeyId = EnforcementFixtures.createUser(cleanup, baseUri.getPort(),
+                auth(OTHER_ACCOUNT, "iam"), user).accessKeyId();
         given().formParam("Action", "PutUserPolicy").formParam("UserName", user).formParam("PolicyName", "p")
                 .formParam("PolicyDocument", "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
                         + "\"Action\":\"sts:AssumeRole\",\"Resource\":\"*\"}]}")
                 .header("Authorization", auth(OTHER_ACCOUNT, "iam")).when().post("/").then().statusCode(200);
-        String accessKeyId = given().formParam("Action", "CreateAccessKey").formParam("UserName", user)
-                .header("Authorization", auth(OTHER_ACCOUNT, "iam")).when().post("/").then().statusCode(200)
-                .extract().path("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
         String trustsDefault = createRole(trustAccountRoot(DEFAULT_ACCOUNT));
         String trustsOwnAccount = createRole(trustAccountRoot(OTHER_ACCOUNT));
 
@@ -160,7 +169,9 @@ class AssumeRoleTrustConditionsIntegrationTest {
     }
 
     /** A role in the trusted account that its own account may assume, allowed to call AssumeRole. */
-    private static void createCallerRole(String name, String path) {
+    private void createCallerRole(String name, String path) {
+        cleanup.register(() -> EnforcementFixtures.removeRole(baseUri.getPort(),
+                auth(TRUSTED_ACCOUNT, "iam"), name));
         given().formParam("Action", "CreateRole").formParam("RoleName", name).formParam("Path", path)
                 .formParam("AssumeRolePolicyDocument", trustAccountRoot(TRUSTED_ACCOUNT))
                 .header("Authorization", auth(TRUSTED_ACCOUNT, "iam")).when().post("/").then().statusCode(200);
@@ -221,8 +232,10 @@ class AssumeRoleTrustConditionsIntegrationTest {
                   "Principal":{"AWS":"arn:aws:iam::%s:root"},"Action":"sts:AssumeRole"}]}""".formatted(account);
     }
 
-    private static String createRole(String trustPolicy) {
+    private String createRole(String trustPolicy) {
         String role = "trust-cond-" + UUID.randomUUID().toString().substring(0, 8);
+        cleanup.register(() -> EnforcementFixtures.removeRole(baseUri.getPort(),
+                auth(ROLE_ACCOUNT, "iam"), role));
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "CreateRole")
@@ -234,8 +247,4 @@ class AssumeRoleTrustConditionsIntegrationTest {
         return role;
     }
 
-    private static String auth(String accessKeyId, String service) {
-        return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260929/us-east-1/" + service
-                + "/aws4_request, SignedHeaders=host, Signature=abc";
-    }
 }

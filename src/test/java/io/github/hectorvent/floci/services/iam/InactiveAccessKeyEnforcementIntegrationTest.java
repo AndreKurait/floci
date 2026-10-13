@@ -17,6 +17,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 
+import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 
@@ -91,14 +92,14 @@ class InactiveAccessKeyEnforcementIntegrationTest {
         query(accessKeyId, "sts", "GetSessionToken")
                 .then().statusCode(403).body(containsString("InvalidClientTokenId"));
         given()
-                .header("Authorization", authorization(accessKeyId, "s3"))
+                .header("Authorization", auth(accessKeyId, "s3"))
         .when()
                 .get("/")
         .then()
                 .statusCode(403)
                 .body(containsString("InvalidAccessKeyId"));
         given()
-                .header("Authorization", authorization(accessKeyId, "lambda"))
+                .header("Authorization", auth(accessKeyId, "lambda"))
                 .contentType("application/json")
         .when()
                 .get("/2015-03-31/functions")
@@ -114,9 +115,9 @@ class InactiveAccessKeyEnforcementIntegrationTest {
         String bucket = "inactive-key-post-" + suffix;
         String userName = "inactive-key-post-" + suffix;
         cleanup.register(() -> EnforcementFixtures.removeBucket(baseUri.getPort(),
-                authorization("test", "s3"), bucket));
+                auth("test", "s3"), bucket));
         given()
-                .header("Authorization", authorization("test", "s3"))
+                .header("Authorization", auth("test", "s3"))
         .when()
                 .put("/" + bucket)
         .then()
@@ -128,7 +129,7 @@ class InactiveAccessKeyEnforcementIntegrationTest {
         presignedPost(accessKeyId, bucket, "after.txt")
                 .then().statusCode(403).body(containsString("<Code>InvalidAccessKeyId</Code>"));
         given()
-                .header("Authorization", authorization("test", "s3"))
+                .header("Authorization", auth("test", "s3"))
         .when()
                 .head("/" + bucket + "/after.txt")
         .then()
@@ -137,16 +138,13 @@ class InactiveAccessKeyEnforcementIntegrationTest {
 
     /** Creates a user in {@code account}, with an inline policy when one is given, and returns its access key ID. */
     private String userWithKey(String account, String userName, String policy) {
-        cleanup.register(() -> EnforcementFixtures.removeUser(baseUri.getPort(),
-                authorization(account, "iam"), userName));
-        query(account, "iam", "CreateUser", "UserName", userName).then().statusCode(200);
+        String accessKeyId = EnforcementFixtures.createUser(cleanup, baseUri.getPort(),
+                auth(account, "iam"), userName).accessKeyId();
         if (policy != null) {
             query(account, "iam", "PutUserPolicy", "UserName", userName, "PolicyName", "inline",
                     "PolicyDocument", policy).then().statusCode(200);
         }
-        return query(account, "iam", "CreateAccessKey", "UserName", userName)
-                .then().statusCode(200)
-                .extract().path("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
+        return accessKeyId;
     }
 
     private static void setStatus(String account, String userName, String accessKeyId, String status) {
@@ -166,7 +164,7 @@ class InactiveAccessKeyEnforcementIntegrationTest {
     private static Response query(String accessKeyId, String service, String action, String... params) {
         RequestSpecification request = given()
                 .contentType("application/x-www-form-urlencoded")
-                .header("Authorization", authorization(accessKeyId, service))
+                .header("Authorization", auth(accessKeyId, service))
                 .formParam("Action", action);
         for (int i = 0; i < params.length; i += 2) {
             request = request.formParam(params[i], params[i + 1]);
@@ -174,8 +172,4 @@ class InactiveAccessKeyEnforcementIntegrationTest {
         return request.when().post("/");
     }
 
-    private static String authorization(String accessKeyId, String service) {
-        return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260101/us-east-1/" + service
-                + "/aws4_request, SignedHeaders=host, Signature=not-verified";
-    }
 }

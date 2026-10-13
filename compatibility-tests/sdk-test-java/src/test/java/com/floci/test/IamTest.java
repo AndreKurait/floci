@@ -2,6 +2,7 @@ package com.floci.test;
 
 import org.junit.jupiter.api.*;
 import software.amazon.awssdk.services.iam.IamClient;
+import software.amazon.awssdk.services.iam.model.AccessDetail;
 import software.amazon.awssdk.services.iam.model.AddRoleToInstanceProfileRequest;
 import software.amazon.awssdk.services.iam.model.AddUserToGroupRequest;
 import software.amazon.awssdk.services.iam.model.AttachRolePolicyRequest;
@@ -33,6 +34,8 @@ import software.amazon.awssdk.services.iam.model.DeleteSamlProviderRequest;
 import software.amazon.awssdk.services.iam.model.DeleteUserRequest;
 import software.amazon.awssdk.services.iam.model.DetachRolePolicyRequest;
 import software.amazon.awssdk.services.iam.model.DetachUserPolicyRequest;
+import software.amazon.awssdk.services.iam.model.GenerateOrganizationsAccessReportRequest;
+import software.amazon.awssdk.services.iam.model.GenerateOrganizationsAccessReportResponse;
 import software.amazon.awssdk.services.iam.model.GenerateServiceLastAccessedDetailsRequest;
 import software.amazon.awssdk.services.iam.model.GenerateServiceLastAccessedDetailsResponse;
 import software.amazon.awssdk.services.iam.model.GetAccountSummaryResponse;
@@ -42,6 +45,8 @@ import software.amazon.awssdk.services.iam.model.GetInstanceProfileRequest;
 import software.amazon.awssdk.services.iam.model.GetInstanceProfileResponse;
 import software.amazon.awssdk.services.iam.model.GetLoginProfileRequest;
 import software.amazon.awssdk.services.iam.model.GetLoginProfileResponse;
+import software.amazon.awssdk.services.iam.model.GetOrganizationsAccessReportRequest;
+import software.amazon.awssdk.services.iam.model.GetOrganizationsAccessReportResponse;
 import software.amazon.awssdk.services.iam.model.GetPolicyRequest;
 import software.amazon.awssdk.services.iam.model.GetPolicyResponse;
 import software.amazon.awssdk.services.iam.model.GetPolicyVersionRequest;
@@ -58,6 +63,7 @@ import software.amazon.awssdk.services.iam.model.GetServiceLastAccessedDetailsWi
 import software.amazon.awssdk.services.iam.model.GetServiceLastAccessedDetailsWithEntitiesResponse;
 import software.amazon.awssdk.services.iam.model.GetUserRequest;
 import software.amazon.awssdk.services.iam.model.GetUserResponse;
+import software.amazon.awssdk.services.iam.model.JobStatusType;
 import software.amazon.awssdk.services.iam.model.ListAccessKeysRequest;
 import software.amazon.awssdk.services.iam.model.ListAccessKeysResponse;
 import software.amazon.awssdk.services.iam.model.ListAttachedRolePoliciesRequest;
@@ -104,6 +110,11 @@ import software.amazon.awssdk.services.iam.model.UntagUserRequest;
 import software.amazon.awssdk.services.iam.model.UpdateAccessKeyRequest;
 import software.amazon.awssdk.services.iam.model.UpdateLoginProfileRequest;
 import software.amazon.awssdk.services.iam.model.UpdateSamlProviderRequest;
+import software.amazon.awssdk.services.organizations.OrganizationsClient;
+import software.amazon.awssdk.services.organizations.model.Organization;
+import software.amazon.awssdk.services.organizations.model.OrganizationFeatureSet;
+import software.amazon.awssdk.services.organizations.model.PolicyType;
+import software.amazon.awssdk.services.organizations.model.Root;
 
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -133,6 +144,12 @@ class IamTest {
             + "\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}";
     private static final String LOGIN_PROFILE_PASSWORD = "Sdk-Test-P4ssword!";
     private static final String SAML_PROVIDER_NAME = "sdk-test-saml-provider";
+    /**
+     * The Organizations access report reads an organization, and only its management account can
+     * ask for one. This suite builds that organization under an account of its own so it never
+     * contends with the one the Organizations suite builds for the default account.
+     */
+    private static final String REPORT_MANAGEMENT_ACCOUNT = "555555555557";
     private static final String SAML_METADATA_DOCUMENT = "<md:EntityDescriptor "
             + "xmlns:md=\"urn:oasis:names:tc:SAML:2.0:metadata\" entityID=\"https://idp.example.test/sdk-test\">"
             + "<md:IDPSSODescriptor><md:KeyDescriptor use=\"signing\"><ds:KeyInfo "
@@ -947,5 +964,96 @@ class IamTest {
         assertThat(response.policiesGrantingServiceAccess())
                 .extracting(ListPoliciesGrantingServiceAccessEntry::serviceNamespace)
                 .containsExactly("s3", "dynamodb");
+    }
+
+    // ── Organizations Access Report ────────────────────────────────────
+
+    @Test
+    @Order(106)
+    void generateAndGetOrganizationsAccessReport() {
+        try (OrganizationsClient organizations =
+                     TestFixtures.organizationsClient(REPORT_MANAGEMENT_ACCOUNT);
+             IamClient managementIam = TestFixtures.iamClient(REPORT_MANAGEMENT_ACCOUNT)) {
+            Organization organization = organizations
+                    .createOrganization(r -> r.featureSet(OrganizationFeatureSet.ALL))
+                    .organization();
+
+            // Every assertion runs inside the try, so a failure still deletes the organization:
+            // one left behind fails the next run's CreateOrganization for this account.
+            try {
+                Root root = organizations.listRoots().roots().get(0);
+                // The report is SCP logic, which the root has to have service control policies
+                // enabled for before it can be asked about.
+                organizations.enablePolicyType(r -> r.rootId(root.id())
+                        .policyType(PolicyType.SERVICE_CONTROL_POLICY));
+
+                GenerateOrganizationsAccessReportResponse generated =
+                        managementIam.generateOrganizationsAccessReport(
+                                GenerateOrganizationsAccessReportRequest.builder()
+                                        .entityPath(organization.id() + "/" + root.id()).build());
+
+                assertThat(generated.jobId()).hasSize(36);
+
+                GetOrganizationsAccessReportResponse report =
+                        managementIam.getOrganizationsAccessReport(
+                                GetOrganizationsAccessReportRequest.builder()
+                                        .jobId(generated.jobId()).build());
+
+                assertThat(report.jobStatus()).isEqualTo(JobStatusType.COMPLETED);
+                assertThat(report.jobCreationDate()).isNotNull();
+                assertThat(report.jobCompletionDate()).isNotNull();
+                assertThat(report.errorDetails()).isNull();
+                // The management account is not limited by SCPs, so its report is the whole
+                // catalog, and nothing was ever reached, so the two counts are the same number.
+                assertThat(report.numberOfServicesAccessible()).isPositive();
+                assertThat(report.numberOfServicesNotAccessed())
+                        .isEqualTo(report.numberOfServicesAccessible());
+                // Those counts describe the whole report while AccessDetails carries one page of
+                // it. The catalog is larger than the default MaxItems, so this page is truncated
+                // and comes with the marker the next one starts at.
+                assertThat(report.accessDetails())
+                        .isNotEmpty()
+                        .hasSizeLessThanOrEqualTo(report.numberOfServicesAccessible())
+                        .allSatisfy(IamTest::assertServiceNobodyReached);
+                assertThat(report.isTruncated()).isTrue();
+                assertThat(report.marker()).isNotBlank();
+
+                GetOrganizationsAccessReportResponse nextPage =
+                        managementIam.getOrganizationsAccessReport(
+                                GetOrganizationsAccessReportRequest.builder()
+                                        .jobId(generated.jobId())
+                                        .marker(report.marker()).build());
+
+                // The page the marker points at is parsed the same way, down to the members:
+                // nothing says a later page carries the same shape, and the SDK can hand back a
+                // detail with its required members missing.
+                assertThat(nextPage.jobStatus()).isEqualTo(JobStatusType.COMPLETED);
+                assertThat(nextPage.numberOfServicesAccessible())
+                        .isEqualTo(report.numberOfServicesAccessible());
+                assertThat(nextPage.numberOfServicesNotAccessed())
+                        .isEqualTo(report.numberOfServicesNotAccessed());
+                assertThat(nextPage.accessDetails())
+                        .isNotEmpty()
+                        .doesNotContainAnyElementsOf(report.accessDetails())
+                        .allSatisfy(IamTest::assertServiceNobodyReached);
+            } finally {
+                organizations.deleteOrganization();
+            }
+        }
+    }
+
+    /**
+     * A service in the report that principals are allowed to reach and nobody ever did. Floci
+     * records no access, so every entry takes that shape: the two required members, a zero count
+     * and none of the three the API reference's own example omits for a service with no attempt
+     * behind it.
+     */
+    private static void assertServiceNobodyReached(AccessDetail detail) {
+        assertThat(detail.serviceName()).isNotBlank();
+        assertThat(detail.serviceNamespace()).isNotBlank();
+        assertThat(detail.totalAuthenticatedEntities()).isZero();
+        assertThat(detail.lastAuthenticatedTime()).isNull();
+        assertThat(detail.region()).isNull();
+        assertThat(detail.entityPath()).isNull();
     }
 }

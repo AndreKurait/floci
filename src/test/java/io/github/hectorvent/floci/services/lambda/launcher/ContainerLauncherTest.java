@@ -37,6 +37,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -223,6 +224,40 @@ class ContainerLauncherTest {
                 .filter(m -> m.getType() == MountType.VOLUME && "/var/task".equals(m.getTarget()))
                 .findFirst()
                 .orElse(null);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"$LATEST", "1", "7"})
+    void launchExposesTheExecutingVersion(String version) {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("version-fn");
+        fn.setHotReloadHostPath("/home/ci/code");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setVersion(version);
+
+        launcher.launch(fn);
+
+        assertEquals(List.of("AWS_LAMBDA_FUNCTION_VERSION=" + version),
+                captureRealContainerSpec().env().stream()
+                        .filter(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION=")).toList());
+    }
+
+    @Test
+    void launchPreventsAnEnvironmentOverrideOfTheExecutingVersion() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("version-fn");
+        fn.setHotReloadHostPath("/home/ci/code");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setVersion("7");
+        fn.setEnvironment(Map.of("AWS_LAMBDA_FUNCTION_VERSION", "user-override"));
+
+        launcher.launch(fn);
+
+        assertEquals(List.of("AWS_LAMBDA_FUNCTION_VERSION=7"),
+                captureRealContainerSpec().env().stream()
+                        .filter(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION=")).toList());
     }
 
     @Test

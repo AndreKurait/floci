@@ -31,7 +31,6 @@ import static org.hamcrest.Matchers.containsString;
 class IamResourceScopedPolicyEnforcementIntegrationTest {
 
     private static final String ACCOUNT_ID = "000000000000";
-    private static final String REGION = "us-east-1";
 
     /**
      * The emulator is shared with every other test class, so each fixture here is removed again:
@@ -237,19 +236,16 @@ class IamResourceScopedPolicyEnforcementIntegrationTest {
     @Test
     void anOmittedUserNameNamesTheSigningUser() {
         String user = "self-" + suffix();
-        createUser(user);
+        String accessKeyId = EnforcementFixtures.createUser(cleanup, port(),
+                adminAuth(), user).accessKeyId();
         adminIam("PutUserPolicy", Map.of("UserName", user, "PolicyName", "p",
                 "PolicyDocument", denying("GetUser", arn("user/" + user)))).statusCode(200);
-        String akid = adminIam("CreateAccessKey", Map.of("UserName", user)).statusCode(200)
-                .extract().path("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey"
-                        + ".AccessKeyId");
-
         // No UserName: the request is about the signer, and the deny names exactly that user.
-        userIam(akid, "GetUser", Map.of()).statusCode(403).body(containsString("AccessDenied"));
+        userIam(accessKeyId, "GetUser", Map.of()).statusCode(403).body(containsString("AccessDenied"));
         // Naming someone else still goes through, so the deny bound to the signer and not to all.
         String other = "other-" + suffix();
         createUser(other);
-        userIam(akid, "GetUser", Map.of("UserName", other)).statusCode(200);
+        userIam(accessKeyId, "GetUser", Map.of("UserName", other)).statusCode(200);
     }
 
     /** A virtual MFA device is named by the serial number the request carries. */
@@ -383,11 +379,11 @@ class IamResourceScopedPolicyEnforcementIntegrationTest {
     /** An IAM user in {@link #ACCOUNT_ID} carrying {@code policy} inline. */
     private String userWith(String policy) {
         String user = "scoped-" + suffix();
-        createUser(user);
+        String accessKeyId = EnforcementFixtures.createUser(cleanup, port(),
+                adminAuth(), user).accessKeyId();
         adminIam("PutUserPolicy", Map.of("UserName", user, "PolicyName", "p",
                 "PolicyDocument", policy)).statusCode(200);
-        return adminIam("CreateAccessKey", Map.of("UserName", user)).statusCode(200)
-                .extract().path("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
+        return accessKeyId;
     }
 
     private static ValidatableResponse adminIam(String action, Map<String, String> params) {
@@ -411,7 +407,6 @@ class IamResourceScopedPolicyEnforcementIntegrationTest {
     }
 
     private static String auth(String accessKeyId) {
-        return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260919/" + REGION + "/iam"
-                + "/aws4_request, SignedHeaders=host, Signature=abc";
+        return EnforcementFixtures.auth(accessKeyId, "iam");
     }
 }

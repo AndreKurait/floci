@@ -465,6 +465,20 @@ class ElastiCacheServiceTest {
     }
 
     @Test
+    void userErrorsUseTheBotocoreWireCodesWithoutTheFaultSuffix() {
+        service.createUser("dupe-user", "dupe", AuthMode.PASSWORD, List.of("pw"), "on ~* +@all", "redis");
+
+        AwsException duplicate = assertThrows(AwsException.class, () -> service.createUser(
+                "dupe-user", "dupe", AuthMode.PASSWORD, List.of("pw"), "on ~* +@all", "redis"));
+        assertEquals("UserAlreadyExists", duplicate.getErrorCode());
+        assertEquals(400, duplicate.getHttpStatus());
+        assertEquals("UserNotFound", assertThrows(AwsException.class, () -> service.getUser("absent")).getErrorCode());
+        assertEquals("UserNotFound",
+                assertThrows(AwsException.class, () -> service.listUsers("absent", null)).getErrorCode());
+        assertEquals("UserNotFound", assertThrows(AwsException.class, () -> service.deleteUser("absent")).getErrorCode());
+    }
+
+    @Test
     void singleArgAuthFallsBackToGroupAuthToken() {
         service.createReplicationGroup("grp", "test", AuthMode.PASSWORD, "group-token", "us-east-1");
 

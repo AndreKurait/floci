@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.bedrockruntime.backend;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -107,7 +109,69 @@ final class BedrockOpenAiTranslator {
             openAi.set("stop", stopSequences.deepCopy());
         }
 
+        translateOutputConfig(mapper, bedrockRequest.path("outputConfig"), openAi);
+
         return openAi;
+    }
+
+    /**
+     * Converts Bedrock output controls to the OpenAI wire shape, rejecting malformed
+     * configuration before either Converse operation contacts the backend.
+     */
+    private static void translateOutputConfig(ObjectMapper mapper, JsonNode outputConfig, ObjectNode openAi) {
+        if (outputConfig.isMissingNode()) {
+            return;
+        }
+        if (!outputConfig.isObject()) {
+            throw new AwsException("ValidationException", "outputConfig must be an object.", 400);
+        }
+        // Effort is independent of textFormat, so effort-only requests must survive the return below.
+        if (outputConfig.has("effort")) {
+            JsonNode effort = outputConfig.path("effort");
+            if (!effort.isTextual() || !List.of("low", "medium", "high", "xhigh", "max").contains(effort.asText())) {
+                throw new AwsException("ValidationException",
+                        "outputConfig.effort must be low, medium, high, xhigh, or max.", 400);
+            }
+            openAi.put("reasoning_effort", effort.asText());
+        }
+        JsonNode textFormat = outputConfig.path("textFormat");
+        if (textFormat.isMissingNode()) {
+            return;
+        }
+        JsonNode structure = textFormat.path("structure");
+        JsonNode definition = structure.path("jsonSchema");
+        JsonNode schemaString = definition.path("schema");
+        // structure is an AWS union: jsonSchema must be its only member.
+        if (!"json_schema".equals(textFormat.path("type").asText())
+                || !structure.isObject() || structure.size() != 1 || !definition.isObject()
+                || !schemaString.isTextual()
+                || (definition.has("name") && !definition.path("name").isTextual())
+                || (definition.has("description") && !definition.path("description").isTextual())) {
+            throw new AwsException("ValidationException",
+                    "outputConfig.textFormat requires type json_schema and structure.jsonSchema with a schema string"
+                            + " and optional string name/description.", 400);
+        }
+        JsonNode schema;
+        try {
+            // Decimal constraints must retain their precision, and trailing JSON values are malformed input.
+            schema = mapper.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                    .with(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
+                    .readTree(schemaString.asText());
+        } catch (JsonProcessingException e) {
+            throw new AwsException("ValidationException", "Structured output schema must be a JSON object.", 400);
+        }
+        if (schema == null || !schema.isObject()) {
+            throw new AwsException("ValidationException", "Structured output schema must be a JSON object.", 400);
+        }
+        // OpenAI requires a name that Bedrock makes optional, so use a stable default.
+        // Leave strict unset: its extra restrictions would reject schemas with optional properties.
+        ObjectNode responseFormat = openAi.putObject("response_format").put("type", "json_schema");
+        ObjectNode jsonSchema = responseFormat.putObject("json_schema");
+        jsonSchema.put("name", definition.path("name").asText("response"));
+        jsonSchema.set("schema", schema);
+        if (definition.has("description")) {
+            jsonSchema.set("description", definition.path("description").deepCopy());
+        }
     }
 
     /** Builds the OpenAI {@code {type: "function", function: {name}}} shape shared by tools[] entries and tool_choice. */
@@ -222,6 +286,11 @@ final class BedrockOpenAiTranslator {
         }
         StringBuilder sb = new StringBuilder();
         for (JsonNode part : toolResultContent) {
+            if (!part.isObject() || part.size() != 1 || (!part.has("text") && !part.has("json"))) {
+                throw new AwsException("ValidationException",
+                        "The proxy supports only text or json blocks in toolResult.content.",
+                        400);
+            }
             String text = part.path("text").asText(null);
             if (text == null && part.has("json")) {
                 text = part.path("json").toString();

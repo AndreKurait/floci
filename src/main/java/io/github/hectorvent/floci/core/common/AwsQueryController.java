@@ -34,22 +34,18 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Generic dispatcher for all AWS services that use the Query Protocol (form-encoded POST, XML response).
  * Routes requests to the appropriate service handler based on the service name extracted from the
- * Authorization header's credential scope, falling back to action-name matching when no auth header
- * is present.
- *
- * <p>Currently supported services:
- * <ul>
- *   <li>SQS — form-encoded query protocol</li>
- *   <li>SNS — form-encoded query protocol</li>
- *   <li>IAM — form-encoded query protocol (global service)</li>
- *   <li>STS — form-encoded query protocol (global service)</li>
- * </ul>
+ * Authorization header's credential scope. When there is no such header, or its scope names no
+ * service that speaks the Query protocol, the action name and the {@code Version} the request
+ * declares decide instead, as {@link #inferServiceFromAction} describes.
  *
  * @see AwsJsonController
  */
@@ -104,6 +100,7 @@ public class AwsQueryController {
             "TagPolicy", "UntagPolicy", "ListPolicyTags",
             "TagInstanceProfile", "UntagInstanceProfile", "ListInstanceProfileTags",
             "CreateLoginProfile", "GetLoginProfile", "DeleteLoginProfile", "UpdateLoginProfile",
+            "ChangePassword",
             "GenerateCredentialReport", "GetCredentialReport",
             "GetAccountSummary", "GetAccountAuthorizationDetails",
             "SimulatePrincipalPolicy", "SimulateCustomPolicy",
@@ -161,8 +158,9 @@ public class AwsQueryController {
             "PutScalingPolicy", "DeletePolicy", "DescribePolicies",
             "DescribeScalingActivities",
             "DescribeAutoScalingNotificationTypes", "DescribeTerminationPolicyTypes",
-            "DescribeAdjustmentTypes", "DescribeAccountLimits",
-            "DescribeLifecycleHookTypes", "DescribeMetricCollectionTypes"
+            "DescribeAdjustmentTypes", "DescribeAccountLimits", "DescribeLoadBalancers",
+            "DescribeLifecycleHookTypes", "DescribeMetricCollectionTypes",
+            "EnableMetricsCollection", "DisableMetricsCollection"
     );
 
     private static final Set<String> ELB_V2_ACTIONS = Set.of(
@@ -309,7 +307,7 @@ public class AwsQueryController {
                     "The request must contain the parameter Action", 400);
         }
 
-        String service = serviceResolver.resolve(authorization, action);
+        String service = serviceResolver.resolve(authorization, action, formParams.getFirst("Version"));
         LOG.debugv("Query protocol service={0} action={1}", service, action);
 
         String region = regionResolver.resolveRegion(httpHeaders);
@@ -528,17 +526,13 @@ public class AwsQueryController {
         return Response.status(400).entity(xml).type(MediaType.APPLICATION_XML).build();
     }
 
-    /**
-     * Determines the target AWS service. Prefers the service name embedded in the
-     * Authorization header credential scope. Falls back to action-name lookup when
-     * the header is absent (e.g. raw HTTP testing without AWS SDK auth).
-     */
     private static final Set<String> ELASTICACHE_ACTIONS = Set.of(
             "ValidateIamAuthToken",
             "CreateReplicationGroup", "DescribeReplicationGroups", "ModifyReplicationGroup", "DeleteReplicationGroup",
             "CreateUser", "DescribeUsers", "ModifyUser", "DeleteUser",
             "CreateUserGroup", "DescribeUserGroups", "ModifyUserGroup", "DeleteUserGroup",
-            "CreateServerlessCache", "DescribeServerlessCaches", "ModifyServerlessCache", "DeleteServerlessCache"
+            "CreateServerlessCache", "DescribeServerlessCaches", "ModifyServerlessCache", "DeleteServerlessCache",
+            "ListTagsForResource"
     );
 
     private static final Set<String> CLOUDWATCH_ACTIONS = Set.of(
@@ -652,53 +646,87 @@ public class AwsQueryController {
             "GetClusterCredentials", "GetClusterCredentialsWithIAM"
     );
 
-    static String inferServiceFromAction(String action) {
-        if (STS_ACTIONS.contains(action)) {
-            return "sts";
+    /**
+     * Tried last, so by name alone SQS takes only what no other service defines, as it takes a name
+     * nobody defines. Its {@code Version} is what wins back the two names SNS also defines.
+     */
+    private static final Set<String> SQS_ACTIONS = Set.of(
+            "CreateQueue", "DeleteQueue", "ListQueues", "GetQueueUrl",
+            "GetQueueAttributes", "SetQueueAttributes", "PurgeQueue",
+            "SendMessage", "SendMessageBatch", "ReceiveMessage", "DeleteMessage", "DeleteMessageBatch",
+            "ChangeMessageVisibility", "ChangeMessageVisibilityBatch",
+            "TagQueue", "UntagQueue", "ListQueueTags", "ListDeadLetterSourceQueues",
+            "StartMessageMoveTask", "ListMessageMoveTasks", "CancelMessageMoveTask",
+            "AddPermission", "RemovePermission"
+    );
+
+    /** ELBv2's names and Classic's own. A name both APIs define is split by {@link #isElbClassicRequest}. */
+    private static final Set<String> ELB_ACTIONS = Stream.concat(
+            ELB_V2_ACTIONS.stream(), ElbClassicQueryHandler.CLASSIC_ONLY_ACTIONS.stream())
+            .collect(Collectors.toUnmodifiableSet());
+
+    /** A Query service, the API versions its clients declare, and the action names it serves. */
+    private record QueryService(String name, Set<String> apiVersions, Set<String> actions) {
+    }
+
+    /**
+     * Every Query service, in the order they are tried when the action name alone has to decide:
+     * where two services define the same name, the earlier one takes it.
+     *
+     * <p>An API version is the {@code apiVersion} of the service's model. SES and Elastic Beanstalk
+     * publish the same one and share no action name, so the action settles which of the two a
+     * request is for. Both Elastic Load Balancing APIs lead to one service here and
+     * {@link #isElbClassicRequest} splits them on the same field, and DocumentDB and Neptune publish
+     * RDS's version and are split from it in the {@code rds} case. Cognito's model is JSON only, so
+     * no Query client declares a version for it.
+     */
+    private static final List<QueryService> QUERY_SERVICES = List.of(
+            new QueryService("sts", Set.of("2011-06-15"), STS_ACTIONS),
+            new QueryService("iam", Set.of("2010-05-08"), IAM_ACTIONS),
+            new QueryService("sns", Set.of("2010-03-31"), SNS_ACTIONS),
+            new QueryService("elasticache", Set.of("2015-02-02"), ELASTICACHE_ACTIONS),
+            new QueryService("rds", Set.of("2014-10-31"), RDS_ACTIONS),
+            new QueryService("monitoring", Set.of("2010-08-01"), CLOUDWATCH_ACTIONS),
+            new QueryService("cloudformation", Set.of("2010-05-15"), CLOUDFORMATION_ACTIONS),
+            new QueryService("email", Set.of("2010-12-01"), SES_ACTIONS),
+            new QueryService("cognito-idp", Set.of(), COGNITO_ACTIONS),
+            new QueryService("ec2", Set.of("2016-11-15"), EC2_ACTIONS),
+            new QueryService("elasticloadbalancing",
+                    Set.of(ELB_V2_API_VERSION, ELB_CLASSIC_API_VERSION), ELB_ACTIONS),
+            new QueryService("autoscaling", Set.of("2011-01-01"), AUTOSCALING_ACTIONS),
+            new QueryService("elasticbeanstalk", Set.of("2010-12-01"), ELASTIC_BEANSTALK_ACTIONS),
+            new QueryService("redshift", Set.of("2012-12-01"), REDSHIFT_ACTIONS),
+            new QueryService("sqs", Set.of("2012-11-05"), SQS_ACTIONS));
+
+    /**
+     * The service a Query request goes to when its credential scope does not name one.
+     *
+     * <p>The action name alone is ambiguous wherever two services define it, and then the earlier
+     * one in {@link #QUERY_SERVICES} wins. The {@code Version} every Query client sends is what
+     * tells them apart, as {@link #isElbClassicRequest} already uses it for the two Elastic Load
+     * Balancing APIs: {@code CreateUser} under IAM's version is IAM's, and under ElastiCache's it
+     * is ElastiCache's.
+     *
+     * <p>{@code Version} only chooses among the services that serve the name. One that names a
+     * service without it, or none at all, leaves the order to decide, so a hand-rolled request that
+     * omits the field goes exactly where it went before.
+     */
+    static String inferServiceFromAction(String action, String version) {
+        String byName = null;
+        for (QueryService service : QUERY_SERVICES) {
+            if (!service.actions().contains(action)) {
+                continue;
+            }
+            if (version != null && service.apiVersions().contains(version)) {
+                return service.name();
+            }
+            if (byName == null) {
+                byName = service.name();
+            }
         }
-        if (IAM_ACTIONS.contains(action)) {
-            return "iam";
-        }
-        if (SNS_ACTIONS.contains(action)) {
-            return "sns";
-        }
-        if (ELASTICACHE_ACTIONS.contains(action)) {
-            return "elasticache";
-        }
-        if (RDS_ACTIONS.contains(action)) {
-            return "rds";
-        }
-        if (CLOUDWATCH_ACTIONS.contains(action)) {
-            return "monitoring";
-        }
-        if (CLOUDFORMATION_ACTIONS.contains(action)) {
-            return "cloudformation";
-        }
-        if (SES_ACTIONS.contains(action)) {
-            return "email";
-        }
-        if (COGNITO_ACTIONS.contains(action)) {
-            return "cognito-idp";
-        }
-        if (EC2_ACTIONS.contains(action)) {
-            return "ec2";
-        }
-        if (ELB_V2_ACTIONS.contains(action)
-                || ElbClassicQueryHandler.CLASSIC_ONLY_ACTIONS.contains(action)) {
-            return "elasticloadbalancing";
-        }
-        if (AUTOSCALING_ACTIONS.contains(action)) {
-            return "autoscaling";
-        }
-        if (ELASTIC_BEANSTALK_ACTIONS.contains(action)) {
-            return "elasticbeanstalk";
-        }
-        if (REDSHIFT_ACTIONS.contains(action)) {
-            return "redshift";
-        }
-        // SQS actions are numerous and not enumerated — fall back to sqs only for
-        // requests that arrived without an Authorization header (raw/test clients)
-        return "sqs";
+        // A name no service defines goes to SQS, which is how a raw SQS request without an
+        // Authorization header gets there.
+        return byName != null ? byName : "sqs";
     }
 
     private Response xmlErrorResponse(String code, String message, int status) {

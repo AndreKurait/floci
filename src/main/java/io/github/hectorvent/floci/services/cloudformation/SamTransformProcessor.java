@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import org.jboss.logging.Logger;
 
@@ -17,8 +18,9 @@ import java.util.regex.Pattern;
 
 /**
  * Expands {@code AWS::Serverless-2016-10-31} SAM resource types into standard CloudFormation
- * resources. Inline policy documents in {@code Policies} are silently ignored — only ARN
- * references are attached as managed policies on the generated execution role.
+ * resources. Inline policy documents in a function's {@code Policies} are silently ignored: only
+ * ARN references are attached as managed policies on the generated execution role. The role does
+ * carry the inline policies SAM generates for {@code EventInvokeConfig} destinations.
  */
 class SamTransformProcessor {
 
@@ -56,7 +58,20 @@ class SamTransformProcessor {
         return false;
     }
 
+    /**
+     * Expands the template with no parameter values: a parameter reference SAM resolves falls back
+     * to the parameter's {@code Default}. Every stack operation passes its values to
+     * {@link #expandSamTemplate(JsonNode, Map)} instead.
+     */
     JsonNode expandSamTemplate(JsonNode template) {
+        return expandSamTemplate(template, Map.of());
+    }
+
+    /**
+     * Expands the template with the stack's parameter values, which SAM's translator resolves
+     * parameter references against (falling back to each parameter's {@code Default}).
+     */
+    JsonNode expandSamTemplate(JsonNode template, Map<String, String> parameterValues) {
         if (!hasSamTransform(template)) {
             return template;
         }
@@ -104,7 +119,8 @@ class SamTransformProcessor {
             // copyResourceLevelAttributes runs once per arm, right after that arm builds its node.
             switch (type) {
                 case "AWS::Serverless::Function" -> {
-                    expandServerlessFunction(logicalId, mergeGlobals(globals, "Function", properties), expandedResources);
+                    expandServerlessFunction(logicalId, mergeGlobals(globals, "Function", properties),
+                            resDef, expanded, expandedResources, parameterValues);
                     copyResourceLevelAttributes(resDef, (ObjectNode) expandedResources.path(logicalId));
                 }
                 case "AWS::Serverless::SimpleTable" -> {
@@ -914,22 +930,28 @@ class SamTransformProcessor {
         return base;
     }
 
-    private void expandServerlessFunction(String logicalId, JsonNode properties, ObjectNode resources) {
+    private void expandServerlessFunction(String logicalId, JsonNode properties, JsonNode source,
+                                          ObjectNode template, ObjectNode resources,
+                                          Map<String, String> parameterValues) {
         resources.remove(logicalId);
+        ObjectNode passthrough = passthroughAttributes(source);
 
         boolean hasExplicitRole = !properties.path("Role").isMissingNode()
                 && !properties.path("Role").isNull();
         String roleLogicalId = logicalId + "Role";
 
-        if (!hasExplicitRole) {
-            ObjectNode roleResource = createExecutionRole(properties);
-            resources.set(roleLogicalId, roleResource);
-        }
-
         ObjectNode lambdaResource = createLambdaFunction(logicalId, roleLogicalId, properties, hasExplicitRole);
         resources.set(logicalId, lambdaResource);
 
-        expandAutoPublishAlias(logicalId, properties, resources);
+        String aliasLogicalId = expandAutoPublishAlias(logicalId, properties, passthrough, resources);
+        List<ObjectNode> eventInvokePolicies = expandEventInvokeConfig(
+                logicalId, properties, aliasLogicalId, passthrough, template, resources, parameterValues);
+
+        if (!hasExplicitRole) {
+            ObjectNode roleResource = createExecutionRole(properties, eventInvokePolicies);
+            roleResource.setAll(passthrough.deepCopy());
+            resources.set(roleLogicalId, roleResource);
+        }
 
         JsonNode events = properties.path("Events");
         if (events.isObject()) {
@@ -959,11 +981,12 @@ class SamTransformProcessor {
      * {@code $LATEST}; none is required, since the alias does not reference the version. It
      * returns with the {@code Fn::GetAtt} form once #1987 lands.
      */
-    private void expandAutoPublishAlias(String functionLogicalId, JsonNode properties, ObjectNode resources) {
+    private String expandAutoPublishAlias(String functionLogicalId, JsonNode properties, ObjectNode passthrough,
+                                          ObjectNode resources) {
         JsonNode aliasName = properties.path("AutoPublishAlias");
         if (aliasName.isMissingNode() || aliasName.isNull()
                 || (aliasName.isTextual() && aliasName.asText().isBlank())) {
-            return;
+            return null;
         }
 
         String versionId = uniqueId(functionLogicalId + "Version", resources);
@@ -972,6 +995,7 @@ class SamTransformProcessor {
         ObjectNode versionProps = objectMapper.createObjectNode();
         versionProps.set("FunctionName", ref(functionLogicalId));
         versionDef.set("Properties", versionProps);
+        versionDef.setAll(passthrough.deepCopy());
         resources.set(versionId, versionDef);
 
         // Alias names may legally contain '-' and '_', neither of which is valid in a
@@ -993,10 +1017,358 @@ class SamTransformProcessor {
         // Switch to the GetAtt form once #1987 lands.
         aliasProps.put("FunctionVersion", "$LATEST");
         aliasDef.set("Properties", aliasProps);
+        aliasDef.setAll(passthrough.deepCopy());
         resources.set(aliasId, aliasDef);
+        return aliasId;
     }
 
-    private ObjectNode createExecutionRole(JsonNode properties) {
+    private static final List<String> EVENT_INVOKE_DESTINATION_TYPES =
+            List.of("SQS", "SNS", "EventBridge", "Lambda", "S3Bucket");
+
+    /** The resource attributes SAM copies from a function onto every resource it generates for it. */
+    private static final List<String> PASSTHROUGH_ATTRIBUTES = List.of("Condition", "DeletionPolicy", "UpdateReplacePolicy");
+
+    private ObjectNode passthroughAttributes(JsonNode source) {
+        ObjectNode attributes = objectMapper.createObjectNode();
+        for (String attribute : PASSTHROUGH_ATTRIBUTES) {
+            if (isPropertyPresent(source.path(attribute))) {
+                attributes.set(attribute, source.path(attribute).deepCopy());
+            }
+        }
+        return attributes;
+    }
+
+    /** What expanding one function's EventInvokeConfig shares between its destinations. */
+    private record EventInvokeContext(String functionLogicalId, String configLogicalId, ObjectNode passthrough,
+                                      ObjectNode template, ObjectNode resources, List<ObjectNode> policies,
+                                      Map<String, String> parameterValues) {
+
+        String functionCondition() {
+            return passthrough.path("Condition").asText(null);
+        }
+    }
+
+    /**
+     * Expands {@code EventInvokeConfig} as SAM's translator does: an
+     * {@code AWS::Lambda::EventInvokeConfig} named {@code <Function>EventInvokeConfig}, on
+     * {@code $LATEST} or, with {@code AutoPublishAlias}, on that alias. Each destination's SAM-only
+     * {@code Type} is dropped from the configuration and becomes the inline role policy letting
+     * the function deliver there. An SQS or SNS destination given only its {@code Type} gets the
+     * queue or topic SAM creates for it. Returns those policies, for the generated execution role.
+     *
+     * <p>A {@code Destination} that is an {@code Fn::If} with {@code AWS::NoValue} in one branch
+     * creates the queue or topic only under that branch's condition, using the condition names
+     * SAM generates, so the expanded template matches {@code sam deploy}'s.
+     */
+    private List<ObjectNode> expandEventInvokeConfig(String functionLogicalId, JsonNode properties,
+                                                     String aliasLogicalId, ObjectNode passthrough,
+                                                     ObjectNode template, ObjectNode resources,
+                                                     Map<String, String> parameterValues) {
+        JsonNode config = properties.path("EventInvokeConfig");
+        if (isPropertyPresent(config) && !config.isObject()) {
+            throw invalidResource(functionLogicalId, "Property 'EventInvokeConfig' should be a map.");
+        }
+        if (!config.isObject() || config.isEmpty()) {
+            return List.of();
+        }
+        EventInvokeContext context = new EventInvokeContext(functionLogicalId,
+                functionLogicalId + "EventInvokeConfig", passthrough, template, resources, new ArrayList<>(),
+                parameterValues);
+        requireUnused(context, context.configLogicalId(), "AWS::Lambda::EventInvokeConfig");
+        ObjectNode destinations = objectMapper.createObjectNode();
+
+        JsonNode destinationConfig = config.path("DestinationConfig");
+        if (isTruthy(destinationConfig)) {
+            if (!destinationConfig.isObject()) {
+                throw invalidResource(functionLogicalId,
+                        "Property 'EventInvokeConfig.DestinationConfig' should be a map.");
+            }
+            for (String event : List.of("OnSuccess", "OnFailure")) {
+                JsonNode destination = destinationConfig.path(event);
+                if (!isPropertyPresent(destination)) {
+                    continue;
+                }
+                if (!destination.isObject()) {
+                    throw invalidResource(functionLogicalId,
+                            "Property 'EventInvokeConfig.DestinationConfig." + event + "' should be a map.");
+                }
+                ObjectNode target = objectMapper.createObjectNode();
+                target.set("Destination", expandDestination(context, context.configLogicalId() + event, destination));
+                destinations.set(event, target);
+            }
+        }
+
+        ObjectNode configProps = objectMapper.createObjectNode();
+        configProps.set("FunctionName", ref(functionLogicalId));
+        if (aliasLogicalId != null) {
+            configProps.set("Qualifier", properties.path("AutoPublishAlias").deepCopy());
+        } else {
+            configProps.put("Qualifier", "$LATEST");
+        }
+        configProps.set("DestinationConfig", destinations);
+        copyIfPresent(config, "MaximumEventAgeInSeconds", configProps);
+        copyIfPresent(config, "MaximumRetryAttempts", configProps);
+
+        ObjectNode configDef = objectMapper.createObjectNode();
+        configDef.put("Type", "AWS::Lambda::EventInvokeConfig");
+        configDef.set("Properties", configProps);
+        if (aliasLogicalId != null) {
+            configDef.set("DependsOn", objectMapper.createArrayNode().add(aliasLogicalId));
+        }
+        configDef.setAll(passthrough.deepCopy());
+        resources.set(context.configLogicalId(), configDef);
+        return context.policies();
+    }
+
+    /** The queue or topic SAM creates for an SQS or SNS destination given only its Type. */
+    private record CreatedDestination(String suffix, String resourceType, boolean arnIsRef) {
+
+        static CreatedDestination forType(String type) {
+            return switch (type) {
+                case "SQS" -> new CreatedDestination("Queue", "AWS::SQS::Queue", false);
+                case "SNS" -> new CreatedDestination("Topic", "AWS::SNS::Topic", true);
+                default -> null;
+            };
+        }
+    }
+
+    /**
+     * One destination's ARN for the configuration, creating the queue or topic SAM creates when
+     * none is given, and adding the policy that lets the function deliver to it.
+     */
+    private JsonNode expandDestination(EventInvokeContext context, String destinationLogicalId, JsonNode destination) {
+        String type = destinationType(destination.path("Type"), context.template(), context.parameterValues());
+        if (type == null) {
+            throw invalidResource(context.functionLogicalId(), "'Type: " + pythonRepr(destination.path("Type"))
+                    + "' must be one of " + pythonRepr(EVENT_INVOKE_DESTINATION_TYPES));
+        }
+        JsonNode given = destination.path("Destination");
+        boolean hasDestination = isPropertyPresent(given);
+
+        String propertyCondition = null;
+        JsonNode otherBranch = null;
+        if (hasDestination && given.isObject() && given.size() == 1 && given.path("Fn::If").isArray()
+                && given.path("Fn::If").size() == 3 && given.path("Fn::If").get(0).isTextual()) {
+            JsonNode branches = given.path("Fn::If");
+            boolean trueIsNoValue = isNoValue(branches.get(1));
+            boolean falseIsNoValue = isNoValue(branches.get(2));
+            if (trueIsNoValue && !falseIsNoValue) {
+                propertyCondition = branches.get(0).asText();
+                otherBranch = branches.get(2);
+            } else if (falseIsNoValue && !trueIsNoValue) {
+                propertyCondition = generatedConditionName("NOT" + branches.get(0).asText(), context.configLogicalId());
+                ObjectNode not = objectMapper.createObjectNode();
+                not.set("Fn::Not", objectMapper.createArrayNode().add(conditionRef(branches.get(0).asText())));
+                conditions(context.template()).set(propertyCondition, not);
+                otherBranch = branches.get(1);
+            }
+        }
+
+        JsonNode resolved = given.deepCopy();
+        if (!hasDestination || propertyCondition != null) {
+            CreatedDestination created = CreatedDestination.forType(type);
+            if (created == null) {
+                throw invalidResource(context.functionLogicalId(), "Destination is required if Type is not "
+                        + pythonRepr(List.of("SQS", "SNS")));
+            }
+            String createdLogicalId = destinationLogicalId + created.suffix();
+            requireUnused(context, createdLogicalId, created.resourceType());
+            ObjectNode createdDef = objectMapper.createObjectNode();
+            createdDef.put("Type", created.resourceType());
+            createdDef.set("Properties", objectMapper.createObjectNode());
+            createdDef.setAll(context.passthrough().deepCopy());
+            String createdCondition = andConditions(context, propertyCondition);
+            if (createdCondition != null) {
+                createdDef.put("Condition", createdCondition);
+            }
+            context.resources().set(createdLogicalId, createdDef);
+            JsonNode createdArn = created.arnIsRef() ? ref(createdLogicalId) : getAtt(createdLogicalId, "Arn");
+            if (propertyCondition != null) {
+                ObjectNode conditional = objectMapper.createObjectNode();
+                conditional.set("Fn::If", objectMapper.createArrayNode()
+                        .add(propertyCondition).add(createdArn).add(otherBranch.deepCopy()));
+                resolved = conditional;
+            } else {
+                resolved = createdArn;
+            }
+        }
+        context.policies().add(destinationPolicy(type, destinationLogicalId, resolved));
+        return resolved;
+    }
+
+    /**
+     * The destination type, one of {@link #EVENT_INVOKE_DESTINATION_TYPES} exactly as SAM spells
+     * them, or null. SAM resolves a {@code Ref} to a template parameter before checking it: to the
+     * value the stack was given, or else to the parameter's {@code Default}.
+     */
+    private static String destinationType(JsonNode type, JsonNode template, Map<String, String> parameterValues) {
+        String value = type.isTextual() ? type.asText() : null;
+        if (type.isObject() && type.size() == 1 && type.path("Ref").isTextual()) {
+            String parameter = type.path("Ref").asText();
+            JsonNode defaultValue = template.path("Parameters").path(parameter).path("Default");
+            if (parameterValues.containsKey(parameter)) {
+                value = parameterValues.get(parameter);
+            } else if (defaultValue.isTextual()) {
+                value = defaultValue.asText();
+            }
+        }
+        return value != null && EVENT_INVOKE_DESTINATION_TYPES.contains(value) ? value : null;
+    }
+
+    /** The inline policy SAM adds to the execution role for a destination of {@code type}. */
+    private ObjectNode destinationPolicy(String type, String destinationLogicalId, JsonNode destination) {
+        ArrayNode statements = objectMapper.createArrayNode();
+        String policySuffix = type;
+        switch (type) {
+            case "SQS" -> statements.add(allow("sqs:SendMessage", destination.deepCopy()));
+            // SAM's own policy template spells the action in lower case.
+            case "SNS" -> statements.add(allow("sns:publish", destination.deepCopy()));
+            case "EventBridge" -> statements.add(allow("events:PutEvents", destination.deepCopy()));
+            case "Lambda" -> statements.add(allow("lambda:InvokeFunction", destination.deepCopy()));
+            default -> {
+                ObjectNode objects = objectMapper.createObjectNode();
+                objects.set("Fn::Join", objectMapper.createArrayNode().add("/")
+                        .add(objectMapper.createArrayNode().add(destination.deepCopy()).add("*")));
+                statements.add(allow("s3:PutObject", objects));
+                statements.add(allow("s3:ListBucket", destination.deepCopy()));
+                policySuffix = "S3";
+            }
+        }
+        ObjectNode document = objectMapper.createObjectNode();
+        document.set("Statement", statements);
+        ObjectNode policy = objectMapper.createObjectNode();
+        policy.set("PolicyDocument", document);
+        policy.put("PolicyName", destinationLogicalId + policySuffix + "Policy");
+        return policy;
+    }
+
+    private ObjectNode allow(String action, JsonNode resource) {
+        ObjectNode statement = objectMapper.createObjectNode();
+        statement.put("Action", action);
+        statement.put("Effect", "Allow");
+        statement.set("Resource", resource);
+        return statement;
+    }
+
+    /** SAM refuses to replace a resource the template already declares with one it generates. */
+    private static void requireUnused(EventInvokeContext context, String logicalId, String resourceType) {
+        if (context.resources().has(logicalId)) {
+            throw new AwsException("ValidationError", "Transforming resource with id [" + context.functionLogicalId()
+                    + "] attempts to create a new resource with id [" + logicalId + "] and type \"" + resourceType
+                    + "\". A resource with that id already exists within this template. Please use a different id"
+                    + " for that resource.", 400);
+        }
+    }
+
+    /**
+     * The condition a created destination carries: the function's, the destination's, or a new
+     * one requiring both, named and built as SAM's translator builds it. SAM nests each operand
+     * as {@code {"Condition": {"Condition": name}}}, which CloudFormation rejects ("every Condition
+     * object must have a single String value."); the shape is kept so floci rejects the stack as
+     * AWS does.
+     */
+    private String andConditions(EventInvokeContext context, String propertyCondition) {
+        String functionCondition = context.functionCondition();
+        if (functionCondition == null) {
+            return propertyCondition;
+        }
+        if (propertyCondition == null) {
+            return functionCondition;
+        }
+        String name = generatedConditionName(functionCondition + "AND" + propertyCondition, context.functionLogicalId());
+        ObjectNode and = objectMapper.createObjectNode();
+        and.set("Fn::And", objectMapper.createArrayNode()
+                .add(objectMapper.createObjectNode().set("Condition", conditionRef(functionCondition)))
+                .add(objectMapper.createObjectNode().set("Condition", conditionRef(propertyCondition))));
+        conditions(context.template()).set(name, and);
+        return name;
+    }
+
+    /**
+     * SAM's generated condition name: the name plus the first ten hex digits of the SHA-1 of
+     * {@code hashInput}, cut to CloudFormation's 255-character limit. SHA-1 is SAM's choice and is
+     * kept so the names match; nothing here relies on it being collision-resistant.
+     */
+    private static String generatedConditionName(String name, String hashInput) {
+        String conditionName = name + Digests.sha1Hex(hashInput).substring(0, 10);
+        return conditionName.length() > 255 ? conditionName.substring(0, 255) : conditionName;
+    }
+
+    private ObjectNode conditionRef(String conditionName) {
+        return objectMapper.createObjectNode().put("Condition", conditionName);
+    }
+
+    private static ObjectNode conditions(ObjectNode template) {
+        JsonNode existing = template.path("Conditions");
+        return existing.isObject() ? (ObjectNode) existing : template.putObject("Conditions");
+    }
+
+    private static boolean isNoValue(JsonNode node) {
+        return node.isObject() && node.size() == 1 && "AWS::NoValue".equals(node.path("Ref").asText());
+    }
+
+    /** Python truthiness, which SAM applies to an optional property before reading it. */
+    private static boolean isTruthy(JsonNode node) {
+        if (node.isMissingNode() || node.isNull()) {
+            return false;
+        }
+        if (node.isContainerNode()) {
+            return !node.isEmpty();
+        }
+        if (node.isTextual()) {
+            return !node.asText().isEmpty();
+        }
+        if (node.isBoolean()) {
+            return node.asBoolean();
+        }
+        return node.isNumber() ? node.asDouble() != 0 : true;
+    }
+
+    /**
+     * How Python's {@code format} prints a value, which is how SAM's messages show one: a top-level
+     * string bare, strings inside a dict or list quoted with {@code '}, a missing value as
+     * {@code None}.
+     */
+    private static String pythonRepr(JsonNode value) {
+        return value.isTextual() ? value.asText() : pythonNested(value);
+    }
+
+    private static String pythonRepr(List<String> values) {
+        StringBuilder out = new StringBuilder("[");
+        for (int i = 0; i < values.size(); i++) {
+            out.append(i == 0 ? "" : ", ").append('\'').append(values.get(i)).append('\'');
+        }
+        return out.append(']').toString();
+    }
+
+    private static String pythonNested(JsonNode value) {
+        if (value.isMissingNode() || value.isNull()) {
+            return "None";
+        }
+        if (value.isTextual()) {
+            return "'" + value.asText() + "'";
+        }
+        if (value.isBoolean()) {
+            return value.asBoolean() ? "True" : "False";
+        }
+        if (value.isArray()) {
+            List<String> items = new ArrayList<>();
+            value.forEach(item -> items.add(pythonNested(item)));
+            return "[" + String.join(", ", items) + "]";
+        }
+        if (value.isObject()) {
+            List<String> entries = new ArrayList<>();
+            value.properties().forEach(entry -> entries.add("'" + entry.getKey() + "': " + pythonNested(entry.getValue())));
+            return "{" + String.join(", ", entries) + "}";
+        }
+        return value.asText();
+    }
+
+    private static AwsException invalidResource(String logicalId, String reason) {
+        return new AwsException("ValidationError", "Resource with id [" + logicalId + "] is invalid. " + reason, 400);
+    }
+
+    private ObjectNode createExecutionRole(JsonNode properties, List<ObjectNode> inlinePolicies) {
         ObjectNode roleDef = objectMapper.createObjectNode();
         roleDef.put("Type", "AWS::IAM::Role");
 
@@ -1031,6 +1403,9 @@ class SamTransformProcessor {
             managedPolicies.add(userPolicies.asText());
         }
         roleProps.set("ManagedPolicyArns", managedPolicies);
+        if (!inlinePolicies.isEmpty()) {
+            roleProps.set("Policies", objectMapper.createArrayNode().addAll(inlinePolicies));
+        }
 
         roleDef.set("Properties", roleProps);
         return roleDef;
@@ -1542,8 +1917,7 @@ class SamTransformProcessor {
         } else {
             reason = "Type of property 'DefinitionUri' is invalid.";
         }
-        throw new AwsException("ValidationError",
-                "Resource with id [" + logicalId + "] is invalid. " + reason, 400);
+        throw invalidResource(logicalId, reason);
     }
 
     /** Copies {@code source.<field>} to {@code target.<field>} when present and non-null. */

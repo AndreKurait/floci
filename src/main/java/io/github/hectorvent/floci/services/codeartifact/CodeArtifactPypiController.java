@@ -85,7 +85,8 @@ public class CodeArtifactPypiController {
         this.httpClient = httpClient;
     }
 
-    private record RepositoryHandle(String repoId, String baseUrl, String pathPrefix) {
+    private record RepositoryHandle(String repoId, String baseUrl, String pathPrefix, String region,
+                                     String owner) {
     }
 
     // No route for the bare "/simple/" project-list endpoint: AWS's CodeArtifact User Guide
@@ -181,7 +182,17 @@ public class CodeArtifactPypiController {
                         .build();
             }
 
-            return forwardUpload(handle.baseUrl(), contentType, content);
+            // Snapshotted before the real write, not after: see
+            // CodeArtifactService#currentContainerBackedPackageFence's own javadoc for why the
+            // order matters.
+            long fenceSnapshot = service.currentContainerBackedPackageFence(handle.region(), domain, handle.owner(),
+                    repository, "pypi", null, packageName);
+            Response response = forwardUpload(handle.baseUrl(), contentType, content);
+            if (response.getStatus() == 200 || response.getStatus() == 201) {
+                service.recordContainerBackedAssetBytes(handle.region(), domain, handle.owner(), repository,
+                        "pypi", null, packageName, file.get().content().length, fenceSnapshot);
+            }
+            return response;
         }
     }
 
@@ -314,6 +325,7 @@ public class CodeArtifactPypiController {
             throw new NotFoundException();
         }
         String baseUrl = pypiserver.ensureReady(repoId, null);
-        return new RepositoryHandle(repoId, baseUrl, "/codeartifact/pypi/" + domain + "/" + repository);
+        return new RepositoryHandle(repoId, baseUrl, "/codeartifact/pypi/" + domain + "/" + repository,
+                scope.region(), scope.owner());
     }
 }

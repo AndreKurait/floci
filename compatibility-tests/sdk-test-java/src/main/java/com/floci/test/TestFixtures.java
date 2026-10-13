@@ -164,6 +164,8 @@ import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
+import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -204,6 +206,29 @@ public final class TestFixtures {
      */
     public static boolean isRealAws() {
         return "aws".equalsIgnoreCase(System.getenv("FLOCI_TARGET"));
+    }
+
+    /**
+     * Polls a compatibility condition while preserving each test's timeout and AWS/local cadence.
+     * Terminal-state and service-exception handling stays in the condition supplied by the test.
+     */
+    public static void await(BooleanSupplier condition, String resourceName, String expected,
+                             long timeoutNanos, long pollMillis) throws InterruptedException {
+        await(condition, resourceName, expected, timeoutNanos, pollMillis, () -> "");
+    }
+
+    /** Polls a condition and appends lazily produced diagnostics when the wait expires. */
+    public static void await(BooleanSupplier condition, String resourceName, String expected,
+                             long timeoutNanos, long pollMillis, Supplier<String> timeoutDetails)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + timeoutNanos;
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(pollMillis);
+        }
+        throw new AssertionError(resourceName + " timed out waiting for " + expected + timeoutDetails.get());
     }
 
     /** The region every fixture client signs for, for tests that build or compare region-scoped values. */

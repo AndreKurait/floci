@@ -158,6 +158,8 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
         LOG.infov("Launching pod for function: {0}", fn.getFunctionName());
 
         RuntimeApiServer runtimeApiServer = runtimeApiServerFactory.create();
+        runtimeApiServer.setFunctionMetadata(fn.getFunctionName(), fn.getVersion(), fn.getHandler(),
+                fn.getAccountId());
 
         // Mirrors ContainerLauncher: any failure after the runtime-api server is allocated
         // must release its port and delete a half-created pod, or cold-start bursts leak
@@ -186,7 +188,6 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
             env.add("AWS_LAMBDA_FUNCTION_NAME=" + fn.getFunctionName());
             env.add("AWS_LAMBDA_FUNCTION_MEMORY_SIZE=" + fn.getMemorySize());
             env.add("AWS_LAMBDA_FUNCTION_TIMEOUT=" + fn.getTimeout());
-            env.add("AWS_LAMBDA_FUNCTION_VERSION=$LATEST");
             env.add("AWS_LAMBDA_LOG_GROUP_NAME=" + cwLogGroup);
             env.add("AWS_LAMBDA_LOG_STREAM_NAME=" + cwLogStream);
             if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
@@ -207,6 +208,9 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
                     }
                 });
             }
+
+            env.removeIf(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION="));
+            env.add("AWS_LAMBDA_FUNCTION_VERSION=" + fn.getVersion());
 
             LambdaPodSpecFactory.ImageConfig imageConfig = imagePackage
                     ? new LambdaPodSpecFactory.ImageConfig(fn.getImageConfigEntryPoint(),

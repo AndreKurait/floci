@@ -20,6 +20,17 @@ follows the AWS Sign-In `AuthorizeOAuth2Access` and `CreateOAuth2Token` wire sha
 one-time codes, PKCE verification, refresh-token expiry, and the `aws_sigv4` temporary credential
 type.
 
+The cross-device flow works too, for a CLI that cannot open a browser on the same machine:
+
+```bash
+aws login --remote --endpoint-url http://localhost:4566 --region us-east-1
+```
+
+The CLI prints the authorize URL and waits for a code. After the consent page, Floci lands on
+`/v1/sessions/confirmation` on the same endpoint, the path AWS Sign-In uses, and shows the
+verification code to paste back. The redirect must point at the endpoint the request arrived on
+or at the AWS Sign-In host of a region in the deployment's partition; any other origin is refused.
+
 ## Supported Actions
 
 ### Users
@@ -294,6 +305,7 @@ validation.
 | GetLoginProfile | Returns a user's login profile. |
 | UpdateLoginProfile | Updates a user's login profile password and/or reset-required flag. |
 | DeleteLoginProfile | Deletes a user's login profile. |
+| ChangePassword | Changes the console password of the user who is calling. |
 
 `UserName` is optional on `CreateLoginProfile`, `GetLoginProfile` and `DeleteLoginProfile`: it
 defaults to the user resolved from the signing access key, the same fallback `GetUser` uses. It is
@@ -309,6 +321,37 @@ class, and when the account has an [account password policy](#account-password-p
 also checked against that policy's length and character-class requirements, with
 `PasswordPolicyViolation` returned on either action if it doesn't comply. The password itself is never
 echoed back by any of these actions, matching AWS.
+
+`ChangePassword` is the self-service half of `UpdateLoginProfile`. It takes no `UserName` and acts
+only on the user whose access key signed the request, which is what the API reference means by "the
+IAM user who is calling this operation", and the account root password is not affected by it. A
+caller with no IAM user behind its key, which is Floci's stand-in for account root credentials, is
+refused with `InvalidUserType`, the error the CLI reference documents for that case. `OldPassword`
+must match the stored password, and the reference publishes no error for a mismatch, so Floci
+answers `InvalidParameterValue`, the common error type for a parameter value the service cannot
+accept. It is checked before the new password is held to the account policy, so a caller who cannot
+prove the current password learns nothing about what the policy requires. A successful change
+clears `PasswordResetRequired`, which is what lets a user whose password an administrator reset
+restore their own console access programmatically, and it updates the `password_last_changed` the
+credential report reads.
+
+`PasswordReusePrevention` is enforced on `ChangePassword` and on `UpdateLoginProfile`, which share
+one history per login profile, so an administrator reset cannot put back a password a user has just
+been refused. The reference defines the value as "the number of previous passwords that IAM users
+are prevented from reusing", and says that with no value set users "are not prevented from reusing
+previous passwords". The password the profile currently holds is refused alongside the superseded
+ones, which the reference does not spell out: read the other way, the smallest window the policy
+accepts would still allow setting a password to the value it already has, and would not refuse the
+change away and straight back that the setting exists for. History is recorded whether or not a
+window is set, so switching the policy on has something to compare against, bounded at the 24 the
+policy can ask for, and it goes with the profile when `DeleteLoginProfile` removes it.
+
+`AllowUsersToChangePassword` is accepted and reported but grants nothing. The user
+guide says the option gives all users in the account "access to the iam:ChangePassword action for
+only their user and to the iam:GetAccountPasswordPolicy action", applied at the account level
+rather than by attaching a policy to each user. Floci authorizes both actions from identity
+policies alone, so under [enforcement](#iam-enforcement-mode) a caller needs a policy naming their
+own user however the flag is set.
 
 `DeleteUser` returns `DeleteConflict`, as on AWS, while the user still has a login profile, access
 keys, inline policies, attached managed policies, group memberships, an

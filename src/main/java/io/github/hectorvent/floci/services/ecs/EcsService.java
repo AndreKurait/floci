@@ -81,6 +81,7 @@ import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -1639,24 +1640,24 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
      * reconciliation can recognize it as service-owned without trusting the caller-settable
      * {@code group}. This is the only path that sets {@code owningServiceArn}.
      */
-    private EcsTask launchServiceTask(EcsCluster cluster, EcsServiceModel svc, LaunchType launchType,
+    private EcsTask launchServiceTask(EcsCluster cluster, EcsServiceModel svc, Placement placement,
                                        String containerInstanceArn, String region) {
         // Read before the task definition: UpdateService sets it first, so a launch it overtakes is stamped stale.
         String deploymentId = deploymentId(svc);
         TaskDefinition taskDef = resolveTaskDefinitionOrThrow(svc.getTaskDefinition(), region);
         RunTaskRequest request = new RunTaskRequest();
         request.setCount(1);
-        request.setLaunchType(launchType);
         // AWS labels a service's tasks "service:<name>" and attributes them to the deployment.
         request.setGroup("service:" + svc.getServiceName());
         request.setStartedBy(deploymentId);
         request.setNetworkConfiguration(svc.getNetworkConfiguration());
         request.setPlatformVersion(svc.getPlatformVersion());
         request.setEnableExecuteCommand(svc.isEnableExecuteCommand());
-        // A service pinned to a capacity provider places its tasks through it, unless the
-        // reconciler is placing a DAEMON task on a named container instance.
-        if (containerInstanceArn == null) {
-            request.setCapacityProviderStrategy(svc.getCapacityProviderStrategy());
+        if (placement.capacityProviderName() != null) {
+            request.setCapacityProviderStrategy(List.of(
+                    new CapacityProviderStrategyItem(placement.capacityProviderName(), 1, 0)));
+        } else {
+            request.setLaunchType(placement.launchType());
         }
         if (EcsService.PROPAGATE_TAGS_SERVICE.equals(svc.getPropagateTags())) {
             request.setTags(svc.getTags());
@@ -1672,6 +1673,31 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     /** Where a task runs: a launch type, or the capacity provider that chose one for it. */
     private record Placement(LaunchType launchType, String capacityProviderName) {}
+
+    /** Fill provider deficits for the current deployment, without counting tasks it is replacing. */
+    private List<Placement> serviceTaskPlacements(EcsServiceModel svc, List<EcsTask> currentTasks, int count) {
+        List<CapacityProviderStrategyItem> strategy = svc.getCapacityProviderStrategy();
+        if (strategy == null || strategy.isEmpty()) {
+            return Collections.nCopies(count, new Placement(svc.getLaunchType(), null));
+        }
+        Map<String, Integer> existing = new HashMap<>();
+        for (EcsTask task : currentTasks) {
+            existing.merge(task.getCapacityProviderName(), 1, Integer::sum);
+        }
+        List<Placement> missing = new ArrayList<>();
+        for (Placement placement : distribute(strategy, svc.getDesiredCount())) {
+            int running = existing.getOrDefault(placement.capacityProviderName(), 0);
+            if (running > 0) {
+                existing.put(placement.capacityProviderName(), running - 1);
+            } else {
+                missing.add(placement);
+                if (missing.size() == count) {
+                    break;
+                }
+            }
+        }
+        return missing;
+    }
 
     /**
      * Decides where each of {@code count} tasks runs, in request order.
@@ -5059,7 +5085,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 break;
             }
             try {
-                EcsTask launched = launchServiceTask(cluster, svc, LaunchType.EC2,
+                EcsTask launched = launchServiceTask(cluster, svc, new Placement(LaunchType.EC2, null),
                         ci.getContainerInstanceArn(), region);
                 // A Docker start failure comes back already STOPPED: the slot stays uncovered and
                 // the next tick retries, and it must not count towards runningCount.
@@ -5242,9 +5268,12 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             }
             deployment = deploymentRecordForCurrentWorkload(svc);
             int toStart = svc.getDesiredCount() - (int) current;
-            for (int i = 0; i < toStart; i++) {
+            List<EcsTask> currentTasks = runningTasks.stream()
+                    .filter(task -> !isStaleForDeployment(task, currentDeploymentId, currentTaskDefinitionArn))
+                    .toList();
+            for (Placement placement : serviceTaskPlacements(svc, currentTasks, toStart)) {
                 try {
-                    EcsTask launched = launchServiceTask(cluster, svc, svc.getLaunchType(), null, region);
+                    EcsTask launched = launchServiceTask(cluster, svc, placement, null, region);
                     recordLaunchFailure(svc, null, null);
                     LOG.infov("Service reconciler started task {0} for service {1}",
                             launched.getTaskArn(), svc.getServiceName());

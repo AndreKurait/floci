@@ -1806,7 +1806,7 @@ public class ElastiCacheService implements ResourceProvider {
     public ElastiCacheUser createUser(String userId, String userName, AuthMode authMode,
                                       List<String> passwords, String accessString, String engine) {
         if (users.get(userId).isPresent()) {
-            throw new AwsException("UserAlreadyExistsFault",
+            throw new AwsException("UserAlreadyExists",
                     "User " + userId + " already exists.", 400);
         }
 
@@ -1827,7 +1827,7 @@ public class ElastiCacheService implements ResourceProvider {
 
     public ElastiCacheUser getUser(String userId) {
         return users.get(userId).orElseThrow(() ->
-                new AwsException("UserNotFoundFault", "User " + userId + " not found.", 404));
+                new AwsException("UserNotFound", "User " + userId + " not found.", 404));
     }
 
     public Collection<ElastiCacheUser> listUsers(String filterUserId, String filterEngine) {
@@ -1835,7 +1835,7 @@ public class ElastiCacheService implements ResourceProvider {
         if (filterUserId != null && !filterUserId.isBlank()) {
             return users.get(filterUserId)
                     .map(List::of)
-                    .orElseThrow(() -> new AwsException("UserNotFoundFault",
+                    .orElseThrow(() -> new AwsException("UserNotFound",
                             "User " + filterUserId + " not found.", 404));
         }
         if (filterEngine != null && !filterEngine.isBlank()) {
@@ -1890,7 +1890,7 @@ public class ElastiCacheService implements ResourceProvider {
 
     public void deleteUser(String userId) {
         if (users.get(userId).isEmpty()) {
-            throw new AwsException("UserNotFoundFault", "User " + userId + " not found.", 404);
+            throw new AwsException("UserNotFound", "User " + userId + " not found.", 404);
         }
         synchronized (userGroupLock) {
             users.delete(userId);

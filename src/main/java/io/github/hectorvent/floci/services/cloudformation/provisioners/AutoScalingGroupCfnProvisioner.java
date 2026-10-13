@@ -7,6 +7,9 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.autoscaling.AutoScalingService;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgOptionalFields;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
+import io.github.hectorvent.floci.services.autoscaling.model.AvailabilityZoneDistribution;
+import io.github.hectorvent.floci.services.autoscaling.model.CapacityReservationSpecification;
+import io.github.hectorvent.floci.services.autoscaling.model.InstanceMaintenancePolicy;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
@@ -15,6 +18,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -84,13 +88,23 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
                     AsgSnapshot snapshot = MAPPER.readValue(rawSnapshot, AsgSnapshot.class);
                     // UpdateAutoScalingGroup treats null as "leave unchanged". Restore an unset
                     // snapshot member with its API default instead; -1 removes DefaultInstanceWarmup.
+                    // InstanceMaintenancePolicy clears with -1 on both percentages. The service-linked
+                    // role, AZ distribution and capacity reservation members have no clearing value
+                    // on UpdateAutoScalingGroup, so an unset snapshot member is cleared afterwards.
                     AsgOptionalFields optionalFields = new AsgOptionalFields(
                             snapshot.desiredCapacityType() != null ? snapshot.desiredCapacityType() : "units",
                             snapshot.capacityRebalance() != null ? snapshot.capacityRebalance() : false,
                             snapshot.maxInstanceLifetime() != null ? snapshot.maxInstanceLifetime() : 0,
                             snapshot.defaultInstanceWarmup() != null
                                     ? snapshot.defaultInstanceWarmup()
-                                    : AsgOptionalFields.DEFAULT_INSTANCE_WARMUP_REMOVAL_SENTINEL
+                                    : AsgOptionalFields.DEFAULT_INSTANCE_WARMUP_REMOVAL_SENTINEL,
+                            snapshot.serviceLinkedRoleArn(),
+                            snapshot.instanceMaintenancePolicy() != null
+                                    ? snapshot.instanceMaintenancePolicy()
+                                    : new InstanceMaintenancePolicy(InstanceMaintenancePolicy.REMOVAL_SENTINEL,
+                                            InstanceMaintenancePolicy.REMOVAL_SENTINEL),
+                            snapshot.availabilityZoneDistribution(),
+                            snapshot.capacityReservationSpecification()
                     );
                     autoScalingService.updateAutoScalingGroup(
                             snapshot.region(),
@@ -111,6 +125,10 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
                             snapshot.terminationPolicies(),
                             optionalFields
                     );
+                    clearUnsetSnapshotMembers(snapshot);
+                    if (snapshot.enabledMetrics() != null) {
+                        reconcileMetricsCollection(snapshot.region(), snapshot.name(), snapshot.enabledMetrics());
+                    }
                     return true;
                 } catch (Exception e) {
                     LOG.errorv("Could not restore Auto Scaling group update snapshot for {0}: {1}",
@@ -147,7 +165,12 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
             String desiredCapacityType,
             Boolean capacityRebalance,
             Integer maxInstanceLifetime,
-            Integer defaultInstanceWarmup
+            Integer defaultInstanceWarmup,
+            String serviceLinkedRoleArn,
+            InstanceMaintenancePolicy instanceMaintenancePolicy,
+            AvailabilityZoneDistribution availabilityZoneDistribution,
+            CapacityReservationSpecification capacityReservationSpecification,
+            List<String> enabledMetrics
     ) {}
 
     private static IllegalStateException unsupported(String resourceType) {
@@ -224,6 +247,7 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
         int healthCheckGracePeriod = parseIntProp(props, "HealthCheckGracePeriod", ctx, 0);
         List<String> terminationPolicies = ctx.resolveStringList(props, "TerminationPolicies");
         AsgOptionalFields optionalFields = resolveOptionalFields(props, ctx);
+        List<String> metricsCollection = resolveMetricsCollection(props, ctx);
 
         // provision() re-runs on every UpdateStack, so a same-named group already on file must be
         // reconciled via UpdateAutoScalingGroup instead of re-created (createAutoScalingGroup throws
@@ -252,7 +276,12 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
                     existing.getDesiredCapacityType(),
                     existing.getCapacityRebalance(),
                     existing.getMaxInstanceLifetime(),
-                    existing.getDefaultInstanceWarmup()
+                    existing.getDefaultInstanceWarmup(),
+                    existing.getServiceLinkedRoleArn(),
+                    existing.getInstanceMaintenancePolicy(),
+                    existing.getAvailabilityZoneDistribution(),
+                    existing.getCapacityReservationSpecification(),
+                    existing.getEnabledMetrics() != null ? List.copyOf(existing.getEnabledMetrics()) : List.of()
             );
             try {
                 r.getAttributes().put(CfnRollback.ASG_UPDATE_SNAPSHOT_ATTR, MAPPER.writeValueAsString(snapshot));
@@ -267,6 +296,9 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
                     mixedInstancesPolicy, minSize, maxSize, desiredCapacity, cooldown,
                     availabilityZones, subnetIds, healthCheckType, healthCheckGracePeriod, terminationPolicies,
                     optionalFields);
+            if (metricsCollection != null) {
+                reconcileMetricsCollection(region, name, metricsCollection);
+            }
             asg = requireAutoScalingGroup(region, name);
         } else {
             asg = autoScalingService.createAutoScalingGroup(region, name,
@@ -280,6 +312,10 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
                     resolveAsgTags(props, engine),
                     resolveAsgTagPropagation(props, engine),
                     optionalFields);
+            if (metricsCollection != null && !metricsCollection.isEmpty()) {
+                autoScalingService.enableMetricsCollection(region, name, metricsCollection,
+                        AutoScalingService.METRICS_GRANULARITY);
+            }
             deleteRenamedResource(ctx, name, n -> autoScalingService.deleteAutoScalingGroup(region, n, true),
                     "Auto Scaling group");
         }
@@ -292,6 +328,25 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().put("Arn", asg.getAutoScalingGroupArn());
     }
 
+    private void clearUnsetSnapshotMembers(AsgSnapshot snapshot) {
+        if (snapshot.serviceLinkedRoleArn() != null
+                && snapshot.availabilityZoneDistribution() != null
+                && snapshot.capacityReservationSpecification() != null) {
+            return;
+        }
+        AutoScalingGroup group = requireAutoScalingGroup(snapshot.region(), snapshot.name());
+        if (snapshot.serviceLinkedRoleArn() == null) {
+            group.setServiceLinkedRoleArn(null);
+        }
+        if (snapshot.availabilityZoneDistribution() == null) {
+            group.setAvailabilityZoneDistribution(null);
+        }
+        if (snapshot.capacityReservationSpecification() == null) {
+            group.setCapacityReservationSpecification(null);
+        }
+        autoScalingService.saveAutoScalingGroupIfPresent(group);
+    }
+
     private AutoScalingGroup requireAutoScalingGroup(String region, String name) {
         List<AutoScalingGroup> found = autoScalingService.describeAutoScalingGroups(region, List.of(name));
         if (found.isEmpty()) {
@@ -301,10 +356,10 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * The four group properties the schema defines that the CloudFormation path used to drop,
-     * passing {@code AsgOptionalFields.none()} instead. Absent stays null so an update overwrites
-     * only what the template set, which is what {@code AsgOptionalFields.applyToExistingGroup} and
-     * the Query handler's {@code UpdateAutoScalingGroup} both do.
+     * The optional group properties the schema defines that Create/UpdateAutoScalingGroup also
+     * carry. Absent stays null so an update overwrites only what the template set, which is what
+     * {@code AsgOptionalFields.applyToExistingGroup} and the Query handler's
+     * {@code UpdateAutoScalingGroup} both do.
      */
     private AsgOptionalFields resolveOptionalFields(JsonNode props, ProvisionContext ctx) {
         String capacityRebalance = ctx.resolveOptional(props, "CapacityRebalance");
@@ -314,7 +369,104 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
                         ? null
                         : Boolean.parseBoolean(capacityRebalance),
                 parseOptionalInt("MaxInstanceLifetime", ctx.resolveOptional(props, "MaxInstanceLifetime")),
-                parseOptionalInt("DefaultInstanceWarmup", ctx.resolveOptional(props, "DefaultInstanceWarmup")));
+                parseOptionalInt("DefaultInstanceWarmup", ctx.resolveOptional(props, "DefaultInstanceWarmup")),
+                ctx.resolveOptional(props, "ServiceLinkedRoleARN"),
+                resolveInstanceMaintenancePolicy(props, ctx),
+                resolveAvailabilityZoneDistribution(props, ctx),
+                resolveCapacityReservationSpecification(props, ctx));
+    }
+
+    private InstanceMaintenancePolicy resolveInstanceMaintenancePolicy(JsonNode props, ProvisionContext ctx) {
+        JsonNode node = objectProperty(props, "InstanceMaintenancePolicy", ctx);
+        if (node == null) {
+            return null;
+        }
+        return new InstanceMaintenancePolicy(
+                parseOptionalInt("MinHealthyPercentage", ctx.resolveOptional(node, "MinHealthyPercentage")),
+                parseOptionalInt("MaxHealthyPercentage", ctx.resolveOptional(node, "MaxHealthyPercentage")));
+    }
+
+    private AvailabilityZoneDistribution resolveAvailabilityZoneDistribution(JsonNode props, ProvisionContext ctx) {
+        JsonNode node = objectProperty(props, "AvailabilityZoneDistribution", ctx);
+        if (node == null) {
+            return null;
+        }
+        String strategy = blankToNull(ctx.resolveOptional(node, "CapacityDistributionStrategy"));
+        return strategy != null ? new AvailabilityZoneDistribution(strategy) : null;
+    }
+
+    private CapacityReservationSpecification resolveCapacityReservationSpecification(JsonNode props,
+                                                                                    ProvisionContext ctx) {
+        JsonNode node = objectProperty(props, "CapacityReservationSpecification", ctx);
+        if (node == null) {
+            return null;
+        }
+        String preference = blankToNull(ctx.resolveOptional(node, "CapacityReservationPreference"));
+        if (preference == null) {
+            throw new AwsException("ValidationError",
+                    "CapacityReservationSpecification requires CapacityReservationPreference.", 400);
+        }
+        CapacityReservationSpecification specification = new CapacityReservationSpecification();
+        specification.setCapacityReservationPreference(preference);
+        JsonNode target = objectProperty(node, "CapacityReservationTarget", ctx);
+        if (target != null) {
+            specification.setCapacityReservationIds(ctx.resolveStringList(target, "CapacityReservationIds"));
+            specification.setCapacityReservationResourceGroupArns(
+                    ctx.resolveStringList(target, "CapacityReservationResourceGroupArns"));
+        }
+        return specification;
+    }
+
+    /**
+     * The metric names that {@code MetricsCollection} enables, or {@code null} when the template
+     * omits the property. The schema allows several entries. Their metric lists are merged, and an
+     * entry naming no metrics stands for all of them, as it does on EnableMetricsCollection. The
+     * schema requires {@code Granularity} on every entry.
+     */
+    private List<String> resolveMetricsCollection(JsonNode props, ProvisionContext ctx) {
+        JsonNode node = props != null ? ctx.engine().resolveNode(props.get("MetricsCollection")) : null;
+        if (node == null || !node.isArray()) {
+            return null;
+        }
+        List<String> metrics = new ArrayList<>();
+        for (JsonNode entry : node) {
+            String granularity = blankToNull(ctx.resolveOptional(entry, "Granularity"));
+            if (granularity == null) {
+                throw new AwsException("ValidationError", "MetricsCollection requires Granularity.", 400);
+            }
+            if (!AutoScalingService.METRICS_GRANULARITY.equals(granularity)) {
+                throw new AwsException("ValidationError", AutoScalingService.INVALID_GRANULARITY_MESSAGE, 400);
+            }
+            List<String> named = ctx.resolveStringList(entry, "Metrics");
+            AutoScalingService.validateMetricNames(named);
+            for (String metric : named.isEmpty() ? AutoScalingService.GROUP_METRICS : named) {
+                if (!metrics.contains(metric)) {
+                    metrics.add(metric);
+                }
+            }
+        }
+        return metrics;
+    }
+
+    /**
+     * Makes the group's enabled metrics exactly {@code desired}, so an empty list disables them all.
+     * A template that drops {@code MetricsCollection} altogether never reaches here and leaves
+     * collection untouched.
+     */
+    private void reconcileMetricsCollection(String region, String name, List<String> desired) {
+        autoScalingService.disableMetricsCollection(region, name, List.of());
+        if (!desired.isEmpty()) {
+            autoScalingService.enableMetricsCollection(region, name, desired,
+                    AutoScalingService.METRICS_GRANULARITY);
+        }
+    }
+
+    private JsonNode objectProperty(JsonNode props, String name, ProvisionContext ctx) {
+        if (props == null || !props.has(name)) {
+            return null;
+        }
+        JsonNode node = ctx.engine().resolveNode(props.get(name));
+        return node != null && node.isObject() ? node : null;
     }
 
     /**
@@ -348,6 +500,9 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
                     MixedInstancesPolicy.LaunchTemplateOverride override =
                             new MixedInstancesPolicy.LaunchTemplateOverride();
                     override.setInstanceType(instanceType);
+                    override.setWeightedCapacity(overrideNode.hasNonNull("WeightedCapacity")
+                            ? engine.resolve(overrideNode.get("WeightedCapacity"))
+                            : null);
                     launchTemplate.getOverrides().add(override);
                 }
             }

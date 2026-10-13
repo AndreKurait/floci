@@ -646,6 +646,8 @@ public class CognitoJsonHandler {
         Map<String, String> validationData = new HashMap<>();
         request.path("ValidationData").forEach(a -> validationData.put(a.path("Name").asText(), a.path("Value").asText()));
         Map<String, String> clientMetadata = clientMetadata(request);
+        List<String> desiredDeliveryMediums = new ArrayList<>();
+        request.path("DesiredDeliveryMediums").forEach(m -> desiredDeliveryMediums.add(m.asText()));
 
         CognitoUser user = service.adminCreateUser(
                 request.path("UserPoolId").asText(),
@@ -654,6 +656,7 @@ public class CognitoJsonHandler {
                 tempPassword,
                 messageAction,
                 request.path("ForceAliasCreation").asBoolean(false),
+                desiredDeliveryMediums,
                 validationData,
                 clientMetadata
         );

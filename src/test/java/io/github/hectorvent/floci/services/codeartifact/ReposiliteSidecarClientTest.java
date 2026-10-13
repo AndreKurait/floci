@@ -262,9 +262,11 @@ class ReposiliteSidecarClientTest {
             respond(exchange, 200, "");
         });
 
-        int status = client.deployArtifact("dom--repo", "com/example/a/1.0/a-1.0.jar", "hello".getBytes(StandardCharsets.UTF_8));
+        ReposiliteSidecarClient.DeployOutcome outcome = client.deployArtifact("dom--repo",
+                "com/example/a/1.0/a-1.0.jar", "hello".getBytes(StandardCharsets.UTF_8));
 
-        assertThat(status, is(200));
+        assertThat(outcome.status(), is(200));
+        assertTrue(outcome.wroteNewContent());
         assertArrayEquals("hello".getBytes(StandardCharsets.UTF_8), received.get());
         assertThat(authHeader.get(), equalTo("Basic dGVzdDp0ZXN0"));
     }
@@ -278,9 +280,11 @@ class ReposiliteSidecarClientTest {
             respond(exchange, 200, "hello");
         });
 
-        int status = client.deployArtifact("dom--repo", "com/example/a/1.0/a-1.0.jar", content);
+        ReposiliteSidecarClient.DeployOutcome outcome = client.deployArtifact("dom--repo",
+                "com/example/a/1.0/a-1.0.jar", content);
 
-        assertThat(status, is(200));
+        assertThat(outcome.status(), is(200));
+        assertFalse(outcome.wroteNewContent());
         assertThat(methodsSeen, equalTo(List.of("GET")));
     }
 
@@ -300,10 +304,11 @@ class ReposiliteSidecarClientTest {
             }
         });
 
-        int status = client.deployArtifact("dom--repo", "com/example/a/1.0/a-1.0.jar",
-                "hello".getBytes(StandardCharsets.UTF_8));
+        ReposiliteSidecarClient.DeployOutcome outcome = client.deployArtifact("dom--repo",
+                "com/example/a/1.0/a-1.0.jar", "hello".getBytes(StandardCharsets.UTF_8));
 
-        assertThat(status, is(409));
+        assertThat(outcome.status(), is(409));
+        assertFalse(outcome.wroteNewContent());
         assertThat(methodsSeen, equalTo(List.of("GET", "PUT")));
         assertArrayEquals("hello".getBytes(StandardCharsets.UTF_8), putBody.get());
     }
@@ -328,10 +333,11 @@ class ReposiliteSidecarClientTest {
             }
         });
 
-        int status = client.deployArtifact("dom--repo", "com/example/a/1.0/a-1.0.jar",
-                "hello".getBytes(StandardCharsets.UTF_8));
+        ReposiliteSidecarClient.DeployOutcome outcome = client.deployArtifact("dom--repo",
+                "com/example/a/1.0/a-1.0.jar", "hello".getBytes(StandardCharsets.UTF_8));
 
-        assertThat(status, is(200));
+        assertThat(outcome.status(), is(200));
+        assertTrue(outcome.wroteNewContent());
         assertTrue(methodsSeen.stream().allMatch(m -> m.equals("GET") || m.equals("PUT")));
         assertThat(methodsSeen.get(methodsSeen.size() - 1), equalTo("PUT"));
         assertArrayEquals("hello".getBytes(StandardCharsets.UTF_8), putBody.get());

@@ -108,14 +108,6 @@ public final class EnforcementFixtures {
     }
 
     /**
-     * Deletes an S3 bucket, and first whatever it still holds: "All objects (including all object
-     * versions and delete markers) in the bucket must be deleted before the bucket itself can be
-     * deleted" (S3 API reference, {@code DeleteBucket}), which Floci answers
-     * {@code BucketNotEmpty} for.
-     *
-     * @param authorization an S3-scoped header for an identity allowed to read and delete here
-     */
-    /**
      * Deletes a managed policy, and first the versions and attachments IAM wants gone before it
      * will. Returns quietly when the policy is already absent, so a caller can register the
      * removal before creating it.
@@ -207,6 +199,13 @@ public final class EnforcementFixtures {
         iam(port, authorization, action, parameter, arn);
     }
 
+    /**
+     * Deletes an unversioned S3 bucket after its current objects. This helper lists one page of
+     * objects and does not remove old versions or delete markers, so callers must use it only for
+     * unversioned buckets with at most one page of objects.
+     *
+     * @param authorization an S3-scoped header for an identity allowed to read and delete here
+     */
     public static void removeBucket(int port, String authorization, String bucket) {
         if (s3(port, authorization).when().head("/" + bucket)
                 .then().extract().statusCode() == 404) {

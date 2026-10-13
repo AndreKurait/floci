@@ -52,6 +52,7 @@ final class CognitoAuthFlowHandler {
     private static final Logger LOG = Logger.getLogger(CognitoAuthFlowHandler.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String CUSTOM_MESSAGE_CODE_PARAMETER = "{####}";
+    private static final String CUSTOM_MESSAGE_USERNAME_PARAMETER = "{username}";
     /** The {@code callerContext.clientId} AWS sends for an admin action, which names no app client. */
     private static final String CLIENT_ID_NOT_APPLICABLE = "CLIENT_ID_NOT_APPLICABLE";
     /** The message of a wrong password, which managed login also shows for an unknown user. */
@@ -657,6 +658,9 @@ final class CognitoAuthFlowHandler {
         if (!pool.getId().equals(parts[0])) {
             throw new AwsException("NotAuthorizedException", "Invalid Refresh Token", 400);
         }
+        CognitoService.requireRefreshTokenOfClient(client, parts);
+        List<String> scopes = CognitoService.refreshTokenScopes(parts);
+        CognitoService.requireScopesStillAllowed(client, scopes);
         String username = parts[1];
         long iat;
         try {
@@ -685,14 +689,10 @@ final class CognitoAuthFlowHandler {
             throw ae;
         }
         CognitoService.ClaimsOverride override = firePreTokenGeneration(pool, client, user,
-                clientMetadata, "TokenGeneration_RefreshTokens", List.of());
-        Map<String, Object> auth = new HashMap<>();
-        auth.put("AccessToken", service.generateSignedJwt(user, pool, "access", client, override, refreshTokenUuid));
-        auth.put("IdToken", service.generateSignedJwt(user, pool, "id", client, override, refreshTokenUuid));
-        auth.put("ExpiresIn", service.getAccessTokenExpiresInSeconds(client));
-        auth.put("TokenType", "Bearer");
+                clientMetadata, "TokenGeneration_RefreshTokens", scopes);
         Map<String, Object> result = new HashMap<>();
-        result.put("AuthenticationResult", auth);
+        result.put("AuthenticationResult", service.accessAndIdTokens(user, pool, client, override, refreshTokenUuid,
+                scopes, iat / 1000L));
         return result;
     }
 
@@ -1842,7 +1842,26 @@ final class CognitoAuthFlowHandler {
         req.put("codeParameter", CUSTOM_MESSAGE_CODE_PARAMETER);
         req.put("usernameParameter", user.getUsername());
         req.put("clientMetadata", Map.of());
-        TriggerResult result = invokeTrigger(pool, client, user, "CustomMessage", triggerSource, req);
+        return customMessageResponse(pool, client, user, triggerSource, req);
+    }
+
+    /**
+     * Fires the CustomMessage trigger for an AdminCreateUser invitation. The request carries the
+     * {@code {username}} and {@code {####}} placeholders, which Cognito fills in after the function
+     * returns, and the request's {@code ClientMetadata}. Non-blocking, as for the other sources.
+     */
+    Map<String, Object> fireCustomMessageForAdminCreateUser(UserPool pool, CognitoUser user,
+                                                            Map<String, String> clientMetadata) {
+        Map<String, Object> req = new HashMap<>();
+        req.put("codeParameter", CUSTOM_MESSAGE_CODE_PARAMETER);
+        req.put("usernameParameter", CUSTOM_MESSAGE_USERNAME_PARAMETER);
+        req.put("clientMetadata", clientMetadata == null ? Map.of() : clientMetadata);
+        return customMessageResponse(pool, null, user, "CustomMessage_AdminCreateUser", req);
+    }
+
+    private Map<String, Object> customMessageResponse(UserPool pool, UserPoolClient client, CognitoUser user,
+                                                      String triggerSource, Map<String, Object> request) {
+        TriggerResult result = invokeTrigger(pool, client, user, "CustomMessage", triggerSource, request);
         if (!result.configured()) return null;
         if (result.errored()) {
             LOG.warnv("CustomMessage trigger failed for pool {0} (source {1}): {2}",
@@ -2068,8 +2087,10 @@ final class CognitoAuthFlowHandler {
         return service.generateAuthResult(user, pool, client, override);
     }
 
-    CognitoService.ClaimsOverride preTokenGenerationForRefresh(UserPool pool, UserPoolClient client, CognitoUser user) {
-        return firePreTokenGeneration(pool, client, user, Map.of(), "TokenGeneration_RefreshTokens", List.of());
+    /** {@code scopes} are those of the grant being refreshed, or null for a sign-in through the API. */
+    CognitoService.ClaimsOverride preTokenGenerationForRefresh(UserPool pool, UserPoolClient client, CognitoUser user,
+                                                               List<String> scopes) {
+        return firePreTokenGeneration(pool, client, user, Map.of(), "TokenGeneration_RefreshTokens", scopes);
     }
 
     /**

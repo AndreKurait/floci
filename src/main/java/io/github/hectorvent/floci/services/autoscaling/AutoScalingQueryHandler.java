@@ -55,6 +55,8 @@ public class AutoScalingQueryHandler {
                 case "DescribeInstanceRefreshes"    -> handleDescribeInstanceRefreshes(p, region);
                 case "CreateOrUpdateTags"           -> handleCreateOrUpdateTags(p, region);
                 case "DeleteTags"                   -> handleDeleteTags(p, region);
+                case "EnableMetricsCollection"      -> handleEnableMetricsCollection(p, region);
+                case "DisableMetricsCollection"     -> handleDisableMetricsCollection(p, region);
                 // Instances
                 case "DescribeAutoScalingInstances" -> handleDescribeAutoScalingInstances(p, region);
                 case "SetInstanceProtection"        -> handleSetInstanceProtection(p, region);
@@ -287,6 +289,13 @@ public class AutoScalingQueryHandler {
         if (asg.getDefaultInstanceWarmup() != null) {
             xml.elem("DefaultInstanceWarmup", String.valueOf(asg.getDefaultInstanceWarmup()));
         }
+        if (asg.getServiceLinkedRoleArn() != null) {
+            xml.elem("ServiceLinkedRoleARN", asg.getServiceLinkedRoleArn());
+        }
+        appendInstanceMaintenancePolicyXml(xml, asg.getInstanceMaintenancePolicy());
+        appendAvailabilityZoneDistributionXml(xml, asg.getAvailabilityZoneDistribution());
+        appendCapacityReservationSpecificationXml(xml, asg.getCapacityReservationSpecification());
+        appendEnabledMetricsXml(xml, asg.getEnabledMetrics());
         if (asg.getLaunchConfigurationName() != null) {
             xml.elem("LaunchConfigurationName", asg.getLaunchConfigurationName());
         }
@@ -482,6 +491,23 @@ public class AutoScalingQueryHandler {
                 .end("CreateOrUpdateTagsResponse").build());
     }
 
+    private Response handleEnableMetricsCollection(MultivaluedMap<String, String> p, String region) {
+        service.enableMetricsCollection(region, p.getFirst("AutoScalingGroupName"),
+                memberList(p, "Metrics"), p.getFirst("Granularity"));
+        return ok(new XmlBuilder()
+                .start("EnableMetricsCollectionResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("EnableMetricsCollectionResponse").build());
+    }
+
+    private Response handleDisableMetricsCollection(MultivaluedMap<String, String> p, String region) {
+        service.disableMetricsCollection(region, p.getFirst("AutoScalingGroupName"), memberList(p, "Metrics"));
+        return ok(new XmlBuilder()
+                .start("DisableMetricsCollectionResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("DisableMetricsCollectionResponse").build());
+    }
+
     private Response handleDeleteTags(MultivaluedMap<String, String> p, String region) {
         for (TagRequest tag : parseTagRequests(p)) {
             service.deleteTags(region, tag.resourceId(), tag.resourceType(), List.of(tag.key()));
@@ -565,6 +591,74 @@ public class AutoScalingQueryHandler {
         xml.end("LaunchTemplate");
     }
 
+    private static void appendInstanceMaintenancePolicyXml(XmlBuilder xml, InstanceMaintenancePolicy policy) {
+        if (policy == null) {
+            return;
+        }
+        xml.start("InstanceMaintenancePolicy");
+        if (policy.getMinHealthyPercentage() != null) {
+            xml.elem("MinHealthyPercentage", String.valueOf(policy.getMinHealthyPercentage()));
+        }
+        if (policy.getMaxHealthyPercentage() != null) {
+            xml.elem("MaxHealthyPercentage", String.valueOf(policy.getMaxHealthyPercentage()));
+        }
+        xml.end("InstanceMaintenancePolicy");
+    }
+
+    private static void appendAvailabilityZoneDistributionXml(XmlBuilder xml,
+                                                              AvailabilityZoneDistribution distribution) {
+        if (distribution == null || distribution.getCapacityDistributionStrategy() == null) {
+            return;
+        }
+        xml.start("AvailabilityZoneDistribution")
+           .elem("CapacityDistributionStrategy", distribution.getCapacityDistributionStrategy())
+           .end("AvailabilityZoneDistribution");
+    }
+
+    private static void appendCapacityReservationSpecificationXml(XmlBuilder xml,
+                                                                  CapacityReservationSpecification specification) {
+        if (specification == null) {
+            return;
+        }
+        xml.start("CapacityReservationSpecification");
+        if (specification.getCapacityReservationPreference() != null) {
+            xml.elem("CapacityReservationPreference", specification.getCapacityReservationPreference());
+        }
+        if (specification.hasTarget()) {
+            xml.start("CapacityReservationTarget");
+            if (!specification.getCapacityReservationIds().isEmpty()) {
+                xml.start("CapacityReservationIds");
+                for (String id : specification.getCapacityReservationIds()) {
+                    xml.elem("member", id);
+                }
+                xml.end("CapacityReservationIds");
+            }
+            if (!specification.getCapacityReservationResourceGroupArns().isEmpty()) {
+                xml.start("CapacityReservationResourceGroupArns");
+                for (String arn : specification.getCapacityReservationResourceGroupArns()) {
+                    xml.elem("member", arn);
+                }
+                xml.end("CapacityReservationResourceGroupArns");
+            }
+            xml.end("CapacityReservationTarget");
+        }
+        xml.end("CapacityReservationSpecification");
+    }
+
+    private static void appendEnabledMetricsXml(XmlBuilder xml, List<String> enabledMetrics) {
+        if (enabledMetrics == null || enabledMetrics.isEmpty()) {
+            return;
+        }
+        xml.start("EnabledMetrics");
+        for (String metric : enabledMetrics) {
+            xml.start("member")
+               .elem("Metric", metric)
+               .elem("Granularity", AutoScalingService.METRICS_GRANULARITY)
+               .end("member");
+        }
+        xml.end("EnabledMetrics");
+    }
+
     private static void appendMixedInstancesPolicyXml(XmlBuilder xml, MixedInstancesPolicy policy) {
         if (policy == null) {
             return;
@@ -580,6 +674,9 @@ public class AutoScalingQueryHandler {
                     xml.start("member");
                     if (override.getInstanceType() != null) {
                         xml.elem("InstanceType", override.getInstanceType());
+                    }
+                    if (override.getWeightedCapacity() != null) {
+                        xml.elem("WeightedCapacity", override.getWeightedCapacity());
                     }
                     appendInstanceRequirementsXml(xml, override.getInstanceRequirements());
                     xml.end("member");
@@ -1386,6 +1483,7 @@ public class AutoScalingQueryHandler {
             MixedInstancesPolicy.LaunchTemplateOverride override =
                     new MixedInstancesPolicy.LaunchTemplateOverride();
             override.setInstanceType(p.getFirst(prefix + ".InstanceType"));
+            override.setWeightedCapacity(p.getFirst(prefix + ".WeightedCapacity"));
             override.setInstanceRequirements(parseInstanceRequirements(p, prefix + ".InstanceRequirements"));
             result.add(override);
         }
@@ -1455,7 +1553,42 @@ public class AutoScalingQueryHandler {
                 p.getFirst("DesiredCapacityType"),
                 nullableBoolParam(p, "CapacityRebalance"),
                 parseOptionalInt(p.getFirst("MaxInstanceLifetime"), "MaxInstanceLifetime"),
-                parseOptionalInt(p.getFirst("DefaultInstanceWarmup"), "DefaultInstanceWarmup"));
+                parseOptionalInt(p.getFirst("DefaultInstanceWarmup"), "DefaultInstanceWarmup"),
+                p.getFirst("ServiceLinkedRoleARN"),
+                parseInstanceMaintenancePolicy(p),
+                parseAvailabilityZoneDistribution(p),
+                parseCapacityReservationSpecification(p));
+    }
+
+    private InstanceMaintenancePolicy parseInstanceMaintenancePolicy(MultivaluedMap<String, String> p) {
+        if (!hasAnyPrefix(p, "InstanceMaintenancePolicy.")) {
+            return null;
+        }
+        return new InstanceMaintenancePolicy(
+                parseOptionalInt(p.getFirst("InstanceMaintenancePolicy.MinHealthyPercentage"),
+                        "InstanceMaintenancePolicy.MinHealthyPercentage"),
+                parseOptionalInt(p.getFirst("InstanceMaintenancePolicy.MaxHealthyPercentage"),
+                        "InstanceMaintenancePolicy.MaxHealthyPercentage"));
+    }
+
+    private AvailabilityZoneDistribution parseAvailabilityZoneDistribution(MultivaluedMap<String, String> p) {
+        String strategy = p.getFirst("AvailabilityZoneDistribution.CapacityDistributionStrategy");
+        return strategy != null ? new AvailabilityZoneDistribution(strategy) : null;
+    }
+
+    private CapacityReservationSpecification parseCapacityReservationSpecification(
+            MultivaluedMap<String, String> p) {
+        String prefix = "CapacityReservationSpecification.";
+        if (!hasAnyPrefix(p, prefix)) {
+            return null;
+        }
+        CapacityReservationSpecification specification = new CapacityReservationSpecification();
+        specification.setCapacityReservationPreference(p.getFirst(prefix + "CapacityReservationPreference"));
+        specification.setCapacityReservationIds(
+                memberList(p, prefix + "CapacityReservationTarget.CapacityReservationIds"));
+        specification.setCapacityReservationResourceGroupArns(
+                memberList(p, prefix + "CapacityReservationTarget.CapacityReservationResourceGroupArns"));
+        return specification;
     }
 
     private ParsedTags parseTags(MultivaluedMap<String, String> p) {

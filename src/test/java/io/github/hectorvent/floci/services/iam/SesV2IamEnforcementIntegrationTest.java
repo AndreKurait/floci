@@ -1,13 +1,19 @@
 package io.github.hectorvent.floci.services.iam;
 
+import io.github.hectorvent.floci.testing.EnforcementFixtures;
 import io.github.hectorvent.floci.testing.IamEnforcementProfile;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.net.URI;
 import java.util.UUID;
 
+import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 
@@ -18,6 +24,12 @@ import static org.hamcrest.Matchers.equalTo;
 @QuarkusTest
 @TestProfile(IamEnforcementProfile.class)
 class SesV2IamEnforcementIntegrationTest {
+
+    @TestHTTPResource("/")
+    static URI baseUri;
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
 
     private static final String ACCOUNT = "111111111111";
 
@@ -117,22 +129,16 @@ class SesV2IamEnforcementIntegrationTest {
     }
 
     /** An IAM user in {@link #ACCOUNT} with {@code policy} inline, or no policy when it is null. */
-    private static String userWithPolicy(String policy) {
+    private String userWithPolicy(String policy) {
         String user = "sesv2-iam-" + UUID.randomUUID().toString().substring(0, 8);
-        given().formParam("Action", "CreateUser").formParam("UserName", user)
-                .header("Authorization", auth(ACCOUNT, "iam")).when().post("/").then().statusCode(200);
+        String accessKeyId = EnforcementFixtures.createUser(cleanup, baseUri.getPort(),
+                auth(ACCOUNT, "iam"), user).accessKeyId();
         if (policy != null) {
             given().formParam("Action", "PutUserPolicy").formParam("UserName", user).formParam("PolicyName", "p")
                     .formParam("PolicyDocument", policy)
                     .header("Authorization", auth(ACCOUNT, "iam")).when().post("/").then().statusCode(200);
         }
-        return given().formParam("Action", "CreateAccessKey").formParam("UserName", user)
-                .header("Authorization", auth(ACCOUNT, "iam")).when().post("/").then().statusCode(200)
-                .extract().path("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
+        return accessKeyId;
     }
 
-    private static String auth(String accessKeyId, String service) {
-        return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260930/us-east-1/" + service
-                + "/aws4_request, SignedHeaders=host, Signature=abc";
-    }
 }

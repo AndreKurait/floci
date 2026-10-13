@@ -301,6 +301,10 @@ class AutoScalingPlacementTest {
 
         Fixture(Map<String, String> zones, List<String> declaredSubnets) {
             reconciler = new AutoScalingReconciler(groups, ec2, mock(ElbV2Service.class));
+            doAnswer(call -> {
+                call.<Runnable>getArgument(1).run();
+                return null;
+            }).when(groups).adjustCapacityIfPresent(any(), any());
             when(groups.describeScalingActivities(anyString(), anyString())).thenAnswer(call ->
                     activityStore.describeScalingActivities(call.getArgument(0), call.getArgument(1)));
             when(groups.recordActivity(anyString(), anyString(), anyString(), anyString(), anyString()))

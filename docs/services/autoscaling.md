@@ -10,7 +10,7 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 - `arn:aws:autoscaling:<region>:<account>:launchConfiguration:<uuid>:launchConfigurationName/<name>`
 - `arn:aws:autoscaling:<region>:<account>:scalingPolicy:<uuid>:autoScalingGroupName/<group>/policyName/<name>`
 
-## Supported Operations (45 total)
+## Supported Operations (47 total)
 
 ### Launch Configurations
 
@@ -28,6 +28,8 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 | `DescribeAutoScalingGroups` | Filtered by name list; returns all if no filter; includes current instance list with lifecycle state and mixed instances policy shape when configured |
 | `UpdateAutoScalingGroup` | Updates capacity bounds, cooldown, launch source, AZs |
 | `DeleteAutoScalingGroup` | `ForceDelete=true` terminates all instances before deletion |
+| `EnableMetricsCollection` | Records the named group metrics, or all 20 when none are named, as `EnabledMetrics` on `DescribeAutoScalingGroups`. `Granularity` is required and must be `1Minute`; an unknown metric name raises `ValidationError`. No metrics are published to CloudWatch |
+| `DisableMetricsCollection` | Removes the named metrics from `EnabledMetrics`, or all of them when none are named |
 
 `CreateAutoScalingGroup` accepts both `subnet-a,subnet-b` and
 `subnet-a, subnet-b` in `VPCZoneIdentifier`. `DescribeAutoScalingGroups` returns the
@@ -145,6 +147,19 @@ Floci runs a background reconciler (10 s fixed rate) that keeps each group's InS
 - **Scale-in**: selects InService instances not protected from scale-in, deregisters them from target groups, then calls `TerminateInstances`.
 - Activity records are written on each scale-out and scale-in event.
 
+`SuspendProcesses` pauses desired-capacity scale-out for `Launch` and scale-in for
+`Terminate`. The desired count remains stored, and `ResumeProcesses` allows the
+next reconciliation pass to continue toward it. Omitting process names suspends
+or resumes all processes. Suspending another process does not pause these capacity
+adjustments. Suspension and resumption wait for any desired-capacity adjustment already
+in progress for that group, so a completed suspension cannot be bypassed by an earlier
+reconciliation check.
+
+Suspension does not yet pause instance-refresh selection or replacement cleanup.
+Explicitly requested termination and stale-instance cleanup continue independently.
+Other suspended process names are stored and returned but do not pause their
+associated activities.
+
 ## Launch Source Compatibility
 
 Auto Scaling groups preserve either a launch configuration, a top-level launch template, or a `MixedInstancesPolicy`. These launch sources are mutually exclusive in create/update requests. When a mixed instances policy is supplied, Floci stores and returns:
@@ -153,6 +168,7 @@ Auto Scaling groups preserve either a launch configuration, a top-level launch t
 - `LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateName`
 - `LaunchTemplate.LaunchTemplateSpecification.Version`
 - `LaunchTemplate.Overrides.member.N.InstanceType`
+- `LaunchTemplate.Overrides.member.N.WeightedCapacity`
 - `LaunchTemplate.Overrides.member.N.InstanceRequirements`
 - `InstancesDistribution.OnDemandBaseCapacity`
 - `InstancesDistribution.OnDemandPercentageAboveBaseCapacity`
@@ -164,6 +180,10 @@ specifies `InstanceRequirements` must specify both `VCpuCount` and `MemoryMiB`, 
 AWS model marks required on that shape, and raises `ValidationError` otherwise. Every member of the
 `InstanceRequirements` shape round-trips except `BaselinePerformanceFactors`, which is accepted and
 dropped.
+
+`WeightedCapacity` must be an integer from 1 to 999 written in at most 32 characters, and once
+one override sets it every override must, as the AWS model requires. Either rule raises
+`ValidationError` otherwise.
 
 A group uses attribute-based instance type selection when the mixed instances policy left in effect
 by the request carries at least one launch template override with `InstanceRequirements`. On create
@@ -183,6 +203,13 @@ never set a field omits it from the response rather than reporting a default.
 | `CapacityRebalance` | Stored and echoed as a boolean |
 | `MaxInstanceLifetime` | Seconds. Must be `0` or at least `86400`. `0` means no maximum and is echoed back as `0` |
 | `DefaultInstanceWarmup` | Seconds. Pass `-1` to remove a value already set, after which the field is omitted again |
+| `ServiceLinkedRoleARN` | Stored and echoed as given, 1 to 1600 characters. Floci does not check that the role exists, and a group that never set it omits it rather than reporting the default `AWSServiceRoleForAutoScaling` role |
+| `InstanceMaintenancePolicy` | `MinHealthyPercentage` 0 to 100 and `MaxHealthyPercentage` 100 to 200, both required, at most 100 apart. `-1` on both clears a policy already set. Any other combination raises `ValidationError` |
+| `AvailabilityZoneDistribution` | `CapacityDistributionStrategy` is one of `balanced-only`, `balanced-best-effort`, `reservations-then-balanced` |
+| `CapacityReservationSpecification` | `CapacityReservationPreference` is one of `capacity-reservations-only`, `capacity-reservations-first`, `none`, `default`. `CapacityReservationTarget` (`CapacityReservationIds`, `CapacityReservationResourceGroupArns`) round-trips, and is rejected alongside `none`. Each ID is 1 to 255 characters of `[A-Za-z0-9-_/]` and each resource group ARN is 1 to 1600 characters |
+
+These fields are stored and reported only. Floci's capacity reconciler does not change how it
+launches or replaces instances because of them.
 
 ## Scaling Policy Compatibility
 

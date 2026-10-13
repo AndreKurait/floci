@@ -207,7 +207,8 @@ class Ec2IntegrationTest {
             .post("/")
         .then()
             .statusCode(400)
-            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
+            .body("Response.Errors.Error.Message", equalTo("Invalid availability zone: [us-east-1aa]"));
     }
 
     @Test

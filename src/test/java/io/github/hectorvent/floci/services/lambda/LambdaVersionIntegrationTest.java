@@ -151,7 +151,9 @@ class LambdaVersionIntegrationTest {
             .then()
                 .statusCode(200)
                 .header("X-Amz-Function-Error", nullValue())
-                .body("ok", equalTo(true));
+                .body("ok", equalTo(true))
+                .body("envVersion", equalTo("$LATEST"))
+                .body("contextVersion", equalTo("$LATEST"));
         } finally {
             given().delete(BASE_PATH + "/functions/" + fnName);
         }
@@ -192,6 +194,8 @@ class LambdaVersionIntegrationTest {
                 // Body first: the header assertion below fails fast and would otherwise mask what
                 // the version actually returned.
                 .body("ok", equalTo(true))
+                .body("envVersion", equalTo("1"))
+                .body("contextVersion", equalTo("1"))
                 .header("X-Amz-Function-Error", nullValue());
         } finally {
             given().delete(BASE_PATH + "/functions/" + fnName);
@@ -300,7 +304,13 @@ class LambdaVersionIntegrationTest {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         try (ZipOutputStream zos = new ZipOutputStream(baos)) {
             zos.putNextEntry(new ZipEntry("index.js"));
-            zos.write("exports.handler = async () => ({ ok: true });".getBytes());
+            zos.write("""
+                    exports.handler = async (event, context) => ({
+                        ok: true,
+                        envVersion: process.env.AWS_LAMBDA_FUNCTION_VERSION,
+                        contextVersion: context.functionVersion
+                    });
+                    """.getBytes());
             zos.closeEntry();
         }
         String base64Zip = Base64.getEncoder().encodeToString(baos.toByteArray());

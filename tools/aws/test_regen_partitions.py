@@ -325,6 +325,62 @@ def test_build_adds_ruleset_partitions_only_for_services_endpoints_json_lists_so
     assert by_id(document, "aws")["servicesFromRulesets"] == []
 
 
+def flag_is(parameter, value):
+    return {"fn": "booleanEquals", "argv": [{"ref": parameter}, value]}
+
+
+PLAIN = [flag_is("UseFIPS", False), flag_is("UseDualStack", False)]
+
+
+def test_signin_hosts_reads_only_the_plain_data_plane_branches():
+    rules = [
+        {"type": "tree", "conditions": [flag_is("IsControlPlane", True)],
+         "rules": [endpoint_rule([partition_is("aws")], "https://signin.{Region}.api.aws")]},
+        endpoint_rule([flag_is("IsOAuthEndpoint", True), partition_is("aws")], "https://{Region}.oauth.signin.aws"),
+        endpoint_rule(PLAIN + [partition_is("aws")], "https://{Region}.signin.aws.amazon.com"),
+        endpoint_rule(PLAIN + [partition_is("aws-cn")], "https://{Region}.signin.amazonaws.cn"),
+        endpoint_rule([flag_is("UseFIPS", True), flag_is("UseDualStack", False), partition_is("aws-us-gov")],
+                      "https://{Region}.signin-fips.amazonaws-us-gov.com"),
+        endpoint_rule(PLAIN, "https://{Region}.signin.{PartitionResult#dnsSuffix}"),
+        {"type": "error", "conditions": PLAIN + [partition_is("aws-iso")], "error": "not here"},
+        {"type": "tree", "conditions": [],
+         "rules": [{"type": "tree", "conditions": [partition_is("aws-eusc")],
+                    "rules": [endpoint_rule(PLAIN, "https://{Region}.signin.amazonaws-eusc.eu"),
+                              endpoint_rule([partition_is("aws")] + PLAIN, "https://{Region}.signin.aws.amazon.com")]}]},
+    ]
+
+    assert r.signin_hosts(rules) == {
+        "aws": "{region}.signin.aws.amazon.com",
+        "aws-cn": "{region}.signin.amazonaws.cn",
+        "aws-eusc": "{region}.signin.amazonaws-eusc.eu",
+    }
+
+
+def test_signin_hosts_refuses_two_hosts_for_one_partition():
+    rules = [endpoint_rule(PLAIN + [partition_is("aws")], "https://{Region}.signin.aws.amazon.com"),
+             endpoint_rule(PLAIN + [partition_is("aws")], "https://{Region}.signin.example.com")]
+
+    with pytest.raises(ValueError, match="aws resolves to both"):
+        r.signin_hosts(rules)
+
+
+def test_collect_signin_hosts_reads_the_newest_gzipped_ruleset_or_nothing(tmp_path):
+    assert r.collect_signin_hosts(tmp_path) == {}
+    write_service(tmp_path, "signin", "2023-01-01", {"endpointPrefix": "signin"},
+                  [endpoint_rule(PLAIN + [partition_is("aws-cn")], "https://{Region}.signin.amazonaws.cn")],
+                  gzipped=True)
+
+    assert r.collect_signin_hosts(tmp_path) == {"aws-cn": "{region}.signin.amazonaws.cn"}
+
+
+def test_build_adds_the_signin_host_only_where_one_is_known():
+    document = r.build(PARTITIONS, ENDPOINTS, r.parse_cdk_entities(ENTITIES), None, "test",
+                       signin={"aws-cn": "{region}.signin.amazonaws.cn"})
+
+    assert by_id(document, "aws-cn")["signinHost"] == "{region}.signin.amazonaws.cn"
+    assert "signinHost" not in by_id(document, "aws")
+
+
 def test_build_drops_a_signing_name_whose_own_prefix_service_is_listed_nowhere():
     signing_names = {"execute-api": ["participant.connect"], "ecr": ["api.ecr"], "iam": ["iam-toolbox"]}
     document = r.build(PARTITIONS, ENDPOINTS, r.parse_cdk_entities(ENTITIES), None, "test",

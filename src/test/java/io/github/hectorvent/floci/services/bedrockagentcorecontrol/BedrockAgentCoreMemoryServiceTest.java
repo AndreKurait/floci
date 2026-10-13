@@ -80,6 +80,18 @@ class BedrockAgentCoreMemoryServiceTest {
     }
 
     @Test
+    void updateReplacingOmittedClearsNullDescriptionAndRole() {
+        Memory memory = create("replMemory");
+        service.update(memory.getMemoryId(), null, 45, null, true, REGION);
+
+        Memory after = service.get(memory.getMemoryId(), REGION);
+        assertEquals(45, after.getEventExpiryDuration());
+        assertNull(after.getDescription());
+        assertNull(after.getMemoryExecutionRoleArn());
+        assertEquals(KEY_ARN, after.getEncryptionKeyArn(), "the encryption key is not updatable, so it stays");
+    }
+
+    @Test
     void updateRejectsOutOfRangeExpiry() {
         Memory memory = create("badUpd");
         for (int v : new int[]{2, 366}) {
