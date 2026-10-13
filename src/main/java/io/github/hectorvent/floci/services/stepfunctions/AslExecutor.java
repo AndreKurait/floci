@@ -261,6 +261,7 @@ public class AslExecutor {
     private final Instance<StepFunctionsService> sfnService;
     private final WebClient webClient;
     private final EmulatorConfig config;
+    private final NestedTaskCredentials nestedTaskCredentials;
     private final CustomResourceLiveness customResourceLiveness;
     private final Clock clock;
     private final Sleeper sleeper;
@@ -285,13 +286,14 @@ public class AslExecutor {
                        ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
                        Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
                        CustomResourceLiveness customResourceLiveness, RedshiftDataJsonHandler redshiftDataHandler,
-                       ServiceRegistry serviceRegistry) {
+                       ServiceRegistry serviceRegistry, NestedTaskCredentials nestedTaskCredentials) {
         this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
                 sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry);
+                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
+                nestedTaskCredentials);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
@@ -306,7 +308,9 @@ public class AslExecutor {
                 Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
                 CustomResourceLiveness customResourceLiveness,
                 Clock clock, Sleeper sleeper, Integer maxWaitSecondsOverride,
-                RedshiftDataJsonHandler redshiftDataHandler, ServiceRegistry serviceRegistry) {
+                RedshiftDataJsonHandler redshiftDataHandler, ServiceRegistry serviceRegistry,
+                NestedTaskCredentials nestedTaskCredentials) {
+        this.nestedTaskCredentials = nestedTaskCredentials;
         this.serviceRegistry = serviceRegistry;
         this.customResourceLiveness = customResourceLiveness;
         this.redshiftDataHandler = redshiftDataHandler;
@@ -364,7 +368,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null);
+                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null);
     }
 
     // Kept for tests that do not exercise the Redshift Data API integration.
@@ -385,7 +389,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                clock, sleeper, maxWaitSecondsOverride, null, null);
+                clock, sleeper, maxWaitSecondsOverride, null, null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
@@ -846,6 +850,7 @@ public class AslExecutor {
             ((ObjectNode) context.get("Task")).put("Token", taskToken);
         }
 
+        JsonNode credentialInput = jsonata ? input : applyInputPath(stateDef, input, context);
         JsonNode effectiveInput;
         if (jsonata) {
             effectiveInput = input;
@@ -855,7 +860,7 @@ public class AslExecutor {
                         stateDef.get("Arguments"), "Arguments", statesVar, variables);
             }
         } else {
-            effectiveInput = applyInputPath(stateDef, input, context);
+            effectiveInput = credentialInput;
             if (stateDef.has("Parameters")) {
                 effectiveInput = resolveParameters(stateDef.get("Parameters"), effectiveInput, context);
             }
@@ -872,13 +877,29 @@ public class AslExecutor {
             addTaskScheduledEvent(chain, profile, stateDef, effectiveInput, sm);
             addTaskStartedEvent(chain, profile);
             try {
+                String taskAccount = null;
+                if (mockedInvocation == null && stateDef.has("Credentials")) {
+                    JsonNode credentials = jsonata
+                            ? jsonataEvaluator.resolveTemplate(stateDef.get("Credentials"), "Credentials",
+                                    buildStatesVar(input, null, context), variables)
+                            : resolveParameters(stateDef.get("Credentials"), credentialInput, context);
+                    taskAccount = nestedTaskCredentials.account(credentials, resource, sm);
+                }
+                if (mockedInvocation == null) {
+                    NestedTaskCredentials.validateTargetAccount(resource, effectiveInput, sm, taskAccount);
+                }
+                JsonNode resourceInput = effectiveInput;
+                String resourceToken = taskToken;
                 taskResult = mockedInvocation != null
                         ? mockedTaskResult(mockedInvocation.steps(), stateName, mockedInvocation.responseIndex())
-                        : invokeResource(effectiveResource, effectiveInput, sm, taskToken,
+                        : RequestScopes.callAsChecked(taskAccount, () -> invokeResource(
+                                effectiveResource, resourceInput, sm, resourceToken,
                                 context.path("Execution").path("Id").asText(null),
                                 executionDeadlineNanos, taskDeadlineNanos,
                                 jsonata ? null : stateDef.path("Parameters"),
-                                jobResponse -> addTaskSubmittedEvent(chain, profile, jobResponse));
+                                jobResponse -> RequestScopes.runAs(
+                                        AwsArnUtils.parse(sm.getStateMachineArn()).accountId(),
+                                        () -> addTaskSubmittedEvent(chain, profile, jobResponse))));
                 if (tokenFuture != null) {
                     taskResult = awaitToken(tokenFuture, stateDef, taskToken, executionDeadlineNanos,
                             taskDeadlineNanos);
@@ -5819,7 +5840,8 @@ public class AslExecutor {
             return false;
         }
         try {
-            return abortedByCaller(sfnService.get().describeExecution(executionArn));
+            return RequestScopes.callAs(AwsArnUtils.parse(executionArn).accountId(),
+                    () -> abortedByCaller(sfnService.get().describeExecution(executionArn)));
         } catch (AwsException e) {
             LOG.warnv("Execution {0} vanished while a .sync task was waiting on its job; ending the wait ({1})",
                     executionArn, e.getMessage());
