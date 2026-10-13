@@ -1,0 +1,116 @@
+package io.github.hectorvent.floci.services.apigateway;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.http.ContentType;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+@QuarkusTest
+class ApiGatewayImportedIntegrationTypeIntegrationTest {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final String LAMBDA_URI = "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/"
+            + "functions/arn:aws:lambda:us-east-1:000000000000:function:fixture:live/invocations";
+
+    @ParameterizedTest
+    @CsvSource({
+        "aws, AWS, get, GET",
+        "aws_proxy, AWS_PROXY, get, GET",
+        "http, HTTP, get, GET",
+        "http_proxy, HTTP_PROXY, get, GET",
+        "mock, MOCK, get, GET",
+        "mock, MOCK, x-amazon-apigateway-any-method, ANY"
+    })
+    void importMergeAndOverwriteExposeCanonicalMetadataWithoutChangingOtherFields(
+            String importedType, String expectedType, String operation, String verb) throws Exception {
+        Map<String, Object> integration = integration(importedType);
+        String apiId = importApi(document(operation, integration));
+        try {
+            assertMetadata(apiId, verb, integration, expectedType);
+
+            for (String mode : List.of("merge", "overwrite")) {
+                Map<String, Object> replacement = new LinkedHashMap<>(integration);
+                replacement.put("timeoutInMillis", "merge".equals(mode) ? 14000 : 15000);
+                if (replacement.containsKey("uri")) {
+                    replacement.put("uri", replacement.get("uri").toString().replace("live", "next")
+                            .replace("/original", "/replacement"));
+                }
+                given().contentType(ContentType.JSON).body(document(operation, replacement))
+                        .put("/restapis/" + apiId + "?mode=" + mode)
+                        .then().statusCode(200);
+                assertMetadata(apiId, verb, replacement, expectedType);
+            }
+        } finally {
+            given().delete("/restapis/" + apiId).then().statusCode(202);
+        }
+    }
+
+    private static Map<String, Object> integration(String type) {
+        Map<String, Object> integration = new LinkedHashMap<>();
+        integration.put("type", type);
+        integration.put("timeoutInMillis", 12000);
+        if (!"mock".equals(type)) {
+            integration.put("httpMethod", "POST");
+        }
+        if ("aws".equals(type) || "aws_proxy".equals(type)) {
+            integration.put("uri", LAMBDA_URI);
+        } else if (!"mock".equals(type)) {
+            integration.put("uri", "https://example.com/original");
+        }
+        if (List.of("aws", "http", "mock").contains(type)) {
+            integration.put("responses", Map.of("default", Map.of("statusCode", "200")));
+        }
+        return integration;
+    }
+
+    private static Map<String, Object> document(String verb, Map<String, Object> integration) {
+        return Map.of(
+                "openapi", "3.0.2",
+                "info", Map.of("title", "integration-type", "version", "1"),
+                "paths", Map.of("/status", Map.of(verb, Map.of(
+                        "responses", Map.of("200", Map.of("description", "ok")),
+                        "x-amazon-apigateway-integration", integration))));
+    }
+
+    private static String importApi(Map<String, Object> document) {
+        return given().contentType(ContentType.JSON).body(document)
+                .post("/restapis?mode=import").then().statusCode(201).extract().path("id");
+    }
+
+    private static String methodPath(String apiId, String verb) throws Exception {
+        JsonNode resources = get("/restapis/" + apiId + "/resources").path("item");
+        for (JsonNode resource : resources) {
+            if ("/status".equals(resource.path("path").asText())) {
+                return "/restapis/" + apiId + "/resources/" + resource.path("id").asText() + "/methods/" + verb;
+            }
+        }
+        throw new AssertionError("Imported status resource is missing");
+    }
+
+    private static void assertMetadata(String apiId, String verb, Map<String, Object> expected,
+                                       String expectedType) throws Exception {
+        String path = methodPath(apiId, verb);
+        JsonNode method = get(path);
+        JsonNode integration = get(path + "/integration");
+        assertEquals(expectedType, integration.path("type").asText());
+        assertEquals(integration, method.path("methodIntegration"));
+        for (Map.Entry<String, Object> field : expected.entrySet()) {
+            if (!List.of("type", "responses").contains(field.getKey())) {
+                assertEquals(MAPPER.valueToTree(field.getValue()), integration.get(field.getKey()), field.getKey());
+            }
+        }
+    }
+
+    private static JsonNode get(String path) throws Exception {
+        return MAPPER.readTree(given().get(path).then().statusCode(200).extract().asString());
+    }
+}
