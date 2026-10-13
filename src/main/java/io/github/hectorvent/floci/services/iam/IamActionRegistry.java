@@ -332,10 +332,7 @@ public class IamActionRegistry {
                 RequestBodyReader.formField(ctx, "Operation"));
     }
 
-    /**
-     * Returns the API version from GET query parameters or the POST form body, like
-     * {@link #queryAction}: it is the value the controller routes on.
-     */
+    /** Returns the API version from the same Query input that the controller dispatches. */
     public String queryVersion(ContainerRequestContext ctx) {
         if ("GET".equalsIgnoreCase(ctx.getMethod())) {
             return ctx.getUriInfo().getQueryParameters().getFirst("Version");

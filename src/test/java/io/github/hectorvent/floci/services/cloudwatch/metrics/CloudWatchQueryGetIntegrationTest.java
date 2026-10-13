@@ -68,4 +68,20 @@ class CloudWatchQueryGetIntegrationTest {
                 .queryParam("Action", "PutDashboard")
                 .get("/").then().statusCode(400).body(containsString("ErrorResponse"));
     }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"UnknownAction", ""})
+    void signedUnknownCloudWatchActionsReturnAwsErrors(String action) {
+        given().header("Authorization", authorization("monitoring"))
+                .queryParam("Action", action).queryParam("Version", "2010-08-01")
+                .get("/").then().statusCode(404)
+                .body("ErrorResponse.Error.Code", equalTo("InvalidAction"));
+    }
+
+    @Test
+    void signedCloudWatchGetWithoutAnActionReturnsUnknownOperation() {
+        given().header("Authorization", authorization("monitoring"))
+                .queryParam("Version", "2010-08-01")
+                .get("/").then().statusCode(404).body(containsString("<UnknownOperationException/>"));
+    }
 }

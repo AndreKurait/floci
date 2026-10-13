@@ -340,6 +340,11 @@ S3-scoped requests, SigV4 presigned URLs, unrelated query parameters and browser
 landing-page requests retain their existing routing. `Action` takes precedence over the
 legacy `Operation` fallback.
 
+For requests signed with the `monitoring` scope, unknown or empty actions return HTTP 404
+`InvalidAction`; an absent action returns HTTP 404 `UnknownOperationException`. Authorization
+header names are case-insensitive. GET query parameters supply the API version used for both
+dispatch and IAM action classification.
+
 **Endpoint:** `http://localhost:4566/` — Query: GET or POST; JSON: POST.
 
 ### Supported Actions

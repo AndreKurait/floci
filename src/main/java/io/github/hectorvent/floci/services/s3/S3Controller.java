@@ -237,7 +237,7 @@ public class S3Controller {
         }
         String authorization = httpHeaders.getHeaderString("Authorization");
         if (AwsQueryController.isCloudWatchQueryGet(authorization, target, accept, queryParams)) {
-            return awsQueryController.dispatch(authorization, httpHeaders, queryParams);
+            return awsQueryController.dispatchCloudWatchQueryGet(authorization, httpHeaders, queryParams);
         }
         try {
             List<Bucket> buckets = s3Service.listBuckets();
