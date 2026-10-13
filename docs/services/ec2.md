@@ -820,6 +820,10 @@ In a nondefault VPC it returns `InvalidIPAddress.InUse` without changing the ass
 call `DisassociateAddress` first, as specified by the
 [EC2 API reference](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ReleaseAddress.html).
 
+Deleting an interface, including deletion on instance termination, disassociates its
+Elastic IP without releasing the allocation. A retained interface keeps its association
+after termination; release still follows that interface's VPC rules.
+
 An allocated Elastic IP's `54.x.x.x` address is invented and routes nowhere, so associating
 it re-points it at the address the instance is actually reachable on — the same value
 DescribeInstances reports. This is a deliberate deviation from AWS, where an EIP's public IP

@@ -630,6 +630,63 @@ class Ec2ServiceTest {
                 .networkInterfaces().size());
     }
 
+    @ParameterizedTest
+    @CsvSource({"false,false,true", "false,true,true", "true,false,true",
+            "true,true,true", "true,false,false", "true,true,false"})
+    void terminationKeepsAddressesOnlyOnRetainedInterfaces(boolean suppliedInterface, boolean defaultVpc,
+                                                          boolean deleteOnTermination) {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnetId = defaultVpc
+                ? service.describeSubnets(region, List.of(), Map.of()).getFirst().getSubnetId()
+                : service.createSubnet(region, service.createVpc(region, "10.237.0.0/24", false).getVpcId(),
+                        "10.237.0.0/26", region + "a").getSubnetId();
+        NetworkInterface supplied = suppliedInterface
+                ? service.createNetworkInterface(region, subnetId, null, null, List.of(), List.of(), List.of()) : null;
+        Instance instance = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnetId, null, List.of(), null, null,
+                null, supplied != null ? supplied.getNetworkInterfaceId() : null, 0).getInstances().getFirst();
+        String interfaceId = instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        if (supplied != null) {
+            supplied.getAttachment().setDeleteOnTermination(deleteOnTermination);
+        }
+        Address address = service.allocateAddress(region);
+        service.associateAddress(region, address.getAllocationId(), instance.getInstanceId());
+        String associationId = address.getAssociationId();
+        service.terminateInstances(region, List.of(instance.getInstanceId()));
+        instance.setTerminatedAt(System.currentTimeMillis() - 3_600_001L);
+        service.pruneTerminatedInstances();
+
+        Address remaining = service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).getFirst();
+        assertNull(remaining.getInstanceId());
+        if (deleteOnTermination) {
+            assertNull(remaining.getAssociationId());
+            assertNull(remaining.getNetworkInterfaceId());
+            assertTrue(service.describeNetworkInterfaces(region, List.of(),
+                    Map.of("association.public-ip", List.of("*")), 0, null).networkInterfaces().isEmpty());
+        } else {
+            assertEquals(associationId, remaining.getAssociationId());
+            assertEquals(interfaceId, remaining.getNetworkInterfaceId());
+            NetworkInterface retained = service.describeNetworkInterfaces(region, List.of(interfaceId),
+                    Map.of("association.public-ip", List.of(remaining.getPublicIp())), 0, null)
+                    .networkInterfaces().getFirst();
+            assertNull(retained.getAttachment());
+            assertEquals("available", retained.getStatus());
+            if (!defaultVpc) {
+                AwsException error = assertThrows(AwsException.class,
+                        () -> service.releaseAddress(region, address.getAllocationId()));
+                assertEquals("InvalidIPAddress.InUse", error.getErrorCode());
+                service.deleteNetworkInterface(region, interfaceId);
+                assertNull(service.describeAddresses(region, List.of(address.getAllocationId()), Map.of())
+                        .getFirst().getAssociationId());
+            }
+        }
+        service.releaseAddress(region, address.getAllocationId());
+        assertTrue(service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).isEmpty());
+    }
+
     @Test
     void networkInterfaceAssociationFiltersExcludeSecondaryAddressAssociations() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
