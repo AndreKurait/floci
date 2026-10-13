@@ -16,6 +16,7 @@ public final class Ec2MetadataProxy {
     public static String[] installCommand() {
         return new String[]{"sh", "-c", String.join("\n",
                 "set -eu",
+                "unset LD_LIBRARY_PATH PYTHONPATH PYTHONHOME",
                 "if command -v ip >/dev/null 2>&1 && command -v socat >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then exit 0; fi",
                 "if command -v apt-get >/dev/null 2>&1; then",
                 "  apt-get update -qq >/dev/null",
@@ -43,7 +44,15 @@ public final class Ec2MetadataProxy {
 
     public static String[] startCommand(String flociHost, int imdsPort) {
         return startCommand("imds", "169.254.169.254", 80, flociHost, imdsPort,
-                "curl -fsS --max-time 1 http://169.254.169.254/latest/meta-data/instance-id >/dev/null && exit 0");
+                imdsProbeCommand("http://169.254.169.254"));
+    }
+
+    static String imdsProbeCommand(String endpoint) {
+        return "token=$(curl -fsS --max-time 1 -X PUT "
+                + "-H 'X-aws-ec2-metadata-token-ttl-seconds: 60' " + endpoint + "/latest/api/token)"
+                + " && [ -n \"$token\" ]"
+                + " && curl -fsS --max-time 1 -H \"X-aws-ec2-metadata-token: $token\" "
+                + endpoint + "/latest/meta-data/instance-id >/dev/null && exit 0";
     }
 
     public static String[] podIdentityStartCommand(String flociHost, int flociPort) {
@@ -57,6 +66,7 @@ public final class Ec2MetadataProxy {
         String logFile = "/tmp/floci-" + name + "-proxy.log";
         return new String[]{"sh", "-c", String.join("\n",
                 "set -eu",
+                "unset LD_LIBRARY_PATH PYTHONPATH PYTHONHOME",
                 "ip addr show dev lo | grep -q '" + bindIp + "/32' || ip addr add " + bindIp + "/32 dev lo",
                 "if [ -f " + pidFile + " ] && kill -0 \"$(cat " + pidFile + ")\" 2>/dev/null; then",
                 "  exit 0",
