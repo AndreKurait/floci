@@ -45,6 +45,7 @@ public class Instance {
     private boolean ebsOptimized = false;
     private boolean enaSupport = true;
     private String iamInstanceProfileArn;
+    private String iamInstanceProfileId;
     private Instant iamInstanceProfileAssociationTime;
     private String stateReasonCode;
     private String stateReasonMessage;
@@ -184,6 +185,8 @@ public class Instance {
 
     public String getIamInstanceProfileArn() { return iamInstanceProfileArn; }
     public void setIamInstanceProfileArn(String iamInstanceProfileArn) { this.iamInstanceProfileArn = iamInstanceProfileArn; }
+    public String getIamInstanceProfileId() { return iamInstanceProfileId; }
+    public void setIamInstanceProfileId(String iamInstanceProfileId) { this.iamInstanceProfileId = iamInstanceProfileId; }
     public Instant getIamInstanceProfileAssociationTime() { return iamInstanceProfileAssociationTime; }
     public void setIamInstanceProfileAssociationTime(Instant iamInstanceProfileAssociationTime) { this.iamInstanceProfileAssociationTime = iamInstanceProfileAssociationTime; }
 
