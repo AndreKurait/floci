@@ -9,9 +9,11 @@ import io.github.hectorvent.floci.core.common.WebIdentityTokenVerifier;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.testing.PartitionMatrix;
 import io.github.hectorvent.floci.testing.PartitionMatrix.PartitionCase;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -39,6 +41,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class StsQueryHandlerTest {
@@ -87,7 +90,7 @@ class StsQueryHandlerTest {
 
         return new StsQueryHandler(
                 iamService,
-                mock(AccountResolver.class),
+                new AccountResolver("000000000000"),
                 regionResolver,
                 config,
                 mock(AssumeRolePolicyEvaluator.class),
@@ -97,6 +100,47 @@ class StsQueryHandlerTest {
                 mock(SAMLProviderService.class),
                 mock(SAMLTrustPolicyEvaluator.class),
                 clock);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"ASIAtemporary, AKIAlongterm", "-, ASIAtemporary", "ASIAtemporary, -",
+            "blank, ASIAtemporary", "space, ASIAtemporary"})
+    void temporaryHeaderOrQueryCallerIsRejectedBeforeSessionRegistration(String headerKey, String queryKey) {
+        IamService service = mock(IamService.class);
+        StsQueryHandler handler = newHandler(service, new RegionResolver(REGION, "000000000000"));
+        setCaller(handler, headerKey, queryKey);
+        Response response = handler.handle("GetSessionToken", new MultivaluedHashMap<>());
+        assertEquals(403, response.getStatus());
+        assertTrue(response.getEntity().toString().contains("<Code>AccessDenied</Code>"));
+        verifyNoInteractions(service);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"AKIAlongterm, ASIAtemporary", "-, AKIAlongterm", "-, -",
+            "blank, AKIAlongterm", "space, AKIAlongterm", "blank, -", "space, -"})
+    void longTermAndAnonymousCompatibilityCallsKeepExistingIssuance(String headerKey, String queryKey) {
+        StsQueryHandler handler = newHandler();
+        setCaller(handler, headerKey, queryKey);
+        Response response = handler.handle("GetSessionToken", new MultivaluedHashMap<>());
+        assertEquals(200, response.getStatus());
+    }
+
+    private static void setCaller(StsQueryHandler handler, String headerKey, String queryKey) {
+        handler.headers = mock(HttpHeaders.class);
+        if (!"-".equals(headerKey)) {
+            String authorization = switch (headerKey) {
+                case "blank" -> "";
+                case "space" -> " ";
+                default -> "AWS4-HMAC-SHA256 Credential=" + headerKey + "/20261013/us-east-1/sts/aws4_request";
+            };
+            when(handler.headers.getHeaderString("Authorization")).thenReturn(authorization);
+        }
+        handler.uriInfo = mock(UriInfo.class);
+        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
+        if (!"-".equals(queryKey)) {
+            query.putSingle("X-Amz-Credential", queryKey + "/20261013/us-east-1/sts/aws4_request");
+        }
+        when(handler.uriInfo.getQueryParameters()).thenReturn(query);
     }
 
     @Test

@@ -419,6 +419,14 @@
     "AmiType",
     "Subnets"
   ],
+  "AWS::ElastiCache::ServerlessCache": [
+    "ServerlessCacheName",
+    "KmsKeyId",
+    "SnapshotArnsToRestore",
+    "SubnetIds",
+    "ConnectionType",
+    "NetworkType"
+  ],
   "AWS::ElasticLoadBalancingV2::Listener": [
     "LoadBalancerArn"
   ],

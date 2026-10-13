@@ -201,6 +201,13 @@ public final class CfnRollback {
     public static final String COGNITO_UPDATE_SNAPSHOT_ATTR = "__FlociCognitoUpdateSnapshot";
 
     /**
+     * Holds the settings and tags a serverless cache had before an in-place update changed them,
+     * so a failed stack update can put them back. Written by {@code ElastiCacheServerlessCfnProvisioner}
+     * before its modify call and spent by its {@code rollbackUpdate}.
+     */
+    public static final String SERVERLESS_CACHE_UPDATE_SNAPSHOT_ATTR = "__FlociServerlessCacheUpdateSnapshot";
+
+    /**
      * Holds the configuration an Auto Scaling group carried before an in-place update changed it,
      * so a failed stack update can restore it.
      */
