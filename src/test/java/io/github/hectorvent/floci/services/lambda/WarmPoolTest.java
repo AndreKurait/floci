@@ -28,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -117,6 +118,41 @@ class WarmPoolTest {
         pool.stopManagedContainers();
         verify(containerLauncher, times(1)).stop(handle);
         pool.shutdown();
+    }
+
+    @Test
+    void stopManagedContainersDrainsDifferentFunctionsConcurrently() throws Exception {
+        WarmPool pool = buildPool();
+        pool.init();
+        ContainerHandle first = new ContainerHandle("cid-first", "first", null, ContainerState.WARM);
+        ContainerHandle second = new ContainerHandle("cid-second", "second", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(first, second);
+        pool.release(pool.acquire(function("first")));
+        pool.release(pool.acquire(function("second")));
+
+        CountDownLatch bothStopping = new CountDownLatch(2);
+        CountDownLatch finishStops = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            bothStopping.countDown();
+            assertTrue(finishStops.await(10, TimeUnit.SECONDS));
+            return null;
+        }).when(containerLauncher).stop(any());
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<?> drain = executor.submit(pool::stopManagedContainers);
+        try {
+            assertTrue(bothStopping.await(5, TimeUnit.SECONDS),
+                    "Both functions must begin stopping before either stop completes");
+        } finally {
+            finishStops.countDown();
+            try {
+                drain.get(10, TimeUnit.SECONDS);
+            } finally {
+                executor.shutdownNow();
+                pool.shutdown();
+            }
+        }
+        verify(containerLauncher, times(1)).stop(first);
+        verify(containerLauncher, times(1)).stop(second);
     }
 
     @Test
