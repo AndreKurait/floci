@@ -176,7 +176,14 @@ public class AutoScalingService {
                                                           Boolean instanceMonitoringEnabled,
                                                           List<LaunchConfigurationBlockDeviceMapping> blockDeviceMappings,
                                                           LaunchTemplateData.MetadataOptions metadataOptions) {
-        Ec2Service.validateMetadataOptions(metadataOptions);
+        try {
+            Ec2Service.validateMetadataOptions(metadataOptions);
+        } catch (AwsException error) {
+            if (!"InvalidParameterValue".equals(error.getErrorCode())) {
+                throw error;
+            }
+            throw new AwsException("ValidationError", error.getMessage(), 400);
+        }
         String key = lcKey(region, name);
         if (launchConfigs.containsKey(key)) {
             throw new AwsException("AlreadyExists",
@@ -216,6 +223,7 @@ public class AutoScalingService {
                 }
             }
         }
+        resolveLaunchConfigurationProfile(iamInstanceProfile);
         LaunchConfiguration lc = new LaunchConfiguration();
         lc.setLaunchConfigurationName(name);
         lc.setLaunchConfigurationArn(
@@ -237,6 +245,26 @@ public class AutoScalingService {
         lc.setRegion(region);
         launchConfigs.put(key, lc);
         return lc;
+    }
+
+    String resolveLaunchConfigurationProfile(String profile) {
+        if (isBlank(profile)) {
+            return null;
+        }
+        boolean arn = AwsArnUtils.isArn(profile);
+        String name = arn ? profile.substring(profile.lastIndexOf('/') + 1) : profile;
+        try {
+            String resolved = ec2Service.resolveIamInstanceProfileName(name);
+            if (arn && !profile.equals(resolved)) {
+                throw new AwsException("ValidationError", "Invalid IamInstanceProfile: " + profile, 400);
+            }
+            return resolved;
+        } catch (AwsException error) {
+            if (!"InvalidParameterValue".equals(error.getErrorCode())) {
+                throw error;
+            }
+            throw new AwsException("ValidationError", "Invalid IamInstanceProfile: " + profile, 400);
+        }
     }
 
     public List<LaunchConfiguration> describeLaunchConfigurations(String region, List<String> names) {

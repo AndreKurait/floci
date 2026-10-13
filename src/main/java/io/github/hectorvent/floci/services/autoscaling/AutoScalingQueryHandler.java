@@ -132,6 +132,9 @@ public class AutoScalingQueryHandler {
     }
 
     private static LaunchTemplateData.MetadataOptions parseMetadataOptions(MultivaluedMap<String, String> p) {
+        if (p.keySet().stream().noneMatch(name -> name.startsWith("MetadataOptions."))) {
+            return null;
+        }
         LaunchTemplateData.MetadataOptions options = new LaunchTemplateData.MetadataOptions();
         options.setHttpTokens(p.getFirst("MetadataOptions.HttpTokens"));
         options.setHttpEndpoint(p.getFirst("MetadataOptions.HttpEndpoint"));
@@ -140,7 +143,7 @@ public class AutoScalingQueryHandler {
             try {
                 options.setHttpPutResponseHopLimit(Integer.valueOf(hopLimit));
             } catch (NumberFormatException invalid) {
-                throw new AwsException("ValidationError", "HttpPutResponseHopLimit must be an integer.", 400);
+                throw new AwsException("MalformedInput", "HttpPutResponseHopLimit must be an integer.", 400);
             }
         }
         return options;
@@ -177,13 +180,15 @@ public class AutoScalingQueryHandler {
                .elem("Enabled", String.valueOf(
                        lc.getInstanceMonitoringEnabled() != null ? lc.getInstanceMonitoringEnabled() : Boolean.TRUE))
                .end("InstanceMonitoring");
-            LaunchTemplateData.MetadataOptions metadata = LaunchTemplateData.MetadataOptions.merge(
-                    LaunchTemplateData.MetadataOptions.launchDefaults(), lc.getMetadataOptions());
-            xml.start("MetadataOptions")
-               .elem("HttpTokens", metadata.getHttpTokens())
-               .elem("HttpEndpoint", metadata.getHttpEndpoint())
-               .elem("HttpPutResponseHopLimit", String.valueOf(metadata.getHttpPutResponseHopLimit()))
-               .end("MetadataOptions");
+            if (lc.getMetadataOptions() != null) {
+                LaunchTemplateData.MetadataOptions metadata = LaunchTemplateData.MetadataOptions.merge(
+                        LaunchTemplateData.MetadataOptions.launchDefaults(), lc.getMetadataOptions());
+                xml.start("MetadataOptions")
+                   .elem("HttpTokens", metadata.getHttpTokens())
+                   .elem("HttpEndpoint", metadata.getHttpEndpoint())
+                   .elem("HttpPutResponseHopLimit", String.valueOf(metadata.getHttpPutResponseHopLimit()))
+                   .end("MetadataOptions");
+            }
             writeLaunchConfigurationBlockDeviceMappings(xml, lc.getBlockDeviceMappings());
             xml.end("member");
         }

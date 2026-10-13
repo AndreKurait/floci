@@ -295,6 +295,10 @@ bridge. Conflicting metadata host routes and Floci-owned DNAT rules are refused.
 No listener or local address is installed on port 80, so applications may
 continue to use that port.
 
+When `HttpTokens=required`, metadata reads without a valid IMDSv2 token return 401
+before resolving the requested data. `iam/info` returns the attached IAM profile's
+stored ARN and ID rather than an ID derived from the instance.
+
 Both IMDSv1 (no token) and IMDSv2 (token-based) flows are supported:
 
 ```bash
@@ -933,8 +937,12 @@ prefix lists, `EnaSrdSpecification`, `PrimaryIpv6` and `EnaQueueCount` are likew
 | DisassociateIamInstanceProfile | Detaches the profile behind an association id. |
 
 Launches and association changes resolve both names and ARNs against IAM in the
-caller's account. Unknown profiles, foreign-account ARNs, and conflicting name/ARN
-selectors fail with `InvalidParameterValue` before allocation or association changes.
+caller's account. Unknown profiles and foreign-account ARNs fail with
+`InvalidParameterValue` before allocation or association changes. Launches and launch
+template creation reject simultaneous name/ARN selectors with
+`InvalidParameterCombination`; association replacement uses the ARN when both are
+provided. Launch templates reject malformed profile ARNs at creation with
+`InvalidIamInstanceProfileArn.Malformed`.
 EC2 stores and returns IAM's profile ID, including for launch-template and Auto Scaling
 instances. Persisted instances from older versions omit the unknown ID until the
 profile is reassociated; looking up the ARN could misidentify a deleted and recreated
@@ -1268,3 +1276,14 @@ The file uses the same schema as `src/main/resources/ec2/image-catalog.yaml` and
 include every image that process should expose. Missing or invalid files fail on first
 catalog use; leaving the setting unset preserves the bundled catalog. Containerized
 Floci needs the file mounted at the configured container path.
+
+### Public IPv4 addresses in mock mode
+
+Mock instances apply `MapPublicIpOnLaunch` unless the primary launch interface explicitly
+sets `AssociatePublicIpAddress`. Direct launches and Auto Scaling launch templates preserve
+both `true` and `false` overrides. An automatically assigned public address remains stable
+while running, is released on stop or termination, and is replaced on restart; the private
+address remains unchanged.
+
+A launch template with network interfaces cannot be combined with an instance-level
+`SubnetId`; place the subnet on the primary network interface instead.

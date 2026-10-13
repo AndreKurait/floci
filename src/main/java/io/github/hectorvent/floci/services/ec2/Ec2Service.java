@@ -7665,7 +7665,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (name == null || name.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter LaunchTemplateName", 400);
         }
-        validateLaunchTemplateData(data);
+        validateLaunchTemplateData(region, data);
         boolean exists = launchTemplates.scan(k -> true).stream()
                 .anyMatch(lt -> lt.getRegion().equals(region) && name.equals(lt.getLaunchTemplateName()));
         if (exists) {
@@ -7705,9 +7705,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * ExcludedInstanceTypes", and "Only one of SpotMaxPricePercentageOverLowestPrice or
      * MaxSpotPriceAsPercentageOfOptimalOnDemandPrice can be specified".
      */
-    private static void validateLaunchTemplateData(LaunchTemplateData data) {
+    private static void validateLaunchTemplateData(String region, LaunchTemplateData data) {
         if (data == null) {
             return;
+        }
+        LaunchTemplateData.IamInstanceProfile profile = data.getIamInstanceProfile();
+        if (profile != null) {
+            validateLaunchProfileSelectors(profile.getName(), profile.getArn());
+            if (isSet(profile.getArn())) {
+                AwsArnUtils.Arn arn = AwsArnUtils.isArn(profile.getArn()) ? AwsArnUtils.parse(profile.getArn()) : null;
+                if (arn == null || !AwsRegions.partitionFor(region).equals(arn.partition())
+                        || !"iam".equals(arn.service()) || !arn.region().isEmpty()
+                        || !arn.accountId().matches("\\d{12}")
+                        || !arn.resource().startsWith("instance-profile/") || arn.resource().endsWith("/")) {
+                    throw new AwsException("InvalidIamInstanceProfileArn.Malformed",
+                            "Invalid IAM instance profile ARN: " + profile.getArn(), 400);
+                }
+            }
         }
         requireInstanceTypeOrInstanceRequirements(data);
         validateInstanceRequirements(data.getInstanceRequirements());
@@ -7802,7 +7816,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                                       String sourceVersion, LaunchTemplateData data,
                                                       String versionDescription) {
         ensureDefaultResources(region);
-        validateLaunchTemplateData(data);
+        validateLaunchTemplateData(region, data);
         LaunchTemplate launchTemplate = findLaunchTemplate(region, id, name);
         ensureLaunchTemplateVersions(launchTemplate);
         int latestVersion = parseLaunchTemplateVersion(launchTemplate.getLatestVersionNumber()) + 1;
@@ -7814,7 +7828,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     resolveLaunchTemplateVersion(launchTemplate, sourceVersion, launchTemplate.getLatestVersionNumber()));
         }
         LaunchTemplateData merged = source.mergedWith(data != null ? data : new LaunchTemplateData());
-        validateLaunchTemplateData(merged);
+        validateLaunchTemplateData(region, merged);
         launchTemplate.setLatestVersionNumber(String.valueOf(latestVersion));
         launchTemplate.getVersions().put(String.valueOf(latestVersion), merged);
         launchTemplate.setData(new LaunchTemplateData(merged));
@@ -7922,11 +7936,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             return null;
         }
         LaunchTemplateData.IamInstanceProfile profile = data.getIamInstanceProfile();
-        return resolveIamInstanceProfileArn(profile.getName(), profile.getArn());
+        return resolveLaunchIamInstanceProfileArn(profile.getName(), profile.getArn());
     }
 
     public String resolveIamInstanceProfileName(String name) {
         return resolveIamInstanceProfileArn(name, null);
+    }
+
+    public String resolveLaunchIamInstanceProfileArn(String name, String arn) {
+        validateLaunchProfileSelectors(name, arn);
+        return resolveIamInstanceProfileArn(name, arn);
+    }
+
+    private static void validateLaunchProfileSelectors(String name, String arn) {
+        if (isSet(name) && isSet(arn)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "The parameter iamInstanceProfile.name may not be used with iamInstanceProfile.arn.", 400);
+        }
     }
 
     public String resolveIamInstanceProfileArn(String name, String arn) {
@@ -7944,7 +7970,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             throw new IllegalStateException("IAM service is required to resolve instance profiles");
         }
         String lookupName = name;
-        if (!hasName) {
+        if (hasArn) {
             lookupName = arn.substring(arn.lastIndexOf('/') + 1);
         }
         return iamService.findInstanceProfile(callerAccountId(), lookupName)

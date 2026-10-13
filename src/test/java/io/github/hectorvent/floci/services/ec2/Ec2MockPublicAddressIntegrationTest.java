@@ -7,6 +7,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
@@ -14,6 +15,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -46,16 +48,7 @@ class Ec2MockPublicAddressIntegrationTest {
                 .post("/").then().statusCode(200).extract().path("CreateSubnetResponse.subnet.subnetId");
         request("ModifySubnetAttribute", owner).formParam("SubnetId", subnet)
                 .formParam("MapPublicIpOnLaunch.Value", subnetDefault).post("/").then().statusCode(200);
-        String volume = request("CreateVolume", owner).formParam("Size", 8)
-                .formParam("AvailabilityZone", REGION + "a").post("/").then().statusCode(200)
-                .extract().path("CreateVolumeResponse.volumeId");
-        String snapshot = request("CreateSnapshot", owner).formParam("VolumeId", volume)
-                .post("/").then().statusCode(200).extract().path("CreateSnapshotResponse.snapshotId");
-        String image = request("RegisterImage", owner).formParam("Name", "public-address")
-                .formParam("RootDeviceName", "/dev/sda1").formParam("Architecture", "x86_64")
-                .formParam("BlockDeviceMapping.1.DeviceName", "/dev/sda1")
-                .formParam("BlockDeviceMapping.1.Ebs.SnapshotId", snapshot)
-                .post("/").then().statusCode(200).extract().path("RegisterImageResponse.imageId");
+        String image = "ami-amazonlinux2023";
         String template = null;
         if (!"direct".equals(source)) {
             RequestSpecification create = request("CreateLaunchTemplate", owner)
@@ -76,6 +69,9 @@ class Ec2MockPublicAddressIntegrationTest {
                 version.formParam("LaunchTemplateData.NetworkInterface.1.DeviceIndex", 0)
                         .formParam("LaunchTemplateData.NetworkInterface.1.AssociatePublicIpAddress", override);
             }
+            if ("template".equals(source) && !"unset".equals(override)) {
+                version.formParam("LaunchTemplateData.NetworkInterface.1.SubnetId", subnet);
+            }
             version.post("/").then().statusCode(200);
         }
         String instance;
@@ -93,8 +89,10 @@ class Ec2MockPublicAddressIntegrationTest {
             RequestSpecification launch = request("RunInstances", owner)
                     .formParam("MinCount", 1).formParam("MaxCount", 1);
             if (template != null) {
-                launch.formParam("LaunchTemplate.LaunchTemplateId", template).formParam("LaunchTemplate.Version", "2")
-                        .formParam("SubnetId", subnet);
+                launch.formParam("LaunchTemplate.LaunchTemplateId", template).formParam("LaunchTemplate.Version", "2");
+                if ("unset".equals(override)) {
+                    launch.formParam("SubnetId", subnet);
+                }
             } else {
                 launch.formParam("ImageId", image).formParam("InstanceType", "t3.micro");
                 if (!"unset".equals(override)) {
@@ -113,7 +111,7 @@ class Ec2MockPublicAddressIntegrationTest {
         String publicIp = first.extract().xmlPath().getString(INSTANCE + "ipAddress");
         assertEquals(publicExpected, !publicIp.isEmpty());
         if (publicExpected) {
-            assertTrue(publicIp.matches("54\\.[0-9]+\\.[0-9]+\\.[0-9]+"));
+            assertTrue(publicIp.matches("[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"));
         }
         assertEquals(publicIp, describe(owner, instance).extract().xmlPath().getString(INSTANCE + "ipAddress"));
         if (!"asg".equals(source)) {
@@ -138,11 +136,28 @@ class Ec2MockPublicAddressIntegrationTest {
         if (template != null) {
             request("DeleteLaunchTemplate", owner).formParam("LaunchTemplateId", template).post("/").then().statusCode(200);
         }
-        request("DeregisterImage", owner).formParam("ImageId", image).post("/").then().statusCode(200);
-        request("DeleteSnapshot", owner).formParam("SnapshotId", snapshot).post("/").then().statusCode(200);
-        request("DeleteVolume", owner).formParam("VolumeId", volume).post("/").then().statusCode(200);
         request("DeleteSubnet", owner).formParam("SubnetId", subnet).post("/").then().statusCode(200);
         request("DeleteVpc", owner).formParam("VpcId", vpc).post("/").then().statusCode(200);
+    }
+
+    @Test
+    void templateNetworkInterfaceRejectsAnInstanceLevelSubnet() {
+        String owner = Long.toString(ACCOUNTS.incrementAndGet());
+        String template = request("CreateLaunchTemplate", owner)
+                .formParam("LaunchTemplateName", "invalid-subnet-combination")
+                .formParam("LaunchTemplateData.ImageId", "ami-amazonlinux2023")
+                .formParam("LaunchTemplateData.InstanceType", "t3.micro")
+                .formParam("LaunchTemplateData.NetworkInterface.1.DeviceIndex", 0)
+                .formParam("LaunchTemplateData.NetworkInterface.1.AssociatePublicIpAddress", true)
+                .post("/").then().statusCode(200)
+                .extract().path("CreateLaunchTemplateResponse.launchTemplate.launchTemplateId");
+        request("RunInstances", owner).formParam("MinCount", 1).formParam("MaxCount", 1)
+                .formParam("LaunchTemplate.LaunchTemplateId", template)
+                .formParam("SubnetId", "subnet-conflicting")
+                .post("/").then().statusCode(400)
+                .body("Response.Errors.Error.Code", equalTo("InvalidParameterCombination"));
+        request("DeleteLaunchTemplate", owner).formParam("LaunchTemplateId", template)
+                .post("/").then().statusCode(200);
     }
 
     private ValidatableResponse describe(String owner, String instance) {

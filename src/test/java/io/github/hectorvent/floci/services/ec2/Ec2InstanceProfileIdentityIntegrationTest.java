@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
+import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
@@ -94,12 +95,18 @@ class Ec2InstanceProfileIdentityIntegrationTest {
                             .formParam("MinCount", "1").formParam("MaxCount", "1")
                             .formParam("ClientToken", token);
                     if (template) {
-                        templateId = request(ACCOUNT, "ec2", "CreateLaunchTemplate")
+                        ValidatableResponse created = request(ACCOUNT, "ec2", "CreateLaunchTemplate")
                                 .formParam("LaunchTemplateName", "invalid-" + token)
                                 .formParam("LaunchTemplateData.ImageId", "ami-0abcdef1234567890")
                                 .formParam("LaunchTemplateData.InstanceType", "t3.micro")
                                 .formParam("LaunchTemplateData.IamInstanceProfile.Arn", arn)
-                                .post("/").then().statusCode(200)
+                                .post("/").then();
+                        if (arn.contains(":role/") || arn.startsWith("arn:aws-cn:")) {
+                            created.statusCode(400).body("Response.Errors.Error.Code",
+                                    equalTo("InvalidIamInstanceProfileArn.Malformed"));
+                            continue;
+                        }
+                        templateId = created.statusCode(200)
                                 .extract().path("CreateLaunchTemplateResponse.launchTemplate.launchTemplateId");
                         run.formParam("LaunchTemplate.LaunchTemplateId", templateId);
                     } else {
@@ -151,7 +158,7 @@ class Ec2InstanceProfileIdentityIntegrationTest {
     }
 
     @Test
-    void conflictingSelectorsDoNotReplaceAnExistingAssociation() {
+    void replacementUsesArnWhenBothSelectorsAreProvided() {
         String name = "profile-replace-" + UUID.randomUUID().toString().substring(0, 8);
         Profile first = createProfile(ACCOUNT, name);
         Profile second = createProfile(ACCOUNT, name + "-second");
@@ -163,12 +170,7 @@ class Ec2InstanceProfileIdentityIntegrationTest {
             String association = Ec2Service.iamInstanceProfileAssociationId(id);
             request(ACCOUNT, "ec2", "ReplaceIamInstanceProfileAssociation")
                     .formParam("AssociationId", association).formParam("IamInstanceProfile.Name", name)
-                    .formParam("IamInstanceProfile.Arn", second.arn()).post("/").then().statusCode(400)
-                    .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
-            assertProfile(id, first);
-            request(ACCOUNT, "ec2", "ReplaceIamInstanceProfileAssociation")
-                    .formParam("AssociationId", association).formParam("IamInstanceProfile.Arn", second.arn())
-                    .post("/").then().statusCode(200)
+                    .formParam("IamInstanceProfile.Arn", second.arn()).post("/").then().statusCode(200)
                     .body("ReplaceIamInstanceProfileAssociationResponse.iamInstanceProfileAssociation"
                             + ".iamInstanceProfile.id", equalTo(second.id()));
             assertProfile(id, second);
@@ -180,6 +182,29 @@ class Ec2InstanceProfileIdentityIntegrationTest {
             terminate(id);
             deleteProfile(ACCOUNT, name);
             deleteProfile(ACCOUNT, name + "-second");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void launchRejectsBothProfileSelectors(boolean template) {
+        String name = "profile-selectors-" + UUID.randomUUID().toString().substring(0, 8);
+        Profile profile = createProfile(ACCOUNT, name);
+        try {
+            RequestSpecification request = request(ACCOUNT, "ec2",
+                    template ? "CreateLaunchTemplate" : "RunInstances");
+            String prefix = template ? "LaunchTemplateData." : "";
+            request.formParam(prefix + "ImageId", "ami-0abcdef1234567890")
+                    .formParam(prefix + "InstanceType", "t3.micro")
+                    .formParam(prefix + "IamInstanceProfile.Name", name)
+                    .formParam(prefix + "IamInstanceProfile.Arn", profile.arn());
+            if (template) {
+                request.formParam("LaunchTemplateName", name);
+            }
+            request.post("/").then().statusCode(400)
+                    .body("Response.Errors.Error.Code", equalTo("InvalidParameterCombination"));
+        } finally {
+            deleteProfile(ACCOUNT, name);
         }
     }
 

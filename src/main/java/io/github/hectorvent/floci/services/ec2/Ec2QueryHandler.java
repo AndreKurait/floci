@@ -782,7 +782,8 @@ public class Ec2QueryHandler {
             userData = Ec2UserDataDecoder.decode(userDataEncoded);
         }
 
-        String iamInstanceProfileArn = resolveIamInstanceProfileArn(p);
+        String iamInstanceProfileArn = service.resolveLaunchIamInstanceProfileArn(
+                p.getFirst("IamInstanceProfile.Name"), p.getFirst("IamInstanceProfile.Arn"));
 
         // Parse TagSpecifications. AWS applies each specification to exactly the resource
         // type it names, so the interfaces RunInstances creates are tagged only by a
@@ -814,10 +815,23 @@ public class Ec2QueryHandler {
         List<LaunchTemplateData.BlockDeviceMapping> blockDevices = parseLaunchTemplateBlockDeviceMappings(p, "");
         LaunchTemplateData launchTemplateData = resolveRunInstancesLaunchTemplateData(
                 p, region, userDataEncoded == null || userDataEncoded.isBlank());
+        boolean suppliedInterfaces = p.keySet().stream().anyMatch(name -> name.startsWith("NetworkInterface."));
+        if (p.getFirst("SubnetId") != null && (suppliedInterfaces
+                || launchTemplateData != null && !launchTemplateData.getNetworkInterfaces().isEmpty())) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Network interfaces and an instance-level subnet ID may not be specified on the same request", 400);
+        }
         if (launchTemplateData != null) {
-            if (associatePublicIp == null && networkInterfaceId == null
-                    && p.keySet().stream().noneMatch(name -> name.startsWith("NetworkInterface."))) {
-                associatePublicIp = launchTemplateData.effectiveAssociatePublicIpAddress();
+            if (!suppliedInterfaces) {
+                LaunchTemplateData.NetworkInterface primary = launchTemplateData.getNetworkInterfaces().stream()
+                        .filter(networkInterface -> Integer.valueOf(0).equals(networkInterface.getDeviceIndex()))
+                        .findFirst().orElse(null);
+                if (primary != null) {
+                    subnetId = firstNonBlank(subnetId, primary.getSubnetId());
+                    if (associatePublicIp == null) {
+                        associatePublicIp = primary.getAssociatePublicIpAddress();
+                    }
+                }
             }
             blockDevices = Ec2BlockDevices.merge(launchTemplateData.getBlockDeviceMappings(), blockDevices);
             if (launchTemplateData.getMetadataOptions() != null) {

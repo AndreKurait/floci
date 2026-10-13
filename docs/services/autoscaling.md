@@ -244,6 +244,6 @@ aws autoscaling set-desired-capacity \
   --desired-capacity 3
 ```
 
-Launch configurations accept an IAM instance profile name or ARN. At launch, the reconciler resolves it in the owning account through EC2/IAM; absent or foreign profiles fail the scaling activity without allocating an instance.
+Launch configurations accept an IAM instance profile name or ARN. Unknown and foreign profiles fail creation with `ValidationError`. At launch, the reconciler resolves a stored name to its ARN in the owning account.
 
-Launch-configuration metadata options (`HttpTokens`, `HttpEndpoint`, and `HttpPutResponseHopLimit`) round-trip through Query and CloudFormation and reach EC2 launches. Omitted values retain the EC2 defaults; explicit values override them. Launch templates and mixed-instance templates likewise forward their existing metadata options.
+Launch-configuration metadata options (`HttpTokens`, `HttpEndpoint`, and `HttpPutResponseHopLimit`) round-trip through Query and CloudFormation and reach EC2 launches. When the structure is omitted it stays absent from `DescribeLaunchConfigurations`; a supplied partial structure reports defaults for unspecified fields. Launch templates and mixed-instance templates likewise forward their existing metadata options.

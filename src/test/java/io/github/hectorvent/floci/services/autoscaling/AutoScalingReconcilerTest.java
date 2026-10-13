@@ -117,6 +117,11 @@ class AutoScalingReconcilerTest {
         version.getData().setImageId("ami-version-1");
         version.getData().setInstanceType("t3.micro");
         version.getData().setEncodedUserData("IyEvYmluL2Jhc2gKZWNobyBoaQo=");
+        LaunchTemplateData.MetadataOptions metadata = new LaunchTemplateData.MetadataOptions();
+        metadata.setHttpTokens("required");
+        metadata.setHttpEndpoint("enabled");
+        metadata.setHttpPutResponseHopLimit(2);
+        version.getData().setMetadataOptions(metadata);
         version.getData().setIamInstanceProfile(new LaunchTemplateData.IamInstanceProfile(
                 "arn:aws:iam::000000000000:instance-profile/app-profile", null));
         when(ec2Service.iamInstanceProfileArn(version.getData()))
@@ -137,7 +142,7 @@ class AutoScalingReconcilerTest {
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
                 anyList(), eq("#!/bin/bash\necho hi\n"),
-                eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null), eq(null), eq(0), eq(null), eq(null), eq(null), eq(null), eq(false),
+                eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null), eq(null), eq(0), eq(null), eq(metadata), eq(null), eq(null), eq(false),
                 eq(null), eq(null), eq(List.of()))).thenReturn(reservation);
 
         reconciler.reconcile(asg);
@@ -150,7 +155,7 @@ class AutoScalingReconcilerTest {
         verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
                 tags.capture(), eq("#!/bin/bash\necho hi\n"),
-                eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null), eq(null), eq(0), eq(null), eq(null), eq(null), eq(null), eq(false),
+                eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null), eq(null), eq(0), eq(null), eq(metadata), eq(null), eq(null), eq(false),
                 eq(null), eq(null), eq(List.of()));
         assertNull(version.getData().getUserData());
         assertEquals(propagatedTags.size(), tags.getValue().size());
@@ -370,6 +375,11 @@ class AutoScalingReconcilerTest {
         version.getData().setImageId("ami-version-3");
         version.getData().setInstanceType("t3.micro");
         version.getData().setEncodedUserData("IyEvYmluL2Jhc2gKZWNobyBoaQo=");
+        LaunchTemplateData.MetadataOptions metadata = new LaunchTemplateData.MetadataOptions();
+        metadata.setHttpTokens("required");
+        metadata.setHttpEndpoint("enabled");
+        metadata.setHttpPutResponseHopLimit(2);
+        version.getData().setMetadataOptions(metadata);
         when(ec2Service.describeLaunchTemplates("us-east-1", List.of("lt-123"), List.of(), Map.of()))
                 .thenReturn(List.of(launchTemplate));
         when(ec2Service.describeLaunchTemplateVersions("us-east-1", "lt-123", null, List.of("3")))
@@ -380,7 +390,7 @@ class AutoScalingReconcilerTest {
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-3"), eq("t3.small"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                onlyGroupNameTag("app-asg"), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null), eq(null), eq(0), eq(null), eq(null), eq(null), eq(null), eq(false),
+                onlyGroupNameTag("app-asg"), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null), eq(null), eq(0), eq(null), eq(metadata), eq(null), eq(null), eq(false),
                 eq(null), eq(null), eq(List.of()))).thenReturn(reservation);
 
         reconciler.reconcile(asg);
@@ -392,7 +402,7 @@ class AutoScalingReconcilerTest {
         assertEquals("t3.small", asg.getInstances().getFirst().getInstanceType());
         verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-version-3"), eq("t3.small"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                onlyGroupNameTag("app-asg"), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null), eq(null), eq(0), eq(null), eq(null), eq(null), eq(null), eq(false),
+                onlyGroupNameTag("app-asg"), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null), eq(null), eq(0), eq(null), eq(metadata), eq(null), eq(null), eq(false),
                 eq(null), eq(null), eq(List.of()));
         assertNull(version.getData().getUserData());
     }
@@ -464,7 +474,8 @@ class AutoScalingReconcilerTest {
                 org.mockito.ArgumentMatchers.any(),
                 org.mockito.ArgumentMatchers.any(),
                 org.mockito.ArgumentMatchers.any(),
-                org.mockito.ArgumentMatchers.any(), eq(null), eq(0), eq(null));
+                org.mockito.ArgumentMatchers.any(), eq(null), eq(0), eq(null), eq(null), eq(null), eq(null),
+                eq(false), eq(null), eq(null), eq(List.of()));
     }
 
     @Test

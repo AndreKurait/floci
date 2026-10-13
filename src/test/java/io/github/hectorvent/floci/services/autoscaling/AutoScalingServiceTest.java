@@ -227,6 +227,8 @@ class AutoScalingServiceTest {
         source.setSecurityGroups(List.of(new GroupIdentifier("sg-source", "default")));
         source.setUserData("source-user-data");
         source.setIamInstanceProfileArn("arn:aws:iam::000000000000:instance-profile/source");
+        when(ec2Service.resolveIamInstanceProfileName("source"))
+                .thenReturn(source.getIamInstanceProfileArn());
         Reservation reservation = new Reservation();
         reservation.getInstances().add(source);
         when(ec2Service.describeInstances(REGION, List.of("i-1234567890abcdef0"), java.util.Map.of()))
