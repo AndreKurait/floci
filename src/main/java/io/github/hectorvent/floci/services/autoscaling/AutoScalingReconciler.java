@@ -368,12 +368,13 @@ public class AutoScalingReconciler {
                         propagatedInstanceTags(asg, launchSource),
                         launchSource.userData(),
                         launchSource.iamInstanceProfile(),
-                        launchSource.associatePublicIpAddress(), null, 0, placement.availabilityZone());
+                        launchSource.associatePublicIpAddress(), null, 0, null);
 
                 for (Instance ec2Inst : reservation.getInstances()) {
                     AsgInstance asgInst = new AsgInstance();
                     asgInst.setInstanceId(ec2Inst.getInstanceId());
-                    asgInst.setAvailabilityZone(ec2Inst.getPlacement() != null
+                    asgInst.setAvailabilityZone(placement.subnetId() == null && placement.availabilityZone() != null
+                            ? placement.availabilityZone() : ec2Inst.getPlacement() != null
                             ? ec2Inst.getPlacement().getAvailabilityZone() : placement.availabilityZone());
                     asgInst.setLifecycleState("Pending");
                     asgInst.setHealthStatus("Healthy");
@@ -390,7 +391,8 @@ public class AutoScalingReconciler {
                 if (placement.subnetId() != null) {
                     placements.set(placements.indexOf(placement), new LaunchPlacement(placement.subnetId(),
                             placement.availabilityZone(), Math.max(0,
-                                    placement.availableIpAddresses() - reservation.getInstances().size())));
+                                    placement.availableIpAddresses() - reservation.getInstances().size()),
+                            placement.requiresIpv4Address()));
                 }
             }
         } catch (RuntimeException e) {
@@ -409,8 +411,10 @@ public class AutoScalingReconciler {
             }
         }
         if (launchFailure instanceof AwsException) {
-            recordFailedActivity(asg, "Launching new EC2 instances",
-                    "Instances were requested in response to a desired capacity change.", launchFailure);
+            String description = "Launching a new EC2 instance.";
+            String message = statusMessage(launchFailure, " Launching EC2 instance failed.");
+            recordFailedActivity(asg, description + "  Status Reason: " + message,
+                    "Instances were requested in response to a desired capacity change.", message, description);
             return false;
         }
         if (launchFailure != null) {
@@ -453,14 +457,15 @@ public class AutoScalingReconciler {
                     throw new AwsException("InvalidSubnetID.NotFound", "The subnet ID '" + id + "' does not exist", 400);
                 }
                 // Subnets remain authoritative when an update leaves older zone metadata behind.
-                placements.add(new LaunchPlacement(id, subnet.getAvailabilityZone(), subnet.getAvailableIpAddressCount()));
+                placements.add(new LaunchPlacement(id, subnet.getAvailabilityZone(), subnet.getAvailableIpAddressCount(),
+                        subnet.getCidrBlock() != null && !subnet.getCidrBlock().isBlank()));
             }
             return placements;
         }
         if (!asg.getAvailabilityZones().isEmpty()) {
-            return asg.getAvailabilityZones().stream().map(zone -> new LaunchPlacement(null, zone, 0)).toList();
+            return asg.getAvailabilityZones().stream().map(zone -> new LaunchPlacement(null, zone, 0, false)).toList();
         }
-        return List.of(new LaunchPlacement(null, null, 0));
+        return List.of(new LaunchPlacement(null, null, 0, false));
     }
 
     private LaunchPlacement leastPopulatedPlacement(AutoScalingGroup asg, List<LaunchPlacement> placements) {
@@ -472,23 +477,25 @@ public class AutoScalingReconciler {
             if (!isActiveLifecycleState(instance.getLifecycleState())) {
                 continue;
             }
-            Instance actual = ec2Service.getInstance(asg.getRegion(), instance.getInstanceId()).orElse(null);
+            Instance actual = asg.getSubnetIds().isEmpty() ? null
+                    : ec2Service.getInstance(asg.getRegion(), instance.getInstanceId()).orElse(null);
             String zone = actual != null && actual.getPlacement() != null
                     ? actual.getPlacement().getAvailabilityZone() : instance.getAvailabilityZone();
             if (zoneCounts.containsKey(zone)) {
                 zoneCounts.compute(zone, (ignored, count) -> count + 1);
             }
         }
-        return placements.stream()
-                .filter(placement -> placement.subnetId() == null || placement.availableIpAddresses() > 0)
-                .min(Comparator
+        Comparator<LaunchPlacement> preference = Comparator
                 .comparingLong((LaunchPlacement placement) -> zoneCounts.get(placement.availabilityZone()))
-                .thenComparing(Comparator.comparingInt(LaunchPlacement::availableIpAddresses).reversed()))
-                .orElseThrow(() -> new AwsException("InsufficientFreeAddressesInSubnet",
-                        "No configured subnet has free IPv4 addresses.", 400));
+                .thenComparing(Comparator.comparingInt(LaunchPlacement::availableIpAddresses).reversed());
+        return placements.stream()
+                .filter(placement -> !placement.requiresIpv4Address() || placement.availableIpAddresses() > 0)
+                .min(preference)
+                .orElseGet(() -> placements.stream().min(preference).orElseThrow());
     }
 
-    private record LaunchPlacement(String subnetId, String availabilityZone, int availableIpAddresses) {}
+    private record LaunchPlacement(String subnetId, String availabilityZone, int availableIpAddresses,
+                                   boolean requiresIpv4Address) {}
 
     private static List<io.github.hectorvent.floci.services.ec2.model.Tag> propagatedInstanceTags(
             AutoScalingGroup asg,
@@ -552,10 +559,15 @@ public class AutoScalingReconciler {
      * different error is recorded, so the history carries the current reason.
      */
     private void recordFailedActivity(AutoScalingGroup asg, String description, String cause, Exception failure) {
-        String statusMessage = statusMessage(failure);
+        recordFailedActivity(asg, description, cause, statusMessage(failure, ""), description);
+    }
+
+    private void recordFailedActivity(AutoScalingGroup asg, String description, String cause,
+                                      String statusMessage, String descriptionPrefix) {
         ScalingActivity previous = asgService.describeScalingActivities(asg.getRegion(), asg.getAutoScalingGroupName())
                 .stream()
-                .filter(activity -> description.equals(activity.getDescription()))
+                .filter(activity -> activity.getDescription() != null
+                        && activity.getDescription().startsWith(descriptionPrefix))
                 .findFirst()
                 .orElse(null);
         if (previous != null && "Failed".equals(previous.getStatusCode())
@@ -567,17 +579,16 @@ public class AutoScalingReconciler {
         asgService.completeActivity(activity.getActivityId(), "Failed", statusMessage);
     }
 
-    private static String statusMessage(Exception failure) {
+    private static String statusMessage(Exception failure, String suffix) {
         String message = failure.getMessage() != null && !failure.getMessage().isBlank()
                 ? failure.getMessage()
                 : failure.getClass().getSimpleName();
-        if (message.length() <= STATUS_MESSAGE_MAX_LENGTH) {
-            return message;
+        int maxLength = STATUS_MESSAGE_MAX_LENGTH - suffix.length();
+        if (message.length() <= maxLength) {
+            return message + suffix;
         }
-        int end = Character.isHighSurrogate(message.charAt(STATUS_MESSAGE_MAX_LENGTH - 1))
-                ? STATUS_MESSAGE_MAX_LENGTH - 1
-                : STATUS_MESSAGE_MAX_LENGTH;
-        return message.substring(0, end);
+        int end = Character.isHighSurrogate(message.charAt(maxLength - 1)) ? maxLength - 1 : maxLength;
+        return message.substring(0, end) + suffix;
     }
 
     private void deregisterFromTargetGroups(AutoScalingGroup asg, List<String> instanceIds) {
