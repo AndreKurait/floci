@@ -6,7 +6,8 @@ import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -57,8 +58,9 @@ class BedrockProxyTimeoutIntegrationTest {
         backend.stop(0);
     }
 
-    @Test
-    void converse_backendTimesOut_returnsModelTimeoutException() {
+    @ParameterizedTest
+    @ValueSource(strings = {"converse", "converse-stream"})
+    void backendTimesOut_returnsModelTimeoutException(String operation) {
         given()
             .contentType("application/json")
             .header("Authorization", AUTH_HEADER)
@@ -66,7 +68,7 @@ class BedrockProxyTimeoutIntegrationTest {
                 {"messages": [{"role": "user", "content": [{"text": "hi"}]}]}
                 """)
         .when()
-            .post("/model/" + MAPPED_MODEL_ID + "/converse")
+            .post("/model/" + MAPPED_MODEL_ID + "/" + operation)
         .then()
             .statusCode(408)
             .body("__type", equalTo("ModelTimeoutException"));

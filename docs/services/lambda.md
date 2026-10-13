@@ -73,8 +73,11 @@ supported ranges before changing any stored settings. A rejected value returns
 `InvalidParameterValueException` and leaves the function configuration unchanged.
 
 The event invoke configuration is stored and returned as AWS does, and `AWS::Lambda::EventInvokeConfig`
-provisions it from a stack. Asynchronous invocations apply its retry, event age, destination settings,
-and dead-letter queue configurations (`DeadLetterConfig`).
+provisions it from a stack. A SAM function's `EventInvokeConfig` expands into that resource as
+`sam deploy` does: on `$LATEST`, or on the `AutoPublishAlias` alias, with the inline role policy for
+each destination and the SQS queue or SNS topic SAM creates when a destination gives only its `Type`.
+Asynchronous invocations apply its retry, event age, destination settings, and dead-letter queue
+configurations (`DeadLetterConfig`).
 
 ### Function policies under IAM enforcement
 

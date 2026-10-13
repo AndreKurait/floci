@@ -44,6 +44,27 @@ class AwsQueryActionRoutingParityTest {
         }
     }
 
+    /** A heading in the gap file: what it labels, and the three counts it claims for its rows. */
+    private record GapHeading(String label, String line, int total, int unrouted, int claimed) {
+
+        private static GapHeading of(String label, Matcher heading, int firstCount) {
+            return new GapHeading(label, heading.group(),
+                    Integer.parseInt(heading.group(firstCount)),
+                    Integer.parseInt(heading.group(firstCount + 1)),
+                    Integer.parseInt(heading.group(firstCount + 2)));
+        }
+
+        /** Records a mismatch when the unrouted and claimed rows counted under it disagree with it. */
+        private void check(int[] rows, List<String> wrong) {
+            int rowTotal = rows[0] + rows[1];
+            if (total != rowTotal || unrouted != rows[0] || claimed != rows[1]) {
+                wrong.add("the " + label + " heading says " + total + " (" + unrouted + " unrouted, "
+                        + claimed + " claimed) but the rows under it are " + rowTotal + " ("
+                        + rows[0] + " unrouted, " + rows[1] + " claimed): " + line);
+            }
+        }
+    }
+
     private static final String HANDLERS_ROOT = "src/main/java/io/github/hectorvent/floci/services/";
 
     /**
@@ -94,6 +115,13 @@ class AwsQueryActionRoutingParityTest {
     private static final Pattern CASE_LABELS =
             Pattern.compile("case\\s+((?:\"[A-Za-z0-9]+\"\\s*,?\\s*)+)\\s*(?:->|:)");
     private static final Pattern QUOTED_LABEL = Pattern.compile("\"([A-Za-z0-9]+)\"");
+
+    /** {@code # 189 entries: 171 unrouted, 18 claimed by another service.} */
+    private static final Pattern TOTAL_HEADING = Pattern.compile(
+            "^#\\s*(\\d+) entries: (\\d+) unrouted, (\\d+) claimed by another service\\.?$");
+    /** {@code # autoscaling: 17 (13 unrouted, 4 claimed elsewhere)} */
+    private static final Pattern SERVICE_HEADING = Pattern.compile(
+            "^#\\s*([a-z0-9-]+): (\\d+) \\((\\d+) unrouted, (\\d+) claimed elsewhere\\)$");
 
     @Test
     void everyDispatchedActionRoutesToItsOwnService() throws IOException {
@@ -169,6 +197,77 @@ class AwsQueryActionRoutingParityTest {
                 "Every *QueryHandler.java has to be registered in this test with the service its "
                         + "actions must reach, so its dispatch list is compared against routing. "
                         + "Unregistered: " + unregistered);
+    }
+
+    /**
+     * The headings in the gap file count the rows under them, and a fix that removes rows makes
+     * them wrong. They are worth keeping, because the scale and the split between the two kinds of
+     * gap are the first thing a reader wants, so the test keeps them honest instead.
+     *
+     * <p>Every heading is checked, not just the total: a per-service fix is exactly the change that
+     * invalidates its own service heading. The headings must also be present, so deleting one
+     * cannot make this pass by having nothing left to compare.
+     *
+     * <p>The file is walked in order, so a service heading is held to the rows physically below it,
+     * up to the next heading, rather than to its service's rows wherever they sit. Each row has to
+     * sit under its own service's heading, and a service gets one heading, so a misplaced row or a
+     * section split in two fails even when every service's overall count still adds up.
+     */
+    @Test
+    void theKnownGapHeadingsCountTheRowsBelowThem() throws IOException {
+        List<String> wrong = new ArrayList<>();
+        Set<String> headed = new TreeSet<>();
+        int[] allRows = new int[2];
+        GapHeading total = null;
+        GapHeading section = null;
+        int[] sectionRows = new int[2];
+
+        for (String raw : Files.readAllLines(KNOWN_GAPS)) {
+            String line = raw.strip();
+            Matcher totalHeading = TOTAL_HEADING.matcher(line);
+            Matcher serviceHeading = SERVICE_HEADING.matcher(line);
+            if (totalHeading.matches()) {
+                if (total != null) {
+                    wrong.add("the total heading appears twice: " + line);
+                }
+                total = GapHeading.of("total", totalHeading, 1);
+            } else if (serviceHeading.matches()) {
+                if (section != null) {
+                    section.check(sectionRows, wrong);
+                }
+                section = GapHeading.of(serviceHeading.group(1), serviceHeading, 2);
+                sectionRows = new int[2];
+                if (!headed.add(section.label())) {
+                    wrong.add("the " + section.label() + " heading appears twice, splitting its rows: " + line);
+                }
+            } else if (!line.isEmpty() && !line.startsWith("#")) {
+                String[] columns = line.split("\t");
+                int column = "sqs".equals(columns[2]) ? 0 : 1;
+                allRows[column]++;
+                if (section == null) {
+                    wrong.add(line + " comes before any service heading");
+                } else {
+                    sectionRows[column]++;
+                    if (!section.label().equals(columns[0])) {
+                        wrong.add(line + " sits under the " + section.label() + " heading, not its own");
+                    }
+                }
+            }
+        }
+        if (section != null) {
+            section.check(sectionRows, wrong);
+        }
+
+        if (total == null) {
+            wrong.add("the total heading is missing, so nothing states the overall count");
+        } else {
+            total.check(allRows, wrong);
+        }
+
+        assertTrue(wrong.isEmpty(),
+                "A heading in " + KNOWN_GAPS + " no longer counts the rows under it, or a row is not "
+                        + "under its own service's heading. Removing a gap means updating the heading "
+                        + "that counted it, including the total. " + wrong);
     }
 
     /** One line of the known-gap file: the service, the action, and what it reaches instead. */

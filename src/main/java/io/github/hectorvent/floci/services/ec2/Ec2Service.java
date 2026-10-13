@@ -9912,7 +9912,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
                 if (!found) {
                     throw new AwsException("InvalidParameterValue",
-                            "The zone name '" + requestedName + "' is not valid for this region.", 400);
+                            "Invalid availability zone: [" + requestedName + "]", 400);
                 }
             }
             allZones.removeIf(az -> !requestedNames.contains(az.get("zoneName")));
