@@ -6,6 +6,10 @@ Floci supports AWS AppConfig and AppConfigData for local configuration managemen
 
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
 
+The legacy `GetConfiguration` data-plane route accepts application, environment and profile names or IDs.
+It returns only the deployed version, its content type and `Configuration-Version`; a matching
+`ClientConfigurationVersion` returns HTTP 200 with no body. `ClientId` is required.
+
 ### Supported Operations
 
 - `CreateApplication`
