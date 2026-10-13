@@ -653,6 +653,22 @@ public class AwsQueryController {
             "GetClusterCredentials", "GetClusterCredentialsWithIAM"
     );
 
+    /** Root GET requests that can use the CloudWatch Query handler without claiming S3 traffic. */
+    public static boolean isCloudWatchQueryGet(String authorization, String target, String accept,
+                                                MultivaluedMap<String, String> queryParams) {
+        if (target != null || queryParams.containsKey("X-Amz-Credential")
+                || (accept != null && accept.contains(MediaType.TEXT_HTML))) {
+            return false;
+        }
+        String action = AwsQueryServiceResolver.action(queryParams);
+        if (action == null || !CLOUDWATCH_ACTIONS.contains(action)) {
+            return false;
+        }
+        return SigV4CredentialScope.serviceName(authorization)
+                .map("monitoring"::equals)
+                .orElseGet(() -> authorization == null && "monitoring".equals(inferServiceFromAction(action)));
+    }
+
     static String inferServiceFromAction(String action) {
         if (STS_ACTIONS.contains(action)) {
             return "sts";

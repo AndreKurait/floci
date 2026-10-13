@@ -8,6 +8,7 @@ import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvFileSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.Mockito;
 
 import java.io.ByteArrayInputStream;
@@ -30,6 +31,51 @@ import static org.mockito.Mockito.when;
 class IamActionRegistryTest {
 
     private final IamActionRegistry registry = new IamActionRegistry();
+
+    @Test
+    void cloudWatchGetUsesQueryActionAndOperationPrecedence() {
+        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
+        query.add("Action", "GetMetricStatistics");
+        query.add("Operation", "ListMetrics");
+        ContainerRequestContext ctx = mockCtx("GET", "/", query, null, "");
+        when(ctx.getHeaderString("Authorization")).thenReturn(
+                "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/monitoring/aws4_request");
+        assertEquals("monitoring:GetMetricStatistics", registry.resolve("monitoring", ctx));
+        assertEquals("GetMetricStatistics", registry.queryAction(ctx));
+        query.remove("Action");
+        assertEquals("monitoring:ListMetrics", registry.resolve("monitoring", ctx));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "s3,GetMetricStatistics,false", "sns,TagResource,false", "monitoring,TagResource,true",
+            "monitoring,UnknownAction,false", "unknown,GetMetricStatistics,false"
+    })
+    void getClassificationRespectsSigningScope(String scope, String action, boolean expected) {
+        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
+        query.add("Action", action);
+        ContainerRequestContext ctx = mockCtx("GET", "/", query, null, "");
+        when(ctx.getHeaderString("Authorization")).thenReturn(
+                "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/" + scope + "/aws4_request");
+        assertEquals(expected, IamActionRegistry.isQueryRequest(ctx));
+    }
+
+    @Test
+    void targetBrowserAndBucketPathsAreNotCloudWatchQuery() {
+        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
+        query.add("Action", "ListMetrics");
+        ContainerRequestContext ctx = mockCtx("GET", "/", query, null, "");
+        assertEquals(true, IamActionRegistry.isQueryRequest(ctx));
+        query.add("X-Amz-Credential", "test/20261013/us-east-1/s3/aws4_request");
+        assertEquals(false, IamActionRegistry.isQueryRequest(ctx));
+        query.remove("X-Amz-Credential");
+        when(ctx.getHeaderString("Accept")).thenReturn("text/html");
+        assertEquals(false, IamActionRegistry.isQueryRequest(ctx));
+        when(ctx.getHeaderString("Accept")).thenReturn(null);
+        when(ctx.getHeaderString("X-Amz-Target")).thenReturn("Example.Target");
+        assertEquals(false, IamActionRegistry.isQueryRequest(ctx));
+        assertEquals(false, IamActionRegistry.isQueryRequest(mockCtx("GET", "/bucket", query, null, "")));
+    }
 
     @Test
     void resolvesActionFromFormEncodedBody() {
