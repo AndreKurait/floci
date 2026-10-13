@@ -43,6 +43,21 @@ class AcmIntegrationTest {
     // ==================== User Story 1: RequestCertificate ====================
 
     @Test
+    void requestCertificateRejectsEmptySans() {
+        given()
+            .header("X-Amz-Target", "CertificateManager.RequestCertificate")
+            .contentType(ACM_CONTENT_TYPE)
+            .body("""
+                {"DomainName": "empty-sans.example.com", "SubjectAlternativeNames": []}
+                """)
+        .when().post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", containsString("subjectAlternativeNames"));
+    }
+
+    @Test
     @Order(1)
     void requestCertificateBasic() {
         createdCertificateArn = given()
