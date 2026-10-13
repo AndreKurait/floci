@@ -1157,6 +1157,11 @@ and the last one as AWS reserves them, and skipping every address a persisted in
 interface or NAT gateway in the subnet still holds, so a restart does not hand one out twice. A
 subnet with no free address left fails the request with `InsufficientFreeAddressesInSubnet`.
 
+`CreateSubnet` derives `AvailableIpAddressCount` from the IPv4 CIDR, excluding the
+five AWS-reserved addresses. `DescribeSubnets` subtracts addresses currently held
+by instances, network interfaces, NAT gateways and interface endpoints. ASG
+scale-out uses this count when selecting among subnets in the same zone.
+
 ## Requirements
 
 EC2 requires the Docker socket to be accessible (same as Lambda, ECS, and other container services):

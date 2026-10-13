@@ -119,8 +119,8 @@ public class AutoScalingReconciler {
                 try {
                     reconcile(asg);
                 } catch (Exception e) {
-                    LOG.warnv("Reconcile failed for ASG {0} in account {1}: {2}",
-                            asg.getAutoScalingGroupName(), accountId, e.getMessage());
+                    LOG.warnv(e, "Reconcile failed for ASG {0} in account {1}",
+                            asg.getAutoScalingGroupName(), accountId);
                 }
             }
         } catch (Exception e) {
@@ -138,7 +138,9 @@ public class AutoScalingReconciler {
         int desired = asg.getDesiredCapacity();
 
         if (activeCapacity < desired) {
-            scaleOut(asg, (int) (desired - activeCapacity));
+            if (!scaleOut(asg, (int) (desired - activeCapacity))) {
+                return;
+            }
         } else if (activeCapacity > desired) {
             scaleIn(asg, (int) (activeCapacity - desired));
         }
@@ -344,16 +346,17 @@ public class AutoScalingReconciler {
         return "Pending".equals(state) || "InService".equals(state);
     }
 
-    private void scaleOut(AutoScalingGroup asg, int count) {
+    private boolean scaleOut(AutoScalingGroup asg, int count) {
         LaunchSource launchSource = resolveLaunchSource(asg);
         if (launchSource == null) {
             LOG.warnv("ASG {0}: no launch source found, cannot scale out", asg.getAutoScalingGroupName());
-            return;
+            return true;
         }
         LOG.infov("ASG {0}: scaling out by {1}", asg.getAutoScalingGroupName(), count);
         List<String> launchedInstanceIds = new ArrayList<>();
+        RuntimeException launchFailure = null;
         try {
-            List<LaunchPlacement> placements = launchPlacements(asg);
+            List<LaunchPlacement> placements = new ArrayList<>(launchPlacements(asg));
             for (int index = 0; index < count; index++) {
                 LaunchPlacement placement = leastPopulatedPlacement(asg, placements);
                 Reservation reservation = ec2Service.runInstances(
@@ -389,22 +392,58 @@ public class AutoScalingReconciler {
                     LOG.infov("ASG {0}: launched instance {1} (Pending)",
                             asg.getAutoScalingGroupName(), ec2Inst.getInstanceId());
                 }
-            }
-        } catch (Exception e) {
-            LOG.warnv("ASG {0}: failed to launch instances: {1}",
-                    asg.getAutoScalingGroupName(), e.getMessage());
-            recordFailedActivity(asg, "Launching EC2 instance(s) for desired capacity: " + count,
-                    "A capacity change requested additional instances.", e);
-        } finally {
-            // Preserve successful allocations even if a later single-instance launch fails.
-            if (!launchedInstanceIds.isEmpty() && !asgService.saveAutoScalingGroupIfPresent(asg)) {
-                try {
-                    ec2Service.terminateInstances(asg.getRegion(), launchedInstanceIds);
-                } catch (Exception e) {
-                    LOG.warnv("ASG {0}: failed to clean up instances {1} after group deletion: {2}",
-                            asg.getAutoScalingGroupName(), launchedInstanceIds, e.getMessage());
+                if (placement.subnetId() != null) {
+                    placements.set(placements.indexOf(placement), new LaunchPlacement(placement.subnetId(),
+                            placement.availabilityZone(), Math.max(0,
+                                    placement.availableIpAddresses() - reservation.getInstances().size())));
                 }
             }
+        } catch (RuntimeException e) {
+            launchFailure = e;
+        }
+        // Preserve successful allocations even if a later single-instance launch fails.
+        if (!launchedInstanceIds.isEmpty()) {
+            try {
+                preserveScaleOutAllocations(asg, launchedInstanceIds);
+            } catch (RuntimeException persistenceFailure) {
+                if (launchFailure != null) {
+                    launchFailure.addSuppressed(persistenceFailure);
+                    throw launchFailure;
+                }
+                throw persistenceFailure;
+            }
+        }
+        if (launchFailure instanceof AwsException) {
+            recordFailedActivity(asg, "Launching new EC2 instances",
+                    "Instances were requested in response to a desired capacity change.", launchFailure);
+            return false;
+        }
+        if (launchFailure != null) {
+            throw launchFailure;
+        }
+        return true;
+    }
+
+    private void preserveScaleOutAllocations(AutoScalingGroup asg, List<String> launchedInstanceIds) {
+        RuntimeException saveFailure = null;
+        try {
+            if (asgService.saveAutoScalingGroupIfPresent(asg)) {
+                return;
+            }
+        } catch (RuntimeException e) {
+            saveFailure = e;
+        }
+        try {
+            ec2Service.terminateInstances(asg.getRegion(), launchedInstanceIds);
+            asg.getInstances().removeIf(instance -> launchedInstanceIds.contains(instance.getInstanceId()));
+        } catch (RuntimeException cleanupFailure) {
+            if (saveFailure == null) {
+                throw cleanupFailure;
+            }
+            saveFailure.addSuppressed(cleanupFailure);
+        }
+        if (saveFailure != null) {
+            throw saveFailure;
         }
     }
 
@@ -418,20 +457,15 @@ public class AutoScalingReconciler {
                 if (subnet == null) {
                     throw new AwsException("InvalidSubnetID.NotFound", "The subnet ID '" + id + "' does not exist", 400);
                 }
-                if (asg.getAvailabilityZones().isEmpty()
-                        || asg.getAvailabilityZones().contains(subnet.getAvailabilityZone())) {
-                    placements.add(new LaunchPlacement(id, subnet.getAvailabilityZone()));
-                }
-            }
-            if (placements.isEmpty()) {
-                throw new AwsException("ValidationError", "No declared subnet is in a configured availability zone", 400);
+                // Subnets remain authoritative when an update leaves older zone metadata behind.
+                placements.add(new LaunchPlacement(id, subnet.getAvailabilityZone(), subnet.getAvailableIpAddressCount()));
             }
             return placements;
         }
         if (!asg.getAvailabilityZones().isEmpty()) {
-            return asg.getAvailabilityZones().stream().map(zone -> new LaunchPlacement(null, zone)).toList();
+            return asg.getAvailabilityZones().stream().map(zone -> new LaunchPlacement(null, zone, 0)).toList();
         }
-        return List.of(new LaunchPlacement(null, null));
+        return List.of(new LaunchPlacement(null, null, 0));
     }
 
     private LaunchPlacement leastPopulatedPlacement(AutoScalingGroup asg, List<LaunchPlacement> placements) {
@@ -450,11 +484,16 @@ public class AutoScalingReconciler {
                 zoneCounts.compute(zone, (ignored, count) -> count + 1);
             }
         }
-        return placements.stream().min(Comparator.comparingLong(
-                placement -> zoneCounts.get(placement.availabilityZone()))).orElseThrow();
+        return placements.stream()
+                .filter(placement -> placement.subnetId() == null || placement.availableIpAddresses() > 0)
+                .min(Comparator
+                .comparingLong((LaunchPlacement placement) -> zoneCounts.get(placement.availabilityZone()))
+                .thenComparing(Comparator.comparingInt(LaunchPlacement::availableIpAddresses).reversed()))
+                .orElseThrow(() -> new AwsException("InsufficientFreeAddressesInSubnet",
+                        "No configured subnet has free IPv4 addresses.", 400));
     }
 
-    private record LaunchPlacement(String subnetId, String availabilityZone) {}
+    private record LaunchPlacement(String subnetId, String availabilityZone, int availableIpAddresses) {}
 
     private static List<io.github.hectorvent.floci.services.ec2.model.Tag> propagatedInstanceTags(
             AutoScalingGroup asg,
@@ -514,7 +553,7 @@ public class AutoScalingReconciler {
     /**
      * Records a failed scaling activity with the error text, matching AWS (100% progress and a
      * {@code StatusMessage}). A failure that repeats on a later pass with the same error, because
-     * termination keeps failing, is not recorded again: the latest activity with the same
+     * scaling keeps failing, is not recorded again: the latest activity with the same
      * description already records it, whatever other activities were recorded after it. A
      * different error is recorded, so the history carries the current reason.
      */
