@@ -539,7 +539,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
     }
 
     @Test
-    void emptySecurityAlternativeKeepsImportedMethodPublic() throws Exception {
+    void emptySecurityAlternativeDoesNotRemoveApiKeyRequirement() throws Exception {
         String optionalOperationSecurity = API_KEY_SPEC.replace(
                 "\"security\": [{\"client_key\": []}]",
                 "\"security\": [{\"client_key\": []}, {}]");
@@ -552,9 +552,9 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
                 JsonNode method = getJson(methodPath(apiId));
                 deploy(apiId, "optional-security");
                 assertAll(
-                        () -> assertFalse(method.path("apiKeyRequired").asBoolean()),
+                        () -> assertTrue(method.path("apiKeyRequired").asBoolean()),
                         () -> assertEquals("NONE", method.path("authorizationType").asText()),
-                        () -> assertEquals(200, invokeWithoutApiKey(apiId, "optional-security")));
+                        () -> assertEquals(403, invokeWithoutApiKey(apiId, "optional-security")));
             } finally {
                 given().delete("/restapis/" + apiId).then().statusCode(202);
             }
@@ -576,7 +576,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
     }
 
     @Test
-    void apiKeyAndAuthorizerAlternativesDoNotRequireAnApiKeyAndKeepAuthorizer() throws Exception {
+    void apiKeyAndAuthorizerAlternativesKeepBothRequirements() throws Exception {
         String apiKeyAndAuthorizerSpec = """
                 {
                   "openapi": "3.0.1",
@@ -602,7 +602,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
             JsonNode method = getJson(methodPath(apiId));
             deploy(apiId, "mixed-security");
             assertAll(
-                    () -> assertFalse(method.path("apiKeyRequired").asBoolean()),
+                    () -> assertTrue(method.path("apiKeyRequired").asBoolean()),
                     () -> assertEquals("CUSTOM", method.path("authorizationType").asText()),
                     () -> assertTrue(method.hasNonNull("authorizerId")),
                     () -> assertEquals(403, invoke(apiId, "mixed-security")),
