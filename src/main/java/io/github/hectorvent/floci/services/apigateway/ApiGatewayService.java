@@ -4097,7 +4097,7 @@ public class ApiGatewayService implements ResourceProvider {
         List<SecurityRequirement> secReqs = operation.getSecurity() != null
                 ? operation.getSecurity() : openAPI.getSecurity();
         boolean apiKeyRequired = secReqs != null && !secReqs.isEmpty()
-                && secReqs.stream().allMatch(requirement -> requirement.keySet().stream()
+                && secReqs.stream().anyMatch(requirement -> requirement.keySet().stream()
                         .anyMatch(apiKeySchemes::contains));
         String authType = "NONE";
         String authorizerId = null;
