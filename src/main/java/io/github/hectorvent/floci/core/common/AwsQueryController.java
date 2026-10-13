@@ -192,7 +192,9 @@ public class AwsQueryController {
             "UpdateSecurityGroupRuleDescriptionsIngress", "UpdateSecurityGroupRuleDescriptionsEgress",
             "CreateKeyPair", "DescribeKeyPairs", "DeleteKeyPair", "ImportKeyPair",
             "DescribeImages", "RegisterImage", "DeregisterImage", "CreateImage", "CopyImage",
-            "DescribeSnapshots",
+            "DescribeImageAttribute", "ModifyImageAttribute",
+            "CreateSnapshot", "DeleteSnapshot", "DescribeSnapshots",
+            "DescribeSnapshotAttribute", "ModifySnapshotAttribute",
             "EnableSnapshotBlockPublicAccess", "DisableSnapshotBlockPublicAccess",
             "GetSnapshotBlockPublicAccessState",
             "CreateTags", "DeleteTags", "DescribeTags",
@@ -539,7 +541,7 @@ public class AwsQueryController {
 
     private static final Set<String> CLOUDWATCH_ACTIONS = Set.of(
             "PutMetricData", "ListMetrics", "GetMetricStatistics", "GetMetricData",
-            "PutMetricAlarm", "DescribeAlarms", "DeleteAlarms", "SetAlarmState",
+            "PutMetricAlarm", "PutCompositeAlarm", "DescribeAlarms", "DeleteAlarms", "SetAlarmState",
             "ListTagsForResource", "TagResource", "UntagResource",
             "PutDashboard", "GetDashboard", "ListDashboards", "DeleteDashboards",
             "PutMetricStream", "GetMetricStream", "ListMetricStreams", "DeleteMetricStream",
