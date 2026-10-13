@@ -451,6 +451,7 @@ class ElbV2ServiceTest {
     }
 
     private static void stubAlbSubnets(Ec2Service ec2Service) {
+        lenient().when(ec2Service.attachmentTopologyLock(anyString())).thenReturn(new Object());
         Subnet subnetA = subnet("subnet-a", REGION + "a");
         Subnet subnetB = subnet("subnet-b", REGION + "b");
         lenient().when(ec2Service.requireSubnet(REGION, "subnet-a")).thenReturn(subnetA);
@@ -508,4 +509,28 @@ class ElbV2ServiceTest {
                 reloaded.describeLoadBalancers(REGION, null, List.of("stored-nlb"), null, null)
                         .getFirst().getCanonicalHostedZoneId());
     }
+    @Test
+    void subnetAndVpcDependenciesComeFromReloadedLoadBalancersOnly() {
+        SharedStorageFactory storage = new SharedStorageFactory();
+        ElbV2Service first = serviceWithStorage(storage, dataPlane, healthChecker);
+        String arn = first.createLoadBalancer(REGION, "stored-dependency", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        String targetGroup = first.createTargetGroup(REGION, "independent-group", "HTTP", "HTTP1", 80,
+                "vpc-a", "instance", "HTTP", "traffic-port", true, "/", 30, 5, 5, 2, "200",
+                "ipv4", Map.of()).getTargetGroupArn();
+        ElbV2Service restored = serviceWithStorage(storage, dataPlane, healthChecker);
+        assertTrue(restored.hasSubnetDependency(REGION, "subnet-a"));
+        assertTrue(restored.hasSubnetDependency(REGION, "subnet-b"));
+        assertTrue(restored.hasVpcDependency(REGION, "vpc-a"));
+        assertFalse(restored.hasSubnetDependency("us-east-1", "subnet-a"));
+        assertFalse(restored.hasVpcDependency("us-east-1", "vpc-a"));
+        assertFalse(restored.hasSubnetDependency(REGION, "subnet-unrelated"));
+        restored.deleteLoadBalancer(REGION, arn);
+        ElbV2Service afterDelete = serviceWithStorage(storage, dataPlane, healthChecker);
+        assertFalse(afterDelete.hasSubnetDependency(REGION, "subnet-a"));
+        assertFalse(afterDelete.hasVpcDependency(REGION, "vpc-a"));
+        assertEquals(targetGroup, afterDelete.describeTargetGroups(REGION, null,
+                List.of(targetGroup), null).getFirst().getTargetGroupArn());
+    }
+
 }
