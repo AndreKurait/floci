@@ -221,7 +221,7 @@ further divergences, both deliberate:
 
 | Action | Description |
 |--------|-------------|
-| AdminCreateUser | Creates or resends setup for a user in a user pool. Creating a user invokes the pre sign-up trigger with triggerSource `PreSignUp_AdminCreateUser`, the request's `ValidationData` and `ClientMetadata`, and `callerContext.clientId` `CLIENT_ID_NOT_APPLICABLE`. A trigger error refuses the user with `UserLambdaValidationException`, and its `autoConfirmUser`, `autoVerifyEmail` and `autoVerifyPhone` are ignored, as on AWS. |
+| AdminCreateUser | Creates a user and sends the invitation, or with `MessageAction` `RESEND` gives an existing `FORCE_CHANGE_PASSWORD` user a new temporary password and sends the invitation again. See [AdminCreateUser invitations](#admincreateuser-invitations). Creating a user invokes the pre sign-up trigger with triggerSource `PreSignUp_AdminCreateUser`, the request's `ValidationData` and `ClientMetadata`, and `callerContext.clientId` `CLIENT_ID_NOT_APPLICABLE`. A trigger error refuses the user with `UserLambdaValidationException`, and its `autoConfirmUser`, `autoVerifyEmail` and `autoVerifyPhone` are ignored, as on AWS. |
 | AdminGetUser | Returns a user's stored attributes and status, and the MFA settings (`UserMFASettingList`, `PreferredMfaSetting`) once any is turned on. |
 | AdminDeleteUser | Deletes a user from a user pool. An API Gateway Cognito authorizer rejects the user's existing tokens afterwards. |
 | AdminSetUserPassword | Sets a user's password and permanent-password status. |
@@ -234,6 +234,43 @@ further divergences, both deliberate:
 | AdminSetUserMFAPreference | Sets a user's email and software-token MFA preferences from `EmailMfaSettings` and `SoftwareTokenMfaSettings`, and passkey MFA from `WebAuthnMfaSettings` (see [Passkeys](#passkeys)). SMS settings are accepted but not stored. See [MFA preferences](#mfa-preferences). |
 | AdminUserGlobalSignOut | Revokes the access, ID and refresh tokens issued to a user. |
 | AdminLinkProviderForUser | Links an external IdP identity to an existing user's `identities` attribute. |
+
+#### AdminCreateUser invitations
+
+- **Temporary password:** without `TemporaryPassword`, Floci generates one that meets the pool's
+  password policy, and the user starts in `FORCE_CHANGE_PASSWORD`, as on AWS. In a pool whose
+  `SignInPolicy.AllowedFirstAuthFactors` offers `EMAIL_OTP` or `SMS_OTP` (above the Lite tier), no
+  password is generated: the user is created `CONFIRMED` without one, and must have an `email` for
+  `EMAIL_OTP` or a `phone_number` for `SMS_OTP`, and a value for every attribute the pool's schema
+  marks as required, or the request fails with `InvalidParameterException`. A user with a password
+  may leave required attributes out, as on AWS. A passkey does not make a pool passwordless here,
+  as on AWS.
+- **Invitation:** without `MessageAction`, the invitation goes to each of `DesiredDeliveryMediums`
+  (`SMS`, the default, or `EMAIL`; any other value is refused) that the user has an `email` or
+  `phone_number` for. Email goes through Floci's SES (readable at `/_aws/ses`) from the pool's
+  `EmailConfiguration` sender, like the other Cognito messages, and SMS through its SNS.
+- **Text:** the `CustomMessage` trigger's response, when one is configured and answers. It is
+  invoked with triggerSource `CustomMessage_AdminCreateUser`, `usernameParameter` `{username}`,
+  `codeParameter` `{####}` and the request's `ClientMetadata`. Otherwise the pool's
+  `AdminCreateUserConfig.InviteMessageTemplate` (`EmailSubject`, `EmailMessage`, `SMSMessage`), or
+  AWS's default, `Your username is {username} and temporary password is {####}.` under the subject
+  `Your temporary password`. `{username}` and `{####}` (the temporary password) are filled in. A
+  user without a password gets `Your username is {username}.` by default. As on AWS, a message
+  without `{####}` is not delivered to a user with a password.
+- **`SUPPRESS`** sends nothing. **`RESEND`** sets the request's `TemporaryPassword`, or a
+  generated one, and sends the invitation again.
+- **Delivery failure** returns `CodeDeliveryFailureException`, as `SignUp` does. The invitation is
+  sent before anything is stored, so a failed one creates no user, leaves a resent user's previous
+  temporary password working, and leaves a `ForceAliasCreation` alias with its holder. When one
+  medium fails and another delivers, the request succeeds.
+- **CloudFormation:** `AWS::Cognito::UserPoolUser` has no `TemporaryPassword`, so its user gets a
+  generated one, and the template's `DesiredDeliveryMediums`, `ValidationData` and `ClientMetadata`
+  are passed on.
+
+Where AWS documents no outcome, Floci picks one: a requested medium the user has no attribute for is
+skipped, since AWS requires the attribute but documents no error for its absence; a template's
+`{####}` is left empty for a user without a password; and `RESEND` without `TemporaryPassword` in a
+passwordless pool generates a password. `TemporaryPasswordValidityDays` is not enforced.
 
 ### User Operations
 

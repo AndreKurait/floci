@@ -46,6 +46,7 @@ import io.github.hectorvent.floci.services.cognito.verification.VerificationCode
 import io.github.hectorvent.floci.services.cognito.verification.VerificationCodeException;
 import io.github.hectorvent.floci.services.cognito.verification.VerificationCodeService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.secretsmanager.RandomPasswordGenerator;
 import io.github.hectorvent.floci.services.ses.SesService;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -99,6 +100,9 @@ public class CognitoService implements ResourceProvider {
             List.of("ALLOW_REFRESH_TOKEN_AUTH", "ALLOW_USER_SRP_AUTH", "ALLOW_CUSTOM_AUTH");
     private static final String COGNITO_PASSWORD_SYMBOLS =
             "^$*.[]{}()?\"!@#%&/\\,><':;|_~`=+-";
+    private static final int GENERATED_PASSWORD_MINIMUM_LENGTH = 8;
+    private static final List<String> MESSAGE_ACTIONS = List.of("RESEND", "SUPPRESS");
+    private static final List<String> DELIVERY_MEDIUMS = List.of("SMS", "EMAIL");
     // JVM-local stripes bound lock memory without retaining one lock for every user key.
     private static final int USER_LOCK_STRIPES = 512;
     /**
@@ -2087,10 +2091,13 @@ public class CognitoService implements ResourceProvider {
     /**
      * AdminCreateUser with optional MessageAction.
      *
-     * <p>{@code messageAction = "RESEND"} resends the invitation for an existing
-     * user in {@code FORCE_CHANGE_PASSWORD} status without recreating it; floci
-     * has no email transport, so this only refreshes {@code lastModifiedDate}.
-     * {@code "SUPPRESS"} or {@code null} retain the default create behavior.</p>
+     * <p>Without a {@code temporaryPassword}, Cognito generates one, unless the pool offers
+     * passwordless sign-in, where the user is created {@code CONFIRMED} with no password. A user
+     * with a password starts in {@code FORCE_CHANGE_PASSWORD}.</p>
+     *
+     * <p>{@code messageAction = null} sends the invitation; {@code "SUPPRESS"} sends nothing.
+     * {@code "RESEND"} gives an existing {@code FORCE_CHANGE_PASSWORD} user a new temporary
+     * password, the requested one or a generated one, and sends the invitation again.</p>
      */
     public CognitoUser adminCreateUser(String userPoolId,
                                        String username,
@@ -2107,12 +2114,13 @@ public class CognitoService implements ResourceProvider {
                                        String messageAction,
                                        boolean forceAliasCreation) {
         return adminCreateUser(userPoolId, username, attributes, temporaryPassword, messageAction,
-                forceAliasCreation, Map.of(), Map.of());
+                forceAliasCreation, List.of(), Map.of(), Map.of());
     }
 
     /**
-     * AdminCreateUser with the request's {@code ValidationData} and {@code ClientMetadata}, which
-     * reach only the PreSignUp trigger and are never stored.
+     * AdminCreateUser with the request's {@code DesiredDeliveryMediums} for the invitation, where an
+     * empty list means AWS's default, {@code SMS}, and its {@code ValidationData} and
+     * {@code ClientMetadata}, which reach only the Lambda triggers and are never stored.
      */
     public CognitoUser adminCreateUser(String userPoolId,
                                        String username,
@@ -2120,22 +2128,23 @@ public class CognitoService implements ResourceProvider {
                                        String temporaryPassword,
                                        String messageAction,
                                        boolean forceAliasCreation,
+                                       List<String> desiredDeliveryMediums,
                                        Map<String, String> validationData,
                                        Map<String, String> clientMetadata) {
+        validateMessageAction(messageAction);
+        List<String> deliveryMediums = invitationDeliveryMediums(desiredDeliveryMediums);
         // Locked on the requested username/alias (not yet resolved to a canonical id, since
         // an alias pool doesn't have one until creation), so two concurrent requests for the
         // same identifier can't both pass the existence/alias check and create duplicates.
         Object lock = userLock(userPoolId, username);
-        if ("RESEND".equalsIgnoreCase(messageAction)) {
-            synchronized (lock) {
-                return resendInvitationUnderUserLock(userPoolId, username);
-            }
+        if ("RESEND".equals(messageAction)) {
+            return resendInvitation(userPoolId, username, temporaryPassword, clientMetadata, deliveryMediums, lock);
         }
 
-        // The PreSignUp trigger runs with no lock held: its function can call back into the pool,
-        // and a call that needs the same lock stripe would wait until the invocation timed out.
-        // A taken username or alias is refused before the trigger sees the request, and checked
-        // again under the lock once the trigger accepts, since users can change while it runs.
+        // The PreSignUp and CustomMessage triggers run with no lock held: a function can call back
+        // into the pool, and a call that needs the same lock stripe would wait until the invocation
+        // timed out. A taken username or alias is refused before the triggers see the request, and
+        // checked again under the lock once they return, since users can change while they run.
         UserPool pool = describeUserPool(userPoolId);
         // Claimed before the username is checked, so an overlapping request for it is refused here
         // rather than passing the check while this one is in its trigger and invoking the trigger
@@ -2146,25 +2155,85 @@ public class CognitoService implements ResourceProvider {
         }
         try {
             aliasHolderToMove(pool, username, forceAliasCreation);
-            CognitoUser user = newAdminCreatedUser(pool, username, attributes, temporaryPassword);
+            String password = initialPassword(pool, temporaryPassword);
+            CognitoUser user = newAdminCreatedUser(pool, username, attributes, password);
 
             // Before anything is stored, so a trigger that refuses the user leaves the pool unchanged,
             // including the alias a ForceAliasCreation request would move.
             authFlowHandler.firePreSignUpForAdminCreateUser(pool, user, validationData, clientMetadata);
+            Invitation invitation = "SUPPRESS".equals(messageAction) ? null : new Invitation(password,
+                    deliveryMediums, invitationCustomMessage(pool, user, deliveryMediums, clientMetadata));
 
             synchronized (lock) {
-                return storeAdminCreatedUserUnderUserLock(userPoolId, username, forceAliasCreation, user);
+                return storeAdminCreatedUserUnderUserLock(userPoolId, username, forceAliasCreation, user,
+                        invitation);
             }
         } finally {
             adminCreatesInFlight.remove(inFlightKey);
         }
     }
 
-    private CognitoUser resendInvitationUnderUserLock(String userPoolId, String username) {
+    private static void validateMessageAction(String messageAction) {
+        if (messageAction != null && !MESSAGE_ACTIONS.contains(messageAction)) {
+            throw new AwsException("InvalidParameterException",
+                    "1 validation error detected: Value '" + messageAction + "' at 'messageAction' failed to "
+                            + "satisfy constraint: Member must satisfy enum value set: [RESEND, SUPPRESS]", 400);
+        }
+    }
+
+    /** The request's {@code DesiredDeliveryMediums}, or {@code SMS}, AWS's default, when it names none. */
+    private static List<String> invitationDeliveryMediums(List<String> requested) {
+        if (requested == null || requested.isEmpty()) {
+            return List.of("SMS");
+        }
+        if (!DELIVERY_MEDIUMS.containsAll(requested)) {
+            throw new AwsException("InvalidParameterException",
+                    "1 validation error detected: Value '" + requested + "' at 'desiredDeliveryMediums' failed to "
+                            + "satisfy constraint: Member must satisfy constraint: "
+                            + "[Member must satisfy enum value set: [SMS, EMAIL]]", 400);
+        }
+        return requested;
+    }
+
+    private CognitoUser resendInvitation(String userPoolId, String username, String temporaryPassword,
+                                         Map<String, String> clientMetadata, List<String> deliveryMediums,
+                                         Object lock) {
+        // The CustomMessage trigger runs with no lock held, as on create; the user is read again
+        // under the lock before anything changes.
         UserPool pool = describeUserPool(userPoolId);
-        CognitoUser existing = userStore.get(userKey(userPoolId, username)).orElse(null);
+        CognitoUser target = resendTarget(pool, username);
+        Map<String, Object> customMessage = invitationCustomMessage(pool, target, deliveryMediums, clientMetadata);
+        synchronized (lock) {
+            return resendInvitationUnderUserLock(userPoolId, username, temporaryPassword, deliveryMediums,
+                    customMessage);
+        }
+    }
+
+    private CognitoUser resendInvitationUnderUserLock(String userPoolId, String username, String temporaryPassword,
+                                                      List<String> deliveryMediums,
+                                                      Map<String, Object> customMessage) {
+        UserPool pool = describeUserPool(userPoolId);
+        CognitoUser existing = resendTarget(pool, username);
+        // "RESEND ... to reset the temporary-password duration with a new temporary password".
+        String password = temporaryPassword != null && !temporaryPassword.isEmpty()
+                ? temporaryPassword : generateTemporaryPassword(pool);
+        // Checked and sent before the stored user changes, so a refused password or a failed
+        // delivery leaves the user's current temporary password working.
+        validatePasswordAgainstPolicy(pool, existing, password);
+        deliverInvitation(pool, existing, new Invitation(password, deliveryMediums, customMessage));
+        updateUserPassword(existing, password);
+        existing.setTemporaryPassword(true);
+        existing.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        userStore.put(userKey(userPoolId, existing.getUsername()), existing);
+        LOG.infov("Resent invitation for user {0} in pool {1}", existing.getUsername(), userPoolId);
+        return existing;
+    }
+
+    /** The user a RESEND for {@code username} names, refused unless it awaits its first sign-in. */
+    private CognitoUser resendTarget(UserPool pool, String username) {
+        CognitoUser existing = userStore.get(userKey(pool.getId(), username)).orElse(null);
         if (usesAliasUsernames(pool) && existing == null) {
-            existing = findUserByAlias(userPoolId, aliasAttributeForValue(pool, username), username);
+            existing = findUserByAlias(pool.getId(), aliasAttributeForValue(pool, username), username);
         }
         if (existing == null) {
             throw new AwsException("UserNotFoundException", "User not found", 400);
@@ -2175,9 +2244,6 @@ public class CognitoService implements ResourceProvider {
                     """.formatted(existing.getUserStatus());
             throw new AwsException("UnsupportedUserStateException", userStateExceptionMessage, 400);
         }
-        existing.setLastModifiedDate(System.currentTimeMillis() / 1000L);
-        userStore.put(userKey(userPoolId, existing.getUsername()), existing);
-        LOG.infov("Resent invitation for user {0} in pool {1}", existing.getUsername(), userPoolId);
         return existing;
     }
 
@@ -2209,8 +2275,49 @@ public class CognitoService implements ResourceProvider {
         return existing;
     }
 
+    /**
+     * The new user's password: the requested one, or a generated one unless the pool offers
+     * passwordless sign-in, where the user gets none. "If you don't specify a value, Amazon Cognito
+     * generates one for you unless you have passwordless options active for your user pool."
+     */
+    private String initialPassword(UserPool pool, String temporaryPassword) {
+        if (temporaryPassword != null && !temporaryPassword.isEmpty()) {
+            return temporaryPassword;
+        }
+        return passwordlessFactors(pool).isEmpty() ? generateTemporaryPassword(pool) : null;
+    }
+
+    /**
+     * The passwordless first factors the pool offers, an email or SMS one-time password. A passkey
+     * does not count: AWS still needs a password for a user whose only factors are a password and
+     * a passkey. As in USER_AUTH, a Lite pool offers none.
+     */
+    private static List<String> passwordlessFactors(UserPool pool) {
+        if ("LITE".equals(pool.getUserPoolTier())) {
+            return List.of();
+        }
+        List<String> factors = new ArrayList<>(CognitoAuthFlowHandler.allowedFirstAuthFactors(pool));
+        factors.retainAll(List.of("EMAIL_OTP", "SMS_OTP"));
+        return factors;
+    }
+
+    /**
+     * A temporary password that meets any password policy: the policy's minimum length, and at
+     * least eight characters, with an uppercase and a lowercase letter, a digit and a symbol.
+     * Secrets Manager's punctuation is the same set as Cognito's password symbols.
+     */
+    @SuppressWarnings("unchecked")
+    private String generateTemporaryPassword(UserPool pool) {
+        int minimumLength = 0;
+        if (pool.getPolicies() != null && pool.getPolicies().get("PasswordPolicy") instanceof Map<?, ?> policy) {
+            minimumLength = policyInt((Map<String, Object>) policy, "MinimumLength");
+        }
+        return RandomPasswordGenerator.generate(MAPPER.createObjectNode()
+                .put("PasswordLength", Math.max(GENERATED_PASSWORD_MINIMUM_LENGTH, minimumLength)));
+    }
+
     private CognitoUser newAdminCreatedUser(UserPool pool, String username, Map<String, String> attributes,
-                                            String temporaryPassword) {
+                                            String password) {
         Map<String, String> resolvedAttributes = attributes == null
                 ? new HashMap<>() : new HashMap<>(attributes);
 
@@ -2231,22 +2338,97 @@ public class CognitoService implements ResourceProvider {
             user.getAttributes().put("sub", UUID.randomUUID().toString());
         }
 
-        if (temporaryPassword != null && !temporaryPassword.isEmpty()) {
-            updateUserPassword(user, temporaryPassword);
+        if (password != null) {
+            updateUserPassword(user, password);
             user.setTemporaryPassword(true);
             user.setUserStatus("FORCE_CHANGE_PASSWORD");
+        } else {
+            requirePasswordlessSignInAttribute(pool, user);
+            requireSchemaRequiredAttributes(pool, user);
         }
         return user;
     }
 
+    /**
+     * "To create a user without a password, you must provide attribute values for an available
+     * passwordless sign-in factor": an email address for EMAIL_OTP, a phone number for SMS_OTP.
+     */
+    private void requirePasswordlessSignInAttribute(UserPool pool, CognitoUser user) {
+        List<String> attributes = new ArrayList<>();
+        for (String factor : passwordlessFactors(pool)) {
+            attributes.add("EMAIL_OTP".equals(factor) ? "email" : "phone_number");
+        }
+        if (attributes.stream().noneMatch(attribute -> user.getAttributes().get(attribute) != null)) {
+            throw new AwsException("InvalidParameterException",
+                    "A user without a password needs a value for " + String.join(" or ", attributes) + ".", 400);
+        }
+    }
+
+    /**
+     * "When you create a user without a password, your request only succeeds if the user provides
+     * values for all attributes that you have marked as required in your user pool." A user with a
+     * temporary password may leave them out and supply them at the NEW_PASSWORD_REQUIRED challenge.
+     */
+    private static void requireSchemaRequiredAttributes(UserPool pool, CognitoUser user) {
+        List<String> missing = new ArrayList<>();
+        for (Map<String, Object> attribute : CognitoStandardAttributes.merge(pool.getSchemaAttributes())) {
+            String name = String.valueOf(attribute.get("Name"));
+            String value = user.getAttributes().get(name);
+            boolean required = Boolean.parseBoolean(String.valueOf(attribute.get("Required")));
+            if (required && (value == null || value.isEmpty())) {
+                missing.add(name + ": The attribute is required");
+            }
+        }
+        if (!missing.isEmpty()) {
+            throw new AwsException("InvalidParameterException",
+                    "Attributes did not conform to the schema: " + String.join(", ", missing), 400);
+        }
+    }
+
+    /**
+     * What the invitation for a new or resent user needs: the temporary password it carries,
+     * {@code null} for a user without one, the mediums it goes to, and the CustomMessage trigger's
+     * response, {@code null} when the trigger is not configured or failed.
+     */
+    private record Invitation(String temporaryPassword, List<String> deliveryMediums,
+                              Map<String, Object> customMessage) {
+    }
+
+    /** The CustomMessage trigger's response, fired only when the invitation has somewhere to go. */
+    private Map<String, Object> invitationCustomMessage(UserPool pool, CognitoUser user, List<String> deliveryMediums,
+                                                        Map<String, String> clientMetadata) {
+        if (messageDispatcher == null || !CognitoMessageDispatcher.hasInvitationRecipient(user, deliveryMediums)) {
+            return null;
+        }
+        return authFlowHandler.fireCustomMessageForAdminCreateUser(pool, user, clientMetadata);
+    }
+
+    private void deliverInvitation(UserPool pool, CognitoUser user, Invitation invitation) {
+        if (invitation == null || messageDispatcher == null) {
+            return;
+        }
+        try {
+            messageDispatcher.dispatchInvitation(pool, user, invitation.temporaryPassword(),
+                    invitation.deliveryMediums(), invitation.customMessage());
+        } catch (RuntimeException e) {
+            LOG.warnv(e, "Failed to deliver the invitation for user {0} in pool {1}",
+                    user.getUsername(), pool.getId());
+            throw new AwsException("CodeDeliveryFailureException", "Failed to deliver the message.", 400);
+        }
+    }
+
     private CognitoUser storeAdminCreatedUserUnderUserLock(String userPoolId, String username,
-                                                           boolean forceAliasCreation, CognitoUser user) {
-        // Read again under the lock rather than reused from before the trigger: while it ran, the
+                                                           boolean forceAliasCreation, CognitoUser user,
+                                                           Invitation invitation) {
+        // Read again under the lock rather than reused from before the triggers: while they ran, the
         // pool may have been deleted, another request may have taken the username or alias, and
         // the alias holder may have been updated or deleted, which writing back an earlier read
         // would undo.
         UserPool pool = describeUserPool(userPoolId);
         CognitoUser aliasHolder = aliasHolderToMove(pool, username, forceAliasCreation);
+        // Sent once nothing else can refuse the request and before anything is stored, so a failed
+        // delivery leaves no user behind and the alias where it was.
+        deliverInvitation(pool, user, invitation);
         if (aliasHolder != null) {
             String aliasAttribute = aliasAttributeForValue(pool, username);
             aliasHolder.getAttributes().remove(aliasAttribute);

@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -92,6 +93,77 @@ class BedrockAgentCoreControlServiceTest {
         assertTrue(service.resolveVersion(updated, "1").getRoleArn().endsWith("role/agent"));
         assertTrue(service.resolveVersion(updated, "2").getRoleArn().endsWith("role/agent2"));
         assertEquals("2", service.resolveVersion(updated, null).getVersion());
+    }
+
+    @Test
+    void updatePublishesExactlyTheConfigurationTheRequestCarries() {
+        ObjectNode authorizer = mapper.createObjectNode();
+        authorizer.putObject("customJWTAuthorizer").put("discoveryUrl", "A");
+        ObjectNode protocol = mapper.createObjectNode().put("serverProtocol", "MCP");
+        AgentRuntime rt = service.createAgentRuntime("myAgent", artifact(), network(),
+                "arn:aws:iam::000000000000:role/agent", "desc", Map.of("K", "v"), authorizer, protocol, null, REGION);
+        String id = rt.getAgentRuntimeId();
+
+        // A PUT with the optional members omitted: the new version carries none of them.
+        service.updateAgentRuntime(id, artifact(), network(),
+                "arn:aws:iam::000000000000:role/agent", null, null, null, null, REGION);
+
+        AgentRuntime fresh = service.getAgentRuntime(id, REGION);
+        AgentRuntimeVersion latest = service.resolveVersion(fresh, null);
+        assertNull(latest.getDescription());
+        assertNull(latest.getAuthorizerConfiguration());
+        assertNull(latest.getProtocolConfiguration());
+        assertTrue(latest.getEnvironmentVariables().isEmpty());
+        AgentRuntimeVersion first = service.resolveVersion(fresh, "1");
+        assertEquals("A", first.getAuthorizerConfiguration().path("customJWTAuthorizer").path("discoveryUrl").asText());
+        assertEquals("MCP", first.getProtocolConfiguration().path("serverProtocol").asText());
+        assertEquals(Map.of("K", "v"), first.getEnvironmentVariables());
+    }
+
+    @Test
+    void createAndUpdateRejectUnknownNetworkModeAndServerProtocol() {
+        ObjectNode privateNetwork = mapper.createObjectNode().put("networkMode", "PRIVATE");
+        AwsException badMode = assertThrows(AwsException.class, () -> service.createAgentRuntime("myAgent",
+                artifact(), privateNetwork, "arn:aws:iam::000000000000:role/agent", null, null, null, null, null, REGION));
+        assertEquals("ValidationException", badMode.getErrorCode());
+        assertEquals("1 validation error detected: Value 'PRIVATE' at 'networkConfiguration.networkMode' failed to "
+                + "satisfy constraint: Member must satisfy enum value set: [PUBLIC, VPC]", badMode.getMessage());
+
+        AwsException noMode = assertThrows(AwsException.class, () -> service.createAgentRuntime("myAgent",
+                artifact(), mapper.createObjectNode(), "arn:aws:iam::000000000000:role/agent", null, null, null, null,
+                null, REGION));
+        assertEquals("networkConfiguration.networkMode is required", noMode.getMessage());
+
+        String id = create("myAgent").getAgentRuntimeId();
+        ObjectNode grpc = mapper.createObjectNode().put("serverProtocol", "GRPC");
+        AwsException badProtocol = assertThrows(AwsException.class, () -> service.updateAgentRuntime(id, artifact(),
+                network(), "arn:aws:iam::000000000000:role/agent", null, null, null, grpc, REGION));
+        assertEquals("1 validation error detected: Value 'GRPC' at 'protocolConfiguration.serverProtocol' failed to "
+                + "satisfy constraint: Member must satisfy enum value set: [MCP, HTTP, A2A, AGUI]", badProtocol.getMessage());
+        assertEquals(1, service.getAgentRuntime(id, REGION).getLatestVersion(), "a rejected update publishes nothing");
+    }
+
+    @Test
+    void createAcceptsTheAguiServerProtocol() {
+        ObjectNode agui = mapper.createObjectNode().put("serverProtocol", "AGUI");
+        AgentRuntime rt = service.createAgentRuntime("aguiAgent", artifact(), network(),
+                "arn:aws:iam::000000000000:role/agent", null, null, null, agui, null, REGION);
+        assertEquals("AGUI", service.resolveVersion(rt, "1").getProtocolConfiguration().path("serverProtocol").asText());
+    }
+
+    @Test
+    void updateEndpointClearsAnOmittedDescriptionOnlyWhenReplacingOmitted() {
+        String id = create("myAgent").getAgentRuntimeId();
+        service.createEndpoint(id, "prod", "1", "prod ep", null, REGION);
+
+        service.updateEndpoint(id, "prod", null, null, REGION);
+        assertEquals("prod ep", service.getEndpoint(id, "prod", REGION).getDescription(),
+                "the API call leaves an omitted description alone");
+
+        service.updateEndpoint(id, "prod", null, null, true, REGION);
+        assertNull(service.getEndpoint(id, "prod", REGION).getDescription());
+        assertEquals("1", service.getEndpoint(id, "prod", REGION).getTargetVersion(),
+                "an omitted version keeps the endpoint on the version it serves");
     }
 
     @Test

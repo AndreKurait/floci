@@ -144,7 +144,8 @@ class RedshiftServerlessTest {
                 ExecuteStatementResponse executed = dataClient.executeStatement(request -> request
                         .workgroupName(workgroupName)
                         .database("dev")
-                        .sql("select 1"));
+                        .sql("select 1")
+                        .waitTimeSeconds(30));
                 assertThat(executed.workgroupName()).isEqualTo(workgroupName);
                 assertThat(executed.clusterIdentifier()).isNull();
                 DescribeStatementResponse described = dataClient.describeStatement(request -> request.id(executed.id()));

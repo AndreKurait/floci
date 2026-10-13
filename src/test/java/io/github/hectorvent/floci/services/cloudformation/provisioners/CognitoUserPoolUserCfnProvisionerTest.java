@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -58,20 +59,23 @@ class CognitoUserPoolUserCfnProvisionerTest {
     }
 
     @Test
-    void createPassesUsernameAttributesAndMessageActionThrough() throws Exception {
+    void createPassesEveryAdminCreateUserPropertyThrough() throws Exception {
         stubCreateEchoingTheUsername();
         StackResource r = resource(null);
 
         provisioner.provision(r, props("""
                 {"UserPoolId": "pool-a", "Username": "user-one", "MessageAction": "SUPPRESS",
-                 "ForceAliasCreation": true, "DesiredDeliveryMediums": ["EMAIL"],
+                 "ForceAliasCreation": true, "DesiredDeliveryMediums": ["EMAIL", "SMS"],
                  "UserAttributes": [{"Name": "email", "Value": "one@example.com"},
-                                    {"Name": "name", "Value": "One"}]}"""), ctx(null));
+                                    {"Name": "name", "Value": "One"}],
+                 "ValidationData": [{"Name": "invite", "Value": "abc"}],
+                 "ClientMetadata": {"source": "stack"}}"""), ctx(null));
 
         Map<String, String> attributes = new LinkedHashMap<>();
         attributes.put("email", "one@example.com");
         attributes.put("name", "One");
-        verify(cognito).adminCreateUser("pool-a", "user-one", attributes, null, "SUPPRESS", true);
+        verify(cognito).adminCreateUser("pool-a", "user-one", attributes, null, "SUPPRESS", true,
+                List.of("EMAIL", "SMS"), Map.of("invite", "abc"), Map.of("source", "stack"));
         assertEquals("user-one", r.getPhysicalId(), "Ref must resolve to the username");
         assertTrue(r.getAttributes().keySet().stream().allMatch(key -> key.startsWith("__Floci")),
                 "AWS::Cognito::UserPoolUser exposes no Fn::GetAtt attribute");
@@ -82,7 +86,7 @@ class CognitoUserPoolUserCfnProvisionerTest {
     void anEmailAsUsernamePoolRefsTheCanonicalUsernameCognitoReturns() throws Exception {
         CognitoUser created = new CognitoUser();
         created.setUsername("d275a484-c0c1-70b3-46da-d9dafa5205e3");
-        when(cognito.adminCreateUser(anyString(), anyString(), any(), any(), any(), anyBoolean()))
+        when(cognito.adminCreateUser(anyString(), anyString(), any(), any(), any(), anyBoolean(), any(), any(), any()))
                 .thenReturn(created);
         StackResource r = resource(null);
 
@@ -91,7 +95,8 @@ class CognitoUserPoolUserCfnProvisionerTest {
                  "UserAttributes": [{"Name": "email", "Value": "alias.user@example.com"}]}"""), ctx(null));
 
         verify(cognito).adminCreateUser("pool-a", "alias.user@example.com",
-                Map.of("email", "alias.user@example.com"), null, null, false);
+                Map.of("email", "alias.user@example.com"), null, null, false,
+                List.of(), Map.of(), Map.of());
         assertEquals("d275a484-c0c1-70b3-46da-d9dafa5205e3", r.getPhysicalId());
     }
 
@@ -104,7 +109,8 @@ class CognitoUserPoolUserCfnProvisionerTest {
                 {"UserPoolId": "pool-a"}"""), ctx(null));
 
         assertThat(r.getPhysicalId(), matchesPattern("my-stack-User-[a-z0-9]{12}"));
-        verify(cognito).adminCreateUser("pool-a", r.getPhysicalId(), Map.of(), null, null, false);
+        verify(cognito).adminCreateUser("pool-a", r.getPhysicalId(), Map.of(), null, null, false,
+                List.of(), Map.of(), Map.of());
     }
 
     @Test
@@ -133,7 +139,7 @@ class CognitoUserPoolUserCfnProvisionerTest {
         assertEquals("AlreadyExists", thrown.getErrorCode());
         assertEquals("Resource of type 'AWS::Cognito::UserPoolUser' with identifier 'pool-a|alice' already exists.",
                 thrown.getMessage());
-        verify(cognito, never()).adminCreateUser(any(), any(), any(), any(), any(), anyBoolean());
+        verify(cognito, never()).adminCreateUser(any(), any(), any(), any(), any(), anyBoolean(), any(), any(), any());
         assertNull(r.getPhysicalId());
     }
 
@@ -147,7 +153,7 @@ class CognitoUserPoolUserCfnProvisionerTest {
                 {"UserPoolId": "pool-a", "Username": "alice", "MessageAction": "RESEND"}"""), ctx(null)));
 
         assertEquals("UserNotFoundException", thrown.getErrorCode());
-        verify(cognito, never()).adminCreateUser(any(), any(), any(), any(), any(), anyBoolean());
+        verify(cognito, never()).adminCreateUser(any(), any(), any(), any(), any(), anyBoolean(), any(), any(), any());
     }
 
     @Test
@@ -199,7 +205,8 @@ class CognitoUserPoolUserCfnProvisionerTest {
         provisioner.provision(r, props("""
                 {"UserPoolId": "pool-a", "Username": "user-one-b"}"""), ctx("user-one"));
 
-        verify(cognito).adminCreateUser("pool-a", "user-one-b", Map.of(), null, null, false);
+        verify(cognito).adminCreateUser("pool-a", "user-one-b", Map.of(), null, null, false,
+                List.of(), Map.of(), Map.of());
         assertEquals("user-one-b", r.getPhysicalId());
         assertTrue(provisioner.hasReplacementUpdate(r));
         assertEquals("user-one", provisioner.updateCleanupPhysicalId(r));
@@ -224,7 +231,8 @@ class CognitoUserPoolUserCfnProvisionerTest {
 
         assertNotEquals(first, r.getPhysicalId());
         assertThat(r.getPhysicalId(), matchesPattern("my-stack-User-[a-z0-9]{12}"));
-        verify(cognito).adminCreateUser("pool-a", r.getPhysicalId(), Map.of("name", "Two"), null, null, false);
+        verify(cognito).adminCreateUser("pool-a", r.getPhysicalId(), Map.of("name", "Two"), null, null, false,
+                List.of(), Map.of(), Map.of());
         assertTrue(provisioner.hasReplacementUpdate(r));
     }
 
@@ -406,7 +414,7 @@ class CognitoUserPoolUserCfnProvisionerTest {
     }
 
     private void stubCreateEchoingTheUsername() {
-        when(cognito.adminCreateUser(anyString(), anyString(), any(), any(), any(), anyBoolean()))
+        when(cognito.adminCreateUser(anyString(), anyString(), any(), any(), any(), anyBoolean(), any(), any(), any()))
                 .thenAnswer(inv -> {
                     CognitoUser user = new CognitoUser();
                     user.setUsername(inv.getArgument(1));

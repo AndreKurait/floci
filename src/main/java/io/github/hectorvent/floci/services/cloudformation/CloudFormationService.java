@@ -354,7 +354,7 @@ public class CloudFormationService implements ResourceProvider {
         // unpackaged DefinitionUri) does not fail the API call: it creates the change set and
         // marks it FAILED, with the transform's own error in StatusReason. Match that here instead
         // of throwing, so this failure is reported by the change set, not by a 400 on creation.
-        String samTransformFailureReason = samTransformFailureReason(stackName, resolvedTemplate);
+        String samTransformFailureReason = samTransformFailureReason(stackName, resolvedTemplate, parameters, region);
 
         // Reject an unresolvable or circular dependency graph up front, before any stack state is
         // created, so CreateStack/UpdateStack fail synchronously the way real CloudFormation does.
@@ -493,7 +493,8 @@ public class CloudFormationService implements ResourceProvider {
      * transform's own per-resource message. The count is always 1: {@code expandSamTemplate}
      * throws on the first bad resource rather than accumulating them.
      */
-    private String samTransformFailureReason(String stackName, String templateBody) {
+    private String samTransformFailureReason(String stackName, String templateBody, Map<String, String> parameters,
+                                             String region) {
         JsonNode template;
         try {
             template = parseTemplate(templateBody);
@@ -505,9 +506,9 @@ public class CloudFormationService implements ResourceProvider {
         if (!samTransformProcessor.hasSamTransform(template)) {
             return null;
         }
+        JsonNode expanded;
         try {
-            samTransformProcessor.expandSamTemplate(template);
-            return null;
+            expanded = samTransformProcessor.expandSamTemplate(template, samTransformParameters(template, parameters, region));
         } catch (AwsException e) {
             return "Transform AWS::Serverless-2016-10-31 failed with: Invalid Serverless "
                     + "Application Specification document. Number of errors found: 1. "
@@ -522,6 +523,14 @@ public class CloudFormationService implements ResourceProvider {
                     stackName, e.getMessage());
             throw e;
         }
+        // The transform succeeded but produced a template CloudFormation rejects: AWS fails the
+        // change set with the template error itself, not a transform failure.
+        try {
+            requireStringConditionReferencesIn(expanded);
+        } catch (AwsException e) {
+            return e.getMessage();
+        }
+        return null;
     }
 
     // ── DescribeChangeSet ─────────────────────────────────────────────────────
@@ -554,7 +563,8 @@ public class CloudFormationService implements ResourceProvider {
                 // The deployed stack's template is always the SAM-expanded form (see
                 // executeTemplate); comparing the change set's raw SAM source against it would
                 // report every SAM-generated resource as Add/Remove even on a no-op update.
-                newTemplate = samTransformProcessor.expandSamTemplate(newTemplate);
+                newTemplate = samTransformProcessor.expandSamTemplate(newTemplate,
+                        samTransformParameters(newTemplate, cs.getParameters(), region));
             }
             JsonNode newResources = newTemplate.path("Resources");
             boolean createType = "CREATE".equalsIgnoreCase(cs.getChangeSetType())
@@ -1465,6 +1475,22 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     /**
+     * The parameter values the SAM transform sees: the given ones over each {@code Default}, with
+     * {@code AWS::SSM::Parameter::Value<String>} parameters already read from Parameter Store, as
+     * CloudFormation resolves them before it runs the transform. A parameter that cannot be fetched
+     * leaves the values unresolved here; the execution path reports that failure with its own error.
+     */
+    private Map<String, String> samTransformParameters(JsonNode template, Map<String, String> params, String region) {
+        Map<String, String> given = resolveDefaultParameters(template, params);
+        try {
+            return resolveSsmParameters(template, given, region);
+        } catch (AwsException e) {
+            LOG.debugv("SAM transform sees unresolved parameters: {0}", e.getMessage());
+            return given;
+        }
+    }
+
+    /**
      * Substitutes {@code AWS::SSM::Parameter::Value<String>}-typed parameter values — which carry
      * an SSM parameter <em>name</em> — with the value stored in Parameter Store for the stack's
      * account and region, as real CloudFormation does before template processing. Missing
@@ -1530,13 +1556,16 @@ public class CloudFormationService implements ResourceProvider {
             boolean hasSamTransform = samTransformProcessor.hasSamTransform(template);
             if (hasSamTransform) {
                 LOG.infov("Applying SAM transform for stack {0}", stack.getStackName());
-                template = samTransformProcessor.expandSamTemplate(template);
+                template = samTransformProcessor.expandSamTemplate(template, samTransformParameters(template, params, region));
             }
 
             // Persist the merged/expanded tree, not the raw submitted body, whenever either
             // processor actually changed it, so the change-set baseline diffs against it instead of
             // against a stale Fn::Transform node. A template neither processor touched keeps its
             // submitted body byte for byte.
+            // A template CloudFormation rejects outright fails before the stack takes it on, as the
+            // synchronous check does for a template no transform touched.
+            requireStringConditionReferencesIn(template);
             if (includeMerged || hasSamTransform) {
                 templateBody = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(template);
             }
@@ -2675,6 +2704,35 @@ public class CloudFormationService implements ResourceProvider {
         return conditions;
     }
 
+    private static final String NON_STRING_CONDITION_REFERENCE =
+            "Template error: every Condition object must have a single String value.";
+
+    /**
+     * Rejects a template whose conditions name another one with anything but a string, as
+     * CloudFormation does before evaluating any of them: {@code Fn::And}, {@code Fn::Or} and
+     * {@code Fn::Not} stop early, so evaluation alone would read such an operand as false or never
+     * reach it. SAM's translator emits this shape when a conditional function's event invoke
+     * destination is itself conditional. Checked on the template being deployed only, so a stored
+     * template is never a reason an update cannot proceed.
+     */
+    private static void requireStringConditionReferencesIn(JsonNode template) {
+        template.path("Conditions").forEach(CloudFormationService::requireStringConditionReferences);
+    }
+
+    private static void requireStringConditionReferences(JsonNode expression) {
+        if (expression.isArray()) {
+            expression.forEach(CloudFormationService::requireStringConditionReferences);
+            return;
+        }
+        if (!expression.isObject()) {
+            return;
+        }
+        if (expression.has("Condition") && !expression.get("Condition").isTextual()) {
+            throw new AwsException("ValidationError", NON_STRING_CONDITION_REFERENCE, 400);
+        }
+        expression.forEach(CloudFormationService::requireStringConditionReferences);
+    }
+
     /**
      * Fails a create/update before any stack state is mutated when a resource that will be created
      * depends on a resource excluded by a false condition, or when resources depend on each other
@@ -2705,6 +2763,7 @@ public class CloudFormationService implements ResourceProvider {
             return;
         }
 
+        requireStringConditionReferencesIn(template);
         Map<String, String> resolvedParams = resolveDefaultParameters(template, params);
         Map<String, Boolean> conditions =
                 resolveConditions(template, resolvedParams, null, region, accountId);

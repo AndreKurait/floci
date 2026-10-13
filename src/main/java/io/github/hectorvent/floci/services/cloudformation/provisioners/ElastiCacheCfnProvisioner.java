@@ -455,7 +455,7 @@ public class ElastiCacheCfnProvisioner implements CfnResourceProvisioner {
             case USER_GROUP -> CfnDeletes.safeDelete("ElastiCache user group", physicalId,
                     () -> elastiCacheService.deleteUserGroup(physicalId), "UserGroupNotFound");
             case USER -> CfnDeletes.safeDelete("ElastiCache user", physicalId,
-                    () -> elastiCacheService.deleteUser(physicalId), "UserNotFoundFault");
+                    () -> elastiCacheService.deleteUser(physicalId), "UserNotFound");
             default -> {
             }
         }

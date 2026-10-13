@@ -40,6 +40,8 @@ public class BedrockAgentCoreControlService {
     static final String STATUS_DELETING = "DELETING";
     private static final String ARN_SERVICE = "bedrock-agentcore";
     private static final Pattern NAME_PATTERN = Pattern.compile("[a-zA-Z][a-zA-Z0-9_]{0,47}");
+    private static final List<String> NETWORK_MODES = List.of("PUBLIC", "VPC");
+    private static final List<String> SERVER_PROTOCOLS = List.of("MCP", "HTTP", "A2A", "AGUI");
     private static final String ID_ALPHABET =
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final int MAX_PAGE = 100;
@@ -103,6 +105,7 @@ public class BedrockAgentCoreControlService {
         if (roleArn == null || roleArn.isBlank()) {
             throw new AwsException("ValidationException", "roleArn is required", 400);
         }
+        validateConfiguration(networkConfiguration, protocolConfiguration);
 
         Instant now = Instant.now();
         String id = name + "-" + randomId();
@@ -157,6 +160,11 @@ public class BedrockAgentCoreControlService {
                         "AgentCore runtime version not found: " + wanted, 404));
     }
 
+    /**
+     * UpdateAgentRuntime is a PUT that publishes a new version holding exactly the configuration
+     * the request carries, so an omitted (null) description, authorizer, protocol or environment
+     * is cleared on the new version rather than carried over from the previous one.
+     */
     public AgentRuntime updateAgentRuntime(String id, JsonNode artifact, JsonNode networkConfiguration,
                                            String roleArn, String description, Map<String, String> environmentVariables,
                                            JsonNode authorizerConfiguration, JsonNode protocolConfiguration,
@@ -170,6 +178,7 @@ public class BedrockAgentCoreControlService {
         if (roleArn == null || roleArn.isBlank()) {
             throw new AwsException("ValidationException", "roleArn is required", 400);
         }
+        validateConfiguration(networkConfiguration, protocolConfiguration);
         AgentRuntime runtime = getAgentRuntime(id, region);
         Instant now = Instant.now();
 
@@ -179,21 +188,39 @@ public class BedrockAgentCoreControlService {
         runtime.setDescription(description);
         runtime.setAgentRuntimeArtifact(artifact);
         runtime.setNetworkConfiguration(networkConfiguration);
-        if (authorizerConfiguration != null) {
-            runtime.setAuthorizerConfiguration(authorizerConfiguration);
-        }
-        if (protocolConfiguration != null) {
-            runtime.setProtocolConfiguration(protocolConfiguration);
-        }
-        if (environmentVariables != null) {
-            runtime.setEnvironmentVariables(new HashMap<>(environmentVariables));
-        }
+        runtime.setAuthorizerConfiguration(authorizerConfiguration);
+        runtime.setProtocolConfiguration(protocolConfiguration);
+        runtime.setEnvironmentVariables(environmentVariables != null ? new HashMap<>(environmentVariables) : new HashMap<>());
         runtime.setLastUpdatedAt(now);
         runtime.getVersions().add(snapshot(runtime, String.valueOf(newVersion), now));
 
         storage.put(key(region, id), runtime);
         LOG.infov("Updated AgentCore runtime {0} to version {1}", id, newVersion);
         return runtime;
+    }
+
+    /**
+     * The enum members of a runtime's network and protocol configuration, rejected with the API's
+     * ValidationException wording. The artifact and the rest of each blob stay opaque.
+     */
+    private static void validateConfiguration(JsonNode networkConfiguration, JsonNode protocolConfiguration) {
+        requireEnum(networkConfiguration.path("networkMode"), "networkConfiguration.networkMode", NETWORK_MODES);
+        if (protocolConfiguration != null && !protocolConfiguration.isNull()) {
+            requireEnum(protocolConfiguration.path("serverProtocol"), "protocolConfiguration.serverProtocol",
+                    SERVER_PROTOCOLS);
+        }
+    }
+
+    private static void requireEnum(JsonNode value, String member, List<String> allowed) {
+        if (value.isMissingNode() || value.isNull()) {
+            throw new AwsException("ValidationException", member + " is required", 400);
+        }
+        if (!value.isTextual() || !allowed.contains(value.asText())) {
+            throw new AwsException("ValidationException",
+                    "1 validation error detected: Value '" + value.asText() + "' at '" + member
+                            + "' failed to satisfy constraint: Member must satisfy enum value set: "
+                            + allowed, 400);
+        }
     }
 
     public AgentRuntime deleteAgentRuntime(String id, String clientToken, String region) {
@@ -269,22 +296,23 @@ public class BedrockAgentCoreControlService {
     // ──────────────────────────── Tagging (Phase 4) ────────────────────────────
 
     public Map<String, String> getTagsByArn(String region, String arn) {
-        return new HashMap<>(findByArn(region, arn).getTags());
+        return new HashMap<>(getAgentRuntimeByArn(region, arn).getTags());
     }
 
     public void tagByArn(String region, String arn, Map<String, String> tags) {
-        AgentRuntime runtime = findByArn(region, arn);
+        AgentRuntime runtime = getAgentRuntimeByArn(region, arn);
         runtime.getTags().putAll(tags);
         storage.put(key(region, runtime.getAgentRuntimeId()), runtime);
     }
 
     public void untagByArn(String region, String arn, List<String> keys) {
-        AgentRuntime runtime = findByArn(region, arn);
+        AgentRuntime runtime = getAgentRuntimeByArn(region, arn);
         keys.forEach(runtime.getTags()::remove);
         storage.put(key(region, runtime.getAgentRuntimeId()), runtime);
     }
 
-    private AgentRuntime findByArn(String region, String arn) {
+    /** The runtime a runtime ARN names, at any version; ResourceNotFoundException when none does. */
+    public AgentRuntime getAgentRuntimeByArn(String region, String arn) {
         String uuid = uuidFromArn(arn);
         String prefix = keyPrefix(region);
         return storage.scan(k -> k.startsWith(prefix)).stream()
@@ -341,8 +369,20 @@ public class BedrockAgentCoreControlService {
         return findEndpoint(runtime, name);
     }
 
+    /** UpdateAgentRuntimeEndpoint on the API: a null version or description is left as it is. */
     public AgentRuntimeEndpoint updateEndpoint(String runtimeId, String name, String agentRuntimeVersion,
                                                String description, String region) {
+        return updateEndpoint(runtimeId, name, agentRuntimeVersion, description, false, region);
+    }
+
+    /**
+     * Updates an endpoint from arguments that are its whole declared configuration when
+     * {@code replaceOmitted} is true: a null description then clears the stored one, which the API
+     * call leaves alone. A null version keeps the endpoint on the version it serves either way, as
+     * UpdateAgentRuntimeEndpoint does.
+     */
+    public AgentRuntimeEndpoint updateEndpoint(String runtimeId, String name, String agentRuntimeVersion,
+                                               String description, boolean replaceOmitted, String region) {
         AgentRuntime runtime = getAgentRuntime(runtimeId, region);
         AgentRuntimeEndpoint endpoint = findEndpoint(runtime, name);
         if (agentRuntimeVersion != null) {
@@ -350,7 +390,7 @@ public class BedrockAgentCoreControlService {
             endpoint.setTargetVersion(agentRuntimeVersion);
             endpoint.setLiveVersion(agentRuntimeVersion);
         }
-        if (description != null) {
+        if (description != null || replaceOmitted) {
             endpoint.setDescription(description);
         }
         endpoint.setLastUpdatedAt(Instant.now());
@@ -400,6 +440,32 @@ public class BedrockAgentCoreControlService {
         AgentRuntime runtime = getAgentRuntime(runtimeId, region);
         return Pagination.paginate(runtime.getEndpoints(), AgentRuntimeEndpoint::getName, maxResults, nextToken,
                 MAX_PAGE, "ValidationException");
+    }
+
+    /** An endpoint together with the runtime that holds it. */
+    public record EndpointLocation(AgentRuntime runtime, AgentRuntimeEndpoint endpoint) {
+    }
+
+    /**
+     * The endpoint an endpoint ARN ({@code agentEndpoint/<uuid>}) names, with its runtime, or empty
+     * when no runtime in the region holds it. Endpoints are addressed by runtime id and name on the
+     * API, so this is the only way back from the ARN CloudFormation keeps as the physical id.
+     */
+    public Optional<EndpointLocation> findEndpointByArn(String region, String arn) {
+        String[] parts = arn == null ? new String[0] : arn.split(":");
+        if (parts.length < 6 || !parts[5].startsWith("agentEndpoint/")) {
+            return Optional.empty();
+        }
+        String uuid = parts[5].substring("agentEndpoint/".length());
+        String prefix = keyPrefix(region);
+        for (AgentRuntime runtime : storage.scan(k -> k.startsWith(prefix))) {
+            for (AgentRuntimeEndpoint endpoint : runtime.getEndpoints()) {
+                if (uuid.equals(endpoint.getUuid())) {
+                    return Optional.of(new EndpointLocation(runtime, endpoint));
+                }
+            }
+        }
+        return Optional.empty();
     }
 
     private AgentRuntimeEndpoint findEndpoint(AgentRuntime runtime, String name) {

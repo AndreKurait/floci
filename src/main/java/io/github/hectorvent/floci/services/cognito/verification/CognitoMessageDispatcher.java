@@ -13,9 +13,12 @@ import org.apache.james.mime4j.field.address.DefaultAddressParser;
 import org.apache.james.mime4j.field.address.ParseException;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Routes a verification code through SES (email) or SNS (SMS) according to
@@ -26,6 +29,8 @@ import java.util.Map;
  * The caller may supply the response of a CustomMessage Lambda trigger invocation,
  * whose {@code emailSubject}/{@code emailMessage}/{@code smsMessage} take precedence
  * over the pool's own template.
+ *
+ * AdminCreateUser invitations go out the same way, from {@link UserPool#getAdminCreateUserConfig()}.
  *
  * Email is sent from the address the pool's {@code EmailConfiguration} names when SES has verified
  * it for the pool's account, or from {@code no-reply@verificationemail.com} otherwise.
@@ -44,6 +49,13 @@ public final class CognitoMessageDispatcher {
     private static final String DEVELOPER_SENDING_ACCOUNT = "DEVELOPER";
     private static final String SES_IDENTITY_RESOURCE_PREFIX = "identity/";
     private static final String CODE_PLACEHOLDER = "{####}";
+    private static final String USERNAME_PLACEHOLDER = "{username}";
+    private static final Pattern INVITE_PLACEHOLDERS = Pattern.compile("\\{username}|\\{####}");
+    // AdminCreateUser invitation defaults, used when neither a CustomMessage trigger nor the pool's
+    // AdminCreateUserConfig.InviteMessageTemplate supplies the text.
+    private static final String DEFAULT_INVITE_SUBJECT = "Your temporary password";
+    private static final String DEFAULT_INVITE_BODY = "Your username is {username} and temporary password is {####}.";
+    private static final String DEFAULT_PASSWORDLESS_INVITE_BODY = "Your username is {username}.";
 
     private final SesService ses;
     private final SnsService sns;
@@ -86,31 +98,141 @@ public final class CognitoMessageDispatcher {
                 if (subject == null) subject = stringOr(template.get("EmailSubject"), DEFAULT_EMAIL_SUBJECT);
                 String rawBody = stringOrNull(customMessageResponse, "emailMessage");
                 if (rawBody == null) rawBody = stringOr(template.get(emailTemplateKey()), DEFAULT_EMAIL_BODY);
-                String body = renderTemplate(rawBody, code);
-                Sender sender = sender(pool, region);
-                ses.sendEmail(SendEmailRequest.builder()
-                    .source(sender.from())
-                    // SES takes Source as the default return path, the envelope sender it records
-                    // and hands to the SMTP relay, which takes a bare address.
-                    .returnPath(sender.from().equals(sender.address()) ? null : sender.address())
-                    .toAddresses(List.of(email))
-                    .region(region)
-                    .content(new EmailContent.Simple(subject, body, null, List.of()))
-                    .build());
+                sendEmail(pool, region, email, subject, renderTemplate(rawBody, code));
             } else if ("SMS".equalsIgnoreCase(medium) && phone != null) {
                 String rawBody = stringOrNull(customMessageResponse, "smsMessage");
                 if (rawBody == null) rawBody = stringOr(resolveSmsTemplate(pool, template, purpose), DEFAULT_SMS_BODY);
-                String body = renderTemplate(rawBody, code);
-                sns.publish(
-                    null, null,
-                    phone,
-                    body,
-                    null,
-                    null,
-                    region
-                );
+                sendSms(region, phone, renderTemplate(rawBody, code));
             }
         }
+    }
+
+    /**
+     * Sends the AdminCreateUser invitation to each of {@code deliveryMediums} that the user has an
+     * {@code email} or {@code phone_number} for. The text is the CustomMessage trigger's response
+     * when it gave one, else the pool's {@code AdminCreateUserConfig.InviteMessageTemplate}, else
+     * AWS's default, with {@code {username}} and {@code {####}} (the temporary password) filled in.
+     *
+     * <p>{@code temporaryPassword} is {@code null} for a user created without a password, whose
+     * default message names only the username and whose template's {@code {####}} is left empty. As
+     * on AWS, a message without {@code {####}} is not delivered to a user who has a password, since
+     * it could not tell them the password.</p>
+     *
+     * <p>A failed send is rethrown only when no message reached the user, so a caller that stores
+     * the user once this returns never leaves a delivered invitation naming an account it did not
+     * create.</p>
+     */
+    public void dispatchInvitation(UserPool pool, CognitoUser user, String temporaryPassword,
+                                   List<String> deliveryMediums, Map<String, Object> customMessageResponse) {
+        Map<String, Object> template = inviteMessageTemplate(pool);
+        String defaultBody = temporaryPassword == null ? DEFAULT_PASSWORDLESS_INVITE_BODY : DEFAULT_INVITE_BODY;
+        String email = invitationRecipient(user, deliveryMediums, "EMAIL");
+        String phone = invitationRecipient(user, deliveryMediums, "SMS");
+        String region = AwsArnUtils.regionOrDefault(pool.getArn(), defaultRegion);
+
+        List<Runnable> sends = new ArrayList<>();
+        if (email != null) {
+            String body = renderInvitation(firstNonNull(stringOrNull(customMessageResponse, "emailMessage"),
+                stringOrNull(template, "EmailMessage"), defaultBody), user.getUsername(), temporaryPassword);
+            String subject = firstNonNull(stringOrNull(customMessageResponse, "emailSubject"),
+                stringOrNull(template, "EmailSubject"), DEFAULT_INVITE_SUBJECT);
+            if (body != null) {
+                sends.add(() -> sendEmail(pool, region, email, subject, body));
+            }
+        }
+        if (phone != null) {
+            String body = renderInvitation(firstNonNull(stringOrNull(customMessageResponse, "smsMessage"),
+                stringOrNull(template, "SMSMessage"), defaultBody), user.getUsername(), temporaryPassword);
+            if (body != null) {
+                sends.add(() -> sendSms(region, phone, body));
+            }
+        }
+
+        RuntimeException failure = null;
+        boolean delivered = false;
+        for (Runnable send : sends) {
+            try {
+                send.run();
+                delivered = true;
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                }
+            }
+        }
+        if (failure != null && !delivered) {
+            throw failure;
+        }
+        if (failure != null) {
+            LOG.warnv(failure, "An invitation for user {0} in pool {1} failed on one medium and went out on another",
+                user.getUsername(), pool.getId());
+        }
+    }
+
+    /** Whether any of {@code deliveryMediums} can reach the user, so an invitation has somewhere to go. */
+    public static boolean hasInvitationRecipient(CognitoUser user, List<String> deliveryMediums) {
+        return invitationRecipient(user, deliveryMediums, "EMAIL") != null
+            || invitationRecipient(user, deliveryMediums, "SMS") != null;
+    }
+
+    /** The user's {@code email} for {@code EMAIL} or {@code phone_number} for {@code SMS}, when requested. */
+    private static String invitationRecipient(CognitoUser user, List<String> deliveryMediums, String medium) {
+        if (!deliveryMediums.contains(medium)) {
+            return null;
+        }
+        return user.getAttributes().get("EMAIL".equals(medium) ? "email" : "phone_number");
+    }
+
+    private void sendEmail(UserPool pool, String region, String email, String subject, String body) {
+        Sender sender = sender(pool, region);
+        ses.sendEmail(SendEmailRequest.builder()
+            .source(sender.from())
+            // SES takes Source as the default return path, the envelope sender it records
+            // and hands to the SMTP relay, which takes a bare address.
+            .returnPath(sender.from().equals(sender.address()) ? null : sender.address())
+            .toAddresses(List.of(email))
+            .region(region)
+            .content(new EmailContent.Simple(subject, body, null, List.of()))
+            .build());
+    }
+
+    private void sendSms(String region, String phone, String body) {
+        sns.publish(
+            null, null,
+            phone,
+            body,
+            null,
+            null,
+            region
+        );
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> inviteMessageTemplate(UserPool pool) {
+        Map<String, Object> config = pool.getAdminCreateUserConfig();
+        return config != null && config.get("InviteMessageTemplate") instanceof Map<?, ?> template
+            ? (Map<String, Object>) template : Map.of();
+    }
+
+    /**
+     * The invitation text, or {@code null} when it has no {@code {####}} to carry the user's
+     * temporary password. Both placeholders are filled in one pass, so neither a username nor a
+     * password that happens to contain the other placeholder is substituted twice.
+     */
+    private static String renderInvitation(String template, String username, String temporaryPassword) {
+        if (temporaryPassword != null && !template.contains(CODE_PLACEHOLDER)) {
+            return null;
+        }
+        return INVITE_PLACEHOLDERS.matcher(template).replaceAll(match -> Matcher.quoteReplacement(
+            USERNAME_PLACEHOLDER.equals(match.group()) ? username
+                : temporaryPassword == null ? "" : temporaryPassword));
+    }
+
+    private static String firstNonNull(String first, String second, String fallback) {
+        if (first != null) {
+            return first;
+        }
+        return second != null ? second : fallback;
     }
 
     /**

@@ -52,6 +52,7 @@ final class CognitoAuthFlowHandler {
     private static final Logger LOG = Logger.getLogger(CognitoAuthFlowHandler.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String CUSTOM_MESSAGE_CODE_PARAMETER = "{####}";
+    private static final String CUSTOM_MESSAGE_USERNAME_PARAMETER = "{username}";
     /** The {@code callerContext.clientId} AWS sends for an admin action, which names no app client. */
     private static final String CLIENT_ID_NOT_APPLICABLE = "CLIENT_ID_NOT_APPLICABLE";
     /** The message of a wrong password, which managed login also shows for an unknown user. */
@@ -1841,7 +1842,26 @@ final class CognitoAuthFlowHandler {
         req.put("codeParameter", CUSTOM_MESSAGE_CODE_PARAMETER);
         req.put("usernameParameter", user.getUsername());
         req.put("clientMetadata", Map.of());
-        TriggerResult result = invokeTrigger(pool, client, user, "CustomMessage", triggerSource, req);
+        return customMessageResponse(pool, client, user, triggerSource, req);
+    }
+
+    /**
+     * Fires the CustomMessage trigger for an AdminCreateUser invitation. The request carries the
+     * {@code {username}} and {@code {####}} placeholders, which Cognito fills in after the function
+     * returns, and the request's {@code ClientMetadata}. Non-blocking, as for the other sources.
+     */
+    Map<String, Object> fireCustomMessageForAdminCreateUser(UserPool pool, CognitoUser user,
+                                                            Map<String, String> clientMetadata) {
+        Map<String, Object> req = new HashMap<>();
+        req.put("codeParameter", CUSTOM_MESSAGE_CODE_PARAMETER);
+        req.put("usernameParameter", CUSTOM_MESSAGE_USERNAME_PARAMETER);
+        req.put("clientMetadata", clientMetadata == null ? Map.of() : clientMetadata);
+        return customMessageResponse(pool, null, user, "CustomMessage_AdminCreateUser", req);
+    }
+
+    private Map<String, Object> customMessageResponse(UserPool pool, UserPoolClient client, CognitoUser user,
+                                                      String triggerSource, Map<String, Object> request) {
+        TriggerResult result = invokeTrigger(pool, client, user, "CustomMessage", triggerSource, request);
         if (!result.configured()) return null;
         if (result.errored()) {
             LOG.warnv("CustomMessage trigger failed for pool {0} (source {1}): {2}",
