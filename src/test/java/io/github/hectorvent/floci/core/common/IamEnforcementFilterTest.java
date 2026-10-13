@@ -377,11 +377,12 @@ class IamEnforcementFilterTest {
         ServiceDescriptor monitoring = descriptor("monitoring", ServiceProtocol.QUERY, Set.of("monitoring"), null);
         when(catalog.byCredentialScope("monitoring")).thenReturn(Optional.of(monitoring));
         when(catalog.byExternalKey("monitoring")).thenReturn(Optional.of(monitoring));
+        when(catalog.canonicalCredentialScope("monitoring")).thenReturn("cloudwatch");
         when(iamService.resolveCallerContext(eq("AKIAUSER"), any())).thenReturn(CallerContext.of(List.of()));
 
         newFilter(resourceInfo(S3Controller.class)).filter(ctx);
 
-        verify(conditionContextResolver).resolve("monitoring", "monitoring:GetMetricStatistics", ctx);
+        verify(conditionContextResolver).resolve("cloudwatch", "cloudwatch:GetMetricStatistics", ctx);
         verify(actionRegistry, never()).resolveRoute(eq("s3"), any());
     }
 

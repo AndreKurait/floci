@@ -2,7 +2,11 @@ package io.github.hectorvent.floci.core.common;
 
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
+import jakarta.ws.rs.core.MultivaluedHashMap;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Optional;
 
@@ -22,7 +26,8 @@ class ProtocolClaimerIntegrationTest {
 
     private Optional<ProtocolClaim> claim(String method, String path, String contentType,
                                           String smithyProtocol, String xAmzTarget, String authorization) {
-        return claimer.claim(new ClaimSignals(method, path, contentType, smithyProtocol, xAmzTarget, authorization));
+        return claimer.claim(new ClaimSignals(method, path, contentType, smithyProtocol, xAmzTarget,
+                authorization, null, new MultivaluedHashMap<>()));
     }
 
     @Test
@@ -162,6 +167,41 @@ class ProtocolClaimerIntegrationTest {
                 "application/x-www-form-urlencoded", null, null, null).orElseThrow();
         assertEquals(WireProtocol.AWS_QUERY, withoutAuth.protocol());
         assertNull(withoutAuth.service());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Action", "Operation"})
+    void cloudWatchGetsUseTheQueryClaimWithOrWithoutASignature(String actionParameter) {
+        MultivaluedHashMap<String, String> query = new MultivaluedHashMap<>();
+        query.putSingle(actionParameter, "GetMetricStatistics");
+        query.putSingle("Version", "2010-08-01");
+        for (String authorization : new String[] {null, SQS_AUTH.replace("/sqs/", "/monitoring/")}) {
+            ProtocolClaim claim = claimer.claim(new ClaimSignals("GET", "/", null, null, null,
+                    authorization, null, query)).orElseThrow();
+            assertEquals(WireProtocol.AWS_QUERY, claim.protocol());
+            assertEquals("monitoring", claim.service().externalKey());
+            assertEquals("GetMetricStatistics", claim.operation());
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "GET, /, AmazonSSM.DescribeParameters, , false",
+            "GET, /, , text/html, false",
+            "GET, /, , , true",
+            "GET, /bucket, , , false",
+            "POST, /, , , false"
+    })
+    void cloudWatchGetExclusionsRemainRest(String method, String path, String target,
+                                          String accept, boolean presigned) {
+        MultivaluedHashMap<String, String> query = new MultivaluedHashMap<>();
+        query.putSingle("Action", "GetMetricStatistics");
+        if (presigned) {
+            query.putSingle("X-Amz-Credential", "presigned");
+        }
+        ProtocolClaim claim = claimer.claim(new ClaimSignals(method, path, null, null, target,
+                SQS_AUTH.replace("/sqs/", "/monitoring/"), accept, query)).orElseThrow();
+        assertEquals(WireProtocol.REST, claim.protocol());
     }
 
     @Test
