@@ -13,7 +13,9 @@ import java.util.Locale;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 @QuarkusTest
 class ApiGatewayImportedIntegrationTypeIntegrationTest {
@@ -63,6 +65,55 @@ class ApiGatewayImportedIntegrationTypeIntegrationTest {
         } finally {
             given().delete("/restapis/" + apiId).then().statusCode(202);
         }
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "custom_type, get, GET",
+        "CuStOm_TyPe, get, GET",
+        "'', get, GET",
+        "' mock', get, GET",
+        "'mock ', get, GET",
+        "http-proxy, get, GET",
+        "hıttp, get, GET",
+        "mοck, get, GET",
+        "CuStOm_TyPe, x-amazon-apigateway-any-method, ANY"
+    })
+    void unknownTypesWarnAndOmitIntegrationOrRefuseBeforeChangingApi(
+            String type, String operation, String verb) throws Exception {
+        Map<String, Object> invalid = document(operation, Map.of("type", type));
+        String warning = "Unknown integration type '" + type + "' for '" + verb + " /status'. Ignoring.";
+        String error = "Warnings found during import:\n\t" + warning;
+        given().contentType(ContentType.JSON).body(invalid)
+                .post("/restapis?mode=import&failonwarnings=true")
+                .then().statusCode(400).body("message", equalTo(error));
+        String apiId = given().contentType(ContentType.JSON).body(invalid)
+                .post("/restapis?mode=import")
+                .then().statusCode(201).body("warnings", equalTo(List.of(warning))).extract().path("id");
+        try {
+            assertMissingIntegration(apiId, verb);
+            Map<String, Object> valid = integration("mock");
+            for (String mode : List.of("merge", "overwrite")) {
+                given().contentType(ContentType.JSON).body(document(operation, valid))
+                        .put("/restapis/" + apiId + "?mode=overwrite").then().statusCode(200);
+                given().contentType(ContentType.JSON).body(invalid)
+                        .put("/restapis/" + apiId + "?mode=" + mode + "&failonwarnings=true")
+                        .then().statusCode(400).body("message", equalTo(error));
+                assertMetadata(apiId, verb, valid, "MOCK");
+                given().contentType(ContentType.JSON).body(invalid)
+                        .put("/restapis/" + apiId + "?mode=" + mode)
+                        .then().statusCode(200).body("warnings", equalTo(List.of(warning)));
+                assertMissingIntegration(apiId, verb);
+            }
+        } finally {
+            given().delete("/restapis/" + apiId).then().statusCode(202);
+        }
+    }
+
+    private static void assertMissingIntegration(String apiId, String verb) throws Exception {
+        String path = methodPath(apiId, verb);
+        given().get(path + "/integration").then().statusCode(404);
+        assertFalse(get(path).has("methodIntegration"));
     }
 
     private static Map<String, Object> integration(String type) {
