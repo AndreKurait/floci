@@ -352,7 +352,7 @@ class AutoScalingPlacementTest {
                 return List.of(reservation);
             });
             when(ec2.runInstances(any(), any(), any(), anyInt(), anyInt(), any(), any(), any(), any(),
-                    any(), any(), any(), any(), any(), anyInt(), any())).thenAnswer(call -> {
+                    any(), any(), any(), any())).thenAnswer(call -> {
                         if (allocations >= failAfter) {
                             if (deleteOnFailure) {
                                 groupPresent = false;
@@ -360,7 +360,7 @@ class AutoScalingPlacementTest {
                             throw launchFailure;
                         }
                         String subnet = call.getArgument(7);
-                        String zone = call.getArgument(15);
+                        String zone = null;
                         if (subnet != null) {
                             if (!ipv6Only.contains(subnet) && availableIps.getOrDefault(subnet, 251) == 0) {
                                 throw new AwsException("InsufficientFreeAddressesInSubnet",

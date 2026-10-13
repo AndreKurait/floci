@@ -370,7 +370,7 @@ public class AutoScalingReconciler {
                         propagatedInstanceTags(asg, launchSource),
                         launchSource.userData(),
                         launchSource.iamInstanceProfile(),
-                        launchSource.associatePublicIpAddress(), null, 0, null);
+                        launchSource.associatePublicIpAddress());
 
                 for (Instance ec2Inst : reservation.getInstances()) {
                     AsgInstance asgInst = new AsgInstance();
