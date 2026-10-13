@@ -332,6 +332,14 @@ public class IamActionRegistry {
                 RequestBodyReader.formField(ctx, "Operation"));
     }
 
+    /** Returns the API version from the same Query input that the controller dispatches. */
+    public String queryVersion(ContainerRequestContext ctx) {
+        if ("GET".equalsIgnoreCase(ctx.getMethod())) {
+            return ctx.getUriInfo().getQueryParameters().getFirst("Version");
+        }
+        return RequestBodyReader.formField(ctx, "Version");
+    }
+
     /** The root form POST or CloudWatch GET that the Query controller dispatches. */
     public static boolean isQueryRequest(ContainerRequestContext ctx) {
         if (ctx.getUriInfo() == null) {

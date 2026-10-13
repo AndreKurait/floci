@@ -41,11 +41,13 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -101,7 +103,7 @@ public class CodeArtifactService implements Resettable {
     private static final long DEFAULT_TOKEN_DURATION_SECONDS = 43200;
     private static final int TOKEN_RANDOM_BYTES = 32;
 
-    public record DomainView(CodeArtifactDomain domain, int repositoryCount) {}
+    public record DomainView(CodeArtifactDomain domain, int repositoryCount, long assetSizeBytes) {}
     public record ResourcePolicy(String resourceArn, String revision, String document) {}
     public record PublishPackageVersionResult(CodeArtifactPackageVersion packageVersion, PackageAsset asset) {}
     public record PackageVersionAssetResult(PackageAsset asset, String packageVersionRevision) {}
@@ -125,6 +127,23 @@ public class CodeArtifactService implements Resettable {
     // Bearer tokens are ephemeral security material, not durable emulator state: kept in memory
     // only, the same way IamService keeps STS session credentials, regardless of storage mode.
     private final ConcurrentHashMap<String, AuthorizationTokenRecord> authorizationTokens = new ConcurrentHashMap<>();
+    // A race guard, not emulator state a caller can ever observe directly: never persisted, and
+    // never needs to survive a restart (an in-flight race can't span one either). See
+    // currentContainerBackedPackageFence's own javadoc for what this protects against.
+    private final ConcurrentHashMap<String, Long> containerBackedPackageDeletionFence = new ConcurrentHashMap<>();
+    private final AtomicLong containerBackedPackageDeletionCounter = new AtomicLong();
+    // Maven, npm, and pypi publishes go straight to their own sidecar and never create a
+    // packageVersions record (see CONTAINER_BACKED_FORMATS), so DescribeDomain's assetSizeBytes
+    // can't see their bytes by summing packageVersions the way it does for generic. Each format's
+    // own proxy reports a successful, non-idempotent publish's size here instead, keyed exactly
+    // like packageOriginConfigs (region/domain/repository/format/namespace/package, no version).
+    // In memory only, like the fence above, not through StorageFactory: the Maven/npm/pypi
+    // content these bytes count lives in the sidecar containers themselves, which do not survive
+    // a Floci restart either (no volume attached, removed on shutdown; see this service's own
+    // Known limitations doc). Persisting the count but not the content it describes would leave
+    // a stale total surviving a restart for bytes that no longer exist anywhere, with nothing to
+    // ever naturally clean it up; kept in memory instead, so a restart loses both together.
+    private final ConcurrentHashMap<String, Long> containerBackedAssetBytes = new ConcurrentHashMap<>();
 
     @Inject
     public CodeArtifactService(StorageFactory storageFactory, RegionResolver regionResolver, EmulatorConfig config,
@@ -194,7 +213,7 @@ public class CodeArtifactService implements Resettable {
         d.setCreatedTime(Instant.now().getEpochSecond());
         d.setTags(validateTags(tags, Map.of(), domain, "domain"));
         domains.putForAccount(owner, key, d);
-        return new DomainView(d, 0);
+        return new DomainView(d, 0, 0L);
     }
 
     /**
@@ -211,13 +230,14 @@ public class CodeArtifactService implements Resettable {
                     + "until they are deleted.", domain, "domain");
         }
         domains.deleteForAccount(owner, key);
-        return new DomainView(d, 0);
+        return new DomainView(d, 0, 0L);
     }
 
     public DomainView describeDomain(String region, String domain, String domainOwner) {
         String owner = effectiveOwner(domainOwner);
         CodeArtifactDomain d = requireDomain(owner, domainKey(region, domain), domain);
-        return new DomainView(d, repositoryCountForDomain(owner, region, domain));
+        return new DomainView(d, repositoryCountForDomain(owner, region, domain),
+                assetSizeBytesForDomain(owner, region, domain));
     }
 
     public PaginatedResult<DomainView> listDomains(String region, Integer maxResults, String nextToken) {
@@ -225,8 +245,11 @@ public class CodeArtifactService implements Resettable {
         List<CodeArtifactDomain> matching = domains.scanForAccount(owner, k -> k.startsWith(region + "::"));
         PaginatedResult<CodeArtifactDomain> page = Pagination.paginate(matching, CodeArtifactDomain::getName,
                 maxResults, nextToken, 100, 1000, "ValidationException");
+        // DomainSummary (what ListDomains actually returns) has no assetSizeBytes field at all on
+        // real AWS, unlike DomainDescription; 0 here is never observed by a caller, same as
+        // repositoryCount would be if DomainSummary carried one.
         List<DomainView> views = page.items().stream()
-                .map(d -> new DomainView(d, repositoryCountForDomain(owner, region, d.getName())))
+                .map(d -> new DomainView(d, repositoryCountForDomain(owner, region, d.getName()), 0L))
                 .toList();
         return new PaginatedResult<>(views, page.nextToken());
     }
@@ -340,6 +363,32 @@ public class CodeArtifactService implements Resettable {
         packageOriginConfigs.keysForAccount(owner).stream()
                 .filter(k -> k.startsWith(originPrefix))
                 .forEach(k -> packageOriginConfigs.deleteForAccount(owner, k));
+        // Keyed the same way: without this, a repository recreated under the same name would
+        // inherit the previous one's Maven/npm/pypi byte counts into DescribeDomain's total.
+        String ownerScopedOriginPrefix = ownerScopedKey(owner, originPrefix);
+        containerBackedAssetBytes.keySet().stream()
+                .filter(k -> k.startsWith(ownerScopedOriginPrefix))
+                .toList()
+                .forEach(containerBackedAssetBytes::remove);
+        // packageVersions (generic-format metadata and asset bytes) is keyed the same way too, and
+        // was never cleaned up here before assetSizeBytesForDomain existed to notice: without
+        // this, a repository recreated under this same name would inherit every generic package
+        // version the previous one ever had, resurfacing through DescribePackageVersion,
+        // GetPackageVersionAsset, and DescribeDomain's own total alike. Deletes each version's own
+        // asset content too, the same way deletePackage already does for one package at a time.
+        for (CodeArtifactPackageVersion pv : packageVersions.scanForAccount(owner, k -> k.startsWith(originPrefix))) {
+            String versionKey = packageVersionKey(region, domain, repository, pv.getFormat(), pv.getNamespace(),
+                    pv.getPackageName(), pv.getVersion());
+            packageVersions.deleteForAccount(owner, versionKey);
+            for (PackageAsset asset : pv.getAssets().values()) {
+                try {
+                    deleteAssetContent(owner, versionKey, asset.getName());
+                } catch (UncheckedIOException e) {
+                    LOG.warnv(e, "Could not delete CodeArtifact asset file for {0}/{1}: {2}", versionKey,
+                            asset.getName(), e.getMessage());
+                }
+            }
+        }
         return r;
     }
 
@@ -833,9 +882,19 @@ public class CodeArtifactService implements Resettable {
         String originKey = packageKey(region, domain, repository, format, namespace, packageName);
         Optional<PackageOriginConfig> originConfig = packageOriginConfigs.getForAccount(owner, originKey);
         boolean hadRealContent;
+        String accountingKey = packageKey(region, domain, repository, format, namespace,
+                accountingPackageName(format, packageName));
         if (CONTAINER_BACKED_FORMATS.contains(format)) {
             hadRealContent = deleteContainerBackedPackageIfPresent(region, domain, owner, repository, format,
                     namespace, packageName);
+            if (hadRealContent) {
+                // Bumped only on an actual deletion, never a no-op (nothing there to begin with):
+                // see currentContainerBackedPackageFence's own javadoc for what this protects
+                // against, and why it can replace a sidecar round trip entirely rather than just
+                // relocate one.
+                containerBackedPackageDeletionFence.put(ownerScopedKey(owner, accountingKey),
+                        containerBackedPackageDeletionCounter.incrementAndGet());
+            }
         } else {
             List<CodeArtifactPackageVersion> versions = genericPackageVersions(region, domain, owner, repository,
                     format, namespace, packageName);
@@ -869,6 +928,12 @@ public class CodeArtifactService implements Resettable {
         // same coordinates must 404 rather than finding a zero-version package the deleted config
         // left behind.
         packageOriginConfigs.deleteForAccount(owner, originKey);
+        // Harmless no-op for generic (nothing is ever recorded there under this key; its bytes
+        // live in packageVersions instead, already gone via the version-deleting branch above).
+        // Uses accountingKey, not originKey: for pypi the two can differ (see
+        // accountingPackageName's own javadoc), and the byte count was written under whichever
+        // one actually matches what pypiserver itself treats as this package's identity.
+        containerBackedAssetBytes.remove(ownerScopedKey(owner, accountingKey));
         String publishRestriction = originConfig.map(PackageOriginConfig::getPublishRestriction).orElse("ALLOW");
         String upstreamRestriction = originConfig.map(PackageOriginConfig::getUpstreamRestriction).orElse("BLOCK");
         return new PackageDescription(format, namespace, packageName, publishRestriction, upstreamRestriction);
@@ -1131,6 +1196,8 @@ public class CodeArtifactService implements Resettable {
         repositories.clear();
         packageVersions.clear();
         packageOriginConfigs.clear();
+        containerBackedAssetBytes.clear();
+        containerBackedPackageDeletionFence.clear();
         authorizationTokens.clear();
         if (inMemory) {
             memoryAssetStore.clear();
@@ -1175,6 +1242,202 @@ public class CodeArtifactService implements Resettable {
 
     private int repositoryCountForDomain(String owner, String region, String domain) {
         return repositories.scanForAccount(owner, k -> k.startsWith(region + "::" + domain + "::")).size();
+    }
+
+    /**
+     * Sums every stored {@link PackageAsset}'s size across the domain's repositories, plus
+     * whatever each repository's Maven/npm/pypi proxy has reported through
+     * {@link #recordContainerBackedAssetBytes}, for {@code DescribeDomain}'s {@code
+     * assetSizeBytes}.
+     *
+     * <p>Scoped per-repository (via each live repository's own key prefix) rather than one scan
+     * over the whole domain: a defense-in-depth match for the per-repository prefix every read
+     * path here already uses, not a load-bearing one by itself. {@link #deleteRepository} deletes
+     * a repository's {@code packageVersions} records (and their asset content) and
+     * {@code containerBackedAssetBytes} outright, by that same prefix, specifically so a
+     * repository recreated under the same name can never inherit either; this method's own
+     * per-repository scoping means that even a future gap in that cleanup would still only risk
+     * double-scanning live data, never resurrecting a deleted repository's orphaned bytes into a
+     * same-named replacement's total.
+     */
+    private long assetSizeBytesForDomain(String owner, String region, String domain) {
+        long total = 0L;
+        for (CodeArtifactRepository r : repositories.scanForAccount(owner, k -> k.startsWith(region + "::" + domain
+                + "::"))) {
+            String repositoryPrefix = region + "::" + domain + "::" + r.getName() + "::";
+            for (CodeArtifactPackageVersion pv : packageVersions.scanForAccount(owner,
+                    k -> k.startsWith(repositoryPrefix))) {
+                for (PackageAsset asset : pv.getAssets().values()) {
+                    total += asset.getSize();
+                }
+            }
+            String ownerScopedRepositoryPrefix = ownerScopedKey(owner, repositoryPrefix);
+            for (Map.Entry<String, Long> entry : containerBackedAssetBytes.entrySet()) {
+                if (entry.getKey().startsWith(ownerScopedRepositoryPrefix)) {
+                    total += entry.getValue();
+                }
+            }
+        }
+        return total;
+    }
+
+    /**
+     * A snapshot each format proxy takes right before issuing its real write to the sidecar
+     * (Reposilite/Verdaccio/pypiserver), to pass into {@link #recordContainerBackedAssetBytes}
+     * once that write (and the proxy's own decision that it actually wrote something new)
+     * completes. Comparing the two there detects not just that the package existed when the
+     * write was issued, but that no {@link #deletePackage} has completed in between: a package
+     * deleted and republished under the same name while an npm publish's accounting runs on a
+     * delayed callback (its own Vert.x response arriving well after this snapshot was taken, long
+     * after Maven's or pypi's near-immediate inline accounting would have run) must not have the
+     * first publish's bytes misattributed to the second. {@code deletePackage}'s container-backed
+     * branch bumps the counter behind this snapshot on an actual deletion; so does
+     * {@link #forgetContainerBackedPackage}, for the one other way a container-backed package's
+     * real content can disappear: a real npm client's native {@code npm unpublish}, which the
+     * pinned Verdaccio image (configured with {@code unpublish: $all}) honors on its own wire
+     * protocol without ever calling {@code deletePackage} (confirmed: {@code
+     * CodeArtifactNpmDataPlane} forwards it straight through, detecting only enough of its shape
+     * to call {@code forgetContainerBackedPackage} afterward). Maven and pypi have no such native
+     * delete of their own to worry about. A snapshot that still matches at record time proves
+     * neither of those two paths has removed whatever now answers to this name. Cheap and
+     * lock-free (a {@code ConcurrentHashMap} read), unlike the sidecar round trip this replaces,
+     * so it never costs a proxy anything to call this inline, even on a Vert.x event-loop thread.
+     */
+    public long currentContainerBackedPackageFence(String region, String domain, String domainOwner,
+            String repository, String format, String namespace, String packageName) {
+        String owner = effectiveOwner(domainOwner);
+        String key = packageKey(region, domain, repository, format, namespace, accountingPackageName(format,
+                packageName));
+        return containerBackedPackageDeletionFence.getOrDefault(ownerScopedKey(owner, key), 0L);
+    }
+
+    /**
+     * Adds {@code bytes} to the running total CodeArtifact's own storage tracks for one
+     * Maven/npm/pypi package, independent of whatever that sidecar could report back later: none
+     * of the three expose an enumeration cheap enough for {@link #assetSizeBytesForDomain} to
+     * query live (the same reason {@link #describePackageVersion} can't bridge to them either).
+     * Called by each format's own proxy only once it has already decided, in its own terms, that a
+     * real write just happened: never for an idempotent short-circuit (nothing new was written) or
+     * a rejected conflict (Reposilite's {@code redeployment: false}, Verdaccio's native reject, or
+     * this emulator's own pypi preflight), since neither actually adds any bytes.
+     * {@code packageFenceSnapshot} is whatever {@link #currentContainerBackedPackageFence} returned
+     * when the proxy called it, right before issuing that write.
+     *
+     * <p>{@code namespace}/{@code packageName} here come straight from the wire protocol (a Maven
+     * GAV path segment, an npm scope/name, a twine form field), never through
+     * {@link #validatePackageCoordinates}/{@link #validatePackageToken} the way every JSON-API
+     * package operation's own namespace/packageName already is. {@link #escapeKeySegment}'s whole
+     * collision-safety argument rests on no namespace/package/version that reaches it ever
+     * containing a raw {@code '#'}; silently skipping one that does (rather than escaping or
+     * rejecting outright) keeps that invariant true for this one new path into
+     * {@link #packageKey} without turning a client's publish, which already succeeded against the
+     * real sidecar, into a thrown exception over what is only a best-effort accounting side
+     * channel.
+     *
+     * <p>Unlike every other mutating method here, the caller's own "does this repository still
+     * exist" check ({@code ensureFormatContainerId}, inside each proxy's own {@code requireScope}/
+     * {@code requireRepository} path) ran in a separate, already-released {@code synchronized}
+     * call, before the real HTTP round trip to the sidecar that this call reports the result of.
+     * A {@code DeleteRepository} landing in that window, after the sidecar write already
+     * succeeded but before this call runs, would otherwise resurrect a key {@code deleteRepository}
+     * already cleaned up: invisible to {@code DescribeDomain} while the repository stays deleted
+     * (its domain-sum loop only walks live repositories), but inherited the moment a repository is
+     * recreated under the same name, since this key is name-based with no fresh id the way {@code
+     * sidecarContainerIds} deliberately gets one. Re-checking existence here, inside the same
+     * {@code synchronized} call that does the write, closes that window the same way every other
+     * method's single-call check-then-act already does.
+     *
+     * <p>The repository check above does not catch the same window opening for
+     * {@link #deletePackage} instead of {@link #deleteRepository}: the repository stays alive,
+     * only the one package underneath it is gone, and {@link #assetSizeBytesForDomain}'s
+     * per-repository scan would then count a phantom entry for a package that no longer exists, or
+     * misattribute it to whatever was republished under the same name. The fence comparison below
+     * closes that window precisely, with no sidecar round trip (and so no lock-held network call,
+     * and no event-loop-blocking call from an async proxy like npm's) needed to do it.
+     */
+    public synchronized void recordContainerBackedAssetBytes(String region, String domain, String domainOwner,
+            String repository, String format, String namespace, String packageName, long bytes,
+            long packageFenceSnapshot) {
+        if (!isValidPackageToken(packageName) || (namespace != null && !isValidPackageToken(namespace))) {
+            LOG.warnv("Skipping container-backed asset byte accounting for {0}/{1} package ''{2}'': namespace or "
+                    + "package name contains a character ('#', '/', or whitespace) a real CodeArtifact package "
+                    + "coordinate cannot have.", domain, repository, packageName);
+            return;
+        }
+        String owner = effectiveOwner(domainOwner);
+        if (repositories.getForAccount(owner, repositoryKey(region, domain, repository)).isEmpty()) {
+            LOG.warnv("Skipping container-backed asset byte accounting for {0}/{1}: the repository was deleted "
+                    + "while this publish was in flight.", domain, repository);
+            return;
+        }
+        String key = packageKey(region, domain, repository, format, namespace, accountingPackageName(format,
+                packageName));
+        long currentFence = containerBackedPackageDeletionFence.getOrDefault(ownerScopedKey(owner, key), 0L);
+        if (currentFence != packageFenceSnapshot) {
+            LOG.warnv("Skipping container-backed asset byte accounting for {0}/{1} package ''{2}'': a "
+                    + "DeletePackage removed it from the {3} sidecar (possibly replaced by a different publish) "
+                    + "while this publish was in flight.", domain, repository, packageName, format);
+            return;
+        }
+        String ownerScopedKey = ownerScopedKey(owner, key);
+        long existing = containerBackedAssetBytes.getOrDefault(ownerScopedKey, 0L);
+        containerBackedAssetBytes.put(ownerScopedKey, existing + bytes);
+    }
+
+    /**
+     * Cleans up this service's own byte accounting and deletion fence for one container-backed
+     * package after something other than {@link #deletePackage} removed it directly from the
+     * sidecar: specifically, a real npm client's native {@code npm unpublish}, which the pinned
+     * Verdaccio image (configured with {@code unpublish: $all}) honors on its own wire protocol,
+     * bypassing {@link #deletePackage} entirely (confirmed: {@code CodeArtifactNpmDataPlane}
+     * forwards any request that is not a publish straight through). {@link #deletePackage}'s own
+     * container-backed branch already does both of these same two things as part of deleting the
+     * real sidecar content too; this is that same bookkeeping on its own, for when the sidecar
+     * content is already gone by a path {@link #deletePackage} never saw.
+     *
+     * <p>{@code namespace}/{@code packageName} come straight from the wire protocol here too (the
+     * unpublish request's own path), so this guards the same escape-collision invariant
+     * {@link #recordContainerBackedAssetBytes} does, the same way and for the same reason.
+     */
+    public synchronized void forgetContainerBackedPackage(String region, String domain, String domainOwner,
+            String repository, String format, String namespace, String packageName) {
+        if (!isValidPackageToken(packageName) || (namespace != null && !isValidPackageToken(namespace))) {
+            LOG.warnv("Ignoring a native unpublish of {0}/{1} package ''{2}'': namespace or package name contains "
+                    + "a character ('#', '/', or whitespace) a real CodeArtifact package coordinate cannot have.",
+                    domain, repository, packageName);
+            return;
+        }
+        String owner = effectiveOwner(domainOwner);
+        String key = packageKey(region, domain, repository, format, namespace, accountingPackageName(format,
+                packageName));
+        String ownerScopedKey = ownerScopedKey(owner, key);
+        containerBackedAssetBytes.remove(ownerScopedKey);
+        containerBackedPackageDeletionFence.put(ownerScopedKey, containerBackedPackageDeletionCounter.incrementAndGet());
+    }
+
+    /**
+     * The fence and {@code containerBackedAssetBytes} are both process-wide plain
+     * {@code ConcurrentHashMap}s, not account-scoped storage the way every durable store here is,
+     * so the account has to be folded into the key explicitly rather than relying on an
+     * {@code AccountAwareStorageBackend} to keep two accounts' identical-looking package keys
+     * apart.
+     */
+    private static String ownerScopedKey(String owner, String packageKey) {
+        return owner + "::" + packageKey;
+    }
+
+    /**
+     * The same PEP 503 project-name normalization {@code PypiserverSidecarClient} applies before
+     * every lookup against the real pypiserver sidecar (lowercase, runs of {@code -_.} collapsed
+     * to one {@code -}), applied here too, only for pypi's own accounting/fence key: pypiserver
+     * treats case- and punctuation-equivalent spellings as the same package, so an upload spelled
+     * one way and a later {@code DeletePackage} spelled another must still address the same byte
+     * count and the same fence entry, the way they already address the same sidecar package.
+     * {@code packageOriginConfigs} deliberately keeps using the caller's raw spelling unchanged;
+     * that mismatch is pre-existing and unrelated to the byte accounting this method guards.
+     */
+    private static String accountingPackageName(String format, String packageName) {
+        return "pypi".equals(format) ? packageName.toLowerCase(Locale.ROOT).replaceAll("[-_.]+", "-") : packageName;
     }
 
     private int domainCountForAccount(String owner, String region) {
@@ -1293,9 +1556,13 @@ public class CodeArtifactService implements Resettable {
     }
 
     private static void validatePackageToken(String field, String value) {
-        if (value == null || value.isEmpty() || value.length() > 255 || !PACKAGE_TOKEN.matcher(value).matches()) {
+        if (!isValidPackageToken(value)) {
             throw validation(field + " must be 1-255 characters with no '#', '/', or whitespace.");
         }
+    }
+
+    private static boolean isValidPackageToken(String value) {
+        return value != null && !value.isEmpty() && value.length() <= 255 && PACKAGE_TOKEN.matcher(value).matches();
     }
 
     /**

@@ -10,7 +10,9 @@ import java.util.Objects;
  * controller and Cognito, and rebuilt inside SesService whenever the content is rendered or
  * sanitized, so the request always carries the content being sent. It is not a wire shape: each
  * caller translates its own request into these fields (v2 {@code FromEmailAddress} into
- * {@code source}, {@code FeedbackForwardingEmailAddress} into {@code returnPath}, v1 {@code Tags}
+ * {@code source}, {@code FeedbackForwardingEmailAddress} into {@code returnPath}, v2
+ * {@code FromEmailAddressIdentityArn} into both {@code sourceArn} and {@code fromArn},
+ * {@code FeedbackForwardingEmailAddressIdentityArn} into {@code returnPathArn}, v1 {@code Tags}
  * into {@code emailTags}, v1 {@code SendRawEmail} {@code Destinations} into {@code toAddresses}),
  * and a field a caller's API lacks keeps the builder default.
  */
@@ -21,6 +23,9 @@ public record SendEmailRequest(
         List<String> bccAddresses,
         List<String> replyToAddresses,
         String returnPath,
+        String sourceArn,
+        String fromArn,
+        String returnPathArn,
         String configurationSetName,
         List<MessageTag> emailTags,
         ListManagementOptions listManagement,
@@ -70,6 +75,9 @@ public record SendEmailRequest(
                 .bccAddresses(bccAddresses)
                 .replyToAddresses(replyToAddresses)
                 .returnPath(returnPath)
+                .sourceArn(sourceArn)
+                .fromArn(fromArn)
+                .returnPathArn(returnPathArn)
                 .configurationSetName(configurationSetName)
                 .emailTags(emailTags)
                 .listManagement(listManagement)
@@ -85,6 +93,9 @@ public record SendEmailRequest(
         private List<String> bccAddresses = List.of();
         private List<String> replyToAddresses = List.of();
         private String returnPath;
+        private String sourceArn;
+        private String fromArn;
+        private String returnPathArn;
         private String configurationSetName;
         private List<MessageTag> emailTags = List.of();
         private ListManagementOptions listManagement;
@@ -101,6 +112,9 @@ public record SendEmailRequest(
         public Builder bccAddresses(List<String> bccAddresses) { this.bccAddresses = bccAddresses; return this; }
         public Builder replyToAddresses(List<String> replyToAddresses) { this.replyToAddresses = replyToAddresses; return this; }
         public Builder returnPath(String returnPath) { this.returnPath = returnPath; return this; }
+        public Builder sourceArn(String sourceArn) { this.sourceArn = sourceArn; return this; }
+        public Builder fromArn(String fromArn) { this.fromArn = fromArn; return this; }
+        public Builder returnPathArn(String returnPathArn) { this.returnPathArn = returnPathArn; return this; }
         public Builder configurationSetName(String configurationSetName) { this.configurationSetName = configurationSetName; return this; }
         public Builder emailTags(List<MessageTag> emailTags) { this.emailTags = emailTags; return this; }
         public Builder listManagement(ListManagementOptions listManagement) { this.listManagement = listManagement; return this; }
@@ -110,7 +124,8 @@ public record SendEmailRequest(
 
         public SendEmailRequest build() {
             return new SendEmailRequest(source, toAddresses, ccAddresses, bccAddresses, replyToAddresses,
-                    returnPath, configurationSetName, emailTags, listManagement, tenantName, region, content);
+                    returnPath, sourceArn, fromArn, returnPathArn, configurationSetName, emailTags, listManagement,
+                    tenantName, region, content);
         }
     }
 }

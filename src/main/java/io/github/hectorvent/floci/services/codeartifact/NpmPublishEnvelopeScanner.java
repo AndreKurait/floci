@@ -26,8 +26,11 @@ final class NpmPublishEnvelopeScanner {
 
     record Version(String tarball, String integrity) {}
 
+    /** {@code size} is the attachment's real, decoded byte count, counted alongside its digest. */
+    record Attachment(String integrity, long size) {}
+
     record Envelope(String name, Map<String, String> distTags, Map<String, Version> versions,
-            Map<String, String> attachmentIntegrity) {}
+            Map<String, Attachment> attachments) {}
 
     private static final JsonFactory FACTORY = JsonFactory.builder()
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
@@ -47,7 +50,7 @@ final class NpmPublishEnvelopeScanner {
     private String name;
     private final Map<String, String> distTags = new HashMap<>();
     private final Map<String, Map<String, String>> versionFields = new HashMap<>();
-    private final Map<String, String> attachmentIntegrity = new HashMap<>();
+    private final Map<String, Attachment> attachments = new HashMap<>();
 
     private NpmPublishEnvelopeScanner(JsonParser parser) {
         this.parser = parser;
@@ -74,7 +77,7 @@ final class NpmPublishEnvelopeScanner {
                 case "_attachments" -> forEachField(filename ->
                         forEachField(attachmentField -> {
                             if (attachmentField.equals("data")) {
-                                attachmentIntegrity.put(filename, hashBase64());
+                                attachments.put(filename, hashBase64());
                             } else {
                                 parser.skipChildren();
                             }
@@ -125,15 +128,41 @@ final class NpmPublishEnvelopeScanner {
         return parser.getText();
     }
 
-    private String hashBase64() throws IOException {
+    /**
+     * {@link JsonParser#readBinaryValue} already resolves a JSON escape sequence within the
+     * base64 text before decoding it (confirmed directly: a validly-escaped, valid-length
+     * attachment decodes correctly, digest and byte count both exactly right), so this never
+     * needs a separate unescaping path of its own.
+     */
+    private Attachment hashBase64() throws IOException {
         requireToken(JsonToken.VALUE_STRING);
         MessageDigest digest = sha512();
-        try (OutputStream sink = new DigestOutputStream(OutputStream.nullOutputStream(), digest)) {
+        CountingOutputStream counted = new CountingOutputStream();
+        try (OutputStream sink = new DigestOutputStream(counted, digest)) {
             parser.readBinaryValue(sink);
         } catch (IllegalArgumentException e) {
             throw invalid("attachment data is not plain base64");
         }
-        return "sha512-" + Base64.getEncoder().encodeToString(digest.digest());
+        return new Attachment("sha512-" + Base64.getEncoder().encodeToString(digest.digest()), counted.count());
+    }
+
+    /** Discards every byte written to it, counting them as it goes. */
+    private static final class CountingOutputStream extends OutputStream {
+        private long count;
+
+        @Override
+        public void write(int b) {
+            count++;
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) {
+            count += len;
+        }
+
+        long count() {
+            return count;
+        }
     }
 
     private void requireToken(JsonToken expected) throws IOException {
@@ -148,7 +177,7 @@ final class NpmPublishEnvelopeScanner {
             Map<String, String> fields = entry.getValue();
             versions.put(entry.getKey(), new Version(fields.get("tarball"), fields.get("integrity")));
         }
-        return new Envelope(name, distTags, versions, attachmentIntegrity);
+        return new Envelope(name, distTags, versions, attachments);
     }
 
     private static MessageDigest sha512() {

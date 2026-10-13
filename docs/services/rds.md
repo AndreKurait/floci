@@ -57,7 +57,11 @@ RDS Data API (`rds-data`) is documented separately because it uses REST JSON rou
 | `PromoteReadReplica` | Detach a read replica into a standalone instance and turn automated backups on |
 | `SwitchoverReadReplica` | Refused with `InvalidDBInstanceState`: AWS supports switchover only for Oracle and SQL Server replicas, neither of which is emulated |
 | `PromoteReadReplicaDBCluster` | Refused with `InvalidDBClusterStateFault`: no cluster is created as a replica of an instance |
-| `DescribeOrderableDBInstanceOptions` | List deterministic instance class options |
+| `DescribeDBEngineVersions` | List the engine catalogue's versions with their parameter group family, default flag and upgrade targets |
+| `DescribeEngineDefaultParameters` | Return a known family's default parameters (an empty list, as Floci's default groups hold none) |
+| `DescribeEngineDefaultClusterParameters` | Return a known family's default cluster parameters (an empty list, as for instances) |
+| `DescribeValidDBInstanceModifications` | Return the storage an instance can move to: its type and the sizes a modify stores as asked |
+| `DescribeOrderableDBInstanceOptions` | List the orderable engine, version and instance class combinations from the engine catalogue; see [Engine catalogue](#engine-catalogue) |
 | `DescribeEvents` | - |
 | `CreateEventSubscription` | Create an event notification subscription (stored, nothing is published) |
 | `DescribeEventSubscriptions` | List subscriptions, or the one the request names |
@@ -553,6 +557,33 @@ same-region replicas; a cross-region replica keeps its link with the replication
 `terminated` until it is promoted or deleted, which is what AWS does for PostgreSQL. Deleting a
 replica drops it from its source's list.
 
+## Engine catalogue
+
+`DescribeDBEngineVersions` and `DescribeOrderableDBInstanceOptions` read one curated catalogue: a
+representative version for each major version Floci knows through its managed parameter and option
+groups (PostgreSQL 13 to 18, MySQL 8.0 and 8.4, MariaDB 10.11, 11.2 and 11.4, SQL Server Standard 15,
+Aurora PostgreSQL 15 to 17 and Aurora MySQL 8.0). It is not AWS's full version list. Each version
+reports the parameter group family the create path computes for it, its major version and its upgrade
+targets (the engine's later versions, with `IsMajorVersionUpgrade` set across a major version). Each
+engine's default is the version a create request that names none gets (instances, clusters and global
+clusters alike), so `DefaultOnly` agrees with what Floci builds; for Aurora MySQL that is
+`8.0.mysql_aurora.3.05.2`. Each version also reports what Floci supports for it: `SupportsReadReplica`
+for PostgreSQL only, `SupportsGlobalDatabases` for the two Aurora engines, and `SupportsParallelQuery`
+and `SupportsBabelfish` as false. `ExportableLogTypes` and `SupportedFeatureNames` list the engine's
+documented log types and IAM role feature names. `EngineVersion` takes an exact version or a major version such as `16`, and the
+documented filters (`db-parameter-group-family`, `engine`, `engine-mode`, `engine-version`, `status`)
+apply. Every version is `available`, so `IncludeAll` changes nothing.
+
+`DescribeEngineDefaultParameters` and `DescribeEngineDefaultClusterParameters` accept a family from the
+catalogue (`InvalidParameterValue` otherwise) and return an empty parameter list, consistent with
+`DescribeDBParameters` on a default group, which lists only values set on the group.
+`DescribeValidDBInstanceModifications` reports the instance's storage type and the sizes `ModifyDBInstance`
+stores as asked: the current size, and from the smallest real increase up to the engine's maximum (16384
+GiB for SQL Server, 65536 GiB otherwise). Storage only grows, and for PostgreSQL, MySQL and MariaDB an
+increase under 10% is rounded up to 10%, so at 40 GiB the second range starts at 44. An Aurora instance
+has no storage of its own to modify, so its list is empty. `DescribeOrderableDBInstanceOptions` matches
+`EngineVersion` exactly or as a major version prefix, so `8.0` finds the MySQL `8.0.36` rows.
+
 ## Cluster endpoints
 
 `CreateDBClusterEndpoint` adds an Aurora custom endpoint to an available cluster. As the Aurora user
@@ -580,6 +611,20 @@ Custom endpoints are modelled, not routed: a custom endpoint reports the cluster
 (read from the cluster each time, so it follows a restart onto another proxy port), so it is
 reachable, but connections through it go where the cluster endpoint sends them rather than being
 spread across the chosen members.
+
+## Aurora managed password opt-out
+
+When `ModifyDBCluster` disables `ManageMasterUserPassword` while the managed secret has
+cross-Region replicas, the request succeeds but retains the cluster password and its
+`MasterUserSecret` metadata, as Aurora does. Remove the secret's replicas and retry to
+release password management. Other requested cluster settings still apply.
+
+Floci reserves the secret while changing backend credentials, without holding a shared
+Secrets Manager lock during backend I/O. Replication and deletion requests for that secret
+fail while release is in progress; unrelated secrets remain available.
+A failed backend password rotation retains the managed secret and stored credentials.
+If Secrets Manager support is unavailable, opt-out fails before changing cluster state.
+This does not provide a transaction across database backends and persistent storage.
 
 ## Point in time restore
 

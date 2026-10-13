@@ -31,6 +31,10 @@ class Ec2InstanceTypeCatalogTest {
                 "t2.nano",
                 "t2.micro",
                 "t2.small",
+                "t2.medium",
+                "t2.large",
+                "t2.xlarge",
+                "t2.2xlarge",
                 "t3.nano",
                 "t3.micro",
                 "t3.small",
@@ -54,6 +58,14 @@ class Ec2InstanceTypeCatalogTest {
         assertLargeGravitonType("m6gd.large");
         assertLargeGravitonType("m7gd.large");
         assertLargeGravitonType("m8gd.large");
+    }
+
+    @Test
+    void largerT2TypesResolveWithDocumentedCapacity() {
+        assertT2Type("t2.medium", 2, 4096, 6, 3);
+        assertT2Type("t2.large", 2, 8192, 12, 3);
+        assertT2Type("t2.xlarge", 4, 16384, 15, 3);
+        assertT2Type("t2.2xlarge", 8, 32768, 15, 3);
     }
 
     @Test
@@ -142,6 +154,17 @@ class Ec2InstanceTypeCatalogTest {
                 .toResponseMap().get("burstablePerformanceSupported"));
         assertEquals(false, instanceTypeCatalog.find("m5.large").orElseThrow()
                 .toResponseMap().get("burstablePerformanceSupported"));
+    }
+
+    private void assertT2Type(String name, int vcpu, int memoryMib, int ipv4PerInterface, int maxInterfaces) {
+        Ec2InstanceTypeCatalog.CatalogInstanceType instanceType = instanceTypeCatalog.find(name).orElseThrow();
+
+        assertEquals(vcpu, instanceType.vcpu, name);
+        assertEquals(memoryMib, instanceType.memoryMib, name);
+        assertEquals(List.of("x86_64"), instanceType.supportedArchitectures, name);
+        assertEquals(ipv4PerInterface, instanceType.ipv4AddressesPerInterface, name);
+        assertEquals(maxInterfaces, instanceType.networkCards.get(0).maximumNetworkInterfaces, name);
+        assertTrue(instanceType.currentGeneration, name);
     }
 
     private void assertLargeGravitonType(String name) {

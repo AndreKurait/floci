@@ -29,7 +29,7 @@ For running SQL without a PostgreSQL wire connection (the way Lambda and Step Fu
 | `DescribeClusterParameters` | Return the parameters of a group, with any values set by `ModifyClusterParameterGroup` |
 | `ModifyClusterParameterGroup` | Update parameter values on a group |
 | `DeleteClusterParameterGroup` | Remove a parameter group |
-| `CreateTags` | Add or overwrite tags on a cluster, snapshot, subnet group, parameter group or snapshot copy grant |
+| `CreateTags` | Add or overwrite tags on a cluster, snapshot, subnet group, parameter group, snapshot copy grant or snapshot schedule |
 | `DeleteTags` | Remove tags by key from a resource |
 | `DescribeTags` | List tagged resources and their tags |
 | `CreateClusterSubnetGroup` | Register a cluster subnet group (metadata only) |
@@ -42,6 +42,14 @@ For running SQL without a PostgreSQL wire connection (the way Lambda and Step Fu
 | `CreateSnapshotCopyGrant` | Register a snapshot copy grant, defaulting `KmsKeyId` to the AWS-managed Redshift key. `SnapshotCopyGrantName` must be 1-63 characters, start with a lowercase letter, and contain only lowercase letters, digits and non-consecutive hyphens |
 | `DescribeSnapshotCopyGrants` | List snapshot copy grants, optionally filtered by name, paged with `MaxRecords` and `Marker` |
 | `DeleteSnapshotCopyGrant` | Remove a snapshot copy grant |
+| `EnableSnapshotCopy` | Record cross-region snapshot copy on a cluster (`RetentionPeriod` defaults to 7, `ManualSnapshotRetentionPeriod` to -1); `DescribeClusters` then reports `ClusterSnapshotCopyStatus`. A `DestinationRegion` that is not an AWS region is refused with `UnknownSnapshotCopyRegionFault`. No snapshot is copied |
+| `DisableSnapshotCopy` | Clear a cluster's snapshot copy configuration |
+| `ModifySnapshotCopyRetentionPeriod` | Change the automated (or, with `Manual`, the manual) snapshot copy retention period |
+| `CreateSnapshotSchedule` | Store a snapshot schedule of `rate(...)` / `cron(...)` definitions with optional tags; a `ScheduleIdentifier` other than letters, digits and hyphens is refused with `InvalidParameterValue`. No snapshots are taken on it |
+| `ModifySnapshotSchedule` | Replace a schedule's definitions |
+| `DescribeSnapshotSchedules` | List schedules filtered by `ScheduleIdentifier`, `ClusterIdentifier`, `TagKeys` and `TagValues`, paged with `MaxRecords` and `Marker`, with their associated clusters |
+| `DeleteSnapshotSchedule` | Remove a schedule; refused with `InvalidClusterSnapshotScheduleState` while a cluster uses it |
+| `ModifyClusterSnapshotSchedule` | Associate a cluster with a schedule, or disassociate it with `DisassociateSchedule` |
 | `ModifyCluster` | Update node type, parameter group, security groups, Multi-AZ flag, or the master password |
 | `DescribeClusterVersions` | Return the single emulated engine version and its parameter group family |
 | `DescribeOrderableClusterOptions` | Return the static node types and cluster types, optionally filtered by `NodeType` or `ClusterVersion` |
@@ -499,7 +507,7 @@ These views expose the documented Redshift column names, types, and ordering map
 - Multi-node clusters: `NodeType` and `NumberOfNodes` are stored as metadata; every cluster is a single PostgreSQL container.
 - Parameter groups apply no real engine settings; values are stored and echoed back only.
 - Subnet groups, VPC routing, and security groups are metadata only.
-- Resize, pause/resume, IAM authentication, snapshot schedules, and cross-region snapshot copy.
+- Resize, pause/resume, and IAM authentication. Snapshot schedules and cross-region snapshot copy are stored and reported, but no snapshot is taken on a schedule or copied to another region.
 - `IAM_ROLE default` and cross-account role ARNs are not supported for COPY or UNLOAD.
 - The auth proxy validates the master user's password and any live `GetClusterCredentials` credential. Other non-master users pass straight through to PostgreSQL, which remains the authority for their credentials.
 - A cluster using `ManageMasterPassword` keeps its generated password in sync with the

@@ -392,13 +392,15 @@ class DynamoDbAccessPathValidatorTest {
         AwsException allAttributes = assertThrows(AwsException.class,
                 () -> DynamoDbAccessPathValidator.validateSelection(
                         table, tablePath, "ALL_ATTRIBUTES", "sk", null, null));
-        assertEquals("Cannot specify the ProjectionExpression when choosing to get ALL_ATTRIBUTES",
+        assertEquals("1 validation error detected: "
+                + "Cannot specify the ProjectionExpression when choosing to get ALL_ATTRIBUTES",
                 allAttributes.getMessage());
 
         AwsException count = assertThrows(AwsException.class,
                 () -> DynamoDbAccessPathValidator.validateSelection(
                         table, tablePath, "COUNT", "sk", null, null));
-        assertEquals("Cannot specify the ProjectionExpression when choosing to get only the Count",
+        assertEquals("1 validation error detected: "
+                + "Cannot specify the ProjectionExpression when choosing to get only the Count",
                 count.getMessage());
     }
 
@@ -407,13 +409,15 @@ class DynamoDbAccessPathValidatorTest {
         AwsException both = assertThrows(AwsException.class,
                 () -> DynamoDbAccessPathValidator.validateSelection(
                         table, tablePath, "ALL_PROJECTED_ATTRIBUTES", "sk", null, null));
-        assertEquals("Cannot specify the ProjectionExpression when choosing to get ALL_PROJECTED_ATTRIBUTES",
+        assertEquals("1 validation error detected: "
+                + "Cannot specify the ProjectionExpression when choosing to get ALL_PROJECTED_ATTRIBUTES",
                 both.getMessage());
 
         AwsException indexOnly = assertThrows(AwsException.class,
                 () -> DynamoDbAccessPathValidator.validateSelection(
                         table, tablePath, "ALL_PROJECTED_ATTRIBUTES", null, null, null));
-        assertEquals("ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName",
+        assertEquals("1 validation error detected: "
+                + "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName",
                 indexOnly.getMessage());
     }
 

@@ -313,7 +313,8 @@ public final class AwsPartitions {
                 globalServices,
                 node.path("supportsDualStack").asBoolean(false),
                 node.path("supportsFips").asBoolean(false),
-                s3DualStackRegions);
+                s3DualStackRegions,
+                node.path("signinHost").asText(null));
     }
 
     private static String required(JsonNode node, String field) {
