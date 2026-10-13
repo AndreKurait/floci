@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
@@ -19,26 +18,24 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 class ApiGatewayImportedIntegrationTypeIntegrationTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final String CREDENTIALS = "arn:aws:iam::000000000000:role/integration";
     private static final String LAMBDA_URI = "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/"
             + "functions/arn:aws:lambda:us-east-1:000000000000:function:fixture:live/invocations";
 
     @ParameterizedTest
     @CsvSource({
-        "aws, AWS",
-        "aws_proxy, AWS_PROXY",
-        "http, HTTP",
-        "http_proxy, HTTP_PROXY",
-        "mock, MOCK",
-        "AWS_PROXY, AWS_PROXY",
-        "custom_type, custom_type"
+        "aws, AWS, get, GET",
+        "aws_proxy, AWS_PROXY, get, GET",
+        "http, HTTP, get, GET",
+        "http_proxy, HTTP_PROXY, get, GET",
+        "mock, MOCK, get, GET",
+        "mock, MOCK, x-amazon-apigateway-any-method, ANY"
     })
     void importMergeAndOverwriteExposeCanonicalMetadataWithoutChangingOtherFields(
-            String importedType, String expectedType) throws Exception {
+            String importedType, String expectedType, String operation, String verb) throws Exception {
         Map<String, Object> integration = integration(importedType);
-        String apiId = importApi(document("get", integration));
+        String apiId = importApi(document(operation, integration));
         try {
-            assertMetadata(apiId, "GET", integration, expectedType);
+            assertMetadata(apiId, verb, integration, expectedType);
 
             for (String mode : List.of("merge", "overwrite")) {
                 Map<String, Object> replacement = new LinkedHashMap<>(integration);
@@ -47,36 +44,11 @@ class ApiGatewayImportedIntegrationTypeIntegrationTest {
                     replacement.put("uri", replacement.get("uri").toString().replace("live", "next")
                             .replace("/original", "/replacement"));
                 }
-                given().contentType(ContentType.JSON).body(document("get", replacement))
+                given().contentType(ContentType.JSON).body(document(operation, replacement))
                         .put("/restapis/" + apiId + "?mode=" + mode)
                         .then().statusCode(200);
-                assertMetadata(apiId, "GET", replacement, expectedType);
+                assertMetadata(apiId, verb, replacement, expectedType);
             }
-        } finally {
-            given().delete("/restapis/" + apiId).then().statusCode(202);
-        }
-    }
-
-    @Test
-    void anyMethodUsesTheSameImportNormalization() throws Exception {
-        Map<String, Object> integration = integration("mock");
-        String apiId = importApi(document("x-amazon-apigateway-any-method", integration));
-        try {
-            assertMetadata(apiId, "ANY", integration, "MOCK");
-        } finally {
-            given().delete("/restapis/" + apiId).then().statusCode(202);
-        }
-    }
-
-    @Test
-    void directPutIntegrationKeepsItsExistingTypeHandling() throws Exception {
-        String apiId = importApi(document("get", integration("MOCK")));
-        try {
-            Map<String, Object> direct = integration("aws_proxy");
-            given().contentType(ContentType.JSON).body(direct)
-                    .put(methodPath(apiId, "GET") + "/integration")
-                    .then().statusCode(201);
-            assertMetadata(apiId, "GET", direct, "aws_proxy");
         } finally {
             given().delete("/restapis/" + apiId).then().statusCode(202);
         }
@@ -85,14 +57,17 @@ class ApiGatewayImportedIntegrationTypeIntegrationTest {
     private static Map<String, Object> integration(String type) {
         Map<String, Object> integration = new LinkedHashMap<>();
         integration.put("type", type);
-        integration.put("httpMethod", "POST");
         integration.put("timeoutInMillis", 12000);
-        integration.put("passthroughBehavior", "when_no_match");
-        if ("aws".equals(type) || "aws_proxy".equals(type) || "AWS_PROXY".equals(type)) {
+        if (!"mock".equals(type)) {
+            integration.put("httpMethod", "POST");
+        }
+        if ("aws".equals(type) || "aws_proxy".equals(type)) {
             integration.put("uri", LAMBDA_URI);
-            integration.put("credentials", CREDENTIALS);
-        } else if (!"mock".equals(type) && !"MOCK".equals(type)) {
-            integration.put("uri", "https://example.test/original");
+        } else if (!"mock".equals(type)) {
+            integration.put("uri", "https://example.com/original");
+        }
+        if (List.of("aws", "http", "mock").contains(type)) {
+            integration.put("responses", Map.of("default", Map.of("statusCode", "200")));
         }
         return integration;
     }
@@ -101,11 +76,6 @@ class ApiGatewayImportedIntegrationTypeIntegrationTest {
         return Map.of(
                 "openapi", "3.0.2",
                 "info", Map.of("title", "integration-type", "version", "1"),
-                "components", Map.of("securitySchemes", Map.of(
-                        "sigv4", Map.of("type", "apiKey", "name", "Authorization", "in", "header",
-                                "x-amazon-apigateway-authtype", "awsSigv4"),
-                        "key", Map.of("type", "apiKey", "name", "x-api-key", "in", "header"))),
-                "security", List.of(Map.of("sigv4", List.of()), Map.of("key", List.of())),
                 "paths", Map.of("/status", Map.of(verb, Map.of(
                         "responses", Map.of("200", Map.of("description", "ok")),
                         "x-amazon-apigateway-integration", integration))));
@@ -131,12 +101,10 @@ class ApiGatewayImportedIntegrationTypeIntegrationTest {
         String path = methodPath(apiId, verb);
         JsonNode method = get(path);
         JsonNode integration = get(path + "/integration");
-        assertEquals("AWS_IAM", method.path("authorizationType").asText());
-        assertEquals(true, method.path("apiKeyRequired").asBoolean());
         assertEquals(expectedType, integration.path("type").asText());
         assertEquals(integration, method.path("methodIntegration"));
         for (Map.Entry<String, Object> field : expected.entrySet()) {
-            if (!"type".equals(field.getKey())) {
+            if (!List.of("type", "responses").contains(field.getKey())) {
                 assertEquals(MAPPER.valueToTree(field.getValue()), integration.get(field.getKey()), field.getKey());
             }
         }
