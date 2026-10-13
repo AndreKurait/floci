@@ -554,7 +554,9 @@ public class AwsQueryController {
     private static final Set<String> RDS_ACTIONS = Set.of(
             "CreateDBInstance", "DescribeDBInstances", "DeleteDBInstance",
             "ModifyDBInstance", "RebootDBInstance",
-            "DescribeOrderableDBInstanceOptions",
+            "DescribeOrderableDBInstanceOptions", "DescribeValidDBInstanceModifications",
+            "DescribeDBEngineVersions", "DescribeEngineDefaultParameters",
+            "DescribeEngineDefaultClusterParameters",
             "CreateDBSubnetGroup", "DescribeDBSubnetGroups", "ModifyDBSubnetGroup", "DeleteDBSubnetGroup",
             "AddTagsToResource", "ListTagsForResource", "RemoveTagsFromResource",
             "CreateDBCluster", "DescribeDBClusters", "DeleteDBCluster", "ModifyDBCluster",
@@ -642,6 +644,9 @@ public class AwsQueryController {
             "ModifyClusterParameterGroup",
             "CreateClusterSubnetGroup", "DescribeClusterSubnetGroups", "ModifyClusterSubnetGroup", "DeleteClusterSubnetGroup",
             "CreateSnapshotCopyGrant", "DescribeSnapshotCopyGrants", "DeleteSnapshotCopyGrant",
+            "EnableSnapshotCopy", "DisableSnapshotCopy", "ModifySnapshotCopyRetentionPeriod",
+            "CreateSnapshotSchedule", "DescribeSnapshotSchedules", "ModifySnapshotSchedule",
+            "DeleteSnapshotSchedule", "ModifyClusterSnapshotSchedule",
             "CreateTags", "DeleteTags", "DescribeTags",
             "GetClusterCredentials", "GetClusterCredentialsWithIAM"
     );

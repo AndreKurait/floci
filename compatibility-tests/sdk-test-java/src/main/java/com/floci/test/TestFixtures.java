@@ -121,6 +121,14 @@ import software.amazon.awssdk.services.route53.model.ResourceRecordSet;
 import software.amazon.awssdk.services.rum.RumClient;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.DeleteMarkerEntry;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.ListObjectVersionsRequest;
+import software.amazon.awssdk.services.s3.model.ListObjectVersionsResponse;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
+import software.amazon.awssdk.services.s3.model.ObjectVersion;
+import software.amazon.awssdk.services.s3.model.S3Object;
 import software.amazon.awssdk.services.s3control.S3ControlClient;
 import software.amazon.awssdk.services.s3control.endpoints.S3ControlEndpointProvider;
 import software.amazon.awssdk.services.s3tables.S3TablesClient;
@@ -162,6 +170,7 @@ import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.function.BooleanSupplier;
@@ -642,6 +651,42 @@ public final class TestFixtures {
                 .credentialsProvider(CREDENTIALS)
                 .forcePathStyle(true)
                 .build();
+    }
+
+    /** Removes objects, versions and delete markers before a test deletes its bucket. */
+    public static void deleteBucketContents(S3Client s3, String bucket) {
+        String token = null;
+        do {
+            ListObjectsV2Response response = s3.listObjectsV2(ListObjectsV2Request.builder()
+                    .bucket(bucket).continuationToken(token).build());
+            for (S3Object object : response.contents()) {
+                s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(object.key()).build());
+            }
+            token = response.isTruncated() ? response.nextContinuationToken() : null;
+        } while (token != null);
+
+        // Collect every page before deleting: deleting a page invalidates its resume marker.
+        List<ObjectVersion> versions = new ArrayList<>();
+        List<DeleteMarkerEntry> markers = new ArrayList<>();
+        String keyMarker = null;
+        String versionMarker = null;
+        do {
+            ListObjectVersionsResponse response = s3.listObjectVersions(
+                    ListObjectVersionsRequest.builder()
+                            .bucket(bucket).keyMarker(keyMarker).versionIdMarker(versionMarker).build());
+            versions.addAll(response.versions());
+            markers.addAll(response.deleteMarkers());
+            keyMarker = response.isTruncated() ? response.nextKeyMarker() : null;
+            versionMarker = response.isTruncated() ? response.nextVersionIdMarker() : null;
+        } while (keyMarker != null);
+        for (ObjectVersion version : versions) {
+            s3.deleteObject(DeleteObjectRequest.builder()
+                    .bucket(bucket).key(version.key()).versionId(version.versionId()).build());
+        }
+        for (DeleteMarkerEntry marker : markers) {
+            s3.deleteObject(DeleteObjectRequest.builder()
+                    .bucket(bucket).key(marker.key()).versionId(marker.versionId()).build());
+        }
     }
 
     /** Async client with the Java-based multipart support enabled (5 MiB threshold and parts), for the transfer manager. */

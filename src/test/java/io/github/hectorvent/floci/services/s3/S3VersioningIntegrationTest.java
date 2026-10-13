@@ -497,4 +497,24 @@ class S3VersioningIntegrationTest {
                 .post("/");
         }
     }
+
+    @Test
+    @Order(21)
+    void deleteBucketRejectsVersionsBehindDeleteMarker() {
+        String bucket = "versioned-delete-bucket-test";
+        given().when().put("/" + bucket).then().statusCode(200);
+        given().body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+                .when().put("/" + bucket + "?versioning").then().statusCode(200);
+        String versionId = given().body("data").when().put("/" + bucket + "/key")
+                .then().statusCode(200).extract().header("x-amz-version-id");
+        String markerId = given().when().delete("/" + bucket + "/key")
+                .then().statusCode(204).extract().header("x-amz-version-id");
+
+        given().when().delete("/" + bucket).then().statusCode(409)
+                .body(containsString("<Code>BucketNotEmpty</Code>"));
+
+        given().when().delete("/" + bucket + "/key?versionId=" + markerId).then().statusCode(204);
+        given().when().delete("/" + bucket + "/key?versionId=" + versionId).then().statusCode(204);
+        given().when().delete("/" + bucket).then().statusCode(204);
+    }
 }

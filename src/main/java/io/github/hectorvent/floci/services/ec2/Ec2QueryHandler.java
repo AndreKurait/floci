@@ -4678,6 +4678,10 @@ public class Ec2QueryHandler {
         }
         xml.end("groupSet");
         xml.raw(tagSetXml(ni.getTagSet()));
+        ni.getPrivateIpAddresses().stream()
+                .filter(ip -> ip.isPrimary() && ip.getAssociation() != null)
+                .findFirst()
+                .ifPresent(ip -> xml.raw(networkInterfaceAssociationXml(ip.getAssociation())));
         if (ni.getAttachment() != null) {
             xml.start("attachment")
                     .elem("attachmentId", ni.getAttachment().getAttachmentId())
@@ -4697,18 +4701,22 @@ public class Ec2QueryHandler {
                         .elem("privateDnsName", ip.getPrivateDnsName())
                         .elem("primary", String.valueOf(ip.isPrimary()));
                 if (ip.getAssociation() != null) {
-                    xml.start("association")
-                            .elem("publicIp", ip.getAssociation().getPublicIp())
-                            .elem("allocationId", ip.getAssociation().getAllocationId())
-                            .elem("associationId", ip.getAssociation().getAssociationId())
-                            .elem("ipOwnerId", ip.getAssociation().getIpOwnerId())
-                            .end("association");
+                    xml.raw(networkInterfaceAssociationXml(ip.getAssociation()));
                 }
                 xml.end("item");
             }
             xml.end("privateIpAddressesSet");
         }
         return xml.build();
+    }
+
+    private static String networkInterfaceAssociationXml(NetworkInterfaceAssociation association) {
+        return new XmlBuilder().start("association")
+                .elem("publicIp", association.getPublicIp())
+                .elem("allocationId", association.getAllocationId())
+                .elem("associationId", association.getAssociationId())
+                .elem("ipOwnerId", association.getIpOwnerId())
+                .end("association").build();
     }
 
     private Response handleCreateNetworkInterface(MultivaluedMap<String, String> p, String region) {

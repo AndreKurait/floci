@@ -95,6 +95,7 @@ AWS::ECS::TaskDefinition	EcsCfnProvisioner
 AWS::EKS::Cluster	EksCfnProvisioner
 AWS::EKS::Nodegroup	EksCfnProvisioner
 AWS::ElastiCache::CacheCluster	ElastiCacheCfnProvisioner
+AWS::ElastiCache::ServerlessCache	ElastiCacheServerlessCfnProvisioner
 AWS::ElastiCache::SubnetGroup	ElastiCacheCfnProvisioner
 AWS::ElastiCache::User	ElastiCacheCfnProvisioner
 AWS::ElastiCache::UserGroup	ElastiCacheCfnProvisioner
@@ -107,6 +108,7 @@ AWS::Events::Archive	EventsArchiveCfnProvisioner
 AWS::Events::EventBus	EventsCfnProvisioner
 AWS::Events::EventBusPolicy	EventsCfnProvisioner
 AWS::Events::Rule	EventsCfnProvisioner
+AWS::GuardDuty::MalwareProtectionPlan	GuardDutyMalwareProtectionPlanCfnProvisioner
 AWS::IAM::AccessKey	IamAccessKeyCfnProvisioner
 AWS::IAM::InstanceProfile	IamInstanceProfileCfnProvisioner
 AWS::IAM::ManagedPolicy	IamManagedPolicyCfnProvisioner

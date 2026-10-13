@@ -433,7 +433,14 @@ public class ElastiCacheCfnProvisioner implements CfnResourceProvisioner {
         if (passwords.isEmpty()) {
             passwords = ctx.resolveStringList(props, "Passwords");
         }
-        boolean noPasswordRequired = Boolean.parseBoolean(ctx.resolveOptional(props, "NoPasswordRequired"));
+        String noPasswordFlag = ctx.resolveOptional(props, "NoPasswordRequired");
+        // parseBoolean reads every unrecognised value as false, which would hide a malformed template.
+        if (noPasswordFlag != null && !noPasswordFlag.isBlank()
+                && !"true".equalsIgnoreCase(noPasswordFlag) && !"false".equalsIgnoreCase(noPasswordFlag)) {
+            throw new AwsException("ValidationException",
+                    "NoPasswordRequired must be true or false, got: " + noPasswordFlag, 400);
+        }
+        boolean noPasswordRequired = Boolean.parseBoolean(noPasswordFlag);
         return UserAuthentication.resolve(type, passwords, noPasswordRequired);
     }
 

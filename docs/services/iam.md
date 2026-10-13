@@ -1266,6 +1266,9 @@ account key carries no identity policies of its own.
 A `Condition` operator can only match a key floci actually places in the request context.
 floci populates:
 
+- `iam:PolicyARN`: the managed policy ARN in the form body for `AttachRolePolicy`,
+  `DetachRolePolicy`, `AttachUserPolicy`, `DetachUserPolicy`, `AttachGroupPolicy` and
+  `DetachGroupPolicy`. The target role, user or group remains the authorized resource.
 - `s3:prefix`, `s3:delimiter`, `s3:max-keys`: from the S3 request parameters.
 - `aws:RequestTag/<key>`: the tags named in the request itself, before they are applied, for
   `ec2:RunInstances` (`TagSpecification.N`), `ec2:CreateTags` (`Tag.N`) and

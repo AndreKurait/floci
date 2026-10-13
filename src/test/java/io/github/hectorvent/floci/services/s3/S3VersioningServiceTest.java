@@ -179,6 +179,55 @@ class S3VersioningServiceTest {
     }
 
     @Test
+    void deleteBucketRejectsDeleteMarkerOnlyUntilPurged() {
+        s3Service.putBucketVersioning("versioned-bucket", "Enabled");
+        S3Object version = s3Service.putObject("versioned-bucket", "key",
+                "data".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        s3Service.deleteObject("versioned-bucket", "key");
+        s3Service.deleteObject("versioned-bucket", "key", version.getVersionId());
+
+        assertEquals(1, s3Service.listObjectVersions("versioned-bucket", null, 100, null).versions().size());
+        assertBucketNotEmptyThenPurgeAndDelete();
+    }
+
+    @Test
+    void deleteBucketRejectsSuspendedBucketWithOlderVersionUntilPurged() {
+        s3Service.putBucketVersioning("versioned-bucket", "Enabled");
+        s3Service.putObject("versioned-bucket", "key",
+                "data".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        s3Service.deleteObject("versioned-bucket", "key");
+        s3Service.putBucketVersioning("versioned-bucket", "Suspended");
+
+        assertBucketNotEmptyThenPurgeAndDelete();
+    }
+
+    @Test
+    void purgedBucketCanBeRecreatedWithoutResurrectingVersions() {
+        s3Service.putBucketVersioning("versioned-bucket", "Enabled");
+        s3Service.putObject("versioned-bucket", "key",
+                "data".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        s3Service.deleteObject("versioned-bucket", "key");
+
+        assertBucketNotEmptyThenPurgeAndDelete();
+        s3Service.createBucket("versioned-bucket", "us-east-1");
+        assertTrue(s3Service.listObjectVersions("versioned-bucket", null, 100, null).versions().isEmpty());
+    }
+
+    private void assertBucketNotEmptyThenPurgeAndDelete() {
+        AwsException error = assertThrows(AwsException.class,
+                () -> s3Service.deleteBucket("versioned-bucket"));
+        assertEquals("BucketNotEmpty", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        List<S3Object> versions = s3Service.listObjectVersions("versioned-bucket", null, 100, null).versions();
+        assertFalse(versions.isEmpty());
+        for (S3Object version : versions) {
+            s3Service.deleteObject("versioned-bucket", version.getKey(), version.getVersionId());
+        }
+        assertTrue(s3Service.listObjectVersions("versioned-bucket", null, 100, null).versions().isEmpty());
+        assertDoesNotThrow(() -> s3Service.deleteBucket("versioned-bucket"));
+    }
+
+    @Test
     void getObjectWithNonExistentVersionIdThrowsNoSuchVersion() {
         s3Service.putBucketVersioning("versioned-bucket", "Enabled");
         s3Service.putObject("versioned-bucket", "test.txt",
