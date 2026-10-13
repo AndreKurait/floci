@@ -77,6 +77,7 @@ class ApiGatewayImportedIntegrationTypeIntegrationTest {
         "http-proxy, get, GET",
         "hıttp, get, GET",
         "mοck, get, GET",
+        "MOCK, get, GET",
         "CuStOm_TyPe, x-amazon-apigateway-any-method, ANY"
     })
     void unknownTypesWarnAndOmitIntegrationOrRefuseBeforeChangingApi(
