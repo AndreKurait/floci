@@ -171,7 +171,7 @@ public final class EnforcementFixtures {
                 "InstanceProfileName", profileName).statusCode(200);
     }
 
-    /** Deletes a group, and first the users in it, which IAM wants gone before it will. */
+    /** Deletes a group after removing its users, inline policies and managed policy attachments. */
     public static void removeGroup(int port, String authorization, String groupName) {
         if (iam(port, authorization, "GetGroup", "GroupName", groupName)
                 .extract().statusCode() == 404) {
@@ -189,6 +189,13 @@ public final class EnforcementFixtures {
                         String.class)) {
             iam(port, authorization, "DeleteGroupPolicy", "GroupName", groupName,
                     "PolicyName", policyName).statusCode(200);
+        }
+        for (String policyArn : iam(port, authorization, "ListAttachedGroupPolicies",
+                "GroupName", groupName).statusCode(200).extract().xmlPath()
+                .getList("ListAttachedGroupPoliciesResponse.ListAttachedGroupPoliciesResult"
+                        + ".AttachedPolicies.member.PolicyArn", String.class)) {
+            iam(port, authorization, "DetachGroupPolicy", "GroupName", groupName,
+                    "PolicyArn", policyArn).statusCode(200);
         }
         iam(port, authorization, "DeleteGroup", "GroupName", groupName).statusCode(200);
     }
