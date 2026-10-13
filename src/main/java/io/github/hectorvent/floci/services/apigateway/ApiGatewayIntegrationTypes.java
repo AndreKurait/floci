@@ -2,11 +2,11 @@ package io.github.hectorvent.floci.services.apigateway;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.base.Ascii;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 
 /** Integration types generated from Botocore's public API Gateway service model. */
@@ -19,7 +19,10 @@ final class ApiGatewayIntegrationTypes {
     }
 
     static String canonical(String value) {
-        return TYPES.get(Ascii.toLowerCase(value));
+        if (value.chars().anyMatch(character -> character > 0x7f)) {
+            return null;
+        }
+        return TYPES.get(value.toLowerCase(Locale.ROOT));
     }
 
     private static Map<String, String> load() {
@@ -36,7 +39,7 @@ final class ApiGatewayIntegrationTypes {
                 if (!value.isTextual() || value.asText().isBlank()) {
                     throw new IllegalStateException(RESOURCE_NAME + " carries an invalid integration type");
                 }
-                types.put(Ascii.toLowerCase(value.asText()), value.asText());
+                types.put(value.asText().toLowerCase(Locale.ROOT), value.asText());
             }
             return Map.copyOf(types);
         } catch (IOException error) {
