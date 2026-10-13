@@ -60,9 +60,7 @@ public class ServiceEnabledFilter implements ContainerRequestFilter {
             return new ResolvedRequest(descriptor.externalKey(), descriptor.defaultProtocol());
         }
 
-        return SigV4CredentialScope.serviceName(ctx.getHeaderString("Authorization"))
-                .or(() -> SigV4CredentialScope.serviceNameFromCredential(
-                        ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Credential")))
+        return SignedServiceRoute.signingService(ctx)
                 .flatMap(catalog::byCredentialScope)
                 .map(descriptor -> new ResolvedRequest(
                         descriptor.externalKey(), protocolFor(claim, descriptor)))

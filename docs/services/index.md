@@ -74,7 +74,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [Neptune](neptune.md) | `POST /` with `Action=` param + Gremlin TCP proxy | Query + WebSocket | 14 |
 | [DocumentDB](docdb.md) | `POST /` with `Action=` param + MongoDB container | Query + MongoDB wire | 13 |
 | [DMS](dms.md) | `POST /` + `X-Amz-Target: AmazonDMSv20160101.*` | JSON 1.1 | 20 |
-| [Redshift](redshift.md) | `POST /` with `Action=` param + PostgreSQL container | Query + PostgreSQL wire (+ CFN) | 35 |
+| [Redshift](redshift.md) | `POST /` with `Action=` param + PostgreSQL container | Query + PostgreSQL wire (+ CFN) | 43 |
 | [Redshift Data API](redshift-data.md) | `POST /` + `X-Amz-Target: RedshiftData.*` | JSON 1.1 | 11 |
 | [Redshift Serverless](redshift-serverless.md) | `POST /` + `X-Amz-Target: RedshiftServerless.*` | JSON 1.1 | 24 |
 | [EMR](emr.md) | `POST /` + `X-Amz-Target: ElasticMapReduce.*` | JSON 1.1 | 37 |
@@ -87,7 +87,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [ACM](acm.md) | `POST /` + `X-Amz-Target: CertificateManager.*` | JSON 1.1 | 16 |
 | [ECR](ecr.md) | `POST /` + `X-Amz-Target: AmazonEC2ContainerRegistry_V20150921.*` (control plane) and `/v2/...` (data plane proxied to `registry:2`) | JSON 1.1 + OCI Distribution | 17 |
 | [Resource Groups Tagging API](resource-groups-tagging.md) | `POST /` + `X-Amz-Target: ResourceGroupsTaggingAPI_20170126.*` | JSON 1.1 | 5 |
-| [Resource Explorer](resource-explorer.md) | `POST /{OperationName}`, rewritten to `/re2/*` for the four paths S3 Vectors also claims | REST JSON | 32 |
+| [Resource Explorer](resource-explorer.md) | `POST /{OperationName}`, rewritten to `/_re2/*` for the four paths S3 Vectors also claims | REST JSON | 32 |
 | [SES](ses.md) | `POST /` with `Action=` param | Query | 16 |
 | [SES v2](ses.md#v2) | `/v2/email/*` | REST JSON | 10 |
 | [OpenSearch](opensearch.md) | `/2021-01-01/opensearch/...` | REST JSON | 24 |

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -23,6 +24,7 @@ import io.github.hectorvent.floci.services.redshift.model.Integration;
 import io.github.hectorvent.floci.services.redshift.model.Parameter;
 import io.github.hectorvent.floci.services.redshift.model.Snapshot;
 import io.github.hectorvent.floci.services.redshift.model.SnapshotCopyGrant;
+import io.github.hectorvent.floci.services.redshift.model.SnapshotSchedule;
 import io.github.hectorvent.floci.services.redshift.proxy.RedshiftProxyManager;
 import io.github.hectorvent.floci.services.secretsmanager.RandomPasswordGenerator;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
@@ -51,6 +53,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
@@ -75,6 +78,7 @@ public class RedshiftService {
 
     private final AccountAwareStorageBackend<Integration> integrations;
     private final AccountAwareStorageBackend<SnapshotCopyGrant> snapshotCopyGrants;
+    private final AccountAwareStorageBackend<SnapshotSchedule> snapshotSchedules;
     private final RedshiftContainerManager containerManager;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
@@ -100,6 +104,7 @@ public class RedshiftService {
         this.subnetGroups = storageFactory.create("redshift", "redshift-subnet-groups.json", new TypeReference<Map<String, ClusterSubnetGroup>>() {});
         this.integrations = storageFactory.create("redshift", "redshift-integrations.json", new TypeReference<Map<String, Integration>>() {});
         this.snapshotCopyGrants = storageFactory.create("redshift", "redshift-snapshot-copy-grants.json", new TypeReference<Map<String, SnapshotCopyGrant>>() {});
+        this.snapshotSchedules = storageFactory.create("redshift", "redshift-snapshot-schedules.json", new TypeReference<Map<String, SnapshotSchedule>>() {});
         this.containerManager = containerManager;
         this.config = config;
         this.regionResolver = regionResolver;
@@ -1317,9 +1322,251 @@ public class RedshiftService {
         SnapshotCopyGrant grant = snapshotCopyGrants.get(name)
                 .orElseThrow(() -> new AwsException("SnapshotCopyGrantNotFoundFault",
                         "Snapshot copy grant " + name + " not found", 400));
+        boolean inUse = clusters.scan(k -> true).stream()
+                .anyMatch(c -> name.equals(c.getSnapshotCopyGrantName()));
+        if (inUse) {
+            throw new AwsException("InvalidSnapshotCopyGrantStateFault",
+                    "Snapshot copy grant " + name + " is used by one or more clusters", 400);
+        }
         snapshotCopyGrants.delete(name);
         snapshotCopyGrants.flush();
         return grant;
+    }
+
+    // ── Snapshot Copy Operations ─────────────────────────────────────────────
+
+    private static final int DEFAULT_SNAPSHOT_COPY_RETENTION_DAYS = 7;
+    // AWS reports -1 ("retain indefinitely") when ManualSnapshotRetentionPeriod is not given.
+    private static final int RETAIN_MANUAL_SNAPSHOTS_INDEFINITELY = -1;
+
+    private Cluster requireCluster(String clusterIdentifier) {
+        return clusters.get(clusterIdentifier)
+                .orElseThrow(() -> new AwsException("ClusterNotFound", "Cluster " + clusterIdentifier + " not found", 404));
+    }
+
+    // Automated snapshots: 1 to 35 days.
+    private static void validateAutomatedRetention(int days) {
+        if (days < 1 || days > 35) {
+            throw new AwsException("InvalidRetentionPeriodFault",
+                    "RetentionPeriod must be between 1 and 35 days.", 400);
+        }
+    }
+
+    // Manual snapshots: -1 (indefinitely) or 1 to 3653 days.
+    private static void validateManualRetention(int days) {
+        if (days != RETAIN_MANUAL_SNAPSHOTS_INDEFINITELY && (days < 1 || days > 3653)) {
+            throw new AwsException("InvalidRetentionPeriodFault",
+                    "ManualSnapshotRetentionPeriod must be -1 or between 1 and 3653 days.", 400);
+        }
+    }
+
+    /** Copy is recorded on the cluster only; no snapshot is actually copied to another region. */
+    public synchronized Cluster enableSnapshotCopy(String clusterIdentifier, String destinationRegion,
+                                                   Integer retentionPeriod, Integer manualRetentionPeriod,
+                                                   String snapshotCopyGrantName) {
+        Cluster cluster = requireCluster(clusterIdentifier);
+        if (cluster.getSnapshotCopyDestinationRegion() != null) {
+            throw new AwsException("SnapshotCopyAlreadyEnabledFault",
+                    "Snapshot copy is already enabled on cluster " + clusterIdentifier + ".", 400);
+        }
+        if (!AwsRegions.isRegionId(destinationRegion)) {
+            throw new AwsException("UnknownSnapshotCopyRegionFault",
+                    "Unknown destination region: " + destinationRegion, 404);
+        }
+        int retention = retentionPeriod == null ? DEFAULT_SNAPSHOT_COPY_RETENTION_DAYS : retentionPeriod;
+        int manualRetention = manualRetentionPeriod == null
+                ? RETAIN_MANUAL_SNAPSHOTS_INDEFINITELY : manualRetentionPeriod;
+        validateAutomatedRetention(retention);
+        validateManualRetention(manualRetention);
+        boolean hasGrant = snapshotCopyGrantName != null && !snapshotCopyGrantName.isBlank();
+        if (hasGrant && snapshotCopyGrants.get(snapshotCopyGrantName).isEmpty()) {
+            throw new AwsException("SnapshotCopyGrantNotFoundFault",
+                    "Snapshot copy grant " + snapshotCopyGrantName + " not found", 400);
+        }
+        cluster.setSnapshotCopyDestinationRegion(destinationRegion);
+        cluster.setSnapshotCopyRetentionPeriod(retention);
+        cluster.setSnapshotCopyManualRetentionPeriod(manualRetention);
+        cluster.setSnapshotCopyGrantName(hasGrant ? snapshotCopyGrantName : null);
+        clusters.put(clusterIdentifier, cluster);
+        clusters.flush();
+        return cluster;
+    }
+
+    public synchronized Cluster disableSnapshotCopy(String clusterIdentifier) {
+        Cluster cluster = requireCluster(clusterIdentifier);
+        if (cluster.getSnapshotCopyDestinationRegion() == null) {
+            throw new AwsException("SnapshotCopyAlreadyDisabledFault",
+                    "Snapshot copy is not enabled on cluster " + clusterIdentifier + ".", 400);
+        }
+        cluster.setSnapshotCopyDestinationRegion(null);
+        cluster.setSnapshotCopyRetentionPeriod(null);
+        cluster.setSnapshotCopyManualRetentionPeriod(null);
+        cluster.setSnapshotCopyGrantName(null);
+        clusters.put(clusterIdentifier, cluster);
+        clusters.flush();
+        return cluster;
+    }
+
+    public synchronized Cluster modifySnapshotCopyRetentionPeriod(String clusterIdentifier, int retentionPeriod,
+                                                                  boolean manual) {
+        Cluster cluster = requireCluster(clusterIdentifier);
+        // SnapshotCopyDisabledFault, not ...AlreadyDisabledFault: the model lists only this one here.
+        if (cluster.getSnapshotCopyDestinationRegion() == null) {
+            throw new AwsException("SnapshotCopyDisabledFault",
+                    "Snapshot copy is not enabled on cluster " + clusterIdentifier + ".", 400);
+        }
+        if (manual) {
+            validateManualRetention(retentionPeriod);
+            cluster.setSnapshotCopyManualRetentionPeriod(retentionPeriod);
+        } else {
+            validateAutomatedRetention(retentionPeriod);
+            cluster.setSnapshotCopyRetentionPeriod(retentionPeriod);
+        }
+        clusters.put(clusterIdentifier, cluster);
+        clusters.flush();
+        return cluster;
+    }
+
+    // ── Snapshot Schedule Operations ─────────────────────────────────────────
+
+    private static final int SNAPSHOT_SCHEDULE_PAGE_MAX = 100;
+
+    private static final Pattern RATE_DEFINITION =
+            Pattern.compile("rate\\(\\s*(\\d+)\\s+(hours?|days?)\\s*\\)");
+    private static final Pattern CRON_DEFINITION =
+            Pattern.compile("cron\\(\\s*([A-Za-z0-9,\\-*/?#]+(?:\\s+[A-Za-z0-9,\\-*/?#]+){2,5})\\s*\\)");
+    // The API reference allows only alphanumerics; the management guide's own example uses a hyphen.
+    private static final Pattern SCHEDULE_IDENTIFIER = Pattern.compile("[A-Za-z0-9-]+");
+
+    /**
+     * Shape check against the Redshift snapshot-schedule documentation: {@code rate(<n> hours|days)}
+     * with a frequency between once an hour and once a day, or {@code cron(...)} with three to six
+     * whitespace-separated fields drawn from the documented cron alphabet. Per-field value ranges
+     * are not checked.
+     */
+    private static boolean isValidScheduleDefinition(String definition) {
+        if (definition == null) {
+            return false;
+        }
+        Matcher rate = RATE_DEFINITION.matcher(definition);
+        if (rate.matches()) {
+            long n = Long.parseLong(rate.group(1).length() > 9 ? "0" : rate.group(1));
+            return rate.group(2).startsWith("hour") ? n >= 1 && n <= 24 : n == 1;
+        }
+        return CRON_DEFINITION.matcher(definition).matches();
+    }
+    private static void validateScheduleDefinitions(List<String> definitions) {
+        if (definitions == null || definitions.isEmpty()) {
+            throw new AwsException("InvalidSchedule", "ScheduleDefinitions must contain at least one definition.", 400);
+        }
+        for (String definition : definitions) {
+            if (!isValidScheduleDefinition(definition)) {
+                throw new AwsException("InvalidSchedule", "Invalid schedule definition: " + definition, 400);
+            }
+        }
+    }
+
+    private SnapshotSchedule requireSnapshotSchedule(String scheduleIdentifier) {
+        return snapshotSchedules.get(scheduleIdentifier)
+                .orElseThrow(() -> new AwsException("SnapshotScheduleNotFound",
+                        "Snapshot schedule " + scheduleIdentifier + " not found", 400));
+    }
+
+    public synchronized SnapshotSchedule createSnapshotSchedule(String scheduleIdentifier, String description,
+                                                                List<String> definitions, Map<String, String> tags) {
+        String id = (scheduleIdentifier == null || scheduleIdentifier.isBlank())
+                ? UUID.randomUUID().toString().replace("-", "")
+                : scheduleIdentifier;
+        if (!SCHEDULE_IDENTIFIER.matcher(id).matches()) {
+            throw new AwsException("InvalidParameterValue",
+                    "ScheduleIdentifier may contain only letters, digits and hyphens: " + id, 400);
+        }
+        if (snapshotSchedules.get(id).isPresent()) {
+            throw new AwsException("SnapshotScheduleAlreadyExists", "Snapshot schedule " + id + " already exists", 400);
+        }
+        validateScheduleDefinitions(definitions);
+        SnapshotSchedule schedule = new SnapshotSchedule(id, description, definitions);
+        if (tags != null && !tags.isEmpty()) {
+            schedule.setTags(new LinkedHashMap<>(tags));
+        }
+        snapshotSchedules.put(id, schedule);
+        snapshotSchedules.flush();
+        return schedule;
+    }
+
+    /**
+     * Every filter given must match. An unknown schedule or cluster yields an empty list rather
+     * than a fault: the model lists no errors for this operation.
+     */
+    public PaginatedResult<SnapshotSchedule> describeSnapshotSchedules(String scheduleIdentifier,
+                                                                       String clusterIdentifier,
+                                                                       List<String> tagKeys, List<String> tagValues,
+                                                                       Integer maxRecords, String marker) {
+        String clusterSchedule = null;
+        if (clusterIdentifier != null && !clusterIdentifier.isBlank()) {
+            clusterSchedule = clusters.get(clusterIdentifier).map(Cluster::getSnapshotScheduleIdentifier).orElse(null);
+            if (clusterSchedule == null) {
+                return new PaginatedResult<>(List.of(), null);
+            }
+        }
+        String byCluster = clusterSchedule;
+        List<SnapshotSchedule> matching = snapshotSchedules.scan(k -> true).stream()
+                .filter(s -> scheduleIdentifier == null || scheduleIdentifier.isBlank()
+                        || scheduleIdentifier.equals(s.getScheduleIdentifier()))
+                .filter(s -> byCluster == null || byCluster.equals(s.getScheduleIdentifier()))
+                .filter(s -> tagKeys == null || tagKeys.isEmpty()
+                        || tagKeys.stream().anyMatch(s.getTags()::containsKey))
+                .filter(s -> tagValues == null || tagValues.isEmpty()
+                        || tagValues.stream().anyMatch(s.getTags()::containsValue))
+                .toList();
+        return Pagination.paginate(matching, SnapshotSchedule::getScheduleIdentifier, maxRecords, marker,
+                SNAPSHOT_SCHEDULE_PAGE_MAX, "InvalidParameterValue");
+    }
+
+    /** Identifiers of the clusters currently using the schedule, sorted for a stable response. */
+    public List<String> clustersUsingSnapshotSchedule(String scheduleIdentifier) {
+        return clusters.scan(k -> true).stream()
+                .filter(c -> scheduleIdentifier.equals(c.getSnapshotScheduleIdentifier()))
+                .map(Cluster::getClusterIdentifier)
+                .sorted()
+                .toList();
+    }
+
+    public synchronized SnapshotSchedule modifySnapshotSchedule(String scheduleIdentifier, List<String> definitions) {
+        SnapshotSchedule schedule = requireSnapshotSchedule(scheduleIdentifier);
+        validateScheduleDefinitions(definitions);
+        schedule.setScheduleDefinitions(new ArrayList<>(definitions));
+        snapshotSchedules.put(scheduleIdentifier, schedule);
+        snapshotSchedules.flush();
+        return schedule;
+    }
+
+    public synchronized void deleteSnapshotSchedule(String scheduleIdentifier) {
+        requireSnapshotSchedule(scheduleIdentifier);
+        if (!clustersUsingSnapshotSchedule(scheduleIdentifier).isEmpty()) {
+            throw new AwsException("InvalidClusterSnapshotScheduleState",
+                    "Snapshot schedule " + scheduleIdentifier + " is associated with one or more clusters.", 400);
+        }
+        snapshotSchedules.delete(scheduleIdentifier);
+        snapshotSchedules.flush();
+    }
+
+    public synchronized Cluster modifyClusterSnapshotSchedule(String clusterIdentifier, String scheduleIdentifier,
+                                                              boolean disassociate) {
+        Cluster cluster = requireCluster(clusterIdentifier);
+        if (disassociate) {
+            cluster.setSnapshotScheduleIdentifier(null);
+        } else {
+            if (scheduleIdentifier == null || scheduleIdentifier.isBlank()) {
+                throw new AwsException("InvalidParameterValue",
+                        "ScheduleIdentifier is required unless DisassociateSchedule is true", 400);
+            }
+            requireSnapshotSchedule(scheduleIdentifier);
+            cluster.setSnapshotScheduleIdentifier(scheduleIdentifier);
+        }
+        clusters.put(clusterIdentifier, cluster);
+        clusters.flush();
+        return cluster;
     }
 
     // ── Tagging Operations ───────────────────────────────────────────────────
@@ -1384,6 +1631,12 @@ public class RedshiftService {
                         "snapshotcopygrant", g.getTags(), tagKeysFilter);
             }
         }
+        if (resourceType == null || "snapshotschedule".equalsIgnoreCase(resourceType)) {
+            for (SnapshotSchedule s : snapshotSchedules.scan(k -> true)) {
+                addTaggedResources(result, snapshotScheduleArn(s.getScheduleIdentifier()),
+                        "snapshotschedule", s.getTags(), tagKeysFilter);
+            }
+        }
         return result;
     }
 
@@ -1425,13 +1678,17 @@ public class RedshiftService {
         return regionResolver.buildArn("redshift", regionResolver.getRegion(), "snapshotcopygrant:" + name);
     }
 
+    private String snapshotScheduleArn(String scheduleIdentifier) {
+        return regionResolver.buildArn("redshift", regionResolver.getRegion(), "snapshotschedule:" + scheduleIdentifier);
+    }
+
     /**
      * Resolves a tagging ResourceName to its backing resource.
      *
      * Redshift ARNs have the shape {@code arn:aws:redshift:<region>:<account>:<type>:<id>},
      * where {@code <type>} is one of {@code cluster}, {@code snapshot} (id shape
      * {@code <clusterId>/<snapshotId>}), {@code parametergroup}, {@code subnetgroup} or
-     * {@code snapshotcopygrant}. Unlike RDS's tag
+     * {@code snapshotcopygrant} or {@code snapshotschedule}. Unlike RDS's tag
      * resolution, there is no bare-name fallback: Redshift tagging is new, so there is no
      * existing caller to stay backward compatible with.
      */
@@ -1512,6 +1769,16 @@ public class RedshiftService {
                     grant.setTags(updated);
                     snapshotCopyGrants.put(id, grant);
                     snapshotCopyGrants.flush();
+                });
+            }
+            case "snapshotschedule" -> {
+                // ResourceNotFoundFault for the same reason as snapshotcopygrant above.
+                SnapshotSchedule schedule = snapshotSchedules.get(id)
+                        .orElseThrow(() -> new AwsException("ResourceNotFoundFault", "Snapshot schedule " + id + " not found", 404));
+                yield new TagHandle(schedule.getTags(), updated -> {
+                    schedule.setTags(updated);
+                    snapshotSchedules.put(id, schedule);
+                    snapshotSchedules.flush();
                 });
             }
             default -> throw new AwsException("InvalidParameterValue",
