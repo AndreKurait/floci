@@ -560,7 +560,7 @@ public class AwsQueryController {
             "CreateDBSubnetGroup", "DescribeDBSubnetGroups", "ModifyDBSubnetGroup", "DeleteDBSubnetGroup",
             "AddTagsToResource", "ListTagsForResource", "RemoveTagsFromResource",
             "CreateDBCluster", "DescribeDBClusters", "DeleteDBCluster", "ModifyDBCluster",
-            "AddRoleToDBCluster", "RemoveRoleFromDBCluster",
+            "AddRoleToDBCluster", "RemoveRoleFromDBCluster", "AddRoleToDBInstance", "RemoveRoleFromDBInstance",
             "DescribeGlobalClusters",
             "CreateDBParameterGroup", "DescribeDBParameterGroups",
             "DeleteDBParameterGroup", "ModifyDBParameterGroup", "DescribeDBParameters",

@@ -583,14 +583,23 @@ public class ContainerLifecycleManager {
         createVolumeIfAbsent(volumeName);
     }
 
-    /** Creates the named volume when it is missing; returns whether it was created. */
+    /** Creates a volume with resource ownership labels for recoverable cleanup. */
+    public void ensureVolume(String volumeName, Map<String, String> labels) {
+        createVolumeIfAbsent(volumeName, labels);
+    }
+
     private boolean createVolumeIfAbsent(String volumeName) {
+        return createVolumeIfAbsent(volumeName, Map.of());
+    }
+
+    /** Creates the named volume when it is missing; returns whether it was created. */
+    private boolean createVolumeIfAbsent(String volumeName, Map<String, String> labels) {
         if (volumeExists(volumeName)) {
             return false;
         }
         dockerClient.createVolumeCmd()
                 .withName(volumeName)
-                .withLabels(ContainerStorageHelper.defaultLabels(config))
+                .withLabels(mergedLabels(labels))
                 .exec();
         LOG.debugv("Created volume {0}", volumeName);
         return true;

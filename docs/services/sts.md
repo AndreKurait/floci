@@ -113,5 +113,13 @@ For temporary credentials returned by an assumed-role action, its `Arn` and `Use
 the `AssumedRoleUser.Arn` and `AssumedRoleUser.AssumedRoleId` returned when the session was created.
 For `GetSessionToken` credentials they are those of the IAM user that minted them, and for `GetFederationToken`
 credentials the `FederatedUser.Arn` and `FederatedUser.FederatedUserId` (`<account>:<name>`).
+The response resolves both header and query-string credentials, including the query session token,
+so a presigned request reports the same caller identity. A nonblank Authorization header retains
+precedence over query credentials.
 
 When `FLOCI_SERVICES_IAM_SEED_DEPLOYER_PRINCIPAL=true`, requests signed with the seeded `floci` access key return `arn:aws:iam::000000000000:user/floci-deployer`. Other unknown local credentials continue to return the account root ARN for backward compatibility.
+
+When `FLOCI_AUTH_VALIDATE_SIGNATURES=true`, the shared signature verifier checks presigned query
+credentials for STS operations, including `GetCallerIdentity`, `GetSessionToken`, `GetFederationToken`
+and `AssumeRole`. It checks the request signature, credential scope, expiry and session token before
+execution. Nonblank Authorization headers retain priority. See [signature checks](../configuration/multi-account.md#signature-validation).

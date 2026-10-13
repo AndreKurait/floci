@@ -1517,12 +1517,16 @@ public class EcsJsonHandler {
     private static final Set<String> VOLUME_CONSUMED = Set.of("name", "efsVolumeConfiguration");
 
     private EfsVolumeConfiguration parseEfsVolumeConfiguration(JsonNode node) {
-        if (node == null || !node.isObject()) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
             return null;
         }
+        if (!node.isObject()) {
+            throw new AwsException("InvalidParameterException", "EFS volume configuration must be an object.", 400);
+        }
         String fileSystemId = node.path("fileSystemId").asText(null);
-        if (fileSystemId == null) {
-            return null;
+        if (fileSystemId == null || fileSystemId.isBlank()) {
+            throw new AwsException("InvalidParameterException",
+                    "EFS volume configuration requires a fileSystemId.", 400);
         }
         Integer transitEncryptionPort = node.path("transitEncryptionPort").isNumber()
                 ? node.path("transitEncryptionPort").asInt() : null;
