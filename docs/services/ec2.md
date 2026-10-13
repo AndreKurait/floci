@@ -1044,3 +1044,14 @@ The file uses the same schema as `src/main/resources/ec2/image-catalog.yaml` and
 include every image that process should expose. Missing or invalid files fail on first
 catalog use; leaving the setting unset preserves the bundled catalog. Containerized
 Floci needs the file mounted at the configured container path.
+
+### Public IPv4 addresses in mock mode
+
+Mock instances apply `MapPublicIpOnLaunch` unless the primary launch interface explicitly
+sets `AssociatePublicIpAddress`. Direct launches and Auto Scaling launch templates preserve
+both `true` and `false` overrides. An automatically assigned public address remains stable
+while running, is released on stop or termination, and is replaced on restart; the private
+address remains unchanged. Elastic IP associations are preserved separately.
+
+A launch template with network interfaces cannot be combined with an instance-level
+`SubnetId`; place the subnet on the primary network interface instead.
