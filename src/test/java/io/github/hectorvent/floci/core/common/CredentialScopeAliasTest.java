@@ -51,6 +51,25 @@ class CredentialScopeAliasTest {
     }
 
     @Test
+    void monitoringAliasResolvesTheCloudWatchQueryAction() {
+        UriInfo uriInfo = mock(UriInfo.class);
+        MultivaluedHashMap<String, String> query = new MultivaluedHashMap<>();
+        query.add("Action", "GetMetricStatistics");
+        when(uriInfo.getPath()).thenReturn("");
+        when(uriInfo.getQueryParameters()).thenReturn(query);
+
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getMethod()).thenReturn("GET");
+        when(ctx.getUriInfo()).thenReturn(uriInfo);
+        when(ctx.getHeaderString("Authorization")).thenReturn(
+                "AWS4-HMAC-SHA256 Credential=AKIAUSER/20261013/us-east-1/monitoring/aws4_request");
+
+        String canonicalScope = catalog.canonicalCredentialScope("monitoring");
+        assertEquals("cloudwatch", canonicalScope);
+        assertEquals("cloudwatch:GetMetricStatistics", actionRegistry.resolve(canonicalScope, ctx));
+    }
+
+    @Test
     void canonicalScopeIsUnchanged() {
         assertEquals("s3", catalog.canonicalCredentialScope("s3"));
         assertEquals("dynamodb", catalog.canonicalCredentialScope("dynamodb"));
@@ -82,7 +101,8 @@ class CredentialScopeAliasTest {
                 .filter(scope -> !scope.equals(catalog.canonicalCredentialScope(scope)))
                 .collect(Collectors.toMap(scope -> scope, catalog::canonicalCredentialScope));
 
-        assertEquals(Map.of("s3express", "s3", "iot-jobs-data", "iot", "awsssoportal", "sso"), rewritten);
+        assertEquals(Map.of("s3express", "s3", "iot-jobs-data", "iot",
+                "awsssoportal", "sso", "monitoring", "cloudwatch"), rewritten);
     }
 
     @Test

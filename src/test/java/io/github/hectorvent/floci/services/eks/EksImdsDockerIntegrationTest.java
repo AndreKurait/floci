@@ -9,9 +9,12 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
+import io.vertx.core.json.JsonObject;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 import org.junit.jupiter.api.AfterEach;
@@ -65,8 +68,13 @@ class EksImdsDockerIntegrationTest {
     @Inject
     DockerHostResolver dockerHostResolver;
 
+    @Inject
+    IamService iamService;
+
     private String containerId;
     private Cluster cluster;
+    private InstanceProfile nodeProfile;
+    private String nodeRoleName;
 
     @BeforeEach
     void requireDockerAndStartMetadataServer() {
@@ -90,6 +98,15 @@ class EksImdsDockerIntegrationTest {
                 lifecycleManager.stopAndRemove(containerId, null);
             } catch (Exception ignored) {
             }
+        }
+        if (nodeProfile != null) {
+            if (nodeRoleName != null) {
+                iamService.removeRoleFromInstanceProfile(nodeProfile.getInstanceProfileName(), nodeRoleName);
+            }
+            iamService.deleteInstanceProfile(nodeProfile.getInstanceProfileName());
+        }
+        if (nodeRoleName != null) {
+            iamService.deleteRole(nodeRoleName);
         }
     }
 
@@ -169,12 +186,27 @@ class EksImdsDockerIntegrationTest {
             assertEquals(instanceId.trim(), podInstanceId.trim(),
                     "Pod should receive the same instance ID as the node namespace");
 
-            // Ordinary pod querying IAM info
+            // The node's profile ARN alone is not an IAM profile with an attached role.
+            String podIamStatusCmd = "ip netns exec pod-test curl -s -o /dev/null -w '%{http_code}' "
+                    + "http://169.254.169.254/latest/meta-data/iam/info";
+            assertEquals("404", execInContainer(containerId, new String[]{"sh", "-c", podIamStatusCmd}));
+            nodeProfile = iamService.createInstanceProfile(clusterName + "-node-profile", "/");
+            nodeRoleName = iamService.createRole(clusterName + "-worker", "/", """
+                    {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                    "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+                    """, "EKS IMDS network test node", 3600, Map.of()).getRoleName();
+            iamService.addRoleToInstanceProfile(nodeProfile.getInstanceProfileName(), nodeRoleName);
+
+            // Ordinary pod querying the real node profile, distinct from the cluster role.
             String podIamInfoCmd = "ip netns exec pod-test wget -q -O - -T 3 http://169.254.169.254/latest/meta-data/iam/info";
             String podIamInfo = execInContainer(containerId, new String[]{"sh", "-c", podIamInfoCmd});
-            assertNotNull(podIamInfo, "Pod IAM info response should not be null");
-            assertTrue(podIamInfo.contains(clusterName + "-node-profile"),
-                    "Pod IAM info should contain instance profile: " + podIamInfo);
+            JsonObject iamInfo = new JsonObject(podIamInfo);
+            assertEquals("Success", iamInfo.getString("Code"));
+            assertEquals(nodeProfile.getArn(), iamInfo.getString("InstanceProfileArn"));
+            assertEquals(nodeProfile.getInstanceProfileId(), iamInfo.getString("InstanceProfileId"));
+            String podRoleCmd = "ip netns exec pod-test wget -q -O - -T 3 "
+                    + "http://169.254.169.254/latest/meta-data/iam/security-credentials/";
+            assertEquals(nodeRoleName, execInContainer(containerId, new String[]{"sh", "-c", podRoleCmd}).trim());
 
             // Prove the FLOCI-LINK-LOCAL rule is strictly required:
             // Temporarily detach FLOCI-LINK-LOCAL from PREROUTING. The pod request now hits CNI-HOSTPORT-DNAT
