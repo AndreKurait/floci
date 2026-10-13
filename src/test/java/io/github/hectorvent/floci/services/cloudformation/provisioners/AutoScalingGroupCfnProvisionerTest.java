@@ -329,7 +329,7 @@ class AutoScalingGroupCfnProvisionerTest {
         lc.setLaunchConfigurationName("my-lc");
         lc.setLaunchConfigurationArn("arn:aws:autoscaling:us-east-1:000000000000:launchConfiguration:my-lc");
         when(autoScaling.createLaunchConfiguration(eq(REGION), eq("my-lc"), any(), eq("ami-1"),
-                eq("t3.micro"), any(), anyList(), any(), any(), any()))
+                eq("t3.micro"), any(), anyList(), any(), any(), any(), any(), anyList(), any()))
                 .thenReturn(lc);
         StackResource r = resource(LAUNCH_CONFIGURATION, "Lc", null);
         ObjectNode props = mapper.createObjectNode()
@@ -360,7 +360,7 @@ class AutoScalingGroupCfnProvisionerTest {
         provisioner.provision(r, props, ctx("my-lc"));
 
         verify(autoScaling, never()).createLaunchConfiguration(anyString(), anyString(), any(), any(),
-                any(), any(), anyList(), any(), any(), any());
+                any(), any(), anyList(), any(), any(), any(), any(), anyList(), any());
         assertEquals("my-lc", r.getPhysicalId());
     }
 
