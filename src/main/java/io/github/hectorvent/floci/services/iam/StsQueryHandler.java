@@ -228,11 +228,13 @@ public class StsQueryHandler {
 
     private Response handleGetCallerIdentity(MultivaluedMap<String, String> params) {
         String accountId = regionResolver.getAccountId();
-        String authorization = headers == null ? null : headers.getHeaderString("Authorization");
-        String accessKeyId = authorization == null ? null : accountResolver.extractAccessKeyId(authorization);
+        String accessKeyId = callerAccessKeyId();
         String sessionToken = headers == null ? null : headers.getHeaderString("X-Amz-Security-Token");
         if (sessionToken == null && params != null) {
             sessionToken = getParam(params, "X-Amz-Security-Token");
+        }
+        if (sessionToken == null && uriInfo != null) {
+            sessionToken = uriInfo.getQueryParameters().getFirst("X-Amz-Security-Token");
         }
         String arn = iamService.resolveCallerArn(accessKeyId)
                 .orElse(regionResolver.buildGlobalArn("iam", accountId, "root"));
