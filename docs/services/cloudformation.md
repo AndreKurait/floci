@@ -683,3 +683,8 @@ aws cloudformation create-stack \
 !!! note "Dependency ordering"
     Use `!Ref MyFunction` (not a plain string) for `FunctionName` so CloudFormation
     provisions the function before the event source mapping.
+
+Slow stack operations return their accepted response after a short initial wait;
+provisioning continues asynchronously. Use `DescribeStacks` and `DescribeStackEvents`
+to observe completion or failure. A client response does not cancel or repeat the
+accepted operation. Template validation errors still fail before acceptance.
