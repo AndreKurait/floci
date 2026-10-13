@@ -416,6 +416,12 @@ always lists both stages, matching AWS.
 declared property removes the controls. An unrelated update preserves controls managed outside
 the template when neither the prior nor the new template declares them.
 
+## SAM published aliases
+
+`AutoPublishAlias` creates a version and points the generated alias at that version's
+numeric `Version` attribute. CloudFormation resolves the version before creating the
+alias. Later changes to `$LATEST` do not change the alias's published code or configuration.
+
 ## Conditions
 
 Template `Conditions` are evaluated before provisioning. A resource whose `Condition` evaluates to
