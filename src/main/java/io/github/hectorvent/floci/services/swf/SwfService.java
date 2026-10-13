@@ -615,7 +615,9 @@ public class SwfService implements Resettable {
 
             applyDecisions(execution, decisions, queued, decisionEventId);
 
-            if (execution.isOpen() && (execution.isDecisionNeeded() || hasNothingPending(execution))) {
+            // An idle execution may be waiting for a signal. Only an event that needs
+            // another decision should wake it; completing an empty batch is not one.
+            if (execution.isOpen() && execution.isDecisionNeeded()) {
                 execution.setDecisionNeeded(false);
                 scheduleDecisionTask(execution);
             }
