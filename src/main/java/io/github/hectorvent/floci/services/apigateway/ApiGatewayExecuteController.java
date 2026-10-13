@@ -1191,7 +1191,7 @@ public class ApiGatewayExecuteController {
                             if (!errors.isEmpty()) {
                                 String errorMsg = errors.iterator().next().getMessage();
                                 return gatewayResponse(scope, GatewayResponseType.BAD_REQUEST_BODY, 400,
-                                        "Invalid request body: " + errorMsg, errorMsg);
+                                        "Invalid request body", errorMsg);
                             }
                         }
                     } catch (Exception e) {

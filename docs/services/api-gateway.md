@@ -276,6 +276,9 @@ Imported OpenAPI and Swagger request models can reference sibling models, includ
 references. Body validation resolves these schemas within the same API while preserving inline
 definitions. External schema URLs are not fetched.
 
+Rejected bodies return `Invalid request body` by default. Custom gateway responses can access
+the schema validation detail through `$context.error.validationErrorString`.
+
 Each deployment snapshots its model schemas. Updating or deleting a model does not change
 validation for an existing deployment; deploy again to apply those changes. Deployments saved
 before model snapshots were introduced retain their previous behavior until redeployed.
