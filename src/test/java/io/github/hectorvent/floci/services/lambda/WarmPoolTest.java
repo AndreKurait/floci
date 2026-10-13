@@ -16,18 +16,22 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -117,6 +121,51 @@ class WarmPoolTest {
         pool.stopManagedContainers();
         verify(containerLauncher, times(1)).stop(handle);
         pool.shutdown();
+    }
+
+    @Test
+    void stopManagedContainersDoesNotLetOneFunctionOccupyEveryWorker() throws Exception {
+        WarmPool pool = buildPool(Optional.of(17), 0);
+        pool.init();
+        AtomicInteger ids = new AtomicInteger();
+        when(containerLauncher.launch(any())).thenAnswer(invocation -> {
+            LambdaFunction fn = invocation.getArgument(0);
+            return new ContainerHandle("cid-" + ids.incrementAndGet(),
+                    fn.getFunctionName(), null, ContainerState.WARM);
+        });
+        List<ContainerHandle> handles = new ArrayList<>();
+        for (String name : List.of("first", "second")) {
+            LambdaFunction fn = function(name);
+            for (int i = 0; i < 17; i++) {
+                handles.add(pool.acquire(fn));
+            }
+        }
+        handles.forEach(pool::release);
+
+        CountDownLatch allStopping = new CountDownLatch(handles.size());
+        CountDownLatch finishStops = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            allStopping.countDown();
+            assertTrue(finishStops.await(10, TimeUnit.SECONDS));
+            return null;
+        }).when(containerLauncher).stop(any());
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<?> drain = executor.submit(pool::stopManagedContainers);
+        try {
+            assertTrue(allStopping.await(5, TimeUnit.SECONDS),
+                    "Every container must begin stopping before blocked stops finish");
+        } finally {
+            finishStops.countDown();
+            try {
+                drain.get(10, TimeUnit.SECONDS);
+            } finally {
+                executor.shutdownNow();
+                pool.shutdown();
+            }
+        }
+        for (ContainerHandle handle : handles) {
+            verify(containerLauncher, times(1)).stop(handle);
+        }
     }
 
     @Test
