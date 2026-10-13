@@ -81,6 +81,11 @@ uppercase and mixed-case spellings, are
 stored as the public Integration values `AWS`, `AWS_PROXY`, `HTTP`, `HTTP_PROXY`,
 and `MOCK`. Both `GetIntegration` and `GetMethod.methodIntegration` return these
 canonical values after import, merge, or overwrite.
+The accepted type list is generated from Botocore's public API Gateway service model
+and checked by `make aws-data-check`; importing an API requires no AWS SDK or network lookup.
+Unknown integration type strings produce warnings and leave the method without an
+integration. With `failOnWarnings=true`, the import or update is rejected before
+changing the API. Leading/trailing whitespace and non-ASCII lookalikes are not accepted.
 
 ### Supported Operations
 

@@ -5,6 +5,8 @@ import uuid
 from contextlib import closing
 
 import boto3
+import pytest
+from botocore.exceptions import ClientError
 
 
 def test_imported_integration_types(aws_config):
@@ -64,5 +66,52 @@ def test_imported_integration_types(aws_config):
                     for field in ("uri", "httpMethod", "timeoutInMillis"):
                         if field in expected:
                             assert integration[field] == embedded[field] == expected[field]
+        finally:
+            api.delete_rest_api(restApiId=api_id)
+
+
+def test_unknown_integration_types(aws_config):
+    invalid_types = [
+        "custom_type", "CuStOm_TyPe", "", " mock", "mock ", "http-proxy", "hıttp", "mοck",
+    ]
+    paths = {
+        "/case" + str(index): {"get": {
+            "responses": {"200": {"description": "ok"}},
+            "x-amazon-apigateway-integration": {"type": value},
+        }}
+        for index, value in enumerate(invalid_types)
+    }
+    expected_warnings = {
+        f"Unknown integration type '{value}' for 'GET /case{index}'. Ignoring."
+        for index, value in enumerate(invalid_types)
+    }
+    document = {"openapi": "3.0.2", "info": {
+        "title": "invalid-integration-types-" + uuid.uuid4().hex, "version": "1"}, "paths": paths}
+    body = json.dumps(document)
+    with closing(boto3.client("apigateway", **aws_config)) as api:
+        with pytest.raises(ClientError) as rejected:
+            api.import_rest_api(body=body, failOnWarnings=True)
+        assert rejected.value.response["Error"]["Code"] == "BadRequestException"
+        assert all(warning in rejected.value.response["Error"]["Message"] for warning in expected_warnings)
+        imported = api.import_rest_api(body=body, failOnWarnings=False)
+        api_id = imported["id"]
+        try:
+            for mode in [None, "merge", "overwrite"]:
+                if mode:
+                    with pytest.raises(ClientError) as rejected:
+                        api.put_rest_api(restApiId=api_id, mode=mode, body=body, failOnWarnings=True)
+                    assert rejected.value.response["Error"]["Code"] == "BadRequestException"
+                    imported = api.put_rest_api(
+                        restApiId=api_id, mode=mode, body=body, failOnWarnings=False)
+                assert set(imported["warnings"]) == expected_warnings
+                resources = api.get_resources(restApiId=api_id)["items"]
+                for resource in resources:
+                    if resource["path"] == "/":
+                        continue
+                    method = {"restApiId": api_id, "resourceId": resource["id"], "httpMethod": "GET"}
+                    with pytest.raises(ClientError) as missing:
+                        api.get_integration(**method)
+                    assert missing.value.response["Error"]["Code"] == "NotFoundException"
+                    assert "methodIntegration" not in api.get_method(**method)
         finally:
             api.delete_rest_api(restApiId=api_id)

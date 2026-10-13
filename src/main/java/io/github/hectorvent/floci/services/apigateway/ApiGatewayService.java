@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.google.common.base.Ascii;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.TlsCertificateManager;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
@@ -3664,19 +3663,36 @@ public class ApiGatewayService implements ResourceProvider {
         if (openAPI.getPaths() != null) {
             for (Map.Entry<String, PathItem> entry : openAPI.getPaths().entrySet()) {
                 PathItem pathItem = entry.getValue();
+                for (Map.Entry<PathItem.HttpMethod, Operation> operation : pathItem.readOperationsMap().entrySet()) {
+                    addImportedIntegrationWarning(entry.getKey(), operation.getKey().name(),
+                            operation.getValue(), warnings);
+                }
                 Object anyMethod = pathItem.getExtensions() != null
                         ? pathItem.getExtensions().get("x-amazon-apigateway-any-method") : null;
                 if (anyMethod != null) {
                     OpenAPIDeserializer.ParseResult anyResult = new OpenAPIDeserializer.ParseResult();
-                    parseAnyMethodOperation(entry.getKey(), anyMethod, anyResult);
+                    Operation operation = parseAnyMethodOperation(entry.getKey(), anyMethod, anyResult);
                     warnings.addAll(anyResult.getMessages());
+                    addImportedIntegrationWarning(entry.getKey(), "ANY", operation, warnings);
                 }
             }
         }
         if (failOnWarnings && !warnings.isEmpty()) {
-            throw new AwsException("BadRequestException", String.join("; ", warnings), 400);
+            throw new AwsException("BadRequestException",
+                    "Warnings found during import:\n\t" + String.join("\n\t", warnings), 400);
         }
         return new ParsedOpenApi(openAPI, List.copyOf(warnings));
+    }
+
+    private static void addImportedIntegrationWarning(String path, String httpMethod,
+                                                       Operation operation, List<String> warnings) {
+        Object extension = operation.getExtensions() == null
+                ? null : operation.getExtensions().get("x-amazon-apigateway-integration");
+        if (extension instanceof Map<?, ?> integration
+                && integration.get("type") instanceof String type
+                && ApiGatewayIntegrationTypes.canonical(type) == null) {
+            warnings.add("Unknown integration type '" + type + "' for '" + httpMethod + " " + path + "'. Ignoring.");
+        }
     }
 
     private void validateImportedAuthorizers(OpenAPI openAPI) {
@@ -4330,7 +4346,10 @@ public class ApiGatewayService implements ResourceProvider {
         Map<String, Object> integrationRequest = new HashMap<>();
         Object integrationType = integrationExt.get("type");
         if (integrationType instanceof String type) {
-            integrationType = Ascii.toUpperCase(type);
+            integrationType = ApiGatewayIntegrationTypes.canonical(type);
+            if (integrationType == null) {
+                return;
+            }
         }
         integrationRequest.put("type", integrationType);
         integrationRequest.put("httpMethod", integrationExt.get("httpMethod"));
