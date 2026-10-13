@@ -26,7 +26,23 @@ class SesConfigurationSetSendingOptionsV2IntegrationTest {
     private static final String SES_AUTH =
             "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/ses/aws4_request";
     private static final String CS = "cs-sending-options";
-    private static final String SENDER = "sender@example.com";
+    // A sender of its own, verified below: the identity outlives this class, and other SES classes
+    // that share the application create sender@example.com themselves.
+    private static final String SENDER = "cs-sending-options-sender@floci.test";
+
+    @Test
+    @Order(0)
+    void verifySender() {
+        given()
+                .contentType("application/x-www-form-urlencoded")
+                .header("Authorization", SES_AUTH)
+                .formParam("Action", "VerifyEmailIdentity")
+                .formParam("EmailAddress", SENDER)
+        .when()
+                .post("/")
+        .then()
+                .statusCode(200);
+    }
 
     @Test
     @Order(1)

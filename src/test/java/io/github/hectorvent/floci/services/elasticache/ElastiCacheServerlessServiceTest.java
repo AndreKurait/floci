@@ -28,6 +28,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -108,7 +109,7 @@ class ElastiCacheServerlessServiceTest {
                 config, ec2, resolver, kms, new ElastiCacheProvisioningIds());
         memcached = new ElastiCacheMemcachedService(mock(ElastiCacheMemcachedContainerManager.class), factory,
                 config, new ElastiCacheProvisioningIds(), resolver);
-        service = new ElastiCacheServerlessService(factory, resolver, runtime, memcached, runtime);
+        service = new ElastiCacheServerlessService(factory, resolver, runtime, memcached);
         runtime.createUser("alice", "alice", AuthMode.PASSWORD, List.of("password-a"), "on ~* +@all", "valkey");
         runtime.createUser("bob", "bob", AuthMode.PASSWORD, List.of("password-b"), "on ~* +@all", "valkey");
         runtime.createUserGroup("team", "valkey", List.of("alice"), "us-east-1");
@@ -242,7 +243,7 @@ class ElastiCacheServerlessServiceTest {
     @Test
     void rehydratedServiceRetainsRuntimeIdentityAndAssociation() {
         ServerlessCache original = service.createServerlessCache(create("cache", "valkey", "team"));
-        ElastiCacheServerlessService reloaded = new ElastiCacheServerlessService(factory, resolver, runtime, memcached, runtime);
+        ElastiCacheServerlessService reloaded = new ElastiCacheServerlessService(factory, resolver, runtime, memcached);
         assertEquals(original.getBackingCacheClusterId(), reloaded.getServerlessCache("cache").getBackingCacheClusterId());
         error("InvalidUserGroupState", () -> runtime.deleteUserGroup("team"));
         reloaded.deleteServerlessCache("cache");
@@ -306,14 +307,14 @@ class ElastiCacheServerlessServiceTest {
     void persistentRestartRestoresHiddenRuntimeCredentialsAndPortOwnership() {
         StorageFactory persistent = persistentFactory();
         ElastiCacheService persistedRuntime = newRuntime(persistent);
-        ElastiCacheServerlessService persisted = new ElastiCacheServerlessService(persistent, resolver, persistedRuntime, memcached, persistedRuntime);
+        ElastiCacheServerlessService persisted = new ElastiCacheServerlessService(persistent, resolver, persistedRuntime, memcached);
         persistedRuntime.createUser("member", "member", AuthMode.PASSWORD, List.of("secret"), "on ~* +@all", "valkey");
         persistedRuntime.createUserGroup("persisted-team", "valkey", List.of("member"), "us-east-1");
         ServerlessCache original = persisted.createServerlessCache(create("persistent", "valkey", "persisted-team"));
         persistent.shutdownAll();
         StorageFactory reloadedFactory = persistentFactory();
         ElastiCacheService reloadedRuntime = newRuntime(reloadedFactory);
-        ElastiCacheServerlessService reloaded = new ElastiCacheServerlessService(reloadedFactory, resolver, reloadedRuntime, memcached, reloadedRuntime);
+        ElastiCacheServerlessService reloaded = new ElastiCacheServerlessService(reloadedFactory, resolver, reloadedRuntime, memcached);
         reloadedFactory.loadAll();
         clearInvocations(proxies);
         reloadedRuntime.restorePersistedRuntime().join();
@@ -361,7 +362,7 @@ class ElastiCacheServerlessServiceTest {
         assertTrue(backing.getForAccount("111111111111", original.getBackingCacheClusterId()).isPresent());
         context.setAccountId("111111111111");
         context.setRegion("cn-north-1");
-        ElastiCacheServerlessService reloaded = new ElastiCacheServerlessService(factory, resolver, reloadedRuntime, memcached, reloadedRuntime);
+        ElastiCacheServerlessService reloaded = new ElastiCacheServerlessService(factory, resolver, reloadedRuntime, memcached);
         assertEquals(original.getEndpoint(), reloaded.getServerlessCache("account-cache").getEndpoint());
         reloaded.deleteServerlessCache("account-cache");
         runtime.deleteUserGroup("team");
@@ -430,5 +431,40 @@ class ElastiCacheServerlessServiceTest {
         service.deleteServerlessCache("multi-cache");
 
         assertNotNull(runtime.deleteUserGroup("team"));
+    }
+
+    @Test
+    void modifyWithResetUnsetClearsLimitsAndSnapshotSettingsButOmittedFieldsStayOtherwise() {
+        service.createServerlessCache(new ElastiCacheServerlessService.CreateServerlessCacheRequest("reset-cache",
+                "valkey", null, "description", List.of("subnet-local"), List.of("sg-local"), null, null,
+                new ServerlessCache.CacheUsageLimits(null, new ServerlessCache.EcpuPerSecond(null, 4000)), 7, "05:00",
+                List.of(), Map.of()));
+
+        ServerlessCache kept = service.modifyServerlessCache(new ElastiCacheServerlessService.ModifyServerlessCacheRequest(
+                "reset-cache", "d", null, null, null, null, null, null, null, null));
+        assertEquals(7, kept.getSnapshotRetentionLimit());
+        assertEquals("05:00", kept.getDailySnapshotTime());
+        assertNotNull(kept.getCacheUsageLimits());
+
+        ServerlessCache reset = service.modifyServerlessCache(new ElastiCacheServerlessService.ModifyServerlessCacheRequest(
+                "reset-cache", "d", null, null, null, null, null, null, null, null, true));
+        assertEquals(0, reset.getSnapshotRetentionLimit());
+        assertNull(reset.getDailySnapshotTime());
+        assertNull(reset.getCacheUsageLimits());
+    }
+
+    @Test
+    void replaceTagsDrivesTheTagsToTheGivenSetAndRejectsMoreThanFifty() {
+        service.createServerlessCache(create("tag-cache", "valkey", null));
+
+        assertEquals(Map.of("env", "dev"), service.replaceTags("tag-cache", Map.of("env", "dev")).getTags());
+        assertEquals(Map.of("env", "dev"), service.getServerlessCache("tag-cache").getTags());
+
+        Map<String, String> tooMany = new HashMap<>();
+        for (int i = 0; i < 51; i++) {
+            tooMany.put("k" + i, "v");
+        }
+        error("TagQuotaPerResourceExceeded", () -> service.replaceTags("tag-cache", tooMany));
+        assertEquals(Map.of("env", "dev"), service.getServerlessCache("tag-cache").getTags());
     }
 }

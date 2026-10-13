@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.elasticache;
 
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.testing.DockerAvailability;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -20,7 +21,6 @@ import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -100,7 +100,7 @@ class ElastiCacheServerlessIntegrationTest {
 
     @Test
     void dockerValkeyPreservesDataAndAuthenticatesCurrentGroupMembers() throws Exception {
-        Assumptions.assumeTrue(dockerAvailable(), "Docker is required for the serverless data plane");
+        Assumptions.assumeTrue(DockerAvailability.isAvailable(), "Docker is required for the serverless data plane");
         try (ElastiCacheClient client = client()) {
             client.createUser(request -> request.userId("serverless-alice").userName("alice").engine("valkey")
                     .accessString("on ~* +@all").passwords("alice-password-123"));
@@ -164,7 +164,7 @@ class ElastiCacheServerlessIntegrationTest {
 
     @Test
     void dockerMemcachedPreservesValuesAcrossMetadataChanges() throws Exception {
-        Assumptions.assumeTrue(dockerAvailable(), "Docker is required for the serverless Memcached data plane");
+        Assumptions.assumeTrue(DockerAvailability.isAvailable(), "Docker is required for the serverless Memcached data plane");
         try (ElastiCacheClient client = client()) {
             try {
                 ServerlessCache cache = client.createServerlessCache(request -> request.serverlessCacheName("serverless-memcached")
@@ -194,22 +194,6 @@ class ElastiCacheServerlessIntegrationTest {
         } catch (ServerlessCacheNotFoundException expected) {
             // Creation failed before publication, or the successful test already deleted it.
         }
-    }
-
-    private static boolean dockerAvailable() throws IOException, InterruptedException {
-        Process process;
-        try {
-            process = new ProcessBuilder("docker", "info").redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                    .redirectError(ProcessBuilder.Redirect.DISCARD).start();
-        } catch (IOException expected) {
-            // Docker CLI is optional on development machines.
-            return false;
-        }
-        if (!process.waitFor(10, TimeUnit.SECONDS)) {
-            process.destroyForcibly();
-            return false;
-        }
-        return process.exitValue() == 0;
     }
 
     private static Socket socket(ServerlessCache cache) throws IOException {

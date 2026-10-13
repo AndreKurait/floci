@@ -205,6 +205,10 @@
     "UserPoolId",
     "GroupName"
   ],
+  "AWS::Cognito::UserPoolResourceServer": [
+    "Identifier",
+    "UserPoolId"
+  ],
   "AWS::Config::ConfigRule": [
     "ConfigRuleName"
   ],
@@ -415,6 +419,14 @@
     "AmiType",
     "Subnets"
   ],
+  "AWS::ElastiCache::ServerlessCache": [
+    "ServerlessCacheName",
+    "KmsKeyId",
+    "SnapshotArnsToRestore",
+    "SubnetIds",
+    "ConnectionType",
+    "NetworkType"
+  ],
   "AWS::ElasticLoadBalancingV2::Listener": [
     "LoadBalancerArn"
   ],
@@ -445,6 +457,7 @@
   "AWS::Events::Rule": [
     "Name"
   ],
+  "AWS::GuardDuty::MalwareProtectionPlan": [],
   "AWS::IAM::AccessKey": [
     "UserName",
     "Serial"

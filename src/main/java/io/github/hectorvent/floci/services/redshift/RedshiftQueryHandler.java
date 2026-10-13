@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.redshift.model.Integration;
 import io.github.hectorvent.floci.services.redshift.model.Parameter;
 import io.github.hectorvent.floci.services.redshift.model.Snapshot;
 import io.github.hectorvent.floci.services.redshift.model.SnapshotCopyGrant;
+import io.github.hectorvent.floci.services.redshift.model.SnapshotSchedule;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MediaType;
@@ -564,6 +565,72 @@ public class RedshiftQueryHandler {
                     .build();
             return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
         }
+        case "EnableSnapshotCopy" -> {
+            Cluster cluster = service.enableSnapshotCopy(requireParam(params, "ClusterIdentifier"),
+                    requireParam(params, "DestinationRegion"),
+                    intParam(params, "RetentionPeriod"),
+                    intParam(params, "ManualSnapshotRetentionPeriod"),
+                    params.getFirst("SnapshotCopyGrantName"));
+            return clusterResponse(action, cluster);
+        }
+        case "DisableSnapshotCopy" -> {
+            return clusterResponse(action, service.disableSnapshotCopy(requireParam(params, "ClusterIdentifier")));
+        }
+        case "ModifySnapshotCopyRetentionPeriod" -> {
+            String clusterIdentifier = requireParam(params, "ClusterIdentifier");
+            requireParam(params, "RetentionPeriod");
+            Cluster cluster = service.modifySnapshotCopyRetentionPeriod(clusterIdentifier,
+                    intParam(params, "RetentionPeriod"), Boolean.parseBoolean(params.getFirst("Manual")));
+            return clusterResponse(action, cluster);
+        }
+        case "CreateSnapshotSchedule" -> {
+            SnapshotSchedule schedule = service.createSnapshotSchedule(params.getFirst("ScheduleIdentifier"),
+                    params.getFirst("ScheduleDescription"), memberList(params, "ScheduleDefinitions"),
+                    parseTags(params));
+            return snapshotScheduleResponse(action, schedule);
+        }
+        case "ModifySnapshotSchedule" -> {
+            SnapshotSchedule schedule = service.modifySnapshotSchedule(requireParam(params, "ScheduleIdentifier"),
+                    memberList(params, "ScheduleDefinitions"));
+            return snapshotScheduleResponse(action, schedule);
+        }
+        case "DescribeSnapshotSchedules" -> {
+            PaginatedResult<SnapshotSchedule> page = service.describeSnapshotSchedules(
+                    params.getFirst("ScheduleIdentifier"), params.getFirst("ClusterIdentifier"),
+                    memberList(params, "TagKeys"), memberList(params, "TagValues"),
+                    intParam(params, "MaxRecords"), params.getFirst("Marker"));
+            XmlBuilder xmlBuilder = new XmlBuilder()
+                    .start("DescribeSnapshotSchedulesResponse")
+                      .start("DescribeSnapshotSchedulesResult")
+                        .start("SnapshotSchedules");
+            for (SnapshotSchedule schedule : page.items()) {
+                xmlBuilder.start("SnapshotSchedule")
+                        .raw(buildSnapshotScheduleFields(schedule))
+                        .end("SnapshotSchedule");
+            }
+            xmlBuilder.end("SnapshotSchedules");
+            if (page.nextToken() != null) {
+                xmlBuilder.elem("Marker", page.nextToken());
+            }
+            String xml = xmlBuilder
+                      .end("DescribeSnapshotSchedulesResult")
+                      .start("ResponseMetadata")
+                        .elem("RequestId", "test-req-id")
+                      .end("ResponseMetadata")
+                    .end("DescribeSnapshotSchedulesResponse")
+                    .build();
+            return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
+        }
+        case "DeleteSnapshotSchedule" -> {
+            service.deleteSnapshotSchedule(requireParam(params, "ScheduleIdentifier"));
+            return emptyResponse(action);
+        }
+        case "ModifyClusterSnapshotSchedule" -> {
+            service.modifyClusterSnapshotSchedule(requireParam(params, "ClusterIdentifier"),
+                    params.getFirst("ScheduleIdentifier"),
+                    Boolean.parseBoolean(params.getFirst("DisassociateSchedule")));
+            return emptyResponse(action);
+        }
         case "ModifyCluster" -> {
             String clusterIdentifier = params.getFirst("ClusterIdentifier");
             if (clusterIdentifier == null || clusterIdentifier.isBlank()) {
@@ -846,6 +913,20 @@ public class RedshiftQueryHandler {
             builder.end("Tags");
         }
 
+        if (cluster.getSnapshotCopyDestinationRegion() != null) {
+            builder.start("ClusterSnapshotCopyStatus")
+                .elem("DestinationRegion", cluster.getSnapshotCopyDestinationRegion())
+                .elem("RetentionPeriod", String.valueOf(cluster.getSnapshotCopyRetentionPeriod()))
+                .elem("ManualSnapshotRetentionPeriod", String.valueOf(cluster.getSnapshotCopyManualRetentionPeriod()))
+                .elem("SnapshotCopyGrantName", cluster.getSnapshotCopyGrantName())
+              .end("ClusterSnapshotCopyStatus");
+        }
+
+        if (cluster.getSnapshotScheduleIdentifier() != null) {
+            builder.elem("SnapshotScheduleIdentifier", cluster.getSnapshotScheduleIdentifier())
+                .elem("SnapshotScheduleState", "ACTIVE");
+        }
+
         if (cluster.getEndpoint() != null) {
             builder.start("Endpoint")
                 .elem("Address", cluster.getEndpoint().getAddress())
@@ -922,6 +1003,75 @@ public class RedshiftQueryHandler {
             .elem("MasterUsername", snapshot.getMasterUsername());
 
         return builder.end("Snapshot").build();
+    }
+
+    private Response clusterResponse(String operation, Cluster cluster) {
+        String xml = new XmlBuilder()
+                .start(operation + "Response")
+                  .start(operation + "Result")
+                    .raw(buildClusterXml(cluster))
+                  .end(operation + "Result")
+                  .start("ResponseMetadata")
+                    .elem("RequestId", "test-req-id")
+                  .end("ResponseMetadata")
+                .end(operation + "Response")
+                .build();
+        return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
+    }
+
+    // Create/ModifySnapshotSchedule return the SnapshotSchedule members directly inside the Result.
+    private Response snapshotScheduleResponse(String operation, SnapshotSchedule schedule) {
+        String xml = new XmlBuilder()
+                .start(operation + "Response")
+                  .start(operation + "Result")
+                    .raw(buildSnapshotScheduleFields(schedule))
+                  .end(operation + "Result")
+                  .start("ResponseMetadata")
+                    .elem("RequestId", "test-req-id")
+                  .end("ResponseMetadata")
+                .end(operation + "Response")
+                .build();
+        return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
+    }
+
+    private static Response emptyResponse(String operation) {
+        String xml = new XmlBuilder()
+                .start(operation + "Response")
+                  .start("ResponseMetadata")
+                    .elem("RequestId", "test-req-id")
+                  .end("ResponseMetadata")
+                .end(operation + "Response")
+                .build();
+        return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
+    }
+
+    // No snapshots are taken on a schedule, so NextInvocations is omitted. An association
+    // takes effect immediately, hence ACTIVE.
+    private String buildSnapshotScheduleFields(SnapshotSchedule schedule) {
+        XmlBuilder builder = new XmlBuilder().start("ScheduleDefinitions");
+        for (String definition : schedule.getScheduleDefinitions()) {
+            builder.elem("ScheduleDefinition", definition);
+        }
+        builder.end("ScheduleDefinitions")
+            .elem("ScheduleIdentifier", schedule.getScheduleIdentifier())
+            .elem("ScheduleDescription", schedule.getScheduleDescription());
+        builder.start("Tags");
+        for (Map.Entry<String, String> tag : schedule.getTags().entrySet()) {
+            builder.start("Tag")
+                .elem("Key", tag.getKey())
+                .elem("Value", tag.getValue())
+              .end("Tag");
+        }
+        builder.end("Tags");
+        List<String> associated = service.clustersUsingSnapshotSchedule(schedule.getScheduleIdentifier());
+        builder.elem("AssociatedClusterCount", associated.size()).start("AssociatedClusters");
+        for (String clusterIdentifier : associated) {
+            builder.start("ClusterAssociatedToSchedule")
+                .elem("ClusterIdentifier", clusterIdentifier)
+                .elem("ScheduleAssociationState", "ACTIVE")
+              .end("ClusterAssociatedToSchedule");
+        }
+        return builder.end("AssociatedClusters").build();
     }
 
     private Response loggingStatusResponse(String operation, Cluster cluster) {
@@ -1162,6 +1312,8 @@ public class RedshiftQueryHandler {
             case "VpcSecurityGroupIds" -> quoted + "(\\.member|\\.VpcSecurityGroupId)?\\.\\d+";
             case "IamRoles", "AddIamRoles", "RemoveIamRoles" -> quoted + "(\\.member|\\.IamRoleArn)?\\.\\d+";
             case "TagKeys" -> quoted + "(\\.member|\\.TagKey)?\\.\\d+";
+            case "TagValues" -> quoted + "(\\.member|\\.TagValue)?\\.\\d+";
+            case "ScheduleDefinitions" -> quoted + "(\\.member|\\.ScheduleDefinition)?\\.\\d+";
             case "DbGroups" -> quoted + "(\\.member|\\.DbGroup)?\\.\\d+";
             default -> quoted + "(\\.member)?\\.\\d+";
         };

@@ -443,7 +443,7 @@ public class CodeArtifactController {
     private ObjectNode domainDescription(DomainView view) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("arn", view.domain().getArn());
-        node.put("assetSizeBytes", 0L);
+        node.put("assetSizeBytes", view.assetSizeBytes());
         node.put("createdTime", view.domain().getCreatedTime());
         node.put("encryptionKey", view.domain().getEncryptionKey());
         node.put("name", view.domain().getName());

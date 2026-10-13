@@ -561,7 +561,7 @@ class CognitoMessageDispatcherTest {
 
     @Test
     void dispatchInvitation_failureOnTheOnlyMedium_isRethrown() {
-        when(ses.sendEmail(any())).thenThrow(new IllegalStateException("SES down"));
+        when(ses.sendServiceEmail(any())).thenThrow(new IllegalStateException("SES down"));
 
         assertThrows(IllegalStateException.class, () -> dispatcher.dispatchInvitation(pool(Map.of()),
             invitee("alice@example.com", null), "Temp1234!", List.of("EMAIL"), null));
@@ -587,7 +587,7 @@ class CognitoMessageDispatcherTest {
 
     private SendEmailRequest sentEmail() {
         ArgumentCaptor<SendEmailRequest> captor = ArgumentCaptor.forClass(SendEmailRequest.class);
-        verify(ses).sendEmail(captor.capture());
+        verify(ses).sendServiceEmail(captor.capture());
         return captor.getValue();
     }
 

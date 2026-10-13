@@ -167,10 +167,8 @@ class S3ObjectTagConditionEnforcementIntegrationTest {
             String suffix = Long.toString(System.nanoTime(), 36);
             bucket = "objtag-" + name + "-" + suffix;
             user = "objtag-" + name + "-" + suffix;
-            if (!versioned) {
-                cleanup.register(() -> EnforcementFixtures.removeBucket(baseUri.getPort(),
-                        auth(ADMIN, "s3"), bucket));
-            }
+            cleanup.register(() -> EnforcementFixtures.removeBucket(baseUri.getPort(),
+                    auth(ADMIN, "s3"), bucket));
             given().header("Authorization", auth(ADMIN, "s3")).when().put("/" + bucket).then().statusCode(200);
             seed("a/tagged-a", "env=a");
             seed("a/tagged-b", "env=b");
