@@ -1179,16 +1179,16 @@ public class ApiGatewayExecuteController {
 
                 if (modelName != null) {
                     try {
-                        io.github.hectorvent.floci.services.apigateway.model.Model model =
-                                apiGatewayService.getModel(region, apiId, modelName);
-                        String schemaStr = model.getSchema();
+                        Map<String, String> models = apiGatewayService.getDeploymentModelSchemas(region, apiId,
+                                scope.stage() != null ? scope.stage().getDeploymentId() : null);
+                        String schemaStr = models.get(modelName);
                         if (schemaStr != null && !schemaStr.isBlank()) {
                             String bodyStr = body != null ? new String(body, StandardCharsets.UTF_8) : "";
                             if (bodyStr.isBlank()) {
                                 return gatewayResponse(scope, GatewayResponseType.BAD_REQUEST_BODY, 400,
                                         "Invalid request body");
                             }
-                            JsonNode schemaNode = modelValidationSchema(region, apiId, schemaStr);
+                            JsonNode schemaNode = modelValidationSchema(models, schemaStr);
                             JsonNode bodyNode = objectMapper.readTree(bodyStr);
 
                             JsonSchemaFactory factory =
@@ -1206,8 +1206,6 @@ public class ApiGatewayExecuteController {
                                         "Invalid request body: " + errorMsg, errorMsg);
                             }
                         }
-                    } catch (AwsException e) {
-                        // Model not found — skip body validation
                     } catch (Exception e) {
                         return gatewayResponse(scope, GatewayResponseType.BAD_REQUEST_BODY, 400,
                                 "Invalid request body");
@@ -1219,7 +1217,7 @@ public class ApiGatewayExecuteController {
         return null;
     }
 
-    private JsonNode modelValidationSchema(String region, String apiId, String schema) throws JsonProcessingException {
+    private JsonNode modelValidationSchema(Map<String, String> models, String schema) throws JsonProcessingException {
         JsonNode root = objectMapper.readTree(schema);
         if (!(root instanceof ObjectNode document)) {
             return root;
@@ -1230,11 +1228,11 @@ public class ApiGatewayExecuteController {
             return root;
         }
         ObjectNode definitions = document.withObject("/components/schemas");
-        for (Model model : apiGatewayService.getModels(region, apiId)) {
-            if (!definitions.has(model.getName()) && model.getSchema() != null) {
+        for (Map.Entry<String, String> model : models.entrySet()) {
+            if (!definitions.has(model.getKey())) {
                 try {
-                    definitions.set(model.getName(), objectMapper.readTree(model.getSchema()));
-                } catch (JsonProcessingException invalid) {
+                    definitions.set(model.getKey(), objectMapper.readTree(model.getValue()));
+                } catch (JsonProcessingException ignored) {
                     // An unrelated malformed model must not invalidate this request. If referenced,
                     // its absent definition is rejected by the schema validator itself.
                 }
