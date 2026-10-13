@@ -10032,10 +10032,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 disassociateAddress(region, address.getAssociationId());
             } else {
                 address.setInstanceId(null);
-                if (address.getAllocatedPublicIp() != null) {
-                    address.setPublicIp(address.getAllocatedPublicIp());
-                }
-                updateStoredAddressAssociation(address);
                 addresses.put(key(region, address.getAllocationId()), address);
             }
         }
