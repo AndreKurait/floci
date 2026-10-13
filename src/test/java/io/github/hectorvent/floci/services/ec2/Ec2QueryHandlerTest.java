@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsPartition;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
@@ -15,10 +17,13 @@ import org.mockito.ArgumentCaptor;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
@@ -184,11 +189,40 @@ class Ec2QueryHandlerTest {
         assertEquals(cleanupFails ? List.of(cleanupFailure) : List.of(), List.of(thrown.getSuppressed()));
     }
 
+    @Test
+    void describeRegionsListsTheDeploymentPartitionForARegionNoPartitionPublishes() {
+        String xml = describeRegions(new RegionResolver("cn-north-1", "000000000000"), "polygondwanaland-west-1");
+
+        assertTrue(xml.contains("<regionName>cn-north-1</regionName>"), xml);
+        assertTrue(xml.contains("<regionEndpoint>ec2.cn-north-1.amazonaws.com.cn</regionEndpoint>"), xml);
+        assertFalse(xml.contains("us-east-1"), xml);
+    }
+
+    @Test
+    void describeRegionsKeepsAPublishedRegionInItsOwnPartition() {
+        String xml = describeRegions(new RegionResolver("cn-north-1", "000000000000"), "us-gov-west-1");
+
+        assertTrue(xml.contains("<regionEndpoint>ec2.us-gov-west-1.amazonaws.com</regionEndpoint>"), xml);
+        assertFalse(xml.contains("cn-north-1"), xml);
+    }
+
+    private String describeRegions(RegionResolver regionResolver, String region) {
+        Ec2Service service = mock(Ec2Service.class);
+        when(service.describeRegions(any(AwsPartition.class), anyBoolean())).thenCallRealMethod();
+        Response response = handler(service, regionResolver)
+                .handle("DescribeRegions", new MultivaluedHashMap<>(), region);
+        return (String) response.getEntity();
+    }
+
     private Ec2QueryHandler handler(Ec2Service service) {
+        return handler(service, new RegionResolver("us-east-1", "000000000000"));
+    }
+
+    private Ec2QueryHandler handler(Ec2Service service, RegionResolver regionResolver) {
         return new Ec2QueryHandler(
                 service, mock(EmulatorConfig.class), mock(FlowLogService.class),
                 mock(Ec2EbsEncryptionService.class), mock(Ec2SnapshotBlockPublicAccessService.class),
-                mock(Ec2IpamService.class));
+                mock(Ec2IpamService.class), regionResolver);
     }
 
     private MultivaluedMap<String, String> createSubnetParams(String cidrBlock) {

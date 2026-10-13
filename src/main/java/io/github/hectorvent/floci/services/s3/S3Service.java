@@ -498,9 +498,7 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     private void deleteBucketLocked(String bucketName) {
-        // Check if bucket is empty
-        List<S3Object> objects = listObjects(bucketName, null, null, 1);
-        if (!objects.isEmpty()) {
+        if (!objectStore.scan(key -> key.startsWith(bucketPrefix(bucketName))).isEmpty()) {
             throw new AwsException("BucketNotEmpty",
                     "The bucket you tried to delete is not empty.", 409);
         }
@@ -6031,6 +6029,10 @@ public class S3Service implements Resettable, ResourceProvider {
                 putObjectForAccount(accountId, latestKey, object);
             }
         }
+    }
+
+    private String bucketPrefix(String bucketName) {
+        return bucketName + "/";
     }
 
     private String objectKey(String bucketName, String key) {

@@ -20,6 +20,21 @@ class SesSendAddressSyntaxIntegrationTest {
     private static final String AUTH =
             "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request";
     private static final String TO = "success@simulator.amazonses.com";
+    // A sender of its own: an identity under example.com would outlive this class and reach the
+    // other SES classes that share the application.
+    private static final String VERIFIED_SENDER = "syntax-sender@floci.test";
+
+    private static void verifySender() {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH)
+            .formParam("Action", "VerifyEmailIdentity")
+            .formParam("EmailAddress", VERIFIED_SENDER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
 
     @Test
     void v1SendEmail_sourceWithoutAt_returnsInvalidParameterValue() {
@@ -302,16 +317,17 @@ class SesSendAddressSyntaxIntegrationTest {
     @ParameterizedTest
     @ValueSource(strings = {"sender.example.com", "sender@", "やまだ@example.com", "sender@例え.jp"})
     void v2SendEmailRaw_malformedFromHeaderIsNotCheckedWithFromEmailAddress(String from) {
+        verifySender();
         given()
             .contentType("application/json; charset=UTF-8")
             .header("Authorization", AUTH)
             .body("""
                 {
-                    "FromEmailAddress": "sender@example.com",
+                    "FromEmailAddress": "%s",
                     "Destination": {"ToAddresses": ["%s"]},
                     "Content": {"Raw": {"Data": "%s"}}
                 }
-                """.formatted(TO, rawMessage(from)))
+                """.formatted(VERIFIED_SENDER, TO, rawMessage(from)))
         .when()
             .post("/v2/email/outbound-emails")
         .then()
@@ -322,17 +338,18 @@ class SesSendAddressSyntaxIntegrationTest {
     @Test
     void v2SendEmailRaw_overLimitFromHeaderIsNotMeasuredWithFromEmailAddress() {
         String from = "A".repeat(321 - " <sender@example.com>".length()) + " <sender@example.com>";
+        verifySender();
 
         given()
             .contentType("application/json; charset=UTF-8")
             .header("Authorization", AUTH)
             .body("""
                 {
-                    "FromEmailAddress": "sender@example.com",
+                    "FromEmailAddress": "%s",
                     "Destination": {"ToAddresses": ["%s"]},
                     "Content": {"Raw": {"Data": "%s"}}
                 }
-                """.formatted(TO, rawMessage(from)))
+                """.formatted(VERIFIED_SENDER, TO, rawMessage(from)))
         .when()
             .post("/v2/email/outbound-emails")
         .then()

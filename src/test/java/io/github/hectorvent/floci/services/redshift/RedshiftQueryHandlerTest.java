@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.redshift.model.Endpoint;
 import io.github.hectorvent.floci.services.redshift.model.Parameter;
 import io.github.hectorvent.floci.services.redshift.model.Snapshot;
 import io.github.hectorvent.floci.services.redshift.model.SnapshotCopyGrant;
+import io.github.hectorvent.floci.services.redshift.model.SnapshotSchedule;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
@@ -511,6 +512,26 @@ class RedshiftQueryHandlerTest {
                 AwsException.class,
                 () -> handler.handle("ModifyCluster", params));
         assertEquals("InvalidParameterValue", ex.getErrorCode());
+    }
+
+    @Test
+    void createSnapshotScheduleReadsScheduleDefinitionLocationNameInNumericOrder() {
+        // The SDK serialises ScheduleDefinitions as "ScheduleDefinitions.ScheduleDefinition.N".
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ScheduleIdentifier", "sched");
+        params.putSingle("ScheduleDefinitions.ScheduleDefinition.10", "cron(0 1 * * ? *)");
+        params.putSingle("ScheduleDefinitions.ScheduleDefinition.2", "rate(12 hours)");
+        when(service.createSnapshotSchedule(any(), any(), any(), any()))
+                .thenAnswer(inv -> new SnapshotSchedule(inv.getArgument(0), null, inv.getArgument(2)));
+
+        Response response = handler.handle("CreateSnapshotSchedule", params);
+
+        assertEquals(200, response.getStatus());
+        verify(service).createSnapshotSchedule(eq("sched"), isNull(),
+                eq(List.of("rate(12 hours)", "cron(0 1 * * ? *)")), eq(Map.of()));
+        String xml = (String) response.getEntity();
+        assertTrue(xml.contains("<CreateSnapshotScheduleResult><ScheduleDefinitions>"
+                + "<ScheduleDefinition>rate(12 hours)</ScheduleDefinition>"), xml);
     }
 
     @Test
