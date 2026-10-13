@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.apigateway;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.sun.net.httpserver.HttpServer;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
 import org.junit.jupiter.api.*;
@@ -9,6 +11,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 import static io.restassured.RestAssured.given;
@@ -1082,6 +1087,119 @@ class ApiGatewayOpenApiImportTest {
     }
 
     // ──────────────────────────── Request Body Validation ────────────────────────────
+
+    @Test
+    @Order(95)
+    void importedModelReferencesValidateCurrentSiblingModelsAndRecursiveBodies() throws Exception {
+        String spec = """
+                {
+                  "openapi":"3.0.1", "info":{"title":"ReferencedWorkflowModels","version":"1"},
+                  "x-amazon-apigateway-request-validators":{
+                    "full":{"validateRequestBody":true,"validateRequestParameters":true}},
+                  "x-amazon-apigateway-request-validator":"full",
+                  "paths":{"/list-workflows":{"post":{
+                    "requestBody":{"content":{"application/json":{
+                      "schema":{"$ref":"#/components/schemas/Request"}}}},
+                    "x-amazon-apigateway-integration":{"type":"MOCK",
+                      "requestTemplates":{"application/json":"{\\"statusCode\\":200}"},
+                      "responses":{"default":{"statusCode":"200",
+                        "responseTemplates":{"application/json":"{\\"accepted\\":true}"}}}}}}},
+                  "components":{"schemas":{
+                    "Category":{"type":"string","enum":["DMS"]},
+                    "Status":{"type":"string","enum":["RUNNING"]},
+                    "Request":{"type":"object","required":["workflowCategory","status"],
+                      "properties":{
+                        "workflowCategory":{"$ref":"#/components/schemas/Category"},
+                        "status":{"$ref":"#/components/schemas/Status"},
+                        "child":{"$ref":"#/components/schemas/Request"}}}}}
+                }
+                """;
+        String apiId = given().contentType(ContentType.JSON).queryParam("mode", "import")
+                .body(spec).post("/restapis").then().statusCode(201).extract().path("id");
+        try {
+            String deployment = given().contentType(ContentType.JSON).body("{}")
+                    .post("/restapis/" + apiId + "/deployments")
+                    .then().statusCode(201).extract().path("id");
+            given().contentType(ContentType.JSON)
+                    .body("{\"stageName\":\"test\",\"deploymentId\":\"" + deployment + "\"}")
+                    .post("/restapis/" + apiId + "/stages").then().statusCode(201);
+            String endpoint = "/execute-api/" + apiId + "/test/list-workflows";
+            String valid = "{\"workflowCategory\":\"DMS\",\"status\":\"RUNNING\"}";
+            given().contentType(ContentType.JSON).body(valid).post(endpoint)
+                    .then().statusCode(200).body(containsString("accepted"));
+            given().contentType(ContentType.JSON)
+                    .body("{\"workflowCategory\":\"DMS\",\"status\":\"RUNNING\",\"child\":" + valid + "}")
+                    .post(endpoint).then().statusCode(200);
+            given().contentType(ContentType.JSON).body("{\"status\":\"RUNNING\"}")
+                    .post(endpoint).then().statusCode(400);
+            given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "INVALID"))
+                    .post(endpoint).then().statusCode(400);
+
+            String schema = "{\"type\":\"string\",\"enum\":[\"DONE\"]}";
+            String patch = "{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
+                    + mapper.writeValueAsString(schema) + "}]}";
+            given().contentType(ContentType.JSON).body(patch)
+                    .patch("/restapis/" + apiId + "/models/Status").then().statusCode(200);
+            given().contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(400);
+            given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
+                    .post(endpoint).then().statusCode(200);
+
+            String storedSchema = given().get("/restapis/" + apiId + "/models/Request")
+                    .then().statusCode(200).extract().path("schema");
+            assertFalse(mapper.readTree(storedSchema).has("components"), "Validation must not rewrite stored models");
+            given().contentType(ContentType.JSON)
+                    .body("{\"name\":\"UnrelatedInvalid\",\"schema\":\"{invalid\"}")
+                    .post("/restapis/" + apiId + "/models").then().statusCode(201);
+            ObjectNode annotated = (ObjectNode) mapper.readTree(storedSchema);
+            annotated.putObject("default").put("$ref", "#/components/schemas/NotAModel");
+            given().contentType(ContentType.JSON)
+                    .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
+                            + mapper.writeValueAsString(annotated.toString()) + "}]}")
+                    .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
+            given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
+                    .post(endpoint).then().statusCode(200);
+            String otherApi = given().contentType(ContentType.JSON).body("{\"name\":\"OtherModelOwner\"}")
+                    .post("/restapis").then().statusCode(201).extract().path("id");
+            try {
+                given().contentType(ContentType.JSON)
+                        .body("{\"name\":\"OtherOnly\",\"contentType\":\"application/json\",\"schema\":"
+                                + mapper.writeValueAsString("{\"type\":\"object\"}") + "}")
+                        .post("/restapis/" + otherApi + "/models").then().statusCode(201);
+                String missing = "{\"$ref\":\"#/components/schemas/OtherOnly\"}";
+                given().contentType(ContentType.JSON)
+                        .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
+                                + mapper.writeValueAsString(missing) + "}]}")
+                        .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
+                given().contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(400);
+            } finally {
+                given().delete("/restapis/" + otherApi).then().statusCode(202);
+            }
+
+            AtomicInteger externalReads = new AtomicInteger();
+            HttpServer external = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            external.createContext("/schema", exchange -> {
+                externalReads.incrementAndGet();
+                byte[] bytes = "{}".getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, bytes.length);
+                exchange.getResponseBody().write(bytes);
+                exchange.close();
+            });
+            external.start();
+            try {
+                String externalSchema = "{\"$ref\":\"http://127.0.0.1:" + external.getAddress().getPort() + "/schema\"}";
+                given().contentType(ContentType.JSON)
+                        .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
+                                + mapper.writeValueAsString(externalSchema) + "}]}")
+                        .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
+                given().contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(400);
+                assertEquals(0, externalReads.get(), "Request validation must not fetch external schemas");
+            } finally {
+                external.stop(0);
+            }
+        } finally {
+            given().delete("/restapis/" + apiId).then().statusCode(202);
+        }
+    }
 
     @Test
     @Order(96)

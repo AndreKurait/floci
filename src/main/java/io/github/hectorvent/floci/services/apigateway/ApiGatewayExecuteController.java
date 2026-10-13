@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.apigateway;
 
 // REST and v2 both define Authorizer; the less-used REST type is qualified below.
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -12,6 +13,9 @@ import com.jayway.jsonpath.InvalidPathException;
 import com.jayway.jsonpath.JsonPath;
 import com.jayway.jsonpath.spi.json.JacksonJsonNodeJsonProvider;
 import com.jayway.jsonpath.spi.mapper.JacksonMappingProvider;
+import com.networknt.schema.JsonSchema;
+import com.networknt.schema.JsonSchemaFactory;
+import com.networknt.schema.SpecVersion;
 import com.networknt.schema.ValidationMessage;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
@@ -31,6 +35,7 @@ import io.github.hectorvent.floci.services.apigateway.model.Integration;
 import io.github.hectorvent.floci.services.apigateway.model.IntegrationResponse;
 import io.github.hectorvent.floci.services.apigateway.model.MethodConfig;
 import io.github.hectorvent.floci.services.apigateway.model.MethodSetting;
+import io.github.hectorvent.floci.services.apigateway.model.Model;
 import io.github.hectorvent.floci.services.apigateway.model.Stage;
 import io.github.hectorvent.floci.services.apigateway.model.UsagePlan;
 import io.github.hectorvent.floci.services.apigateway.model.UsagePlanKey;
@@ -1183,13 +1188,17 @@ public class ApiGatewayExecuteController {
                                 return gatewayResponse(scope, GatewayResponseType.BAD_REQUEST_BODY, 400,
                                         "Invalid request body");
                             }
-                            JsonNode schemaNode = objectMapper.readTree(schemaStr);
+                            JsonNode schemaNode = modelValidationSchema(region, apiId, schemaStr);
                             JsonNode bodyNode = objectMapper.readTree(bodyStr);
 
-                            com.networknt.schema.JsonSchemaFactory factory =
-                                    com.networknt.schema.JsonSchemaFactory.getInstance(
-                                            com.networknt.schema.SpecVersion.VersionFlag.V4);
-                            com.networknt.schema.JsonSchema schema = factory.getSchema(schemaNode);
+                            JsonSchemaFactory factory =
+                                    JsonSchemaFactory.getInstance(
+                                            SpecVersion.VersionFlag.V4, builder -> builder.schemaLoaders(
+                                                    loaders -> loaders.add(iri -> {
+                                                        throw new IllegalArgumentException(
+                                                                "External model references are not supported");
+                                                    })));
+                            JsonSchema schema = factory.getSchema(schemaNode);
                             Set<ValidationMessage> errors = schema.validate(bodyNode);
                             if (!errors.isEmpty()) {
                                 String errorMsg = errors.iterator().next().getMessage();
@@ -1208,6 +1217,30 @@ public class ApiGatewayExecuteController {
         }
 
         return null;
+    }
+
+    private JsonNode modelValidationSchema(String region, String apiId, String schema) throws JsonProcessingException {
+        JsonNode root = objectMapper.readTree(schema);
+        if (!(root instanceof ObjectNode document)) {
+            return root;
+        }
+        if ((document.has("components") && !document.get("components").isObject())
+                || (document.path("components").has("schemas")
+                && !document.path("components").get("schemas").isObject())) {
+            return root;
+        }
+        ObjectNode definitions = document.withObject("/components/schemas");
+        for (Model model : apiGatewayService.getModels(region, apiId)) {
+            if (!definitions.has(model.getName()) && model.getSchema() != null) {
+                try {
+                    definitions.set(model.getName(), objectMapper.readTree(model.getSchema()));
+                } catch (JsonProcessingException invalid) {
+                    // An unrelated malformed model must not invalidate this request. If referenced,
+                    // its absent definition is rejected by the schema validator itself.
+                }
+            }
+        }
+        return root;
     }
 
     private String toAuthorizerEvent(io.github.hectorvent.floci.services.apigateway.model.Authorizer auth,
