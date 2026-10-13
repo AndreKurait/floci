@@ -56,6 +56,7 @@ public class AutoScalingQueryHandler {
                 case "DescribeInstanceRefreshes"    -> handleDescribeInstanceRefreshes(p, region);
                 case "CreateOrUpdateTags"           -> handleCreateOrUpdateTags(p, region);
                 case "DeleteTags"                   -> handleDeleteTags(p, region);
+                case "DescribeTags"                 -> handleDescribeTags(p, region);
                 case "EnableMetricsCollection"      -> handleEnableMetricsCollection(p, region);
                 case "DisableMetricsCollection"     -> handleDisableMetricsCollection(p, region);
                 // Instances
@@ -544,6 +545,34 @@ public class AutoScalingQueryHandler {
                 .start("DeleteTagsResponse", NS)
                   .raw(AwsQueryResponse.responseMetadata())
                 .end("DeleteTagsResponse").build());
+    }
+
+    private Response handleDescribeTags(MultivaluedMap<String, String> p, String region) {
+        List<AutoScalingService.TagFilter> filters = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String prefix = "Filters.member." + i;
+            String name = p.getFirst(prefix + ".Name");
+            List<String> values = memberList(p, prefix + ".Values");
+            if (name == null && values.isEmpty()) { break; }
+            filters.add(new AutoScalingService.TagFilter(name, values));
+        }
+        AutoScalingService.TagPage page = service.describeTags(
+                region, filters, nullableIntParam(p, "MaxRecords"), p.getFirst("NextToken"));
+        XmlBuilder xml = new XmlBuilder().start("DescribeTagsResponse", NS)
+                .start("DescribeTagsResult").start("Tags");
+        for (AutoScalingService.TagDescription tag : page.tags()) {
+            xml.start("member")
+                    .elem("ResourceId", tag.resourceId())
+                    .elem("ResourceType", "auto-scaling-group")
+                    .elem("Key", tag.key())
+                    .elem("Value", tag.value())
+                    .elem("PropagateAtLaunch", Boolean.toString(tag.propagateAtLaunch()))
+                    .end("member");
+        }
+        xml.end("Tags");
+        if (page.nextToken() != null) { xml.elem("NextToken", page.nextToken()); }
+        return ok(xml.end("DescribeTagsResult").raw(AwsQueryResponse.responseMetadata())
+                .end("DescribeTagsResponse").build());
     }
 
     // ── Instances ─────────────────────────────────────────────────────────────

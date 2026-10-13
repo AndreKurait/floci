@@ -589,6 +589,51 @@ public class AutoScalingService {
         groups.put(asgKey(region, asg.getAutoScalingGroupName()), asg);
     }
 
+    public TagPage describeTags(String region, List<TagFilter> filters, Integer maxRecords, String nextToken) {
+        int limit = maxRecords == null ? 50 : maxRecords;
+        if (limit < 1 || limit > 100) {
+            throw new AwsException("ValidationError", "MaxRecords must be between 1 and 100.", 400);
+        }
+        List<TagFilter> selectedFilters = filters == null ? List.of() : filters;
+        for (TagFilter filter : selectedFilters) {
+            if (filter.name() == null || !Set.of("auto-scaling-group", "key", "value", "propagate-at-launch")
+                    .contains(filter.name().toLowerCase(Locale.ROOT))
+                    || filter.values() == null || filter.values().isEmpty()) {
+                throw new AwsException("ValidationError", "A valid tag filter name and values are required.", 400);
+            }
+        }
+        List<TagDescription> matches = describeAutoScalingGroups(region, List.of()).stream()
+                .flatMap(group -> group.getTags().entrySet().stream().map(tag -> new TagDescription(
+                        group.getAutoScalingGroupName(), tag.getKey(), tag.getValue(),
+                        group.getTagPropagateAtLaunch().getOrDefault(tag.getKey(), false))))
+                .filter(tag -> selectedFilters.stream().allMatch(filter -> matchesTagFilter(tag, filter)))
+                .sorted(Comparator.comparing(TagDescription::resourceId).thenComparing(TagDescription::key))
+                .toList();
+        int offset = parseNextToken(nextToken);
+        if (offset > matches.size()) {
+            throw new AwsException("InvalidNextToken", "The NextToken value is not valid.", 400);
+        }
+        int end = Math.min(offset + limit, matches.size());
+        return new TagPage(matches.subList(offset, end), end < matches.size() ? String.valueOf(end) : null);
+    }
+
+    private static boolean matchesTagFilter(TagDescription tag, TagFilter filter) {
+        String value = switch (filter.name().toLowerCase(Locale.ROOT)) {
+            case "auto-scaling-group" -> tag.resourceId();
+            case "key" -> tag.key();
+            case "value" -> tag.value();
+            case "propagate-at-launch" -> Boolean.toString(tag.propagateAtLaunch());
+            default -> throw new IllegalArgumentException("Unvalidated tag filter");
+        };
+        return filter.values().contains(value);
+    }
+
+    public record TagFilter(String name, List<String> values) {}
+
+    public record TagDescription(String resourceId, String key, String value, boolean propagateAtLaunch) {}
+
+    public record TagPage(List<TagDescription> tags, String nextToken) {}
+
     private AutoScalingGroup requireTaggableGroup(String region, String resourceId, String resourceType) {
         if (!"auto-scaling-group".equals(resourceType)) {
             throw new AwsException("ValidationError",
