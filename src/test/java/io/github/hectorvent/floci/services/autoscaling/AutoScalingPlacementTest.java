@@ -218,6 +218,8 @@ class AutoScalingPlacementTest {
         assertEquals("There are not enough free addresses in subnet 'subnet-b' to satisfy the requested "
                         + "number of instances. Launching EC2 instance failed.",
                 fixture.activities().getFirst().getStatusMessage());
+        assertEquals("An instance was started in response to a desired capacity change.",
+                fixture.activities().getFirst().getCause());
         assertEquals(1, fixture.allocations);
         verify(fixture.groups, times(1)).completeInstanceRefreshIfSettled(any(), any());
     }
