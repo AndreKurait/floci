@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.common.base.Ascii;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.TlsCertificateManager;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
@@ -4329,14 +4330,7 @@ public class ApiGatewayService implements ResourceProvider {
         Map<String, Object> integrationRequest = new HashMap<>();
         Object integrationType = integrationExt.get("type");
         if (integrationType instanceof String type) {
-            integrationType = switch (type) {
-                case "aws" -> "AWS"; // partition-literal: OpenAPI integration type, not an AWS partition
-                case "aws_proxy" -> "AWS_PROXY";
-                case "http" -> "HTTP";
-                case "http_proxy" -> "HTTP_PROXY";
-                case "mock" -> "MOCK";
-                default -> type;
-            };
+            integrationType = Ascii.toUpperCase(type);
         }
         integrationRequest.put("type", integrationType);
         integrationRequest.put("httpMethod", integrationExt.get("httpMethod"));
