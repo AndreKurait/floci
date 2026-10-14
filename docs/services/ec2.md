@@ -300,6 +300,14 @@ that publish those images.
 | DeleteTags | Removes tags from supported EC2 resources. |
 | DescribeTags | Lists tags stored for EC2 resources. |
 
+Public tag mutations reject keys beginning with `aws:` regardless of ASCII case.
+An empty `DeleteTags` tag list removes user tags and preserves AWS-managed tags.
+CloudFormation tag updates and rollbacks likewise leave AWS-managed tags intact.
+Instance and security-group templates validate desired tags before changing resource properties
+or deleting old tags. Volume and Spot request creation also reject reserved keys before allocation.
+Nested launch-template tags follow AWS's case-sensitive check: `aws:` is rejected with
+`InvalidTagKey.Malformed`, while `AWS:` and mixed-case prefixes can be stored in template versions.
+
 ### Internet Gateways
 
 | Action | Description |
