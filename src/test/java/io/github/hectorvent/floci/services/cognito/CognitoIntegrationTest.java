@@ -13,6 +13,8 @@ import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -22,7 +24,9 @@ import java.security.Signature;
 import java.security.spec.RSAPublicKeySpec;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Spliterators;
 import java.util.UUID;
 import java.util.regex.Matcher;
@@ -768,8 +772,10 @@ class CognitoIntegrationTest {
                         equalTo("no-reply@verificationemail.com"));
     }
 
-    @Test
-    void adminCreateUserEmailsAnInvitationWithAWorkingTemporaryPassword() throws Exception {
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = "Inv\"ite\\123Aa!")
+    void adminCreateUserEmailsAnInvitationWithAWorkingTemporaryPassword(String temporaryPassword) throws Exception {
         String invitePoolId = cognitoJson("CreateUserPool", """
                 { "PoolName": "InvitationPool" }
                 """).path("UserPool").path("Id").asText();
@@ -782,14 +788,15 @@ class CognitoIntegrationTest {
                 """.formatted(invitePoolId)).path("UserPoolClient").path("ClientId").asText();
         String invitee = "invited+" + UUID.randomUUID() + "@example.com";
 
-        cognitoAction("AdminCreateUser", """
-                {
-                  "UserPoolId": "%s",
-                  "Username": "%s",
-                  "UserAttributes": [{ "Name": "email", "Value": "%s" }],
-                  "DesiredDeliveryMediums": ["EMAIL"]
-                }
-                """.formatted(invitePoolId, invitee, invitee))
+        Map<String, Object> createUser = new LinkedHashMap<>();
+        createUser.put("UserPoolId", invitePoolId);
+        createUser.put("Username", invitee);
+        createUser.put("UserAttributes", List.of(Map.of("Name", "email", "Value", invitee)));
+        createUser.put("DesiredDeliveryMediums", List.of("EMAIL"));
+        if (temporaryPassword != null) {
+            createUser.put("TemporaryPassword", temporaryPassword);
+        }
+        cognitoAction("AdminCreateUser", OBJECT_MAPPER.writeValueAsString(createUser))
                 .then()
                 .statusCode(200)
                 .body("User.UserStatus", equalTo("FORCE_CHANGE_PASSWORD"));
@@ -808,15 +815,15 @@ class CognitoIntegrationTest {
                 .matcher(body);
         assertTrue(invitation.find(), body);
         assertEquals(invitee, invitation.group(1));
+        if (temporaryPassword != null) {
+            assertEquals(temporaryPassword, invitation.group(2));
+        }
 
-        cognitoAction("AdminInitiateAuth", """
-                {
-                  "UserPoolId": "%s",
-                  "ClientId": "%s",
-                  "AuthFlow": "ADMIN_USER_PASSWORD_AUTH",
-                  "AuthParameters": { "USERNAME": "%s", "PASSWORD": "%s" }
-                }
-                """.formatted(invitePoolId, inviteClientId, invitee, invitation.group(2)))
+        cognitoAction("AdminInitiateAuth", OBJECT_MAPPER.writeValueAsString(Map.of(
+                "UserPoolId", invitePoolId,
+                "ClientId", inviteClientId,
+                "AuthFlow", "ADMIN_USER_PASSWORD_AUTH",
+                "AuthParameters", Map.of("USERNAME", invitee, "PASSWORD", invitation.group(2)))))
                 .then()
                 .statusCode(200)
                 .body("ChallengeName", equalTo("NEW_PASSWORD_REQUIRED"));
