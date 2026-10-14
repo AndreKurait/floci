@@ -223,6 +223,19 @@ class EksRegistryHostsDockerIntegrationTest {
         }
         assertTrue(saReady, "default serviceaccount must be created within 30 seconds");
 
+        // ACTIVE survives a Docker restart; wait for kubelet readiness before testing image pulls.
+        long nodeDeadline = System.currentTimeMillis() + 60000;
+        ExecResult nodeReady;
+        do {
+            nodeReady = execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "wait", "--for=condition=Ready", "nodes", "--all", "--timeout=1s"});
+            if (nodeReady.exitCode() == 0) {
+                break;
+            }
+            Thread.sleep(1000);
+        } while (System.currentTimeMillis() < nodeDeadline);
+        assertEquals(0, nodeReady.exitCode(), "node must become Ready after restart: " + nodeReady.stdout());
+
         String podYaml = """
                 apiVersion: v1
                 kind: Pod
@@ -248,7 +261,11 @@ class EksRegistryHostsDockerIntegrationTest {
             }
             Thread.sleep(2000);
         }
-        assertTrue(running, "registry-hosts-pod must reach Running, pulling its image through the configured host");
+        assertTrue(running, "registry-hosts-pod must reach Running, pulling its image through the configured host"
+                + (running ? "" : "\n" + execInContainerWithExitCode(containerId,
+                        new String[]{"kubectl", "describe", "pod", "registry-hosts-pod"}).stdout()
+                        + "\n" + execInContainerWithExitCode(containerId,
+                        new String[]{"kubectl", "describe", "nodes"}).stdout()));
         execInContainerWithExitCode(containerId, new String[]{"kubectl", "delete", "pod", "registry-hosts-pod", "--now"});
     }
 

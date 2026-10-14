@@ -296,6 +296,8 @@ class CloudFormationSchedulerScheduleIntegrationTest {
         Queue queue = sqs.createQueue("external-" + suffix, Map.of(), "us-east-1");
         prepareFailedRollback(stack, name, queue);
         allowOriginalRestore(name);
+        cloudFormation(stack, "ContinueUpdateRollback", null, Map.of());
+        outputs(stack, "UPDATE_ROLLBACK_COMPLETE");
 
         cloudFormation(stack, "UpdateStack", externalQueueTemplate(FAILURE, queue),
                 Map.of("Name", name, "Expression", "rate(15 minutes)", "Payload", "third"));
@@ -318,8 +320,12 @@ class CloudFormationSchedulerScheduleIntegrationTest {
         prepareFailedRollback(stack, name, queue);
         String snapshot = scheduleResource(stack).getAttributes().get("__FlociSchedulerUpdateSnapshot");
 
-        cloudFormation(stack, "UpdateStack", externalQueueTemplate("", queue),
-                Map.of("Name", name, "Expression", "rate(15 minutes)", "Payload", "third"));
+        given().contentType("application/x-www-form-urlencoded").header("Authorization", AUTH)
+                .formParam("Action", "UpdateStack").formParam("StackName", stack)
+                .formParam("TemplateBody", externalQueueTemplate("", queue))
+                .post("/").then().statusCode(400)
+                .body(containsString("UPDATE_ROLLBACK_FAILED"));
+        cloudFormation(stack, "ContinueUpdateRollback", null, Map.of());
         outputs(stack, "UPDATE_ROLLBACK_FAILED");
 
         getSchedule(name, "default").then().statusCode(200)
@@ -340,23 +346,17 @@ class CloudFormationSchedulerScheduleIntegrationTest {
         prepareFailedRollback(stack, name, queue);
         String snapshot = scheduleResource(stack).getAttributes().get("__FlociSchedulerUpdateSnapshot");
         String unchanged = externalQueueTemplate("", queue);
-        cloudFormation(stack, "UpdateStack", unchanged, Map.of("Name", name));
-
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                given().contentType("application/x-www-form-urlencoded").header("Authorization", AUTH)
-                        .formParam("Action", "DescribeStacks").formParam("StackName", stack).post("/")
-                        .then().statusCode(200)
-                        .body(containsString("<StackStatus>UPDATE_COMPLETE_CLEANUP_IN_PROGRESS</StackStatus>"))
-                        .body(containsString("Schedule rollback is still pending")));
-        assertEquals(snapshot, scheduleResource(stack).getAttributes().get("__FlociSchedulerUpdateSnapshot"));
-        assertEquals(unchanged, cloudFormation.describeStacks(stack, "us-east-1").getFirst().getOriginalTemplateBody());
-        getSchedule(name, "default").then().statusCode(200)
-                .body("ScheduleExpression", equalTo("rate(10 minutes)"))
-                .body("Target.Input", equalTo("payload:changed"));
+        String priorTemplate = cloudFormation.describeStacks(stack, "us-east-1").getFirst().getOriginalTemplateBody();
         given().contentType("application/x-www-form-urlencoded").header("Authorization", AUTH)
                 .formParam("Action", "UpdateStack").formParam("StackName", stack)
                 .formParam("TemplateBody", unchanged).post("/").then().statusCode(400)
-                .body(containsString("UPDATE_COMPLETE_CLEANUP_IN_PROGRESS"));
+                .body(containsString("UPDATE_ROLLBACK_FAILED"));
+        outputs(stack, "UPDATE_ROLLBACK_FAILED");
+        assertEquals(snapshot, scheduleResource(stack).getAttributes().get("__FlociSchedulerUpdateSnapshot"));
+        assertEquals(priorTemplate, cloudFormation.describeStacks(stack, "us-east-1").getFirst().getOriginalTemplateBody());
+        getSchedule(name, "default").then().statusCode(200)
+                .body("ScheduleExpression", equalTo("rate(10 minutes)"))
+                .body("Target.Input", equalTo("payload:changed"));
         deleteStack(stack);
         getSchedule(name, "default").then().statusCode(404);
         sqs.deleteQueue(queue.getQueueUrl(), "us-east-1");
@@ -508,6 +508,8 @@ class CloudFormationSchedulerScheduleIntegrationTest {
         Instant firstCreation = scheduler.getSchedule(replacementName, "default", "us-east-1").getCreationDate();
         doCallRealMethod().when(scheduler).deleteSchedule(replacementName, "default", "us-east-1");
         given().delete("/schedules/" + replacementName).then().statusCode(200);
+        cloudFormation(stack, "ContinueUpdateRollback", null, Map.of());
+        outputs(stack, "UPDATE_ROLLBACK_COMPLETE");
         doThrow(new AwsException("InternalServerException", "replacement deletion still unavailable", 500))
                 .when(scheduler).deleteSchedule(replacementName, "default", "us-east-1");
 
@@ -628,6 +630,11 @@ class CloudFormationSchedulerScheduleIntegrationTest {
         recreateScheduleViaApi(name, "default");
 
         try {
+            cloudFormation(stack, "ContinueUpdateRollback", null, Map.of());
+            outputs(stack, "UPDATE_ROLLBACK_COMPLETE");
+            getSchedule(name, "default").then().statusCode(200)
+                    .body("ScheduleExpression", equalTo("rate(5 minutes)"))
+                    .body("Target.Input", equalTo("payload:first"));
             cloudFormation(stack, "UpdateStack", externalQueueTemplate("", queue),
                     Map.of("Name", name, "Expression", "rate(15 minutes)", "Payload", "new"));
             outputs(stack, "UPDATE_COMPLETE");
@@ -683,6 +690,10 @@ class CloudFormationSchedulerScheduleIntegrationTest {
                 && group.equals(request.getGroupName())), eq("us-east-1"));
 
         try {
+            cloudFormation(stack, "ContinueUpdateRollback", null, Map.of());
+            outputs(stack, "UPDATE_ROLLBACK_COMPLETE");
+            assertTrue(pausedRecreatedDestination.get());
+            getSchedule(name, group).then().statusCode(404);
             cloudFormation(stack, "UpdateStack", externalQueueTemplate("", queue),
                     Map.of("Name", name, "Expression", "rate(15 minutes)", "Payload", "new"));
             outputs(stack, "UPDATE_COMPLETE");
