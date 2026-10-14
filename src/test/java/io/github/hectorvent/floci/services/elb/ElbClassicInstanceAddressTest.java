@@ -15,12 +15,12 @@ class ElbClassicInstanceAddressTest {
     @Test
     void externallyManagedInstancesUseTheSameDnsIdentityAsHealthChecks() {
         Instance instance = new Instance();
-        instance.setInstanceId("i-0123456789abcdef0");
-        assertEquals(instance.getInstanceId(), ElbClassicHealthChecker.instanceHost(instance));
+        String registeredId = "i-0123456789abcdef0";
+        assertEquals(registeredId, ElbClassicHealthChecker.instanceHost(instance, registeredId));
         instance.setContainerBridgeIp(" ");
-        assertEquals(instance.getInstanceId(), ElbClassicHealthChecker.instanceHost(instance));
+        assertEquals(registeredId, ElbClassicHealthChecker.instanceHost(instance, registeredId));
         instance.setContainerBridgeIp("10.20.30.40");
-        assertEquals("10.20.30.40", ElbClassicHealthChecker.instanceHost(instance));
+        assertEquals("10.20.30.40", ElbClassicHealthChecker.instanceHost(instance, registeredId));
     }
 
     @Test

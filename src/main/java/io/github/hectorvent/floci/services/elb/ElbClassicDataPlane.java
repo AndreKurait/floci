@@ -151,7 +151,7 @@ public class ElbClassicDataPlane {
                     || !"InService".equals(health.getHealth(lb, id).state())) {
                 continue;
             }
-            targets.add(ElbClassicHealthChecker.instanceHost(instance));
+            targets.add(ElbClassicHealthChecker.instanceHost(instance, id));
         }
         return targets;
     }
