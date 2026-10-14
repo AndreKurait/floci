@@ -278,6 +278,80 @@ class RdsServiceTest {
                 binding.getValue());
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "aurora-postgresql, create", "aurora-postgresql, reboot", "aurora-postgresql, retry",
+            "aurora-mysql, create", "aurora-mysql, reboot", "aurora-mysql, retry"
+    })
+    void memberIamBindingUsesClusterResourceIdAcrossRuntimePaths(String engine, String path) {
+        if ("retry".equals(path)) {
+            when(containerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                    .thenReturn(null);
+        }
+        DbCluster cluster = rdsService.createDbCluster("iam-cluster", engine, null,
+                "admin", "password", "dbname", true, null);
+        clearInvocations(proxyManager);
+        DbInstance member = rdsService.createDbInstance("iam-member", engine, null,
+                "admin", "password", "dbname", "db.serverless",
+                0, true, null, null, "iam-cluster");
+        if (!"create".equals(path)) {
+            clearInvocations(proxyManager);
+            if ("reboot".equals(path)) {
+                rdsService.rebootDbInstance("iam-member");
+            } else {
+                when(containerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                        .thenReturn(new RdsContainerHandle("late-container", cluster.getDbClusterArn(),
+                                "iam-cluster", "127.0.0.1", 15432));
+                rdsService.ensureInstanceBackend("iam-member", "us-east-1");
+            }
+        }
+        ArgumentCaptor<RdsProxyBinding> binding = ArgumentCaptor.forClass(RdsProxyBinding.class);
+        verify(proxyManager).startProxy(eq("rds-resource:" + member.getDbInstanceArn()),
+                any(), eq(true), anyInt(), any(), anyInt(), any(), any(), any(), any(), any(), binding.capture());
+        assertEquals(cluster.getDbClusterResourceId(), binding.getValue().resourceId());
+        assertNotEquals(member.getDbiResourceId(), binding.getValue().resourceId());
+        assertEquals("123456789012", binding.getValue().accountId());
+        assertEquals("us-east-1", binding.getValue().region());
+    }
+
+    @Test
+    void restoredMemberIamBindingsResolveSameNamedClustersByStoredAccountAndRegion() {
+        String defaultAccount = "123456789012";
+        InMemoryStorage<String, DbCluster> rawClusters = new InMemoryStorage<>();
+        InMemoryStorage<String, DbInstance> rawInstances = new InMemoryStorage<>();
+        int port = 7000;
+        for (String account : List.of(defaultAccount, "999999999999")) {
+            for (String region : List.of("us-east-1", "us-west-2")) {
+                DbCluster cluster = persistedCluster(account, "password", port++);
+                cluster.setDbClusterArn("arn:aws:rds:" + region + ":" + account + ":cluster:cluster1");
+                cluster.setDbClusterResourceId("cluster-" + account + "-" + region);
+                DbInstance member = persistedInstance("member", account, "password", port++);
+                member.setDbInstanceArn("arn:aws:rds:" + region + ":" + account + ":db:member");
+                member.setDbiResourceId("db-" + account + "-" + region);
+                member.setDbClusterIdentifier("cluster1");
+                member.setIamDatabaseAuthenticationEnabled(true);
+                cluster.getDbClusterMembers().add("member");
+                rawClusters.put(account + "/" + region + "::cluster1", cluster);
+                rawInstances.put(account + "/" + region + "::member", member);
+            }
+        }
+        RdsService service = newService(containerManager, proxyManager,
+                new AccountAwareStorageBackend<>(rawInstances, null, defaultAccount),
+                new AccountAwareStorageBackend<>(rawClusters, null, defaultAccount),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>());
+        service.restorePersistedRuntime();
+        for (String account : List.of(defaultAccount, "999999999999")) {
+            for (String region : List.of("us-east-1", "us-west-2")) {
+                ArgumentCaptor<RdsProxyBinding> binding = ArgumentCaptor.forClass(RdsProxyBinding.class);
+                verify(proxyManager).startProxy(eq("rds-resource:arn:aws:rds:" + region + ":" + account + ":db:member"),
+                        any(), eq(true), anyInt(), any(), anyInt(), any(), any(), any(), any(), any(), binding.capture());
+                assertEquals("cluster-" + account + "-" + region, binding.getValue().resourceId());
+                assertEquals(account, binding.getValue().accountId());
+                assertEquals(region, binding.getValue().region());
+            }
+        }
+    }
+
     @Test
     void createDbInstanceLeavesPostgresIamTokensUnboundWhenTheBindingIsTurnedOff() {
         when(rdsConfig.iamTokenEndpointBinding()).thenReturn(false);

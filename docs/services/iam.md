@@ -145,6 +145,22 @@ policies are listed in name order so a `Marker` resumes where the previous page 
 | DeleteRolePolicy | Deletes an inline policy from a role. |
 | ListRolePolicies | Lists inline policy names stored on a role. |
 
+Inline policies share an aggregate size limit per principal: 2,048 characters for a user,
+5,120 for a group, and 10,240 for a role. Whitespace does not count. A replacement counts
+instead of the previous document with the same policy name; exceeding the limit returns
+`LimitExceeded` (HTTP 409) and preserves the stored policies. These limits match the
+[AWS IAM quotas](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_iam-quotas.html).
+
+When CloudFormation renames an inline policy, Floci releases its tracked old name on
+retained principals before writing the replacement. Failed updates restore the captured
+previous policies, including historical documents saved before these limits were enforced.
+Compensation checks the current principal, document and mutation ownership before restoration.
+A later write to the same policy prevents restoration even when it writes the same document;
+nested compensations can still unwind in reverse order. Mutation ownership lasts only within
+the current process and active rollback handles. Historical
+oversized documents can be restored only when the other policies still match their captured
+state. A failed compensation is reported as a rollback failure.
+
 ### Instance Profiles
 
 | Action | Description |

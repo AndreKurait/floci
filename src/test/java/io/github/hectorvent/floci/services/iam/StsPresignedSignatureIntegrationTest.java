@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -28,7 +29,9 @@ import java.util.stream.Collectors;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 @TestProfile(StsPresignedSignatureIntegrationTest.SignaturesAndEnforcement.class)
@@ -289,6 +292,74 @@ class StsPresignedSignatureIntegrationTest {
     }
 
     @ParameterizedTest
+    @CsvSource({"sts, expired", "sts, scope", "iam, expired", "iam, scope",
+            "sqs, expired", "sqs, scope", "lambda, expired", "lambda, scope",
+            "sts, future", "iam, future", "sqs, future", "lambda, future"})
+    void queryRefusalExplainsExpiryOrExpectedService(String service, String failure) throws Exception {
+        boolean rest = "lambda".equals(service);
+        boolean queryProtocol = "sts".equals(service) || "iam".equals(service);
+        String method = rest ? "GET" : "POST";
+        String path = rest ? "/2015-03-31/functions" : "/";
+        String body = "sts".equals(service) ? "Action=GetCallerIdentity&Version=2011-06-15"
+                : "iam".equals(service) ? "Action=ListUsers&Version=2010-05-08" : rest ? "" : "{}";
+        boolean expired = "expired".equals(failure);
+        boolean future = "future".equals(failure);
+        long cutoffOffset = future ? 900 : -60;
+        Instant signedAt = Instant.now().plusSeconds(future ? 1200 : expired ? -120 : 0)
+                .truncatedTo(ChronoUnit.SECONDS);
+        URI uri = presignRequest("test", "test", method, path, expired || future ? service : "kms", body,
+                new TreeMap<>(), null, signedAt);
+        RequestSpecification request = given().urlEncodingEnabled(false);
+        if (queryProtocol) {
+            request.contentType("application/x-www-form-urlencoded");
+        } else if (!rest) {
+            request.contentType("application/x-amz-json-1.0").header("X-Amz-Target", "AmazonSQS.ListQueues");
+        }
+        if (queryProtocol) {
+            request.body(body);
+        } else if (!rest) {
+            request.body(body.getBytes(StandardCharsets.UTF_8));
+        }
+        Instant before = Instant.now().plusSeconds(cutoffOffset).truncatedTo(ChronoUnit.SECONDS);
+        Response response = request.request(method, uri);
+        Instant after = Instant.now().plusSeconds(cutoffOffset).truncatedTo(ChronoUnit.SECONDS);
+        response.then().statusCode(403);
+        String message;
+        if (queryProtocol) {
+            response.then().body("ErrorResponse.Error.Code", equalTo("SignatureDoesNotMatch"));
+            message = response.xmlPath().getString("ErrorResponse.Error.Message");
+        } else {
+            response.then().header("X-Amzn-Errortype", equalTo("InvalidSignatureException"));
+            message = response.jsonPath().getString("message");
+        }
+        if (expired || future) {
+            DateTimeFormatter format = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
+            String prefix = future
+                    ? "Signature not yet current: " + format.format(signedAt) + " is still later than "
+                    : "Signature expired: " + format.format(signedAt) + " is now earlier than ";
+            assertTrue(message.startsWith(prefix), message);
+            Instant cutoff = Instant.from(format.parse(message.substring(prefix.length())));
+            assertTrue(!cutoff.isBefore(before) && !cutoff.isAfter(after), message);
+        } else {
+            assertEquals("Credential should be scoped to correct service: '"
+                    + service + "'", message);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"airflow", "mwaa", "kms"})
+    void multipleAcceptedScopesDoNotInventCanonicalSigningName(String service) throws Exception {
+        URI uri = presignRequest("test", "test", "GET", "/environments", service, "", new TreeMap<>(), null);
+        Response response = given().urlEncodingEnabled(false).get(uri);
+        if ("kms".equals(service)) {
+            response.then().statusCode(403).header("X-Amzn-Errortype", equalTo("InvalidSignatureException"))
+                    .body("message", equalTo("Credential should be scoped to the service receiving the request."));
+        } else {
+            response.then().statusCode(200);
+        }
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"bad%ZZ=x&Action=ListUsers", "Action=ListUsers&X-Amz-Security-Token=%"})
     void malformedFormCannotEscapeAsServerError(String body) throws Exception {
         URI uri = presignRequest("test", "test", "POST", "/", "iam", body, new TreeMap<>(), null);
@@ -307,8 +378,14 @@ class StsPresignedSignatureIntegrationTest {
 
     private static URI presignRequest(String key, String secret, String method, String path, String service,
                                      String body, TreeMap<String, String> query, Boolean signedMarker) throws Exception {
+        return presignRequest(key, secret, method, path, service, body, query, signedMarker, Instant.now());
+    }
+
+    private static URI presignRequest(String key, String secret, String method, String path, String service,
+                                     String body, TreeMap<String, String> query, Boolean signedMarker,
+                                     Instant signedAt) throws Exception {
         URI endpoint = URI.create("http://localhost:" + RestAssured.port + path);
-        String date = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC).format(Instant.now());
+        String date = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC).format(signedAt);
         String scope = date.substring(0, 8) + "/us-east-1/" + service + "/aws4_request";
         query.putAll(Map.of("X-Amz-Algorithm", "AWS4-HMAC-SHA256", "X-Amz-Credential", key + "/" + scope,
                 "X-Amz-Date", date, "X-Amz-Expires", "60", "X-Amz-SignedHeaders", Boolean.TRUE.equals(signedMarker)

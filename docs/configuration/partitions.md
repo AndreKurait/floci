@@ -116,7 +116,10 @@ back to `aws` for a label no partition publishes.
   per-region table (`aws/region-facts.json`, generated from the Terraform provider and the CDK,
   which transcribe the AWS General Reference); Network load balancers have their own zone,
   distinct from the Application/Classic one. The CloudFront hosted zone is published for `aws`
-  and `aws-cn`; the SAML sign-on URL for five partitions. The ISO and EUSC regions have no load
+  and `aws-cn`; the SAML sign-on URL for five partitions. The console link in a CodePipeline
+  approval notification uses the console host of the pipeline's partition (`console.amazonaws.cn`
+  in China, `console.amazonaws-us-gov.com` in GovCloud), as the China and GovCloud user guides
+  state it; the path after the host is the commercial console's. The ISO and EUSC regions have no load
   balancer hosted zones, and only the two ISO-F regions have an S3 website zone; where a table has
   no row the field is omitted rather than guessed. An `EDGE` API Gateway REST API or custom domain is
   refused outside the commercial partition (`BadRequestException`): GovCloud, EUSC and ISO have no
@@ -241,6 +244,8 @@ the commercial value or Floci's own base host until sourced:
   (`us-iso-east-1-az1`), where the other partitions get AWS's short prefix (`use1-az1`, `usgw1-az1`,
   `cnn1-az1`);
 - S3 `LocationConstraint` enum values and Route 53 hosted zones for the ISO and EUSC regions;
+- the management console host in the ISO and EUSC partitions, where a CodePipeline approval
+  notification keeps linking to the commercial `console.aws.amazon.com`;
 - the SAML sign-on URL in `aws-iso-e`, `aws-iso-f` and `aws-eusc`, where assertions keep being
   checked against the commercial `https://signin.aws.amazon.com/saml`;
 - the exact error AWS WAF returns for the `CLOUDFRONT` scope in a partition without CloudFront

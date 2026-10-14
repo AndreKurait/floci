@@ -847,7 +847,7 @@ public class RdsService implements Resettable, ResourceProvider {
                         (user, pw) -> validateDbPasswordForScope(
                                 accountId, instanceRegion, id, user, pw),
                         proxyBinding(engine, instance.getEndpoint().address(), instance.getEndpoint().port(),
-                                instanceRegion, accountId, instance.getDbiResourceId()));
+                                instanceRegion, accountId, dbUserResourceId(instance)));
             } catch (RuntimeException | Error e) {
                 try {
                     deleteInstanceForScope(accountId, effectiveRegion, id);
@@ -3610,7 +3610,7 @@ public class RdsService implements Resettable, ResourceProvider {
                         (user, pw) -> validateDbPasswordForScope(
                                 accountId, instanceRegion, id, user, pw),
                         proxyBinding(instance.getEngine(), instance.getEndpoint().address(),
-                                instance.getEndpoint().port(), instanceRegion, accountId, instance.getDbiResourceId()));
+                                instance.getEndpoint().port(), instanceRegion, accountId, dbUserResourceId(instance)));
             } else {
                 // No backing container: created or last rebooted while no daemon was reachable.
                 instance = ensureInstanceBackend(id, effectiveRegion);
@@ -3619,6 +3619,18 @@ public class RdsService implements Resettable, ResourceProvider {
 
         LOG.infov("DB instance {0} rebooted", id);
         return instance;
+    }
+
+    private String dbUserResourceId(DbInstance instance) {
+        String clusterId = instance.getDbClusterIdentifier();
+        if (clusterId != null && !clusterId.isBlank()) {
+            DbCluster cluster = findClusterForScope(accountIdFromArn(instance.getDbInstanceArn()),
+                    regionFromArn(instance.getDbInstanceArn()), clusterId);
+            if (cluster != null) {
+                return cluster.getDbClusterResourceId();
+            }
+        }
+        return instance.getDbiResourceId();
     }
 
     /**
@@ -3718,7 +3730,7 @@ public class RdsService implements Resettable, ResourceProvider {
                     (user, pw) -> validateDbPasswordForScope(
                             accountId, instanceRegion, id, user, pw),
                     proxyBinding(instance.getEngine(), relayEndpoint.address(),
-                            relayEndpoint.port(), instanceRegion, accountId, instance.getDbiResourceId()));
+                            relayEndpoint.port(), instanceRegion, accountId, dbUserResourceId(instance)));
         } catch (RuntimeException e) {
             if (allocatedRelayPort) {
                 releaseProxyPort(relayPort);
@@ -7954,7 +7966,7 @@ public class RdsService implements Resettable, ResourceProvider {
                                     accountId, instanceRegion,
                                     instance.getDbInstanceIdentifier(), user, pw),
                             proxyBinding(instance.getEngine(), instance.getEndpoint().address(), instance.getEndpoint().port(),
-                                    instanceRegion, accountId, instance.getDbiResourceId()));
+                                    instanceRegion, accountId, dbUserResourceId(instance)));
                 }
                 instance.setStatus(DbInstanceStatus.AVAILABLE);
                 putInstanceForScope(accountId, instanceRegion,

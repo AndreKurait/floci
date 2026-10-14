@@ -149,6 +149,130 @@ class IamServiceTest {
         assertEquals(1, iamService.listRolePolicies("R").size());
     }
 
+    @Test
+    void userInlinePolicyQuotaIgnoresWhitespaceAndPreservesRejectedReplacement() {
+        iamService.createUser("R", "/");
+        String exactLimit = policyWithNonWhitespaceLength(2_048);
+        String padded = exactLimit.substring(0, 1) + " \n\t\r ".repeat(1_000) + exactLimit.substring(1);
+        iamService.putUserPolicy("R", "inline-exec", padded);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.putUserPolicy("R", "inline-exec", policyWithNonWhitespaceLength(2_049)));
+
+        assertEquals("LimitExceeded", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        assertEquals(padded, iamService.getUserPolicy("R", "inline-exec"));
+        iamService.putUserPolicy("R", "inline-exec", exactLimit);
+        assertEquals(exactLimit, iamService.getUserPolicy("R", "inline-exec"));
+    }
+
+    @Test
+    void userInlinePolicyQuotaCountsAllPolicies() {
+        iamService.createUser("R", "/");
+        iamService.putUserPolicy("R", "first", policyWithNonWhitespaceLength(1_200));
+        iamService.putUserPolicy("R", "second", policyWithNonWhitespaceLength(649));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.putUserPolicy("R", "third", policyWithNonWhitespaceLength(200)));
+
+        assertEquals("LimitExceeded", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        assertEquals(List.of("first", "second"), iamService.listUserPolicies("R").stream().sorted().toList());
+    }
+
+    @Test
+    void userInlinePolicyQuotaIsAtomicAcrossConcurrentWrites() throws Exception {
+        iamService.createUser("R", "/");
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger accepted = new AtomicInteger();
+        AtomicInteger rejected = new AtomicInteger();
+
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            for (String policyName : List.of("first", "second")) {
+                executor.submit(() -> {
+                    start.await();
+                    try {
+                        iamService.putUserPolicy("R", policyName, policyWithNonWhitespaceLength(1_200));
+                        accepted.incrementAndGet();
+                    } catch (AwsException error) {
+                        assertEquals("LimitExceeded", error.getErrorCode());
+                        rejected.incrementAndGet();
+                    }
+                    return null;
+                });
+            }
+            start.countDown();
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+
+        assertEquals(1, accepted.get());
+        assertEquals(1, rejected.get());
+        assertEquals(1, iamService.listUserPolicies("R").size());
+    }
+
+    @Test
+    void groupInlinePolicyQuotaIgnoresWhitespaceAndPreservesRejectedReplacement() {
+        iamService.createGroup("R", "/");
+        String exactLimit = policyWithNonWhitespaceLength(5_120);
+        String padded = exactLimit.substring(0, 1) + " \n\t\r ".repeat(1_000) + exactLimit.substring(1);
+        iamService.putGroupPolicy("R", "inline-exec", padded);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.putGroupPolicy("R", "inline-exec", policyWithNonWhitespaceLength(5_121)));
+
+        assertEquals("LimitExceeded", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        assertEquals(padded, iamService.getGroupPolicy("R", "inline-exec"));
+        iamService.putGroupPolicy("R", "inline-exec", exactLimit);
+        assertEquals(exactLimit, iamService.getGroupPolicy("R", "inline-exec"));
+    }
+
+    @Test
+    void groupInlinePolicyQuotaCountsAllPolicies() {
+        iamService.createGroup("R", "/");
+        iamService.putGroupPolicy("R", "first", policyWithNonWhitespaceLength(3_000));
+        iamService.putGroupPolicy("R", "second", policyWithNonWhitespaceLength(1_921));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.putGroupPolicy("R", "third", policyWithNonWhitespaceLength(200)));
+
+        assertEquals("LimitExceeded", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        assertEquals(List.of("first", "second"), iamService.listGroupPolicies("R").stream().sorted().toList());
+    }
+
+    @Test
+    void groupInlinePolicyQuotaIsAtomicAcrossConcurrentWrites() throws Exception {
+        iamService.createGroup("R", "/");
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger accepted = new AtomicInteger();
+        AtomicInteger rejected = new AtomicInteger();
+
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            for (String policyName : List.of("first", "second")) {
+                executor.submit(() -> {
+                    start.await();
+                    try {
+                        iamService.putGroupPolicy("R", policyName, policyWithNonWhitespaceLength(3_000));
+                        accepted.incrementAndGet();
+                    } catch (AwsException error) {
+                        assertEquals("LimitExceeded", error.getErrorCode());
+                        rejected.incrementAndGet();
+                    }
+                    return null;
+                });
+            }
+            start.countDown();
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+
+        assertEquals(1, accepted.get());
+        assertEquals(1, rejected.get());
+        assertEquals(1, iamService.listGroupPolicies("R").size());
+    }
+
     /** The STS global endpoint, and so the token version it reports, exists only in the commercial partition. */
     @Test
     void accountSummaryReportsTheGlobalEndpointTokenVersionOnlyWhereStsHasAGlobalHost() {
@@ -636,6 +760,9 @@ class IamServiceTest {
         assertEquals(10L, empty.get("AttachedPoliciesPerGroupQuota"));
         assertEquals(20L, empty.get("AttachedPoliciesPerRoleQuota"));
         assertEquals(6144L, empty.get("PolicySizeQuota"));
+        assertEquals(2048L, empty.get("UserPolicySizeQuota"));
+        assertEquals(5120L, empty.get("GroupPolicySizeQuota"));
+        assertEquals(10240L, empty.get("RolePolicySizeQuota"));
         assertEquals(0L, empty.get("Providers"));
         assertEquals(0L, empty.get("AccountAccessKeysPresent"));
 

@@ -3,7 +3,6 @@ package com.floci.test;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import software.amazon.awssdk.core.waiters.WaiterOverrideConfiguration;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ecs.EcsClient;
 import software.amazon.awssdk.services.ecs.model.Compatibility;
@@ -86,7 +85,7 @@ class EcsEphemeralVolumeTest {
                     DescribeTasksRequest describe = DescribeTasksRequest.builder()
                             .cluster(name).tasks(task.taskArn()).build();
                     assertThat(ecs.waiter().waitUntilTasksStopped(describe,
-                            WaiterOverrideConfiguration.builder().waitTimeout(Duration.ofSeconds(30)).build())
+                            TestFixtures.waiterOverride(Duration.ofSeconds(30)))
                             .matched().response()).isPresent();
                     Task stopped = ecs.describeTasks(describe).tasks().get(0);
                     assertThat(stopped.containers()).hasSize(2).allSatisfy(container -> {

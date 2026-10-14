@@ -28,7 +28,9 @@ import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -375,7 +377,10 @@ public class AutoScalingReconciler {
                         launchSource.launchConfigurationName() == null ? launchSource.iamInstanceProfile()
                                 : asgService.resolveLaunchConfigurationProfile(launchSource.iamInstanceProfile()),
                         launchSource.associatePublicIpAddress(), null, 0, null,
-                        launchSource.metadataOptions(), null, null, false, null, null, launchSource.blockDevices());
+                        launchSource.metadataOptions(), null,
+                        launchSource.encodedUserData() != null ? launchSource.encodedUserData()
+                                : encodeLegacyUserData(launchSource.userData()),
+                        false, null, null, launchSource.blockDevices());
 
                 for (Instance ec2Inst : reservation.getInstances()) {
                     AsgInstance asgInst = new AsgInstance();
@@ -652,6 +657,16 @@ public class AutoScalingReconciler {
     private LaunchSource resolveLaunchSource(AutoScalingGroup asg) {
         LaunchConfiguration lc = resolveLaunchConfiguration(asg);
         if (lc != null) {
+            String userData = lc.getUserData();
+            if (Boolean.TRUE.equals(lc.getUserDataBase64Encoded())) {
+                try {
+                    userData = Ec2UserDataDecoder.decode(userData);
+                } catch (AwsException e) {
+                    LOG.warnv("ASG {0}: cannot decode user data for launch configuration {1}: {2}",
+                            asg.getAutoScalingGroupName(), lc.getLaunchConfigurationName(), e.getMessage());
+                    return null;
+                }
+            }
             return new LaunchSource(
                     lc.getLaunchConfigurationName(),
                     lc.getImageId(),
@@ -659,7 +674,8 @@ public class AutoScalingReconciler {
                     lc.getKeyName(),
                     lc.getSecurityGroups(),
                     List.of(),
-                    lc.getUserData(),
+                    userData,
+                    Boolean.TRUE.equals(lc.getUserDataBase64Encoded()) ? lc.getUserData() : null,
                     lc.getIamInstanceProfile(),
                     null,
                     null,
@@ -690,6 +706,7 @@ public class AutoScalingReconciler {
                     version.getData().getInstanceTags(),
                     Ec2UserDataDecoder.decodeIfMissing(
                             version.getData().getUserData(), version.getData().getEncodedUserData()),
+                    null,
                     ec2Service.iamInstanceProfileArn(version.getData()),
                     asg.getLaunchTemplateId(),
                     asg.getLaunchTemplateName(),
@@ -722,6 +739,7 @@ public class AutoScalingReconciler {
                         version.getData().getInstanceTags(),
                         Ec2UserDataDecoder.decodeIfMissing(
                                 version.getData().getUserData(), version.getData().getEncodedUserData()),
+                        null,
                         ec2Service.iamInstanceProfileArn(version.getData()),
                         specification.getLaunchTemplateId() == null
                                 ? mixedLaunchTemplate.getLaunchTemplateId()
@@ -734,6 +752,10 @@ public class AutoScalingReconciler {
         }
 
         return null;
+    }
+
+    private static String encodeLegacyUserData(String userData) {
+        return userData == null ? null : Base64.getEncoder().encodeToString(userData.getBytes(StandardCharsets.UTF_8));
     }
 
     private LaunchConfiguration resolveLaunchConfiguration(AutoScalingGroup asg) {
@@ -855,6 +877,7 @@ public class AutoScalingReconciler {
             List<String> securityGroupIds,
             List<io.github.hectorvent.floci.services.ec2.model.Tag> instanceTags,
             String userData,
+            String encodedUserData,
             String iamInstanceProfile,
             String launchTemplateId,
             String launchTemplateName,

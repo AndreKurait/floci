@@ -19,6 +19,9 @@ public class LaunchConfiguration {
     private String keyName;
     private List<String> securityGroups = new ArrayList<>();
     private String userData;
+    // Historical configurations mixed API base64 and decoded instance text. An absent marker
+    // retains their existing launch behavior; only newly created records have known encoding.
+    private Boolean userDataBase64Encoded;
     private String iamInstanceProfile;
     private LaunchTemplateData.MetadataOptions metadataOptions;
     // Nullable on purpose: AWS treats an absent flag as "fall back to the
@@ -57,6 +60,8 @@ public class LaunchConfiguration {
 
     public LaunchTemplateData.MetadataOptions getMetadataOptions() { return metadataOptions; }
     public void setMetadataOptions(LaunchTemplateData.MetadataOptions value) { this.metadataOptions = value; }
+    public Boolean getUserDataBase64Encoded() { return userDataBase64Encoded; }
+    public void setUserDataBase64Encoded(Boolean v) { this.userDataBase64Encoded = v; }
 
     public String getIamInstanceProfile() { return iamInstanceProfile; }
     public void setIamInstanceProfile(String v) { this.iamInstanceProfile = v; }

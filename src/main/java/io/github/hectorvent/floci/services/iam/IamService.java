@@ -54,6 +54,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.lang.ref.WeakReference;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
@@ -80,6 +81,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
@@ -103,6 +105,11 @@ import java.util.stream.Stream;
 @ApplicationScoped
 public class IamService implements SessionAccountLookup, ResourceProvider {
 
+    public static final String FEDERATION_TOKEN_SESSION_MESSAGE =
+            "Cannot call GetFederationToken with session credentials";
+
+    private static final int USER_INLINE_POLICY_SIZE_LIMIT = 2_048;
+    private static final int GROUP_INLINE_POLICY_SIZE_LIMIT = 5_120;
     private static final int ROLE_INLINE_POLICY_SIZE_LIMIT = 10_240;
     private static final Logger LOG = Logger.getLogger(IamService.class);
     private static final String CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -389,6 +396,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private final String seededAccountAlias;
     /** Guards case-insensitive IAM name uniqueness checks and their corresponding writes. */
     private final Object resourceNameLock = new Object();
+    // Undo handles retain their ownership keys; completed attempts leave no permanent history.
+    // Both keys and values are weak because each owner itself holds its canonical key.
+    private final Map<InlinePolicyKey, WeakReference<InlinePolicyOwner>> inlinePolicyOwners = new WeakHashMap<>();
     /**
      * Guards every check-then-write on a login profile. ChangePassword is the reason it has to
      * exist: it reads the profile to compare the old password, then writes the new one, so two
@@ -770,61 +780,63 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void deleteUser(String userName) {
-        IamUser user = getUser(userName);
-        if (!user.getAttachedPolicyArns().isEmpty()) {
-            throw new AwsException("DeleteConflict",
-                    "Cannot delete entity, must detach all policies first.", 409);
-        }
-        if (!user.getGroupNames().isEmpty()) {
-            throw new AwsException("DeleteConflict",
-                    "Cannot delete entity, must remove from all groups first.", 409);
-        }
-        if (loginProfiles.get(userName).isPresent()) {
-            throw new AwsException("DeleteConflict",
-                    "Cannot delete entity, must delete login profile first.", 409);
-        }
-        if (!user.getInlinePolicies().isEmpty()) {
-            throw new AwsException("DeleteConflict",
-                    "Cannot delete entity, must delete policies first.", 409);
-        }
-        if (!userAccessKeys(userName).isEmpty()) {
-            throw new AwsException("DeleteConflict",
-                    "Cannot delete entity, must delete access keys first.", 409);
-        }
-        // Both locks are held across the delete rather than just the checks: UploadSigningCertificate
-        // UploadSigningCertificate and EnableMFADevice confirm the user under their own lock, so
-        // none of them can interleave into a credential owned by a deleted user. Taken in this
-        // order here and in UpdateUser, and nowhere else in more than one, so it cannot deadlock.
-        synchronized (serviceCredentialLock) {
-            // AWS lists these among the items to remove first, under their CodeCommit
-            // name: "Git credentials (DeleteServiceSpecificCredential)". Unlike the
-            // cases above it has no message of its own: AWS falls back to the generic
-            // referenced-objects wording here.
-            if (!userServiceCredentials(userName).isEmpty()) {
+        synchronized (resourceNameLock) {
+            IamUser user = getUser(userName);
+            if (!user.getAttachedPolicyArns().isEmpty()) {
                 throw new AwsException("DeleteConflict",
-                        "Cannot delete entity, must remove referenced objects first.", 409);
+                        "Cannot delete entity, must detach all policies first.", 409);
             }
-            synchronized (sshPublicKeyLock) {
-                if (!userSshPublicKeys(userName).isEmpty()) {
+            if (!user.getGroupNames().isEmpty()) {
+                throw new AwsException("DeleteConflict",
+                        "Cannot delete entity, must remove from all groups first.", 409);
+            }
+            if (loginProfiles.get(userName).isPresent()) {
+                throw new AwsException("DeleteConflict",
+                        "Cannot delete entity, must delete login profile first.", 409);
+            }
+            if (!user.getInlinePolicies().isEmpty()) {
+                throw new AwsException("DeleteConflict",
+                        "Cannot delete entity, must delete policies first.", 409);
+            }
+            if (!userAccessKeys(userName).isEmpty()) {
+                throw new AwsException("DeleteConflict",
+                        "Cannot delete entity, must delete access keys first.", 409);
+            }
+            // Both locks are held across the delete rather than just the checks: UploadSigningCertificate
+            // UploadSigningCertificate and EnableMFADevice confirm the user under their own lock, so
+            // none of them can interleave into a credential owned by a deleted user. Taken in this
+            // order here and in UpdateUser, and nowhere else in more than one, so it cannot deadlock.
+            synchronized (serviceCredentialLock) {
+                // AWS lists these among the items to remove first, under their CodeCommit
+                // name: "Git credentials (DeleteServiceSpecificCredential)". Unlike the
+                // cases above it has no message of its own: AWS falls back to the generic
+                // referenced-objects wording here.
+                if (!userServiceCredentials(userName).isEmpty()) {
                     throw new AwsException("DeleteConflict",
-                            "Cannot delete entity, must delete SSH public keys first.", 409);
+                            "Cannot delete entity, must remove referenced objects first.", 409);
                 }
-                synchronized (signingCertificateLock) {
-                    if (!userSigningCertificates(userName).isEmpty()) {
+                synchronized (sshPublicKeyLock) {
+                    if (!userSshPublicKeys(userName).isEmpty()) {
                         throw new AwsException("DeleteConflict",
-                                "Cannot delete entity, must delete signing certificates first.", 409);
+                                "Cannot delete entity, must delete SSH public keys first.", 409);
                     }
-                    synchronized (mfaDeviceLock) {
-                        if (!mfaDevicesForUser(userName).isEmpty()) {
+                    synchronized (signingCertificateLock) {
+                        if (!userSigningCertificates(userName).isEmpty()) {
                             throw new AwsException("DeleteConflict",
-                                    "Cannot delete entity, must deactivate MFA device first.", 409);
+                                    "Cannot delete entity, must delete signing certificates first.", 409);
                         }
-                        users.delete(userName);
+                        synchronized (mfaDeviceLock) {
+                            if (!mfaDevicesForUser(userName).isEmpty()) {
+                                throw new AwsException("DeleteConflict",
+                                        "Cannot delete entity, must deactivate MFA device first.", 409);
+                            }
+                            users.delete(userName);
+                        }
                     }
                 }
             }
+            LOG.infov("Deleted IAM user: {0}", userName);
         }
-        LOG.infov("Deleted IAM user: {0}", userName);
     }
 
     public List<IamUser> listUsers(String pathPrefix) {
@@ -1028,17 +1040,19 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void deleteGroup(String groupName) {
-        IamGroup group = getGroup(groupName);
-        if (!group.getAttachedPolicyArns().isEmpty() || !group.getInlinePolicies().isEmpty()) {
-            throw new AwsException("DeleteConflict",
-                    "Cannot delete entity, must detach all policies first.", 409);
+        synchronized (resourceNameLock) {
+            IamGroup group = getGroup(groupName);
+            if (!group.getAttachedPolicyArns().isEmpty() || !group.getInlinePolicies().isEmpty()) {
+                throw new AwsException("DeleteConflict",
+                        "Cannot delete entity, must detach all policies first.", 409);
+            }
+            if (!group.getUserNames().isEmpty()) {
+                throw new AwsException("DeleteConflict",
+                        "Cannot delete entity, must remove all users from group first.", 409);
+            }
+            groups.delete(groupName);
+            LOG.infov("Deleted IAM group: {0}", groupName);
         }
-        if (!group.getUserNames().isEmpty()) {
-            throw new AwsException("DeleteConflict",
-                    "Cannot delete entity, must remove all users from group first.", 409);
-        }
-        groups.delete(groupName);
-        LOG.infov("Deleted IAM group: {0}", groupName);
     }
 
     public List<IamGroup> listGroups(String pathPrefix) {
@@ -1210,15 +1224,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void deleteRole(String roleName) {
-        validateRoleName(roleName);
-        IamRole role = getRole(roleName);
-        requireNotServiceLinked(role, roleName);
-        if (!role.getAttachedPolicyArns().isEmpty() || !role.getInlinePolicies().isEmpty()) {
-            throw new AwsException("DeleteConflict",
-                    "Cannot delete entity, must detach all policies first.", 409);
+        synchronized (resourceNameLock) {
+            validateRoleName(roleName);
+            IamRole role = getRole(roleName);
+            requireNotServiceLinked(role, roleName);
+            if (!role.getAttachedPolicyArns().isEmpty() || !role.getInlinePolicies().isEmpty()) {
+                throw new AwsException("DeleteConflict",
+                        "Cannot delete entity, must detach all policies first.", 409);
+            }
+            roles.delete(roleName);
+            LOG.infov("Deleted IAM role: {0}", roleName);
         }
-        roles.delete(roleName);
-        LOG.infov("Deleted IAM role: {0}", roleName);
     }
 
     /**
@@ -1630,9 +1646,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         summary.put("AttachedPoliciesPerUserQuota", 10L);
         summary.put("AttachedPoliciesPerGroupQuota", 10L);
         summary.put("AttachedPoliciesPerRoleQuota", 20L);
-        summary.put("GroupPolicySizeQuota", 5120L);
-        summary.put("UserPolicySizeQuota", 2048L);
-        summary.put("RolePolicySizeQuota", 10240L);
+        summary.put("GroupPolicySizeQuota", (long) GROUP_INLINE_POLICY_SIZE_LIMIT);
+        summary.put("UserPolicySizeQuota", (long) USER_INLINE_POLICY_SIZE_LIMIT);
+        summary.put("RolePolicySizeQuota", (long) ROLE_INLINE_POLICY_SIZE_LIMIT);
         summary.put("AccessKeysPerUserQuota", 2L);
         summary.put("SigningCertificatesPerUserQuota", 2L);
         summary.put("ServerCertificates", (long) serverCertificates.scan(k -> true).size());
@@ -1883,9 +1899,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // =========================================================================
 
     public void putUserPolicy(String userName, String policyName, String policyDocument) {
-        IamUser user = getUser(userName);
-        user.getInlinePolicies().put(policyName, policyDocument);
-        users.put(userName, user);
+        synchronized (resourceNameLock) {
+            IamUser user = getUser(userName);
+            Map<String, String> inlinePolicies = user.getInlinePolicies();
+            synchronized (inlinePolicies) {
+                checkInlinePolicyQuota(inlinePolicies, policyName, policyDocument,
+                        USER_INLINE_POLICY_SIZE_LIMIT, "user " + userName);
+                inlinePolicies.put(policyName, policyDocument);
+                invalidateInlinePolicyOwner("User", user.getUserId(), policyName);
+                users.put(userName, user);
+            }
+        }
     }
 
     public String getUserPolicy(String userName, String policyName) {
@@ -1899,12 +1923,15 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void deleteUserPolicy(String userName, String policyName) {
-        IamUser user = getUser(userName);
-        if (user.getInlinePolicies().remove(policyName) == null) {
-            throw new AwsException("NoSuchEntity",
-                    "Policy " + policyName + " not found for user " + userName + ".", 404);
+        synchronized (resourceNameLock) {
+            IamUser user = getUser(userName);
+            if (user.getInlinePolicies().remove(policyName) == null) {
+                throw new AwsException("NoSuchEntity",
+                        "Policy " + policyName + " not found for user " + userName + ".", 404);
+            }
+            invalidateInlinePolicyOwner("User", user.getUserId(), policyName);
+            users.put(userName, user);
         }
-        users.put(userName, user);
     }
 
     public List<String> listUserPolicies(String userName) {
@@ -1916,9 +1943,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // =========================================================================
 
     public void putGroupPolicy(String groupName, String policyName, String policyDocument) {
-        IamGroup group = getGroup(groupName);
-        group.getInlinePolicies().put(policyName, policyDocument);
-        groups.put(groupName, group);
+        synchronized (resourceNameLock) {
+            IamGroup group = getGroup(groupName);
+            Map<String, String> inlinePolicies = group.getInlinePolicies();
+            synchronized (inlinePolicies) {
+                checkInlinePolicyQuota(inlinePolicies, policyName, policyDocument,
+                        GROUP_INLINE_POLICY_SIZE_LIMIT, "group " + groupName);
+                inlinePolicies.put(policyName, policyDocument);
+                invalidateInlinePolicyOwner("Group", group.getGroupId(), policyName);
+                groups.put(groupName, group);
+            }
+        }
     }
 
     public String getGroupPolicy(String groupName, String policyName) {
@@ -1932,12 +1967,15 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void deleteGroupPolicy(String groupName, String policyName) {
-        IamGroup group = getGroup(groupName);
-        if (group.getInlinePolicies().remove(policyName) == null) {
-            throw new AwsException("NoSuchEntity",
-                    "Policy " + policyName + " not found for group " + groupName + ".", 404);
+        synchronized (resourceNameLock) {
+            IamGroup group = getGroup(groupName);
+            if (group.getInlinePolicies().remove(policyName) == null) {
+                throw new AwsException("NoSuchEntity",
+                        "Policy " + policyName + " not found for group " + groupName + ".", 404);
+            }
+            invalidateInlinePolicyOwner("Group", group.getGroupId(), policyName);
+            groups.put(groupName, group);
         }
-        groups.put(groupName, group);
     }
 
     public List<String> listGroupPolicies(String groupName) {
@@ -1949,22 +1987,165 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // =========================================================================
 
     public void putRolePolicy(String roleName, String policyName, String policyDocument) {
-        validateRoleName(roleName);
-        IamRole role = getRole(roleName);
-        requireNotServiceLinked(role, roleName);
-        Map<String, String> inlinePolicies = role.getInlinePolicies();
-        synchronized (inlinePolicies) {
-            long aggregateSize = inlinePolicies.entrySet().stream()
-                    .filter(entry -> !entry.getKey().equals(policyName))
-                    .mapToLong(entry -> nonWhitespaceLength(entry.getValue()))
-                    .sum() + nonWhitespaceLength(policyDocument);
-            if (aggregateSize > ROLE_INLINE_POLICY_SIZE_LIMIT) {
-                throw new AwsException("LimitExceeded",
-                        "Maximum policy size of 10240 bytes exceeded for role " + roleName, 409);
+        synchronized (resourceNameLock) {
+            validateRoleName(roleName);
+            IamRole role = getRole(roleName);
+            requireNotServiceLinked(role, roleName);
+            Map<String, String> inlinePolicies = role.getInlinePolicies();
+            synchronized (inlinePolicies) {
+                checkInlinePolicyQuota(inlinePolicies, policyName, policyDocument,
+                        ROLE_INLINE_POLICY_SIZE_LIMIT, "role " + roleName);
+                inlinePolicies.put(policyName, policyDocument);
+                invalidateInlinePolicyOwner("Role", role.getRoleId(), policyName);
+                roles.put(roleName, role);
             }
-            inlinePolicies.put(policyName, policyDocument);
-            roles.put(roleName, role);
         }
+    }
+
+    /**
+     * CloudFormation compensation captures the stored document with the write. The returned
+     * operation can restore that exact historical value, including policies saved before quotas
+     * were enforced; it cannot admit a caller-supplied oversized replacement.
+     */
+    public InlinePolicyChange putUserPolicyWithRollback(String userName, String policyName, String document) {
+        return changeInlinePolicy(users, "User", userName, policyName, () -> getUser(userName),
+                IamUser::getUserId,
+                IamUser::getInlinePolicies, () -> putUserPolicy(userName, policyName, document),
+                document, USER_INLINE_POLICY_SIZE_LIMIT);
+    }
+
+    public InlinePolicyChange deleteUserPolicyWithRollback(String userName, String policyName) {
+        return changeInlinePolicy(users, "User", userName, policyName, () -> getUser(userName),
+                IamUser::getUserId,
+                IamUser::getInlinePolicies, () -> deleteUserPolicy(userName, policyName),
+                null, USER_INLINE_POLICY_SIZE_LIMIT);
+    }
+
+    public InlinePolicyChange putGroupPolicyWithRollback(String groupName, String policyName, String document) {
+        return changeInlinePolicy(groups, "Group", groupName, policyName, () -> getGroup(groupName),
+                IamGroup::getGroupId,
+                IamGroup::getInlinePolicies, () -> putGroupPolicy(groupName, policyName, document),
+                document, GROUP_INLINE_POLICY_SIZE_LIMIT);
+    }
+
+    public InlinePolicyChange deleteGroupPolicyWithRollback(String groupName, String policyName) {
+        return changeInlinePolicy(groups, "Group", groupName, policyName, () -> getGroup(groupName),
+                IamGroup::getGroupId,
+                IamGroup::getInlinePolicies, () -> deleteGroupPolicy(groupName, policyName),
+                null, GROUP_INLINE_POLICY_SIZE_LIMIT);
+    }
+
+    public InlinePolicyChange putRolePolicyWithRollback(String roleName, String policyName, String document) {
+        return changeInlinePolicy(roles, "Role", roleName, policyName, () -> getValidatedRole(roleName),
+                IamRole::getRoleId,
+                IamRole::getInlinePolicies, () -> putRolePolicy(roleName, policyName, document),
+                document, ROLE_INLINE_POLICY_SIZE_LIMIT);
+    }
+
+    public InlinePolicyChange deleteRolePolicyWithRollback(String roleName, String policyName) {
+        return changeInlinePolicy(roles, "Role", roleName, policyName, () -> getValidatedRole(roleName),
+                IamRole::getRoleId,
+                IamRole::getInlinePolicies, () -> deleteRolePolicy(roleName, policyName),
+                null, ROLE_INLINE_POLICY_SIZE_LIMIT);
+    }
+
+    private <T> InlinePolicyChange changeInlinePolicy(StorageBackend<String, T> store, String kind, String principal,
+                                                       String policyName, Supplier<T> lookup, Function<T, String> identity,
+                                                       Function<T, Map<String, String>> policies,
+                                                       Runnable change, String expectedDocument, int limit) {
+        synchronized (resourceNameLock) {
+            T original = lookup.get();
+            String account = regionResolver.getAccountId();
+            String principalId = identity.apply(original);
+            Map<String, String> inlinePolicies = policies.apply(original);
+            synchronized (inlinePolicies) {
+                String previousDocument = inlinePolicies.get(policyName);
+                Map<String, String> previousSiblings = new LinkedHashMap<>(inlinePolicies);
+                previousSiblings.remove(policyName);
+                InlinePolicyKey candidateKey = new InlinePolicyKey(account, kind, principalId, policyName);
+                InlinePolicyOwner previousOwner = inlinePolicyOwner(candidateKey);
+                InlinePolicyKey key = previousOwner == null ? candidateKey : previousOwner.key();
+                change.run();
+                // Remove an equal stale weak key before installing a new canonical key.
+                inlinePolicyOwners.remove(key);
+                InlinePolicyOwner owner = new InlinePolicyOwner(key);
+                inlinePolicyOwners.put(key, new WeakReference<>(owner));
+                return new InlinePolicyChange(previousDocument, () -> {
+                    synchronized (resourceNameLock) {
+                        if (!account.equals(regionResolver.getAccountId())) {
+                            throw inlinePolicyRollbackConflict(principal, policyName);
+                        }
+                        T current = store.get(principal).orElseThrow(() ->
+                                inlinePolicyRollbackConflict(principal, policyName));
+                        if (!Objects.equals(principalId, identity.apply(current))) {
+                            throw inlinePolicyRollbackConflict(principal, policyName);
+                        }
+                        Map<String, String> currentPolicies = policies.apply(current);
+                        synchronized (currentPolicies) {
+                            if (inlinePolicyOwner(key) != owner
+                                    || !Objects.equals(expectedDocument, currentPolicies.get(policyName))) {
+                                throw inlinePolicyRollbackConflict(principal, policyName);
+                            }
+                            if (previousDocument != null
+                                    && inlinePolicySize(currentPolicies, policyName, previousDocument) > limit) {
+                                Map<String, String> currentSiblings = new LinkedHashMap<>(currentPolicies);
+                                currentSiblings.remove(policyName);
+                                if (!previousSiblings.equals(currentSiblings)) {
+                                    throw inlinePolicyRollbackConflict(principal, policyName);
+                                }
+                            }
+                            if (previousDocument == null) {
+                                currentPolicies.remove(policyName);
+                            } else {
+                                currentPolicies.put(policyName, previousDocument);
+                            }
+                            store.put(principal, current);
+                            inlinePolicyOwners.remove(key);
+                            if (previousOwner != null) {
+                                inlinePolicyOwners.put(previousOwner.key(), new WeakReference<>(previousOwner));
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    private record InlinePolicyKey(String account, String kind, String principalId, String policyName) {}
+
+    private record InlinePolicyOwner(InlinePolicyKey key) {}
+
+    private InlinePolicyOwner inlinePolicyOwner(InlinePolicyKey key) {
+        WeakReference<InlinePolicyOwner> owner = inlinePolicyOwners.get(key);
+        return owner == null ? null : owner.get();
+    }
+
+    private void invalidateInlinePolicyOwner(String kind, String principalId, String policyName) {
+        inlinePolicyOwners.remove(new InlinePolicyKey(regionResolver.getAccountId(), kind, principalId, policyName));
+    }
+
+    public record InlinePolicyChange(String previousDocument, Runnable rollback) {}
+
+    private static AwsException inlinePolicyRollbackConflict(String principal, String policyName) {
+        return new AwsException("ConcurrentModification",
+                "Cannot restore inline policy " + policyName + " on " + principal
+                        + " because its rollback ownership or state changed after the update.", 409);
+    }
+
+    private static void checkInlinePolicyQuota(Map<String, String> inlinePolicies, String policyName,
+                                               String policyDocument, int limit, String principal) {
+        long aggregateSize = inlinePolicySize(inlinePolicies, policyName, policyDocument);
+        if (aggregateSize > limit) {
+            throw new AwsException("LimitExceeded",
+                    "Maximum policy size of " + limit + " bytes exceeded for " + principal, 409);
+        }
+    }
+
+    private static long inlinePolicySize(Map<String, String> policies, String name, String document) {
+        return policies.entrySet().stream()
+                .filter(entry -> !entry.getKey().equals(name))
+                .mapToLong(entry -> nonWhitespaceLength(entry.getValue()))
+                .sum() + nonWhitespaceLength(document);
     }
 
     private static int nonWhitespaceLength(String policyDocument) {
@@ -1990,14 +2171,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void deleteRolePolicy(String roleName, String policyName) {
-        validateRoleName(roleName);
-        IamRole role = getRole(roleName);
-        requireNotServiceLinked(role, roleName);
-        if (role.getInlinePolicies().remove(policyName) == null) {
-            throw new AwsException("NoSuchEntity",
-                    "Policy " + policyName + " not found for role " + roleName + ".", 404);
+        synchronized (resourceNameLock) {
+            validateRoleName(roleName);
+            IamRole role = getRole(roleName);
+            requireNotServiceLinked(role, roleName);
+            if (role.getInlinePolicies().remove(policyName) == null) {
+                throw new AwsException("NoSuchEntity",
+                        "Policy " + policyName + " not found for role " + roleName + ".", 404);
+            }
+            invalidateInlinePolicyOwner("Role", role.getRoleId(), policyName);
+            roles.put(roleName, role);
         }
-        roles.put(roleName, role);
     }
 
     public List<String> listRolePolicies(String roleName) {

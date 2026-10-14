@@ -63,6 +63,9 @@ import java.util.regex.Pattern;
  *       key itself is still checked.</li>
  * </ul>
  *
+ * <p>Authenticated temporary callers of {@code sts:GetFederationToken} are refused here with
+ * the same operation-specific error as the handler, before policy evaluation.
+ *
  * <p>Evaluates the caller's identity policies, optional session policy, and optional
  * permissions boundary, as well as applicable resource policies via {@link ResourcePolicyProvider}.
  *
@@ -363,6 +366,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         }
         if ("sts:GetCallerIdentity".equals(action)) {
             return; // AWS returns caller identity even when an identity policy explicitly denies it
+        }
+
+        if ("sts:GetFederationToken".equals(action) && IamService.isTemporaryAccessKey(akid)) {
+            ctx.abortWith(queryXmlAccessDenied(IamService.FEDERATION_TOKEN_SESSION_MESSAGE));
+            return;
         }
 
         // Service control policies from the caller's organization, when the Organizations

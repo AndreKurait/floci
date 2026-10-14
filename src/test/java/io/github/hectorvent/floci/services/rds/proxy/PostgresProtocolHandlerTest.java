@@ -40,6 +40,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -488,7 +489,7 @@ class PostgresProtocolHandlerTest {
             } finally {
                 proxyClient.close();
                 authThread.join(5_000);
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertFalse(authThread.isAlive(), "authThread did not terminate");
             }
             assertNull(authFailure.get(), "TLS authentication thread failed");
         }

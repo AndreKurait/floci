@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.autoscaling.model.*;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.Ec2UserDataDecoder;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
@@ -17,8 +18,10 @@ import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.*;
+import java.util.Base64;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -218,7 +221,11 @@ public class AutoScalingService {
                             .collect(Collectors.toList());
                 }
                 if (isBlank(userData)) {
-                    userData = source.getUserData();
+                    userData = source.getEncodedUserData();
+                    if (userData == null && source.getUserData() != null) {
+                        userData = Base64.getEncoder().encodeToString(
+                                source.getUserData().getBytes(StandardCharsets.UTF_8));
+                    }
                 }
                 if (isBlank(iamInstanceProfile)) {
                     iamInstanceProfile = source.getIamInstanceProfileArn();
@@ -226,6 +233,7 @@ public class AutoScalingService {
             }
         }
         resolveLaunchConfigurationProfile(iamInstanceProfile);
+        Ec2UserDataDecoder.decode(userData);
         LaunchConfiguration lc = new LaunchConfiguration();
         lc.setLaunchConfigurationName(name);
         lc.setLaunchConfigurationArn(
@@ -236,6 +244,7 @@ public class AutoScalingService {
         lc.setKeyName(keyName);
         lc.setSecurityGroups(securityGroups != null ? new ArrayList<>(securityGroups) : new ArrayList<>());
         lc.setUserData(userData);
+        lc.setUserDataBase64Encoded(Boolean.TRUE);
         lc.setIamInstanceProfile(iamInstanceProfile);
         lc.setMetadataOptions(metadataOptions);
         lc.setAssociatePublicIpAddress(associatePublicIpAddress);
