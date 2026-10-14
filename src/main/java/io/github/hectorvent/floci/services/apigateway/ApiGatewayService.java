@@ -785,16 +785,18 @@ public class ApiGatewayService implements ResourceProvider {
         getRestApi(region, apiId);
         String description = (String) request.getOrDefault("description", "");
         String snapshot;
+        Map<String, String> schemas;
         try {
             snapshot = JSON.writeValueAsString(new DeploymentExportSnapshot(getRestApi(region, apiId),
                     getResources(region, apiId), getModels(region, apiId), getAuthorizers(region, apiId),
                     getRequestValidators(region, apiId), getGatewayResponses(region, apiId).stream()
                             .filter(response -> !response.isDefaultResponse()).toList()));
+            schemas = modelSchemas(JSON.readValue(snapshot, DeploymentExportSnapshot.class).models());
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Cannot capture REST API deployment", e);
         }
         Deployment deployment = new Deployment(shortId(10), description, System.currentTimeMillis() / 1000L, snapshot);
-        deploymentModelStore.put(deploymentKey(region, apiId, deployment.id()), currentModelSchemas(region, apiId));
+        deploymentModelStore.put(deploymentKey(region, apiId, deployment.id()), schemas);
         deploymentStore.put(deploymentKey(region, apiId, deployment.id()), deployment);
         LOG.infov("Created deployment {0} for API {1}", deployment.id(), apiId);
 
@@ -864,8 +866,12 @@ public class ApiGatewayService implements ResourceProvider {
     }
 
     private Map<String, String> currentModelSchemas(String region, String apiId) {
+        return modelSchemas(getModels(region, apiId));
+    }
+
+    private Map<String, String> modelSchemas(List<Model> models) {
         Map<String, String> schemas = new HashMap<>();
-        for (Model model : getModels(region, apiId)) {
+        for (Model model : models) {
             if (model.getSchema() != null) {
                 schemas.put(model.getName(), model.getSchema());
             }
