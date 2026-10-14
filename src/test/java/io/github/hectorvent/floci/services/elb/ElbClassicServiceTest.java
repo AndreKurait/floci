@@ -311,11 +311,11 @@ class ElbClassicServiceTest {
 
     @Test
     void registerAndDeregisterInstancesAreIdempotent() {
-        create("my-elb");
+        ClassicLoadBalancer lb = create("my-elb");
         service.registerInstances(REGION, "my-elb", List.of("i-1"));
         assertEquals(List.of("i-1"), service.registerInstances(REGION, "my-elb", List.of("i-1")));
         assertEquals(List.of(), service.deregisterInstances(REGION, "my-elb", List.of("i-1")));
-        verify(healthChecker).deregisterInstances(REGION, "my-elb", List.of("i-1"));
+        verify(healthChecker).deregisterInstances(lb, List.of("i-1"));
     }
 
     @Test
