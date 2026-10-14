@@ -6,6 +6,8 @@ import io.github.hectorvent.floci.config.TlsCertificateManager;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.apigateway.model.Deployment;
+import io.github.hectorvent.floci.services.apigateway.model.Model;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -18,7 +20,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 
 class ApiGatewayDeploymentModelTest {
@@ -27,6 +31,26 @@ class ApiGatewayDeploymentModelTest {
     private static final String ORIGINAL = "{\"type\":\"string\",\"enum\":[\"READY\"]}";
     private static final String UPDATED = "{\"type\":\"string\",\"enum\":[\"DONE\"]}";
     private static final String SNAPSHOTS = "apigateway-deployment-models.json";
+
+    @Test
+    void deploymentValidationUsesTheSchemaCapturedForExport(@TempDir Path directory) throws Exception {
+        ApiGatewayService service = spy(service(directory));
+        String apiId = service.createRestApi(REGION, Map.of("name", "concurrent-model-update")).getId();
+        Model original = new Model();
+        original.setName("Status");
+        original.setSchema(ORIGINAL);
+        Model updated = new Model();
+        updated.setName("Status");
+        updated.setSchema(UPDATED);
+        doReturn(List.of(original), List.of(updated)).when(service).getModels(REGION, apiId);
+
+        Deployment deployment = service.createDeployment(REGION, apiId, Map.of());
+
+        assertEquals(ORIGINAL, new ObjectMapper().readTree(deployment.exportSnapshot())
+                .path("models").get(0).path("schema").asText());
+        assertEquals(Map.of("Status", ORIGINAL),
+                service.getDeploymentModelSchemas(REGION, apiId, deployment.id()));
+    }
 
     @Test
     void deploymentModelsSurviveUpdatesDeletionAndRestart(@TempDir Path directory) {
