@@ -13,6 +13,11 @@ import java.util.Optional;
  */
 public interface DnsRecordSource {
 
+    /** Stored public authority data only; this lookup must not perform recursive resolution. */
+    default Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
+        return Optional.empty();
+    }
+
     /**
      * Resolves a query name to IPv4 addresses and their TTL. An empty optional means this
      * source does not own the name. The name arrives without a trailing dot and in the case the client sent.

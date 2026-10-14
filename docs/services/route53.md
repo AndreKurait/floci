@@ -61,20 +61,28 @@ Floci resolves private hosted zone DNS records directly through its embedded DNS
 
 - **Record Types**: Resolves IPv4 `A` records (including `CNAME` and `ALIAS` target chasing across private zones, EC2 internal names, and external hostnames). When a private CNAME targets a public hostname, Floci resolves the target addresses off the event loop so container stub resolvers succeed. Multiple values are returned as separate answers.
 - **TTL and Negative Answers**: Answers carry the record set's `TTL`. A chased `CNAME` chain is flattened to `A` records, so it answers with the shortest TTL in the chain; an alias answers with its target's TTL, and an alias or `CNAME` to a name outside the private zones answers with at most 60 seconds, since Floci cannot see that target's TTL. A name absent from the zone receives NXDOMAIN; a name that exists without an `A` record (only `TXT`, for example, or only records beneath it) receives NOERROR with no answers. A wildcard record such as `*.example.internal` answers only when neither the name nor an ancestor closer than the wildcard exists, so a record at `api.team.example.internal` keeps the wildcard from answering for `team.example.internal` or anything beneath it.
-- **Zone Visibility and Fallthrough**: Only private hosted zones (created with a VPC association) are answered by Floci's embedded Route 53 resolver. Public zones and external domains fall through to upstream forwarders. Because the standard DNS wire protocol carries no caller VPC identifier, Floci resolves across private zones without filtering by account or VPC ID.
+- **Zone Visibility and Fallthrough**: Private hosted zones (created with a VPC association) retain IPv4 resolution. Public zones support the authoritative record types described below; unowned external domains fall through to upstream forwarders. Because the standard DNS wire protocol carries no caller VPC identifier, Floci resolves across private zones without filtering by account or VPC ID.
 - **Resolver Rule Precedence**: A Route 53 Resolver rule associated with the querying container's VPC takes precedence over a private hosted zone that matches the same name, as it does in AWS: the query is forwarded to the rule's targets instead of answered from the zone. See [Route 53 Resolver](route53resolver.md#resolver-rules-and-dns-resolution).
 - **Zero-Restart Propagation**: Record changes via `ChangeResourceRecordSets` take effect immediately without restarts.
 - **Kubernetes and external-dns Compatibility**: In-cluster controllers like `external-dns` provisioning Route 53 private records for Services or Ingresses are immediately resolvable.
+
+## Public Authoritative DNS
+
+The same embedded UDP server serves stored public `TXT`, `NS`, and `SOA` records with authoritative answers and their configured TTLs. DNS clients must be able to reach Floci on UDP port 53. The default delegation names below resolve to Floci through its embedded resolver; external container resolvers need to forward `route53.localhost.floci.io` there.
+
+The longest matching public zone answers. Missing names return NXDOMAIN; existing names without the requested supported type return NOERROR with no answers. Both include the zone SOA with the smaller of its TTL and minimum field for negative caching. Changes and deletes affect DNS through the same stored record sets as the Route 53 API.
+
+Public address routing, aliases, CNAME chasing, health-based or weighted record selection, and delegation referrals are not implemented. Queries needing these features, unsupported public types, or ambiguous duplicate public zones return REFUSED without claiming authority. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary; TCP fallback is not implemented.
 
 ## Default Nameservers
 
 New zones use these nameservers (configurable via `floci.services.route53.*`):
 
 ```
-ns-1.awsdns-01.org
-ns-2.awsdns-02.net
-ns-3.awsdns-03.com
-ns-4.awsdns-04.co.uk
+ns-1.route53.localhost.floci.io
+ns-2.route53.localhost.floci.io
+ns-3.route53.localhost.floci.io
+ns-4.route53.localhost.floci.io
 ```
 
 ## Configuration
@@ -82,10 +90,10 @@ ns-4.awsdns-04.co.uk
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_ROUTE53_ENABLED` | `true` | Enable or disable the service |
-| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER1` | `ns-1.awsdns-01.org` | First default nameserver returned in delegation sets |
-| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER2` | `ns-2.awsdns-02.net` | Second default nameserver |
-| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER3` | `ns-3.awsdns-03.com` | Third default nameserver |
-| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER4` | `ns-4.awsdns-04.co.uk` | Fourth default nameserver |
+| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER1` | `ns-1.route53.localhost.floci.io` | First default nameserver returned in delegation sets |
+| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER2` | `ns-2.route53.localhost.floci.io` | Second default nameserver |
+| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER3` | `ns-3.route53.localhost.floci.io` | Third default nameserver |
+| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER4` | `ns-4.route53.localhost.floci.io` | Fourth default nameserver |
 | `FLOCI_SERVICES_ROUTE53_VPC_ASSOCIATION_CONTROL_PLANE_DELAY_MS` | `0` | Optional VPC association/auth processing window used to reproduce documented retryable overlap errors |
 
 ## CLI Examples
@@ -163,4 +171,4 @@ aws route53 delete-hosted-zone --id Z1PA6795UKMFR9
 - Query logging configs
 - DNSSEC (key signing keys, enabling/disabling)
 - `TestDNSAnswer`
-- Public hosted zone authoritative DNS serving (queries for public zones fall through to upstream forwarders)
+- Public authoritative record types other than simple TXT, NS, and SOA; public routing policies, delegation referrals, and DNS-over-TCP

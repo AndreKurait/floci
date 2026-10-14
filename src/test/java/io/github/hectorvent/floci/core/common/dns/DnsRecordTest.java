@@ -47,4 +47,29 @@ class DnsRecordTest {
         assertEquals(1, answer.records().size());
         assertFalse(answer.isEmpty());
     }
+
+    @Test
+    void txtPreservesQuotedSegmentsEscapesAndEmptyStrings() {
+        assertArrayEquals(new byte[]{3, 'a', ' ', 'b', 2, '"', '\\', 1, (byte) 255, 0},
+                new DnsRecord.Txt("\"a b\" \"\\\"\\\\\" \"\\377\" \"\"").data());
+        assertEquals(256, new DnsRecord.Txt("\"" + "x".repeat(255) + "\"").data().length);
+        assertThrows(IllegalArgumentException.class,
+                () -> new DnsRecord.Txt("\"" + "x".repeat(256) + "\"").data());
+        assertThrows(IllegalArgumentException.class, () -> new DnsRecord.Txt("\"\\400\"").data());
+        assertThrows(IllegalArgumentException.class, () -> new DnsRecord.Txt("\"unclosed").data());
+    }
+
+    @Test
+    void soaEncodesNamesAndUnsignedFields() {
+        byte[] bytes = new DnsRecord.Soa("ns.example. host.example. 4294967295 7200 900 1209600 30").data();
+        ByteBuffer packet = ByteBuffer.wrap(bytes);
+        assertEquals("ns.example", EmbeddedDnsServer.readName(packet, bytes));
+        assertEquals("host.example", EmbeddedDnsServer.readName(packet, bytes));
+        assertEquals(4294967295L, Integer.toUnsignedLong(packet.getInt()));
+        assertEquals(7200, packet.getInt());
+        assertEquals(900, packet.getInt());
+        assertEquals(1209600, packet.getInt());
+        assertEquals(30, packet.getInt());
+        assertArrayEquals(DnsRecord.encodeName("ns.example."), new DnsRecord.Ns("ns.example.").data());
+    }
 }
