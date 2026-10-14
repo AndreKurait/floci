@@ -75,6 +75,11 @@ aws sns verify-sms-sandbox-phone-number --phone-number +15555550100 --one-time-p
   --endpoint-url $AWS_ENDPOINT_URL
 ```
 
+A wrong code fails with `VerificationException` and the number stays `Pending`. AWS requires the
+error's `Status` member but documents no values for it, so Floci picks one: the number's verification
+status, `Pending`. `Pending` and `Verified` are the only statuses SNS publishes for a sandbox number,
+and the developer guide reads a number left `Pending` as an unsuccessful verification.
+
 AWS opts a number out when its owner replies STOP. Nothing reaches Floci that way, so no number is
 ever opted out: `CheckIfPhoneNumberIsOptedOut` answers `false`, `ListPhoneNumbersOptedOut` is
 empty, and `OptInPhoneNumber` only checks that the number is in E.164 format.

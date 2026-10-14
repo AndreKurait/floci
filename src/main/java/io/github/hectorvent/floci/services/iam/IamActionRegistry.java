@@ -1,6 +1,9 @@
 package io.github.hectorvent.floci.services.iam;
 
+import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
 import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
+import io.github.hectorvent.floci.core.common.ProtocolClaim;
+import io.github.hectorvent.floci.core.common.WireProtocol;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
@@ -251,15 +254,15 @@ public class IamActionRegistry {
         if (isQueryRequest(ctx)) {
             String queryAction = queryAction(ctx);
             if (queryAction != null && !queryAction.isBlank()) {
-                return credentialScope + ":" + queryAction;
+                return IamAuthorizedActions.actionFor(credentialScope, queryAction);
             }
         }
 
-        // JSON 1.1: X-Amz-Target → service:OperationName
+        // JSON 1.1: X-Amz-Target → the action AWS checks for the operation it names
         String target = ctx.getHeaderString("X-Amz-Target");
         if (target != null && target.contains(".")) {
             String operationName = target.substring(target.lastIndexOf('.') + 1);
-            return credentialScope + ":" + operationName;
+            return IamAuthorizedActions.actionFor(credentialScope, operationName);
         }
 
         return resolveRoute(credentialScope, ctx);
@@ -318,32 +321,42 @@ public class IamActionRegistry {
     }
 
     /**
-     * Returns the Query-protocol action from the form body while preserving the entity stream for
-     * the controller. The controller dispatches only the form body, using the same Action-first,
-     * Operation-second rule. A URL Action must not override the operation that will execute.
+     * Returns the Query action from GET query parameters or the POST form body, preserving the
+     * entity stream. Both use the controller's Action-first, Operation-second rule; a POST URL
+     * Action must not override the form operation that will execute.
      */
     public String queryAction(ContainerRequestContext ctx) {
+        if ("GET".equalsIgnoreCase(ctx.getMethod())) {
+            return AwsQueryServiceResolver.action(ctx.getUriInfo().getQueryParameters());
+        }
         return AwsQueryServiceResolver.action(
                 RequestBodyReader.formField(ctx, "Action"),
                 RequestBodyReader.formField(ctx, "Operation"));
     }
 
-    /**
-     * Returns the API version a Query request declares, from the form body for the same reason as
-     * {@link #queryAction}: it is the value the controller routes on.
-     */
+    /** Returns the API version from the same Query input that the controller dispatches. */
     public String queryVersion(ContainerRequestContext ctx) {
+        if ("GET".equalsIgnoreCase(ctx.getMethod())) {
+            return ctx.getUriInfo().getQueryParameters().getFirst("Version");
+        }
         return RequestBodyReader.formField(ctx, "Version");
     }
 
-    /** The same form POST at the root that the Query controller dispatches. */
+    /** The root form POST or CloudWatch GET that the Query controller dispatches. */
     public static boolean isQueryRequest(ContainerRequestContext ctx) {
-        if (!"POST".equalsIgnoreCase(ctx.getMethod()) || ctx.getUriInfo() == null) {
+        if ("GET".equalsIgnoreCase(ctx.getMethod())) {
+            return ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY) instanceof ProtocolClaim claim
+                    && claim.protocol() == WireProtocol.AWS_QUERY;
+        }
+        if (ctx.getUriInfo() == null) {
             return false;
         }
         String path = ctx.getUriInfo().getPath();
+        if (path != null && !path.isEmpty() && !"/".equals(path)) {
+            return false;
+        }
         MediaType mediaType = ctx.getMediaType();
-        return (path == null || path.isEmpty() || "/".equals(path))
+        return "POST".equalsIgnoreCase(ctx.getMethod())
                 && mediaType != null
                 && "application".equalsIgnoreCase(mediaType.getType())
                 && "x-www-form-urlencoded".equalsIgnoreCase(mediaType.getSubtype());

@@ -448,7 +448,9 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
                     CborErrorResponses.mediaTypeFor(contentType)));
             return;
         }
-        if (isFormEncoded(ctx.getMediaType())) {
+        if (isFormEncoded(ctx.getMediaType())
+                || ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY) instanceof ProtocolClaim claim
+                && claim.protocol() == WireProtocol.AWS_QUERY) {
             ctx.abortWith(AwsQueryResponse.error(queryCode, message, null, status));
             return;
         }

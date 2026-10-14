@@ -100,6 +100,27 @@ class DynamoDbTransactionAuthorizationIntegrationTest {
         request("test", "GetItem", keyBody(table)).statusCode(200).body("Item.value.S", equalTo("original"));
     }
 
+    /**
+     * A transaction item is authorized against a context built for that item, so the keys that
+     * say who is calling have to be written onto it as well: a policy scoped to the caller's own
+     * {@code aws:username} authorizes the item, and the same policy naming somebody else does not.
+     */
+    @Test
+    void aTransactionItemCarriesTheCallersPrincipalKeys() {
+        String name = "tx-auth-" + UUID.randomUUID();
+        String own = table();
+        String caller = userNamed(name, policy("dynamodb:PutItem",
+                ",\"Condition\":{\"StringEquals\":{\"aws:username\":\"" + name + "\"}}"));
+        transaction(caller, "Put", own).statusCode(200);
+        assertResult("Put", own);
+
+        String other = table();
+        String stranger = user(policy("dynamodb:PutItem",
+                ",\"Condition\":{\"StringEquals\":{\"aws:username\":\"somebody-else\"}}"));
+        transaction(stranger, "Put", other).statusCode(400).body(containsString("AccessDeniedException"));
+        request("test", "GetItem", keyBody(other)).statusCode(200).body("Item.value.S", equalTo("original"));
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"Put", "Update", "Delete", "Get", "ConditionCheck"})
     void extraEnvelopeFieldCannotBypassItemAuthorization(String operation) {
@@ -324,7 +345,11 @@ class DynamoDbTransactionAuthorizationIntegrationTest {
     }
 
     private String user(String policy) {
-        String name = "tx-auth-" + UUID.randomUUID();
+        return userNamed("tx-auth-" + UUID.randomUUID(), policy);
+    }
+
+    /** A user whose name the caller chooses, for a policy that has to name it. */
+    private String userNamed(String name, String policy) {
         String key = createUser(cleanup, endpoint.getPort(), auth("test", "iam"), name).accessKeyId();
         given().header("Authorization", auth("test", "iam")).formParam("Action", "PutUserPolicy")
                 .formParam("UserName", name).formParam("PolicyName", "transaction")

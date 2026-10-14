@@ -155,6 +155,11 @@ gzip and expansion beyond 10 MiB; this is Floci's execution safety limit, not an
 Invalid marked data in an older saved configuration is contained as a launch failure so reconciliation
 can still save the group and check refresh progress.
 
+Direct and mixed launch templates retain the selected version's original user-data
+encoding for instance attributes and metadata, including compressed and binary
+payloads. Execution still uses decoded text. Older templates that store only
+execution text retain that text through a UTF-8 fallback.
+
 Auto Scaling groups preserve either a launch configuration, a top-level launch template, or a `MixedInstancesPolicy`. These launch sources are mutually exclusive in create/update requests. When a mixed instances policy is supplied, Floci stores and returns:
 
 - `LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateId`

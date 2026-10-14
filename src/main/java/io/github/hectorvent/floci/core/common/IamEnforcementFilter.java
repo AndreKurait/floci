@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.cloudtrail.CloudTrailService;
 import io.github.hectorvent.floci.services.iam.IamActionRegistry;
+import io.github.hectorvent.floci.services.iam.IamAuthorizedActions;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.ResourceAccountRelationship;
@@ -472,13 +473,13 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if (callerArns.isPresent()) {
             caller = caller.withPrincipalArn(callerArns.get().callerArn());
             conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
-            putPrincipalKeys(conditionContext, callerArns.get());
+            callerArns.get().putPrincipalKeys(conditionContext);
         }
         List<Map<String, List<String>>> targetContexts = new ArrayList<>();
         targetContexts.add(conditionContext);
         for (Map<String, List<String>> target : remainingTargets) {
             Map<String, List<String>> targetContext = new HashMap<>(target);
-            callerArns.ifPresent(arns -> putPrincipalKeys(targetContext, arns));
+            callerArns.ifPresent(arns -> arns.putPrincipalKeys(targetContext));
             targetContexts.add(targetContext);
         }
 
@@ -490,7 +491,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if (!transactionItems.isEmpty()) {
             for (IamConditionContextResolver.DynamoDbTransactionItem item : transactionItems) {
                 Map<String, List<String>> itemContext = new HashMap<>(item.context());
-                callerArns.ifPresent(arns -> putPrincipalKeys(itemContext, arns));
+                callerArns.ifPresent(arns -> arns.putPrincipalKeys(itemContext));
                 if (abortIfDenied(ctx, caller, principal, item.action(), credentialScope,
                         resolveResourceArns(credentialScope, List.of(item.resource())), List.of(itemContext),
                         region, accountId, akid)) {
@@ -551,7 +552,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     private ResolvedAuthorization resolveAuthorization(String auth, String claimedScope,
                                                         ContainerRequestContext ctx) {
         Object claimValue = ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY);
-        // Authorization must not depend on the pre-matching claim filter running first.
+        // Form POSTs are also recognized without a claim; GET dispatch requires the Query claim.
         if (IamActionRegistry.isQueryRequest(ctx)) {
             String queryAction = actionRegistry.queryAction(ctx);
             if (queryAction == null || queryAction.isBlank()) {
@@ -561,7 +562,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String servingScope = catalog.byExternalKey(service)
                     .map(descriptor -> iamServiceScope(descriptor, claimedScope))
                     .orElseGet(() -> catalog.canonicalCredentialScope(service));
-            return new ResolvedAuthorization(servingScope, servingScope + ":" + queryAction);
+            return new ResolvedAuthorization(servingScope,
+                    IamAuthorizedActions.actionFor(servingScope, queryAction));
         }
 
         ResolvedAuthorization routeAuthorization = restRouteAuthorization(ctx);
@@ -677,14 +679,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     private record ResolvedAuthorization(String credentialScope, String action) {
     }
 
-    private static void putPrincipalKeys(Map<String, List<String>> context, CallerArns arns) {
-        context.put("aws:PrincipalArn", List.of(arns.principalArn()));
-    }
-
     /** Floci's account-root principal, which is both the caller and the request's aws:PrincipalArn. */
     private CallerArns accountRootArns(String accountId) {
         String rootArn = AwsArnUtils.Arn.global(requestPartition(), "iam", accountId, "root").toString();
-        return new CallerArns(rootArn, rootArn);
+        return new CallerArns(rootArn, rootArn, CallerArns.TYPE_ACCOUNT, accountId, null);
     }
 
     /**
@@ -776,7 +774,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         // Sorting the rest keeps the choice stable, since credentialScopes is a Set.of whose
         // iteration order changes per JVM run.
         if (descriptor.credentialScopes().contains(descriptor.externalKey())) {
-            return descriptor.externalKey();
+            return catalog.canonicalCredentialScope(descriptor.externalKey());
         }
         return descriptor.credentialScopes().stream()
                 .filter(scope -> scope.equals(catalog.canonicalCredentialScope(scope)))
@@ -946,7 +944,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             if (callerArns.isPresent()) {
                 caller = caller.withPrincipalArn(callerArns.get().callerArn());
                 conditionContext = new HashMap<>();
-                putPrincipalKeys(conditionContext, callerArns.get());
+                callerArns.get().putPrincipalKeys(conditionContext);
             }
 
             ResourcePolicyDecision effectiveDecision = resourcePolicyDecision;
@@ -1407,7 +1405,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     /** Whether the operation this request names is one AWS serves without credentials. */
     private boolean servesWithoutCredentials(ProtocolClaim claim, ContainerRequestContext ctx) {
         if (claim.protocol() == WireProtocol.AWS_QUERY) {
-            return NO_AUTH_QUERY_OPERATIONS.contains(queryOperation(ctx));
+            String operation = queryOperation(ctx);
+            return operation != null && NO_AUTH_QUERY_OPERATIONS.contains(operation);
         }
         if (claim.service() == null || claim.operation() == null) {
             // Nothing names the operation, so there is nothing to match against the list. Refusing
@@ -1422,12 +1421,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     /**
      * The {@code Action} a Query request names, via the registry so the form body is read and put
-     * back the one way this codebase already does it. The scope passed in is a placeholder: for a
-     * Query request the registry returns {@code <scope>:<Action>} and only the suffix is wanted.
+     * back the one way this codebase already does it.
      */
     private String queryOperation(ContainerRequestContext ctx) {
-        String resolved = actionRegistry.resolve("", ctx);
-        return resolved == null ? null : resolved.substring(resolved.indexOf(':') + 1);
+        return actionRegistry.queryAction(ctx);
     }
 
     /**
@@ -1457,7 +1454,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if (isCbor(protocol)) {
             return cborError(ctx, code, message, status);
         }
-        if (isFormEncoded(ctx.getMediaType())) {
+        if (protocol == WireProtocol.AWS_QUERY || isFormEncoded(ctx.getMediaType())) {
             return queryXmlError(queryCode, message, status);
         }
         return jsonError(code, message, status);

@@ -1,14 +1,20 @@
 package io.github.hectorvent.floci.services.s3;
 
 import io.github.hectorvent.floci.services.s3.model.S3Checksum;
+import io.github.hectorvent.floci.testing.EnforcementFixtures;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.UUID;
 
+import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.emptyString;
@@ -28,6 +34,12 @@ class S3GetObjectPartIntegrationTest {
     private static final byte[] FIRST_PART = filled(5 * 1024 * 1024);
     private static final String SECOND_PART = "test content 123";
     private static final long OBJECT_SIZE = FIRST_PART.length + SECOND_PART.length();
+
+    @TestHTTPResource("/")
+    static URI baseUri;
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
 
     @Test
     void getObject_partOfAMultipartObject_isServedLikeItsRange() {
@@ -324,8 +336,9 @@ class S3GetObjectPartIntegrationTest {
                 + (crc32c != null ? "<ChecksumCRC32C>" + crc32c + "</ChecksumCRC32C>" : "") + "</Part>";
     }
 
-    private static String createBucket(String prefix) {
+    private String createBucket(String prefix) {
         String bucket = prefix + "-" + UUID.randomUUID().toString().substring(0, 8);
+        cleanup.register(() -> EnforcementFixtures.removeBucket(baseUri.getPort(), auth("test", "s3"), bucket));
         given().when().put("/" + bucket).then().statusCode(200);
         return bucket;
     }

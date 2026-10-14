@@ -104,6 +104,7 @@ public class ResolvedServiceCatalog {
             java.util.Map.of(
                     "s3express", "s3",
                     "iot-jobs-data", "iot",
+                    "monitoring", "cloudwatch",
                     "awsssoportal", "sso");
 
     private final ServiceCatalog catalog;

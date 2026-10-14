@@ -1,6 +1,11 @@
 package io.github.hectorvent.floci.services.iam;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestContext;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.services.iam.model.AccessKey;
 import io.github.hectorvent.floci.services.iam.model.IamGroup;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
@@ -27,6 +32,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -329,9 +335,37 @@ class ResourceArnBuilderTest {
     void iamNamesTheUserOwningAnAccessKey() {
         String arn = "arn:aws:iam::000000000000:user/bob";
         IamService store = storeHolding("bob", "/", arn);
-        when(store.findUserNameByAccessKeyId("AKIAEXAMPLE")).thenReturn(Optional.of("bob"));
+        when(store.findAccessKeyOwnerInThisAccount("AKIAEXAMPLE")).thenReturn(Optional.of("bob"));
         assertEquals(arn, resourceOf(backedBy(store),
                 "Action=GetAccessKeyLastUsed&AccessKeyId=AKIAEXAMPLE"));
+    }
+
+    /**
+     * The enforcement filter resolves the key's owner before the handler runs, so the resolver
+     * must not migrate a pre-multi-account key into the caller's partition either: another
+     * account asking about it, even one with a same-named user, gets the wildcard and leaves the
+     * key where it was.
+     */
+    @Test
+    void iamDoesNotLetAnotherAccountClaimALegacyAccessKeyThroughTheOwnerLookup() {
+        String stranger = "111122223333";
+        RequestContext context = mock(RequestContext.class);
+        when(context.getAccountId()).thenReturn(stranger);
+        @SuppressWarnings("unchecked")
+        Instance<RequestContext> contexts = mock(Instance.class);
+        when(contexts.get()).thenReturn(context);
+        InMemoryStorage<String, AccessKey> raw = new InMemoryStorage<>();
+        raw.put("AKIALEGACYEXAMPLE", new AccessKey("AKIALEGACYEXAMPLE", "secret", "worker"));
+        IamService iam = new IamService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new AccountAwareStorageBackend<>(raw, contexts, ACCOUNT), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new RegionResolver("us-east-1", ACCOUNT), false);
+        iam.createUser("worker", "/");
+
+        setFormBody("Action=GetAccessKeyLastUsed&AccessKeyId=AKIALEGACYEXAMPLE");
+        assertEquals(List.of("*"), backedBy(iam).buildResources("iam", ctx, "us-east-1", stranger));
+        assertTrue(raw.get("AKIALEGACYEXAMPLE").isPresent(), "the lookup must leave the key unmoved");
+        assertTrue(raw.get(stranger + "/AKIALEGACYEXAMPLE").isEmpty(), "the lookup must not copy the key");
     }
 
     /**

@@ -19,11 +19,15 @@ import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetHealth;
 import io.github.hectorvent.floci.services.ssm.SsmCommandService;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.ArgumentCaptor;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -128,8 +132,20 @@ class AutoScalingReconcilerTest {
                 any(), any(), any(), any(), any(), any(), any(), any(), any(Integer.class), any(), any(), any(), any());
     }
 
-    @Test
-    void scaleOutUsesRequestedLaunchTemplateVersionData() {
+    static Stream<Arguments> templateUserData() {
+        return Stream.of(
+                Arguments.of(null, "IyEvYmluL2Jhc2gKZWNobyBoaQo=", "#!/bin/bash\necho hi\n",
+                        "IyEvYmluL2Jhc2gKZWNobyBoaQo="),
+                Arguments.of("legacy text", null, "legacy text", "bGVnYWN5IHRleHQ="),
+                Arguments.of("YQ==", null, "YQ==", "WVE9PQ=="),
+                Arguments.of(null, null, null, null),
+                Arguments.of(null, "", null, ""));
+    }
+
+    @ParameterizedTest
+    @MethodSource("templateUserData")
+    void scaleOutUsesRequestedLaunchTemplateVersionData(String storedText, String storedEncoding,
+                                                        String expectedText, String expectedEncoding) {
         AutoScalingService asgService = scalingService();
         Ec2Service ec2Service = mock(Ec2Service.class);
         ElbV2Service elbV2Service = mock(ElbV2Service.class);
@@ -151,7 +167,8 @@ class AutoScalingReconcilerTest {
         version.setLatestVersionNumber("1");
         version.getData().setImageId("ami-version-1");
         version.getData().setInstanceType("t3.micro");
-        version.getData().setEncodedUserData("IyEvYmluL2Jhc2gKZWNobyBoaQo=");
+        version.getData().setUserData(storedText);
+        version.getData().setEncodedUserData(storedEncoding);
         version.getData().setIamInstanceProfile(new LaunchTemplateData.IamInstanceProfile(
                 "arn:aws:iam::000000000000:instance-profile/app-profile", null));
         when(ec2Service.iamInstanceProfileArn(version.getData()))
@@ -170,9 +187,9 @@ class AutoScalingReconcilerTest {
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                anyList(), eq("#!/bin/bash\necho hi\n"),
+                anyList(), eq(expectedText),
                 eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null),
-                isNull(), eq(0), isNull(), isNull(), isNull(), any())).thenReturn(reservation);
+                isNull(), eq(0), isNull(), isNull(), isNull(), eq(expectedEncoding))).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -183,10 +200,11 @@ class AutoScalingReconcilerTest {
         ArgumentCaptor<List<Tag>> tags = ArgumentCaptor.captor();
         verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                tags.capture(), eq("#!/bin/bash\necho hi\n"),
+                tags.capture(), eq(expectedText),
                 eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null),
-                isNull(), eq(0), isNull(), isNull(), isNull(), any());
-        assertNull(version.getData().getUserData());
+                isNull(), eq(0), isNull(), isNull(), isNull(), eq(expectedEncoding));
+        assertEquals(storedText, version.getData().getUserData());
+        assertEquals(storedEncoding, version.getData().getEncodedUserData());
         assertEquals(propagatedTags.size(), tags.getValue().size());
         assertEquals("app.ClusterId", tags.getValue().get(0).getKey());
         assertEquals("development", tags.getValue().get(0).getValue());

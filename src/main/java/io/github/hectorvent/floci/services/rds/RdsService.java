@@ -86,6 +86,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -4665,21 +4666,32 @@ public class RdsService implements Resettable, ResourceProvider {
         if (passwordRotated) {
             proxyManager.updateMasterPassword(
                     rdsResourceRelayKey(cluster.getDbClusterArn(), id), newPassword);
-            for (String memberId : cluster.getDbClusterMembers()) {
-                DbInstance member = findInstanceForScope(
-                        currentAccountId(), effectiveRegion, memberId);
-                if (member == null) {
-                    continue;
-                }
-                member.setMasterPassword(newPassword);
-                putInstanceForScope(currentAccountId(), effectiveRegion, memberId, member);
-                proxyManager.updateMasterPassword(
-                        rdsResourceRelayKey(member.getDbInstanceArn(), memberId), newPassword);
-            }
+            updateClusterMembers(cluster, effectiveRegion,
+                    member -> member.setMasterPassword(newPassword),
+                    relayKey -> proxyManager.updateMasterPassword(relayKey, newPassword));
+        }
+
+        if (iamEnabled != null) {
+            proxyManager.updateIamEnabled(rdsResourceRelayKey(cluster.getDbClusterArn(), id), iamEnabled);
+            updateClusterMembers(cluster, effectiveRegion,
+                    member -> member.setIamDatabaseAuthenticationEnabled(iamEnabled),
+                    relayKey -> proxyManager.updateIamEnabled(relayKey, iamEnabled));
         }
 
         LOG.infov("DB cluster {0} modified", id);
         return cluster;
+    }
+
+    private void updateClusterMembers(DbCluster cluster, String region,
+                                      Consumer<DbInstance> change, Consumer<String> updateProxy) {
+        String accountId = currentAccountId();
+        for (DbInstance member : listDbInstances(null, region)) {
+            if (Objects.equals(cluster.getDbClusterIdentifier(), member.getDbClusterIdentifier())) {
+                change.accept(member);
+                putInstanceForScope(accountId, region, member.getDbInstanceIdentifier(), member);
+                updateProxy.accept(rdsResourceRelayKey(member.getDbInstanceArn(), member.getDbInstanceIdentifier()));
+            }
+        }
     }
 
     public synchronized void deleteDbCluster(String id) {

@@ -1,7 +1,7 @@
 {
   "_source": {
     "generator": "tools/aws/regen_dynamodb_shapes.py",
-    "botocore": "botocore 1.43.111 (installed package)"
+    "botocore": "botocore 1.43.113 (local/aws/botocore)"
   },
   "operations": {
     "BatchExecuteStatement": "BatchExecuteStatementInput",

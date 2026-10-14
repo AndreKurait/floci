@@ -99,7 +99,7 @@ class SchedulerContextAttributesIntegrationTest {
         String scheduleName = uniqueName("ctx-rate");
         harness.createSchedule(scheduleName, "rate(1 minute)", "ENABLED", queueArn(queueName), CONTEXT_INPUT);
         Schedule schedule = schedulerService.getSchedule(scheduleName, null, REGION);
-        Instant firstFire = schedule.getCreationDate().plus(1, ChronoUnit.MINUTES);
+        Instant firstFire = schedule.getCreationDate();
         ScheduleDispatcher dispatcher = harness.dispatcherFor(scheduleName);
 
         dispatcher.tick(firstFire.plusSeconds(1));
@@ -190,7 +190,7 @@ class SchedulerContextAttributesIntegrationTest {
         String scheduleName = uniqueName("ctx-ids");
         harness.createSchedule(scheduleName, "rate(1 minute)", "ENABLED", queueArn(queueName), CONTEXT_INPUT);
         Schedule schedule = schedulerService.getSchedule(scheduleName, null, REGION);
-        Instant firstFire = schedule.getCreationDate().plus(1, ChronoUnit.MINUTES);
+        Instant firstFire = schedule.getCreationDate();
         ScheduleDispatcher dispatcher = harness.dispatcherFor(scheduleName);
 
         dispatcher.tick(firstFire.plusSeconds(1));

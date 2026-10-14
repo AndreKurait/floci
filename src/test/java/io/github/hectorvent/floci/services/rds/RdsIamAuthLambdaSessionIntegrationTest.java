@@ -110,6 +110,79 @@ class RdsIamAuthLambdaSessionIntegrationTest {
         }
     }
 
+    @Test
+    void clusterIamToggleChangesAuthenticationAtExistingClusterAndMemberEndpoints() throws Exception {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String clusterId = "iam-cluster-" + suffix;
+        String memberId = "iam-member-" + suffix;
+        String accessKeyId = "ASIA" + suffix.toUpperCase();
+        try {
+            int clusterPort = rds("CreateDBCluster")
+                    .formParam("DBClusterIdentifier", clusterId)
+                    .formParam("Engine", "aurora-postgresql")
+                    .formParam("MasterUsername", MASTER_USER)
+                    .formParam("MasterUserPassword", MASTER_PASSWORD)
+                    .formParam("DatabaseName", DATABASE)
+                    .formParam("EnableIAMDatabaseAuthentication", "false")
+                    .when().post("/").then().statusCode(200)
+                    .extract().xmlPath()
+                    .getInt("CreateDBClusterResponse.CreateDBClusterResult.DBCluster.Port");
+            int memberPort = rds("CreateDBInstance")
+                    .formParam("DBInstanceIdentifier", memberId)
+                    .formParam("DBClusterIdentifier", clusterId)
+                    .formParam("DBInstanceClass", "db.r5.large")
+                    .formParam("Engine", "aurora-postgresql")
+                    .formParam("MasterUsername", MASTER_USER)
+                    .formParam("MasterUserPassword", MASTER_PASSWORD)
+                    .formParam("DBName", DATABASE)
+                    .formParam("AllocatedStorage", "20")
+                    .when().post("/").then().statusCode(200)
+                    .extract().xmlPath()
+                    .getInt("CreateDBInstanceResponse.CreateDBInstanceResult.DBInstance.Endpoint.Port");
+            iamService.registerLambdaExecutionRoleSession(ACCOUNT_ID, accessKeyId, SESSION_SECRET, SESSION_TOKEN,
+                    "arn:aws:iam::" + ACCOUNT_ID + ":role/cluster-connect-with-iam");
+            for (int port : new int[]{clusterPort, memberPort}) {
+                await().atMost(Duration.ofSeconds(60)).ignoreExceptions().until(() -> {
+                    try (Connection connection = connect(port, MASTER_PASSWORD)) {
+                        return connection.isValid(5);
+                    }
+                });
+                String token = SigV4TokenTestHelper.createRdsToken("127.0.0.1", port, MASTER_USER,
+                        accessKeyId, SESSION_SECRET, Instant.now().minusSeconds(60), 900, SESSION_TOKEN);
+                assertThrows(SQLException.class, () -> connect(port, token).close());
+            }
+            for (boolean enabled : new boolean[]{true, false}) {
+                rds("ModifyDBCluster")
+                        .formParam("DBClusterIdentifier", clusterId)
+                        .formParam("EnableIAMDatabaseAuthentication", Boolean.toString(enabled))
+                        .when().post("/").then().statusCode(200);
+                for (int port : new int[]{clusterPort, memberPort}) {
+                    String token = SigV4TokenTestHelper.createRdsToken("127.0.0.1", port, MASTER_USER,
+                            accessKeyId, SESSION_SECRET, Instant.now().minusSeconds(60), 900, SESSION_TOKEN);
+                    if (enabled) {
+                        try (Connection connection = connect(port, token);
+                             Statement statement = connection.createStatement();
+                             ResultSet rows = statement.executeQuery("SELECT current_user")) {
+                            assertTrue(rows.next());
+                            assertEquals(MASTER_USER, rows.getString(1));
+                        }
+                    } else {
+                        assertThrows(SQLException.class, () -> connect(port, token).close());
+                    }
+                    try (Connection connection = connect(port, MASTER_PASSWORD)) {
+                        assertTrue(connection.isValid(5));
+                    }
+                }
+            }
+        } finally {
+            iamService.unregisterSession(ACCOUNT_ID, accessKeyId);
+            rds("DeleteDBInstance").formParam("DBInstanceIdentifier", memberId)
+                    .formParam("SkipFinalSnapshot", "true").when().post("/");
+            rds("DeleteDBCluster").formParam("DBClusterIdentifier", clusterId)
+                    .formParam("SkipFinalSnapshot", "true").when().post("/");
+        }
+    }
+
     private static Connection connect(int port, String password) throws SQLException {
         Properties properties = new Properties();
         properties.setProperty("user", MASTER_USER);

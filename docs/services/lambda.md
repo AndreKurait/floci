@@ -84,6 +84,9 @@ part in authorizing calls to the function:
 - An invoke of a function named by a full or partial ARN runs the function in the account in the
   ARN. An invoke of another account's function needs its function policy to allow the caller as
   well as the caller's own identity policy.
+- A Step Functions Lambda task is authorized the same way, as the state machine's execution role or
+  the role the task's `Credentials` name; see
+  [Step Functions](step-functions.md#lambda-tasks-under-iam-enforcement).
 - `GetFunction`, `GetFunctionConfiguration` and `ListDurableExecutionsByFunction`, given a full ARN
   with a version or alias, read the function in the account in the ARN, and need its function
   policy to allow the caller in the same way.
@@ -371,6 +374,13 @@ disabled fails with Lambda's error as the resource status reason.
     exceed `region-concurrency-limit`.
 
 Function URLs are also reachable directly on `/{proxy:.*}` under the Lambda URL controller, which routes the request into the normal `Invoke` path.
+
+Function URLs are not available in AWS GovCloud (US) or in the China Regions
+([GovCloud guide](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-lambda.html),
+[China guide](https://docs.amazonaws.cn/en_us/aws/latest/userguide/lambda.html)), so
+`CreateFunctionUrlConfig` is an `InvalidParameterValueException` in those regions, and an
+`AWS::Lambda::Url` in a CloudFormation stack there fails with it. See
+[AWS Partitions](../configuration/partitions.md).
 
 **Versions:** `CreateFunction` and `UpdateFunctionCode` honour `Publish`, publishing a version
 and reporting it in the response's `Version`. The two differ in the ARN they return, matching the
