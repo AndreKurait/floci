@@ -602,7 +602,7 @@ public class Ec2QueryHandler {
         }
         if (tags.stream().anyMatch(tag -> Ec2Service.isAwsTagKey(tag.getKey()))) {
             String code = switch (resourceType) {
-                case "vpc", "subnet", "security-group-rule" -> "InvalidParameter";
+                case "vpc", "subnet", "security-group-rule", "spot-instances-request" -> "InvalidParameter";
                 default -> "InvalidParameterValue";
             };
             throw new AwsException(code, "Tag keys starting with 'aws:' are reserved for internal use", 400);
@@ -5950,6 +5950,11 @@ public class Ec2QueryHandler {
                 if (key == null) {
                     break;
                 }
+                if (key.startsWith("aws:")) {
+                    throw new AwsException("InvalidTagKey.Malformed",
+                            "The tag key ‘" + key + "’ is not valid. "
+                                    + "Tag keys starting with 'aws:' are reserved for internal use.", 400);
+                }
                 tagList.add(creationTag(key, p.getFirst(base + ".Tag." + j + ".Value")));
             }
             specs.add(new LaunchTemplateData.TagSpecification(resourceType, tagList));
@@ -6173,19 +6178,7 @@ public class Ec2QueryHandler {
 
         String snapshotId = p.getFirst("SnapshotId");
 
-        List<Tag> volumeTags = new ArrayList<>();
-        for (int i = 1; ; i++) {
-            String resType = p.getFirst("TagSpecification." + i + ".ResourceType");
-            if (resType == null) break;
-            if ("volume".equals(resType)) {
-                for (int j = 1; ; j++) {
-                    String k = p.getFirst("TagSpecification." + i + ".Tag." + j + ".Key");
-                    if (k == null) break;
-                    String v = p.getFirst("TagSpecification." + i + ".Tag." + j + ".Value");
-                    volumeTags.add(creationTag(k, v));
-                }
-            }
-        }
+        List<Tag> volumeTags = parseTagsForResource(p, "volume");
 
         Volume vol = service.createVolume(region, availabilityZone, volumeType, size,
                 encrypted, iops, throughput, snapshotId, volumeTags);
@@ -6442,28 +6435,8 @@ public class Ec2QueryHandler {
         String userData = Ec2UserDataDecoder.decode(userDataEncoded);
         String iamInstanceProfileArn = p.getFirst("LaunchSpecification.IamInstanceProfile.Arn");
 
-        // Parse TagSpecifications
-        List<Tag> spotRequestTags = new ArrayList<>();
-        List<Tag> instanceTags = new ArrayList<>();
-        for (int i = 1; ; i++) {
-            String resType = p.getFirst("TagSpecification." + i + ".ResourceType");
-            if (resType == null) break;
-            if ("spot-instances-request".equals(resType)) {
-                for (int j = 1; ; j++) {
-                    String k = p.getFirst("TagSpecification." + i + ".Tag." + j + ".Key");
-                    if (k == null) break;
-                    String v = p.getFirst("TagSpecification." + i + ".Tag." + j + ".Value");
-                    spotRequestTags.add(creationTag(k, v));
-                }
-            } else if ("instance".equals(resType)) {
-                for (int j = 1; ; j++) {
-                    String k = p.getFirst("TagSpecification." + i + ".Tag." + j + ".Key");
-                    if (k == null) break;
-                    String v = p.getFirst("TagSpecification." + i + ".Tag." + j + ".Value");
-                    instanceTags.add(creationTag(k, v));
-                }
-            }
-        }
+        List<Tag> spotRequestTags = parseTagsForResource(p, "spot-instances-request");
+        List<Tag> instanceTags = parseTagsForResource(p, "instance");
 
         List<SpotInstanceRequest> requests = service.requestSpotInstances(region, spotPrice, instanceCount,
                 type, productDescription, imageId, instanceType, keyName, subnetId, securityGroupIds, userData, iamInstanceProfileArn,

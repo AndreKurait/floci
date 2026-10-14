@@ -94,6 +94,7 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 class RdsServiceTest {
@@ -348,6 +349,108 @@ class RdsServiceTest {
                 assertEquals("cluster-" + account + "-" + region, binding.getValue().resourceId());
                 assertEquals(account, binding.getValue().accountId());
                 assertEquals(region, binding.getValue().region());
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"aurora-postgresql,16.3,false", "aurora-mysql,8.0,false",
+            "aurora-postgresql,16.3,true", "aurora-mysql,8.0,true"})
+    void modifyClusterIamAuthenticationUpdatesExistingMembers(String engine, String version, boolean mockMode) {
+        when(rdsConfig.mock()).thenReturn(mockMode);
+        DbCluster cluster = rdsService.createDbCluster("iam-cluster", engine, version,
+                "admin", "password", "dbname", false, null);
+        DbInstance member = rdsService.createDbInstance("iam-member", engine, version,
+                "admin", "password", "dbname", "db.r5.large",
+                20, false, null, null, "iam-cluster", null, false, false, null,
+                Map.of(), List.of(), null, null, true, DbInstanceSettings.defaults());
+        cluster.getDbClusterMembers().add("missing-member");
+        clearInvocations(proxyManager);
+
+        for (boolean enabled : List.of(true, false)) {
+            rdsService.modifyDbCluster("iam-cluster", null, enabled);
+
+            assertEquals(enabled, rdsService.getDbCluster("iam-cluster").isIamDatabaseAuthenticationEnabled());
+            assertEquals(enabled, rdsService.getDbInstance("iam-member").isIamDatabaseAuthenticationEnabled());
+            verify(proxyManager).updateIamEnabled("rds-resource:" + cluster.getDbClusterArn(), enabled);
+            verify(proxyManager).updateIamEnabled("rds-resource:" + member.getDbInstanceArn(), enabled);
+            clearInvocations(proxyManager);
+            rdsService.modifyDbCluster("iam-cluster", null, null);
+            assertEquals(enabled, rdsService.getDbInstance("iam-member").isIamDatabaseAuthenticationEnabled());
+            verifyNoInteractions(proxyManager);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"aurora-postgresql,16.3,false", "aurora-mysql,8.0,false",
+            "aurora-postgresql,16.3,true", "aurora-mysql,8.0,true"})
+    void modifyClusterIamAuthenticationFindsMembersMissingFromClusterList(
+            String engine, String version, boolean mockMode) {
+        when(rdsConfig.mock()).thenReturn(mockMode);
+        DbCluster cluster = rdsService.createDbCluster("iam-cluster", engine, version,
+                "admin", "password", "dbname", false, null);
+        DbInstance member = rdsService.createDbInstance("iam-member", engine, version,
+                "admin", "password", "dbname", "db.r5.large",
+                20, false, null, null, "iam-cluster", null, false, false, null,
+                Map.of(), List.of(), null, null, true, DbInstanceSettings.defaults());
+        rdsService.createDbInstance("standalone", engine, version,
+                "admin", "password", "dbname", "db.r5.large",
+                20, false, null, null, null);
+        cluster.getDbClusterMembers().clear();
+        clearInvocations(proxyManager);
+
+        for (boolean enabled : List.of(true, false)) {
+            rdsService.modifyDbCluster("iam-cluster", null, enabled);
+
+            assertEquals(enabled, rdsService.getDbInstance("iam-member").isIamDatabaseAuthenticationEnabled());
+            assertFalse(rdsService.getDbInstance("standalone").isIamDatabaseAuthenticationEnabled());
+            verify(proxyManager).updateIamEnabled("rds-resource:" + cluster.getDbClusterArn(), enabled);
+            verify(proxyManager).updateIamEnabled("rds-resource:" + member.getDbInstanceArn(), enabled);
+            verifyNoMoreInteractions(proxyManager);
+            clearInvocations(proxyManager);
+        }
+    }
+
+    @Test
+    void modifyClusterIamAuthenticationKeepsOtherAccountsAndRegionsUnchanged() {
+        InMemoryStorage<String, DbInstance> rawInstances = new InMemoryStorage<>();
+        InMemoryStorage<String, DbCluster> rawClusters = new InMemoryStorage<>();
+        String accountA = "111111111111";
+        String accountB = "222222222222";
+        RdsService serviceA = new RdsService(containerManager, proxyManager, ec2Service,
+                new RegionResolver("us-east-1", accountA), config,
+                new AccountAwareStorageBackend<>(rawInstances, null, accountA),
+                new AccountAwareStorageBackend<>(rawClusters, null, accountA),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>());
+        RdsService serviceB = new RdsService(containerManager, proxyManager, ec2Service,
+                new RegionResolver("us-east-1", accountB), config,
+                new AccountAwareStorageBackend<>(rawInstances, null, accountB),
+                new AccountAwareStorageBackend<>(rawClusters, null, accountB),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>());
+        for (RdsService service : List.of(serviceA, serviceB)) {
+            for (String region : List.of("us-east-1", "us-west-2")) {
+                service.createDbCluster("shared-cluster", "aurora-postgresql", "16.3",
+                        "admin", "password", "dbname", false, null, null, null, false, region);
+                service.createDbInstance("shared-member", "aurora-postgresql", "16.3",
+                        "admin", "password", "dbname", "db.r5.large", 20, false, null, null,
+                        "shared-cluster", null, false, false, null, Map.of(), List.of(), region);
+            }
+        }
+        clearInvocations(proxyManager);
+
+        serviceA.modifyDbCluster("shared-cluster", null, true, "us-east-1");
+
+        for (String account : List.of(accountA, accountB)) {
+            for (String region : List.of("us-east-1", "us-west-2")) {
+                boolean enabled = account.equals(accountA) && region.equals("us-east-1");
+                DbCluster cluster = rawClusters.get(account + "/" + region + "::shared-cluster").orElseThrow();
+                DbInstance member = rawInstances.get(account + "/" + region + "::shared-member").orElseThrow();
+                assertEquals(enabled, cluster.isIamDatabaseAuthenticationEnabled());
+                assertEquals(enabled, member.isIamDatabaseAuthenticationEnabled());
+                verify(proxyManager, times(enabled ? 1 : 0))
+                        .updateIamEnabled("rds-resource:" + cluster.getDbClusterArn(), true);
+                verify(proxyManager, times(enabled ? 1 : 0))
+                        .updateIamEnabled("rds-resource:" + member.getDbInstanceArn(), true);
             }
         }
     }
@@ -2060,6 +2163,31 @@ class RdsServiceTest {
                 eq("rds-resource:" + member.getDbInstanceArn()), eq("rotated-password"));
         assertEquals("rotated-password", member.getMasterPassword());
         verify(proxyManager, never()).stopProxy(anyString());
+    }
+
+    @Test
+    void modifyDbClusterUpdatesPasswordAndIamTogetherForExistingMembers() {
+        DbCluster cluster = rdsService.createDbCluster("cluster1", "aurora-postgresql", "16.3",
+                "admin", "original-password", "dbname", false, null);
+        cluster.setContainerId("container-1");
+        cluster.setDockerVolumeName("volume-1");
+        DbInstance member = rdsService.createDbInstance("member-1", "aurora-postgresql", "16.3",
+                "admin", "original-password", "dbname", "db.r5.large",
+                20, false, null, null, "cluster1");
+        cluster.getDbClusterMembers().add("missing-member");
+        cluster.getDbClusterMembers().clear();
+        clearInvocations(proxyManager);
+
+        rdsService.modifyDbCluster("cluster1", "rotated-password", true);
+
+        DbInstance stored = rdsService.getDbInstance("member-1");
+        assertEquals("rotated-password", stored.getMasterPassword());
+        assertTrue(stored.isIamDatabaseAuthenticationEnabled());
+        verify(proxyManager).updateMasterPassword("rds-resource:" + cluster.getDbClusterArn(), "rotated-password");
+        verify(proxyManager).updateMasterPassword("rds-resource:" + member.getDbInstanceArn(), "rotated-password");
+        verify(proxyManager).updateIamEnabled("rds-resource:" + cluster.getDbClusterArn(), true);
+        verify(proxyManager).updateIamEnabled("rds-resource:" + member.getDbInstanceArn(), true);
+        verifyNoMoreInteractions(proxyManager);
     }
 
     @Test

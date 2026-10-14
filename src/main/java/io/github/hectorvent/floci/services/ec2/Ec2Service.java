@@ -8482,7 +8482,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
-    private static void validateUserTagKeys(List<Tag> tagList) {
+    public static void validateUserTagKeys(List<Tag> tagList) {
         for (Tag tag : tagList) {
             if (isAwsTagKey(tag.getKey())) {
                 throw new AwsException("InvalidParameterValue",

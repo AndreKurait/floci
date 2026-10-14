@@ -1,4 +1,4 @@
-"""Reserved tag validation checked against live AWS on 2026-10-13."""
+"""Reserved tag validation checked against live AWS on 2026-10-13 and 2026-10-14."""
 
 import uuid
 from contextlib import ExitStack
@@ -62,3 +62,55 @@ def test_reserved_tags_reject_atomically_before_allocation_and_mutation(ec2_clie
             ec2_client.delete_tags(Resources=[instance], **args)
             assert not ec2_client.describe_tags(
                 Filters=[{"Name": "resource-id", "Values": [instance]}])["Tags"]
+
+
+@pytest.mark.parametrize("key", ["aws:reserved", "AWS:reserved", "aWs:reserved"])
+def test_volumes_and_spot_requests_reject_reserved_tags(ec2_client, aws_config, key):
+    name = "reserved-creation-" + uuid.uuid4().hex[:12]
+    filters = [{"Name": "tag:Name", "Values": [name]}]
+    tags = [{"Key": "Name", "Value": name}, {"Key": key, "Value": "invalid"}]
+    with pytest.raises(ClientError) as error:
+        ec2_client.create_volume(
+            AvailabilityZone=aws_config["region_name"] + "a", Size=1, VolumeType="gp3",
+            TagSpecifications=[{"ResourceType": "volume", "Tags": tags}])
+    assert error.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert ec2_client.describe_volumes(Filters=filters)["Volumes"] == []
+    with pytest.raises(ClientError) as error:
+        ec2_client.request_spot_instances(
+            InstanceCount=1, Type="one-time",
+            LaunchSpecification={"ImageId": "ami-00000000000000000", "InstanceType": "t3.nano"},
+            TagSpecifications=[{"ResourceType": "spot-instances-request", "Tags": tags}])
+    assert error.value.response["Error"]["Code"] == "InvalidParameter"
+    assert ec2_client.describe_spot_instance_requests(Filters=filters)["SpotInstanceRequests"] == []
+
+
+def test_nested_launch_template_reserved_prefix_is_case_sensitive(ec2_client):
+    name = "reserved-template-" + uuid.uuid4().hex[:12]
+
+    def data(key):
+        return {"InstanceType": "t3.nano",
+                "TagSpecifications": [{"ResourceType": "instance",
+                                       "Tags": [{"Key": key, "Value": "test"}]}]}
+
+    with pytest.raises(ClientError) as error:
+        ec2_client.create_launch_template(LaunchTemplateName=name, LaunchTemplateData=data("aws:reserved"))
+    assert error.value.response["Error"]["Code"] == "InvalidTagKey.Malformed"
+    with pytest.raises(ClientError) as error:
+        ec2_client.describe_launch_templates(LaunchTemplateNames=[name])
+    assert error.value.response["Error"]["Code"] == "InvalidLaunchTemplateName.NotFoundException"
+
+    template = ec2_client.create_launch_template(
+        LaunchTemplateName=name, LaunchTemplateData=data("Name"))["LaunchTemplate"]["LaunchTemplateId"]
+    try:
+        with pytest.raises(ClientError) as error:
+            ec2_client.create_launch_template_version(
+                LaunchTemplateId=template, LaunchTemplateData=data("aws:reserved"))
+        assert error.value.response["Error"]["Code"] == "InvalidTagKey.Malformed"
+        versions = ec2_client.describe_launch_template_versions(LaunchTemplateId=template)["LaunchTemplateVersions"]
+        assert [version["VersionNumber"] for version in versions] == [1]
+        for key in ("AWS:reserved", "aWs:reserved"):
+            version = ec2_client.create_launch_template_version(
+                LaunchTemplateId=template, LaunchTemplateData=data(key))["LaunchTemplateVersion"]
+            assert version["LaunchTemplateData"]["TagSpecifications"] == data(key)["TagSpecifications"]
+    finally:
+        ec2_client.delete_launch_template(LaunchTemplateId=template)

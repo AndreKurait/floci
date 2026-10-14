@@ -563,7 +563,7 @@ public class SesService {
         if (effectiveDestinations.isEmpty()) {
             throw new AwsException("InvalidParameterValue", "Missing required header 'To'.", 400);
         }
-        SesAddressSyntax.requireFallbackFromAt(request, raw, parsed.message());
+        SesAddressSyntax.requireFromHeaderAt(request, raw, parsed.message());
         SesAddressLength.requireRaw(request, raw, parsed.message());
         if (requireVerifiedSender) {
             requireVerifiedSenders(rawSendingAddresses(request, raw, headers), region);
