@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.dynamodb.DynamoDbTableNames;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.iam.IamActionRegistry;
 import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -469,6 +470,15 @@ public class IamConditionContextResolver {
      */
     @SuppressWarnings("unchecked")
     private static Map<String, String> formParameters(ContainerRequestContext ctx) {
+        if ("GET".equalsIgnoreCase(ctx.getMethod()) && IamActionRegistry.isQueryRequest(ctx)) {
+            Map<String, String> parameters = new LinkedHashMap<>();
+            ctx.getUriInfo().getQueryParameters().forEach((key, values) -> {
+                if (!values.isEmpty()) {
+                    parameters.put(key, values.getFirst());
+                }
+            });
+            return parameters;
+        }
         Object cached = ctx.getProperty(BUFFERED_FORM_BODY);
         if (cached instanceof Map<?, ?> map) {
             return (Map<String, String>) map;

@@ -38,7 +38,7 @@ public class S3CorsFilter implements ContainerResponseFilter {
                        ContainerResponseContext responseContext) {
 
         // Only apply CORS headers when the request is routed to the S3 controller
-        if (!S3SignatureFilterScope.routedToS3(resourceInfo)) return;
+        if (!S3SignatureFilterScope.routedToS3(resourceInfo, requestContext)) return;
 
         // Only handle actual requests — preflights are processed by the OPTIONS endpoints
         if ("OPTIONS".equalsIgnoreCase(requestContext.getMethod())) return;

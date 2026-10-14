@@ -67,7 +67,7 @@ class IamActionRegistryTest {
 
     @ParameterizedTest
     @CsvSource({
-            "s3,GetMetricStatistics,false", "sns,TagResource,false", "monitoring,TagResource,true",
+            "s3,GetMetricStatistics,false", "sns,TagResource,true", "monitoring,TagResource,true",
             "monitoring,UnknownAction,true", "unknown,GetMetricStatistics,false"
     })
     void getClassificationRespectsSigningScope(String scope, String action, boolean expected) {

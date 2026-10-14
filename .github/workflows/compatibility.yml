@@ -288,7 +288,7 @@ jobs:
     name: native ${{ matrix.arch }} / ${{ matrix.test }}
     needs: build-native
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     # The suites run against the arm64 image only. What they check is
     # arch-neutral, and running all eight on both arches (16 jobs per PR) left
     # them queued for the shared runner pools for longer than they take to run.

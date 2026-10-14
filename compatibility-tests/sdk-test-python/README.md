@@ -44,7 +44,13 @@ pytest tests/test_s3.py
 just test-python
 ```
 
+`tests/test_ec2_subnet_ipv6.py` checks that expanded IPv6 subnet CIDRs are
+stored and returned in canonical form through Boto 3.
+
 ## Legacy DynamoDB client
+
+`legacy/test_elb_query_get.py` verifies that Boto 2 Query GET reads and deletes
+Classic load balancers created through Boto 3 POST, including the typed missing-resource error.
 
 `legacy/test_cloudwatch_alarm_query.py` exercises Boto 2 alarm creation, filtered
 reads and deletion with Query versions 2010-08-01 and 2013-01-16, including shared

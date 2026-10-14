@@ -19,7 +19,7 @@ import java.util.regex.Pattern;
  * Claiming uses non-payload signals only (method, path, headers, query parameters) so it is safe
  * to run in a pre-matching filter without touching the entity stream. As a
  * consequence the awsQuery claim covers POST {@code /} with the form
- * content type and the CloudWatch GET requests the dispatcher accepts.
+ * content type and the signed Query GET requests the dispatcher accepts.
  * The spec's body-level {@code Action}/{@code Version} checks
  * stay downstream in {@code AwsQueryController}, which already rejects a
  * missing {@code Action} with the AWS {@code MissingAction} error. Nothing
@@ -95,9 +95,13 @@ public class ProtocolClaimer {
         }
 
         if ("GET".equalsIgnoreCase(signals.method()) && isRootPath(path)
-                && AwsQueryController.isCloudWatchQueryGet(signals.authorization(),
+                && AwsQueryController.isQueryGet(signals.authorization(),
                 signals.xAmzTarget(), signals.accept(), signals.queryParameters())) {
-            ServiceDescriptor service = catalog.byCredentialScope("monitoring").orElse(null);
+            String authorization = IamEnforcementFilter.requestAuthorization(
+                    signals.authorization(), signals.queryParameters());
+            ServiceDescriptor service = SigV4CredentialScope.serviceName(authorization)
+                    .flatMap(catalog::byCredentialScope)
+                    .orElseGet(() -> catalog.byCredentialScope("monitoring").orElse(null));
             return Optional.of(new ProtocolClaim(WireProtocol.AWS_QUERY, service,
                     AwsQueryServiceResolver.action(signals.queryParameters()), null));
         }

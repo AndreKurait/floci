@@ -79,7 +79,7 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
 
     @Override
     public void filter(ContainerRequestContext requestContext) {
-        if (!S3SignatureFilterScope.routedToS3(resourceInfo)) {
+        if (!S3SignatureFilterScope.routedToS3(resourceInfo, requestContext)) {
             return;
         }
 

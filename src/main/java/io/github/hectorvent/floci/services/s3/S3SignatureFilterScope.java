@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.s3;
 
+import io.github.hectorvent.floci.core.common.AwsQueryController;
+import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
 
 final class S3SignatureFilterScope {
@@ -12,7 +14,8 @@ final class S3SignatureFilterScope {
                 || (presignGenerator != null && presignGenerator.shouldValidateSignatures());
     }
 
-    static boolean routedToS3(ResourceInfo resourceInfo) {
-        return resourceInfo != null && S3Controller.class.equals(resourceInfo.getResourceClass());
+    static boolean routedToS3(ResourceInfo resourceInfo, ContainerRequestContext context) {
+        return resourceInfo != null && S3Controller.class.equals(resourceInfo.getResourceClass())
+                && !AwsQueryController.isQueryGet(context);
     }
 }

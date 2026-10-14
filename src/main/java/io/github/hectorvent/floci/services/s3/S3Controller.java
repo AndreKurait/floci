@@ -214,8 +214,8 @@ public class S3Controller {
                                 @Context UriInfo uriInfo) {
         MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
         String authorization = httpHeaders.getHeaderString("Authorization");
-        if (AwsQueryController.isCloudWatchQueryGet(authorization, target, accept, queryParams)) {
-            return awsQueryController.dispatchCloudWatchQueryGet(authorization, httpHeaders, queryParams);
+        if (AwsQueryController.isQueryGet(authorization, target, accept, queryParams)) {
+            return awsQueryController.dispatchQueryGet(authorization, httpHeaders, queryParams);
         }
         if (target != null) {
             return null;

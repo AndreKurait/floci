@@ -5912,8 +5912,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         subnet.setRegion(region);
         subnet.setSubnetArn(AwsArnUtils.Arn.of("ec2", region, ownerAccountId, "subnet/" + subnetId).toString());
         if (ipv6CidrBlock != null && !ipv6CidrBlock.isBlank()) {
+            String canonicalIpv6CidrBlock = CidrCanonicalizer.canonicalize(ipv6CidrBlock)
+                    .filter(cidr -> cidr.contains(":")).orElse(ipv6CidrBlock);
             subnet.getIpv6CidrBlockAssociationSet().add(new VpcIpv6CidrBlockAssociation(
-                    "subnet-cidr-assoc-" + randomHex(17), ipv6CidrBlock, null));
+                    "subnet-cidr-assoc-" + randomHex(17), canonicalIpv6CidrBlock, null));
         }
         // The conflict scan and the store must be one step under the VPC's lock, or two
         // overlapping creates in flight together both pass the scan before either is stored.
@@ -9198,8 +9200,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * makes the CreateSubnet overlap check see the real network. In every case it is also why the
      * Describe calls echo back the canonical form: the stored resource never holds anything else.
      *
-     * <p>Only IPv4 blocks are rewritten. DestinationIpv6CidrBlock and the IPv6 blocks of VPCs and
-     * subnets are left untouched, as is DestinationPrefixListId, which is an opaque ID, not a CIDR.
+     * <p>This helper rewrites only IPv4 blocks. IPv6 values and DestinationPrefixListId, which is
+     * an opaque ID rather than a CIDR, are returned unchanged.
      * A null block (an IPv6-only subnet) is returned as is.
      *
      * <p>A block that is not a well-formed "IPv4/prefix" is returned unchanged: this method does
@@ -10111,6 +10113,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             az.put("zoneName", zoneName);
             az.put("state", "available");
             az.put("regionName", region);
+            az.put("networkBorderGroup", region);
             az.put("zoneId", AvailabilityZoneIds.forZoneName(region, zoneName));
             az.put("zoneType", "availability-zone");
             az.put("optInStatus", "opt-in-not-required");
