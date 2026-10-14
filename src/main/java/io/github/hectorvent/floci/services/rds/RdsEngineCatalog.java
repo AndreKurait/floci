@@ -85,7 +85,7 @@ final class RdsEngineCatalog {
     private static final Map<String, List<String>> FEATURE_NAMES = Map.of(
             "postgres", List.of("s3Import", "s3Export", "Lambda"),
             "sqlserver-se", List.of("S3_INTEGRATION"),
-            "aurora-postgresql", List.of("s3Import", "s3Export", "Lambda", "Comprehend", "SageMaker"));
+            "aurora-postgresql", List.of("s3Import", "s3Export", "Lambda", "Comprehend", "SageMaker", "Bedrock"));
 
     static List<String> exportableLogTypes(EngineVersion version) {
         return EXPORTABLE_LOG_TYPES.getOrDefault(version.engine(), List.of());
@@ -93,6 +93,26 @@ final class RdsEngineCatalog {
 
     static List<String> supportedFeatureNames(EngineVersion version) {
         return FEATURE_NAMES.getOrDefault(version.engine(), List.of());
+    }
+
+    /**
+     * The role feature names an engine supports, or null when the catalogue does not list the
+     * engine. {@code aurora} is Aurora MySQL's older name, and the SQL Server editions (or the bare
+     * {@code sqlserver} older state records) share one entry.
+     */
+    static List<String> featureNamesForEngine(String engine) {
+        if (engine == null) {
+            return null;
+        }
+        String catalogued = switch (engine.toLowerCase(Locale.ROOT)) {
+            case "aurora" -> "aurora-mysql";
+            case "sqlserver", "sqlserver-ee", "sqlserver-ex", "sqlserver-web" -> "sqlserver-se";
+            default -> engine.toLowerCase(Locale.ROOT);
+        };
+        if (VERSIONS.stream().noneMatch(v -> v.engine().equals(catalogued))) {
+            return null;
+        }
+        return FEATURE_NAMES.getOrDefault(catalogued, List.of());
     }
 
     /** Floci creates read replicas of PostgreSQL instances only. */

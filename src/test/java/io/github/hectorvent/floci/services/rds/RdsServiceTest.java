@@ -2949,6 +2949,17 @@ class RdsServiceTest {
     }
 
     @Test
+    void supportedFeatureNamesResolveEngineAliases() {
+        assertEquals(List.of("S3_INTEGRATION"), RdsEngineCatalog.featureNamesForEngine("sqlserver-ee"));
+        assertEquals(List.of("S3_INTEGRATION"), RdsEngineCatalog.featureNamesForEngine("SQLSERVER"));
+        assertEquals(List.of(), RdsEngineCatalog.featureNamesForEngine("aurora"));
+        assertEquals(List.of("s3Import", "s3Export", "Lambda"), RdsEngineCatalog.featureNamesForEngine("POSTGRES"));
+        // An engine the catalogue does not list is not judged.
+        assertNull(RdsEngineCatalog.featureNamesForEngine("oracle-ee"));
+        assertNull(RdsEngineCatalog.featureNamesForEngine(null));
+    }
+
+    @Test
     void engineVersionsSortNumericallyForUpgradeTargets() {
         RdsEngineCatalog.EngineVersion pg163 = RdsEngineCatalog.VERSIONS.stream()
                 .filter(v -> v.engine().equals("postgres") && v.version().equals("16.3")).findFirst().orElseThrow();

@@ -1234,6 +1234,25 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     @Test
+    void scanRejectsAnUnknownReturnConsumedCapacityBeforeTheTableLookup() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Missing", "ReturnConsumedCapacity": "BOGUS", "Select": "BOGUS"}
+                """));
+        assertEquals("1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' "
+                + "failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
+                ex.getMessage());
+    }
+
+    @Test
+    void scanReportsTheLimitBeforeReturnConsumedCapacity() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Limit": 0, "ReturnConsumedCapacity": "BOGUS"}
+                """));
+        assertEquals("1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
+                + "Member must have value greater than or equal to 1", ex.getMessage());
+    }
+
+    @Test
     void scanAcceptsSegmentsAtTheBounds() throws Exception {
         createUsersTable("eu-west-1");
 

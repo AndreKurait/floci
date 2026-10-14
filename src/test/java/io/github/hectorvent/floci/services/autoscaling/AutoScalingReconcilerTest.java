@@ -58,7 +58,7 @@ class AutoScalingReconcilerTest {
             Runnable adjustment = invocation.getArgument(1);
             adjustment.run();
             return null;
-        }).when(service).adjustCapacityIfPresent(any(), any());
+        }).when(service).reconcileIfPresent(any(), any());
         return service;
     }
 

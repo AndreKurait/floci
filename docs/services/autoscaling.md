@@ -49,8 +49,12 @@ after a launch error and rebalancing without a capacity increase are not impleme
 
 AWS launch errors appear as failed scaling activities after preserving partial
 launches. Repeated identical failures reuse the recorded activity, following the
-scale-in behavior, and do not complete an instance refresh. Unexpected runtime,
-save and cleanup failures still propagate.
+scale-in behavior, and do not complete an instance refresh. Unexpected runtime
+failures in ordinary scale-out, and save and cleanup failures, still propagate.
+Refresh launch failures retain the original replacement attempt and appear as
+failed scaling activities while other replacements can continue. Refresh and
+ordinary launches share the same launch settings, including template block-device
+mappings; accepted refresh launches keep their recorded source identity.
 
 For groups configured only with Availability Zones, Floci preserves its unpinned
 EC2 launch behavior and counts each member under the requested zone. This permits
@@ -68,6 +72,27 @@ EC2 instance can use a default subnet in a different zone.
 | `TerminateInstanceInAutoScalingGroup` | Terminates a specific instance; optionally decrements desired capacity |
 | `SuspendProcesses` | Records suspended scaling processes (empty list suspends all); reported back by `DescribeAutoScalingGroups` |
 | `ResumeProcesses` | Clears suspended processes (empty list resumes all) |
+
+### Instance Refresh Recovery
+
+New instance refreshes retain the selected instances and their replacement progress
+across persistent, hybrid, and WAL storage reloads. Suspending `InstanceRefresh`,
+`Launch`, or `Terminate` pauses refresh replacements; resuming those processes lets
+the refresh continue. A failed replacement launch remains part of the refresh, so
+ordinary desired-capacity reconciliation does not bypass the pause. Explicit
+`TerminateInstanceInAutoScalingGroup` requests still run, and independent capacity
+increases can proceed while only `InstanceRefresh` is suspended. Paused original
+instances keep their target-group registrations until replacement resumes.
+Explicitly detached instances leave refresh ownership and are not adopted again
+when the refresh resumes. Recovery of an accepted EC2 launch keeps the source
+identity recorded for that attempt even if the group configuration has changed.
+Older attempts without a recorded source use the available EC2 instance metadata
+without assigning the current launch template to the recovered instance.
+
+This does not implement rolling health-percentage limits, checkpoints, rollback,
+or cancellation. Refreshes saved by older versions without replacement ownership
+retain the previous reconciliation behavior. Storage reload coverage does not
+imply an atomic transaction spanning Auto Scaling and EC2 after a process crash.
 
 ### Load Balancer Attachment
 
@@ -155,8 +180,9 @@ adjustments. Suspension and resumption wait for any desired-capacity adjustment 
 in progress for that group, so a completed suspension cannot be bypassed by an earlier
 reconciliation check.
 
-Suspension does not yet pause instance-refresh selection or replacement cleanup.
-Explicitly requested termination and stale-instance cleanup continue independently.
+New owned refresh replacements also pause for `InstanceRefresh`, `Launch`, or
+`Terminate`, as described above. Explicitly requested termination and stale-instance
+cleanup continue independently.
 Other suspended process names are stored and returned but do not pause their
 associated activities.
 

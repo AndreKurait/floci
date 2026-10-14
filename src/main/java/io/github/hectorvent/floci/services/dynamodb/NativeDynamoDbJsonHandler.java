@@ -538,6 +538,15 @@ public class NativeDynamoDbJsonHandler {
     private static final Set<String> VALID_RETURN_CONSUMED_CAPACITY = Set.of("INDEXES", "TOTAL", "NONE");
     private static final Set<String> VALID_RETURN_ITEM_COLLECTION_METRICS = Set.of("SIZE", "NONE");
 
+    private static String returnConsumedCapacityError(JsonNode request) {
+        String value = request.has("ReturnConsumedCapacity") ? request.get("ReturnConsumedCapacity").asText() : null;
+        if (value == null || VALID_RETURN_CONSUMED_CAPACITY.contains(value)) {
+            return null;
+        }
+        return "Value '" + value + "' at 'returnConsumedCapacity' failed to satisfy constraint: "
+                + "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+    }
+
     private Response handlePutItem(JsonNode request, String region) {
         String tableName = request.has("TableName") ? request.path("TableName").asText() : null;
         DynamoDbTableNames.resolve(tableName); // validate tableName before other params
@@ -1091,11 +1100,9 @@ public class NativeDynamoDbJsonHandler {
         }
 
         // Validate ReturnConsumedCapacity before Select
-        String rccQuery = request.has("ReturnConsumedCapacity") ? request.get("ReturnConsumedCapacity").asText() : null;
-        if (rccQuery != null && !VALID_RETURN_CONSUMED_CAPACITY.contains(rccQuery)) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + rccQuery + "' at 'returnConsumedCapacity' failed to satisfy constraint: "
-                    + "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]", 400);
+        String rccQueryError = returnConsumedCapacityError(request);
+        if (rccQueryError != null) {
+            throw new AwsException("ValidationException", "1 validation error detected: " + rccQueryError, 400);
         }
 
         // DynamoDB counts KeyConditions as a non-expression parameter only next to a KeyConditionExpression.
@@ -1258,6 +1265,11 @@ public class NativeDynamoDbJsonHandler {
                     + "Member must have value less than or equal to " + MAX_TOTAL_SEGMENTS);
         }
         throwValidationErrors(rangeErrors);
+
+        String rccScanError = returnConsumedCapacityError(request);
+        if (rccScanError != null) {
+            throw new AwsException("ValidationException", "1 validation error detected: " + rccScanError, 400);
+        }
 
         rejectMixedParameters(request,
                 List.of("AttributesToGet", "ScanFilter", "ConditionalOperator"),

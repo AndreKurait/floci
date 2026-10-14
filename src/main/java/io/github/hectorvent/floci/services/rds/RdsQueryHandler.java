@@ -1179,7 +1179,7 @@ public class RdsQueryHandler {
 
         try {
             List<DbRoleAssociation> associatedRoles = parseAssociatedRoles(params);
-            service.validateClusterRoleAssociations(id, associatedRoles);
+            service.validateClusterRoleAssociations(id, engine, associatedRoles);
             Double serverlessV2Min = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MinCapacity");
             Double serverlessV2Max = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MaxCapacity");
             Integer serverlessV2SecondsUntilAutoPause = parseIntegerParam(

@@ -634,9 +634,12 @@ the feature named; an association that does not exist is `DBClusterRoleNotFound`
 `DBInstanceRoleNotFound`. A stopped cluster or instance refuses both (`InvalidDBClusterStateFault` /
 `InvalidDBInstanceState`).
 
-Associations are recorded, not exercised: Floci does not check the role in IAM, does not check the
-feature name against the engine, and does not hand the role's credentials to the database, so an
-`aws_s3` import still needs credentials of its own. Deleting a cluster or instance drops its
+A `FeatureName` must be one the engine lists in `SupportedFeatureNames` (`DescribeDBEngineVersions`),
+matched without regard to case; any other is `InvalidParameterValue`, and a `CreateDBCluster` naming
+one creates nothing. MySQL, MariaDB and Aurora MySQL list none, so their roles take no feature name.
+
+Associations are recorded, not exercised: Floci does not check the role in IAM and does not hand the
+role's credentials to the database, so an `aws_s3` import still needs credentials of its own. Deleting a cluster or instance drops its
 associations, and snapshots, restores and read replicas start without any.
 
 ## Aurora managed password opt-out

@@ -102,6 +102,11 @@ class RdsCatalogueReadIntegrationTest {
                 .body(VERSIONS + ".SupportsReadReplica", equalTo("false"))
                 .body(containsString("<SupportedFeatureNames></SupportedFeatureNames>"))
                 .body(VERSIONS + ".SupportsGlobalDatabases", equalTo("true"));
+        query("DescribeDBEngineVersions").formParam("Engine", "aurora-postgresql").formParam("DefaultOnly", "true")
+        .when().post("/").then()
+                .statusCode(200)
+                .body(VERSIONS + ".SupportedFeatureNames.member",
+                        contains("s3Import", "s3Export", "Lambda", "Comprehend", "SageMaker", "Bedrock"));
     }
 
     @Test

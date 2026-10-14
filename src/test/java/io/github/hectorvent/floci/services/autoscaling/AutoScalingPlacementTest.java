@@ -306,7 +306,7 @@ class AutoScalingPlacementTest {
             doAnswer(call -> {
                 call.<Runnable>getArgument(1).run();
                 return null;
-            }).when(groups).adjustCapacityIfPresent(any(), any());
+            }).when(groups).reconcileIfPresent(any(), any());
             when(groups.describeScalingActivities(anyString(), anyString())).thenAnswer(call ->
                     activityStore.describeScalingActivities(call.getArgument(0), call.getArgument(1)));
             when(groups.recordActivity(anyString(), anyString(), anyString(), anyString(), anyString()))

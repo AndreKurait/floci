@@ -790,6 +790,11 @@ class RdsControlPlaneTest {
                     .containsExactly(s3Role, lambdaRole);
             assertThatThrownBy(() -> rds.addRoleToDBCluster(b -> b.dbClusterIdentifier(clusterName).roleArn(s3Role)))
                     .isInstanceOf(DbClusterRoleAlreadyExistsException.class);
+            // A feature the engine does not list in SupportedFeatureNames is refused.
+            assertThatThrownBy(() -> rds.addRoleToDBCluster(b -> b.dbClusterIdentifier(clusterName)
+                    .roleArn("arn:aws:iam::000000000000:role/rds-sqlserver-s3").featureName("S3_INTEGRATION")))
+                    .isInstanceOfSatisfying(RdsException.class,
+                            e -> assertThat(e.awsErrorDetails().errorCode()).isEqualTo("InvalidParameterValue"));
 
             rds.removeRoleFromDBCluster(b -> b.dbClusterIdentifier(clusterName).roleArn(s3Role));
             assertThatThrownBy(() -> rds.removeRoleFromDBCluster(b -> b
