@@ -256,8 +256,8 @@ aws lambda update-function-code \
   --s3-bucket my-bucket --s3-key function.zip
 ```
 
-For CloudFormation/CDK deployments, change the package key or object version in
-the template so CloudFormation detects the code change. For local edits without
+For CloudFormation/CDK deployments, change the package key in the template so
+CloudFormation detects the code change. For local edits without
 packaging and redeploying, explicitly enable bind-mount hot reload below.
 
 ## Hot-Reload via Bind Mount
