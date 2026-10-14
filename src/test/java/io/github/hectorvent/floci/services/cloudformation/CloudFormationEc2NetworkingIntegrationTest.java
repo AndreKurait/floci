@@ -90,6 +90,79 @@ class CloudFormationEc2NetworkingIntegrationTest {
         return ec2("DescribeSubnets", Map.of("SubnetId.1", subnetId));
     }
 
+    private static String prefixListTemplate(int capacity, String entries, boolean fail) {
+        String failure = fail ? """
+                ,"Boom":{"Type":"AWS::SecretsManager::Secret","DependsOn":"Firewall",
+                "Properties":{"SecretString":"x","GenerateSecretString":{
+                "SecretStringTemplate":"{}","GenerateStringKey":"p"}}}
+                """ : "";
+        return """
+                {"Resources":{"Firewall":{"Type":"AWS::EC2::PrefixList",
+                "Properties":{"PrefixListName":"firewall-%1$d","AddressFamily":"IPv4",
+                "MaxEntries":%1$d,"Entries":%2$s,"Tags":[{"Key":"capacity","Value":"%1$d"}]}}%3$s},
+                "Outputs":{"Ref":{"Value":{"Ref":"Firewall"}},
+                "Id":{"Value":{"Fn::GetAtt":["Firewall","PrefixListId"]}},
+                "Arn":{"Value":{"Fn::GetAtt":["Firewall","Arn"]}},
+                "Owner":{"Value":{"Fn::GetAtt":["Firewall","OwnerId"]}},
+                "Version":{"Value":{"Fn::GetAtt":["Firewall","Version"]}}}}
+                """.formatted(capacity, entries, failure);
+    }
+
+    @Test
+    void prefixListUpdatesAndRollbackPreserveTheOwnedResourceAndDeleteRemovesIt() {
+        String stack = "ec2-prefix-list-it";
+        String first = "[{\"Cidr\":\"192.0.2.19/24\",\"Description\":\"first\"}]";
+        String expanded = "[{\"Cidr\":\"192.0.2.0/24\",\"Description\":\"changed\"},"
+                + "{\"Cidr\":\"198.51.100.0/24\"}]";
+        cloudFormation(stack, "CreateStack", prefixListTemplate(1, first, false));
+        Map<String, String> created = XmlParser.extractPairs(describeStacks(stack, "CREATE_COMPLETE"),
+                "Outputs", "OutputKey", "OutputValue");
+        String id = created.get("Ref");
+        assertTrue(id.startsWith("pl-"));
+        assertEquals(id, created.get("Id"));
+        assertEquals("arn:aws:ec2:us-east-1:" + created.get("Owner") + ":prefix-list/" + id, created.get("Arn"));
+        assertEquals("1", created.get("Version"));
+        assertTrue(ec2("GetManagedPrefixListEntries", Map.of("PrefixListId", id)).contains("192.0.2.0/24"));
+
+        cloudFormation(stack, "UpdateStack", prefixListTemplate(2, expanded, false));
+        Map<String, String> changed = XmlParser.extractPairs(describeStacks(stack, "UPDATE_COMPLETE"),
+                "Outputs", "OutputKey", "OutputValue");
+        assertEquals(id, changed.get("Ref"));
+        assertEquals("2", changed.get("Version"));
+        String entries = ec2("GetManagedPrefixListEntries", Map.of("PrefixListId", id));
+        assertTrue(entries.contains("changed") && entries.contains("198.51.100.0/24"), entries);
+        String metadata = ec2("DescribeManagedPrefixLists", Map.of("PrefixListId.1", id));
+        assertTrue(metadata.contains("<maxEntries>2</maxEntries>") && metadata.contains("firewall-2"), metadata);
+
+        // An unrelated failure restores the prefix-list entries, capacity, name and tags.
+        cloudFormation(stack, "UpdateStack", prefixListTemplate(1, first, true));
+        describeStacks(stack, "UPDATE_ROLLBACK_COMPLETE");
+        entries = ec2("GetManagedPrefixListEntries", Map.of("PrefixListId", id));
+        assertTrue(entries.contains("changed") && entries.contains("198.51.100.0/24"), entries);
+        metadata = ec2("DescribeManagedPrefixLists", Map.of("PrefixListId.1", id));
+        assertTrue(metadata.contains("<maxEntries>2</maxEntries>") && metadata.contains("firewall-2"), metadata);
+        assertTrue(metadata.contains("<key>capacity</key>") && metadata.contains("<value>2</value>"), metadata);
+
+        // Dropping all optional entries and tags clears them while keeping the physical ID.
+        String empty = """
+                {"Resources":{"Firewall":{"Type":"AWS::EC2::PrefixList","Properties":{
+                "PrefixListName":"empty-firewall","AddressFamily":"IPv4"}}},
+                "Outputs":{"Id":{"Value":{"Ref":"Firewall"}}}}
+                """;
+        cloudFormation(stack, "UpdateStack", empty);
+        assertEquals(id, XmlParser.extractPairs(describeStacks(stack, "UPDATE_COMPLETE"),
+                "Outputs", "OutputKey", "OutputValue").get("Id"));
+        assertFalse(ec2("GetManagedPrefixListEntries", Map.of("PrefixListId", id)).contains("<cidr>"));
+        assertFalse(ec2("DescribeManagedPrefixLists", Map.of("PrefixListId.1", id)).contains("<key>capacity</key>"));
+
+        cloudFormation(stack, "DeleteStack", null);
+        CfnStackWaits.awaitStackDeleted(stack);
+        given().contentType("application/x-www-form-urlencoded").header("Authorization", EC2_AUTH)
+                .formParam("Action", "GetManagedPrefixListEntries").formParam("Version", "2016-11-15")
+                .formParam("PrefixListId", id).post("/").then().statusCode(400)
+                .body(containsString("InvalidPrefixListID.NotFound"));
+    }
+
     private static String template(String vpcId, String publicSubnetCidr, String extraSubnetTag) {
         return """
         {
