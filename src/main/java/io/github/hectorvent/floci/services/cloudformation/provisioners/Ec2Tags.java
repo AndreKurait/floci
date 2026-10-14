@@ -25,7 +25,9 @@ final class Ec2Tags {
     static void reconcile(Ec2Service ec2Service, String region, String resourceId, Map<String, String> desired) {
         Map<String, String> current = new LinkedHashMap<>();
         for (Map<String, String> entry : ec2Service.describeTags(region, Map.of("resource-id", List.of(resourceId)))) {
-            current.put(entry.get("key"), entry.get("value"));
+            if (!Ec2Service.isAwsTagKey(entry.get("key"))) {
+                current.put(entry.get("key"), entry.get("value"));
+            }
         }
         List<String> stale = ProvisionContext.staleTagKeys(current, desired);
         if (!stale.isEmpty()) {

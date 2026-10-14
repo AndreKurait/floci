@@ -8492,7 +8492,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
-    static boolean isAwsTagKey(String key) {
+    public static boolean isAwsTagKey(String key) {
         return key != null && key.toLowerCase(Locale.ROOT).startsWith("aws:");
     }
 
