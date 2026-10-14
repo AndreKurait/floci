@@ -1171,6 +1171,34 @@ class ApiGatewayOpenApiImportTest {
             String storedSchema = given().get("/restapis/" + apiId + "/models/Request")
                     .then().statusCode(200).extract().path("schema");
             assertFalse(mapper.readTree(storedSchema).has("components"), "Validation must not rewrite stored models");
+            String urlSchema = storedSchema.replace("#/components/schemas/",
+                    "https://apigateway.amazonaws.com/restapis/" + apiId + "/models/");
+            given().contentType(ContentType.JSON)
+                    .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
+                            + mapper.writeValueAsString(urlSchema) + "}]}")
+                    .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
+            given().contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
+                    .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
+            given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
+                    .post(endpoint).then().statusCode(200);
+            given().contentType(ContentType.JSON)
+                    .body("{\"workflowCategory\":\"DMS\",\"status\":\"DONE\",\"child\":"
+                            + valid.replace("RUNNING", "DONE") + "}")
+                    .post(endpoint).then().statusCode(200);
+            assertRejectedWithoutIntegration(endpoint, valid, integrationCalls);
+            assertRejectedWithoutIntegration(endpoint,
+                    "{\"workflowCategory\":\"DMS\",\"status\":\"DONE\",\"child\":" + valid + "}", integrationCalls);
+            given().contentType(ContentType.JSON).body(patch.replace("DONE", "RUNNING"))
+                    .patch("/restapis/" + apiId + "/models/Status").then().statusCode(200);
+            given().delete("/restapis/" + apiId + "/models/Category").then().statusCode(202);
+            given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
+                    .post(endpoint).then().statusCode(200);
+            assertRejectedWithoutIntegration(endpoint, valid, integrationCalls);
+            given().contentType(ContentType.JSON).body(patch)
+                    .patch("/restapis/" + apiId + "/models/Status").then().statusCode(200);
+            given().contentType(ContentType.JSON)
+                    .body("{\"name\":\"Category\",\"schema\":\"{\\\"type\\\":\\\"string\\\",\\\"enum\\\":[\\\"DMS\\\"]}\"}")
+                    .post("/restapis/" + apiId + "/models").then().statusCode(201);
             given().contentType(ContentType.JSON)
                     .body("{\"name\":\"UnrelatedInvalid\",\"schema\":\"{invalid\"}")
                     .post("/restapis/" + apiId + "/models").then().statusCode(201);
@@ -1191,7 +1219,8 @@ class ApiGatewayOpenApiImportTest {
                         .body("{\"name\":\"OtherOnly\",\"contentType\":\"application/json\",\"schema\":"
                                 + mapper.writeValueAsString("{\"type\":\"object\"}") + "}")
                         .post("/restapis/" + otherApi + "/models").then().statusCode(201);
-                String missing = "{\"$ref\":\"#/components/schemas/OtherOnly\"}";
+                String missing = "{\"$ref\":\"https://apigateway.amazonaws.com/restapis/"
+                        + otherApi + "/models/OtherOnly\"}";
                 given().contentType(ContentType.JSON)
                         .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
                                 + mapper.writeValueAsString(missing) + "}]}")

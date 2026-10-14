@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CookieHeaders;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
@@ -58,6 +59,7 @@ import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.*;
 import org.jboss.logging.Logger;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URLDecoder;
@@ -1183,8 +1185,19 @@ public class ApiGatewayExecuteController {
                                     JsonSchemaFactory.getInstance(
                                             SpecVersion.VersionFlag.V4, builder -> builder.schemaLoaders(
                                                     loaders -> loaders.add(iri -> {
-                                                        throw new IllegalArgumentException(
-                                                                "External model references are not supported");
+                                                        String prefix = "https://apigateway."
+                                                                + AwsRegions.dnsSuffixFor(region)
+                                                                + "/restapis/" + apiId + "/models/";
+                                                        String reference = iri.toString();
+                                                        String referencedSchema = reference.startsWith(prefix)
+                                                                ? models.get(reference.substring(prefix.length())) : null;
+                                                        if (referencedSchema == null) {
+                                                            throw new IllegalArgumentException(
+                                                                    "Model reference is not in this deployment");
+                                                        }
+                                                        return () -> new ByteArrayInputStream(
+                                                                modelValidationSchema(models, referencedSchema)
+                                                                        .toString().getBytes(StandardCharsets.UTF_8));
                                                     })));
                             JsonSchema schema = factory.getSchema(schemaNode);
                             Set<ValidationMessage> errors = schema.validate(bodyNode);
