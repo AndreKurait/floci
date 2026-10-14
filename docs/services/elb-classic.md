@@ -65,8 +65,10 @@ existing Classic load balancer's DNS name or an unambiguous public Route53 alias
 The alias target DNS name and hosted-zone ID must match the load balancer. Public endpoints
 select the resource's account, independently of the client's API credentials.
 
-Requests stream to healthy registered EC2 instances at their modeled local IPv4 address and
-the listener's `InstancePort`. Host, method, raw path/query, authorization headers, request body
+Requests stream to healthy registered EC2 instances using the same address as their health
+checks: the modeled container address, or the registered instance's DNS name for external compute.
+DNS resolution happens outside the HTTP event loop and each connection uses the validated IP.
+Requests use the listener's `InstancePort`. Host, method, raw path/query, authorization headers, request body
 and response status/body are preserved. No external DNS target is contacted. Deregistration,
 failed health checks, record changes and load-balancer deletion take effect without restarting.
 

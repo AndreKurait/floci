@@ -21,7 +21,6 @@ import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
-import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -38,7 +37,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 @ApplicationScoped
 public class ElbClassicDataPlane {
 
-    private static final Logger LOG = Logger.getLogger(ElbClassicDataPlane.class);
     private static final Set<String> HOP_HEADERS = Set.of(
             "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
             "te", "trailer", "trailers", "transfer-encoding", "upgrade");
@@ -48,6 +46,7 @@ public class ElbClassicDataPlane {
     private final Route53Service route53;
     private final Ec2Service ec2;
     private final EmulatorConfig config;
+    private final Vertx vertx;
     private final HttpClient client;
     private final AtomicInteger nextTarget = new AtomicInteger();
 
@@ -59,6 +58,7 @@ public class ElbClassicDataPlane {
         this.route53 = route53;
         this.ec2 = ec2;
         this.config = config;
+        this.vertx = vertx;
         this.client = vertx.createHttpClient(new HttpClientOptions().setConnectTimeout(5000).setKeepAlive(true));
     }
 
@@ -129,10 +129,15 @@ public class ElbClassicDataPlane {
         }
         String target = targets.get(Math.floorMod(nextTarget.getAndIncrement(), targets.size()));
         context.request().pause();
-        RequestOptions options = new RequestOptions().setHost(target).setPort(listener.getInstancePort())
-                .setURI(context.request().uri()).setMethod(context.request().method())
-                .setTimeout(lb.getAttributes().getIdleTimeout() * 1000L);
-        client.request(options).onSuccess(upstream -> forward(context, upstream, originalAuthority))
+        // External compute fabrics publish the modeled instance ID in DNS instead of setting a
+        // Docker bridge IP. Resolve off the event loop, then pin the checked address for this request.
+        vertx.executeBlocking(() -> targetAddress(target), false).onSuccess(address -> {
+            RequestOptions options = new RequestOptions().setHost(address).setPort(listener.getInstancePort())
+                    .setURI(context.request().uri()).setMethod(context.request().method())
+                    .setTimeout(lb.getAttributes().getIdleTimeout() * 1000L);
+            client.request(options).onSuccess(upstream -> forward(context, upstream, originalAuthority))
+                    .onFailure(error -> fail(context, 502));
+        })
                 .onFailure(error -> fail(context, 502));
     }
 
@@ -146,18 +151,15 @@ public class ElbClassicDataPlane {
                     || !"InService".equals(health.getHealth(lb, id).state())) {
                 continue;
             }
-            String address = instance.getContainerBridgeIp();
-            if (address == null || !address.matches("[0-9.]+")) {
-                continue;
-            }
-            try {
-                SsrfProtection.rejectMetadataAddresses(new InetAddress[] {InetAddress.getByName(address)}, address);
-                targets.add(address);
-            } catch (IOException error) {
-                LOG.debugv("Classic ELB refuses target {0}: {1}", id, error.getMessage());
-            }
+            targets.add(ElbClassicHealthChecker.instanceHost(instance));
         }
         return targets;
+    }
+
+    static String targetAddress(String host) throws IOException {
+        InetAddress[] addresses = InetAddress.getAllByName(host);
+        SsrfProtection.rejectMetadataAddresses(addresses, host);
+        return addresses[0].getHostAddress();
     }
 
     private void forward(RoutingContext context, HttpClientRequest upstream, String originalAuthority) {

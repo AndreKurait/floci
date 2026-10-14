@@ -219,8 +219,12 @@ public class ElbClassicHealthChecker implements Resettable {
         if (instance == null) {
             return instanceId;
         }
+        return instanceHost(instance);
+    }
+
+    static String instanceHost(Instance instance) {
         String bridgeIp = instance.getContainerBridgeIp();
-        return bridgeIp != null && !bridgeIp.isBlank() ? bridgeIp : instanceId;
+        return bridgeIp != null && !bridgeIp.isBlank() ? bridgeIp : instance.getInstanceId();
     }
 
     private static boolean probe(String host, Target target, int timeoutSeconds) throws IOException {
