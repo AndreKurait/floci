@@ -39,11 +39,9 @@ import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
 import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
-import io.github.hectorvent.floci.services.s3.model.S3ObjectUpdatedEvent;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -3410,8 +3408,8 @@ public class LambdaService implements ResourceProvider {
             // PublishVersion's CodeSha256 precondition is a check-then-act: it compares the hash and
             // then snapshots the code. Mutating these fields without the lock lets an overlapping
             // deploy move $LATEST between those two steps, so a version would carry code whose hash
-            // the caller never authorised even though the check passed. Extraction to disk stays
-            // outside the lock; only the fields that decide what a snapshot copies are inside it.
+            // the caller never authorised even though the check passed. UpdateFunctionCode holds
+            // this same monitor across extraction too; a new function is saved after extraction.
             String newSha256 = Base64.getEncoder().encodeToString(Digests.sha256(zipBytes));
             synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
                 fn.setCodeLocalPath(codePath.toAbsolutePath().normalize().toString());
@@ -4092,39 +4090,4 @@ public class LambdaService implements ResourceProvider {
         }
     }
 
-    /**
-     * Observes S3 object updates and triggers reactive sync for any Lambda
-     * functions linked to the updated object.
-     */
-    public void onS3ObjectUpdated(@Observes S3ObjectUpdatedEvent event) {
-        LOG.debugv("Observing S3 update: {0}/{1}", event.bucketName(), event.key());
-        // For simplicity, we scan all functions in the default region
-        // Most local dev setups use a single region.
-        // This runs on the CDI event thread with no RequestContext, so an ambient scan
-        // would only ever see the default account's partition — a function owned by any
-        // other account would silently never hot-reload from S3.
-        String region = regionResolver.getDefaultRegion();
-        List<LambdaFunction> functions = functionStore.listAllAccounts(region);
-        for (LambdaFunction fn : functions) {
-            if (fn.isHotReload()) {
-                continue;
-            }
-            if (event.bucketName().equals(fn.getS3Bucket()) && event.key().equals(fn.getS3Key())) {
-                LOG.infov("Reactive S3 Sync: updating function {0} from s3://{1}/{2}",
-                        fn.getFunctionName(), event.bucketName(), event.key());
-                try {
-                    S3Object obj = s3Service.getObject(event.bucketName(), event.key());
-                    extractZipCodeBytes(fn, obj.getData(), region);
-                    fn.setLastModified(Instant.now().toEpochMilli());
-                    fn.setRevisionId(UUID.randomUUID().toString());
-                    functionStore.saveForAccount(ownerAccount(fn), region, fn);
-
-                    // Push to warm workers
-                    warmPool.pushCodeUpdate(fn);
-                } catch (Exception e) {
-                    LOG.warnv("Failed reactive sync for function {0}: {1}", fn.getFunctionName(), e.getMessage());
-                }
-            }
-        }
-    }
 }

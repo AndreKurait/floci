@@ -1205,8 +1205,7 @@ class LambdaServiceTest {
 
     @Test
     void hotReload_convertFromS3Backed_clearsBucketAndKey() {
-        // A function previously deployed from S3 that is later converted to hot-reload
-        // must have s3Bucket/s3Key cleared so the reactive S3 sync observer cannot fire.
+        // Converting to bind-mount code clears the previous S3 deployment location.
         LambdaService svc = serviceWithHotReload(true, null);
         Map<String, Object> req = baseRequest("hr-convert");
         req.put("Code", Map.of("S3Bucket", "my-code-bucket", "S3Key", "fn.zip"));
