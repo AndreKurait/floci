@@ -148,7 +148,7 @@ public class AwsQueryController {
             "CreateAutoScalingGroup", "UpdateAutoScalingGroup", "DeleteAutoScalingGroup",
             "DescribeAutoScalingGroups", "SetDesiredCapacity",
             "StartInstanceRefresh", "DescribeInstanceRefreshes",
-            "CreateOrUpdateTags", "DeleteTags",
+            "CreateOrUpdateTags", "DeleteTags", "DescribeTags",
             "DescribeAutoScalingInstances", "AttachInstances", "DetachInstances",
             "TerminateInstanceInAutoScalingGroup",
             "AttachLoadBalancerTargetGroups", "DetachLoadBalancerTargetGroups",
