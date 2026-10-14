@@ -54,6 +54,11 @@ public class SchedulerScheduleCfnProvisioner implements CfnResourceProvisioner {
     @Override
     public void provision(StackResource resource, JsonNode props, ProvisionContext ctx) {
         readCleanup(resource);
+        if (ctx.isUpdate()) {
+            // The rollbackUpdate calls below restore a snapshot; only ContinueUpdateRollback retries
+            // the delete the last rollback could not make.
+            ReplacementCleanup.endRollbackRetry(resource);
+        }
         if (ctx.isUpdate() && resource.getAttributes().containsKey(SNAPSHOT_ATTR)) {
             try {
                 rollbackUpdate(resource);

@@ -23,7 +23,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
@@ -31,7 +30,6 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.restassured.RestAssured.given;
-import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertAll;
@@ -296,7 +294,7 @@ class CloudFormationSchedulerScheduleIntegrationTest {
         Queue queue = sqs.createQueue("external-" + suffix, Map.of(), "us-east-1");
         prepareFailedRollback(stack, name, queue);
         allowOriginalRestore(name);
-        cloudFormation(stack, "ContinueUpdateRollback", null, Map.of());
+        continueUpdateRollback(stack);
         outputs(stack, "UPDATE_ROLLBACK_COMPLETE");
 
         cloudFormation(stack, "UpdateStack", externalQueueTemplate(FAILURE, queue),
@@ -320,12 +318,9 @@ class CloudFormationSchedulerScheduleIntegrationTest {
         prepareFailedRollback(stack, name, queue);
         String snapshot = scheduleResource(stack).getAttributes().get("__FlociSchedulerUpdateSnapshot");
 
-        given().contentType("application/x-www-form-urlencoded").header("Authorization", AUTH)
-                .formParam("Action", "UpdateStack").formParam("StackName", stack)
-                .formParam("TemplateBody", externalQueueTemplate("", queue))
-                .post("/").then().statusCode(400)
-                .body(containsString("UPDATE_ROLLBACK_FAILED"));
-        cloudFormation(stack, "ContinueUpdateRollback", null, Map.of());
+        assertUpdateRefused(stack, externalQueueTemplate("", queue),
+                Map.of("Name", name, "Expression", "rate(15 minutes)", "Payload", "third"));
+        continueUpdateRollback(stack);
         outputs(stack, "UPDATE_ROLLBACK_FAILED");
 
         getSchedule(name, "default").then().statusCode(200)
@@ -345,12 +340,9 @@ class CloudFormationSchedulerScheduleIntegrationTest {
         Queue queue = sqs.createQueue("external-" + suffix, Map.of(), "us-east-1");
         prepareFailedRollback(stack, name, queue);
         String snapshot = scheduleResource(stack).getAttributes().get("__FlociSchedulerUpdateSnapshot");
-        String unchanged = externalQueueTemplate("", queue);
         String priorTemplate = cloudFormation.describeStacks(stack, "us-east-1").getFirst().getOriginalTemplateBody();
-        given().contentType("application/x-www-form-urlencoded").header("Authorization", AUTH)
-                .formParam("Action", "UpdateStack").formParam("StackName", stack)
-                .formParam("TemplateBody", unchanged).post("/").then().statusCode(400)
-                .body(containsString("UPDATE_ROLLBACK_FAILED"));
+
+        assertUpdateRefused(stack, externalQueueTemplate("", queue), Map.of("Name", name));
         outputs(stack, "UPDATE_ROLLBACK_FAILED");
         assertEquals(snapshot, scheduleResource(stack).getAttributes().get("__FlociSchedulerUpdateSnapshot"));
         assertEquals(priorTemplate, cloudFormation.describeStacks(stack, "us-east-1").getFirst().getOriginalTemplateBody());
@@ -508,10 +500,12 @@ class CloudFormationSchedulerScheduleIntegrationTest {
         Instant firstCreation = scheduler.getSchedule(replacementName, "default", "us-east-1").getCreationDate();
         doCallRealMethod().when(scheduler).deleteSchedule(replacementName, "default", "us-east-1");
         given().delete("/schedules/" + replacementName).then().statusCode(200);
-        cloudFormation(stack, "ContinueUpdateRollback", null, Map.of());
-        outputs(stack, "UPDATE_ROLLBACK_COMPLETE");
         doThrow(new AwsException("InternalServerException", "replacement deletion still unavailable", 500))
                 .when(scheduler).deleteSchedule(replacementName, "default", "us-east-1");
+        // With its delete still failing, the rollback finishes only by skipping the schedule, which
+        // keeps the replacement owed when the next update recreates it at the same address.
+        continueUpdateRollback(stack, "Schedule");
+        outputs(stack, "UPDATE_ROLLBACK_COMPLETE");
 
         // Change both resources so the engine actually retries the replacement and its failing dependent.
         String repeatedFailure = FAILURE.replace("\"SecretString\":\"explicit\"",
@@ -630,7 +624,7 @@ class CloudFormationSchedulerScheduleIntegrationTest {
         recreateScheduleViaApi(name, "default");
 
         try {
-            cloudFormation(stack, "ContinueUpdateRollback", null, Map.of());
+            continueUpdateRollback(stack);
             outputs(stack, "UPDATE_ROLLBACK_COMPLETE");
             getSchedule(name, "default").then().statusCode(200)
                     .body("ScheduleExpression", equalTo("rate(5 minutes)"))
@@ -690,7 +684,7 @@ class CloudFormationSchedulerScheduleIntegrationTest {
                 && group.equals(request.getGroupName())), eq("us-east-1"));
 
         try {
-            cloudFormation(stack, "ContinueUpdateRollback", null, Map.of());
+            continueUpdateRollback(stack);
             outputs(stack, "UPDATE_ROLLBACK_COMPLETE");
             assertTrue(pausedRecreatedDestination.get());
             getSchedule(name, group).then().statusCode(404);
@@ -1041,6 +1035,11 @@ class CloudFormationSchedulerScheduleIntegrationTest {
     }
 
     private static void cloudFormation(String stack, String action, String template, Map<String, String> parameters) {
+        cloudFormationRequest(stack, action, template, parameters).post("/").then().statusCode(200);
+    }
+
+    private static RequestSpecification cloudFormationRequest(String stack, String action, String template,
+                                                              Map<String, String> parameters) {
         RequestSpecification request = given().contentType("application/x-www-form-urlencoded")
                 .header("Authorization", AUTH).formParam("Action", action).formParam("StackName", stack);
         if (template != null) {
@@ -1051,6 +1050,20 @@ class CloudFormationSchedulerScheduleIntegrationTest {
             request.formParam("Parameters.member." + index + ".ParameterKey", parameter.getKey());
             request.formParam("Parameters.member." + index + ".ParameterValue", parameter.getValue());
             index++;
+        }
+        return request;
+    }
+
+    // AWS refuses an update over UPDATE_ROLLBACK_FAILED: only ContinueUpdateRollback or DeleteStack proceeds.
+    private static void assertUpdateRefused(String stack, String template, Map<String, String> parameters) {
+        cloudFormationRequest(stack, "UpdateStack", template, parameters).post("/").then().statusCode(400)
+                .body(containsString("is in UPDATE_ROLLBACK_FAILED state and can not be updated."));
+    }
+
+    private static void continueUpdateRollback(String stack, String... resourcesToSkip) {
+        RequestSpecification request = cloudFormationRequest(stack, "ContinueUpdateRollback", null, Map.of());
+        for (int i = 0; i < resourcesToSkip.length; i++) {
+            request.formParam("ResourcesToSkip.member." + (i + 1), resourcesToSkip[i]);
         }
         request.post("/").then().statusCode(200);
     }

@@ -526,6 +526,8 @@ class SchedulerScheduleCfnProvisionerTest {
         when(scheduler.createSchedule(argThat(r -> "c".equals(r.getGroupName())), eq(REGION)))
                 .thenThrow(new AwsException("ConflictException", "destination owned elsewhere", 409));
 
+        // The stack takes this update only after ContinueUpdateRollback skipped the schedule, so the
+        // orphan is still owed, and the failed move's own restore must not retry its delete.
         assertThrows(AwsException.class,
                 () -> provisioner.provision(resource, properties("same", "c"), context("same")));
 
@@ -539,10 +541,9 @@ class SchedulerScheduleCfnProvisionerTest {
         assertEquals("ENABLED", requests.getAllValues().getLast().getState());
         assertEquals("same", resource.getPhysicalId());
         assertEquals("a", resource.getAttributes().get("FlociSchedulerGroupName"));
-        // Restoring the failed move also finishes the earlier orphan cleanup.
-        assertNull(provisioner.updateCleanupPhysicalId(resource));
+        assertEquals("b/same", provisioner.updateCleanupPhysicalId(resource));
 
-        assertFalse(provisioner.completeUpdate(resource).applicable());
+        assertTrue(provisioner.completeUpdate(resource).complete());
         verify(scheduler, times(2)).deleteSchedule("same", "b", REGION);
         verify(scheduler, never()).deleteSchedule("same", "a", REGION);
     }
