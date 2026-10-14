@@ -3280,6 +3280,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                     String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
                                     String hostId, String tenancy,
                                     List<LaunchTemplateData.BlockDeviceMapping> blockDevices) {
+        if (blockDevices == null) {
+            blockDevices = List.of();
+        }
         if (hostId != null && !hostId.isBlank()) {
             Host host = getRequiredAvailableHost(region, hostId);
             if ((availabilityZone == null || availabilityZone.isBlank())
@@ -3995,7 +3998,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private LaunchVolumes planLaunchVolumes(String region, String imageId,
                                              List<LaunchTemplateData.BlockDeviceMapping> overrides) {
-        Image image = imageForCaller(region, imageId).orElseGet(() -> sharedImageForCaller(region, imageId).orElse(null));
+        Image image = imageForCaller(region, imageId).orElseGet(() -> sharedImageForCaller(region, imageId)
+                .orElseGet(() -> imageCatalog.findByIdOrAlias(imageId)
+                        .map(Ec2ImageCatalog.CatalogImage::toImage).orElse(null)));
         String root = image != null && image.getRootDeviceName() != null ? image.getRootDeviceName() : "/dev/xvda";
         List<LaunchTemplateData.BlockDeviceMapping> inherited = new ArrayList<>();
         Set<String> inheritedSnapshots = new HashSet<>();
@@ -7577,7 +7582,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         List<BlockDeviceMapping> result = new ArrayList<>();
         for (BlockDeviceMapping mapping : declared) {
             EbsBlockDevice ebs = mapping.getEbs();
-            BlockDeviceMapping copied = recapture(mapping);
+            BlockDeviceMapping copied = recapture(mapping, Objects.equals(mapping.getDeviceName(), source.getRootDeviceName()));
             if (ebs != null) {
                 Snapshot snapshot = snapshots instanceof AccountAwareStorageBackend<Snapshot> aware
                         ? aware.getForAccount(source.getOwnerId(), key(region, ebs.getSnapshotId())).orElse(null)
