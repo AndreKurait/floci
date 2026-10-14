@@ -6,9 +6,11 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.ProviderMismatchException;
 import java.nio.file.StandardCopyOption;
 import java.util.Comparator;
 import java.util.stream.Stream;
@@ -115,13 +117,16 @@ public class CodeStore {
                         try {
                             Files.createLink(to, from);
                             continue;
-                        } catch (IOException | UnsupportedOperationException ignored) {
+                        } catch (IOException | UnsupportedOperationException | ProviderMismatchException ignored) {
                             // Cross-device and unsupported links retain ordinary copy semantics.
                         }
                     }
                     Files.copy(from, to, StandardCopyOption.REPLACE_EXISTING);
                 }
             }
+        } catch (UncheckedIOException e) {
+            deleteDirectory(target, functionName);
+            throw e.getCause();
         } catch (IOException e) {
             deleteDirectory(target, functionName);
             throw e;
@@ -172,7 +177,7 @@ public class CodeStore {
                         }
                     });
             LOG.debugv("Deleted code for function: {0}", functionName);
-        } catch (IOException e) {
+        } catch (IOException | UncheckedIOException e) {
             LOG.warnv("Failed to delete code directory for {0}: {1}", functionName, e.getMessage());
         }
     }

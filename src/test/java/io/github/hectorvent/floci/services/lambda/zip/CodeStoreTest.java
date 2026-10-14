@@ -3,7 +3,7 @@ package io.github.hectorvent.floci.services.lambda.zip;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.IOException;
 import java.nio.file.FileSystem;
@@ -196,12 +196,12 @@ class CodeStoreTest {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void unsupportedLinksFallBackToIndependentCopies(boolean externalSource, @TempDir Path baseDir)
+    @CsvSource({"true, false", "false, true", "true, true"})
+    void unsupportedLinksFallBackToIndependentCopies(boolean zipSource, boolean zipTarget, @TempDir Path baseDir)
             throws IOException {
         try (FileSystem zip = FileSystems.newFileSystem(baseDir.resolve("code.zip"), Map.of("create", "true"))) {
-            CodeStore store = new CodeStore(zip.getPath("/code"));
-            Path source = externalSource ? baseDir.resolve("source") : zip.getPath("/source");
+            CodeStore store = new CodeStore(zipTarget ? zip.getPath("/code") : baseDir.resolve("code"));
+            Path source = zipSource ? zip.getPath("/source") : baseDir.resolve("source");
             writeHandler(source.resolve("lib"), "original");
 
             Path version = store.copyForVersion(ACCOUNT_A, REGION, "fn", "1", source);
