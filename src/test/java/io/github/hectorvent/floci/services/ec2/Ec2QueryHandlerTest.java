@@ -42,7 +42,8 @@ class Ec2QueryHandlerTest {
             "CreateCapacityReservation,capacity-reservation", "AllocateHosts,dedicated-host",
             "AllocateAddress,elastic-ip", "AuthorizeSecurityGroupIngress,security-group-rule",
             "AuthorizeSecurityGroupEgress,security-group-rule", "RunInstances,instance",
-            "RunInstances,network-interface"
+            "RunInstances,network-interface", "CreateVolume,volume",
+            "RequestSpotInstances,spot-instances-request", "RequestSpotInstances,instance"
     })
     void rejectsReservedCreationTagsBeforeAllocatingResources(String action, String resourceType) {
         for (String prefix : List.of("TagSpecification", "TagSpecifications")) {
@@ -61,12 +62,30 @@ class Ec2QueryHandlerTest {
             Response response = handler(service).handle(action, params, "us-east-1");
 
             assertEquals(400, response.getStatus());
-            String code = List.of("vpc", "subnet", "security-group-rule").contains(resourceType)
+            String code = List.of("vpc", "subnet", "security-group-rule", "spot-instances-request")
+                    .contains(resourceType)
                     ? "InvalidParameter" : "InvalidParameterValue";
             assertTrue(response.getEntity().toString().contains("<Code>" + code + "</Code>"));
             assertTrue(response.getEntity().toString().contains("reserved for internal use"));
             verifyNoInteractions(service);
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"CreateLaunchTemplate", "CreateLaunchTemplateVersion"})
+    void rejectsReservedNestedTemplateTagsBeforeCreatingATemplateOrVersion(String action) {
+        Ec2Service service = mock(Ec2Service.class);
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("LaunchTemplateName", "test");
+        params.putSingle("LaunchTemplateId", "lt-test");
+        params.putSingle("LaunchTemplateData.TagSpecification.1.ResourceType", "instance");
+        params.putSingle("LaunchTemplateData.TagSpecification.1.Tag.1.Key", "aws:reserved");
+
+        Response response = handler(service).handle(action, params, "us-east-1");
+
+        assertEquals(400, response.getStatus());
+        assertTrue(response.getEntity().toString().contains("<Code>InvalidTagKey.Malformed</Code>"));
+        verifyNoInteractions(service);
     }
 
     @ParameterizedTest
