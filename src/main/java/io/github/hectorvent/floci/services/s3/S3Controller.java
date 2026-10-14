@@ -7,7 +7,6 @@ import io.github.hectorvent.floci.core.common.AccountResolver;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
-import io.github.hectorvent.floci.core.common.AwsQueryController;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.IamEnforcementFilter;
 import io.github.hectorvent.floci.core.common.MultipartFormParser;
@@ -121,7 +120,6 @@ public class S3Controller {
     private final S3SelectService s3SelectService;
     private final RegionResolver regionResolver;
     private final SnsQueryHandler snsQueryHandler;
-    private final AwsQueryController awsQueryController;
     private final io.quarkus.vertx.http.runtime.CurrentVertxRequest currentVertxRequest;
     private final io.github.hectorvent.floci.services.floci.ui.UiPages uiPages;
     private final CloudTrailService cloudTrailService;
@@ -135,7 +133,6 @@ public class S3Controller {
     public S3Controller(S3Service s3Service, S3SelectService s3SelectService,
                         RegionResolver regionResolver,
                         SnsQueryHandler snsQueryHandler,
-                        AwsQueryController awsQueryController,
                         io.quarkus.vertx.http.runtime.CurrentVertxRequest currentVertxRequest,
                         io.github.hectorvent.floci.services.floci.ui.UiPages uiPages,
                         CloudTrailService cloudTrailService,
@@ -148,7 +145,6 @@ public class S3Controller {
         this.s3SelectService = s3SelectService;
         this.regionResolver = regionResolver;
         this.snsQueryHandler = snsQueryHandler;
-        this.awsQueryController = awsQueryController;
         this.currentVertxRequest = currentVertxRequest;
         this.uiPages = uiPages;
         this.cloudTrailService = cloudTrailService;
@@ -215,14 +211,10 @@ public class S3Controller {
                                 @HeaderParam("Accept") String accept,
                                 @Context HttpHeaders httpHeaders,
                                 @Context UriInfo uriInfo) {
-        MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
-        String authorization = httpHeaders.getHeaderString("Authorization");
-        if (AwsQueryController.isCloudWatchQueryGet(authorization, target, accept, queryParams)) {
-            return awsQueryController.dispatchCloudWatchQueryGet(authorization, httpHeaders, queryParams);
-        }
         if (target != null) {
             return null;
         }
+        MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
         String action = queryParams.getFirst("Action");
         // SNS emits SubscribeURL/UnsubscribeURL as plain GET links against the
         // service root, which collides with the S3 ListBuckets endpoint. Delegate

@@ -62,9 +62,11 @@ class S3Test {
     private static final String BUCKET = "sdk-test-bucket";
     private static final String LOCATED_BUCKET = "sdk-test-bucket-located";
     // Only the us-east-1 endpoint creates a bucket in another region; any other endpoint takes its own.
-    private static final BucketLocationConstraint LOCATION = TestFixtures.region().id().equals("us-east-1")
-            ? BucketLocationConstraint.EU_CENTRAL_1
-            : BucketLocationConstraint.fromValue(TestFixtures.region().id());
+    // A string, not the SDK enum: the enum has no value for the ISO and EUSC regions, and an unknown
+    // one would be sent as the literal "null".
+    private static final String LOCATION = TestFixtures.region().id().equals("us-east-1")
+            ? "eu-central-1"
+            : TestFixtures.region().id();
     private static final String KEY = "test-file.txt";
     private static final String CONTENT = "Hello from AWS SDK v2!";
 
@@ -112,7 +114,7 @@ class S3Test {
         GetBucketLocationResponse response = s3.getBucketLocation(
                 GetBucketLocationRequest.builder().bucket(LOCATED_BUCKET).build());
 
-        assertThat(response.locationConstraint()).isEqualTo(LOCATION);
+        assertThat(response.locationConstraintAsString()).isEqualTo(LOCATION);
     }
 
     @Test

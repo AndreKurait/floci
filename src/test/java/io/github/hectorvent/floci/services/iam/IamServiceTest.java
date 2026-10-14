@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.Totp;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
@@ -24,6 +25,7 @@ import io.github.hectorvent.floci.services.iam.model.PolicyVersion;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import io.github.hectorvent.floci.services.iam.model.VirtualMfaDevice;
 import io.github.hectorvent.floci.testing.MutableClock;
+import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
@@ -45,6 +47,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
 import java.util.function.Predicate;
 
@@ -366,11 +369,31 @@ class IamServiceTest {
                 null, "123456789012", "s", "AROATESTROLEID:s");
 
         // The session ARN carries only the role's name; aws:PrincipalArn is the role's own ARN.
+        // The principal keys ride along from the same lookup: a role session is typed as an
+        // assumed role, its aws:userid is the stored role-id:session-name, and it has no
+        // aws:username, which the guide lists as not present for a role.
         assertEquals(new IamService.CallerArns("arn:aws:sts::123456789012:assumed-role/TestRole/s",
-                        "arn:aws:iam::123456789012:role/team/TestRole"),
+                        "arn:aws:iam::123456789012:role/team/TestRole",
+                        IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROATESTROLEID:s", null),
                 service.resolveCallerArns("ASIALIVESESSION").orElseThrow());
         // An expired session answers for neither, never for one and not the other.
         assertTrue(service.resolveCallerArns("ASIAEXPIREDSESSION").isEmpty());
+    }
+
+    @Test
+    void anIamUsersCallerArnsCarryItsNameIdAndType() {
+        IamService service = iamService(false, new InMemoryStorage<>(), new InMemoryStorage<>());
+        IamUser user = service.createUser("alice", "/");
+        AccessKey key = service.createAccessKey("alice");
+
+        IamService.CallerArns arns = service.resolveCallerArns(key.getAccessKeyId()).orElseThrow();
+
+        // The one principal the guide gives an aws:username, and its aws:userid is the user's own
+        // id rather than anything the ARN carries.
+        assertEquals(IamService.CallerArns.TYPE_USER, arns.principalType());
+        assertEquals("alice", arns.userName());
+        assertEquals(user.getUserId(), arns.userId());
+        assertEquals(user.getArn(), arns.callerArn());
     }
 
     @Test
@@ -502,7 +525,10 @@ class IamServiceTest {
 
         assertEquals(List.of(READ_S3), context.identityPolicies());
         assertNull(context.sessionPolicyDocument());
-        assertEquals(new IamService.CallerArns(alice.getArn(), alice.getArn()),
+        // Acting as the user means carrying the user's principal keys, aws:username included:
+        // the guide gives one to an IAM user and to no other principal.
+        assertEquals(new IamService.CallerArns(alice.getArn(), alice.getArn(),
+                        IamService.CallerArns.TYPE_USER, alice.getUserId(), "alice"),
                 service.resolveCallerArns("ASIASESSIONTOKEN").orElseThrow());
         assertEquals(alice.getUserId(), service.resolveCallerUserId("ASIASESSIONTOKEN", "token").orElseThrow());
     }
@@ -517,7 +543,11 @@ class IamServiceTest {
         // account's SCPs, rather than the null that lets a credential through unevaluated.
         CallerContext context = service.resolveCallerContext("ASIAROOTSESSION");
         assertEquals(1, context.identityPolicies().size());
-        assertEquals(new IamService.CallerArns("arn:aws:iam::000000000000:root", "arn:aws:iam::000000000000:root"),
+        // "aws:userid: AWS account ID" and no aws:username, which the guide lists as not
+        // present for the account root.
+        assertEquals(new IamService.CallerArns("arn:aws:iam::000000000000:root",
+                        "arn:aws:iam::000000000000:root", IamService.CallerArns.TYPE_ACCOUNT,
+                        "000000000000", null),
                 service.resolveCallerArns("ASIAROOTSESSION").orElseThrow());
     }
 
@@ -624,7 +654,10 @@ class IamServiceTest {
         assertEquals(READ_S3, withPolicy.identityPolicies().getFirst());
         assertFederatedUserLimits(withPolicy.identityPolicies().getLast());
         assertEquals(ALL_S3, withPolicy.sessionPolicyDocument());
-        assertEquals(new IamService.CallerArns(federatedArn, federatedArn),
+        // The same aws:userid both ways, since one derivation now serves both readers, and no
+        // aws:username: the guide lists it as not present for a federated user.
+        assertEquals(new IamService.CallerArns(federatedArn, federatedArn,
+                        IamService.CallerArns.TYPE_FEDERATED_USER, "000000000000:Bob", null),
                 service.resolveCallerArns("ASIAWITHPOLICY").orElseThrow());
         assertEquals("000000000000:Bob", service.resolveCallerUserId("ASIAWITHPOLICY", "token").orElseThrow());
     }
@@ -1238,6 +1271,44 @@ class IamServiceTest {
         iamService.createUser("alice", "/");
         assertTrue(iamService.listAccessKeys("alice").isEmpty());
         assertEquals("alicia", iamService.findUserNameByAccessKeyId(keyId).orElseThrow());
+    }
+
+    @Test
+    void anotherAccountCannotClaimALegacyAccessKeyThroughItsOwnerLookup() {
+        assertLegacyKeyStaysWithTheDefaultAccount(false);
+    }
+
+    @Test
+    void aSameNamedUserInAnotherAccountCannotClaimALegacyAccessKey() {
+        assertLegacyKeyStaysWithTheDefaultAccount(true);
+    }
+
+    /** One shared key store, two accounts told apart by the request context, as in a real boot. */
+    @SuppressWarnings("unchecked")
+    private static void assertLegacyKeyStaysWithTheDefaultAccount(boolean strangerHasSameNamedUser) {
+        AtomicReference<String> caller = new AtomicReference<>("000000000000");
+        RequestContext context = Mockito.mock(RequestContext.class);
+        Mockito.when(context.getAccountId()).thenAnswer(inv -> caller.get());
+        Instance<RequestContext> contexts = Mockito.mock(Instance.class);
+        Mockito.when(contexts.get()).thenReturn(context);
+        InMemoryStorage<String, AccessKey> raw = new InMemoryStorage<>();
+        raw.put("AKIALEGACYEXAMPLE", new AccessKey("AKIALEGACYEXAMPLE", "secret", "worker"));
+        AccountAwareStorageBackend<AccessKey> keys = new AccountAwareStorageBackend<>(raw, contexts, "000000000000");
+        IamService owner = iamService(false, keys);
+        IamService stranger = iamService(false, keys);
+        owner.createUser("worker", "/");
+
+        caller.set("111122223333");
+        if (strangerHasSameNamedUser) {
+            stranger.createUser("worker", "/");
+        }
+        assertTrue(stranger.findAccessKeyOwnerInThisAccount("AKIALEGACYEXAMPLE").isEmpty());
+        assertTrue(raw.get("AKIALEGACYEXAMPLE").isPresent(), "the stranger's lookup must leave the key unmoved");
+        assertTrue(raw.get("111122223333/AKIALEGACYEXAMPLE").isEmpty(), "the stranger's lookup must not copy the key");
+
+        caller.set("000000000000");
+        assertEquals("worker", owner.findAccessKeyOwnerInThisAccount("AKIALEGACYEXAMPLE").orElseThrow());
+        assertTrue(raw.get("AKIALEGACYEXAMPLE").isPresent(), "the owner's read must not migrate either");
     }
 
     @Test

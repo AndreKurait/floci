@@ -1,5 +1,8 @@
 package io.github.hectorvent.floci.services.iam;
 
+import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
+import io.github.hectorvent.floci.core.common.ProtocolClaim;
+import io.github.hectorvent.floci.core.common.WireProtocol;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedHashMap;
@@ -56,8 +59,8 @@ class IamActionRegistryTest {
         query.add("Operation", "ListMetrics");
         query.add("Version", "2010-08-01");
         ContainerRequestContext ctx = mockCtx("GET", "/", query, null, "");
-        when(ctx.getHeaderString("Authorization")).thenReturn(
-                "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/monitoring/aws4_request");
+        when(ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY))
+                .thenReturn(new ProtocolClaim(WireProtocol.AWS_QUERY, null, "GetMetricStatistics", null));
         assertEquals("monitoring:GetMetricStatistics", registry.resolve("monitoring", ctx));
         assertEquals("GetMetricStatistics", registry.queryAction(ctx));
         assertEquals("2010-08-01", registry.queryVersion(ctx));
@@ -65,35 +68,14 @@ class IamActionRegistryTest {
         assertEquals("monitoring:ListMetrics", registry.resolve("monitoring", ctx));
     }
 
-    @ParameterizedTest
-    @CsvSource({
-            "s3,GetMetricStatistics,false", "sns,TagResource,false", "monitoring,TagResource,true",
-            "monitoring,UnknownAction,true", "unknown,GetMetricStatistics,false"
-    })
-    void getClassificationRespectsSigningScope(String scope, String action, boolean expected) {
-        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
-        query.add("Action", action);
-        ContainerRequestContext ctx = mockCtx("GET", "/", query, null, "");
-        when(ctx.getHeaderString("Authorization")).thenReturn(
-                "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/" + scope + "/aws4_request");
-        assertEquals(expected, IamActionRegistry.isQueryRequest(ctx));
-    }
-
     @Test
-    void targetBrowserAndBucketPathsAreNotCloudWatchQuery() {
+    void getRequiresTheQueryClaimRatherThanQueryParametersAlone() {
         MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
         query.add("Action", "ListMetrics");
         ContainerRequestContext ctx = mockCtx("GET", "/", query, null, "");
-        assertEquals(true, IamActionRegistry.isQueryRequest(ctx));
-        query.add("X-Amz-Credential", "test/20261013/us-east-1/s3/aws4_request");
         assertEquals(false, IamActionRegistry.isQueryRequest(ctx));
-        query.remove("X-Amz-Credential");
-        when(ctx.getHeaderString("Accept")).thenReturn("text/html");
+        when(ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY)).thenReturn(new ProtocolClaim(WireProtocol.REST, null, null, null));
         assertEquals(false, IamActionRegistry.isQueryRequest(ctx));
-        when(ctx.getHeaderString("Accept")).thenReturn(null);
-        when(ctx.getHeaderString("X-Amz-Target")).thenReturn("Example.Target");
-        assertEquals(false, IamActionRegistry.isQueryRequest(ctx));
-        assertEquals(false, IamActionRegistry.isQueryRequest(mockCtx("GET", "/bucket", query, null, "")));
     }
 
     @Test

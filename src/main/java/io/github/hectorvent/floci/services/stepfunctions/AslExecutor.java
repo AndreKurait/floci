@@ -104,6 +104,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
@@ -255,6 +256,7 @@ public class AslExecutor {
     private final RdsDataService rdsDataService;
     private final RedshiftDataJsonHandler redshiftDataHandler;
     private final ServiceRegistry serviceRegistry;
+    private final LambdaTaskAuthorizer lambdaTaskAuthorizer;
     private final ObjectMapper objectMapper;
     private final Configuration jsonPathConfiguration;
     private final JsonataEvaluator jsonataEvaluator;
@@ -288,14 +290,15 @@ public class AslExecutor {
                        ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
                        Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
                        CustomResourceLiveness customResourceLiveness, RedshiftDataJsonHandler redshiftDataHandler,
-                       ServiceRegistry serviceRegistry, NestedTaskCredentials nestedTaskCredentials) {
+                       ServiceRegistry serviceRegistry, NestedTaskCredentials nestedTaskCredentials,
+                       LambdaTaskAuthorizer lambdaTaskAuthorizer) {
         this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
                 sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
-                nestedTaskCredentials);
+                nestedTaskCredentials, lambdaTaskAuthorizer);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
@@ -311,9 +314,10 @@ public class AslExecutor {
                 CustomResourceLiveness customResourceLiveness,
                 Clock clock, Sleeper sleeper, Integer maxWaitSecondsOverride,
                 RedshiftDataJsonHandler redshiftDataHandler, ServiceRegistry serviceRegistry,
-                NestedTaskCredentials nestedTaskCredentials) {
+                NestedTaskCredentials nestedTaskCredentials, LambdaTaskAuthorizer lambdaTaskAuthorizer) {
         this.nestedTaskCredentials = nestedTaskCredentials;
         this.serviceRegistry = serviceRegistry;
+        this.lambdaTaskAuthorizer = lambdaTaskAuthorizer;
         this.customResourceLiveness = customResourceLiveness;
         this.redshiftDataHandler = redshiftDataHandler;
         this.lambdaExecutor = lambdaExecutor;
@@ -370,7 +374,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null);
+                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null, null);
     }
 
     // Kept for tests that do not exercise the Redshift Data API integration.
@@ -391,7 +395,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                clock, sleeper, maxWaitSecondsOverride, null, null, null);
+                clock, sleeper, maxWaitSecondsOverride, null, null, null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
@@ -854,6 +858,10 @@ public class AslExecutor {
 
         JsonNode credentialInput = jsonata ? input : applyInputPath(stateDef, input, context);
         JsonNode effectiveInput;
+        // The role a task's Credentials name is read the way its Parameters or Arguments are, and
+        // only under IAM enforcement, the one place it is used.
+        JsonNode credentials = null;
+        boolean readCredentials = stateDef.has("Credentials") && iamEnforcementEnabled();
         if (jsonata) {
             effectiveInput = input;
             if (stateDef.has("Arguments")) {
@@ -861,12 +869,20 @@ public class AslExecutor {
                 effectiveInput = jsonataEvaluator.resolveTemplate(
                         stateDef.get("Arguments"), "Arguments", statesVar, variables);
             }
+            if (readCredentials) {
+                credentials = jsonataEvaluator.resolveTemplate(stateDef.get("Credentials"), "Credentials",
+                        buildStatesVar(input, null, context), variables);
+            }
         } else {
             effectiveInput = credentialInput;
+            if (readCredentials) {
+                credentials = resolveParameters(stateDef.get("Credentials"), effectiveInput, context);
+            }
             if (stateDef.has("Parameters")) {
                 effectiveInput = resolveParameters(stateDef.get("Parameters"), effectiveInput, context);
             }
         }
+        String credentialsRoleArn = credentials == null ? null : credentials.path("RoleArn").asText(null);
 
         // Registered after the input template resolved, so a template failure leaves no token behind.
         CompletableFuture<JsonNode> tokenFuture = needsToken ? sfnService.get().registerPendingToken(taskToken,
@@ -881,12 +897,16 @@ public class AslExecutor {
             addTaskStartedEvent(chain, profile);
             try {
                 String taskAccount = null;
-                if (mockedInvocation == null && stateDef.has("Credentials")) {
-                    JsonNode credentials = jsonata
+                boolean lambdaCredentials = iamEnforcementEnabled()
+                        && ((effectiveResource.contains(":lambda:") && effectiveResource.contains(":function:"))
+                            || StatesIntegration.parse(effectiveResource)
+                                .map(integration -> integration.is("lambda", "invoke")).orElse(false));
+                if (mockedInvocation == null && stateDef.has("Credentials") && !lambdaCredentials) {
+                    JsonNode nestedCredentials = jsonata
                             ? jsonataEvaluator.resolveTemplate(stateDef.get("Credentials"), "Credentials",
                                     buildStatesVar(input, null, context), variables)
                             : resolveParameters(stateDef.get("Credentials"), credentialInput, context);
-                    taskAccount = nestedTaskCredentials.account(credentials, resource, sm);
+                    taskAccount = nestedTaskCredentials.account(nestedCredentials, resource, sm);
                 }
                 if (mockedInvocation == null) {
                     NestedTaskCredentials.validateTargetAccount(resource, effectiveInput, sm, taskAccount);
@@ -899,7 +919,7 @@ public class AslExecutor {
                                 effectiveResource, resourceInput, sm, resourceToken,
                                 context.path("Execution").path("Id").asText(null),
                                 executionDeadlineNanos, taskDeadlineNanos,
-                                jsonata ? null : stateDef.path("Parameters"),
+                                jsonata ? null : stateDef.path("Parameters"), credentialsRoleArn,
                                 jobResponse -> RequestScopes.runAs(
                                         AwsArnUtils.parse(sm.getStateMachineArn()).accountId(),
                                         () -> addTaskSubmittedEvent(chain, profile, jobResponse))));
@@ -1161,12 +1181,15 @@ public class AslExecutor {
     }
 
     /**
+     * @param credentialsRoleArn the role the task's {@code Credentials} name, read only under IAM
+     *                           enforcement, or null when the task runs as the execution role
      * @param jobSubmitted called with the response of the call that started a {@code .sync} job,
      *                     once it has returned and before the job is waited on
      */
     private JsonNode invokeResource(String resource, JsonNode input, StateMachine sm, String taskToken,
                                     String executionArn, long executionDeadlineNanos, long taskDeadlineNanos,
-                                    JsonNode rawParameters, Consumer<JsonNode> jobSubmitted) throws Exception {
+                                    JsonNode rawParameters, String credentialsRoleArn,
+                                    Consumer<JsonNode> jobSubmitted) throws Exception {
         // Support Lambda resources: direct ARN or optimized integration
         String functionName = null;
         String functionRef = null;
@@ -1211,13 +1234,25 @@ public class AslExecutor {
             String region = ref.region() != null ? ref.region() : stateMachineArn.region();
             String accountId = ref.account() == null || ref.account().equals(stateMachineArn.accountId())
                     ? null : ref.account();
-            // Floci evaluates no Lambda resource policy, so under IAM enforcement it answers a
-            // cross-account function as its own Invoke API does: refused.
-            if (accountId != null && iamEnforcementEnabled()) {
-                throw new FailStateException("Lambda.AccessDeniedException",
-                        "User: " + sm.getRoleArn() + " is not authorized to perform: lambda:InvokeFunction"
-                                + " on resource: " + functionRef
-                                + " because no resource-based policy allows the lambda:InvokeFunction action");
+            // The task invokes the function as its role: the execution role, or the role its
+            // Credentials name once the execution role has assumed it. The role's policies or the
+            // function's have to allow the call, and both when the function is in another account.
+            if (iamEnforcementEnabled()) {
+                String invokingRoleArn = sm.getRoleArn();
+                if (credentialsRoleArn != null) {
+                    Optional<String> assumeRefusal = lambdaTaskAuthorizer.assumeRefusal(sm.getRoleArn(),
+                            credentialsRoleArn, sm.getStateMachineArn());
+                    if (assumeRefusal.isPresent()) {
+                        throw new FailStateException("States.Permissions", assumeRefusal.get());
+                    }
+                    invokingRoleArn = credentialsRoleArn;
+                }
+                String functionArn = LambdaArnUtils.functionArn(functionRef, stateMachineArn.partition(), region,
+                        stateMachineArn.accountId());
+                Optional<String> refusal = lambdaTaskAuthorizer.refusal(invokingRoleArn, functionArn);
+                if (refusal.isPresent()) {
+                    throw new FailStateException("Lambda.AccessDeniedException", refusal.get());
+                }
             }
             LambdaFunction fn = resolveLambdaFunction(accountId, region, functionName,
                     extractLambdaQualifier(functionRef));

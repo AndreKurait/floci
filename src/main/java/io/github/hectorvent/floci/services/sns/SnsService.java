@@ -475,8 +475,12 @@ public class SnsService implements Resettable, ResourceProvider {
             return;
         }
         if (!oneTimePassword.equals(number.getOneTimePassword())) {
+            // Status is a required member of the error and AWS documents no values for it, so it carries
+            // the number's own verification status, which a wrong password leaves Pending: the only
+            // statuses SNS publishes for a sandbox number are Pending and Verified.
             throw new AwsException("VerificationException",
-                    "The one-time password does not match the one sent to " + phoneNumber + ".", 400);
+                    "The one-time password does not match the one sent to " + phoneNumber + ".", 400,
+                    Map.of("Status", number.getStatus()));
         }
         number.setStatus(SmsSandboxPhoneNumber.VERIFIED);
         number.setOneTimePassword(null);

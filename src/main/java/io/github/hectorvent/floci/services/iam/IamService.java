@@ -779,6 +779,25 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return accessKeys.get(accessKeyId).map(AccessKey::getUserName);
     }
 
+    /**
+     * The owner of a key in the calling account, for a read that is not the owner's own request.
+     * Unlike {@link #findUserNameByAccessKeyId}, this never migrates: an unprefixed
+     * pre-multi-account key belongs to the default account and is only read in place, so another
+     * account asking (even one with a same-named user) neither learns the owner nor moves the key.
+     */
+    public Optional<String> findAccessKeyOwnerInThisAccount(String accessKeyId) {
+        if (accessKeyId == null) {
+            return Optional.empty();
+        }
+        if (!(accessKeys instanceof AccountAwareStorageBackend<AccessKey> aware)) {
+            return findUserNameByAccessKeyId(accessKeyId);
+        }
+        String accountId = aware.accountId();
+        return aware.getForAccount(accountId, accessKeyId)
+                .or(() -> aware.getLegacyForAccount(accountId, accessKeyId))
+                .map(AccessKey::getUserName);
+    }
+
     public void deleteUser(String userName) {
         synchronized (resourceNameLock) {
             IamUser user = getUser(userName);
@@ -5158,12 +5177,76 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     /**
      * The two ARNs a caller's access key stands for, read from one lookup of the key.
      *
-     * @param callerArn    the identity the caller acts as: the user's ARN, or for a role session its
-     *                     {@code assumed-role} session ARN, as {@link #resolveCallerArn} returns it
-     * @param principalArn the request's {@code aws:PrincipalArn}: the user's ARN, or for a role
-     *                     session the ARN of the role that was assumed, path included
+     * @param callerArn     the identity the caller acts as: the user's ARN, or for a role session
+     *                      its {@code assumed-role} session ARN, as {@link #resolveCallerArn}
+     *                      returns it
+     * @param principalArn  the request's {@code aws:PrincipalArn}: the user's ARN, or for a role
+     *                      session the ARN of the role that was assumed, path included
+     * @param principalType the request's {@code aws:PrincipalType}
+     * @param userId        the request's {@code aws:userid}, in the shape the guide gives for this
+     *                      kind of principal, or null when it publishes none
+     * @param userName      the request's {@code aws:username}, which only an IAM user has
      */
-    public record CallerArns(String callerArn, String principalArn) {}
+    public record CallerArns(String callerArn, String principalArn, String principalType,
+                             String userId, String userName) {
+
+        /**
+         * The {@code aws:PrincipalType} values, from the IAM User Guide's principal key values
+         * list. The guide renders the role-session value both as {@code AssumedRole} and, twice,
+         * as "Assumed role"; the unspaced form is the one that fits the vocabulary the rest of the
+         * list uses, every other value there being a single word or CamelCase, and it is the form
+         * AWS publishes machine-side, as CloudTrail's {@code userIdentity.type} does.
+         */
+        public static final String TYPE_ACCOUNT = "Account";
+        public static final String TYPE_USER = "User";
+        public static final String TYPE_FEDERATED_USER = "FederatedUser";
+        public static final String TYPE_ASSUMED_ROLE = "AssumedRole";
+
+        /** The two ARNs alone, for a caller whose principal keys the site cannot derive. */
+        public CallerArns(String callerArn, String principalArn) {
+            this(callerArn, principalArn, null, null, null);
+        }
+
+        /**
+         * Writes the condition keys that say who is calling onto a request context, so every
+         * context a request is evaluated against sees the same principal: the enforcement
+         * filter's, one per resource the request names, and the one S3 builds when it evaluates a
+         * bucket policy itself.
+         *
+         * <p>{@code aws:PrincipalType} and {@code aws:userid} are published for every principal,
+         * the guide saying both are "included in the request context for all requests, including
+         * anonymous requests". {@code aws:username} is not: it is "always included in the request
+         * context for IAM users" while "requests that are made using the AWS account root user or
+         * IAM roles do not include this key", so it is only put here when the caller is a user. A
+         * key left absent is what makes a policy that matches on it fail to match, which is the
+         * behaviour AWS documents for a key with no value, so omitting it is the enforcement, not
+         * a gap in it.
+         */
+        public void putPrincipalKeys(Map<String, List<String>> context) {
+            context.put("aws:PrincipalArn", List.of(principalArn));
+            if (principalType != null) {
+                context.put("aws:PrincipalType", List.of(principalType));
+            }
+            if (userId != null) {
+                context.put("aws:userid", List.of(userId));
+            }
+            if (userName != null) {
+                context.put("aws:username", List.of(userName));
+            }
+        }
+    }
+
+    /**
+     * An IAM user acting as itself, whether it signed with its own access key or with a session
+     * token it minted: the guide gives this principal, and only this one, an
+     * {@code aws:username}, and its {@code aws:userid} is the user's own unique id rather than
+     * anything derivable from the ARN.
+     */
+    private static CallerArns callerForUser(IamUser user) {
+        return new CallerArns(user.getArn(), user.getArn(), CallerArns.TYPE_USER,
+                user.getUserId(), user.getUserName());
+    }
+
 
     /**
      * Both of the caller's ARNs from a single lookup, so they always describe the same credential:
@@ -5176,8 +5259,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         Optional<AccessKey> akOpt = accessKeys.get(accessKeyId);
         if (akOpt.isPresent()) {
-            String userName = akOpt.get().getUserName();
-            return users.get(userName).map(IamUser::getArn).map(arn -> new CallerArns(arn, arn));
+            return users.get(akOpt.get().getUserName()).map(IamService::callerForUser);
         }
 
         Optional<SessionCredential> sessionOpt = findSessionForCallerContext(accessKeyId);
@@ -5188,15 +5270,25 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 return Optional.empty();
             }
             if (isFederatedUserSession(session)) {
-                return Optional.of(new CallerArns(session.getRoleArn(), session.getRoleArn()));
+                // A federated user has no aws:username at all, only the account:name userid.
+                String federatedArn = session.getRoleArn();
+                return Optional.of(new CallerArns(federatedArn, federatedArn,
+                        CallerArns.TYPE_FEDERATED_USER,
+                        sessionUserId(session).orElse(null), null));
             }
             String roleArn = session.getRoleArn();
             if (roleArn == null) {
                 // GetSessionToken credentials act as the identity that minted them.
                 if (issuedByRoot(session)) {
-                    return Optional.of(new CallerArns(session.getIssuerArn(), session.getIssuerArn()));
+                    // The account root's aws:userid is the account id, and it has no
+                    // aws:username: the guide lists it as not present for this principal.
+                    String issuerArn = session.getIssuerArn();
+                    return Optional.of(new CallerArns(issuerArn, issuerArn,
+                            CallerArns.TYPE_ACCOUNT,
+                            AwsArnUtils.accountOrDefault(issuerArn, regionResolver.getAccountId()),
+                            null));
                 }
-                return issuingUser(session).map(user -> new CallerArns(user.getArn(), user.getArn()));
+                return issuingUser(session).map(IamService::callerForUser);
             }
             String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
             String accountId = AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId());
@@ -5210,7 +5302,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             String partition = AwsArnUtils.partitionOrDefault(roleArn, regionResolver.getPartition());
             String sessionArn = AwsArnUtils.Arn.global(partition, "sts", accountId,
                     "assumed-role/" + roleName + "/" + sessionName).toString();
-            return Optional.of(new CallerArns(sessionArn, roleArn));
+            return Optional.of(new CallerArns(sessionArn, roleArn, CallerArns.TYPE_ASSUMED_ROLE,
+                    sessionUserId(session).orElse(null), null));
         }
 
         return Optional.empty();
@@ -5254,43 +5347,55 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                     && !hasMatchingSessionToken(session, sessionToken)) {
                 return Optional.empty();
             }
-            if (isFederatedUserSession(session)) {
-                // account:caller-specified-name, the aws:userid of a federated user.
-                AwsArnUtils.Arn federatedUser = AwsArnUtils.parse(session.getRoleArn());
-                return Optional.of(federatedUser.accountId() + ":"
-                        + federatedUser.resource().substring(FEDERATED_USER_PREFIX.length()));
+            return sessionUserId(session);
+        }
+
+        return Optional.empty();
+    }
+
+    /**
+     * The {@code aws:userid} of a session, in the shape the IAM User Guide's principal key values
+     * list gives the kind of principal that holds it. Shared with {@link #resolveCallerArns}, which
+     * reports the same key for the same credential and must not derive it a second way.
+     */
+    private Optional<String> sessionUserId(SessionCredential session) {
+        if (isFederatedUserSession(session)) {
+            // account:caller-specified-name, the aws:userid of a federated user.
+            AwsArnUtils.Arn federatedUser = AwsArnUtils.parse(session.getRoleArn());
+            return Optional.of(federatedUser.accountId() + ":"
+                    + federatedUser.resource().substring(FEDERATED_USER_PREFIX.length()));
+        }
+        if (session.getRoleArn() == null) {
+            Optional<IamUser> issuingUser = issuingUser(session);
+            if (issuingUser.isPresent()) {
+                return Optional.of(issuingUser.get().getUserId());
             }
-            if (session.getRoleArn() == null) {
-                Optional<IamUser> issuingUser = issuingUser(session);
-                if (issuingUser.isPresent()) {
-                    return Optional.of(issuingUser.get().getUserId());
-                }
-            }
-            if (session.getAssumedRoleId() != null) {
-                return Optional.of(session.getAssumedRoleId());
-            } else if (session.getEc2RoleId() != null && session.getEc2InstanceId() != null) {
-                return Optional.of(session.getEc2RoleId() + ":" + session.getEc2InstanceId());
-            } else if (session.getRoleArn() != null) {
-                String roleArn = session.getRoleArn();
-                String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : roleArn;
-                String accountId = AwsArnUtils.accountOrDefault(roleArn,
-                        session.getOriginAccountId() != null ? session.getOriginAccountId() : regionResolver.getAccountId());
-                Optional<IamRole> roleOpt = findRole(accountId, roleName);
-                String roleId = roleOpt.map(IamRole::getRoleId).filter(id -> !id.isBlank()).orElse(null);
-                if (roleId != null) {
-                    String sessionName = session.getRoleSessionName();
-                    if (sessionName == null || sessionName.isBlank()) {
-                        if (session.getEc2InstanceId() != null) {
-                            sessionName = session.getEc2InstanceId();
-                        } else if (session.getEcsTaskArn() != null) {
-                            String taskArn = session.getEcsTaskArn();
-                            sessionName = taskArn.contains("/") ? taskArn.substring(taskArn.lastIndexOf('/') + 1) : taskArn;
-                        } else {
-                            sessionName = "floci-session";
-                        }
+        }
+        if (session.getAssumedRoleId() != null) {
+            return Optional.of(session.getAssumedRoleId());
+        } else if (session.getEc2RoleId() != null && session.getEc2InstanceId() != null) {
+            return Optional.of(session.getEc2RoleId() + ":" + session.getEc2InstanceId());
+        } else if (session.getRoleArn() != null) {
+            String roleArn = session.getRoleArn();
+            String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : roleArn;
+            String fallbackAccount = session.getOriginAccountId() != null
+                    ? session.getOriginAccountId() : regionResolver.getAccountId();
+            String accountId = AwsArnUtils.accountOrDefault(roleArn, fallbackAccount);
+            Optional<IamRole> roleOpt = findRole(accountId, roleName);
+            String roleId = roleOpt.map(IamRole::getRoleId).filter(id -> !id.isBlank()).orElse(null);
+            if (roleId != null) {
+                String sessionName = session.getRoleSessionName();
+                if (sessionName == null || sessionName.isBlank()) {
+                    if (session.getEc2InstanceId() != null) {
+                        sessionName = session.getEc2InstanceId();
+                    } else if (session.getEcsTaskArn() != null) {
+                        String taskArn = session.getEcsTaskArn();
+                        sessionName = taskArn.contains("/") ? taskArn.substring(taskArn.lastIndexOf('/') + 1) : taskArn;
+                    } else {
+                        sessionName = "floci-session";
                     }
-                    return Optional.of(roleId + ":" + sessionName);
                 }
+                return Optional.of(roleId + ":" + sessionName);
             }
         }
 

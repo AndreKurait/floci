@@ -10,6 +10,7 @@ import io.restassured.config.EncoderConfig;
 import io.restassured.http.ContentType;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -23,6 +24,7 @@ import static io.restassured.RestAssured.config;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.not;
 
 @QuarkusTest
 @TestProfile(IamEnforcementProfile.class)
@@ -48,6 +50,50 @@ class CloudWatchQueryGetIamEnforcementIntegrationTest {
                 .statusCode(403)
                 .contentType(containsString("xml"))
                 .body("ErrorResponse.Error.Code", equalTo("MissingAuthenticationToken"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"rpc-v2-cbor", "unknown"})
+    void anUnclaimedGetCannotDeleteAnAlarm(String smithyProtocol) {
+        String alarm = "query-unclaimed-" + UUID.randomUUID();
+        String root = auth("000000000000", "monitoring");
+        given().header("Authorization", root).contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "PutMetricAlarm").formParam("Version", "2010-08-01")
+                .formParam("AlarmName", alarm).formParam("Namespace", "Example/QueryGet")
+                .formParam("MetricName", "Requests").formParam("Statistic", "Sum").formParam("Period", "60")
+                .formParam("EvaluationPeriods", "1").formParam("Threshold", "1")
+                .formParam("ComparisonOperator", "GreaterThanThreshold")
+                .post("/").then().statusCode(200);
+        cleanup.register(() -> given().port(baseUri.getPort()).header("Authorization", root)
+                .contentType("application/x-www-form-urlencoded").formParam("Action", "DeleteAlarms")
+                .formParam("AlarmNames.member.1", alarm).post("/").then().statusCode(200));
+        given().header("Smithy-Protocol", smithyProtocol).queryParam("Action", "DeleteAlarms")
+                .queryParam("Version", "2010-08-01").queryParam("AlarmNames.member.1", alarm)
+                .get("/").then().body(not(containsString("DeleteAlarmsResponse")));
+        given().header("Authorization", root).queryParam("Action", "DescribeAlarms")
+                .queryParam("Version", "2010-08-01").queryParam("AlarmNames.member.1", alarm)
+                .get("/").then().statusCode(200).body(containsString(alarm));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"rpc-v2-cbor", "unknown"})
+    void anUnclaimedGetCannotPublishMetrics(String smithyProtocol) {
+        String namespace = "query-unclaimed-" + UUID.randomUUID();
+        given().header("Smithy-Protocol", smithyProtocol).queryParam("Action", "PutMetricData")
+                .queryParam("Version", "2010-08-01").queryParam("Namespace", namespace)
+                .queryParam("MetricData.member.1.MetricName", "Denied").queryParam("MetricData.member.1.Value", "1")
+                .get("/").then().body(not(containsString("PutMetricDataResponse")));
+        given().header("Authorization", auth("000000000000", "monitoring"))
+                .queryParam("Action", "ListMetrics").queryParam("Version", "2010-08-01")
+                .queryParam("Namespace", namespace).get("/").then().statusCode(200)
+                .body(not(containsString(namespace)));
+    }
+
+    @Test
+    void internalRouteCannotBeCalledDirectly() {
+        given().header("Authorization", auth("000000000000", "monitoring"))
+                .queryParam("Action", "ListMetrics").get("/_cloudwatch-query")
+                .then().statusCode(404);
     }
 
     @ParameterizedTest
@@ -109,9 +155,43 @@ class CloudWatchQueryGetIamEnforcementIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void userPolicyAndAlarmStorageUseTheCredentialAccount(boolean presigned) {
+        String account = "111122223333";
+        String admin = auth(account, "iam");
+        String user = "query-account-" + UUID.randomUUID();
+        String alarm = "query-account-" + UUID.randomUUID();
+        String key = EnforcementFixtures.createUser(cleanup, baseUri.getPort(), admin, user).accessKeyId();
+        given().header("Authorization", admin).contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "PutUserPolicy").formParam("UserName", user).formParam("PolicyName", "cloudwatch")
+                .formParam("PolicyDocument", """
+                        {"Version":"2012-10-17","Statement":[{
+                          "Effect":"Allow","Action":"cloudwatch:*","Resource":"*",
+                          "Condition":{"StringEquals":{"aws:PrincipalAccount":"111122223333"}}
+                        }]}
+                        """).post("/").then().statusCode(200);
+        cleanup.register(() -> given().port(baseUri.getPort()).header("Authorization", auth(account, "monitoring"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", "DeleteAlarms")
+                .formParam("AlarmNames.member.1", alarm).post("/").then().statusCode(200));
+        signedRequest(key, presigned).queryParam("Action", "PutMetricAlarm").queryParam("Version", "2010-08-01")
+                .queryParam("AlarmName", alarm).queryParam("Namespace", "Example/QueryGet")
+                .queryParam("MetricName", "Requests").queryParam("Statistic", "Sum").queryParam("Period", "60")
+                .queryParam("EvaluationPeriods", "1").queryParam("Threshold", "1")
+                .queryParam("ComparisonOperator", "GreaterThanThreshold")
+                .get("/").then().statusCode(200);
+        signedRequest(key, presigned).queryParam("Action", "DescribeAlarms").queryParam("Version", "2010-08-01")
+                .queryParam("AlarmNames.member.1", alarm).get("/").then().statusCode(200)
+                .body(containsString("arn:aws:cloudwatch:us-east-1:" + account + ":alarm:" + alarm));
+        signedRequest("000000000000", presigned).queryParam("Action", "DescribeAlarms")
+                .queryParam("Version", "2010-08-01").queryParam("AlarmNames.member.1", alarm)
+                .get("/").then().statusCode(200).body(not(containsString(alarm)));
+    }
+
     private static RequestSpecification signedRequest(String accessKey, boolean presigned) {
         return presigned
-                ? given().queryParam("X-Amz-Credential", accessKey + "/20261013/us-east-1/monitoring/aws4_request")
+                ? given().queryParam("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+                        .queryParam("X-Amz-Credential", accessKey + "/20261013/us-east-1/monitoring/aws4_request")
                 : given().header("Authorization", auth(accessKey, "monitoring"));
     }
 }

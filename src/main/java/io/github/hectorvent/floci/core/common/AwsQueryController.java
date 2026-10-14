@@ -23,15 +23,17 @@ import io.github.hectorvent.floci.services.sns.SnsQueryHandler;
 import io.github.hectorvent.floci.services.sqs.SqsQueryHandler;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.GET;
 import jakarta.ws.rs.HeaderParam;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.Context;
-import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
 
 import java.util.List;
@@ -51,6 +53,8 @@ import java.util.stream.Stream;
  */
 @Path("/")
 public class AwsQueryController {
+
+    static final String CLOUDWATCH_GET_PATH = "/_cloudwatch-query";
 
     private static final Logger LOG = Logger.getLogger(AwsQueryController.class);
 
@@ -300,7 +304,6 @@ public class AwsQueryController {
     @Produces(MediaType.APPLICATION_XML)
     public Response dispatch(
             @HeaderParam("Authorization") String authorization,
-            @Context HttpHeaders httpHeaders,
             MultivaluedMap<String, String> formParams) {
 
         String action = AwsQueryServiceResolver.action(formParams);
@@ -312,7 +315,7 @@ public class AwsQueryController {
         String service = serviceResolver.resolve(authorization, action, formParams.getFirst("Version"));
         LOG.debugv("Query protocol service={0} action={1}", service, action);
 
-        String region = regionResolver.resolveRegion(httpHeaders);
+        String region = regionResolver.resolveRegionFromAuth(authorization);
 
         try {
             return dispatchToHandler(service, action, formParams, authorization, region);
@@ -667,8 +670,18 @@ public class AwsQueryController {
                 && "monitoring".equals(inferServiceFromAction(action, queryParams.getFirst("Version")));
     }
 
-    public Response dispatchCloudWatchQueryGet(String authorization, HttpHeaders headers,
-                                               MultivaluedMap<String, String> queryParams) {
+    @GET
+    @Path(CLOUDWATCH_GET_PATH)
+    @Produces({MediaType.APPLICATION_XML, MediaType.TEXT_HTML})
+    public Response dispatchCloudWatchQueryGet(@HeaderParam("Authorization") String authorization,
+                                               @Context UriInfo uriInfo,
+                                               @Context ContainerRequestContext request) {
+        // Only the pre-matching Query claim may select this internal route.
+        if (!(request.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY) instanceof ProtocolClaim claim)
+                || claim.protocol() != WireProtocol.AWS_QUERY) {
+            return Response.status(404).build();
+        }
+        MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
         String action = AwsQueryServiceResolver.action(queryParams);
         if (action == null) {
             return Response.status(404).type(MediaType.APPLICATION_XML)
@@ -685,7 +698,7 @@ public class AwsQueryController {
             return xmlErrorResponse("InvalidAction", "Could not find operation " + action + " for version "
                     + version, 404);
         }
-        return dispatch(IamEnforcementFilter.requestAuthorization(authorization, queryParams), headers, queryParams);
+        return dispatch(IamEnforcementFilter.requestAuthorization(authorization, queryParams), queryParams);
     }
 
     /**

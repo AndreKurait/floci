@@ -101,9 +101,7 @@ class CognitoServiceTest {
         revokedTokenStore = new InMemoryStorage<>();
         regionResolver = new RegionResolver("us-east-1", "000000000000");
         acmService = mock(AcmService.class);
-        // Every certificate exists and is issued unless a test says otherwise.
-        when(acmService.describeCertificate(anyString(), eq("us-east-1")))
-                .thenAnswer(inv -> issuedCertificate(inv.getArgument(0)));
+        CognitoCertificateStubs.everyCertificateIsIssued(acmService);
         service = new CognitoService(
                 poolStore,
                 new InMemoryStorage<>(),
@@ -6172,13 +6170,6 @@ class CognitoServiceTest {
     private static final String AWS_CERTIFICATE_MESSAGE = "The specified SSL certificate doesn't exist, "
             + "isn't in us-east-1 region, isn't valid, or doesn't include a valid certificate chain.";
 
-    private static Certificate issuedCertificate(String arn) {
-        Certificate certificate = new Certificate();
-        certificate.setArn(arn);
-        certificate.setStatus(CertificateStatus.ISSUED);
-        return certificate;
-    }
-
     /** The ARN a domain registers on its certificate: the CloudFront distribution serving it. */
     private String consumerArn(String domain) {
         String distribution = service.describeUserPoolDomain(domain).getCloudFrontDistribution();
@@ -6217,7 +6208,7 @@ class CognitoServiceTest {
     @Test
     void createUserPoolDomainRejectsACertificateThatIsNotIssued() {
         UserPool pool = service.createUserPool(Map.of("PoolName", "DomainPool"), "us-east-1");
-        Certificate pending = issuedCertificate(CERTIFICATE_ARN);
+        Certificate pending = CognitoCertificateStubs.issuedCertificate(CERTIFICATE_ARN);
         pending.setStatus(CertificateStatus.PENDING_VALIDATION);
         when(acmService.describeCertificate(CERTIFICATE_ARN, "us-east-1")).thenReturn(pending);
 

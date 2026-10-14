@@ -1,10 +1,10 @@
 {
   "_source": {
     "generator": "tools/aws/regen_partitions.py",
-    "botocore": "botocore 1.43.111 (installed package)",
+    "botocore": "botocore 1.43.113 (local/aws/botocore)",
     "partitionsJsonVersion": "1.1",
     "endpointsJsonVersion": 3,
-    "regionFlags": "carried over from the previous file (no aws-cdk checkout)"
+    "regionFlags": "aws-cdk region-info/lib/aws-entities.ts rules"
   },
   "signingNames": {
     "IoTSecuredTunneling": [
@@ -144,7 +144,8 @@
       "featurestore-runtime.sagemaker",
       "job-runtime.sagemaker",
       "metrics.sagemaker",
-      "runtime.sagemaker"
+      "runtime.sagemaker",
+      "training-session-runtime.sagemaker"
     ],
     "servicecatalog": [
       "servicecatalog-appregistry"
@@ -1162,6 +1163,7 @@
         "identitystore",
         "internetmonitor",
         "kafka",
+        "kafkaconnect",
         "kendra-ranking",
         "kinesis",
         "kinesisanalytics",

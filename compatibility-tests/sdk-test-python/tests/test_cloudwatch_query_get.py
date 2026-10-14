@@ -73,6 +73,10 @@ def test_cloudwatch_query_get(aws_config):
         assert result.tag.endswith("GetMetricStatisticsResponse")
         assert [float(node.text) for node in result.iter()
                 if node.tag.endswith("}Sum") or node.tag == "Sum"] == [17.0]
+    status, result = request("GET", parameters, presigned=True)
+    assert status == 200
+    assert [float(node.text) for node in result.iter()
+            if node.tag.endswith("}Sum") or node.tag == "Sum"] == [17.0]
     for selection in [{"Operation": "ListMetrics"}, {"Action": "ListMetrics", "Operation": "PutDashboard"}]:
         status, result = request("GET", selection | {"Namespace": namespace})
         assert status == 200

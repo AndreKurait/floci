@@ -38,6 +38,7 @@ import software.amazon.awssdk.services.sns.model.SetSubscriptionAttributesReques
 import software.amazon.awssdk.services.sns.model.SubscribeRequest;
 import software.amazon.awssdk.services.sns.model.SubscribeResponse;
 import software.amazon.awssdk.services.sns.model.UnsubscribeRequest;
+import software.amazon.awssdk.services.sns.model.VerificationException;
 import software.amazon.awssdk.services.sns.model.VerifySmsSandboxPhoneNumberRequest;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.*;
@@ -671,8 +672,15 @@ class SnsTest {
         try {
             assertThat(sandboxStatus(phoneNumber)).isEqualTo(SMSSandboxPhoneNumberVerificationStatus.PENDING);
 
+            String code = textedCode(phoneNumber);
+            String wrong = String.format("%06d", (Integer.parseInt(code) + 1) % 1_000_000);
+            assertThatThrownBy(() -> sns.verifySMSSandboxPhoneNumber(VerifySmsSandboxPhoneNumberRequest.builder()
+                    .phoneNumber(phoneNumber).oneTimePassword(wrong).build()))
+                    .isInstanceOfSatisfying(VerificationException.class,
+                            e -> assertThat(e.status()).isEqualTo("Pending"));
+
             sns.verifySMSSandboxPhoneNumber(VerifySmsSandboxPhoneNumberRequest.builder()
-                    .phoneNumber(phoneNumber).oneTimePassword(textedCode(phoneNumber)).build());
+                    .phoneNumber(phoneNumber).oneTimePassword(code).build());
 
             assertThat(sandboxStatus(phoneNumber)).isEqualTo(SMSSandboxPhoneNumberVerificationStatus.VERIFIED);
         } finally {

@@ -49,7 +49,8 @@ PREFIX ?= $(HOME)/.local
         aws-data-sync aws-data-check aws-data-test \
         iam-namespaces-sync iam-namespaces-check iam-namespaces-verify iam-namespaces-test \
         iam-action-resources-sync iam-action-resources-check iam-action-resources-verify \
-        iam-action-resources-test iam-data-verify
+        iam-action-resources-test iam-authorized-actions-sync iam-authorized-actions-check \
+        iam-authorized-actions-verify iam-authorized-actions-test iam-data-verify
 
 help: ## List the targets below
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -296,10 +297,11 @@ iam-data-verify: ## CI gate (online): every vendored IAM file must still match A
 	@# Both halves run even when the first fails, so one file's drift cannot hide the other's
 	@# state. Sequential steps in CI stop at the first failure, which once left the action
 	@# resource gate unexercised while the namespace list was stale.
-	@namespaces=0; actions=0; \
+	@namespaces=0; actions=0; authorized=0; \
 	$(MAKE) --no-print-directory iam-namespaces-verify || namespaces=$$?; \
 	$(MAKE) --no-print-directory iam-action-resources-verify || actions=$$?; \
-	if [ $$namespaces -ne 0 ] || [ $$actions -ne 0 ]; then \
+	$(MAKE) --no-print-directory iam-authorized-actions-verify || authorized=$$?; \
+	if [ $$namespaces -ne 0 ] || [ $$actions -ne 0 ] || [ $$authorized -ne 0 ]; then \
 		echo ""; \
 		echo "error: vendored IAM data does not match upstream:"; \
 		if [ $$namespaces -ne 0 ]; then \
@@ -308,8 +310,38 @@ iam-data-verify: ## CI gate (online): every vendored IAM file must still match A
 		if [ $$actions -ne 0 ]; then \
 			echo "       the action resource map, see its message above"; \
 		fi; \
+		if [ $$authorized -ne 0 ]; then \
+			echo "       the map of operations to their IAM actions, see its message above"; \
+		fi; \
 		exit 1; \
 	fi
 
 iam-action-resources-test: ## Run the IAM action resource generator's unit tests
 	$(PYTHON) -m pytest tools/aws/test_regen_iam_action_resources.py -q
+
+iam-authorized-actions-sync: ## Regenerate src/main/resources/aws/iam-authorized-actions.json from AWS (commit the result)
+	$(PYTHON) tools/aws/regen_iam_authorized_actions.py
+
+iam-authorized-actions-check: ## CI gate (offline): the vendored map of operations to their IAM actions must be well-formed
+	@$(PYTHON) tools/aws/regen_iam_authorized_actions.py --check || { \
+		echo ""; \
+		echo "error: src/main/resources/aws/iam-authorized-actions.json is malformed."; \
+		echo "       Run 'make iam-authorized-actions-sync' and commit the result."; \
+		exit 1; \
+	}
+
+iam-authorized-actions-verify: ## CI gate (online): every vendored operation must still be authorized as AWS says
+	@$(PYTHON) tools/aws/regen_iam_authorized_actions.py --verify; status=$$?; \
+	if [ $$status -eq 2 ]; then \
+		echo ""; \
+		echo "error: could not reach AWS's service reference, so nothing was verified."; \
+		exit 1; \
+	elif [ $$status -ne 0 ]; then \
+		echo ""; \
+		echo "error: the vendored map authorizes an operation as an action AWS does not check for it."; \
+		echo "       Run 'make iam-authorized-actions-sync' and commit the result."; \
+		exit 1; \
+	fi
+
+iam-authorized-actions-test: ## Run the IAM authorized-action generator's unit tests
+	$(PYTHON) -m pytest tools/aws/test_regen_iam_authorized_actions.py -q

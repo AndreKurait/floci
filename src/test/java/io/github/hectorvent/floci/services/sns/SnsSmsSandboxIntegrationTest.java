@@ -62,10 +62,10 @@ class SnsSmsSandboxIntegrationTest {
         assertEquals("Pending", statusOf(phoneNumber));
 
         String code = codeTextedTo(phoneNumber);
-        String wrong = String.format("%06d", (Integer.parseInt(code) + 1) % 1_000_000);
-        query("VerifySMSSandboxPhoneNumber", Map.of("PhoneNumber", phoneNumber, "OneTimePassword", wrong))
+        query("VerifySMSSandboxPhoneNumber", Map.of("PhoneNumber", phoneNumber, "OneTimePassword", anotherCode(code)))
                 .statusCode(400)
-                .body("ErrorResponse.Error.Code", equalTo("VerificationException"));
+                .body("ErrorResponse.Error.Code", equalTo("VerificationException"))
+                .body("ErrorResponse.Error.Status", equalTo("Pending"));
         assertEquals("Pending", statusOf(phoneNumber));
 
         query("VerifySMSSandboxPhoneNumber", Map.of("PhoneNumber", phoneNumber, "OneTimePassword", code))
@@ -130,8 +130,15 @@ class SnsSmsSandboxIntegrationTest {
                 .formatted(phoneNumber))
                 .statusCode(200);
 
+        String code = codeTextedTo(phoneNumber);
         json("VerifySMSSandboxPhoneNumber", "{\"PhoneNumber\": \"%s\", \"OneTimePassword\": \"%s\"}"
-                .formatted(phoneNumber, codeTextedTo(phoneNumber)))
+                .formatted(phoneNumber, anotherCode(code)))
+                .statusCode(400)
+                .body("__type", equalTo("VerificationException"))
+                .body("Status", equalTo("Pending"));
+
+        json("VerifySMSSandboxPhoneNumber", "{\"PhoneNumber\": \"%s\", \"OneTimePassword\": \"%s\"}"
+                .formatted(phoneNumber, code))
                 .statusCode(200);
 
         assertEquals("Verified", statusOf(phoneNumber));
@@ -215,6 +222,11 @@ class SnsSmsSandboxIntegrationTest {
             byNumber.put(numbers.get(i), statuses.get(i));
         }
         return byNumber;
+    }
+
+    /** A well-formed one-time password that is not {@code code}. */
+    private static String anotherCode(String code) {
+        return String.format("%06d", (Integer.parseInt(code) + 1) % 1_000_000);
     }
 
     private static ValidatableResponse query(String action, Map<String, String> params) {
