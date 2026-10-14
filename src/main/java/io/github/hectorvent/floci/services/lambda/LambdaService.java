@@ -2290,14 +2290,7 @@ public class LambdaService implements ResourceProvider {
                 .max(java.util.Comparator.comparingLong(v -> Long.parseLong(v.getVersion())));
     }
 
-    /**
-     * Copies the function's current code into a directory belonging to this version, falling back
-     * to {@code $LATEST}'s path if there is nothing to copy or the copy fails.
-     *
-     * <p>A copy failure must not fail the publish: the version is still a correct snapshot of the
-     * configuration, and falling back leaves it exactly as good as every version published before
-     * this existed, rather than turning a working call into an error.
-     */
+    /** Publishes an owned code snapshot; a failed copy must not reference mutable {@code $LATEST}. */
     private String versionCodePath(String region, LambdaFunction fn, String version) {
         String current = fn.getCodeLocalPath();
         if (current == null || fn.getHotReloadHostPath() != null) {
@@ -2306,12 +2299,14 @@ public class LambdaService implements ResourceProvider {
         try {
             Path copied = codeStore.copyForVersion(
                     ownerAccount(fn), region, fn.getFunctionName(), version, Path.of(current));
-            return copied == null ? current : copied.toAbsolutePath().normalize().toString();
+            if (copied == null) {
+                throw new IOException("Code directory is missing: " + current);
+            }
+            return copied.toAbsolutePath().normalize().toString();
         } catch (IOException e) {
-            LOG.warnv("Could not give version {0} of {1} its own code directory, "
-                            + "falling back to the shared one: {2}",
-                    version, fn.getFunctionName(), e.getMessage());
-            return current;
+            throw new AwsException("ServiceException",
+                    "Could not create a code snapshot for version " + version + " of "
+                            + fn.getFunctionName() + ": " + e.getMessage(), 500);
         }
     }
 
