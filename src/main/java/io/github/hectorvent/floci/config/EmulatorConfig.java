@@ -1887,9 +1887,11 @@ public interface EmulatorConfig {
 
         /**
          * How often the buffer flusher checks for streams whose buffering
-         * interval (BufferingHints.IntervalInSeconds) has elapsed.
+         * interval (BufferingHints.IntervalInSeconds) has elapsed. AWS delivers once
+         * the first buffer condition is met, so a buffer is delivered at most this
+         * long after its interval ends.
          */
-        @WithDefault("10")
+        @WithDefault("1")
         long tickIntervalSeconds();
 
         /**
