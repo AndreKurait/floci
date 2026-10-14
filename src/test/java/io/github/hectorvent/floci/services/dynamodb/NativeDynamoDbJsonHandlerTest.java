@@ -1184,6 +1184,56 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     @Test
+    void queryListsEveryMixedParameter() {
+        AwsException ex = expectValidationException("Query", json("""
+                {"TableName": "Users", "KeyConditionExpression": "userId = :u",
+                 "ExpressionAttributeValues": {":u": {"S": "a"}},
+                 "KeyConditions": {"userId": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "a"}]}},
+                 "FilterExpression": "attribute_exists(x)", "ProjectionExpression": "userId",
+                 "AttributesToGet": ["userId"], "ConditionalOperator": "AND",
+                 "QueryFilter": {"x": {"ComparisonOperator": "NOT_NULL"}}}
+                """));
+        assertEquals("Can not use both expression and non-expression parameters in the same request: "
+                + "Non-expression parameters: {AttributesToGet, QueryFilter, ConditionalOperator, KeyConditions} "
+                + "Expression parameters: {ProjectionExpression, FilterExpression, KeyConditionExpression}",
+                ex.getMessage());
+    }
+
+    @Test
+    void queryAllowsAFilterExpressionWithKeyConditions() throws Exception {
+        createUsersTable("eu-west-1");
+
+        Response response = handler.handle("Query", json("""
+                {"TableName": "Users",
+                 "KeyConditions": {"userId": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "a"}]}},
+                 "FilterExpression": "attribute_exists(x)"}
+                """), "eu-west-1");
+        assertEquals(200, response.getStatus());
+    }
+
+    @Test
+    void scanListsEveryMixedParameter() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "FilterExpression": "attribute_exists(x)",
+                 "ProjectionExpression": "userId", "AttributesToGet": ["userId"],
+                 "ConditionalOperator": "AND", "ScanFilter": {"x": {"ComparisonOperator": "NOT_NULL"}}}
+                """));
+        assertEquals("Can not use both expression and non-expression parameters in the same request: "
+                + "Non-expression parameters: {AttributesToGet, ScanFilter, ConditionalOperator} "
+                + "Expression parameters: {ProjectionExpression, FilterExpression}", ex.getMessage());
+    }
+
+    @Test
+    void scanReportsTheLimitBeforeMixedParameters() {
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Limit": 0, "FilterExpression": "attribute_exists(x)",
+                 "ScanFilter": {"x": {"ComparisonOperator": "NOT_NULL"}}}
+                """));
+        assertEquals("1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
+                + "Member must have value greater than or equal to 1", ex.getMessage());
+    }
+
+    @Test
     void scanAcceptsSegmentsAtTheBounds() throws Exception {
         createUsersTable("eu-west-1");
 

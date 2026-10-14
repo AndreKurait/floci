@@ -7,6 +7,8 @@
  */
 package io.github.hectorvent.floci.core.common.docker;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.transport.DockerHttpClient;
 import com.github.dockerjava.transport.NamedPipeSocket;
 import com.github.dockerjava.transport.SSLConfig;
@@ -70,6 +72,8 @@ import java.util.stream.Stream;
  * response timeout ({@link #isLongLivedStream}), while every other call keeps it.
  */
 public final class FlociDockerHttpClient implements DockerHttpClient {
+
+    private static final ObjectMapper EXEC_CONFIG_MAPPER = new ObjectMapper();
 
     /**
      * A pooled connection idle this long is checked before it is leased again, so a socket the daemon
@@ -196,8 +200,9 @@ public final class FlociDockerHttpClient implements DockerHttpClient {
         }
 
         try {
+            boolean ttyExec = isTtyExec(request);
             ClassicHttpResponse response = httpClient.executeOpen(host, httpRequest, context);
-            return new FlociResponse(httpRequest, response);
+            return new FlociResponse(httpRequest, response, ttyExec && response.getCode() == 200);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -206,6 +211,16 @@ public final class FlociDockerHttpClient implements DockerHttpClient {
     @Override
     public void close() throws IOException {
         httpClient.close();
+    }
+
+    private static boolean isTtyExec(Request request) throws IOException {
+        String route = request.path().split("\\?", 2)[0];
+        if (!"POST".equals(request.method()) || !route.contains("/exec/") || !route.endsWith("/start")
+                || request.bodyBytes() == null) {
+            return false;
+        }
+        JsonNode config = EXEC_CONFIG_MAPPER.readTree(request.bodyBytes());
+        return config != null && config.path("Tty").asBoolean() && !config.path("Detach").asBoolean();
     }
 
     /**
@@ -302,10 +317,13 @@ public final class FlociDockerHttpClient implements DockerHttpClient {
 
         private final HttpUriRequestBase request;
         private final ClassicHttpResponse response;
+        private final boolean ttyExec;
+        private InputStream body;
 
-        FlociResponse(HttpUriRequestBase request, ClassicHttpResponse response) {
+        FlociResponse(HttpUriRequestBase request, ClassicHttpResponse response, boolean ttyExec) {
             this.request = request;
             this.response = response;
+            this.ttyExec = ttyExec;
         }
 
         @Override
@@ -329,7 +347,12 @@ public final class FlociDockerHttpClient implements DockerHttpClient {
         @Override
         public InputStream getBody() {
             try {
-                return response.getEntity() != null ? response.getEntity().getContent() : EmptyInputStream.INSTANCE;
+                if (body == null) {
+                    InputStream content = response.getEntity() != null
+                            ? response.getEntity().getContent() : EmptyInputStream.INSTANCE;
+                    body = ttyExec ? new TtyFramingInputStream(content) : content;
+                }
+                return body;
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }

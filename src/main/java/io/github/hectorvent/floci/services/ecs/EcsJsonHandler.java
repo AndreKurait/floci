@@ -55,6 +55,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -87,6 +88,10 @@ public class EcsJsonHandler {
     }
 
     public Response handle(String action, JsonNode request, String region) {
+        return handle(action, request, region, null);
+    }
+
+    public Response handle(String action, JsonNode request, String region, URI requestBaseUri) {
         return switch (action) {
             // Clusters
             case "CreateCluster" -> handleCreateCluster(request, region);
@@ -111,7 +116,7 @@ public class EcsJsonHandler {
             case "ListTasks" -> handleListTasks(request, region);
             case "UpdateTaskProtection" -> handleUpdateTaskProtection(request, region);
             case "GetTaskProtection" -> handleGetTaskProtection(request, region);
-            case "ExecuteCommand" -> handleExecuteCommand(request, region);
+            case "ExecuteCommand" -> handleExecuteCommand(request, region, requestBaseUri);
 
             case "CreateService" -> handleCreateService(request, region);
             case "UpdateService" -> handleUpdateService(request, region);
@@ -515,7 +520,7 @@ public class EcsJsonHandler {
         return Response.ok(resp).build();
     }
 
-    private Response handleExecuteCommand(JsonNode req, String region) {
+    private Response handleExecuteCommand(JsonNode req, String region, URI requestBaseUri) {
         String cluster = req.has("cluster") ? req.path("cluster").asText() : null;
         String task = req.path("task").asText();
         String container = req.hasNonNull("container") ? req.path("container").asText() : null;
@@ -535,7 +540,7 @@ public class EcsJsonHandler {
         resp.put("interactive", interactive);
         ObjectNode session = resp.putObject("session");
         session.put("sessionId", result.session().sessionId());
-        session.put("streamUrl", service.execStreamUrl(result.session()));
+        session.put("streamUrl", service.execStreamUrl(result.session(), requestBaseUri));
         session.put("tokenValue", result.session().tokenValue());
         return Response.ok(resp).build();
     }

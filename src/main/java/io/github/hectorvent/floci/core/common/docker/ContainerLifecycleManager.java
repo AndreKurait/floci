@@ -1146,6 +1146,9 @@ public class ContainerLifecycleManager {
         if (spec.readonlyRootfs()) {
             hostConfig.withReadonlyRootfs(true);
         }
+        if (spec.init()) {
+            hostConfig.withInit(true);
+        }
 
         // Port bindings — services decide whether to request them based on their
         // own in-container-vs-native logic. When Floci runs inside Docker, most

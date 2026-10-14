@@ -1645,7 +1645,7 @@ public class S3Controller {
                 S3Checksum expectedChecksum = extractChecksum(httpHeaders, uriInfo);
                 S3Object obj = s3Service.completeMultipartUpload(bucket, key, uploadId, partNumbers,
                         completedPartETags(completedParts), completedPartChecksums(completedParts), checksumType,
-                        expectedChecksum);
+                        expectedChecksum, multipartObjectSize(httpHeaders, uriInfo));
                 String baseUrl = uriInfo.getBaseUri().toString();
                 if (baseUrl.endsWith("/")) {
                     baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
@@ -2296,6 +2296,35 @@ public class S3Controller {
         if (size > maxSize) {
             throw S3Service.entityTooLarge(size, maxSize);
         }
+    }
+
+    private static Long multipartObjectSize(HttpHeaders httpHeaders, UriInfo uriInfo) {
+        String name = "x-amz-mp-object-size";
+        String value = httpHeaders != null ? httpHeaders.getHeaderString(name) : null;
+        if (value == null && uriInfo != null && uriInfo.getQueryParameters() != null) {
+            for (Map.Entry<String, List<String>> entry : uriInfo.getQueryParameters().entrySet()) {
+                if (entry.getKey().equalsIgnoreCase(name) && !entry.getValue().isEmpty()) {
+                    value = entry.getValue().getFirst();
+                    break;
+                }
+            }
+        }
+        if (value == null) {
+            return null;
+        }
+        String normalized = value.trim();
+        long size;
+        try {
+            size = Long.parseLong(normalized);
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidRequest", "Value for x-amz-mp-object-size header is invalid: '"
+                    + normalized + "'", 400);
+        }
+        if (size < 0) {
+            throw new AwsException("InvalidRequest", "Value for x-amz-mp-object-size header is less than zero: '"
+                    + normalized + "'", 400);
+        }
+        return size;
     }
 
     private static String trailerHeader(HttpHeaders httpHeaders, UriInfo uriInfo) {

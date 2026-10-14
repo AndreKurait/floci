@@ -1098,26 +1098,12 @@ public class NativeDynamoDbJsonHandler {
                     + "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]", 400);
         }
 
-        if (keyConditionExpr != null && keyConditions != null) {
-            throw new AwsException("ValidationException",
-                    "Can not use both expression and non-expression parameters in the same request: "
-                    + "Non-expression parameters: {KeyConditions} Expression parameters: {KeyConditionExpression}", 400);
-        }
-        if (keyConditionExpr != null && queryFilter != null) {
-            throw new AwsException("ValidationException",
-                    "Can not use both expression and non-expression parameters in the same request: "
-                    + "Non-expression parameters: {QueryFilter} Expression parameters: {KeyConditionExpression}", 400);
-        }
-        if (filterExpr != null && queryFilter != null) {
-            throw new AwsException("ValidationException",
-                    "Can not use both expression and non-expression parameters in the same request: "
-                    + "Non-expression parameters: {QueryFilter} Expression parameters: {FilterExpression}", 400);
-        }
-        if (attributesToGet != null && projectionExpression != null) {
-            throw new AwsException("ValidationException",
-                    "Can not use both expression and non-expression parameters in the same request: "
-                    + "Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400);
-        }
+        // DynamoDB counts KeyConditions as a non-expression parameter only next to a KeyConditionExpression.
+        rejectMixedParameters(request,
+                keyConditionExpr == null
+                        ? List.of("AttributesToGet", "QueryFilter", "ConditionalOperator")
+                        : List.of("AttributesToGet", "QueryFilter", "ConditionalOperator", "KeyConditions"),
+                List.of("ProjectionExpression", "FilterExpression", "KeyConditionExpression"));
 
         if (keyConditionExpr == null && keyConditions == null) {
             throw new AwsException("ValidationException",
@@ -1254,12 +1240,6 @@ public class NativeDynamoDbJsonHandler {
         Integer segment = request.has("Segment") ? request.get("Segment").asInt() : null;
         Integer totalSegments = request.has("TotalSegments") ? request.get("TotalSegments").asInt() : null;
 
-        if (filterExpr != null && scanFilter != null) {
-            throw new AwsException("ValidationException",
-                    "Can not use both expression and non-expression parameters in the same request: "
-                    + "Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}", 400);
-        }
-
         List<String> rangeErrors = new ArrayList<>();
         if (limit != null && limit < 1) {
             rangeErrors.add("Value at 'Limit' failed to satisfy constraint: "
@@ -1278,6 +1258,10 @@ public class NativeDynamoDbJsonHandler {
                     + "Member must have value less than or equal to " + MAX_TOTAL_SEGMENTS);
         }
         throwValidationErrors(rangeErrors);
+
+        rejectMixedParameters(request,
+                List.of("AttributesToGet", "ScanFilter", "ConditionalOperator"),
+                List.of("ProjectionExpression", "FilterExpression"));
 
         if (segment != null && totalSegments == null) {
             throw new AwsException("ValidationException",
@@ -1310,11 +1294,6 @@ public class NativeDynamoDbJsonHandler {
             throw new AwsException("ValidationException",
                     "1 validation error detected: Value '" + select + "' at 'select' failed to satisfy constraint: "
                     + "Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]", 400);
-        }
-        if (projectionExpressionScan != null && attributesToGetScan != null) {
-            throw new AwsException("ValidationException",
-                    "Can not use both expression and non-expression parameters in the same request: "
-                    + "Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400);
         }
         boolean hasAttributesToGetScan = attributesToGetScan != null && attributesToGetScan.size() > 0;
         if ("SPECIFIC_ATTRIBUTES".equals(select)
@@ -2038,6 +2017,18 @@ public class NativeDynamoDbJsonHandler {
         List<String> validationErrors = new ArrayList<>();
         addReturnConsumedCapacityError(request, validationErrors);
         throwValidationErrors(validationErrors);
+    }
+
+    private static void rejectMixedParameters(JsonNode request, List<String> nonExpressionNames,
+                                              List<String> expressionNames) {
+        List<String> nonExpression = nonExpressionNames.stream().filter(request::has).toList();
+        List<String> expression = expressionNames.stream().filter(request::has).toList();
+        if (!nonExpression.isEmpty() && !expression.isEmpty()) {
+            throw new AwsException("ValidationException",
+                    "Can not use both expression and non-expression parameters in the same request: "
+                    + "Non-expression parameters: {" + String.join(", ", nonExpression)
+                    + "} Expression parameters: {" + String.join(", ", expression) + "}", 400);
+        }
     }
 
     private static void throwValidationErrors(List<String> validationErrors) {

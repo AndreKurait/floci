@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.elbv2;
 import io.github.hectorvent.floci.testing.RealElbV2DataPlaneProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import io.restassured.response.Response;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClientRequest;
@@ -20,6 +21,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -40,6 +42,43 @@ class ElbV2PreserveHostHeaderIntegrationTest {
 
     @Inject
     Vertx vertx;
+
+    @Test
+    void preservesRepeatedTargetResponseHeaders() throws Exception {
+        HttpServer backend = vertx.createHttpServer().requestHandler(request -> {
+            request.response().headers()
+                    .add("Set-Cookie", "a=1; Path=/")
+                    .add("Set-Cookie", "b=2; Path=/")
+                    .add("Set-Cookie", "c=3; Path=/")
+                    .add("X-Multi", "one")
+                    .add("X-Multi", "two")
+                    .add("Keep-Alive", "timeout=5");
+            request.response().end("ok");
+        }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        String loadBalancerArn = null;
+        String targetGroupArn = null;
+        String listenerArn = null;
+        try {
+            loadBalancerArn = createLoadBalancer();
+            targetGroupArn = createTargetGroup(backend.actualPort());
+            registerTarget(targetGroupArn, backend.actualPort());
+            listenerArn = createListener(loadBalancerArn, targetGroupArn);
+            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
+                Response response = given().baseUri("http://127.0.0.1").port(LISTENER_PORT).get("/headers");
+                assertEquals(200, response.statusCode());
+                assertEquals("ok", response.asString());
+                assertEquals(List.of("a=1; Path=/", "b=2; Path=/", "c=3; Path=/"),
+                        response.headers().getValues("Set-Cookie"));
+                assertEquals(List.of("one", "two"), response.headers().getValues("X-Multi"));
+                assertEquals(List.of(), response.headers().getValues("Keep-Alive"));
+            });
+        } finally {
+            deleteListener(listenerArn);
+            deleteTargetGroup(targetGroupArn);
+            deleteLoadBalancer(loadBalancerArn);
+            backend.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        }
+    }
 
     @Test
     void preservesHostHeaderWhenLoadBalancerAttributeIsEnabled() throws Exception {

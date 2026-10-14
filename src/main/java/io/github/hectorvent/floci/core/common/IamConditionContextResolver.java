@@ -403,10 +403,25 @@ public class IamConditionContextResolver {
      * One condition context per target after the first, for the EC2 actions that accept several
      * resource ids in one request. An untagged target yields an empty context rather than none,
      * so a policy scoped through {@code aws:ResourceTag} fails to match it. Requests naming a
-     * single target, and every other service, get an empty list.
+     * single target get an empty list. Single-item DynamoDB writes also use separate contexts
+     * for distinct return modes, so every requested output must be authorized on the same resource.
      */
     public List<Map<String, List<String>>> resolveRemainingTargets(String credentialScope, String action,
                                                                    ContainerRequestContext ctx) {
+        if ("dynamodb".equals(credentialScope)) {
+            List<String> modes = singleItemReturnValues(action, bufferedJsonBody(ctx));
+            if (modes.size() < 2) {
+                return List.of();
+            }
+            Map<String, List<String>> primary = dynamoDbConditionContext(action, ctx);
+            List<Map<String, List<String>>> contexts = new ArrayList<>();
+            for (int i = 1; i < modes.size(); i++) {
+                Map<String, List<String>> context = new LinkedHashMap<>(primary);
+                context.put("dynamodb:ReturnValues", List.of(modes.get(i)));
+                contexts.add(context);
+            }
+            return contexts;
+        }
         if (!"ec2".equals(credentialScope)) {
             return List.of();
         }
@@ -532,7 +547,7 @@ public class IamConditionContextResolver {
 
     /**
      * Populates {@code dynamodb:LeadingKeys}, {@code dynamodb:Attributes} and
-     * {@code dynamodb:Select} from the buffered request body.
+     * {@code dynamodb:Select} and single-item write {@code dynamodb:ReturnValues} from the buffered request body.
      *
      * <p>A key that cannot be resolved (unknown table, a Key that omits the partition
      * attribute, an unparseable KeyConditionExpression) is omitted rather than guessed.
@@ -560,7 +575,26 @@ public class IamConditionContextResolver {
         if (keys.select() != null) {
             conditions.put("dynamodb:Select", List.of(keys.select()));
         }
+        List<String> returnValues = singleItemReturnValues(action, body);
+        if (!returnValues.isEmpty()) {
+            conditions.put("dynamodb:ReturnValues", List.of(returnValues.getFirst()));
+        }
         return conditions.isEmpty() ? null : conditions;
+    }
+
+    private static List<String> singleItemReturnValues(String action, JsonNode body) {
+        if (!("dynamodb:PutItem".equals(action) || "dynamodb:UpdateItem".equals(action)
+                || "dynamodb:DeleteItem".equals(action)) || body == null || !body.isObject()) {
+            return List.of();
+        }
+        Set<String> modes = new LinkedHashSet<>();
+        for (String field : List.of("ReturnValues", "ReturnValuesOnConditionCheckFailure")) {
+            String mode = body.path(field).asText("NONE");
+            if (!"NONE".equals(mode)) {
+                modes.add(mode);
+            }
+        }
+        return modes.isEmpty() ? List.of("NONE") : List.copyOf(modes);
     }
 
     /** One transaction item keeps its action, table and condition keys together. */

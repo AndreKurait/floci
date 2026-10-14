@@ -526,6 +526,8 @@ class SchedulerScheduleCfnProvisionerTest {
         when(scheduler.createSchedule(argThat(r -> "c".equals(r.getGroupName())), eq(REGION)))
                 .thenThrow(new AwsException("ConflictException", "destination owned elsewhere", 409));
 
+        // The stack takes this update only after ContinueUpdateRollback skipped the schedule, so the
+        // orphan is still owed, and the failed move's own restore must not retry its delete.
         assertThrows(AwsException.class,
                 () -> provisioner.provision(resource, properties("same", "c"), context("same")));
 
