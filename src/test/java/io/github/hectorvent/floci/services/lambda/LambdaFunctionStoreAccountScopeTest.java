@@ -8,11 +8,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/**
- * The S3 sync-reload observer runs with no {@code RequestContext}, so it sees the default
- * account's partition. It needs an all-accounts view to find the function an S3 update
- * belongs to, and an explicit-account save to put it back where it came from.
- */
+/** Account-scoped storage also supports background operations without a request context. */
 class LambdaFunctionStoreAccountScopeTest {
 
     private static final String REGION = "us-east-1";
