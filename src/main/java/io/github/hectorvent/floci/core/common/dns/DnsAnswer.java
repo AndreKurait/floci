@@ -10,7 +10,15 @@ import java.util.List;
  * <p>The TTL is per answer rather than per record: every address behind one Cloud Map service
  * shares that service's TTL, which is how Route 53 publishes a record set.
  */
-public record DnsAnswer(List<DnsRecord> records, int ttlSeconds, boolean nameExists) {
+public record DnsAnswer(List<DnsRecord> records, int ttlSeconds, boolean nameExists,
+                        Authority authority, int responseCode) {
+
+    /** The zone's SOA supplies the authority section and cache lifetime of negative answers. */
+    public record Authority(String name, DnsRecord.Soa soa, int ttlSeconds) {}
+
+    public DnsAnswer(List<DnsRecord> records, int ttlSeconds, boolean nameExists) {
+        this(records, ttlSeconds, nameExists, null, nameExists ? 0 : 3);
+    }
 
     /** What the DNS server publishes for a name whose zone declares no TTL of its own. */
     public static final int DEFAULT_TTL_SECONDS = 60;
@@ -35,6 +43,21 @@ public record DnsAnswer(List<DnsRecord> records, int ttlSeconds, boolean nameExi
 
     public static DnsAnswer typedRecords(List<DnsRecord> records, int ttlSeconds) {
         return new DnsAnswer(records, ttlSeconds, true);
+    }
+
+    public DnsAnswer withAuthority(String zoneName, DnsRecord.Soa soa, int soaTtl) {
+        int negativeTtl = (int) Math.min(soaTtl, soa.minimum());
+        return new DnsAnswer(records, ttlSeconds, nameExists,
+                new Authority(zoneName, soa, negativeTtl), responseCode);
+    }
+
+    /** An owned public query whose type, routing policy, or zone identity cannot be served. */
+    public static DnsAnswer refused() {
+        return new DnsAnswer(List.of(), DEFAULT_TTL_SECONDS, true, null, 5);
+    }
+
+    public boolean isPublicAuthorityAnswer() {
+        return authority != null || responseCode == 5;
     }
 
     /** IPv4 projection retained for callers that explicitly resolve A records. */

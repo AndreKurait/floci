@@ -623,12 +623,18 @@ public class Route53Service implements Resettable {
         if (qname == null || qname.isBlank()) {
             return List.of();
         }
-        String normalizedQname = normalizeName(qname).toLowerCase();
+        return findRecordsForName(normalizeName(qname).toLowerCase(),
+                mostSpecificZones(normalizeName(qname).toLowerCase(), true).stream()
+                        .map(owned -> getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId()))
+                        .toList());
+    }
+
+    private static List<ResourceRecordSet> findRecordsForName(String normalizedQname,
+                                                              List<List<ResourceRecordSet>> zoneRecords) {
         List<ResourceRecordSet> nameMatches = new ArrayList<>();
         List<ResourceRecordSet> wildcardMatches = new ArrayList<>();
 
-        for (OwnedZone owned : mostSpecificPrivateZones(normalizedQname)) {
-            List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId());
+        for (List<ResourceRecordSet> records : zoneRecords) {
             List<ResourceRecordSet> zoneWildcards = new ArrayList<>();
             for (ResourceRecordSet rrs : records) {
                 String rName = normalizeName(rrs.getName()).toLowerCase();
@@ -684,7 +690,7 @@ public class Route53Service implements Resettable {
         }
         String normalizedQname = normalizeName(qname).toLowerCase();
         String suffix = "." + normalizedQname;
-        for (OwnedZone owned : mostSpecificPrivateZones(normalizedQname)) {
+        for (OwnedZone owned : mostSpecificZones(normalizedQname, true)) {
             for (ResourceRecordSet rrs : getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId())) {
                 if (normalizeName(rrs.getName()).toLowerCase().endsWith(suffix)) {
                     return true;
@@ -694,17 +700,31 @@ public class Route53Service implements Resettable {
         return false;
     }
 
-    /** The private zones with the longest name containing {@code normalizedQname}, so a parent zone never answers for a child. */
-    private List<OwnedZone> mostSpecificPrivateZones(String normalizedQname) {
-        if (privateZoneNameCounts.isEmpty()
-                || privateZoneNameCounts.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
+    record PublicDnsZone(String name, List<ResourceRecordSet> matchingRecords, List<ResourceRecordSet> records) {}
+
+    List<PublicDnsZone> publicDnsZones(String qname) {
+        String normalized = normalizeName(qname).toLowerCase();
+        return mostSpecificZones(normalized, false).stream()
+                .map(owned -> {
+                    List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(
+                            owned.accountId(), owned.zone().getId());
+                    return new PublicDnsZone(owned.zone().getName(),
+                            findRecordsForName(normalized, List.of(records)), records);
+                })
+                .toList();
+    }
+
+    /** The longest containing zones, so a parent never answers for a more specific child. */
+    private List<OwnedZone> mostSpecificZones(String normalizedQname, boolean privateZone) {
+        if (privateZone && (privateZoneNameCounts.isEmpty()
+                || privateZoneNameCounts.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z)))) {
             return List.of();
         }
         List<OwnedZone> matchingZones = new ArrayList<>();
         int maxZoneLength = -1;
         for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
             HostedZone zone = owned.zone();
-            if (!zone.isPrivateZone()) {
+            if (zone.isPrivateZone() != privateZone) {
                 continue;
             }
             String zoneName = normalizeName(zone.getName()).toLowerCase();
