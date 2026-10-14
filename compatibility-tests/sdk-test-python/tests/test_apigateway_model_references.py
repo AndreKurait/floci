@@ -13,7 +13,8 @@ from botocore.config import Config
 
 
 @pytest.mark.parametrize("version", ["openapi", "swagger"])
-def test_imported_model_references(aws_config, version):
+@pytest.mark.parametrize("model_reference", ["local", "url"])
+def test_imported_model_references(aws_config, version, model_reference="local"):
     prefix = "#/components/schemas/" if version == "openapi" else "#/definitions/"
     schemas = {
         "Status": {"type": "string", "enum": ["READY"]},
@@ -52,6 +53,11 @@ def test_imported_model_references(aws_config, version):
         api_id = api.import_rest_api(body=json.dumps(document), failOnWarnings=True,
                                     parameters={"endpointConfigurationTypes": "REGIONAL"})["id"]
         try:
+            if model_reference == "url":
+                reference = f"https://apigateway.amazonaws.com/restapis/{api_id}/models/"
+                request_schema = json.dumps(schemas["Request"]).replace(prefix, reference)
+                api.update_model(restApiId=api_id, modelName="Request", patchOperations=[
+                    {"op": "replace", "path": "/schema", "value": request_schema}])
             hostname = f"{api_id}.execute-api.{api.meta.region_name}.amazonaws.com"
             target = urllib.parse.urlsplit(aws_config.get("endpoint_url") or "https://" + hostname)
             connection_type = (http.client.HTTPSConnection if target.scheme == "https"
