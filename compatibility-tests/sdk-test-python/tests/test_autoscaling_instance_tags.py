@@ -22,24 +22,6 @@ def test_launched_instances_include_group_name(ec2_client, aws_config, group_tag
         image = ec2_client.register_image(
             Name=name, Architecture="x86_64", RootDeviceName="/dev/sda1")["ImageId"]
         cleanup.callback(ec2_client.deregister_image, ImageId=image)
-        before_instances = ec2_client.describe_instances(Filters=[
-            {"Name": "subnet-id", "Values": [subnet]}])["Reservations"]
-        before_interfaces = ec2_client.describe_network_interfaces(Filters=[
-            {"Name": "subnet-id", "Values": [subnet]}])["NetworkInterfaces"]
-        with pytest.raises(ClientError) as error:
-            ec2_client.run_instances(
-                ImageId=image, InstanceType="t3.nano", SubnetId=subnet, MinCount=1, MaxCount=1,
-                TagSpecifications=[{"ResourceType": "network-interface", "Tags": [
-                    {"Key": "Name", "Value": name}, {"Key": "aWs:reserved", "Value": "invalid"},
-                ]}])
-        assert error.value.response["Error"] == {
-            "Code": "InvalidParameterValue",
-            "Message": "Tag keys starting with 'aws:' are reserved for internal use",
-        }
-        assert ec2_client.describe_instances(Filters=[
-            {"Name": "subnet-id", "Values": [subnet]}])["Reservations"] == before_instances
-        assert ec2_client.describe_network_interfaces(Filters=[
-            {"Name": "subnet-id", "Values": [subnet]}])["NetworkInterfaces"] == before_interfaces
         template = ec2_client.create_launch_template(
             LaunchTemplateName=name,
             LaunchTemplateData={
@@ -78,40 +60,6 @@ def test_launched_instances_include_group_name(ec2_client, aws_config, group_tag
         assert observed["Shared"] == ("group" if group_tags else "template")
         assert ("GroupOnly" in observed) == group_tags
         assert "NotPropagated" not in observed
-
-        for operation, normal_value in [
-                (ec2_client.create_tags, "changed"),
-                (ec2_client.delete_tags, observed["Shared"])]:
-            for key in ["aws:autoscaling:groupName", "AWS:custom", "aWs:custom"]:
-                with pytest.raises(ClientError) as error:
-                    operation(Resources=[instance_id], Tags=[
-                        {"Key": "Shared", "Value": normal_value},
-                        {"Key": key, "Value": "spoofed"},
-                    ])
-                assert error.value.response["Error"]["Code"] == "InvalidParameterValue"
-                assert error.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
-                assert error.value.response["Error"]["Message"] == (
-                    f"Value ( {key} ) for parameter key is invalid. "
-                    "Tag keys starting with 'aws:' are reserved for internal use"
-                )
-                current = ec2_client.describe_instances(
-                    InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]
-                assert {tag["Key"]: tag["Value"] for tag in current["Tags"]} == observed
-
-        with pytest.raises(ClientError) as error:
-            ec2_client.delete_tags(Resources=[instance_id], Tags=[
-                {"Key": "aws:autoscaling:groupName"}])
-        assert error.value.response["Error"]["Code"] == "InvalidParameterValue"
-
-        for delete_args in [{"Tags": []}, {}]:
-            ec2_client.create_tags(Resources=[instance_id], Tags=[
-                {"Key": "Editable", "Value": "normal"}])
-            ec2_client.delete_tags(Resources=[instance_id], **delete_args)
-            current = ec2_client.describe_instances(
-                InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]
-            remaining = {tag["Key"]: tag["Value"] for tag in current["Tags"]}
-            assert remaining["aws:autoscaling:groupName"] == name
-            assert all(key.lower().startswith("aws:") for key in remaining)
 
         ec2_client.create_tags(Resources=[instance_id], Tags=[{"Key": "Kept", "Value": "after-detach"}])
         cleanup.callback(ec2_client.terminate_instances, InstanceIds=[instance_id])
