@@ -539,9 +539,10 @@ class SchedulerScheduleCfnProvisionerTest {
         assertEquals("ENABLED", requests.getAllValues().getLast().getState());
         assertEquals("same", resource.getPhysicalId());
         assertEquals("a", resource.getAttributes().get("FlociSchedulerGroupName"));
-        assertEquals("b/same", provisioner.updateCleanupPhysicalId(resource));
+        // Restoring the failed move also finishes the earlier orphan cleanup.
+        assertNull(provisioner.updateCleanupPhysicalId(resource));
 
-        assertTrue(provisioner.completeUpdate(resource).complete());
+        assertFalse(provisioner.completeUpdate(resource).applicable());
         verify(scheduler, times(2)).deleteSchedule("same", "b", REGION);
         verify(scheduler, never()).deleteSchedule("same", "a", REGION);
     }
