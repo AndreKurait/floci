@@ -133,6 +133,23 @@ final class SesSendAddresses {
         }
     }
 
+    /** The first address the named headers hold, or null when the message has none. */
+    static String firstHeaderAddress(Message message, String name) {
+        Header header = message == null ? null : message.getHeader();
+        if (header == null) {
+            return null;
+        }
+        for (Field field : header.getFields(name)) {
+            if (field.getBody() != null) {
+                List<String> addresses = splitAddressList(field.getBody());
+                if (!addresses.isEmpty()) {
+                    return addresses.get(0);
+                }
+            }
+        }
+        return null;
+    }
+
     static void forEachHeaderAddress(Message message, String name, Consumer<String> check) {
         Header header = message == null ? null : message.getHeader();
         if (header == null) {

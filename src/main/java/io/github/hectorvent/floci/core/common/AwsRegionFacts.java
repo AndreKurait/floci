@@ -13,9 +13,9 @@ import java.util.Set;
 /**
  * The per-region and per-partition constants AWS publishes only as prose tables, vendored in
  * {@code aws/region-facts.json} by {@code tools/aws/regen_region_facts.py} from the Terraform
- * provider and the CDK: load balancer and S3 website hosted zone ids, the CloudFront hosted
- * zone per partition, the SAML sign-on URL per partition and the VPC endpoint service-name
- * prefixes. Every accessor is {@link Optional}: the ISO and EUSC partitions have no published
+ * provider, the CDK and the China and GovCloud user guides: load balancer and S3 website hosted
+ * zone ids, the CloudFront hosted zone per partition, the SAML sign-on URL and the management
+ * console host per partition and the VPC endpoint service-name prefixes. Every accessor is {@link Optional}: the ISO and EUSC partitions have no published
  * hosted zones, and a service that needs one there has nothing faithful to answer.
  */
 public final class AwsRegionFacts {
@@ -56,6 +56,14 @@ public final class AwsRegionFacts {
     /** The console's SAML endpoint; absent for {@code aws-iso-e}, {@code aws-iso-f} and {@code aws-eusc}. */
     public static Optional<String> samlSignOnUrl(String partition) {
         return partitionText(partition, "samlSignOnUrl");
+    }
+
+    /**
+     * The management console host, without a scheme. Stated by the user guides for {@code aws},
+     * {@code aws-cn} and {@code aws-us-gov}; absent for the ISO partitions and {@code aws-eusc}.
+     */
+    public static Optional<String> consoleHost(String partition) {
+        return partitionText(partition, "consoleHost");
     }
 
     /** {@code com.amazonaws.vpce}, {@code cn.com.amazonaws.vpce}, ...: the reversed DNS suffix plus {@code .vpce}. */

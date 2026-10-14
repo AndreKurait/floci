@@ -1160,6 +1160,30 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     @Test
+    void scanNamesTheSelectWhenRejectingAttributesToGet() {
+        createUsersTable("eu-west-1");
+
+        AwsException ex = expectValidationException("Scan", json("""
+                {"TableName": "Users", "Select": "COUNT", "AttributesToGet": ["userId"]}
+                """));
+        assertEquals("1 validation error detected: Cannot specify the AttributesToGet "
+                + "when choosing to get only the Count", ex.getMessage());
+    }
+
+    @Test
+    void queryReportsTheAttributesToGetConflictBeforeTheMissingIndex() {
+        createUsersTable("eu-west-1");
+
+        AwsException ex = expectValidationException("Query", json("""
+                {"TableName": "Users",
+                 "KeyConditions": {"userId": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "a"}]}},
+                 "Select": "ALL_PROJECTED_ATTRIBUTES", "AttributesToGet": ["userId"]}
+                """));
+        assertEquals("1 validation error detected: Cannot specify the AttributesToGet "
+                + "when choosing to get ALL_PROJECTED_ATTRIBUTES", ex.getMessage());
+    }
+
+    @Test
     void scanAcceptsSegmentsAtTheBounds() throws Exception {
         createUsersTable("eu-west-1");
 

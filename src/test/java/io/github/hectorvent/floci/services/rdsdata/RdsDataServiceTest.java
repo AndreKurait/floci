@@ -54,6 +54,66 @@ class RdsDataServiceTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Test
+    void rejectsMultipleStatementsBeforeEitherWriteRuns() throws Exception {
+        TestHarness harness = new TestHarness(DatabaseEngine.POSTGRES);
+        harness.createEventsTable();
+
+        AwsException error = assertThrows(AwsException.class, () -> harness.service.executeStatement(harness.request(
+                "insert into data_api_events(name) values ('first'); insert into data_api_events(name) values ('second')"),
+                REGION));
+
+        assertEquals("ValidationException", error.getErrorCode());
+        assertEquals("Multistatements aren't supported.", error.getMessage());
+        assertEquals(400, error.getHttpStatus());
+        assertEquals(0, harness.countEvents());
+    }
+
+    @Test
+    void rejectsMultipleStatementsInsideATransactionWithoutChangingItsData() throws Exception {
+        TestHarness harness = new TestHarness(DatabaseEngine.POSTGRES);
+        harness.createEventsTable();
+        String transactionId = harness.service.beginTransaction(harness.beginRequest(), REGION)
+                .path("transactionId").asText();
+        ObjectNode request = harness.request(
+                "insert into data_api_events(name) values ('first'); insert into data_api_events(name) values ('second')");
+        request.put("transactionId", transactionId);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> harness.service.executeStatement(request, REGION));
+        assertEquals("ValidationException", error.getErrorCode());
+        assertEquals("Multistatements aren't supported.", error.getMessage());
+
+        harness.service.commitTransaction(harness.transactionRequest(transactionId), REGION);
+        assertEquals(0, harness.countEvents());
+    }
+
+    @Test
+    void batchRejectsMultipleStatementsBeforeAnyParameterSetRuns() throws Exception {
+        for (DatabaseEngine engine : List.of(DatabaseEngine.POSTGRES, DatabaseEngine.MYSQL)) {
+            TestHarness harness = new TestHarness(engine);
+            harness.createEventsTable();
+            ObjectNode request = harness.request(
+                    "insert into data_api_events(name) values (:name); insert into data_api_events(name) values ('second')");
+            request.set("parameterSets", parameterSets("first"));
+
+            AwsException error = assertThrows(AwsException.class,
+                    () -> harness.service.batchExecuteStatement(request, REGION));
+            assertEquals("ValidationException", error.getErrorCode());
+            assertEquals("Multistatements aren't supported.", error.getMessage());
+            assertEquals(0, harness.countEvents());
+        }
+    }
+
+    @Test
+    void executesSingleStatementsContainingLiteralAndCommentSemicolons() throws Exception {
+        TestHarness harness = new TestHarness(DatabaseEngine.POSTGRES);
+        ObjectNode response = harness.service.executeStatement(harness.request(
+                "select ';' as separator /* ignored; statement */; -- trailing; comment\n"), REGION);
+
+        assertEquals(";", response.path("records").get(0).get(0).path("stringValue").asText());
+    }
+
+    @Test
     void executeStatementRejectsAResponseOverOneMebibyte() throws Exception {
         TestHarness harness = new TestHarness();
         ObjectNode request = harness.request(

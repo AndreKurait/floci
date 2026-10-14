@@ -21,9 +21,16 @@ import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
+import java.util.zip.GZIPOutputStream;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.doThrow;
@@ -138,6 +145,49 @@ class AutoScalingServiceTest {
         assertTrue(service.describeAutoScalingGroups(REGION, List.of("missing-image-asg")).isEmpty());
     }
 
+    static Stream<String> rejectedUserData() throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (GZIPOutputStream gzip = new GZIPOutputStream(bytes)) {
+            gzip.write(new byte[10 * 1024 * 1024 + 1]);
+        }
+        return Stream.of("not base64!", "YQ==\n", "H4sI", Base64.getEncoder().encodeToString(new byte[16385]),
+                Base64.getEncoder().encodeToString(bytes.toByteArray()));
+    }
+
+    @ParameterizedTest
+    @MethodSource("rejectedUserData")
+    void createLaunchConfigurationRejectsUnlaunchableDataBeforeSaving(String data) {
+        AwsException error = assertThrows(AwsException.class, () -> service.createLaunchConfiguration(REGION,
+                "invalid-data", null, "ami-test", "t3.micro", null, List.of(), data, null, null));
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertTrue(service.describeLaunchConfigurations(REGION, List.of("invalid-data")).isEmpty());
+        service.createLaunchConfiguration(REGION, "invalid-data", null, "ami-test", "t3.micro", null,
+                List.of(), "YQ==", null, null);
+        assertEquals("YQ==", service.describeLaunchConfigurations(REGION, List.of("invalid-data"))
+                .getFirst().getUserData());
+    }
+
+    @Test
+    void createLaunchConfigurationChecksSelectedInheritedDataAndAllowsValidOverride() {
+        Ec2Service ec2 = mock(Ec2Service.class);
+        service.ec2Service = ec2;
+        Instance source = new Instance();
+        source.setImageId("ami-test");
+        source.setInstanceType("t3.micro");
+        source.setEncodedUserData("not base64!");
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(source));
+        when(ec2.describeInstances(REGION, List.of("i-source"), Map.of())).thenReturn(List.of(reservation));
+        assertThrows(AwsException.class, () -> service.createLaunchConfiguration(REGION, "inherited-invalid",
+                "i-source", null, null, null, List.of(), null, null, null));
+        assertTrue(service.describeLaunchConfigurations(REGION, List.of("inherited-invalid")).isEmpty());
+        LaunchConfiguration overridden = service.createLaunchConfiguration(REGION, "overridden-valid",
+                "i-source", null, null, null, List.of(), "Yg==", null, null);
+        assertEquals("Yg==", overridden.getUserData());
+        assertEquals("not base64!", source.getEncodedUserData());
+    }
+
     @Test
     void createLaunchConfigurationRejectsMissingImageOrInstanceTypeWithoutInstanceId() {
         AwsException missingImage = assertThrows(AwsException.class, () -> service.createLaunchConfiguration(REGION,
@@ -207,7 +257,8 @@ class AutoScalingServiceTest {
         assertEquals("m7g.large", launchConfiguration.getInstanceType());
         assertEquals("source-key", launchConfiguration.getKeyName());
         assertEquals(List.of("sg-source"), launchConfiguration.getSecurityGroups());
-        assertEquals("source-user-data", launchConfiguration.getUserData());
+        assertEquals("c291cmNlLXVzZXItZGF0YQ==", launchConfiguration.getUserData());
+        assertEquals(Boolean.TRUE, launchConfiguration.getUserDataBase64Encoded());
         assertEquals("arn:aws:iam::000000000000:instance-profile/source",
                 launchConfiguration.getIamInstanceProfile());
         assertEquals(launchConfiguration,

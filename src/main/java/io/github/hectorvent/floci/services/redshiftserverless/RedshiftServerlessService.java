@@ -471,6 +471,21 @@ public class RedshiftServerlessService implements Resettable {
         return snapshotArn.substring(prefix.length());
     }
 
+    /**
+     * Changes a snapshot's retention. An omitted period leaves the snapshot as it is, and -1 makes
+     * it indefinite. {@code snapshotRemainingDays} keeps counting from the creation time, because
+     * the snapshot carries no separate retention start.
+     */
+    public synchronized RedshiftServerlessSnapshot updateSnapshot(String snapshotName, Integer retentionPeriod,
+                                                                  String region) {
+        RedshiftServerlessSnapshot snapshot = new RedshiftServerlessSnapshot(getSnapshot(snapshotName, region));
+        if (retentionPeriod != null) {
+            snapshot.setRetentionPeriod(validateRetentionPeriod(retentionPeriod));
+            snapshots.put(storageKey(region, snapshotName), snapshot);
+        }
+        return snapshot;
+    }
+
     public synchronized RedshiftServerlessSnapshot deleteSnapshot(String snapshotName, String region) {
         RedshiftServerlessSnapshot deleted = getSnapshot(snapshotName, region);
         snapshots.delete(storageKey(region, snapshotName));

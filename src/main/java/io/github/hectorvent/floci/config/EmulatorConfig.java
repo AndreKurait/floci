@@ -2888,7 +2888,7 @@ public interface EmulatorConfig {
          * ARN AWS would refuse. The content is never fetched either way, so a function whose
          * behaviour depends on the layer will not run correctly here.
          *
-         * <p>A layer ARN outside the {@code aws} partition is rejected regardless: partitions
+         * <p>A layer ARN outside the request's partition is rejected regardless: partitions
          * are isolated, so no resource policy can make one readable.
          *
          * Env var: FLOCI_SERVICES_LAMBDA_ACCEPT_EXTERNAL_LAYER_ARNS

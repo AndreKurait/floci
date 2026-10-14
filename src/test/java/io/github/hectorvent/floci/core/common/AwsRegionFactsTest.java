@@ -50,6 +50,17 @@ class AwsRegionFactsTest {
         assertTrue(AwsRegionFacts.samlSignOnUrl(null).isEmpty());
     }
 
+    /** The hosts the China and GovCloud user guides state; no guide covers the ISO or EUSC partitions. */
+    @Test
+    void consoleHostIsPerPartitionWhereAGuideStatesIt() {
+        assertEquals(Optional.of("console.aws.amazon.com"), AwsRegionFacts.consoleHost("aws"));
+        assertEquals(Optional.of("console.amazonaws.cn"), AwsRegionFacts.consoleHost("aws-cn"));
+        assertEquals(Optional.of("console.amazonaws-us-gov.com"), AwsRegionFacts.consoleHost("aws-us-gov"));
+        assertTrue(AwsRegionFacts.consoleHost("aws-iso").isEmpty());
+        assertTrue(AwsRegionFacts.consoleHost("aws-eusc").isEmpty());
+        assertTrue(AwsRegionFacts.consoleHost(null).isEmpty());
+    }
+
     @ParameterizedTest
     @CsvSource({
             "us-east-1,       s3,         com.amazonaws.us-east-1.s3",

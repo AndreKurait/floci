@@ -188,6 +188,14 @@ certificate as soon as it is created, so `https://<domain>` verifies without a r
 [TLS](../configuration/tls.md) for the accepted suffixes. A prefix domain is served under
 `amazoncognito.com` on AWS, not by Floci, and is left alone.
 
+Custom domains are not available in AWS GovCloud (US)
+([GovCloud guide](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-cog.html)) or in
+the AWS European Sovereign Cloud
+([EUSC guide](https://docs.aws.eu/esc/latest/userguide/cognito.html)), so `CreateUserPoolDomain` and
+`UpdateUserPoolDomain` refuse a `CustomDomainConfig` in a GovCloud or EUSC region with
+`InvalidParameterException`. Prefix domains work there. See
+[AWS Partitions](../configuration/partitions.md).
+
 ### Log Delivery
 
 | Action | Description |

@@ -1,5 +1,8 @@
 package io.github.hectorvent.floci.services.iam;
 
+import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
+import io.github.hectorvent.floci.core.common.ProtocolClaim;
+import io.github.hectorvent.floci.core.common.WireProtocol;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedHashMap;
@@ -8,6 +11,7 @@ import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvFileSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.Mockito;
 
 import java.io.ByteArrayInputStream;
@@ -30,6 +34,32 @@ import static org.mockito.Mockito.when;
 class IamActionRegistryTest {
 
     private final IamActionRegistry registry = new IamActionRegistry();
+
+    @Test
+    void cloudWatchGetUsesQueryActionAndOperationPrecedence() {
+        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
+        query.add("Action", "GetMetricStatistics");
+        query.add("Operation", "ListMetrics");
+        query.add("Version", "2010-08-01");
+        ContainerRequestContext ctx = mockCtx("GET", "/", query, null, "");
+        when(ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY))
+                .thenReturn(new ProtocolClaim(WireProtocol.AWS_QUERY, null, "GetMetricStatistics", null));
+        assertEquals("monitoring:GetMetricStatistics", registry.resolve("monitoring", ctx));
+        assertEquals("GetMetricStatistics", registry.queryAction(ctx));
+        assertEquals("2010-08-01", registry.queryVersion(ctx));
+        query.remove("Action");
+        assertEquals("monitoring:ListMetrics", registry.resolve("monitoring", ctx));
+    }
+
+    @Test
+    void getRequiresTheQueryClaimRatherThanQueryParametersAlone() {
+        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
+        query.add("Action", "ListMetrics");
+        ContainerRequestContext ctx = mockCtx("GET", "/", query, null, "");
+        assertEquals(false, IamActionRegistry.isQueryRequest(ctx));
+        when(ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY)).thenReturn(new ProtocolClaim(WireProtocol.REST, null, null, null));
+        assertEquals(false, IamActionRegistry.isQueryRequest(ctx));
+    }
 
     @Test
     void resolvesActionFromFormEncodedBody() {

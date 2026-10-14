@@ -145,6 +145,22 @@ policies are listed in name order so a `Marker` resumes where the previous page 
 | DeleteRolePolicy | Deletes an inline policy from a role. |
 | ListRolePolicies | Lists inline policy names stored on a role. |
 
+Inline policies share an aggregate size limit per principal: 2,048 characters for a user,
+5,120 for a group, and 10,240 for a role. Whitespace does not count. A replacement counts
+instead of the previous document with the same policy name; exceeding the limit returns
+`LimitExceeded` (HTTP 409) and preserves the stored policies. These limits match the
+[AWS IAM quotas](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_iam-quotas.html).
+
+When CloudFormation renames an inline policy, Floci releases its tracked old name on
+retained principals before writing the replacement. Failed updates restore the captured
+previous policies, including historical documents saved before these limits were enforced.
+Compensation checks the current principal, document and mutation ownership before restoration.
+A later write to the same policy prevents restoration even when it writes the same document;
+nested compensations can still unwind in reverse order. Mutation ownership lasts only within
+the current process and active rollback handles. Historical
+oversized documents can be restored only when the other policies still match their captured
+state. A failed compensation is reported as a rollback failure.
+
 ### Instance Profiles
 
 | Action | Description |
@@ -1098,6 +1114,17 @@ a Query `Action` field on it does not change the action it is checked as, and it
 still percent-encoded, as the router matches it, so an encoded `/` inside a parameter cannot make
 the route's rule miss.
 
+A request that names its operation, in a Query `Action` or an `X-Amz-Target` header, is authorized
+as the action AWS checks for that operation, which is usually the operation's own name. Where AWS
+authorizes an operation as a single action of another name, Floci does the same: `SendMessageBatch`
+is checked as `sqs:SendMessage` and `PublishBatch` as `sns:Publish`, so a policy granting the
+single-message action covers the batch call, and one naming the batch operation, which is not an
+IAM action, grants nothing. The mapping is taken from AWS's Service Reference and vendored in
+`src/main/resources/aws/iam-authorized-actions.json`. DynamoDB `TransactGetItems`, which AWS checks
+as `dynamodb:GetItem`, is checked item by item, as described under
+[Condition keys floci populates](#condition-keys-floci-populates): each `Get` as
+`dynamodb:GetItem` on its own table, with its own `dynamodb:LeadingKeys`.
+
 ### Resource-based policies
 
 When `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED` is active, Floci also queries registered `ResourcePolicyProvider` SPI implementations (such as S3 bucket policies) during request authorization:
@@ -1306,6 +1333,26 @@ floci populates:
   `assumed-role` session ARN, as AWS reports it ("For IAM roles, the request context returns the
   ARN of the role"); a condition naming the session ARN does not match. It is **absent** only for
   unknown keys, where nothing about the caller can be resolved.
+- `aws:PrincipalType` and `aws:userid`: resolved from the same lookup as `aws:PrincipalArn`, so
+  they always describe the same credential. The values follow the user guide's principal key
+  values list: `Account` with the account id for the account-root principal and for a session
+  token it minted, `User` with the user's own id for an IAM user access key and for a session
+  token that user minted, `FederatedUser` with `account:name` for a `GetFederationToken` session,
+  and `AssumedRole` with `role-id:session-name` for a role session, which for a role assigned to
+  an EC2 instance is `role-id:instance-id`. The guide renders the role-session type both as
+  `AssumedRole` and as "Assumed role"; floci uses the unspaced form, which is the one that fits
+  the vocabulary of every other value in that list and the one AWS publishes machine-side. The
+  guide's fifth value, `Anonymous`, is **not** populated: it applies to unsigned callers on S3,
+  SQS and SNS, which reach a resource policy through its own evaluation path rather than through
+  the enforcement filter, so a bucket policy conditioned on `aws:PrincipalType` being `Anonymous`
+  does not match an unsigned request.
+- `aws:username`: the IAM user's name, and **only** for an IAM user, whether it signed with its
+  own access key or with a session token it minted. The guide is explicit that it is "always
+  included in the request context for IAM users" while "anonymous requests and requests that are
+  made using the AWS account root user or IAM roles do not include this key", so for a role
+  session, a federated user or the account root it is absent, and a statement that matches on it
+  cannot match: an absent key has no equal or like value. That absence is the enforcement rather
+  than a gap in it.
 - `aws:TagKeys`: the case-sensitive requested tag keys for EC2 `RunInstances` and
   `CreateTags`, and S3 `PutBucketTagging`. `ForAllValues:StringEquals` can restrict the
   complete requested set without a `Null` guard; no tags still means absent context.
@@ -1334,6 +1381,13 @@ being bounded by SCPs (below): both forms of root enforcement now agree. A negat
 (`StringNotEquals`, `ArnNotLike`, `NotIpAddress` and the rest) is the exception, as on AWS: an
 absent key cannot equal what the policy names, so the condition holds, and a `Deny` written
 that way applies when the key is missing.
+
+The keys that say who is calling are written onto every context a request is evaluated against:
+the one the enforcement filter builds, one per resource the request names, one per transaction
+item, and the one S3 builds when it evaluates a bucket policy itself under `s3.enforce-auth`. A
+role trust policy is the exception: `sts:AssumeRole` evaluates its conditions with
+`aws:PrincipalArn` alone, so a trust policy keyed on `aws:userid`, `aws:PrincipalType` or
+`aws:username` does not match yet.
 
 Transactions check each item as `PutItem`, `UpdateItem`, `DeleteItem`, `GetItem`, or
 `ConditionCheckItem` before executing the request. Each item uses its own table, leading key
