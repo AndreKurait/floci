@@ -10,7 +10,9 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
+import io.github.hectorvent.floci.services.ec2.model.ManagedPrefixList;
 import io.github.hectorvent.floci.services.ec2.model.NatGateway;
+import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.Route;
 import io.github.hectorvent.floci.services.ec2.model.RouteTable;
 import io.github.hectorvent.floci.services.ec2.model.RouteTableAssociation;
@@ -89,6 +91,46 @@ class Ec2NetworkCfnProvisionerTest {
         s.setCidrBlock("10.0.1.0/24");
         s.setAvailabilityZone("us-east-1a");
         return s;
+    }
+
+    @Test
+    void prefixListUsesTheEc2IdAndAllFourRegistryAttributes() throws Exception {
+        ManagedPrefixList list = new ManagedPrefixList();
+        list.setPrefixListId("pl-0123456789abcdef0");
+        list.setPrefixListArn("arn:aws:ec2:us-east-1:000000000000:prefix-list/pl-0123456789abcdef0");
+        list.setOwnerId("000000000000");
+        list.setVersion(1);
+        when(ec2.createManagedPrefixList(eq(REGION), eq("firewall"), eq("IPv4"),
+                eq(2), any(), eq(List.of()))).thenReturn(list);
+        StackResource r = resource("AWS::EC2::PrefixList", "Firewall");
+
+        provisioner.provision(r, mapper.readTree("""
+                {"PrefixListName":"firewall","AddressFamily":"IPv4","MaxEntries":2,
+                 "Entries":[{"Cidr":"192.0.2.19/24","Description":"example"}]}
+                """), ctx());
+
+        assertEquals(list.getPrefixListId(), r.getPhysicalId());
+        assertEquals(Map.of("PrefixListId", list.getPrefixListId(), "Arn", list.getPrefixListArn(),
+                "OwnerId", "000000000000", "Version", "1"), r.getAttributes());
+        ArgumentCaptor<List<PrefixListEntry>> entries = ArgumentCaptor.captor();
+        verify(ec2).createManagedPrefixList(eq(REGION), eq("firewall"), eq("IPv4"),
+                eq(2), entries.capture(), eq(List.of()));
+        assertEquals("192.0.2.0/24", entries.getValue().getFirst().getCidr());
+        assertEquals("example", entries.getValue().getFirst().getDescription());
+    }
+
+    @Test
+    void prefixListDeleteToleratesOnlyItsOwnNotFoundError() {
+        StackResource r = resource("AWS::EC2::PrefixList", "Firewall");
+        r.setPhysicalId("pl-missing");
+        doThrow(new AwsException("InvalidPrefixListID.NotFound", "missing", 400))
+                .when(ec2).deleteManagedPrefixList(REGION, "pl-missing");
+        assertDoesNotThrow(() -> provisioner.delete(r, REGION));
+        r.setPhysicalId("pl-busy");
+        doThrow(new AwsException("DependencyViolation", "in use", 400))
+                .when(ec2).deleteManagedPrefixList(REGION, "pl-busy");
+        assertEquals("DependencyViolation",
+                assertThrows(AwsException.class, () -> provisioner.delete(r, REGION)).getErrorCode());
     }
 
     @Test

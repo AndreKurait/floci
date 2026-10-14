@@ -334,6 +334,11 @@ public class AwsQueryController {
     private Response dispatchToHandler(String service, String action,
                                        MultivaluedMap<String, String> formParams,
                                        String authorization, String region) {
+        String version = formParams.getFirst("Version");
+        if ("monitoring".equals(service) && version != null
+                && !supportsQueryAction(service, action, version)) {
+            return cloudWatchVersionError(action, version);
+        }
         return switch (service) {
             case "sqs" -> sqsQueryHandler.handle(action, formParams, region);
             case "sns" -> snsQueryHandler.handle(action, formParams, region);
@@ -674,18 +679,16 @@ public class AwsQueryController {
             return Response.status(404).type(MediaType.APPLICATION_XML)
                     .entity("<UnknownOperationException/>").build();
         }
-        String version = queryParams.getFirst("Version");
-        version = version == null ? "2009-05-15" : version;
-        Set<String> actions = switch (version) {
-            case "2009-05-15" -> Set.of("ListMetrics", "GetMetricStatistics");
-            case CLOUDWATCH_API_VERSION -> CLOUDWATCH_ACTIONS;
-            default -> Set.of();
-        };
-        if (!actions.contains(action)) {
-            return xmlErrorResponse("InvalidAction", "Could not find operation " + action + " for version "
-                    + version, 404);
+        if (queryParams.getFirst("Version") == null
+                && !supportsQueryAction("monitoring", action, "2009-05-15")) {
+            return cloudWatchVersionError(action, "2009-05-15");
         }
         return dispatch(IamEnforcementFilter.requestAuthorization(authorization, queryParams), headers, queryParams);
+    }
+
+    private Response cloudWatchVersionError(String action, String version) {
+        return xmlErrorResponse("InvalidAction", "Could not find operation " + action + " for version "
+                + version, 404);
     }
 
     /**
@@ -729,6 +732,9 @@ public class AwsQueryController {
             new QueryService("elasticache", Set.of("2015-02-02"), ELASTICACHE_ACTIONS),
             new QueryService("rds", Set.of("2014-10-31"), RDS_ACTIONS),
             new QueryService("monitoring", Set.of(CLOUDWATCH_API_VERSION), CLOUDWATCH_ACTIONS),
+            new QueryService("monitoring", Set.of("2009-05-15"), Set.of("ListMetrics", "GetMetricStatistics")),
+            new QueryService("monitoring", Set.of("2013-01-16"),
+                    Set.of("PutMetricAlarm", "DescribeAlarms", "DeleteAlarms")),
             new QueryService("cloudformation", Set.of("2010-05-15"), CLOUDFORMATION_ACTIONS),
             new QueryService("email", Set.of("2010-12-01"), SES_ACTIONS),
             new QueryService("cognito-idp", Set.of(), COGNITO_ACTIONS),
@@ -739,6 +745,11 @@ public class AwsQueryController {
             new QueryService("elasticbeanstalk", Set.of("2010-12-01"), ELASTIC_BEANSTALK_ACTIONS),
             new QueryService("redshift", Set.of("2012-12-01"), REDSHIFT_ACTIONS),
             new QueryService("sqs", Set.of("2012-11-05"), SQS_ACTIONS));
+
+    private static boolean supportsQueryAction(String serviceName, String action, String version) {
+        return QUERY_SERVICES.stream().anyMatch(service -> service.name().equals(serviceName)
+                && service.apiVersions().contains(version) && service.actions().contains(action));
+    }
 
     /**
      * The service a Query request goes to when its credential scope does not name one.

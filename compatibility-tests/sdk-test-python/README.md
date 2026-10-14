@@ -46,6 +46,10 @@ just test-python
 
 ## Legacy DynamoDB client
 
+`legacy/test_cloudwatch_alarm_query.py` exercises Boto 2 alarm creation, filtered
+reads and deletion with Query versions 2010-08-01 and 2013-01-16, including shared
+storage with Boto 3 and account/region isolation.
+
 `legacy/test_dynamodb_20111205.py` exercises the 2011-12-05 API with Boto 2,
 including paginated queries and batch cleanup of tables created by Boto 3.
 Public Boto 2.49.0 needs Python 3.9: it uses retired collections and import
