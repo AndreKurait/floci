@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.time.Duration;
 import java.util.concurrent.Semaphore;
 
 /**
@@ -39,6 +40,7 @@ public class RdsAuthProxy {
 
     private volatile boolean running;
     private ServerSocket serverSocket;
+    private Thread acceptThread;
 
     public RdsAuthProxy(String instanceId, String backendHost, int backendPort,
                         DatabaseEngine engine, boolean iamEnabled,
@@ -99,7 +101,7 @@ public class RdsAuthProxy {
         serverSocket.setReuseAddress(true);
         serverSocket.bind(new InetSocketAddress(proxyPort));
         running = true;
-        Thread.ofVirtual().name("rds-proxy-accept-" + instanceId).start(this::acceptLoop);
+        acceptThread = Thread.ofVirtual().name("rds-proxy-accept-" + instanceId).start(this::acceptLoop);
         LOG.infov("RDS proxy started for instance {0} on port {1} → {2}:{3}",
                 instanceId, String.valueOf(proxyPort), backendHost, String.valueOf(backendPort));
     }
@@ -120,6 +122,13 @@ public class RdsAuthProxy {
             if (serverSocket != null) {
                 serverSocket.close();
             }
+            // A pending accept can defer closing the socket's file descriptor until it exits.
+            if (acceptThread != null && !acceptThread.join(Duration.ofSeconds(5))) {
+                throw new IllegalStateException("RDS proxy listener did not stop for instance " + instanceId);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted stopping RDS proxy for instance " + instanceId, e);
         } catch (IOException e) {
             LOG.warnv(e, "Error closing RDS proxy server socket for instance {0}", instanceId);
             throw new RuntimeException(
