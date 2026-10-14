@@ -5,10 +5,12 @@ import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.testutil.FreePorts;
 import org.junit.jupiter.api.Test;
 
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -23,6 +25,29 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class RdsProxyManagerTest {
+
+    @Test
+    void stoppedProxyCanImmediatelyRestartOnItsExistingPort() throws IOException {
+        RdsProxyManager manager = new RdsProxyManager(
+                mock(RdsSigV4Validator.class), mock(RdsProxyTlsCertificates.class), testConfig());
+        int port = FreePorts.anyInterfacePort();
+        try {
+            for (int attempt = 0; attempt < 100; attempt++) {
+                start(manager, "rebooted", port);
+                try (Socket client = new Socket("localhost", port)) {
+                    client.setSoTimeout(5000);
+                    DataOutputStream out = new DataOutputStream(client.getOutputStream());
+                    out.writeInt(8);
+                    out.writeInt(0);
+                    out.flush();
+                    assertEquals(-1, client.getInputStream().read());
+                }
+                manager.stopProxy("rebooted");
+            }
+        } finally {
+            manager.stopAll();
+        }
+    }
 
     @Test
     void replacingProxyStopsPreviousListenerAndKeepsReplacementOwned() throws IOException {
