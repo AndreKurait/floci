@@ -1012,6 +1012,22 @@ class RdsQueryHandlerTest {
         assertTrue(body.contains("<DBInstanceClass>db.t4g.medium</DBInstanceClass>"));
     }
 
+    @Test
+    void describeOrderableDbInstanceOptions_auroraMysqlReportsGeneralPublicLicense() {
+        when(service.describeOrderableDbInstanceOptions("aurora-mysql", null, null))
+                .thenReturn(List.of(Map.of(
+                        "engine", "aurora-mysql",
+                        "engineVersion", "8.0.mysql_aurora.3.05.2",
+                        "dbInstanceClass", "db.r5.large")));
+
+        MultivaluedMap<String, String> p = params();
+        p.add("Engine", "aurora-mysql");
+        String body = (String) handler.handle("DescribeOrderableDBInstanceOptions", p).getEntity();
+
+        assertTrue(body.contains("<LicenseModel>general-public-license</LicenseModel>"));
+        assertFalse(body.contains("postgresql-license"));
+    }
+
     // ──────────────────────────── DBParameterGroups XML tag ──────────────────────
 
     @Test

@@ -13,6 +13,7 @@ import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.BillingMode;
 import software.amazon.awssdk.services.dynamodb.model.ConditionCheck;
+import software.amazon.awssdk.services.dynamodb.model.ConditionalCheckFailedException;
 import software.amazon.awssdk.services.dynamodb.model.Delete;
 import software.amazon.awssdk.services.dynamodb.model.DynamoDbException;
 import software.amazon.awssdk.services.dynamodb.model.Get;
@@ -145,6 +146,73 @@ class DynamoDbTransactionAuthorizationTest {
                         error -> assertThat(error.awsErrorDetails().errorCode()).isEqualTo("AccessDeniedException"));
         assertThat(read().get("value").s()).isEqualTo("original");
         assertThat(admin.getItem(r -> r.tableName(table).key(key("forbidden"))).item()).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Put", "Update", "Delete"})
+    void standaloneReturnValuesConditionsRejectBeforeMutation(String operation) {
+        allow("dynamodb:" + operation + "Item", ",\"Condition\":{\"StringEquals\":{"
+                + "\"dynamodb:ReturnValues\":\"NONE\"}}");
+        assertThatThrownBy(() -> standaloneWrite(operation, "ALL_OLD"))
+                .isInstanceOfSatisfying(DynamoDbException.class,
+                        error -> assertThat(error.awsErrorDetails().errorCode()).isEqualTo("AccessDeniedException"));
+        assertThat(read().get("value").s()).isEqualTo("original");
+        assertThat(standaloneWrite(operation, null)).isEmpty();
+        if ("Delete".equals(operation)) {
+            assertThat(read()).isEmpty();
+        } else {
+            assertThat(read().get("value").s()).isEqualTo("changed");
+        }
+        admin.putItem(r -> r.tableName(table).item(item("item", "original")));
+        allow("dynamodb:" + operation + "Item", ",\"Condition\":{\"StringEquals\":{"
+                + "\"dynamodb:ReturnValues\":\"ALL_OLD\"}}");
+        assertThat(standaloneWrite(operation, "ALL_OLD").get("value").s()).isEqualTo("original");
+    }
+
+    private Map<String, AttributeValue> standaloneWrite(String operation, String returnValues) {
+        return switch (operation) {
+            case "Put" -> caller.putItem(r -> r.tableName(table).item(item("item", "changed"))
+                    .returnValues(returnValues)).attributes();
+            case "Update" -> caller.updateItem(r -> r.tableName(table).key(key("item"))
+                    .updateExpression("SET #v = :v").expressionAttributeNames(Map.of("#v", "value"))
+                    .expressionAttributeValues(Map.of(":v", AttributeValue.fromS("changed")))
+                    .returnValues(returnValues)).attributes();
+            case "Delete" -> caller.deleteItem(r -> r.tableName(table).key(key("item"))
+                    .returnValues(returnValues)).attributes();
+            default -> throw new IllegalArgumentException(operation);
+        };
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void differingStandaloneReturnModesRequireBothGrants(boolean succeeds) {
+        for (String grant : new String[]{"UPDATED_NEW", "ALL_OLD"}) {
+            allow("dynamodb:UpdateItem", ",\"Condition\":{\"StringEquals\":{"
+                    + "\"dynamodb:ReturnValues\":\"" + grant + "\"}}");
+            assertThatThrownBy(() -> mixedReturnUpdate(succeeds))
+                    .isInstanceOfSatisfying(DynamoDbException.class,
+                            error -> assertThat(error.awsErrorDetails().errorCode()).isEqualTo("AccessDeniedException"));
+            assertThat(read().get("value").s()).isEqualTo("original");
+        }
+        allow("dynamodb:UpdateItem", ",\"Condition\":{\"StringEquals\":{"
+                + "\"dynamodb:ReturnValues\":[\"UPDATED_NEW\",\"ALL_OLD\"]}}");
+        if (succeeds) {
+            assertThat(mixedReturnUpdate(true).get("value").s()).isEqualTo("changed");
+            assertThat(read().get("value").s()).isEqualTo("changed");
+        } else {
+            assertThatThrownBy(() -> mixedReturnUpdate(false))
+                    .isInstanceOfSatisfying(ConditionalCheckFailedException.class,
+                            error -> assertThat(error.item().get("value").s()).isEqualTo("original"));
+            assertThat(read().get("value").s()).isEqualTo("original");
+        }
+    }
+
+    private Map<String, AttributeValue> mixedReturnUpdate(boolean succeeds) {
+        return caller.updateItem(r -> r.tableName(table).key(key("item"))
+                .updateExpression("SET #v = :v").expressionAttributeNames(Map.of("#v", "value"))
+                .expressionAttributeValues(Map.of(":v", AttributeValue.fromS("changed")))
+                .conditionExpression(succeeds ? "attribute_exists(PK)" : "attribute_not_exists(PK)")
+                .returnValues("UPDATED_NEW").returnValuesOnConditionCheckFailure("ALL_OLD")).attributes();
     }
 
     private void transaction(String operation) {

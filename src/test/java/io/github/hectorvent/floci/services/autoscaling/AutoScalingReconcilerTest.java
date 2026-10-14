@@ -37,6 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.argThat;
@@ -287,6 +288,38 @@ class AutoScalingReconcilerTest {
 
         verify(ec2Service).terminateInstances("us-east-1", List.of("i-stale"));
         verify(asgService, never()).completeInstanceRefreshIfSettled("us-east-1", "app-asg");
+    }
+
+    @Test
+    void scaleOutPassesTheLaunchTemplateBlockDeviceMappings() {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(asgService, ec2Service, mock(ElbV2Service.class));
+        AutoScalingGroup asg = launchTemplateAsg();
+        stubLaunchTemplate(ec2Service, "ami-version-1", "t3.micro");
+        LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
+        ebs.setVolumeType("gp3");
+        LaunchTemplateData.BlockDeviceMapping root = new LaunchTemplateData.BlockDeviceMapping();
+        root.setDeviceName("/dev/xvda");
+        root.setEbs(ebs);
+        ec2Service.describeLaunchTemplateVersions("us-east-1", "lt-123", null, List.of("1"))
+                .getFirst().getData().setBlockDeviceMappings(List.of(root));
+        when(asgService.saveAutoScalingGroupIfPresent(asg)).thenReturn(true);
+        Instance ec2Instance = new Instance();
+        ec2Instance.setInstanceId("i-gp3");
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(ec2Instance));
+        when(ec2Service.runInstances(any(), any(), any(), any(Integer.class), any(Integer.class), any(),
+                any(), any(), any(), any(), any(), any(), any(), any(), any(Integer.class), any(), any(), any(), any(),
+                anyBoolean(), any(), any(), any())).thenReturn(reservation);
+
+        reconciler.reconcile(asg);
+
+        ArgumentCaptor<List<LaunchTemplateData.BlockDeviceMapping>> mappings = ArgumentCaptor.captor();
+        verify(ec2Service).runInstances(any(), any(), any(), any(Integer.class), any(Integer.class), any(),
+                any(), any(), any(), any(), any(), any(), any(), any(), any(Integer.class), any(), any(), any(), any(),
+                anyBoolean(), any(), any(), mappings.capture());
+        assertEquals(List.of(root), mappings.getValue());
     }
 
     @Test

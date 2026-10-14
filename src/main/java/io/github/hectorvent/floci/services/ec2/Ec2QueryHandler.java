@@ -982,7 +982,8 @@ public class Ec2QueryHandler {
                         null,
                         null,
                         0,
-                        launch.availabilityZone(), null, null, launch.encodedUserData());
+                        launch.availabilityZone(), null, null, launch.encodedUserData(), false,
+                        null, null, launch.blockDeviceMappings());
                 Instance instance = reservation.getInstances().get(0);
                 launchedInstanceIds.add(instance.getInstanceId());
                 results.add(new FleetLaunchResult(instance, launch));
@@ -1140,7 +1141,8 @@ public class Ec2QueryHandler {
                 template.getEncodedUserData(),
                 service.iamInstanceProfileArn(template),
                 template.effectiveSecurityGroupIds(),
-                new ArrayList<>(tags.values()));
+                new ArrayList<>(tags.values()),
+                template.getBlockDeviceMappings());
     }
 
     /**
@@ -1185,7 +1187,8 @@ public class Ec2QueryHandler {
     private record FleetLaunch(String launchTemplateId, String launchTemplateName, String launchTemplateVersion,
                                String instanceType, String imageId, String subnetId, String availabilityZone,
                                String keyName, String userData, String encodedUserData, String iamInstanceProfileArn,
-                               List<String> securityGroupIds, List<Tag> instanceTags) {}
+                               List<String> securityGroupIds, List<Tag> instanceTags,
+                               List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings) {}
 
     private record FleetLaunchKey(String launchTemplateId, String launchTemplateName, String launchTemplateVersion,
                                   String instanceType, String imageId, String subnetId, String availabilityZone) {

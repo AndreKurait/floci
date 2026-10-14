@@ -150,6 +150,10 @@ class RdsCatalogueReadIntegrationTest {
                 .extract().xmlPath().getString("CreateDBClusterResponse.CreateDBClusterResult.DBCluster.EngineVersion");
         assertEquals(expected, created);
         assertEquals(defaultVersion(engine), created);
+        // A caller sizing instances for the cluster must find an orderable class at that version.
+        query("DescribeOrderableDBInstanceOptions").formParam("Engine", engine).formParam("EngineVersion", created)
+        .when().post("/").then().statusCode(200)
+                .body(containsString("<OrderableDBInstanceOption>"));
         query("DeleteDBCluster").formParam("DBClusterIdentifier", id).formParam("SkipFinalSnapshot", "true")
         .when().post("/").then().statusCode(200);
     }
