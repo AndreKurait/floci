@@ -6,6 +6,7 @@ import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientRequest;
 import io.vertx.core.http.HttpClientResponse;
 import io.vertx.core.http.HttpServer;
@@ -199,28 +200,35 @@ class ElbV2PreserveHostHeaderIntegrationTest {
     }
 
     private void assertStreamsRequestAndResponse(String loadBalancerArn) throws Exception {
-        HttpClientRequest request = vertx.createHttpClient()
-                .request(new RequestOptions()
-                        .setHost(loadBalancerDnsName(loadBalancerArn))
-                        .setPort(LISTENER_PORT)
-                        .setMethod(io.vertx.core.http.HttpMethod.POST)
-                        .setURI("/stream"))
-                .toCompletionStage()
-                .toCompletableFuture()
-                .get(2, TimeUnit.SECONDS);
-        CompletableFuture<Buffer> bodyFuture = new CompletableFuture<>();
-        CompletableFuture<HttpClientResponse> responseFuture = request.response()
-                .onSuccess(response -> response.bodyHandler(bodyFuture::complete))
-                .toCompletionStage()
-                .toCompletableFuture();
-        request.putHeader("Content-Length", "11");
-        request.write(Buffer.buffer("hello "));
-        request.end(Buffer.buffer("world"));
+        String host = loadBalancerDnsName(loadBalancerArn);
+        HttpClient client = vertx.createHttpClient();
+        try {
+            HttpClientRequest request = client
+                    .request(new RequestOptions()
+                            .setHost("127.0.0.1")
+                            .setPort(LISTENER_PORT)
+                            .setMethod(io.vertx.core.http.HttpMethod.POST)
+                            .setURI("/stream"))
+                    .toCompletionStage()
+                    .toCompletableFuture()
+                    .get(10, TimeUnit.SECONDS);
+            CompletableFuture<Buffer> bodyFuture = new CompletableFuture<>();
+            CompletableFuture<HttpClientResponse> responseFuture = request.response()
+                    .onSuccess(response -> response.bodyHandler(bodyFuture::complete))
+                    .toCompletionStage()
+                    .toCompletableFuture();
+            request.putHeader("Host", host);
+            request.putHeader("Content-Length", "11");
+            request.write(Buffer.buffer("hello "));
+            request.end(Buffer.buffer("world"));
 
-        HttpClientResponse response = responseFuture.get(2, TimeUnit.SECONDS);
-        assertEquals(200, response.statusCode());
-        assertEquals("11", response.getHeader("X-Received-Content-Length"));
-        assertEquals("stream-hello world", bodyFuture.get(2, TimeUnit.SECONDS).toString());
+            HttpClientResponse response = responseFuture.get(10, TimeUnit.SECONDS);
+            assertEquals(200, response.statusCode());
+            assertEquals("11", response.getHeader("X-Received-Content-Length"));
+            assertEquals("stream-hello world", bodyFuture.get(10, TimeUnit.SECONDS).toString());
+        } finally {
+            client.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        }
     }
 
     private static String createLoadBalancer() {

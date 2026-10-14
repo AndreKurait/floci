@@ -294,7 +294,8 @@ handling; a hand-rolled signer must include it.
 
 Imported OpenAPI and Swagger request models can reference sibling models, including recursive
 references. Body validation resolves these schemas within the same API while preserving inline
-definitions. External schema URLs are not fetched.
+definitions. API Gateway model URLs (`https://apigateway.amazonaws.com/restapis/{api}/models/{name}`)
+also resolve from that deployment's snapshot. Other schema URLs are not fetched.
 
 Rejected bodies return `Invalid request body` by default. Custom gateway responses can access
 the schema validation detail through `$context.error.validationErrorString`.
