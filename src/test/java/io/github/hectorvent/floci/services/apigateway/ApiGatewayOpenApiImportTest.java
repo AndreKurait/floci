@@ -1089,7 +1089,7 @@ class ApiGatewayOpenApiImportTest {
     // ──────────────────────────── Request Body Validation ────────────────────────────
 
     @Test
-    @Order(95)
+    @Order(100)
     void importedModelReferencesValidateDeployedSiblingModelsAndRecursiveBodies() throws Exception {
         String spec = """
                 {
@@ -1116,7 +1116,25 @@ class ApiGatewayOpenApiImportTest {
                 """;
         String apiId = given().contentType(ContentType.JSON).queryParam("mode", "import")
                 .body(spec).post("/restapis").then().statusCode(201).extract().path("id");
+        AtomicInteger integrationCalls = new AtomicInteger();
+        HttpServer integration = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         try {
+            integration.createContext("/accepted", exchange -> {
+                integrationCalls.incrementAndGet();
+                byte[] bytes = "{\"accepted\":true}".getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, bytes.length);
+                exchange.getResponseBody().write(bytes);
+                exchange.close();
+            });
+            integration.start();
+            String resourceId = given().get("/restapis/" + apiId + "/resources")
+                    .then().statusCode(200).extract().path("item.find { it.path == '/list-workflows' }.id");
+            given().contentType(ContentType.JSON)
+                    .body("{\"type\":\"HTTP_PROXY\",\"httpMethod\":\"POST\",\"uri\":\"http://127.0.0.1:"
+                            + integration.getAddress().getPort() + "/accepted\"}")
+                    .put("/restapis/" + apiId + "/resources/" + resourceId + "/methods/POST/integration")
+                    .then().statusCode(201);
             String deployment = given().contentType(ContentType.JSON).body("{}")
                     .post("/restapis/" + apiId + "/deployments")
                     .then().statusCode(201).extract().path("id");
@@ -1130,10 +1148,12 @@ class ApiGatewayOpenApiImportTest {
             given().contentType(ContentType.JSON)
                     .body("{\"workflowCategory\":\"DMS\",\"status\":\"RUNNING\",\"child\":" + valid + "}")
                     .post(endpoint).then().statusCode(200);
-            given().contentType(ContentType.JSON).body("{\"status\":\"RUNNING\"}")
-                    .post(endpoint).then().statusCode(400).body("message", equalTo("Invalid request body"));
-            given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "INVALID"))
-                    .post(endpoint).then().statusCode(400);
+            assertEquals(2, integrationCalls.get(), "Valid requests must reach the integration");
+            assertRejectedWithoutIntegration(endpoint, "{\"status\":\"RUNNING\"}", integrationCalls);
+            assertRejectedWithoutIntegration(endpoint, valid.replace("RUNNING", "INVALID"), integrationCalls);
+            assertRejectedWithoutIntegration(endpoint,
+                    "{\"workflowCategory\":\"DMS\",\"status\":\"RUNNING\",\"child\":"
+                            + valid.replace("RUNNING", "INVALID") + "}", integrationCalls);
 
             String schema = "{\"type\":\"string\",\"enum\":[\"DONE\"]}";
             String patch = "{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
@@ -1141,11 +1161,10 @@ class ApiGatewayOpenApiImportTest {
             given().contentType(ContentType.JSON).body(patch)
                     .patch("/restapis/" + apiId + "/models/Status").then().statusCode(200);
             given().contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(200);
-            given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
-                    .post(endpoint).then().statusCode(400);
+            assertRejectedWithoutIntegration(endpoint, valid.replace("RUNNING", "DONE"), integrationCalls);
             given().contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
                     .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
-            given().contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(400);
+            assertRejectedWithoutIntegration(endpoint, valid, integrationCalls);
             given().contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
                     .post(endpoint).then().statusCode(200);
 
@@ -1179,7 +1198,7 @@ class ApiGatewayOpenApiImportTest {
                         .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
                 given().contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
                         .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
-                given().contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(400);
+                assertRejectedWithoutIntegration(endpoint, valid, integrationCalls);
             } finally {
                 given().delete("/restapis/" + otherApi).then().statusCode(202);
             }
@@ -1202,14 +1221,22 @@ class ApiGatewayOpenApiImportTest {
                         .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
                 given().contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
                         .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
-                given().contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(400);
+                assertRejectedWithoutIntegration(endpoint, valid, integrationCalls);
                 assertEquals(0, externalReads.get(), "Request validation must not fetch external schemas");
             } finally {
                 external.stop(0);
             }
         } finally {
+            integration.stop(0);
             given().delete("/restapis/" + apiId).then().statusCode(202);
         }
+    }
+
+    private void assertRejectedWithoutIntegration(String endpoint, String body, AtomicInteger integrationCalls) {
+        int calls = integrationCalls.get();
+        given().contentType(ContentType.JSON).body(body).post(endpoint)
+                .then().statusCode(400).body("message", equalTo("Invalid request body"));
+        assertEquals(calls, integrationCalls.get(), "Rejected requests must not reach the integration");
     }
 
     @Test
@@ -1424,7 +1451,7 @@ class ApiGatewayOpenApiImportTest {
     // ──────────────────────────── Content-Type Tolerance ────────────────────────────
 
     @Test
-    @Order(70)
+    @Order(73)
     void importRestApi_octetStreamContentType() throws Exception {
         String spec = """
                 {"openapi": "3.0.1", "info": {"title": "OctetImport", "version": "1.0"}, "paths": {}}
@@ -1498,7 +1525,7 @@ class ApiGatewayOpenApiImportTest {
     // ──────────────────────────── Security scheme / authorizer import ────────────────────────────
 
     @Test
-    @Order(90)
+    @Order(89)
     void importRestApi_lambdaAuthorizerFromSecurityScheme() throws Exception {
         String spec = """
                 {
@@ -1774,7 +1801,7 @@ class ApiGatewayOpenApiImportTest {
     }
 
     @Test
-    @Order(95)
+    @Order(101)
     void importRestApi_requestAuthorizerWithoutIdentitySourceRejectsDefaultCaching() {
         String title = "InvalidCachedRequestAuthorizer";
         String spec = requestAuthorizerSpec(title, "", "/invalid");
@@ -1796,7 +1823,7 @@ class ApiGatewayOpenApiImportTest {
     }
 
     @Test
-    @Order(96)
+    @Order(102)
     void importRestApi_requestAuthorizerWithoutIdentitySourceAllowsZeroTtl() throws Exception {
         String spec = requestAuthorizerSpec(
                 "UncachedRequestAuthorizer", ", \"authorizerResultTtlInSeconds\": 0", "/uncached");
@@ -1820,7 +1847,7 @@ class ApiGatewayOpenApiImportTest {
     }
 
     @Test
-    @Order(97)
+    @Order(103)
     void putRestApi_invalidCachedRequestAuthorizerDoesNotReplaceExistingApi() throws Exception {
         String originalSpec = """
                 {
