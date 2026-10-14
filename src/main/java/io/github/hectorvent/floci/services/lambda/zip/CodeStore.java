@@ -7,6 +7,7 @@ import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Comparator;
@@ -93,7 +94,8 @@ public class CodeStore {
     /**
      * Copies a function's current code into its own directory for {@code version}, replacing any
      * directory already there. Returns null when there is nothing to copy, which is the case for
-     * image-backed and hot-reload functions.
+     * image-backed and hot-reload functions. Regular files can share storage: deployment installs
+     * a new extracted directory instead of modifying files in the previous one.
      */
     public Path copyForVersion(String accountId, String region, String functionName, String version, Path source)
             throws IOException {
@@ -109,6 +111,14 @@ public class CodeStore {
                     Files.createDirectories(to);
                 } else {
                     Files.createDirectories(to.getParent());
+                    if (Files.isRegularFile(from, LinkOption.NOFOLLOW_LINKS)) {
+                        try {
+                            Files.createLink(to, from);
+                            continue;
+                        } catch (IOException | UnsupportedOperationException ignored) {
+                            // Cross-device and unsupported links retain ordinary copy semantics.
+                        }
+                    }
                     Files.copy(from, to, StandardCopyOption.REPLACE_EXISTING);
                 }
             }
