@@ -14,7 +14,7 @@ from botocore.config import Config
 
 @pytest.mark.parametrize("version", ["openapi", "swagger"])
 @pytest.mark.parametrize("model_reference", ["local", "url"])
-def test_imported_model_references(aws_config, version, model_reference="local"):
+def test_imported_model_references(aws_config, version, model_reference):
     prefix = "#/components/schemas/" if version == "openapi" else "#/definitions/"
     schemas = {
         "Status": {"type": "string", "enum": ["READY"]},
