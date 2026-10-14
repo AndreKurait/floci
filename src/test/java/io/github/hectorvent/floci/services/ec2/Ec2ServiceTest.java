@@ -105,6 +105,61 @@ import static org.mockito.Mockito.when;
 
 class Ec2ServiceTest {
 
+    @ParameterizedTest
+    @CsvSource({
+            "false, aws:autoscaling:groupName", "true, aws:autoscaling:groupName",
+            "false, AWS:custom", "true, AWS:custom",
+            "false, aWs:custom", "true, aWs:custom"
+    })
+    void userTagMutationsRejectAwsKeysBeforeChangingAnyResource(boolean delete, String key) {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        List<Tag> original = List.of(new Tag("aws:autoscaling:groupName", "group"), new Tag("env", "original"));
+        List<String> ids = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                        2, 2, null, List.of(), null, null, original, null, null)
+                .getInstances().stream().map(Instance::getInstanceId).toList();
+        List<Tag> changes = List.of(new Tag("env", delete ? null : "changed"), new Tag(key, "spoofed"));
+
+        AwsException error = assertThrows(AwsException.class, () -> {
+            if (delete) {
+                service.deleteTags("us-east-1", ids, changes);
+            } else {
+                service.createTags("us-east-1", ids, changes);
+            }
+        });
+
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertEquals("Value ( " + key + " ) for parameter key is invalid. "
+                + "Tag keys starting with 'aws:' are reserved for internal use", error.getMessage());
+        for (Reservation reservation : service.describeInstances("us-east-1", ids, Map.of())) {
+            for (Instance instance : reservation.getInstances()) {
+                assertEquals(original, instance.getTags());
+            }
+        }
+    }
+
+    @Test
+    void deletingAllUserTagsPreservesTheAutoscalingMembershipTag() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Tag membership = new Tag("aws:autoscaling:groupName", "group");
+        String id = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                        1, 1, null, List.of(), null, null,
+                        List.of(membership, new Tag("env", "original")), null, null)
+                .getInstances().getFirst().getInstanceId();
+
+        service.createTags("us-east-1", List.of(id), List.of(new Tag("env", "updated")));
+        service.deleteTags("us-east-1", List.of(id), List.of());
+
+        Instance instance = service.describeInstances("us-east-1", List.of(id), Map.of())
+                .getFirst().getInstances().getFirst();
+        assertEquals(List.of(membership), instance.getTags());
+    }
+
+
     @Test
     void createAndDescribeVpcsDoNotContactDockerEvenOnFirstUse() {
         EmulatorConfig config = mockConfig(false);

@@ -472,7 +472,9 @@ class Ec2InstanceCfnProvisionerTest {
         when(ec2.describeInstances("us-east-1", List.of("i-1"), null))
                 .thenReturn(List.of(reservationOf(i1)));
         when(ec2.describeTags(eq("us-east-1"), any())).thenReturn(List.of(
-                tagEntry("i-1", "env", "prod"), tagEntry("i-1", "old", "stale")));
+                tagEntry("i-1", "env", "prod"), tagEntry("i-1", "old", "stale"),
+                tagEntry("i-1", "aws:autoscaling:groupName", "group"),
+                tagEntry("i-1", "AWS:cloudformation:stack-id", "stack")));
         provisioner.provision(r, props("""
                 {"ImageId": "ami-1", "Tags": [{"Key": "env", "Value": "prod"}]}
                 """), ctx("i-1"));

@@ -300,6 +300,10 @@ that publish those images.
 | DeleteTags | Removes tags from supported EC2 resources. |
 | DescribeTags | Lists tags stored for EC2 resources. |
 
+Public tag mutations reject keys beginning with `aws:` regardless of ASCII case.
+An empty `DeleteTags` tag list removes user tags and preserves AWS-managed tags.
+CloudFormation tag updates and rollbacks likewise leave AWS-managed tags intact.
+
 ### Internet Gateways
 
 | Action | Description |
