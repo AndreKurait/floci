@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsS
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.github.hectorvent.floci.services.ecs.container.EcsContainerManager;
 import io.github.hectorvent.floci.services.ecs.container.EcsTaskHandle;
+import io.github.hectorvent.floci.services.ecs.container.EcsTaskLaunchException;
 import io.github.hectorvent.floci.services.ecs.exec.EcsExecChannelHandler;
 import io.github.hectorvent.floci.services.ecs.exec.EcsExecSessionRegistry;
 import io.github.hectorvent.floci.services.ecs.exec.ExecSession;
@@ -128,6 +129,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     private final Object reconcilerLock = new Object();
     // False until a previous run's task containers are confirmed gone; no task starts before.
     private volatile boolean leftoverContainersRemoved = true;
+    private volatile boolean leftoverTaskVolumesRemoved;
     private volatile boolean leftoverContainersBlockReported;
 
     // region::clusterName → EcsCluster
@@ -138,8 +140,9 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     private Map<String, Integer> latestRevisions = new ConcurrentHashMap<>();
     // taskArn → EcsTask
     private final Map<String, EcsTask> tasks = new ConcurrentHashMap<>();
-    // taskArn → EcsTaskHandle (running containers or unresolved log readers)
+    // taskArn → EcsTaskHandle (running containers or pending resource cleanup)
     private final Map<String, EcsTaskHandle> taskHandles = new ConcurrentHashMap<>();
+    private final Set<String> shutdownCleanupTasks = ConcurrentHashMap.newKeySet();
     // region::clusterName/serviceName → EcsServiceModel
     private Map<String, EcsServiceModel> services = new ConcurrentHashMap<>();
     private AccountAwareStorageBackend<EcsServiceModel> servicesStore;
@@ -239,6 +242,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         this.containerManager = containerManager;
         this.dockerMode = !config.services().ecs().mock();
         this.sweepLeftoverContainers = dockerMode && config.services().ecs().reconcileContainersOnStartup();
+        this.leftoverTaskVolumesRemoved = !sweepLeftoverContainers;
         this.baseUrl = config.effectiveBaseUrl();
         this.lbRegistrar = lbRegistrar;
         this.storageFactory = storageFactory;
@@ -287,6 +291,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     void releasePreviousRunLeftovers() {
         if (sweepLeftoverContainers) {
             leftoverContainersRemoved = containerManager.removeLeftoverContainers();
+            retryPreviousRunTaskVolumes();
         }
         if (lbRegistrar != null) {
             lbRegistrar.releaseRecordedTargets();
@@ -384,8 +389,16 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             }
             try {
                 containerManager.stopTask(claimed);
+                for (int attempt = 0; attempt < 2 && claimed.hasTaskVolumes(); attempt++) {
+                    containerManager.cleanupStoppedTask(claimed);
+                }
             } catch (Exception e) {
                 LOG.warnv("Failed to stop ECS task {0} on shutdown: {1}", taskArn, e.getMessage());
+            } finally {
+                if (claimed.hasTaskVolumes()) {
+                    taskHandles.put(taskArn, claimed);
+                    shutdownCleanupTasks.add(taskArn);
+                }
             }
         }
         // Task state is memory-only, so an ENI left behind here would outlive every task that
@@ -1551,6 +1564,9 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                         stopTask(cluster.getClusterName(), taskArn, task.getStoppedReason(), task.getStopCode(), region);
                     }
                 } catch (Exception e) {
+                    if (e instanceof EcsTaskLaunchException failedLaunch) {
+                        retainPendingCleanupHandle(taskArn, failedLaunch.getHandle());
+                    }
                     LOG.errorv("Failed to start ECS task {0}: {1}", taskArn, e.getMessage());
                     task.setLastStatus(TaskStatus.STOPPED.name());
                     task.setDesiredStatus(TaskStatus.STOPPED.name());
@@ -1983,7 +1999,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 return task;
             }
             taskHandles.remove(task.getTaskArn(), handle);
-            retainUnresolvedLogHandle(task.getTaskArn(), handle);
+            retainPendingCleanupHandle(task.getTaskArn(), handle);
             finishedAt = handle.getFinishedAt();
         }
 
@@ -4717,6 +4733,11 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     void reconcile() {
         try {
+            retryPreviousRunTaskVolumes();
+        } catch (Exception e) {
+            LOG.warnv(e, "ECS previous-run task volume cleanup failed: {0}", e.getMessage());
+        }
+        try {
             reconcileTasks();
         } catch (Exception e) {
             LOG.warnv(e, "ECS task reconciliation tick failed: {0}", e.getMessage());
@@ -4730,6 +4751,12 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                             accountId, e.getMessage());
                 }
             });
+        }
+    }
+
+    private void retryPreviousRunTaskVolumes() {
+        if (sweepLeftoverContainers && leftoverContainersRemoved && !leftoverTaskVolumesRemoved) {
+            leftoverTaskVolumesRemoved = containerManager.removeLeftoverTaskVolumes();
         }
     }
 
@@ -4798,8 +4825,13 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private void reconcileTask(String taskArn) {
+        if (shutdownCleanupTasks.contains(taskArn)) {
+            reconcileStoppedTask(taskArn);
+            return;
+        }
         EcsTask task = tasks.get(taskArn);
         if (task == null) {
+            reconcileStoppedTask(taskArn);
             return;
         }
         synchronized (task) {
@@ -4854,6 +4886,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
         // Close log streams and remove the stopped Docker containers without re-inspecting.
         containerManager.cleanupStoppedTask(claimed);
+        retainPendingCleanupHandle(taskArn, claimed);
 
         if (task.getContainers() != null) {
             task.getContainers().forEach(c -> {
@@ -4961,14 +4994,17 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             containerManager.stopTaskAndCollectExitCodes(claimed);
         } finally {
             // A task can be reported STOPPED even if Docker rejected both teardown attempts.
-            // Keep only the affected log readers and retry their teardown on later reconciliation ticks.
-            retainUnresolvedLogHandle(taskArn, claimed);
+            // Keep pending log readers and task volumes for later cleanup attempts.
+            retainPendingCleanupHandle(taskArn, claimed);
         }
     }
 
-    private void retainUnresolvedLogHandle(String taskArn, EcsTaskHandle handle) {
-        if (handle != null && handle.hasOpenLogStreams()) {
+    private void retainPendingCleanupHandle(String taskArn, EcsTaskHandle handle) {
+        if (handle != null && (handle.hasOpenLogStreams() || handle.hasTaskVolumes()
+                || !handle.allContainersRemoved())) {
             taskHandles.put(taskArn, handle);
+        } else {
+            shutdownCleanupTasks.remove(taskArn);
         }
     }
 
@@ -4986,8 +5022,10 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             containerIds.put(container.getName(), dockerId);
         }
         Map<String, Integer> stopTimeouts = new LinkedHashMap<>();
+        Set<String> taskVolumeNames = Set.of();
         try {
             TaskDefinition definition = resolveTaskDefinitionOrThrow(task.getTaskDefinitionArn(), region);
+            taskVolumeNames = containerManager.taskVolumeNames(task, definition);
             for (ContainerDefinition container : definition.getContainerDefinitions()) {
                 if (container.getStopTimeout() != null) {
                     stopTimeouts.put(container.getName(), container.getStopTimeout());
@@ -4998,7 +5036,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                     task.getTaskArn());
         }
         EcsTaskHandle recovered = new EcsTaskHandle(task.getTaskArn(), containerIds, Map.of(),
-                null, task.getNetworkInterfaceId(), region, stopTimeouts);
+                null, task.getNetworkInterfaceId(), region, stopTimeouts, taskVolumeNames);
         EcsTaskHandle existing = taskHandles.putIfAbsent(task.getTaskArn(), recovered);
         return existing != null ? existing : recovered;
     }

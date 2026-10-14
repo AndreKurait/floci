@@ -71,6 +71,10 @@ RDS Data API (`rds-data`) is documented separately because it uses REST JSON rou
 | `DescribeDBClusterEndpoints` | List a cluster's built-in writer and reader endpoints and its custom endpoints, with the four documented filters |
 | `ModifyDBClusterEndpoint` | Change a custom endpoint's type or member list |
 | `DeleteDBClusterEndpoint` | Delete a custom endpoint |
+| `AddRoleToDBCluster` | Associate an IAM role with a cluster, optionally for a feature; see [IAM role associations](#iam-role-associations) |
+| `RemoveRoleFromDBCluster` | Remove a role from a cluster |
+| `AddRoleToDBInstance` | Associate an IAM role with an instance for a feature |
+| `RemoveRoleFromDBInstance` | Remove a role from an instance |
 | `AddSourceIdentifierToSubscription` | Add a source id to a subscription |
 | `RemoveSourceIdentifierFromSubscription` | Remove a source id from a subscription |
 | `CreateDBSubnetGroup` | Create a DB subnet group; tags given here are readable through `ListTagsForResource` |
@@ -612,6 +616,29 @@ Custom endpoints are modelled, not routed: a custom endpoint reports the cluster
 reachable, but connections through it go where the cluster endpoint sends them rather than being
 spread across the chosen members.
 
+## IAM role associations
+
+`AddRoleToDBCluster` and `AddRoleToDBInstance` associate an IAM role with an available cluster or
+instance, and `DescribeDBClusters` / `DescribeDBInstances` report it in `AssociatedRoles` with status
+`ACTIVE` straight away. `CreateDBCluster` accepts `AssociatedRoles` too: a list that names a role twice,
+or has an entry without a `RoleArn`, refuses the create before any cluster exists, and the roles are
+associated in one step, so a create that fails leaves no cluster behind.
+
+`FeatureName` (such as `s3Import`, `s3Export` or `Lambda`) is optional for a cluster and required for an
+instance. A role is associated at most once per cluster (`DBClusterRoleAlreadyExists`, which covers
+the role ARN only, so two roles may share a feature), and a role or a feature at most once per instance
+(`DBInstanceRoleAlreadyExists`, documented as "The specified RoleArn or FeatureName value is already
+associated"). `RemoveRoleFromDBCluster` removes the
+role, matching the feature name when one is given, and `RemoveRoleFromDBInstance` removes the role for
+the feature named; an association that does not exist is `DBClusterRoleNotFound` /
+`DBInstanceRoleNotFound`. A stopped cluster or instance refuses both (`InvalidDBClusterStateFault` /
+`InvalidDBInstanceState`).
+
+Associations are recorded, not exercised: Floci does not check the role in IAM, does not check the
+feature name against the engine, and does not hand the role's credentials to the database, so an
+`aws_s3` import still needs credentials of its own. Deleting a cluster or instance drops its
+associations, and snapshots, restores and read replicas start without any.
+
 ## Aurora managed password opt-out
 
 When `ModifyDBCluster` disables `ManageMasterUserPassword` while the managed secret has
@@ -729,7 +756,7 @@ On RDS, a token is only good for the endpoint it was generated for: the hostname
 arn:aws:rds-db:<region>:<account-id>:dbuser:<DbiResourceId>/<db-user-name>
 ```
 
-Aurora clusters use the `DbClusterResourceId`, and connections through an RDS Proxy use the proxy's `prx-…` resource id. A token that fails any of these checks is refused with the engine's ordinary authentication failure; the reason is written to Floci's log.
+Aurora cluster endpoints and their member instance endpoints use the cluster's `DbClusterResourceId`, including after member reboot or runtime recovery, and connections through an RDS Proxy use the proxy's `prx-…` resource id. A token that fails any of these checks is refused with the engine's ordinary authentication failure; the reason is written to Floci's log.
 
 On PostgreSQL, the token names a database role (`DBUser`) and the session runs as that role: `current_user` and `session_user` both report it, objects it creates are owned by it, and a token naming a role the database does not have is refused with `FATAL: role "..." does not exist`. Create the role first with `CREATE ROLE <name> WITH LOGIN` as the master user, and grant it whatever the application needs.
 

@@ -12,11 +12,12 @@ import java.util.List;
 import static io.restassured.RestAssured.given;
 
 /**
- * Takes an IAM user or an S3 bucket that an enforcement test created back out of the shared
- * application, and makes the users such a test signs as ({@link #createUser}, {@link #auth}),
- * registering each one's removal as it goes. A {@code @QuarkusTest} shares one application with every other test class, so a
- * fixture left behind outlives the class that made it and is visible to the next class that lists
- * users or buckets unscoped. Registered with {@link PartitionCleanup} as each fixture is made.
+ * Takes an IAM user or an S3 bucket that a test created back out of the shared application, and
+ * makes the users an enforcement test signs as ({@link #createUser}, {@link #auth}), registering
+ * each one's removal as it goes. A {@code @QuarkusTest} shares one application with every other
+ * test class, so a fixture left behind outlives the class that made it and is visible to the next
+ * class that lists users or buckets unscoped. Registered with {@link PartitionCleanup} as each
+ * fixture is made.
  *
  * <p>Both read back what is attached rather than taking it as an argument, and both return
  * quietly when the thing is not there. That is what makes them safe to register before the create

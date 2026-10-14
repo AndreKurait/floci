@@ -1158,6 +1158,72 @@ class Ec2IntegrationTest {
     }
 
     @Test
+    void describeEbsOnlyGravitonInstanceType() {
+        given()
+            .formParam("Action", "DescribeInstanceTypes")
+            .formParam("InstanceType.1", "m6g.large")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.size()", equalTo(1))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.vCpuInfo.defaultVCpus", equalTo("2"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.memoryInfo.sizeInMiB", equalTo("8192"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.processorInfo.supportedArchitectures.item",
+                    equalTo("arm64"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.instanceStorageSupported", equalTo("false"));
+    }
+
+    @Test
+    void describeEbsOnlyGravitonOfferingsWithLocationFilters() {
+        for (String zone : List.of("us-east-1a", "us-east-1b", "us-east-1c")) {
+            given()
+                .formParam("Action", "DescribeInstanceTypeOfferings")
+                .formParam("LocationType", "availability-zone")
+                .formParam("Filter.1.Name", "location")
+                .formParam("Filter.1.Value.1", zone)
+                .formParam("MaxResults", "1000")
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.instanceType",
+                        hasItems("m6g.large", "m5.large"))
+                .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.location", everyItem(equalTo(zone)));
+        }
+        given()
+            .formParam("Action", "DescribeInstanceTypeOfferings")
+            .formParam("LocationType", "region")
+            .formParam("Filter.1.Name", "instance-type")
+            .formParam("Filter.1.Value.1", "m6g.large")
+            .formParam("Filter.2.Name", "location")
+            .formParam("Filter.2.Value.1", "us-east-1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.size()", equalTo(1))
+            .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.instanceType", equalTo("m6g.large"))
+            .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.location", equalTo("us-east-1"));
+        given()
+            .formParam("Action", "DescribeInstanceTypeOfferings")
+            .formParam("LocationType", "availability-zone")
+            .formParam("Filter.1.Name", "instance-type")
+            .formParam("Filter.1.Value.1", "m6g.large")
+            .formParam("Filter.2.Name", "location")
+            .formParam("Filter.2.Value.1", "other-zone")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstanceTypeOfferingsResponse.instanceTypeOfferingSet.item.size()", equalTo(0));
+    }
+
+    @Test
     @Order(19)
     void describeInstanceTypeOfferings() {
         given()

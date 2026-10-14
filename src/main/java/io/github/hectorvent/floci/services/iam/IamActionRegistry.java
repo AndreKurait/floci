@@ -252,15 +252,15 @@ public class IamActionRegistry {
         if (isQueryRequest(ctx)) {
             String queryAction = queryAction(ctx);
             if (queryAction != null && !queryAction.isBlank()) {
-                return credentialScope + ":" + queryAction;
+                return IamAuthorizedActions.actionFor(credentialScope, queryAction);
             }
         }
 
-        // JSON 1.1: X-Amz-Target → service:OperationName
+        // JSON 1.1: X-Amz-Target → the action AWS checks for the operation it names
         String target = ctx.getHeaderString("X-Amz-Target");
         if (target != null && target.contains(".")) {
             String operationName = target.substring(target.lastIndexOf('.') + 1);
-            return credentialScope + ":" + operationName;
+            return IamAuthorizedActions.actionFor(credentialScope, operationName);
         }
 
         return resolveRoute(credentialScope, ctx);

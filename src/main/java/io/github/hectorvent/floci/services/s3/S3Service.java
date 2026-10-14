@@ -1414,18 +1414,23 @@ public class S3Service implements Resettable, ResourceProvider {
         }
         String account = accessKeyId.matches("\\d{12}") ? accessKeyId : ownerId();
         String rootArn = regionResolver.buildGlobalArn("iam", account, "root");
-        return Optional.of(new CallerArns(rootArn, rootArn));
+        return Optional.of(new CallerArns(rootArn, rootArn, CallerArns.TYPE_ACCOUNT, account, null));
     }
 
     /**
      * The request context a bucket policy is evaluated with here: the caller is an IAM principal,
-     * never a service, and for a role session {@code aws:PrincipalArn} is the role's ARN.
+     * never a service, and the keys that say who is calling are the ones
+     * {@link CallerArns#putPrincipalKeys} writes, so a bucket policy sees the same principal
+     * whether S3 evaluates it or the enforcement filter does. For a role session
+     * {@code aws:PrincipalArn} is the role's ARN.
      */
     private static Map<String, List<String>> bucketPolicyContext(CallerArns caller) {
-        return caller != null
-                ? Map.of("aws:PrincipalArn", List.of(caller.principalArn()),
-                        "aws:PrincipalIsAWSService", List.of("false"))
-                : Map.of("aws:PrincipalIsAWSService", List.of("false"));
+        Map<String, List<String>> context = new HashMap<>();
+        context.put("aws:PrincipalIsAWSService", List.of("false"));
+        if (caller != null) {
+            caller.putPrincipalKeys(context);
+        }
+        return Map.copyOf(context);
     }
 
     private boolean isSameAccountAsBucketOwner(String accessKeyId, String principalArn, String bucketOwnerAccount) {

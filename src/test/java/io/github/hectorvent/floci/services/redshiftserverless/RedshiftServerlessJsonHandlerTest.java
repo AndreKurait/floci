@@ -76,6 +76,9 @@ class RedshiftServerlessJsonHandlerTest {
         iamDbUserResolver = mock(RedshiftIamDbUserResolver.class);
         when(iamDbUserResolver.resolveDbUser("AUTH")).thenReturn("IAM:alice");
         EmulatorConfig config = mock(EmulatorConfig.class, org.mockito.Mockito.RETURNS_DEEP_STUBS);
+        when(storageFactory.create(eq("redshiftserverless"), eq("redshiftserverless-snapshots.json"),
+                any(TypeReference.class))).thenReturn((AccountAwareStorageBackend)
+                AccountAwareStorageBackend.inMemory(ACCOUNT_ID));
         when(config.storage().persistentPath()).thenReturn(System.getProperty("java.io.tmpdir"));
         when(storageFactory.create(eq("redshiftserverless"), eq("redshiftserverless-usagelimits.json"),
                 any(TypeReference.class))).thenReturn((AccountAwareStorageBackend)
@@ -470,6 +473,29 @@ class RedshiftServerlessJsonHandlerTest {
             request.put(field, value);
         }
         return request;
+    }
+
+    @Test
+    void updateSnapshotReturnsTheUpdatedSnapshotAndRejectsABadRetention() {
+        create("upd-handler-ns");
+        body(handler.handle("CreateSnapshot",
+                parse("{\"snapshotName\":\"upd-handler\",\"namespaceName\":\"upd-handler-ns\",\"retentionPeriod\":7}"),
+                REGION));
+
+        JsonNode updated = body(handler.handle("UpdateSnapshot",
+                parse("{\"snapshotName\":\"upd-handler\",\"retentionPeriod\":45}"), REGION)).get("snapshot");
+        assertEquals("upd-handler", updated.get("snapshotName").textValue());
+        assertEquals(45, updated.get("snapshotRetentionPeriod").intValue());
+        assertEquals(45, updated.get("snapshotRemainingDays").intValue());
+
+        JsonNode indefinite = body(handler.handle("UpdateSnapshot",
+                parse("{\"snapshotName\":\"upd-handler\",\"retentionPeriod\":-1}"), REGION)).get("snapshot");
+        assertTrue(indefinite.path("snapshotRetentionPeriod").isMissingNode());
+
+        assertEquals(400, handler.handle("UpdateSnapshot",
+                parse("{\"snapshotName\":\"upd-handler\",\"retentionPeriod\":0}"), REGION).getStatus());
+        assertEquals(400, handler.handle("UpdateSnapshot",
+                parse("{\"snapshotName\":\"missing-snap\",\"retentionPeriod\":5}"), REGION).getStatus());
     }
 
     private JsonNode body(Response response) {

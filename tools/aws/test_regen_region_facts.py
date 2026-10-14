@@ -102,6 +102,24 @@ TS_VPCE = '''
     return VPC_ENDPOINT_SERVICE_EXCEPTIONS[region]?.includes(name) ? '.cn' : '';
   }
 '''
+GUIDE_COMMERCIAL = """
+From the management account of your organization in the commercial Region, sign in to the Organizations console at https://console.aws.amazon.com/organizations
+"""
+GUIDE_CHINA = """
+The Amazon Web Services Management Console is available in both Chinese and English and can be accessed at https://console.amazonaws.cn . The console is dedicated to the China Regions.
+"""
+GUIDE_GOVCLOUD = """
+Sign in to the AWS GovCloud (US) console and open the IAM console at https://console.amazonaws-us-gov.com/iam.
+
+IAM users can now use either the account alias or account number.
+
+Sign in to the AWS GovCloud (US) console and open the IAM console at https://console.amazonaws-us-gov.com/iam.
+"""
+# the same sentence in the Markdown AWS serves at .../userguide/console.md
+GUIDE_CHINA_MARKDOWN = """
+The Amazon Web Services Management Console is available in both Chinese and English and can be accessed at [https://console.amazonaws.cn](https://console.amazonaws.cn). The Amazon Web Services Management Console is dedicated to the China Regions.
+"""
+GUIDES = {"aws": GUIDE_COMMERCIAL, "aws-cn": GUIDE_CHINA, "aws-us-gov": GUIDE_GOVCLOUD}
 PARTITIONS = {"partitions": [
     {"id": "aws", "dnsSuffix": "amazonaws.com", "regions": [{"id": "us-east-1"}, {"id": "af-south-1"}]},
     {"id": "aws-cn", "dnsSuffix": "amazonaws.com.cn", "regions": [{"id": "cn-north-1"}, {"id": "cn-northwest-1"}]},
@@ -110,17 +128,18 @@ PARTITIONS = {"partitions": [
 ]}
 
 
-def write_sources(tmp_path: Path) -> tuple[Path, Path]:
+def write_sources(tmp_path: Path) -> tuple[Path, Path, Path]:
     tf = tmp_path / "terraform"
     cdk = tmp_path / "cdk"
+    guides = tmp_path / "guides"
     for root, rel, body in [
         (tf, r.TF_ELB, GO_ELB), (tf, r.TF_ELBV2, GO_ELBV2), (tf, r.TF_S3, GO_S3), (tf, r.TF_CLIENT, GO_CLIENT),
         (cdk, r.CDK_FACT_TABLES, TS_FACTS), (cdk, r.CDK_CLOUDFRONT_TARGET, TS_CLOUDFRONT), (cdk, r.CDK_VPC_ENDPOINT, TS_VPCE),
-    ]:
+    ] + [(guides, r.CONSOLE_HOST_SENTENCES[partition][0], body) for partition, body in GUIDES.items()]:
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
-    return tf, cdk
+    return tf, cdk, guides
 
 
 @pytest.mark.parametrize("camel,region", [
@@ -159,9 +178,36 @@ def test_vpc_endpoint_exceptions_are_per_region_and_service():
     assert cn_suffix == {"cn-north-1": ["transcribe"], "cn-northwest-1": ["transcribe"]}
 
 
+def test_console_hosts_come_from_the_guide_sentences(tmp_path):
+    _, _, guides = write_sources(tmp_path)
+    assert r.parse_console_hosts(guides) == {"aws": "console.aws.amazon.com", "aws-cn": "console.amazonaws.cn",
+                                             "aws-us-gov": "console.amazonaws-us-gov.com"}
+    assert r.guides_present(guides)
+    assert not r.guides_present(tmp_path / "nowhere")
+
+
+def test_the_china_console_host_parses_from_the_markdown_link_form():
+    page, sentence = r.CONSOLE_HOST_SENTENCES["aws-cn"]
+    assert r.parse_console_host(GUIDE_CHINA_MARKDOWN, sentence, page) == "console.amazonaws.cn"
+
+
+def test_a_guide_page_without_its_sentence_or_with_two_hosts_is_an_error():
+    page, sentence = r.CONSOLE_HOST_SENTENCES["aws-us-gov"]
+    with pytest.raises(ValueError, match="configure-account"):
+        r.parse_console_host("Sign in to the AWS GovCloud (US) console.", sentence, page)
+    with pytest.raises(ValueError, match="console.example.com"):
+        r.parse_console_host(GUIDE_GOVCLOUD + GUIDE_GOVCLOUD.replace("console.amazonaws-us-gov.com", "console.example.com"),
+                             sentence, page)
+    # the China guide's other spelling sits in a different sentence and is not picked up
+    page, sentence = r.CONSOLE_HOST_SENTENCES["aws-cn"]
+    with pytest.raises(ValueError, match="console.md"):
+        r.parse_console_host("a graphical user interface that you access online at https://console.www.amazonaws.cn .",
+                             sentence, page)
+
+
 def test_build_merges_sources_with_terraform_winning_the_s3_conflicts(tmp_path):
-    tf, cdk = write_sources(tmp_path)
-    document = r.build(tf, cdk, PARTITIONS)
+    tf, cdk, guides = write_sources(tmp_path)
+    document = r.build(tf, cdk, guides, PARTITIONS)
     regions = document["regions"]
     assert regions["us-east-1"] == {"albHostedZoneId": "Z35SXDOTRQ7X7K", "classicElbHostedZoneId": "Z35SXDOTRQ7X7K",
                                     "nlbHostedZoneId": "Z26RNL4JYFTOTI", "s3WebsiteHostedZoneId": "Z3AQBSTGFYJSTF"}
@@ -174,23 +220,26 @@ def test_build_merges_sources_with_terraform_winning_the_s3_conflicts(tmp_path):
     partitions = document["partitions"]
     assert partitions["aws-cn"] == {"vpcEndpointServiceNamePrefix": "cn.com.amazonaws.vpce",
                                     "cloudfrontHostedZoneId": "Z3RFFRIM2A3IF5",
-                                    "samlSignOnUrl": "https://signin.amazonaws.cn/saml"}
+                                    "samlSignOnUrl": "https://signin.amazonaws.cn/saml",
+                                    "consoleHost": "console.amazonaws.cn"}
+    assert partitions["aws-us-gov"]["consoleHost"] == "console.amazonaws-us-gov.com"
     assert partitions["aws-iso-f"] == {"vpcEndpointServiceNamePrefix": "gov.ic.hci.csp.vpce"}
 
 
 def test_build_refuses_a_region_the_partition_data_does_not_publish(tmp_path):
-    tf, cdk = write_sources(tmp_path)
+    tf, cdk, guides = write_sources(tmp_path)
     with pytest.raises(ValueError, match="af-south-1"):
-        r.build(tf, cdk, {"partitions": [p for p in PARTITIONS["partitions"] if p["id"] != "aws"]
+        r.build(tf, cdk, guides, {"partitions": [p for p in PARTITIONS["partitions"] if p["id"] != "aws"]
                           + [{"id": "aws", "dnsSuffix": "amazonaws.com", "regions": [{"id": "us-east-1"}]}]})
 
 
 def test_cli_write_check_and_self_check(tmp_path, capsys):
-    tf, cdk = write_sources(tmp_path)
+    tf, cdk, guides = write_sources(tmp_path)
     partitions = tmp_path / "partitions.json"
     partitions.write_text(json.dumps(PARTITIONS))
     output = tmp_path / "out" / "region-facts.json"
-    common = ["--terraform", str(tf), "--cdk", str(cdk), "--partitions", str(partitions), "--output", str(output)]
+    common = ["--terraform", str(tf), "--cdk", str(cdk), "--guides", str(guides),
+              "--partitions", str(partitions), "--output", str(output)]
     assert r.main(["--check"] + common) == 1
     assert r.main(common) == 0
     assert r.main(["--check"] + common) == 0
@@ -199,23 +248,28 @@ def test_cli_write_check_and_self_check(tmp_path, capsys):
     assert r.main(["--check", "--terraform", str(tmp_path / "nowhere"), "--cdk", str(tmp_path / "nowhere"),
                    "--partitions", str(partitions), "--output", str(output)]) == 0
     assert "shape verified only" in capsys.readouterr().out
+    # nor with the checkouts but without the guide snapshots
+    assert r.main(["--check", "--terraform", str(tf), "--cdk", str(cdk), "--guides", str(tmp_path / "nowhere"),
+                   "--partitions", str(partitions), "--output", str(output)]) == 0
+    assert "shape verified only" in capsys.readouterr().out
     output.write_text('{"partitions": {}, "regions": {"us-east-1": {"albHostedZoneId": "nope"}}}')
     assert r.main(["--check", "--terraform", str(tmp_path / "nowhere"), "--cdk", str(tmp_path / "nowhere"),
                    "--partitions", str(partitions), "--output", str(output)]) == 1
 
 
 def test_repo_file_matches_the_local_checkouts_when_present():
-    if not (r.LOCAL_TERRAFORM / r.TF_ELB).exists() or not (r.LOCAL_CDK / r.CDK_FACT_TABLES).exists():
+    if (not (r.LOCAL_TERRAFORM / r.TF_ELB).exists() or not (r.LOCAL_CDK / r.CDK_FACT_TABLES).exists()
+            or not r.guides_present(r.LOCAL_GUIDES)):
         pytest.skip("local/aws checkouts not present")
-    document = r.build(r.LOCAL_TERRAFORM, r.LOCAL_CDK, json.loads(r.PARTITIONS.read_text(encoding="utf-8")))
+    document = r.build(r.LOCAL_TERRAFORM, r.LOCAL_CDK, r.LOCAL_GUIDES, json.loads(r.PARTITIONS.read_text(encoding="utf-8")))
     assert r.strip_source(r.render(document)) == r.strip_source(r.OUTPUT.read_text(encoding="utf-8"))
 
 
 def test_self_check_holds_the_values_to_what_partitions_json_publishes(tmp_path):
     partitions = tmp_path / "partitions.json"
     partitions.write_text(json.dumps(PARTITIONS))
-    tf, cdk = write_sources(tmp_path)
-    good = r.build(tf, cdk, PARTITIONS)
+    tf, cdk, guides = write_sources(tmp_path)
+    good = r.build(tf, cdk, guides, PARTITIONS)
     output = tmp_path / "region-facts.json"
 
     def problems(mutate):
@@ -238,6 +292,12 @@ def test_self_check_holds_the_values_to_what_partitions_json_publishes(tmp_path)
             vpcEndpointServiceNamePrefix="com.example.vpce"),
         "plain-http SAML URL": lambda d: d["partitions"][partition].update(
             samlSignOnUrl="http://signin.example/saml"),
+        "console host with a scheme": lambda d: d["partitions"][partition].update(
+            consoleHost="https://console.aws.amazon.com"),
+        "console host that is not a console": lambda d: d["partitions"][partition].update(consoleHost="example.com"),
+        "missing China console host": lambda d: d["partitions"]["aws-cn"].pop("consoleHost"),
+        "missing GovCloud console host": lambda d: d["partitions"]["aws-us-gov"].pop("consoleHost"),
+        "missing commercial console host": lambda d: d["partitions"]["aws"].pop("consoleHost"),
         "missing partition": lambda d: d["partitions"].pop(partition),
         "partition entry not an object": lambda d: d["partitions"].update({partition: "invalid"}),
         "region entry not an object": lambda d: d["regions"].update({region: ["invalid"]}),

@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -34,6 +35,7 @@ import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.eq;
+import static org.mockito.Mockito.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -101,6 +103,32 @@ class AutoScalingReconcilerTest {
     }
 
     @Test
+    void malformedSavedConfigurationDoesNotSkipGroupPersistenceOrRefreshCheck() {
+        AutoScalingService service = scalingService();
+        Ec2Service ec2 = mock(Ec2Service.class);
+        AutoScalingGroup group = new AutoScalingGroup();
+        group.setRegion("us-east-1");
+        group.setAutoScalingGroupName("bad-data");
+        group.setDesiredCapacity(1);
+        group.setLaunchConfigurationName("saved-bad-data");
+        LaunchConfiguration configuration = new LaunchConfiguration();
+        configuration.setImageId("ami-test");
+        configuration.setInstanceType("t3.micro");
+        configuration.setUserData("not base64!");
+        configuration.setUserDataBase64Encoded(true);
+        when(service.describeLaunchConfigurations("us-east-1", List.of("saved-bad-data")))
+                .thenReturn(List.of(configuration));
+        when(service.saveAutoScalingGroupIfPresent(group)).thenReturn(true);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(service, ec2, mock(ElbV2Service.class));
+        assertDoesNotThrow(() -> reconciler.reconcile(group));
+        assertEquals(0, group.getInstances().size());
+        verify(service).saveAutoScalingGroupIfPresent(group);
+        verify(service).completeInstanceRefreshIfSettled("us-east-1", "bad-data");
+        verify(ec2, never()).runInstances(any(), any(), any(), any(Integer.class), any(Integer.class), any(),
+                any(), any(), any(), any(), any(), any(), any(), any(), any(Integer.class), any(), any(), any(), any());
+    }
+
+    @Test
     void scaleOutUsesRequestedLaunchTemplateVersionData() {
         AutoScalingService asgService = scalingService();
         Ec2Service ec2Service = mock(Ec2Service.class);
@@ -143,7 +171,8 @@ class AutoScalingReconcilerTest {
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
                 anyList(), eq("#!/bin/bash\necho hi\n"),
-                eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null))).thenReturn(reservation);
+                eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -155,7 +184,8 @@ class AutoScalingReconcilerTest {
         verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
                 tags.capture(), eq("#!/bin/bash\necho hi\n"),
-                eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null));
+                eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any());
         assertNull(version.getData().getUserData());
         assertEquals(propagatedTags.size(), tags.getValue().size());
         assertEquals("app.ClusterId", tags.getValue().get(0).getKey());
@@ -180,7 +210,8 @@ class AutoScalingReconcilerTest {
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null), eq(List.of()),
-                eq(null), eq(null), eq(null))).thenReturn(reservation);
+                eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -204,7 +235,8 @@ class AutoScalingReconcilerTest {
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null), eq(List.of()),
-                eq(null), eq(null), eq(null))).thenReturn(reservation);
+                eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -248,13 +280,15 @@ class AutoScalingReconcilerTest {
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-lc"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), anyList(), eq(null), eq(null),
-                anyList(), eq(null), eq(null), eq(associatePublicIp))).thenReturn(reservation);
+                anyList(), eq(null), eq(null), eq(associatePublicIp),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
         verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-lc"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), anyList(), eq(null), eq(null),
-                anyList(), eq(null), eq(null), eq(associatePublicIp));
+                anyList(), eq(null), eq(null), eq(associatePublicIp),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any());
     }
 
     @Test
@@ -286,7 +320,8 @@ class AutoScalingReconcilerTest {
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-7"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                eq(List.of()), eq(null), eq(null), eq(null))).thenReturn(reservation);
+                eq(List.of()), eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -336,7 +371,8 @@ class AutoScalingReconcilerTest {
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-3"), eq("t3.small"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                eq(List.of()), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null))).thenReturn(reservation);
+                eq(List.of()), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -347,7 +383,8 @@ class AutoScalingReconcilerTest {
         assertEquals("t3.small", asg.getInstances().getFirst().getInstanceType());
         verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-version-3"), eq("t3.small"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                eq(List.of()), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null));
+                eq(List.of()), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any());
         assertNull(version.getData().getUserData());
     }
 
@@ -418,7 +455,8 @@ class AutoScalingReconcilerTest {
                 org.mockito.ArgumentMatchers.any(),
                 org.mockito.ArgumentMatchers.any(),
                 org.mockito.ArgumentMatchers.any(),
-                org.mockito.ArgumentMatchers.any());
+                org.mockito.ArgumentMatchers.any(),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any());
     }
 
     @Test
