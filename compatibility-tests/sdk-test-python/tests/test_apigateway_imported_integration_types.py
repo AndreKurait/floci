@@ -72,7 +72,7 @@ def test_imported_integration_types(aws_config):
 
 def test_unknown_integration_types(aws_config):
     invalid_types = [
-        "custom_type", "CuStOm_TyPe", "", " mock", "mock ", "http-proxy", "hıttp", "mοck", "MOCK",
+        "custom_type", "CuStOm_TyPe", "", " mock", "mock ", "http-proxy", "hıttp", "mοck", "moc\u212A",
     ]
     paths = {
         "/case" + str(index): {"get": {
