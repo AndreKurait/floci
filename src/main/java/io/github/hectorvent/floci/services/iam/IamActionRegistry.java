@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.services.iam;
 
-import io.github.hectorvent.floci.core.common.AwsQueryController;
+import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
 import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
+import io.github.hectorvent.floci.core.common.ProtocolClaim;
+import io.github.hectorvent.floci.core.common.WireProtocol;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
@@ -342,17 +344,16 @@ public class IamActionRegistry {
 
     /** The root form POST or CloudWatch GET that the Query controller dispatches. */
     public static boolean isQueryRequest(ContainerRequestContext ctx) {
+        if ("GET".equalsIgnoreCase(ctx.getMethod())) {
+            return ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY) instanceof ProtocolClaim claim
+                    && claim.protocol() == WireProtocol.AWS_QUERY;
+        }
         if (ctx.getUriInfo() == null) {
             return false;
         }
         String path = ctx.getUriInfo().getPath();
         if (path != null && !path.isEmpty() && !"/".equals(path)) {
             return false;
-        }
-        if ("GET".equalsIgnoreCase(ctx.getMethod())) {
-            return AwsQueryController.isCloudWatchQueryGet(ctx.getHeaderString("Authorization"),
-                    ctx.getHeaderString("X-Amz-Target"), ctx.getHeaderString("Accept"),
-                    ctx.getUriInfo().getQueryParameters());
         }
         MediaType mediaType = ctx.getMediaType();
         return "POST".equalsIgnoreCase(ctx.getMethod())

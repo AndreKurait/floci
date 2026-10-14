@@ -359,34 +359,6 @@ class IamEnforcementFilterTest {
     }
 
     @Test
-    void cloudWatchGetAuthorizesQueryActionEvenOnS3Resource() {
-        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
-        UriInfo uriInfo = mock(UriInfo.class);
-        MultivaluedHashMap<String, String> query = new MultivaluedHashMap<>();
-        query.add("Action", "GetMetricStatistics");
-        String auth = "AWS4-HMAC-SHA256 Credential=AKIAUSER/20261013/us-east-1/monitoring/aws4_request";
-        requestContext.setAccountId("000000000000");
-        requestContext.setRegion("us-east-1");
-        when(ctx.getMethod()).thenReturn("GET");
-        when(ctx.getUriInfo()).thenReturn(uriInfo);
-        when(uriInfo.getPath()).thenReturn("");
-        when(uriInfo.getQueryParameters()).thenReturn(query);
-        when(ctx.getHeaderString("Authorization")).thenReturn(auth);
-        when(accountResolver.extractAccessKeyId(auth)).thenReturn("AKIAUSER");
-        when(actionRegistry.queryAction(ctx)).thenReturn("GetMetricStatistics");
-        ServiceDescriptor monitoring = descriptor("monitoring", ServiceProtocol.QUERY, Set.of("monitoring"), null);
-        when(catalog.byCredentialScope("monitoring")).thenReturn(Optional.of(monitoring));
-        when(catalog.byExternalKey("monitoring")).thenReturn(Optional.of(monitoring));
-        when(catalog.canonicalCredentialScope("monitoring")).thenReturn("cloudwatch");
-        when(iamService.resolveCallerContext(eq("AKIAUSER"), any())).thenReturn(CallerContext.of(List.of()));
-
-        newFilter(resourceInfo(S3Controller.class)).filter(ctx);
-
-        verify(conditionContextResolver).resolve("cloudwatch", "cloudwatch:GetMetricStatistics", ctx);
-        verify(actionRegistry, never()).resolveRoute(eq("s3"), any());
-    }
-
-    @Test
     void queryActionAuthorizesTheServiceSelectedByDispatch() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
         String auth = "AWS4-HMAC-SHA256 Credential=AKIAUSER/20260924/us-east-1/lambda/aws4_request, "

@@ -552,7 +552,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     private ResolvedAuthorization resolveAuthorization(String auth, String claimedScope,
                                                         ContainerRequestContext ctx) {
         Object claimValue = ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY);
-        // Authorization must not depend on the pre-matching claim filter running first.
+        // Form POSTs are also recognized without a claim; GET dispatch requires the Query claim.
         if (IamActionRegistry.isQueryRequest(ctx)) {
             String queryAction = actionRegistry.queryAction(ctx);
             if (queryAction == null || queryAction.isBlank()) {
