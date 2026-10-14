@@ -60,9 +60,9 @@ public class ElbClassicHealthChecker implements Resettable {
     private final EmulatorConfig config;
     private final Ec2Service ec2Service;
 
-    // "region|lbName" → instanceId → state
+    // "account|region|lbName" → instanceId → state
     private final Map<String, Map<String, InstanceState>> states = new ConcurrentHashMap<>();
-    // "region|lbName" → Vert.x timer id
+    // "account|region|lbName" → Vert.x timer id
     private final Map<String, Long> timers = new ConcurrentHashMap<>();
 
     @Inject
@@ -72,12 +72,12 @@ public class ElbClassicHealthChecker implements Resettable {
         this.ec2Service = ec2Service;
     }
 
-    public static String key(String region, String loadBalancerName) {
-        return region + "|" + loadBalancerName;
+    private static String key(ClassicLoadBalancer lb) {
+        return lb.getAccountId() + "|" + lb.getRegion() + "|" + lb.getLoadBalancerName();
     }
 
     public void startMonitoring(ClassicLoadBalancer lb) {
-        String k = key(lb.getRegion(), lb.getLoadBalancerName());
+        String k = key(lb);
         states.computeIfAbsent(k, x -> new ConcurrentHashMap<>());
         if (mock() || vertx == null) {
             return;
@@ -88,22 +88,22 @@ public class ElbClassicHealthChecker implements Resettable {
         timers.put(k, vertx.setPeriodic(interval * 1000L, id -> probeAll(lb)));
     }
 
-    public void stopMonitoring(String region, String loadBalancerName) {
-        String k = key(region, loadBalancerName);
+    public void stopMonitoring(ClassicLoadBalancer lb) {
+        String k = key(lb);
         stopTimer(k);
         states.remove(k);
     }
 
     /** Re-arms the periodic timer after {@code ConfigureHealthCheck} changed the interval. */
     public void healthCheckChanged(ClassicLoadBalancer lb) {
-        if (states.containsKey(key(lb.getRegion(), lb.getLoadBalancerName()))) {
+        if (states.containsKey(key(lb))) {
             startMonitoring(lb);
         }
     }
 
     public void registerInstances(ClassicLoadBalancer lb, Collection<String> instanceIds) {
         Map<String, InstanceState> lbStates =
-                states.computeIfAbsent(key(lb.getRegion(), lb.getLoadBalancerName()),
+                states.computeIfAbsent(key(lb),
                         k -> new ConcurrentHashMap<>());
         for (String id : instanceIds) {
             lbStates.putIfAbsent(id, new InstanceState());
@@ -113,8 +113,8 @@ public class ElbClassicHealthChecker implements Resettable {
         }
     }
 
-    public void deregisterInstances(String region, String loadBalancerName, Collection<String> instanceIds) {
-        Map<String, InstanceState> lbStates = states.get(key(region, loadBalancerName));
+    public void deregisterInstances(ClassicLoadBalancer lb, Collection<String> instanceIds) {
+        Map<String, InstanceState> lbStates = states.get(key(lb));
         if (lbStates != null) {
             instanceIds.forEach(lbStates::remove);
         }
@@ -127,11 +127,11 @@ public class ElbClassicHealthChecker implements Resettable {
      * live Classic load balancer reports between {@code RegisterInstancesWithLoadBalancer} and the
      * first successful check.
      */
-    public InstanceHealth getHealth(String region, String loadBalancerName, String instanceId) {
+    public InstanceHealth getHealth(ClassicLoadBalancer lb, String instanceId) {
         if (mock()) {
             return InstanceHealth.inService();
         }
-        Map<String, InstanceState> lbStates = states.get(key(region, loadBalancerName));
+        Map<String, InstanceState> lbStates = states.get(key(lb));
         InstanceState s = lbStates != null ? lbStates.get(instanceId) : null;
         if (s == null || s.health == null) {
             return InstanceHealth.registering();
@@ -160,7 +160,7 @@ public class ElbClassicHealthChecker implements Resettable {
     }
 
     private void probeAll(ClassicLoadBalancer lb) {
-        Map<String, InstanceState> lbStates = states.get(key(lb.getRegion(), lb.getLoadBalancerName()));
+        Map<String, InstanceState> lbStates = states.get(key(lb));
         if (lbStates == null || lbStates.isEmpty()) {
             return;
         }

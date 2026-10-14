@@ -44,6 +44,10 @@ pytest tests/test_s3.py
 just test-python
 ```
 
+`tests/test_elb_classic_public_alias.py` creates a Classic load balancer and
+weighted public alias through Boto 3, checking account ownership, missing-target
+responses and alias/load-balancer deletion through the shared HTTP edge.
+
 ## Configuration
 
 | Variable         | Default                 | Description             |

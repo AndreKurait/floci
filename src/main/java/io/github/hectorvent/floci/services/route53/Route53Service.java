@@ -25,11 +25,14 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -59,6 +62,7 @@ public class Route53Service implements Resettable {
     private final Map<String, Long> hostedZoneMutationBusyUntilNanos = new ConcurrentHashMap<>();
     private final Map<String, Long> authorizationMutationBusyUntilNanos = new ConcurrentHashMap<>();
     private final Map<String, Integer> privateZoneNameCounts = new ConcurrentHashMap<>();
+    private final Map<String, Integer> publicZoneNameCounts = new ConcurrentHashMap<>();
 
     @Inject
     public Route53Service(StorageFactory factory, EmulatorConfig config, RegionResolver regionResolver,
@@ -88,9 +92,7 @@ public class Route53Service implements Resettable {
         this.ec2Service = ec2Service;
         this.vpcAssociationControlPlaneDelayMs = Math.max(0, r53.vpcAssociationControlPlaneDelayMs());
         for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
-            if (owned.zone().isPrivateZone()) {
-                privateZoneNameCounts.merge(normalizeName(owned.zone().getName()).toLowerCase(), 1, Integer::sum);
-            }
+            zoneNameCounts(owned.zone()).merge(normalizeName(owned.zone().getName()).toLowerCase(), 1, Integer::sum);
         }
     }
 
@@ -114,8 +116,8 @@ public class Route53Service implements Resettable {
         zone.setOwnerAccountId(callerAccountId);
         if (vpcAssociation != null) {
             vpcAssociation.setOwnerAccountId(callerAccountId);
-            privateZoneNameCounts.merge(normalizedName.toLowerCase(), 1, Integer::sum);
         }
+        zoneNameCounts(zone).merge(normalizedName.toLowerCase(), 1, Integer::sum);
         zoneStore.put(id, zone);
         recordStore.put(id, buildDefaultRecords(normalizedName));
         ChangeInfo change = newChange(null);
@@ -144,10 +146,8 @@ public class Route53Service implements Resettable {
         recordStore.delete(id);
         tagStore.delete("hostedzone/" + id);
         vpcAuthorizationStore.delete(id);
-        if (zone.isPrivateZone()) {
-            privateZoneNameCounts.computeIfPresent(normalizeName(zone.getName()).toLowerCase(),
-                    (k, v) -> v > 1 ? v - 1 : null);
-        }
+        zoneNameCounts(zone).computeIfPresent(normalizeName(zone.getName()).toLowerCase(),
+                (k, v) -> v > 1 ? v - 1 : null);
         return newChange(null);
     }
 
@@ -623,12 +623,18 @@ public class Route53Service implements Resettable {
         if (qname == null || qname.isBlank()) {
             return List.of();
         }
-        String normalizedQname = normalizeName(qname).toLowerCase();
+        return findRecordsForName(normalizeName(qname).toLowerCase(),
+                mostSpecificZones(normalizeName(qname).toLowerCase(), true).stream()
+                        .map(owned -> getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId()))
+                        .toList());
+    }
+
+    private static List<ResourceRecordSet> findRecordsForName(String normalizedQname,
+                                                              List<List<ResourceRecordSet>> zoneRecords) {
         List<ResourceRecordSet> nameMatches = new ArrayList<>();
         List<ResourceRecordSet> wildcardMatches = new ArrayList<>();
 
-        for (OwnedZone owned : mostSpecificPrivateZones(normalizedQname)) {
-            List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId());
+        for (List<ResourceRecordSet> records : zoneRecords) {
             List<ResourceRecordSet> zoneWildcards = new ArrayList<>();
             for (ResourceRecordSet rrs : records) {
                 String rName = normalizeName(rrs.getName()).toLowerCase();
@@ -684,7 +690,7 @@ public class Route53Service implements Resettable {
         }
         String normalizedQname = normalizeName(qname).toLowerCase();
         String suffix = "." + normalizedQname;
-        for (OwnedZone owned : mostSpecificPrivateZones(normalizedQname)) {
+        for (OwnedZone owned : mostSpecificZones(normalizedQname, true)) {
             for (ResourceRecordSet rrs : getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId())) {
                 if (normalizeName(rrs.getName()).toLowerCase().endsWith(suffix)) {
                     return true;
@@ -694,17 +700,86 @@ public class Route53Service implements Resettable {
         return false;
     }
 
-    /** The private zones with the longest name containing {@code normalizedQname}, so a parent zone never answers for a child. */
-    private List<OwnedZone> mostSpecificPrivateZones(String normalizedQname) {
-        if (privateZoneNameCounts.isEmpty()
-                || privateZoneNameCounts.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
+    public record PublicAlias(String dnsName, String hostedZoneId) {}
+
+    /**
+     * Follows an unambiguous public alias/CNAME chain without making an upstream DNS request.
+     * Returns null for unresolved or ambiguous names. A zone alone does not identify the service
+     * that owns a hostname; the consumer must match the result to its own resource before routing.
+     */
+    public PublicAlias lookupPublicAlias(String name) {
+        String normalized = normalizeName(name).toLowerCase(Locale.ROOT);
+        if (publicZoneNameCounts.keySet().stream().noneMatch(zone -> DomainNames.isWithin(normalized, zone))) {
+            return null;
+        }
+        String current = normalized;
+        Set<String> visited = new HashSet<>();
+        String targetZoneId = null;
+        for (int depth = 0; depth < 8; depth++) {
+            if (!visited.add(current)) {
+                break;
+            }
+            List<OwnedZone> zones = mostSpecificZones(current, false);
+            if (zones.isEmpty()) {
+                return new PublicAlias(current, targetZoneId);
+            }
+            if (zones.size() != 1) {
+                break;
+            }
+            OwnedZone owned = zones.getFirst();
+            if (targetZoneId != null && !owned.zone().getId().equals(targetZoneId)) {
+                break;
+            }
+            List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId());
+            String currentName = current;
+            boolean delegated = records.stream().anyMatch(record -> "NS".equals(record.getType())
+                    && !record.getName().equalsIgnoreCase(owned.zone().getName())
+                    && DomainNames.isWithin(currentName, normalizeName(record.getName()).toLowerCase(Locale.ROOT)));
+            List<ResourceRecordSet> matches = findRecordsForName(current, List.of(records)).stream()
+                    .filter(record -> "A".equals(record.getType()) || "CNAME".equals(record.getType()))
+                    .toList();
+            if (delegated || matches.size() != 1) {
+                break;
+            }
+            ResourceRecordSet record = matches.getFirst();
+            if (record.getRegion() != null || record.getFailover() != null || record.getHealthCheckId() != null) {
+                break;
+            }
+            AliasTarget alias = record.getAliasTarget();
+            String next;
+            if ("A".equals(record.getType()) && alias != null) {
+                next = alias.getDnsName();
+                targetZoneId = alias.getHostedZoneId();
+            } else if ("CNAME".equals(record.getType())
+                    && record.getRecords() != null && record.getRecords().size() == 1) {
+                next = record.getRecords().getFirst().getValue();
+                targetZoneId = null;
+            } else {
+                break;
+            }
+            if (next == null || next.isBlank()) {
+                break;
+            }
+            current = normalizeName(next).toLowerCase(Locale.ROOT);
+        }
+        return null;
+    }
+
+    private Map<String, Integer> zoneNameCounts(HostedZone zone) {
+        return zone.isPrivateZone() ? privateZoneNameCounts : publicZoneNameCounts;
+    }
+
+    /** The longest containing zones, so a parent never answers for a more specific child. */
+    private List<OwnedZone> mostSpecificZones(String normalizedQname, boolean privateZone) {
+        if (privateZone && (privateZoneNameCounts.isEmpty()
+                || privateZoneNameCounts.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z)))) {
             return List.of();
         }
         List<OwnedZone> matchingZones = new ArrayList<>();
         int maxZoneLength = -1;
         for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
             HostedZone zone = owned.zone();
-            if (!zone.isPrivateZone()) {
+            if (zone.isPrivateZone() != privateZone) {
                 continue;
             }
             String zoneName = normalizeName(zone.getName()).toLowerCase();
@@ -1026,5 +1101,6 @@ public class Route53Service implements Resettable {
         hostedZoneMutationBusyUntilNanos.clear();
         authorizationMutationBusyUntilNanos.clear();
         privateZoneNameCounts.clear();
+        publicZoneNameCounts.clear();
     }
 }
