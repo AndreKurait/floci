@@ -72,8 +72,10 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import jakarta.ws.rs.core.UriBuilder;
 import org.jboss.logging.Logger;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -2275,12 +2277,19 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                         "The container " + containerName + " is not part of the task.", 400));
     }
 
-    /** The {@code ws://} URL a client opens for an exec session's data channel. */
+    /** The data channel URL for a caller without an HTTP request endpoint. */
     public String execStreamUrl(ExecSession session) {
-        String websocketBase = baseUrl.startsWith("https://")
-                ? "wss://" + baseUrl.substring("https://".length())
-                : "ws://" + baseUrl.substring(baseUrl.indexOf("://") + 3);
-        return websocketBase + EcsExecChannelHandler.CHANNEL_PATH_PREFIX + session.sessionId();
+        return execStreamUrl(session, null);
+    }
+
+    /** Uses the request's reachable endpoint, or configured base URL for non-HTTP callers. */
+    public String execStreamUrl(ExecSession session, URI requestBaseUri) {
+        URI endpoint = requestBaseUri != null ? requestBaseUri : URI.create(baseUrl);
+        return UriBuilder.fromUri(endpoint)
+                .scheme("https".equalsIgnoreCase(endpoint.getScheme()) ? "wss" : "ws")
+                .path(EcsExecChannelHandler.CHANNEL_PATH_PREFIX)
+                .path(session.sessionId())
+                .build().toString();
     }
 
     /** A container reached through the task metadata endpoint, with the task it belongs to. */

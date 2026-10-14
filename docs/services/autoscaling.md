@@ -39,6 +39,24 @@ and zero capacity. Both groups had identical configuration except for name, ARN
 and creation time. The SDK regression is
 `compatibility-tests/sdk-test-python/tests/test_autoscaling_subnet_whitespace.py`.
 
+Scale-out follows the [AWS placement rules](https://docs.aws.amazon.com/autoscaling/ec2/userguide/auto-scaling-benefits.html):
+choose the zone with the fewest active instances, then its subnet with the most
+free IPv4 addresses. Declared subnets and actual EC2 placement take precedence
+over stale group zone metadata. Exhausted IPv4 subnets are skipped when another
+subnet has capacity. If all are full, EC2 reports the selected subnet's allocation
+error. IPv6-only subnets do not require free IPv4 addresses. Retrying another zone
+after a launch error and rebalancing without a capacity increase are not implemented.
+
+AWS launch errors appear as failed scaling activities after preserving partial
+launches. Repeated identical failures reuse the recorded activity, following the
+scale-in behavior, and do not complete an instance refresh. Unexpected runtime,
+save and cleanup failures still propagate.
+
+For groups configured only with Availability Zones, Floci preserves its unpinned
+EC2 launch behavior and counts each member under the requested zone. This permits
+real zones outside the local subnet catalog, such as `us-east-1d`; the underlying
+EC2 instance can use a default subnet in a different zone.
+
 ### Instance Management
 
 | Operation | Notes |

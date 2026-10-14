@@ -1373,6 +1373,14 @@ floci populates:
   `Null:false` when the policy must require a resolved key. Malformed requests that pass
   authorization are still checked by the DynamoDB handler.
 
+- `dynamodb:ReturnValues`: standalone `PutItem`, `UpdateItem` and `DeleteItem` authorize each
+  distinct non-`NONE` mode requested by `ReturnValues` and `ReturnValuesOnConditionCheckFailure`
+  before execution. When neither requests a non-`NONE` mode, authorization uses `NONE`.
+  Each mode is checked separately, so a grant must cover both `UPDATED_NEW` and `ALL_OLD`
+  when they are requested together; `NONE` plus `ALL_OLD` needs only `ALL_OLD`. Omitted or
+  null parameters use the execution default. Read and batch operations do not acquire this
+  key from unrelated fields. Transaction failure-image context is described below.
+
 **Any other condition key is absent from the request context.** A positive scalar operator
 without `IfExists` on an absent key makes the whole statement *not apply*: it neither matches nor
 blocks. A `DenyRootUser`-style guardrail keyed on `aws:PrincipalArn` therefore fires against

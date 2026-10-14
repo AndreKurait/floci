@@ -164,6 +164,21 @@ public final class ReplacementCleanup {
         return true;
     }
 
+    /**
+     * Ends the retry a failed rollback left for the replacement it could not delete. Only
+     * ContinueUpdateRollback retries that delete, and a new update reaches the resource only once
+     * one skipped it, so a provisioner calls this as an update starts: otherwise rolling back an
+     * attempt that failed before {@link #record} would retry the earlier delete instead of undoing
+     * the attempt. The replacement stays listed, so the next committed update or the stack delete
+     * still removes it.
+     */
+    static void endRollbackRetry(StackResource r) {
+        ObjectNode cleanup = read(r);
+        if (cleanup != null && cleanup.remove("undeletedReplacement") != null) {
+            write(r, cleanup);
+        }
+    }
+
     static boolean hasReplacement(StackResource r) {
         ObjectNode cleanup = read(r);
         return cleanup != null && cleanup.path("displaced").size() > 0;

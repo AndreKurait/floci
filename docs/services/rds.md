@@ -748,6 +748,12 @@ The RDS auth proxy validates the master username and password at the proxy layer
 
 IAM database authentication is also supported. Set `--enable-iam-database-authentication` at instance creation time and use `aws rds generate-db-auth-token` to obtain a token.
 
+New Aurora members inherit IAM database authentication from their cluster.
+`EnableIAMDatabaseAuthentication` on `CreateDBInstance` does not override the
+cluster setting, including when the instance parameter is omitted.
+Member IAM connections currently require the cluster master username and password
+to be supplied when creating the member; those credentials are not yet inherited.
+
 Changing `EnableIAMDatabaseAuthentication` with `ModifyDBCluster` updates existing
 Aurora members and applies to new connections through the cluster and member
 endpoints. Omitting the flag preserves the current setting. Existing connections

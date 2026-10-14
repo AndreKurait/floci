@@ -912,6 +912,9 @@ public class RdsQueryHandler {
         if (engine != null && engine.regionMatches(true, 0, "sqlserver", 0, 9)) {
             return "license-included";
         }
+        if (engine != null && engine.equalsIgnoreCase("aurora-mysql")) {
+            return "general-public-license";
+        }
         return "postgresql-license";
     }
 

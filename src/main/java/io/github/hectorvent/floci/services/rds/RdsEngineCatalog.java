@@ -26,6 +26,8 @@ final class RdsEngineCatalog {
     }
 
     private static final List<String> PROVISIONED = List.of("provisioned");
+    private static final List<String> AURORA_CLASSES =
+            List.of("db.t3.medium", "db.t4g.medium", "db.r5.large", "db.r6g.large");
 
     static final List<EngineVersion> VERSIONS = List.of(
             postgres("13.20", "13", false, List.of()),
@@ -51,11 +53,11 @@ final class RdsEngineCatalog {
             new EngineVersion("aurora-postgresql", "15.12", "15", "aurora-postgresql15",
                     "Aurora (PostgreSQL)", false, List.of(), PROVISIONED),
             new EngineVersion("aurora-postgresql", "16.3", "16", "aurora-postgresql16",
-                    "Aurora (PostgreSQL)", true, List.of(), PROVISIONED),
+                    "Aurora (PostgreSQL)", true, AURORA_CLASSES, PROVISIONED),
             new EngineVersion("aurora-postgresql", "17.4", "17", "aurora-postgresql17",
                     "Aurora (PostgreSQL)", false, List.of(), PROVISIONED),
             new EngineVersion("aurora-mysql", "8.0.mysql_aurora.3.05.2", "8.0", "aurora-mysql8.0",
-                    "Aurora MySQL", true, List.of(), PROVISIONED),
+                    "Aurora MySQL", true, AURORA_CLASSES, PROVISIONED),
             new EngineVersion("aurora-mysql", "8.0.mysql_aurora.3.08.0", "8.0", "aurora-mysql8.0",
                     "Aurora MySQL", false, List.of(), PROVISIONED));
 

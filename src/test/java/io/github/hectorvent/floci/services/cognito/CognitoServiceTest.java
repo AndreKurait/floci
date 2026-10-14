@@ -61,6 +61,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
+import static io.github.hectorvent.floci.testing.InlineMocks.inlineMock;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -2080,8 +2081,8 @@ class CognitoServiceTest {
 
     @Test
     void signUpWithoutDeliveryTargetFailsBeforePersistingUser() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-        CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
         CognitoService serviceWithVerification = new CognitoService(
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
@@ -2116,8 +2117,8 @@ class CognitoServiceTest {
 
     @Test
     void signUpRollsBackUserWhenDispatchFails() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-        CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
         when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.SIGNUP_CONFIRMATION), any()))
                 .thenReturn("123456");
         doThrow(new RuntimeException("SES unavailable")).when(messageDispatcher)
@@ -2239,8 +2240,8 @@ class CognitoServiceTest {
     @Test
     @SuppressWarnings("unchecked")
     void expiredPendingEmailCodeLeavesActiveAttributeAndVerifiedFlagUnchanged() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-        CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
         when(verificationCodeService.issue(any(), any(),
                 eq(VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION), any()))
                 .thenReturn("123456");
@@ -2303,8 +2304,8 @@ class CognitoServiceTest {
     @Test
     @SuppressWarnings("unchecked")
     void verificationCodeForRequiredEmailUpdateUsesPendingDestination() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-        CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
         when(verificationCodeService.issue(any(), any(),
                 eq(VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION), any()))
                 .thenReturn("123456");
@@ -2364,8 +2365,8 @@ class CognitoServiceTest {
 
     @Test
     void adminContactUpdateClearsOnlyMatchingPendingValueAndVerificationCode() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-        CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
         PendingContactFixture fixture = createPendingContactFixture(
                 verificationCodeService, messageDispatcher);
         clearInvocations(verificationCodeService);
@@ -2391,8 +2392,8 @@ class CognitoServiceTest {
 
     @Test
     void adminContactDeleteClearsOnlyMatchingPendingValueAndVerificationCode() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-        CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
         PendingContactFixture fixture = createPendingContactFixture(
                 verificationCodeService, messageDispatcher);
         clearInvocations(verificationCodeService);
@@ -3405,8 +3406,8 @@ class CognitoServiceTest {
     @Test
     @SuppressWarnings("unchecked")
     void initiateAuthWithUserAuthOffersEmailOtpWhenVerificationIsConfiguredAndEmailVerified() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-        CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
         when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.EMAIL_OTP), any()))
                 .thenReturn("654321");
         CognitoService serviceWithVerification = new CognitoService(
@@ -3461,8 +3462,8 @@ class CognitoServiceTest {
     @Test
     @SuppressWarnings("unchecked")
     void initiateAuthWithUserAuthOffersSmsOtpWhenVerificationIsConfiguredAndPhoneVerified() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-        CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
         when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.SMS_OTP), any()))
                 .thenReturn("135790");
         CognitoService serviceWithVerification = new CognitoService(
@@ -3516,8 +3517,8 @@ class CognitoServiceTest {
 
     @Test
     void respondToEmailOtpChallengeRejectsWrongCode() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-        CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
         when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.EMAIL_OTP), any()))
                 .thenReturn("654321");
         doThrow(new VerificationCodeException(VerificationCodeException.Kind.MISMATCH, "nope"))
@@ -3657,7 +3658,7 @@ class CognitoServiceTest {
     @ParameterizedTest
     @CsvSource({"PASSWORD", "SMS_OTP", "WEB_AUTHN"})
     void initiateAuthWithUserAuthOffersTheChoiceForAPreferredChallengeTheUserCannotTake(String preferred) {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
         CognitoService serviceWithVerification = serviceWithVerification(verificationCodeService);
         UserPool pool = poolWithFirstFactors(serviceWithVerification, "EMAIL_OTP", "SMS_OTP");
         UserPoolClient client = openClient(serviceWithVerification, pool.getId(), "c", false);
@@ -3691,7 +3692,7 @@ class CognitoServiceTest {
     /** Managed login asks again after a wrong code, so the USER_AUTH session must outlive one. */
     @Test
     void managedLoginEmailOtpKeepsTheSessionForAnotherTryAfterAWrongCode() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
         when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.EMAIL_OTP), any()))
                 .thenReturn("654321");
         doThrow(new VerificationCodeException(VerificationCodeException.Kind.MISMATCH, "nope"))
@@ -3839,7 +3840,7 @@ class CognitoServiceTest {
     @ParameterizedTest
     @CsvSource({"page", "api"})
     void slowCodeRedemptionForOneUserDoesNotHoldUpAnotherUsersSignIn(String aliceAnswersThrough) throws Exception {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
         when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.EMAIL_OTP), any()))
                 .thenReturn("654321");
         CountDownLatch aliceRedeeming = new CountDownLatch(1);
@@ -3884,14 +3885,14 @@ class CognitoServiceTest {
 
     /** A service whose EMAIL_OTP code is always {@code code}, with delivery mocked out. */
     private CognitoService serviceWithEmailOtpCode(String code) {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
         when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.EMAIL_OTP), any()))
                 .thenReturn(code);
         return serviceWithVerification(verificationCodeService);
     }
 
     private CognitoService serviceWithVerification(VerificationCodeService verificationCodeService) {
-        return serviceWithVerification(verificationCodeService, mock(CognitoMessageDispatcher.class));
+        return serviceWithVerification(verificationCodeService, inlineMock(CognitoMessageDispatcher.class));
     }
 
     private CognitoService serviceWithVerification(VerificationCodeService verificationCodeService,
@@ -3921,7 +3922,7 @@ class CognitoServiceTest {
      * {@code clock}, that puts each code it sends in {@code sentCode}.
      */
     private CognitoService serviceWithSlowCodeStore(Clock clock, AtomicReference<String> sentCode) {
-        CognitoMessageDispatcher dispatcher = mock(CognitoMessageDispatcher.class);
+        CognitoMessageDispatcher dispatcher = inlineMock(CognitoMessageDispatcher.class);
         doAnswer(invocation -> {
             sentCode.set(invocation.getArgument(3));
             return null;
@@ -3958,8 +3959,8 @@ class CognitoServiceTest {
 
     @Test
     void issueOtpChallengeSurfacesRateLimitInsteadOfAGenericDeliveryFailure() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-        CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
         when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.EMAIL_OTP), any()))
                 .thenThrow(new VerificationCodeException(
                         VerificationCodeException.Kind.RATE_LIMIT, "Attempt limit exceeded"));
@@ -3999,8 +4000,8 @@ class CognitoServiceTest {
 
     @Test
     void issueOtpChallengeInvalidatesTheIssuedCodeWhenDispatchFails() {
-        VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-        CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
         when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.EMAIL_OTP), any()))
                 .thenReturn("777888");
         doThrow(new RuntimeException("SES unavailable")).when(messageDispatcher)
@@ -5515,8 +5516,8 @@ class CognitoServiceTest {
         }
 
         private CognitoService createVerificationEnabledService() {
-            VerificationCodeService verificationCodeService = mock(VerificationCodeService.class);
-            CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+            VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+            CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
             when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.SIGNUP_CONFIRMATION), any()))
                     .thenReturn("123456");
             return new CognitoService(
@@ -5552,8 +5553,8 @@ class CognitoServiceTest {
 
         @BeforeEach
         void setUpVerification() {
-            verificationCodeService = mock(VerificationCodeService.class);
-            CognitoMessageDispatcher messageDispatcher = mock(CognitoMessageDispatcher.class);
+            verificationCodeService = inlineMock(VerificationCodeService.class);
+            CognitoMessageDispatcher messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
             svc = new CognitoService(
                     new InMemoryStorage<>(),
                     new InMemoryStorage<>(),
@@ -6585,7 +6586,7 @@ class CognitoServiceTest {
 
         @BeforeEach
         void setUpMessaging() {
-            messageDispatcher = mock(CognitoMessageDispatcher.class);
+            messageDispatcher = inlineMock(CognitoMessageDispatcher.class);
             svc = new CognitoService(
                     new InMemoryStorage<>(),
                     new InMemoryStorage<>(),
@@ -6599,7 +6600,7 @@ class CognitoServiceTest {
                     regionResolver,
                     null,
                     acmService,
-                    mock(VerificationCodeService.class),
+                    inlineMock(VerificationCodeService.class),
                     messageDispatcher,
                     mock(TlsCertificateManager.class)
             );

@@ -274,6 +274,66 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void singleItemWritesUseTheirReturnValuesAndExecutionDefault() {
+        for (String action : List.of("PutItem", "UpdateItem", "DeleteItem")) {
+            for (String value : List.of("NONE", "ALL_OLD", "UPDATED_OLD", "ALL_NEW", "UPDATED_NEW", "")) {
+                ContainerRequestContext request = mock(ContainerRequestContext.class);
+                when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json(
+                        "{\"ReturnValues\":\"" + value + "\"}"));
+                assertEquals(List.of(value), resolver.resolve("dynamodb", "dynamodb:" + action, request)
+                        .get("dynamodb:ReturnValues"));
+            }
+            for (String body : List.of("{}", "{\"ReturnValues\":null}")) {
+                ContainerRequestContext request = mock(ContainerRequestContext.class);
+                when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json(body));
+                assertEquals(List.of("NONE"), resolver.resolve("dynamodb", "dynamodb:" + action, request)
+                        .get("dynamodb:ReturnValues"));
+            }
+        }
+    }
+
+    @Test
+    void unrelatedActionsDoNotAcquireSpoofedReturnValues() {
+        for (String action : List.of("GetItem", "Query", "Scan", "BatchGetItem", "BatchWriteItem",
+                "TransactGetItems", "TransactWriteItems")) {
+            ContainerRequestContext request = mock(ContainerRequestContext.class);
+            when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json("{\"ReturnValues\":\"ALL_OLD\"}"));
+            Map<String, List<String>> context = resolver.resolve("dynamodb", "dynamodb:" + action, request);
+            assertFalse(context != null && context.containsKey("dynamodb:ReturnValues"));
+        }
+    }
+
+    @Test
+    void requestedReturnModesUseSeparateCompleteContextsWithoutNoneOrDuplicates() {
+        when(dynamoDbService.findTable("FgacTable", "us-east-1")).thenReturn(Optional.of(fgacTable()));
+        Map<String, List<String>> cases = Map.of(
+                "", List.of("NONE"),
+                ",\"ReturnValues\":null,\"ReturnValuesOnConditionCheckFailure\":null", List.of("NONE"),
+                ",\"ReturnValues\":\"NONE\",\"ReturnValuesOnConditionCheckFailure\":\"ALL_OLD\"", List.of("ALL_OLD"),
+                ",\"ReturnValues\":\"ALL_OLD\",\"ReturnValuesOnConditionCheckFailure\":\"NONE\"", List.of("ALL_OLD"),
+                ",\"ReturnValues\":\"ALL_OLD\",\"ReturnValuesOnConditionCheckFailure\":\"ALL_OLD\"", List.of("ALL_OLD"),
+                ",\"ReturnValues\":\"UPDATED_NEW\",\"ReturnValuesOnConditionCheckFailure\":\"ALL_OLD\"",
+                List.of("UPDATED_NEW", "ALL_OLD"));
+        for (Map.Entry<String, List<String>> entry : cases.entrySet()) {
+            ContainerRequestContext request = mock(ContainerRequestContext.class);
+            when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json(
+                    "{\"TableName\":\"FgacTable\",\"Key\":{\"PK\":{\"S\":\"USER_alice\"}}"
+                            + entry.getKey() + "}"));
+            Map<String, List<String>> primary = resolver.resolve("dynamodb", "dynamodb:UpdateItem", request);
+            List<Map<String, List<String>>> remaining =
+                    resolver.resolveRemainingTargets("dynamodb", "dynamodb:UpdateItem", request);
+            assertEquals(List.of(entry.getValue().getFirst()), primary.get("dynamodb:ReturnValues"));
+            assertEquals(entry.getValue().size() - 1, remaining.size());
+            assertEquals(List.of("USER_alice"), primary.get("dynamodb:LeadingKeys"));
+            for (int i = 0; i < remaining.size(); i++) {
+                assertEquals(List.of(entry.getValue().get(i + 1)), remaining.get(i).get("dynamodb:ReturnValues"));
+                assertEquals(primary.get("dynamodb:LeadingKeys"), remaining.get(i).get("dynamodb:LeadingKeys"));
+                assertEquals(primary.get("dynamodb:Attributes"), remaining.get(i).get("dynamodb:Attributes"));
+            }
+        }
+    }
+
+    @Test
     void returnsNullWhenNoBodyWasBuffered() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
         when(containerRequest.getProperty("floci.bufferedJsonBody")).thenReturn(null);
