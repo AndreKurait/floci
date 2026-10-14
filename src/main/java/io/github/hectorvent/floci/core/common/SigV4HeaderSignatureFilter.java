@@ -75,7 +75,8 @@ import java.util.function.UnaryOperator;
  * {@code ExecuteApiSigV4Authorizer}, which decides per method whether IAM auth applies at all, and
  * one for {@code AppSyncExecutionController} (GraphQL) through AppSync's {@code IamAuthValidator},
  * which answers in the {@code UnauthorizedException} envelope AppSync clients parse.
- * Everything else is verified here, S3 Control included, whatever service its scope names.
+ * Root GET requests delegated to the Query dispatcher are verified here, as is S3 Control.
+ * Everything else is verified here whatever service its scope names.
  *
  * <p>As with S3, signature verification is authentication only, and an unsigned request is let
  * through: whether a caller may act is IAM enforcement's decision. A nonblank Authorization
@@ -159,6 +160,9 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             return;
         }
         Class<?> resource = resourceInfo != null ? resourceInfo.getResourceClass() : null;
+        if (resource == S3Controller.class && AwsQueryController.isQueryGet(ctx)) {
+            resource = AwsQueryController.class;
+        }
         if (resource != null && VERIFIED_ELSEWHERE.contains(resource)) {
             return;
         }
@@ -455,7 +459,7 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
                     CborErrorResponses.mediaTypeFor(contentType)));
             return;
         }
-        if (isFormEncoded(ctx.getMediaType())) {
+        if (resource == AwsQueryController.class || isFormEncoded(ctx.getMediaType())) {
             ctx.abortWith(AwsQueryResponse.error(queryCode, message, null, status));
             return;
         }

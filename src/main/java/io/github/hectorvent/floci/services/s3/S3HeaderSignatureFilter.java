@@ -111,7 +111,7 @@ public class S3HeaderSignatureFilter implements ContainerRequestFilter {
 
     @Override
     public void filter(ContainerRequestContext ctx) throws IOException {
-        if (!S3SignatureFilterScope.routedToS3(resourceInfo)
+        if (!S3SignatureFilterScope.routedToS3(resourceInfo, ctx)
                 || !S3SignatureFilterScope.verifiesSignatures(s3Service, presignGenerator)) {
             return;
         }

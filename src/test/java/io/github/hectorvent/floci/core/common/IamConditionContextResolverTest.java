@@ -140,6 +140,40 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void queryGetConditionsUseTheFirstDecodedUrlValue() {
+        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
+        query.add("Action", "CreateTags");
+        query.add("ResourceId.1", "i-target");
+        query.add("Tag.1.Key", "Team");
+        query.add("Tag.1.Value", "A+B%2F");
+        query.add("Tag.1.Value", "ignored");
+        when(ec2Service.resourceTags("i-target")).thenReturn(List.of(new Tag("Owner", "alice")));
+        Map<String, List<String>> conditions = resolver.resolve(
+                "ec2", "ec2:CreateTags", queryRequest("ec2", query));
+        assertEquals(List.of("A+B%2F"), conditions.get("aws:RequestTag/Team"));
+        assertEquals(List.of("Team"), conditions.get("aws:TagKeys"));
+        assertEquals(List.of("alice"), conditions.get("aws:ResourceTag/Owner"));
+
+        query.clear();
+        query.add("Action", "AttachRolePolicy");
+        query.add("PolicyArn", "arn:aws:iam::123456789012:policy/Team/A+B%2F");
+        assertEquals(Map.of("iam:PolicyARN", List.of("arn:aws:iam::123456789012:policy/Team/A+B%2F")),
+                resolver.resolve("iam", "iam:AttachRolePolicy", queryRequest("iam", query)));
+    }
+
+    private static ContainerRequestContext queryRequest(String service, MultivaluedMap<String, String> query) {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        UriInfo uri = mock(UriInfo.class);
+        when(request.getMethod()).thenReturn("GET");
+        when(request.getHeaderString("Authorization")).thenReturn(
+                "AWS4-HMAC-SHA256 Credential=test/20261014/us-east-1/" + service + "/aws4_request");
+        when(request.getUriInfo()).thenReturn(uri);
+        when(uri.getPath()).thenReturn("/");
+        when(uri.getQueryParameters()).thenReturn(query);
+        return request;
+    }
+
+    @Test
     void resolvesS3ListBucketQueryConditionContext() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
         UriInfo uriInfo = mock(UriInfo.class);

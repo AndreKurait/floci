@@ -1,6 +1,7 @@
 # Elastic Load Balancing (Classic, v1)
 
-**Protocol:** Query (XML) — `POST http://localhost:4566/` with `Action=` and `Version=2012-06-01`
+**Protocol:** Query (XML), form `POST` or SigV4-signed `GET` at `http://localhost:4566/`
+with `Action=` and `Version=2012-06-01`.
 
 Classic Elastic Load Balancing is the 2012-06-01 API behind `aws elb` and Terraform's `aws_elb`
 resource. It is a **different API** from [ELB v2](elb.md) (ALB/NLB, 2015-12-01), even though both
@@ -9,7 +10,7 @@ scope.
 
 ## How Floci tells the two apart
 
-Every Query-protocol request carries the API version it is speaking as the `Version` form
+Every Query-protocol request carries the API version it is speaking as the `Version` request
 parameter, and that is what Floci routes on:
 
 | `Version` | Answered by |

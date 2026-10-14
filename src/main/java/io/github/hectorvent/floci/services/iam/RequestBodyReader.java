@@ -45,6 +45,9 @@ public final class RequestBodyReader {
     }
 
     public static String formField(ContainerRequestContext ctx, String key) {
+        if ("GET".equalsIgnoreCase(ctx.getMethod()) && IamActionRegistry.isQueryRequest(ctx)) {
+            return ctx.getUriInfo().getQueryParameters().getFirst(key);
+        }
         MediaType mt = ctx.getMediaType();
         if (mt == null
                 || !"application".equalsIgnoreCase(mt.getType())

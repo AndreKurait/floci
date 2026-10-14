@@ -449,4 +449,47 @@ class SigV4HeaderSignatureIntegrationTest {
         .then()
             .statusCode(200);
     }
+
+    @Test
+    @Order(19)
+    void queryGetAuthenticatesTheIssuedKeyBeforeDispatch() {
+        AwsRequestSigner signer = AwsRequestSigner.signedAs(
+                userAccessKeyId, userSecretKey, "elasticloadbalancing");
+        given().filter(signer)
+                .queryParam("Action", "DescribeLoadBalancers")
+                .queryParam("Version", "2012-06-01")
+                .get("/").then().statusCode(200)
+                .body(containsString("DescribeLoadBalancersResponse"));
+        given().filter(signer.withSecret("not-the-issued-secret"))
+                .queryParam("Action", "DescribeLoadBalancers")
+                .queryParam("Version", "2012-06-01")
+                .get("/").then().statusCode(403)
+                .contentType(containsString("xml"))
+                .body("ErrorResponse.Error.Code", equalTo("SignatureDoesNotMatch"));
+    }
+
+    @Test
+    @Order(20)
+    void presignedQueryGetAuthenticatesTheIssuedKeyBeforeDispatch() throws Exception {
+        URI endpoint = URI.create("http://localhost:" + RestAssured.port + "/");
+        Map<String, String> query = Map.of(
+                "Action", "DescribeLoadBalancers", "Version", "2012-06-01");
+        AwsRequestSigner signer = AwsRequestSigner.signedAs(
+                userAccessKeyId, userSecretKey, "elasticloadbalancing");
+        try (HttpClient client = HttpClient.newHttpClient()) {
+            URI signed = signer.presignedUri("GET", endpoint, query, new byte[0]);
+            HttpResponse<String> accepted = client.send(HttpRequest.newBuilder(signed).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, accepted.statusCode(), accepted.body());
+            assertTrue(accepted.body().contains("DescribeLoadBalancersResponse"), accepted.body());
+
+            URI forged = signer.withSecret("not-the-issued-secret")
+                    .presignedUri("GET", endpoint, query, new byte[0]);
+            HttpResponse<String> refused = client.send(HttpRequest.newBuilder(forged).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(403, refused.statusCode(), refused.body());
+            assertEquals("SignatureDoesNotMatch",
+                    new XmlPath(refused.body()).getString("ErrorResponse.Error.Code"));
+        }
+    }
 }

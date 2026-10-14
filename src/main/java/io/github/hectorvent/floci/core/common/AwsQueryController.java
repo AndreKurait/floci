@@ -27,6 +27,7 @@ import jakarta.ws.rs.HeaderParam;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
@@ -41,7 +42,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
- * Generic dispatcher for all AWS services that use the Query Protocol (form-encoded POST, XML response).
+ * Generic dispatcher for AWS Query requests (form-encoded POST or signed GET, XML response).
  * Routes requests to the appropriate service handler based on the service name extracted from the
  * Authorization header's credential scope. When there is no such header, or its scope names no
  * service that speaks the Query protocol, the action name and the {@code Version} the request
@@ -312,7 +313,7 @@ public class AwsQueryController {
         String service = serviceResolver.resolve(authorization, action, formParams.getFirst("Version"));
         LOG.debugv("Query protocol service={0} action={1}", service, action);
 
-        String region = regionResolver.resolveRegion(httpHeaders);
+        String region = regionResolver.resolveRegionFromAuth(authorization);
 
         try {
             return dispatchToHandler(service, action, formParams, authorization, region);
@@ -660,30 +661,45 @@ public class AwsQueryController {
             "GetClusterCredentials", "GetClusterCredentialsWithIAM"
     );
 
-    /** Root GET requests that can use the CloudWatch Query handler without claiming S3 traffic. */
-    public static boolean isCloudWatchQueryGet(String authorization, String target, String accept,
-                                                MultivaluedMap<String, String> queryParams) {
+    public static boolean isQueryGet(ContainerRequestContext context) {
+        if (!"GET".equalsIgnoreCase(context.getMethod()) || context.getUriInfo() == null) {
+            return false;
+        }
+        String path = context.getUriInfo().getPath();
+        return (path == null || path.isEmpty() || "/".equals(path))
+                && isQueryGet(context.getHeaderString("Authorization"), context.getHeaderString("X-Amz-Target"),
+                context.getHeaderString("Accept"), context.getUriInfo().getQueryParameters());
+    }
+
+    /** Query signing scopes distinguish root GET requests from S3 and browser traffic. */
+    public static boolean isQueryGet(String authorization, String target, String accept,
+                                     MultivaluedMap<String, String> queryParams) {
         String auth = IamEnforcementFilter.requestAuthorization(authorization, queryParams);
         if (auth != null) {
-            return SigV4CredentialScope.serviceName(auth).filter("monitoring"::equals).isPresent();
+            return SigV4CredentialScope.serviceName(auth).filter(scope -> QUERY_SERVICES.stream()
+                    .anyMatch(service -> service.name().equals(scope) && !service.apiVersions().isEmpty()))
+                    .isPresent();
         }
         String action = AwsQueryServiceResolver.action(queryParams);
         return target == null && (accept == null || !accept.contains(MediaType.TEXT_HTML)) && action != null
                 && "monitoring".equals(inferServiceFromAction(action, queryParams.getFirst("Version")));
     }
 
-    public Response dispatchCloudWatchQueryGet(String authorization, HttpHeaders headers,
-                                               MultivaluedMap<String, String> queryParams) {
+    public Response dispatchQueryGet(String authorization, HttpHeaders headers,
+                                      MultivaluedMap<String, String> queryParams) {
+        String auth = IamEnforcementFilter.requestAuthorization(authorization, queryParams);
         String action = AwsQueryServiceResolver.action(queryParams);
-        if (action == null) {
-            return Response.status(404).type(MediaType.APPLICATION_XML)
-                    .entity("<UnknownOperationException/>").build();
+        if ("monitoring".equals(serviceResolver.resolve(auth, action, queryParams.getFirst("Version")))) {
+            if (action == null) {
+                return Response.status(404).type(MediaType.APPLICATION_XML)
+                        .entity("<UnknownOperationException/>").build();
+            }
+            if (queryParams.getFirst("Version") == null
+                    && !supportsQueryAction("monitoring", action, "2009-05-15")) {
+                return cloudWatchVersionError(action, "2009-05-15");
+            }
         }
-        if (queryParams.getFirst("Version") == null
-                && !supportsQueryAction("monitoring", action, "2009-05-15")) {
-            return cloudWatchVersionError(action, "2009-05-15");
-        }
-        return dispatch(IamEnforcementFilter.requestAuthorization(authorization, queryParams), headers, queryParams);
+        return dispatch(auth, headers, queryParams);
     }
 
     private Response cloudWatchVersionError(String action, String version) {

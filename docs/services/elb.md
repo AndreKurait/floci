@@ -1,6 +1,7 @@
 # Elastic Load Balancing v2
 
-**Protocol:** Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
+**Protocol:** Query (XML), form `POST` or SigV4-signed `GET` at `http://localhost:4566/`
+with `Action=` and `Version=2015-12-01`.
 
 Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB) through the ELBv2 management API. The control plane is AWS SDK / CLI / Terraform compatible, and HTTP listeners can forward to registered instance targets using the target's reachable local address.
 
