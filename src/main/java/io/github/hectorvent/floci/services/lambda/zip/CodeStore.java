@@ -112,6 +112,9 @@ public class CodeStore {
                     Files.copy(from, to, StandardCopyOption.REPLACE_EXISTING);
                 }
             }
+        } catch (IOException e) {
+            deleteDirectory(target, functionName);
+            throw e;
         }
         return target;
     }

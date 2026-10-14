@@ -33,6 +33,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -2170,6 +2172,43 @@ class LambdaServiceTest {
         assertTrue(Files.isDirectory(v2Path), "a surviving version's code must be left alone");
         assertEquals("v2", Files.readString(v2Path.resolve("index.js")).trim());
         assertTrue(Files.isDirectory(latestPath), "$LATEST's code must be left alone");
+    }
+
+    @Test
+    void failedVersionSnapshotKeepsLatestVersionsAndAliasesIntact() throws Exception {
+        String name = "failed-version-snapshot";
+        Map<String, Object> request = baseRequest(name);
+        request.put("Code", Map.of("ZipFile", zipWithBody("v1")));
+        service.createFunction(REGION, request);
+        LambdaFunction first = service.publishVersion(REGION, name, null);
+        service.createAlias(REGION, name, "live", first.getVersion(), null, null);
+        LambdaFunction latest = service.updateFunctionCode(REGION, name,
+                Map.of("ZipFile", zipWithBody("v2")));
+        Path latestPath = Path.of(latest.getCodeLocalPath());
+        Path firstPath = Path.of(first.getCodeLocalPath());
+        Path unreadable = Files.createSymbolicLink(latestPath.resolve("unreadable"),
+                Path.of("missing-file"));
+        try {
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> service.publishVersion(REGION, name, null));
+            assertEquals("ServiceException", failure.getErrorCode());
+            assertEquals(Set.of("$LATEST", first.getVersion()),
+                    service.listVersionsByFunction(REGION, name).stream()
+                            .map(LambdaFunction::getVersion).collect(Collectors.toSet()));
+            assertEquals(first.getVersion(), service.getAlias(REGION, name, "live").getFunctionVersion());
+            assertEquals("v1", Files.readString(firstPath.resolve("index.js")).trim());
+            assertEquals("v2", Files.readString(latestPath.resolve("index.js")).trim());
+            try (Stream<Path> versions = Files.list(firstPath.getParent())) {
+                assertEquals(List.of(firstPath), versions.toList(),
+                        "a failed snapshot must not leave a partial version directory");
+            }
+        } finally {
+            Files.delete(unreadable);
+        }
+        LambdaFunction retry = service.publishVersion(REGION, name, null);
+        assertNotEquals(latestPath, Path.of(retry.getCodeLocalPath()));
+        assertEquals(latest.getCodeSha256(), retry.getCodeSha256());
+        assertEquals("v2", Files.readString(Path.of(retry.getCodeLocalPath()).resolve("index.js")).trim());
     }
 
     private static String zipWithBody(String body) throws Exception {
