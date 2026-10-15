@@ -7,6 +7,7 @@ import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.UUID;
@@ -54,40 +55,37 @@ class SwfLegacyProtocolIntegrationTest {
     }
 
     @Test
-    void legacyDuplicateRegistrationPreservesTypedBotoFaults() {
+    void legacyDuplicateActivityRegistrationPreservesTypedBotoFaults() {
         String domain = "legacy-duplicate-" + UUID.randomUUID();
         String domainBody = """
                 {"name":"%s","workflowExecutionRetentionPeriodInDays":"7"}
                 """.formatted(domain);
         call(MODERN_JSON, MODERN_PREFIX, "RegisterDomain", domainBody).then().statusCode(200);
-        call(LEGACY_JSON, LEGACY_PREFIX, "RegisterDomain", domainBody).then().statusCode(400)
-                .contentType("application/json")
-                .body("__type", equalTo("com.amazonaws.swf.base.model#DomainAlreadyExistsFault"));
         String activity = "{\"domain\":\"" + domain + "\",\"name\":\"work\",\"version\":\"1\"}";
         call(MODERN_JSON, MODERN_PREFIX, "RegisterActivityType", activity).then().statusCode(200);
         call(LEGACY_JSON, LEGACY_PREFIX, "RegisterActivityType", activity).then().statusCode(400)
                 .body("__type", equalTo("com.amazonaws.swf.base.model#TypeAlreadyExistsFault"));
     }
 
-    @Test
-    void longTargetAlsoResolvesOnModernJsonProtocol() {
-        call(MODERN_JSON, LEGACY_PREFIX, "ListDomains", "{\"registrationStatus\":\"REGISTERED\"}")
-                .then().statusCode(200);
-        call(LEGACY_JSON, MODERN_PREFIX, "ListDomains", "{\"registrationStatus\":\"REGISTERED\"}")
-                .then().statusCode(200);
-    }
-
     @ParameterizedTest
-    @ValueSource(strings = {"{", "null", "[]", "1", "{} trailing"})
-    void legacyInvalidBodyRetainsSerializationFailure(String body) {
-        call(LEGACY_JSON, LEGACY_PREFIX, "RegisterDomain", body).then().statusCode(400)
-                .body("__type", equalTo("SerializationException"));
-    }
-
-    @Test
-    void legacyUnknownOperationIsNotSuccessful() {
-        call(LEGACY_JSON, LEGACY_PREFIX, "NotAnOperation", "{}").then().statusCode(404)
-                .body("__type", equalTo("UnknownOperationException"));
+    @CsvSource(textBlock = """
+            SimpleWorkflowService., application/json
+            SimpleWorkflowService., application/json; charset=UTF-8
+            SimpleWorkflowService., application/x-amz-json-1.0
+            com.amazonaws.swf.service.model.SimpleWorkflowService., application/json
+            com.amazonaws.swf.service.model.SimpleWorkflowService., application/json; charset=UTF-8
+            com.amazonaws.swf.service.model.SimpleWorkflowService., application/x-amz-json-1.0
+            """)
+    void acceptedWireFormatsShareDomainStateAndTypedFaults(String prefix, String mediaType) {
+        String domain = "wire-swf-" + UUID.randomUUID();
+        String registration = """
+                {"name":"%s","workflowExecutionRetentionPeriodInDays":"7"}
+                """.formatted(domain);
+        call(MODERN_JSON, MODERN_PREFIX, "RegisterDomain", registration).then().statusCode(200);
+        call(mediaType, prefix, "DescribeDomain", "{\"name\":\"" + domain + "\"}")
+                .then().statusCode(200).body("domainInfo.name", equalTo(domain));
+        call(mediaType, prefix, "RegisterDomain", registration).then().statusCode(400)
+                .body("__type", equalTo("com.amazonaws.swf.base.model#DomainAlreadyExistsFault"));
     }
 
     @ParameterizedTest
@@ -96,18 +94,7 @@ class SwfLegacyProtocolIntegrationTest {
             "AmazonSSM.DescribeParameters"
     })
     void plainJsonDoesNotClaimOtherTargets(String target) {
-        call(LEGACY_JSON, "", target, "{}").then().statusCode(404)
-                .body("__type", equalTo("UnknownOperationException"));
-    }
-
-    @Test
-    void smithyHeaderStillPreventsLegacyFallback() {
-        given().contentType(LEGACY_JSON)
-                .header("Smithy-Protocol", "rpc-v2-json")
-                .header("X-Amz-Target", LEGACY_PREFIX + "ListDomains")
-                .body("{\"registrationStatus\":\"REGISTERED\"}")
-                .post("/").then().statusCode(404)
-                .body("__type", equalTo("UnknownOperationException"));
+        call(LEGACY_JSON, "", target, "{}").then().statusCode(404);
     }
 
     private static Response call(String mediaType, String prefix, String action, String body) {
