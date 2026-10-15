@@ -28,7 +28,8 @@ class StepFunctionsCallbackTokenTest {
     private static final String OWNER = "111111111111";
     private final RegionResolver resolver = mock(RegionResolver.class);
     private final StepFunctionsService service = new StepFunctionsService(mock(StorageFactory.class),
-            resolver, mock(AslExecutor.class), new ObjectMapper(), mock(SfnMockLoader.class));
+            resolver, mock(AslExecutor.class), new ObjectMapper(), mock(SfnMockLoader.class),
+            mock(StepFunctionsEventPublisher.class));
 
     @Test
     void foreignCallbacksCannotClaimOrRefreshAnOwnedToken() throws Exception {
