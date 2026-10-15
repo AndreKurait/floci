@@ -77,6 +77,28 @@ public class IamActionRegistry {
         rule("lambda", "POST",   ".*/durable-execution-callbacks/.+/heartbeat$",
                 "lambda:SendDurableExecutionCallbackHeartbeat"),
 
+        // ── Lambda Web Functions (/2025-03-07, signs as lambda) ─────────────────
+        rule("lambda", "PUT",    "^/2025-03-07/web-functions$",                       "lambda:CreateWebFunction"),
+        rule("lambda", "POST",   "^/2025-03-07/web-functions$",                       "lambda:ListWebFunctions"),
+        rule("lambda", "GET",    "^/2025-03-07/web-functions/[^/]+$",                 "lambda:GetWebFunction"),
+        rule("lambda", "DELETE", "^/2025-03-07/web-functions/[^/]+$",                 "lambda:DeleteWebFunction"),
+        rule("lambda", "POST",   "^/2025-03-07/web-functions/[^/]+/revisions$",       "lambda:CreateWebFunctionRevision"),
+        rule("lambda", "POST",   "^/2025-03-07/web-functions/[^/]+/list-revisions$",  "lambda:ListWebFunctionRevisions"),
+        rule("lambda", "GET",    "^/2025-03-07/web-functions/[^/]+/revisions/[^/]+$", "lambda:GetWebFunctionRevision"),
+        rule("lambda", "DELETE", "^/2025-03-07/web-functions/[^/]+/revisions/[^/]+$", "lambda:DeleteWebFunctionRevision"),
+        rule("lambda", "PUT",    "^/2025-03-07/web-functions/[^/]+/endpoints$",       "lambda:CreateWebFunctionEndpoint"),
+        rule("lambda", "POST",   "^/2025-03-07/web-functions/[^/]+/list-endpoints$",  "lambda:ListWebFunctionEndpoints"),
+        rule("lambda", "GET",    "^/2025-03-07/web-functions/[^/]+/endpoints/[^/]+$", "lambda:GetWebFunctionEndpoint"),
+        rule("lambda", "PATCH",  "^/2025-03-07/web-functions/[^/]+/endpoints/[^/]+$", "lambda:UpdateWebFunctionEndpoint"),
+        rule("lambda", "DELETE", "^/2025-03-07/web-functions/[^/]+/endpoints/[^/]+$", "lambda:DeleteWebFunctionEndpoint"),
+        rule("lambda", "GET",    "^/2025-03-07/web-account-settings$",                "lambda:GetWebAccountSettings"),
+        rule("lambda", "GET",    "^/2025-03-07/tags/.+",                              "lambda:ListTags"),
+        rule("lambda", "POST",   "^/2025-03-07/tags/.+",                              "lambda:TagResource"),
+        rule("lambda", "DELETE", "^/2025-03-07/tags/.+",                              "lambda:UntagResource"),
+        rule("lambda", "PUT",    "^/2025-03-07/resource-policy/.+",                   "lambda:PutResourcePolicy"),
+        rule("lambda", "GET",    "^/2025-03-07/resource-policy/.+",                   "lambda:GetResourcePolicy"),
+        rule("lambda", "DELETE", "^/2025-03-07/resource-policy/.+",                   "lambda:DeleteResourcePolicy"),
+
         // ── DynamoDB (JSON 1.1, action from X-Amz-Target handled separately) ──
         // Handled via Query-style action extraction in the filter
 

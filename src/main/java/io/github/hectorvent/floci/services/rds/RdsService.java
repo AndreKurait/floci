@@ -9782,6 +9782,8 @@ public class RdsService implements Resettable, ResourceProvider {
      */
     public synchronized DbCluster addRolesToNewDbCluster(String region, String clusterId,
                                                          List<DbRoleAssociation> roles) {
+        // The features are checked below against the cluster's own engine.
+        validateClusterRoleAssociations(clusterId, null, roles);
         String effectiveRegion = effectiveRegion(region);
         DbCluster cluster = getDbCluster(clusterId, effectiveRegion);
         requireAvailableCluster(cluster, clusterId);

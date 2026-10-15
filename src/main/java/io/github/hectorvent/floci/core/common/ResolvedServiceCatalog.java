@@ -45,6 +45,7 @@ import io.github.hectorvent.floci.services.lambda.LambdaController;
 import io.github.hectorvent.floci.services.lambda.durable.DurableExecutionController;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsController;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaNetworkConnectorsController;
+import io.github.hectorvent.floci.services.lambdaweb.LambdaWebController;
 import io.github.hectorvent.floci.services.macie2.MacieController;
 import io.github.hectorvent.floci.services.marketplace.MarketplaceCatalogController;
 import io.github.hectorvent.floci.services.marketplace.MarketplaceDeploymentController;
@@ -149,7 +150,8 @@ public class ResolvedServiceCatalog {
                         Set.of(LambdaController.class,
                                 DurableExecutionController.class,
                                 LambdaMicrovmsController.class,
-                                LambdaNetworkConnectorsController.class)),
+                                LambdaNetworkConnectorsController.class,
+                                LambdaWebController.class)),
                 descriptor("apigateway", "apigateway", config.services().apigateway().enabled(), true,
                         "apigateway", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),

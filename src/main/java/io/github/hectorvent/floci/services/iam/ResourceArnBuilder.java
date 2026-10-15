@@ -596,6 +596,10 @@ public class ResourceArnBuilder {
      * given.
      */
     private String buildLambdaArn(String path, ContainerRequestContext ctx, String region, String accountId) {
+        String webFunctionArn = webFunctionArn(path, region, accountId);
+        if (webFunctionArn != null) {
+            return webFunctionArn;
+        }
         String executionArn = durableExecutionArn(path);
         if (executionArn == null) {
             executionArn = durableCallbackExecutionArn(path);
@@ -629,6 +633,51 @@ public class ResourceArnBuilder {
             // A reference Lambda refuses, which its handler answers with a 400 before acting on anything.
             return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
         }
+    }
+
+    /**
+     * The resource of a Lambda Web Functions route. An action on a revision or an endpoint is evaluated
+     * against that child's ARN; an action on the function, a create of a revision or endpoint, the list of
+     * either, and the tag and resource-policy routes against the function's (Lambda Developer Guide,
+     * "Lambda Web Function permissions"). ListWebFunctions, GetWebAccountSettings and CreateWebFunction
+     * name no resource. Null for every other Lambda route.
+     */
+    private static String webFunctionArn(String path, String region, String accountId) {
+        if (!path.startsWith("/2025-03-07/")) {
+            return null;
+        }
+        String rest = path.substring("/2025-03-07/".length());
+        if (rest.startsWith("tags/") || rest.startsWith("resource-policy/")) {
+            String arn = rest.substring(rest.indexOf('/') + 1);
+            return arn.startsWith("arn:") ? arn : "*";
+        }
+        if (!rest.startsWith("web-functions/")) {
+            return "*";
+        }
+        List<String> segments = new ArrayList<>(List.of(rest.substring("web-functions/".length()).split("/")));
+        if (segments.isEmpty() || segments.getFirst().isEmpty()) {
+            return "*";
+        }
+        String functionArn;
+        if (segments.getFirst().startsWith("arn:") && segments.size() > 1) {
+            // A function ARN carries one slash: arn:...:web-function/<name>.
+            functionArn = segments.get(0) + "/" + segments.get(1);
+            segments.subList(0, 2).clear();
+        } else {
+            functionArn = AwsArnUtils.Arn.of("lambda", region, accountId,
+                    "web-function/" + segments.getFirst()).toString();
+            segments.removeFirst();
+        }
+        if (segments.size() >= 2 && ("revisions".equals(segments.get(0)) || "endpoints".equals(segments.get(0)))) {
+            String child = "revisions".equals(segments.get(0)) ? "revision" : "endpoint";
+            String id = String.join("/", segments.subList(1, segments.size()));
+            if (id.startsWith("arn:") && id.contains("/" + child + "/")) {
+                // A revision or endpoint ARN ends in its id: arn:...:web-function/<name>/revision/<id>.
+                id = id.substring(id.lastIndexOf('/') + 1);
+            }
+            return functionArn + "/" + child + "/" + id;
+        }
+        return functionArn;
     }
 
     /**

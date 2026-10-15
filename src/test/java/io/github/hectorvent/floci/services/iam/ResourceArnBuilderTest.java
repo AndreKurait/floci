@@ -1002,6 +1002,43 @@ class ResourceArnBuilderTest {
     }
 
     @Test
+    void lambdaWebRoutesResolveTheFunctionRevisionOrEndpointTheyActOn() {
+        String fn = "arn:aws:lambda:us-east-1:000000000000:web-function/app";
+        when(uriInfo.getPath()).thenReturn("/2025-03-07/web-functions/app");
+        assertEquals(fn, builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        when(uriInfo.getPath()).thenReturn("/2025-03-07/web-functions/app/revisions");
+        assertEquals(fn, builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        when(uriInfo.getPath()).thenReturn("/2025-03-07/web-functions/app/list-endpoints");
+        assertEquals(fn, builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        when(uriInfo.getPath()).thenReturn("/2025-03-07/web-functions/app/revisions/rev-abcde");
+        assertEquals(fn + "/revision/rev-abcde", builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        when(uriInfo.getPath()).thenReturn("/2025-03-07/web-functions/app/endpoints/prod");
+        assertEquals(fn + "/endpoint/prod", builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        // A function named by its ARN keeps the account and region it names.
+        when(uriInfo.getPath()).thenReturn(
+                "/2025-03-07/web-functions/arn:aws:lambda:us-east-1:111122223333:web-function/app/endpoints/prod");
+        assertEquals("arn:aws:lambda:us-east-1:111122223333:web-function/app/endpoint/prod",
+                builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        // A revision or endpoint named by its ARN resolves to its id under the path's function.
+        when(uriInfo.getPath()).thenReturn("/2025-03-07/web-functions/app/revisions/"
+                + "arn:aws:lambda:us-east-1:000000000000:web-function/app/revision/rev-abcde");
+        assertEquals(fn + "/revision/rev-abcde", builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        when(uriInfo.getPath()).thenReturn("/2025-03-07/web-functions/app/endpoints/"
+                + "arn:aws:lambda:us-east-1:000000000000:web-function/app/endpoint/prod");
+        assertEquals(fn + "/endpoint/prod", builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        // The tag and policy routes carry the function ARN in the path.
+        when(uriInfo.getPath()).thenReturn("/2025-03-07/tags/" + fn);
+        assertEquals(fn, builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        when(uriInfo.getPath()).thenReturn("/2025-03-07/resource-policy/" + fn);
+        assertEquals(fn, builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        // Listing functions, the account settings and creating a function name no resource.
+        when(uriInfo.getPath()).thenReturn("/2025-03-07/web-functions");
+        assertEquals("*", builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        when(uriInfo.getPath()).thenReturn("/2025-03-07/web-account-settings");
+        assertEquals("*", builder.build("lambda", ctx, "us-east-1", "000000000000"));
+    }
+
+    @Test
     void lambdaRoutesOtherThanInvokeAreCheckedAgainstTheCallersUnqualifiedFunction() {
         when(uriInfo.getPath()).thenReturn(
                 "/2015-03-31/functions/arn:aws:lambda:us-east-1:111122223333:function:my-function:1/code");

@@ -180,7 +180,8 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
             String prefixList = text(target, "destinationPrefixListId");
             String egressOnly = text(target, "egressOnlyInternetGatewayId");
             if (egressOnly != null) {
-                ec2Service.deleteRoute(region, routeTableId, cidr, ipv6, prefixList);
+                CfnDeletes.safeDelete("route", routeTableId, () -> ec2Service.deleteRoute(region, routeTableId, cidr,
+                        ipv6, prefixList), "InvalidRoute.NotFound");
                 ec2Service.createRoute(region, routeTableId, cidr, ipv6, prefixList, null, null, egressOnly, null);
             } else {
                 ec2Service.replaceRoute(region, routeTableId, cidr, ipv6, prefixList,

@@ -9509,12 +9509,38 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         synchronized (lockFor(key(region, routeTableId))) {
             RouteTable current = getRequiredRouteTable(region, routeTableId);
             List<Route> next = new ArrayList<>(current.getRoutes());
-            next.removeIf(r -> matchesDestination(r, canonicalDestinationCidrBlock, destinationIpv6CidrBlock,
-                    destinationPrefixListId));
+            List<Route> matched = next.stream()
+                    .filter(r -> matchesDestination(r, canonicalDestinationCidrBlock, destinationIpv6CidrBlock,
+                            destinationPrefixListId))
+                    .toList();
+            if (matched.isEmpty()) {
+                throw new AwsException("InvalidRoute.NotFound",
+                        "The route identified by "
+                                + destinationLabel(canonicalDestinationCidrBlock, destinationIpv6CidrBlock,
+                                        destinationPrefixListId)
+                                + " does not exist", 400);
+            }
+            for (Route route : matched) {
+                if (isLocalRoute(route)) {
+                    throw new AwsException("InvalidParameterValue",
+                            "cannot remove local route " + route.getDestinationCidrBlock()
+                                    + " in route table " + routeTableId, 400);
+                }
+            }
+            next.removeAll(matched);
             current.setRoutes(next);
             routeTables.put(key(region, routeTableId), current);
             notifyRouteTableUpdated(region, current);
         }
+    }
+
+    /**
+     * The route CreateRouteTable seeds for the VPC CIDR, which AWS refuses to delete. Keyed on the
+     * origin rather than the "local" gateway: ReplaceRoute may repoint the route (NAT gateway, ENI,
+     * peering connection) and keeps its origin, and AWS still refuses to delete it while repointed.
+     */
+    private static boolean isLocalRoute(Route route) {
+        return "CreateRouteTable".equals(route.getOrigin());
     }
 
     private RouteTable getRequiredRouteTable(String region, String routeTableId) {

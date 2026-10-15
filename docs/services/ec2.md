@@ -544,7 +544,7 @@ Nested launch-template tags follow AWS's case-sensitive check: `aws:` is rejecte
 | DisassociateRouteTable | Removes a route table association. |
 | CreateRoute | Adds a route to a route table. Accepts `InstanceId`, `NetworkInterfaceId`, and `VpcPeeringConnectionId` as targets (alongside `GatewayId`/`NatGatewayId`/`EgressOnlyInternetGatewayId`) and reports them back on `DescribeRouteTables`. |
 | ReplaceRoute | Replaces the target of an existing route, accepting `InstanceId`, `NetworkInterfaceId`, and `VpcPeeringConnectionId`. |
-| DeleteRoute | Removes a route from a route table. |
+| DeleteRoute | Removes a route from a route table. Refuses the route to the VPC CIDR that `CreateRouteTable` seeds with `InvalidParameterValue`, and reports a destination with no route as `InvalidRoute.NotFound`. |
 
 ### VPC Peering Connections
 

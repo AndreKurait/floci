@@ -785,6 +785,41 @@ history is retained, and a previously running execution is marked `ABORTED` with
 `ExecutionAborted` event appended. After a further restart, the execution is already terminal, so
 no additional event is written.
 
+## Execution status change events
+
+Floci publishes AWS-shaped `Step Functions Execution Status Change` events to the **default**
+EventBridge bus (`source: aws.states`, `resources: [executionArn]`) for every status a STANDARD
+execution enters. Rules that match `aws.states`, for example on `detail.stateMachineArn` or
+`detail.status`, fire as they do on AWS. EXPRESS executions emit no events, as on AWS.
+
+| `detail.status` | When |
+|---|---|
+| `RUNNING` | `StartExecution` creates the execution, including a nested `states:startExecution` |
+| `SUCCEEDED` | the execution reaches a terminal state without failing |
+| `FAILED` | a `Fail` state, an unhandled error, or a runtime error ends the execution |
+| `TIMED_OUT` | the state machine's `TimeoutSeconds` elapses |
+| `ABORTED` | `StopExecution` stops the execution |
+
+The `detail` carries every key of AWS's documented event, null when it does not apply:
+`executionArn`, `stateMachineArn`, `name`, `status`, `startDate` and `stopDate` (epoch
+milliseconds, `stopDate` null while `RUNNING`), `input`, `inputDetails`, `output` and
+`outputDetails` (set only on `SUCCEEDED`), `stateMachineVersionArn` and `stateMachineAliasArn`
+(null unless the execution was started through one), `error`, `cause`, and the redrive fields.
+
+- A `TIMED_OUT` event names `States.Timeout` as its `error`.
+- `FAILED` and `TIMED_OUT` report `redriveStatus` `REDRIVABLE` with the reason
+  `Execution is <status> and is redrivable`. Every other status reports `NOT_REDRIVABLE` with
+  `Execution is <status> and cannot be redriven`.
+- As on AWS, when the escaped `input` and escaped `output` together exceed 248 KiB, `input` is
+  left out and `inputDetails.included` is `false`. When the escaped `output` alone exceeds
+  248 KiB, `output` is left out and `outputDetails.included` is `false`.
+  `DescribeExecution` still returns both in full.
+
+Known differences from AWS:
+
+- Executions aborted by the startup sweep described above emit no `ABORTED` event.
+- Floci does not implement redrive, so `redriveCount` is always `0` and `redriveDate` is null.
+
 ## Partitions
 
 Service integration resources carry the partition of the state machine's region

@@ -387,6 +387,36 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void deleteRouteRefusesTheLocalRouteAndReportsMissingDestinations() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.86.0.0/16", false).getVpcId();
+        String routeTableId = service.createRouteTable(region, vpcId).getRouteTableId();
+        service.createRoute(region, routeTableId, "0.0.0.0/0", null, null, "igw-route0test0000000",
+                null, null, null);
+
+        AwsException local = assertThrows(AwsException.class,
+                () -> service.deleteRoute(region, routeTableId, "10.86.0.0/16", null, null));
+        assertEquals("InvalidParameterValue", local.getErrorCode());
+        assertTrue(local.getMessage().contains("10.86.0.0/16"), local.getMessage());
+
+        AwsException missing = assertThrows(AwsException.class,
+                () -> service.deleteRoute(region, routeTableId, "203.0.113.0/24", null, null));
+        assertEquals("InvalidRoute.NotFound", missing.getErrorCode());
+        assertTrue(missing.getMessage().contains("203.0.113.0/24"), missing.getMessage());
+
+        service.deleteRoute(region, routeTableId, "0.0.0.0/0", null, null);
+
+        assertEquals(1, service.describeRouteTables(region, List.of(routeTableId), Map.of())
+                .getFirst().getRoutes().size(), "the local route survives");
+        assertEquals("CreateRouteTable", service.describeRouteTables(region, List.of(routeTableId), Map.of())
+                .getFirst().getRoutes().getFirst().getOrigin());
+    }
+
+    @Test
     void deleteVpcFailsWhileAVpcEndpointRemains() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class),

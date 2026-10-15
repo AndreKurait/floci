@@ -87,6 +87,7 @@ import software.amazon.awssdk.services.lambda.model.InvocationType;
 import software.amazon.awssdk.services.lambda.model.InvokeRequest;
 import software.amazon.awssdk.services.lambda.model.InvokeResponse;
 import software.amazon.awssdk.services.lambda.model.Runtime;
+import software.amazon.awssdk.services.lambdaweb.LambdaWebClient;
 import software.amazon.awssdk.services.lightsail.LightsailClient;
 import software.amazon.awssdk.services.macie2.Macie2Client;
 import software.amazon.awssdk.services.marketplaceagreement.MarketplaceAgreementClient;
@@ -823,6 +824,14 @@ public final class TestFixtures {
 
     public static LambdaClient lambdaClient() {
         return LambdaClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static LambdaWebClient lambdaWebClient() {
+        return LambdaWebClient.builder()
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
                 .credentialsProvider(CREDENTIALS)
