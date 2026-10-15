@@ -21,7 +21,6 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CookieHeaders;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
@@ -1185,9 +1184,8 @@ public class ApiGatewayExecuteController {
                                     JsonSchemaFactory.getInstance(
                                             SpecVersion.VersionFlag.V4, builder -> builder.schemaLoaders(
                                                     loaders -> loaders.add(iri -> {
-                                                        String prefix = "https://apigateway."
-                                                                + AwsRegions.dnsSuffixFor(region)
-                                                                + "/restapis/" + apiId + "/models/";
+                                                        String prefix = "https://apigateway.amazonaws.com/restapis/" // partition-literal: documented model URI uses this host in every partition
+                                                                + apiId + "/models/";
                                                         String reference = iri.toString();
                                                         String referencedSchema = reference.startsWith(prefix)
                                                                 ? models.get(reference.substring(prefix.length())) : null;
