@@ -1197,9 +1197,8 @@ public class ApiGatewayExecuteController {
                                     JsonSchemaFactory.getInstance(
                                             SpecVersion.VersionFlag.V4, builder -> builder.schemaLoaders(
                                                     loaders -> loaders.add(iri -> {
-                                                        String prefix = "https://apigateway."
-                                                                + AwsRegions.dnsSuffixFor(region)
-                                                                + "/restapis/" + apiId + "/models/";
+                                                        String prefix = "https://apigateway.amazonaws.com/restapis/" // partition-literal: documented model URI uses this host in every partition
+                                                                + apiId + "/models/";
                                                         String reference = iri.toString();
                                                         String referencedSchema = reference.startsWith(prefix)
                                                                 ? models.get(reference.substring(prefix.length())) : null;

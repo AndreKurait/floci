@@ -5,11 +5,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpServer;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.builder.RequestSpecBuilder;
 import io.restassured.http.ContentType;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
@@ -1087,6 +1090,191 @@ class ApiGatewayOpenApiImportTest {
     }
 
     // ──────────────────────────── Request Body Validation ────────────────────────────
+
+    @ParameterizedTest
+    @ValueSource(strings = {"us-east-1", "cn-north-1", "us-gov-west-1"})
+    @Order(100)
+    void importedModelReferencesValidateDeployedSiblingModelsAndRecursiveBodies(String region) throws Exception {
+        RequestSpecification request = new RequestSpecBuilder().addHeader("Authorization",
+                "AWS4-HMAC-SHA256 Credential=test/20261015/" + region
+                        + "/apigateway/aws4_request, SignedHeaders=host, Signature=test").build();
+        String spec = """
+                {
+                  "openapi":"3.0.1", "info":{"title":"ReferencedWorkflowModels","version":"1"},
+                  "x-amazon-apigateway-request-validators":{
+                    "full":{"validateRequestBody":true,"validateRequestParameters":true}},
+                  "x-amazon-apigateway-request-validator":"full",
+                  "paths":{"/list-workflows":{"post":{
+                    "requestBody":{"content":{"application/json":{
+                      "schema":{"$ref":"#/components/schemas/Request"}}}},
+                    "x-amazon-apigateway-integration":{"type":"MOCK",
+                      "requestTemplates":{"application/json":"{\\"statusCode\\":200}"},
+                      "responses":{"default":{"statusCode":"200",
+                        "responseTemplates":{"application/json":"{\\"accepted\\":true}"}}}}}}},
+                  "components":{"schemas":{
+                    "Category":{"type":"string","enum":["DMS"]},
+                    "Status":{"type":"string","enum":["RUNNING"]},
+                    "Request":{"type":"object","required":["workflowCategory","status"],
+                      "properties":{
+                        "workflowCategory":{"$ref":"#/components/schemas/Category"},
+                        "status":{"$ref":"#/components/schemas/Status"},
+                        "child":{"$ref":"#/components/schemas/Request"}}}}}
+                }
+                """;
+        String apiId = given().spec(request).contentType(ContentType.JSON).queryParam("mode", "import")
+                .body(spec).post("/restapis").then().statusCode(201).extract().path("id");
+        AtomicInteger integrationCalls = new AtomicInteger();
+        HttpServer integration = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        try {
+            integration.createContext("/accepted", exchange -> {
+                integrationCalls.incrementAndGet();
+                byte[] bytes = "{\"accepted\":true}".getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, bytes.length);
+                exchange.getResponseBody().write(bytes);
+                exchange.close();
+            });
+            integration.start();
+            String resourceId = given().spec(request).get("/restapis/" + apiId + "/resources")
+                    .then().statusCode(200).extract().path("item.find { it.path == '/list-workflows' }.id");
+            given().spec(request).contentType(ContentType.JSON)
+                    .body("{\"type\":\"HTTP_PROXY\",\"httpMethod\":\"POST\",\"uri\":\"http://127.0.0.1:"
+                            + integration.getAddress().getPort() + "/accepted\"}")
+                    .put("/restapis/" + apiId + "/resources/" + resourceId + "/methods/POST/integration")
+                    .then().statusCode(201);
+            String deployment = given().spec(request).contentType(ContentType.JSON).body("{}")
+                    .post("/restapis/" + apiId + "/deployments")
+                    .then().statusCode(201).extract().path("id");
+            given().spec(request).contentType(ContentType.JSON)
+                    .body("{\"stageName\":\"test\",\"deploymentId\":\"" + deployment + "\"}")
+                    .post("/restapis/" + apiId + "/stages").then().statusCode(201);
+            String endpoint = "/execute-api/" + apiId + "/test/list-workflows";
+            String valid = "{\"workflowCategory\":\"DMS\",\"status\":\"RUNNING\"}";
+            given().spec(request).contentType(ContentType.JSON).body(valid).post(endpoint)
+                    .then().statusCode(200).body(containsString("accepted"));
+            given().spec(request).contentType(ContentType.JSON)
+                    .body("{\"workflowCategory\":\"DMS\",\"status\":\"RUNNING\",\"child\":" + valid + "}")
+                    .post(endpoint).then().statusCode(200);
+            assertEquals(2, integrationCalls.get(), "Valid requests must reach the integration");
+            assertRejectedWithoutIntegration(request, endpoint, "{\"status\":\"RUNNING\"}", integrationCalls);
+            assertRejectedWithoutIntegration(request, endpoint, valid.replace("RUNNING", "INVALID"), integrationCalls);
+            assertRejectedWithoutIntegration(request, endpoint,
+                    "{\"workflowCategory\":\"DMS\",\"status\":\"RUNNING\",\"child\":"
+                            + valid.replace("RUNNING", "INVALID") + "}", integrationCalls);
+
+            String schema = "{\"type\":\"string\",\"enum\":[\"DONE\"]}";
+            String patch = "{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
+                    + mapper.writeValueAsString(schema) + "}]}";
+            given().spec(request).contentType(ContentType.JSON).body(patch)
+                    .patch("/restapis/" + apiId + "/models/Status").then().statusCode(200);
+            given().spec(request).contentType(ContentType.JSON).body(valid).post(endpoint).then().statusCode(200);
+            assertRejectedWithoutIntegration(request, endpoint, valid.replace("RUNNING", "DONE"), integrationCalls);
+            given().spec(request).contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
+                    .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
+            assertRejectedWithoutIntegration(request, endpoint, valid, integrationCalls);
+            given().spec(request).contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
+                    .post(endpoint).then().statusCode(200);
+
+            String storedSchema = given().spec(request).get("/restapis/" + apiId + "/models/Request")
+                    .then().statusCode(200).extract().path("schema");
+            assertFalse(mapper.readTree(storedSchema).has("components"), "Validation must not rewrite stored models");
+            String urlSchema = storedSchema.replace("#/components/schemas/",
+                    "https://apigateway.amazonaws.com/restapis/" + apiId + "/models/");
+            given().spec(request).contentType(ContentType.JSON)
+                    .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
+                            + mapper.writeValueAsString(urlSchema) + "}]}")
+                    .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
+            given().spec(request).contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
+                    .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
+            given().spec(request).contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
+                    .post(endpoint).then().statusCode(200);
+            given().spec(request).contentType(ContentType.JSON)
+                    .body("{\"workflowCategory\":\"DMS\",\"status\":\"DONE\",\"child\":"
+                            + valid.replace("RUNNING", "DONE") + "}")
+                    .post(endpoint).then().statusCode(200);
+            assertRejectedWithoutIntegration(request, endpoint, valid, integrationCalls);
+            assertRejectedWithoutIntegration(request, endpoint,
+                    "{\"workflowCategory\":\"DMS\",\"status\":\"DONE\",\"child\":" + valid + "}", integrationCalls);
+            given().spec(request).contentType(ContentType.JSON).body(patch.replace("DONE", "RUNNING"))
+                    .patch("/restapis/" + apiId + "/models/Status").then().statusCode(200);
+            given().spec(request).delete("/restapis/" + apiId + "/models/Category").then().statusCode(202);
+            given().spec(request).contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
+                    .post(endpoint).then().statusCode(200);
+            assertRejectedWithoutIntegration(request, endpoint, valid, integrationCalls);
+            given().spec(request).contentType(ContentType.JSON).body(patch)
+                    .patch("/restapis/" + apiId + "/models/Status").then().statusCode(200);
+            given().spec(request).contentType(ContentType.JSON)
+                    .body("{\"name\":\"Category\",\"schema\":\"{\\\"type\\\":\\\"string\\\",\\\"enum\\\":[\\\"DMS\\\"]}\"}")
+                    .post("/restapis/" + apiId + "/models").then().statusCode(201);
+            given().spec(request).contentType(ContentType.JSON)
+                    .body("{\"name\":\"UnrelatedInvalid\",\"schema\":\"{invalid\"}")
+                    .post("/restapis/" + apiId + "/models").then().statusCode(201);
+            ObjectNode annotated = (ObjectNode) mapper.readTree(storedSchema);
+            annotated.putObject("default").put("$ref", "#/components/schemas/NotAModel");
+            given().spec(request).contentType(ContentType.JSON)
+                    .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
+                            + mapper.writeValueAsString(annotated.toString()) + "}]}")
+                    .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
+            given().spec(request).contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
+                    .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
+            given().spec(request).contentType(ContentType.JSON).body(valid.replace("RUNNING", "DONE"))
+                    .post(endpoint).then().statusCode(200);
+            String otherApi = given().spec(request).contentType(ContentType.JSON).body("{\"name\":\"OtherModelOwner\"}")
+                    .post("/restapis").then().statusCode(201).extract().path("id");
+            try {
+                given().spec(request).contentType(ContentType.JSON)
+                        .body("{\"name\":\"OtherOnly\",\"contentType\":\"application/json\",\"schema\":"
+                                + mapper.writeValueAsString("{\"type\":\"object\"}") + "}")
+                        .post("/restapis/" + otherApi + "/models").then().statusCode(201);
+                String missing = "{\"$ref\":\"https://apigateway.amazonaws.com/restapis/"
+                        + otherApi + "/models/OtherOnly\"}";
+                given().spec(request).contentType(ContentType.JSON)
+                        .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
+                                + mapper.writeValueAsString(missing) + "}]}")
+                        .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
+                given().spec(request).contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
+                        .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
+                assertRejectedWithoutIntegration(request, endpoint, valid, integrationCalls);
+            } finally {
+                given().spec(request).delete("/restapis/" + otherApi).then().statusCode(202);
+            }
+
+            AtomicInteger externalReads = new AtomicInteger();
+            HttpServer external = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            external.createContext("/schema", exchange -> {
+                externalReads.incrementAndGet();
+                byte[] bytes = "{}".getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, bytes.length);
+                exchange.getResponseBody().write(bytes);
+                exchange.close();
+            });
+            external.start();
+            try {
+                String externalSchema = "{\"$ref\":\"http://127.0.0.1:" + external.getAddress().getPort() + "/schema\"}";
+                given().spec(request).contentType(ContentType.JSON)
+                        .body("{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/schema\",\"value\":"
+                                + mapper.writeValueAsString(externalSchema) + "}]}")
+                        .patch("/restapis/" + apiId + "/models/Request").then().statusCode(200);
+                given().spec(request).contentType(ContentType.JSON).body("{\"stageName\":\"test\"}")
+                        .post("/restapis/" + apiId + "/deployments").then().statusCode(201);
+                assertRejectedWithoutIntegration(request, endpoint, valid, integrationCalls);
+                assertEquals(0, externalReads.get(), "Request validation must not fetch external schemas");
+            } finally {
+                external.stop(0);
+            }
+        } finally {
+            integration.stop(0);
+            given().spec(request).delete("/restapis/" + apiId).then().statusCode(202);
+        }
+    }
+
+    private void assertRejectedWithoutIntegration(RequestSpecification request, String endpoint, String body,
+                                                  AtomicInteger integrationCalls) {
+        int calls = integrationCalls.get();
+        given().spec(request).contentType(ContentType.JSON).body(body).post(endpoint)
+                .then().statusCode(400).body("message", equalTo("Invalid request body"));
+        assertEquals(calls, integrationCalls.get(), "Rejected requests must not reach the integration");
+    }
 
     @Test
     @Order(100)
