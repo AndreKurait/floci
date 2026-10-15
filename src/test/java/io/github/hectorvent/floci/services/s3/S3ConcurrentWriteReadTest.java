@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.s3;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
@@ -32,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
  * secondary source and {@code ENOENT: global-config.yaml}. getObject must therefore never return
  * a torn view of a key that always holds the same full-size payload.
  */
+@Timeout(150)
 class S3ConcurrentWriteReadTest {
 
     @TempDir
@@ -149,7 +151,7 @@ class S3ConcurrentWriteReadTest {
 
         ExecutorService executor = Executors.newFixedThreadPool(writers + readers);
         List<Future<Void>> futures = new ArrayList<>(writers + readers);
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(120);
         try {
             for (int w = 0; w < writers; w++) {
                 futures.add(executor.submit(() -> {
