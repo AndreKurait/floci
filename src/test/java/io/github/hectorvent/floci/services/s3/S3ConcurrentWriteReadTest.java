@@ -7,11 +7,10 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -22,6 +21,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 /**
  * In {@code hybrid}/filesystem storage mode (the default) an S3 object's bytes live on disk.
@@ -64,11 +64,11 @@ class S3ConcurrentWriteReadTest {
 
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService executor = Executors.newFixedThreadPool(writers + readers);
-        List<Future<Void>> futures = new ArrayList<>(writers + readers);
+        ExecutorCompletionService<Void> completions = new ExecutorCompletionService<>(executor);
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(120);
         try {
             for (int w = 0; w < writers; w++) {
-                futures.add(executor.submit(() -> {
+                completions.submit(() -> {
                     try {
                         start.await();
                         for (int i = 0; i < iterations && firstTear.get() == null
@@ -79,10 +79,10 @@ class S3ConcurrentWriteReadTest {
                         writersDone.countDown();
                     }
                     return null;
-                }));
+                });
             }
             for (int r = 0; r < readers; r++) {
-                futures.add(executor.submit(() -> {
+                completions.submit(() -> {
                     start.await();
                     while (writersDone.getCount() > 0 && firstTear.get() == null
                             && !Thread.currentThread().isInterrupted()) {
@@ -97,13 +97,15 @@ class S3ConcurrentWriteReadTest {
                         }
                     }
                     return null;
-                }));
+                });
             }
             start.countDown();
-            for (Future<Void> future : futures) {
+            for (int completed = 0; completed < writers + readers; completed++) {
                 long remaining = deadline - System.nanoTime();
                 assertFalse(remaining <= 0, "concurrent overwrite test exceeded its deadline");
-                future.get(remaining, TimeUnit.NANOSECONDS);
+                Future<Void> future = completions.poll(remaining, TimeUnit.NANOSECONDS);
+                assertNotNull(future, "concurrent overwrite test exceeded its deadline");
+                future.get();
             }
         } finally {
             executor.shutdownNow();
@@ -150,11 +152,11 @@ class S3ConcurrentWriteReadTest {
         CountDownLatch start = new CountDownLatch(1);
 
         ExecutorService executor = Executors.newFixedThreadPool(writers + readers);
-        List<Future<Void>> futures = new ArrayList<>(writers + readers);
+        ExecutorCompletionService<Void> completions = new ExecutorCompletionService<>(executor);
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(120);
         try {
             for (int w = 0; w < writers; w++) {
-                futures.add(executor.submit(() -> {
+                completions.submit(() -> {
                     try {
                         start.await();
                         for (int i = 0; i < iterations && firstTear.get() == null
@@ -166,10 +168,10 @@ class S3ConcurrentWriteReadTest {
                         writersDone.countDown();
                     }
                     return null;
-                }));
+                });
             }
             for (int r = 0; r < readers; r++) {
-                futures.add(executor.submit(() -> {
+                completions.submit(() -> {
                     start.await();
                     while (writersDone.getCount() > 0 && firstTear.get() == null
                             && !Thread.currentThread().isInterrupted()) {
@@ -193,13 +195,15 @@ class S3ConcurrentWriteReadTest {
                         }
                     }
                     return null;
-                }));
+                });
             }
             start.countDown();
-            for (Future<Void> future : futures) {
+            for (int completed = 0; completed < writers + readers; completed++) {
                 long remaining = deadline - System.nanoTime();
                 assertFalse(remaining <= 0, "concurrent overwrite test exceeded its deadline");
-                future.get(remaining, TimeUnit.NANOSECONDS);
+                Future<Void> future = completions.poll(remaining, TimeUnit.NANOSECONDS);
+                assertNotNull(future, "concurrent overwrite test exceeded its deadline");
+                future.get();
             }
         } finally {
             executor.shutdownNow();
