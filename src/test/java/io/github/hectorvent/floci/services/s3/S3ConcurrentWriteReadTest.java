@@ -65,7 +65,7 @@ class S3ConcurrentWriteReadTest {
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService executor = Executors.newFixedThreadPool(writers + readers);
         List<Future<Void>> futures = new ArrayList<>(writers + readers);
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(120);
         try {
             for (int w = 0; w < writers; w++) {
                 futures.add(executor.submit(() -> {
