@@ -57,7 +57,12 @@ public class ContainerReachableEndpoint {
      * listener is {@code TlsProxyServer} on {@code floci.port}.
      */
     public String baseUrl() {
-        String flociHostname = embeddedDnsServer.getServerIp().isPresent()
+        return baseUrl(true);
+    }
+
+    /** Uses the Docker host when the container does not receive Floci's DNS resolver. */
+    public String baseUrl(boolean useEmbeddedDns) {
+        String flociHostname = useEmbeddedDns && embeddedDnsServer.getServerIp().isPresent()
                 ? config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX)
                 : dockerHostResolver.resolve();
         return "http://" + flociHostname + ":" + port();
