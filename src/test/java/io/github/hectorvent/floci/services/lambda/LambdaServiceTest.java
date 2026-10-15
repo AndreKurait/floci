@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -987,6 +988,7 @@ class LambdaServiceTest {
         when(lambdaCfg.defaultTimeoutSeconds()).thenReturn(3);
         when(lambdaCfg.defaultMemoryMb()).thenReturn(128);
         when(lambdaCfg.zipMaxEntries()).thenReturn(zipMaxEntries);
+        when(lambdaCfg.executor()).thenReturn("docker");
         when(hr.enabled()).thenReturn(enabled);
         when(hr.allowedPaths()).thenReturn(allowedPaths == null ? Optional.empty() : Optional.of(allowedPaths));
 
@@ -1231,6 +1233,7 @@ class LambdaServiceTest {
         LambdaService svc = serviceWithHotReload(true, null);
         String name = "hr-managed-deployment";
         Map<String, Object> request = baseRequest(name);
+        request.put("Architectures", List.of("x86_64"));
         request.put("Code", Map.of("S3Bucket", "hot-reload", "S3Key", "/tmp/host-code"));
         request.put("Environment", Map.of("Variables", Map.of("MARKER", "configured")));
         LambdaFunction original = svc.createFunction(REGION, request);
@@ -2253,7 +2256,7 @@ class LambdaServiceTest {
 
     @Test
     void failedVersionSnapshotKeepsLatestVersionsAndAliasesIntact() throws Exception {
-        String name = "failed-version-snapshot";
+        String name = "failed-version-snapshot-" + UUID.randomUUID();
         Map<String, Object> request = baseRequest(name);
         request.put("Code", Map.of("ZipFile", zipWithBody("v1")));
         service.createFunction(REGION, request);
@@ -2292,6 +2295,7 @@ class LambdaServiceTest {
     void rejectedZipUpdatePreservesLatestCodeVersionsAliasesAndConfiguration() throws Exception {
         String name = "rejected-zip-deployment";
         Map<String, Object> request = baseRequest(name);
+        request.put("Architectures", List.of("x86_64"));
         request.put("Code", Map.of("ZipFile", zipWithBody("v1")));
         request.put("Environment", Map.of("Variables", Map.of("MARKER", "original")));
         service.createFunction(REGION, request);
