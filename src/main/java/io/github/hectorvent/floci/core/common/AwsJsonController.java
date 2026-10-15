@@ -105,6 +105,9 @@ public class AwsJsonController {
             @HeaderParam("X-Amz-Target") String target,
             @Context HttpHeaders httpHeaders,
             String body) {
+        if (target == null) {
+            return JsonErrorResponseUtils.createMissingTargetErrorResponse();
+        }
         if (!SwfConstants.isTarget(target)) {
             return JsonErrorResponseUtils.createUnknownOperationErrorResponse(target);
         }

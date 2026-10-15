@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -14,6 +16,7 @@ import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @QuarkusTest
 @TestProfile(StrictProtocolClaimingIntegrationTest.StrictClaimingProfile.class)
@@ -86,6 +89,25 @@ class SwfLegacyProtocolIntegrationTest {
                 .then().statusCode(200).body("domainInfo.name", equalTo(domain));
         call(mediaType, prefix, "RegisterDomain", registration).then().statusCode(400)
                 .body("__type", equalTo("com.amazonaws.swf.base.model#DomainAlreadyExistsFault"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {LEGACY_PREFIX, MODERN_PREFIX})
+    void cborDoesNotClaimSwfTargets(String prefix) throws Exception {
+        byte[] response = given().contentType("application/x-amz-cbor-1.1")
+                .header("X-Amz-Target", prefix + "ListDomains")
+                .body(new byte[]{(byte) 0xbf, (byte) 0xff})
+                .post("/").then().statusCode(404).contentType("application/x-amz-cbor-1.1")
+                .extract().asByteArray();
+
+        assertEquals("UnknownOperationException",
+                new ObjectMapper(new CBORFactory()).readTree(response).path("__type").asText());
+    }
+
+    @Test
+    void plainJsonWithoutTargetReportsTheMissingHeader() {
+        given().contentType(LEGACY_JSON).body("{}").post("/")
+                .then().statusCode(404).body("message", equalTo("Missing X-Amz-Target header."));
     }
 
     @ParameterizedTest
