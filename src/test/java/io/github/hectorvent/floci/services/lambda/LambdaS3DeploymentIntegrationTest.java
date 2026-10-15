@@ -11,7 +11,6 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 import static io.restassured.RestAssured.given;
-import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 
 @QuarkusTest
@@ -37,22 +36,22 @@ class LambdaS3DeploymentIntegrationTest {
                         .when().post(functionPath + "/versions").then().statusCode(201)
                         .body("CodeSha256", equalTo(codeHash)).extract().path("Version");
                 given().body("{}").when().post(functionPath + "/invocations")
-                        .then().statusCode(200).body(containsString("v1"));
+                        .then().statusCode(200).body("body", equalTo("v1"));
 
                 given().body(makeZip("v2")).when().put("/" + name + "/" + key).then().statusCode(200);
                 given().when().get(functionPath + "/configuration")
                         .then().statusCode(200).body("CodeSha256", equalTo(codeHash));
                 given().body("{}").when().post(functionPath + "/invocations")
-                        .then().statusCode(200).body(containsString("v1"));
+                        .then().statusCode(200).body("body", equalTo("v1"));
 
                 given().contentType("application/json")
                         .body(Map.of("S3Bucket", name, "S3Key", key))
                         .when().put(functionPath + "/code").then().statusCode(200);
                 given().body("{}").when().post(functionPath + "/invocations")
-                        .then().statusCode(200).body(containsString("v2"));
+                        .then().statusCode(200).body("body", equalTo("v2"));
                 given().queryParam("Qualifier", version).body("{}")
                         .when().post(functionPath + "/invocations")
-                        .then().statusCode(200).body(containsString("v1"));
+                        .then().statusCode(200).body("body", equalTo("v1"));
             } finally {
                 given().when().delete(functionPath).then().statusCode(204);
             }
