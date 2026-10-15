@@ -381,10 +381,57 @@ class RedshiftServerlessJsonHandlerTest {
 
     @Test
     void anUnknownActionIsReportedAsUnknownOperation() {
+        Response response = handler.handle("NoSuchOperation", mapper.createObjectNode(), REGION);
+
+        assertEquals(400, response.getStatus());
+        assertEquals("UnknownOperationException", errorType(response));
+    }
+
+    @Test
+    void aModeledActionWithoutAnImplementationIsStillAnUnknownOperation() {
         Response response = handler.handle("CreateScheduledAction", mapper.createObjectNode(), REGION);
 
         assertEquals(400, response.getStatus());
         assertEquals("UnknownOperationException", errorType(response));
+    }
+
+    @Test
+    void aRequestBreakingTheModelConstraintsIsRejectedWithoutChangingState() {
+        Response badEnum = handler.handle("CreateNamespace",
+                parse("{\"namespaceName\":\"state-ns\",\"logExports\":[\"nope\"]}"), REGION);
+        Response missingNamespace = handler.handle("CreateWorkgroup", parse("{\"workgroupName\":\"state-wg\"}"), REGION);
+        Response missingName = handler.handle("GetWorkgroup", parse("{}"), REGION);
+
+        assertEquals("ValidationException", errorType(badEnum));
+        assertEquals("ValidationException", errorType(missingNamespace));
+        assertEquals("ValidationException", errorType(missingName));
+        assertEquals("ResourceNotFoundException", errorType(
+                handler.handle("GetNamespace", parse("{\"namespaceName\":\"state-ns\"}"), REGION)));
+        assertEquals(0, body(handler.handle("ListWorkgroups", parse("{}"), REGION)).get("workgroups").size());
+    }
+
+    @Test
+    void aNonStringPageTokenIsRejectedInsteadOfRestartingTheListing() {
+        for (String action : new String[] {"ListNamespaces", "ListWorkgroups", "ListSnapshots", "ListUsageLimits"}) {
+            Response response = handler.handle(action, parse("{\"nextToken\":12345678}"), REGION);
+
+            assertEquals("ValidationException", errorType(response), action);
+        }
+    }
+
+    @Test
+    void aTagWithANonStringKeyOrValueIsRejectedInsteadOfCoerced() {
+        String arn = body(handler.handle("CreateNamespace", parse("{\"namespaceName\":\"tag-ns\"}"), REGION))
+                .get("namespace").get("namespaceArn").textValue();
+
+        for (String tag : new String[] {"{\"key\":123,\"value\":\"v\"}", "{\"key\":\"k\",\"value\":false}"}) {
+            Response response = handler.handle("TagResource",
+                    parse("{\"resourceArn\":\"" + arn + "\",\"tags\":[" + tag + "]}"), REGION);
+
+            assertEquals("ValidationException", errorType(response), tag);
+        }
+        assertEquals(0, body(handler.handle("ListTagsForResource", parse("{\"resourceArn\":\"" + arn + "\"}"), REGION))
+                .get("tags").size());
     }
 
     @Test

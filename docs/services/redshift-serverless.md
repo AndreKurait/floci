@@ -69,7 +69,7 @@ Namespace and workgroup state is account and Region scoped and persisted through
 
 ## AWS-compatible failures
 
-Namespace and workgroup names, database names, log export values, ports and workgroup enum members are validated. Floci returns `ValidationException` for a malformed request, `ConflictException` when a namespace or workgroup name is already taken, when a namespace already has a workgroup, or when a namespace being deleted still has one, and `ResourceNotFoundException` for an unknown namespace or workgroup.
+Every request is checked against the AWS model constraints before dispatch: required members, string lengths and patterns (including resource names and tag keys and values), list sizes (including subnets, security groups, and tag lists), number ranges, and enum values. Floci returns `ValidationException` for a malformed request or one breaking these model constraints, `ConflictException` when a namespace or workgroup name is already taken, when a namespace already has a workgroup, or when a namespace being deleted still has one, and `ResourceNotFoundException` for an unknown namespace or workgroup.
 
 AWS also models `AccessDeniedException`, `InternalServerException`, and `ThrottlingException`. Floci does not inject provider-side failures that cannot be derived from the request or emulator state.
 

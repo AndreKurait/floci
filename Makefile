@@ -14,6 +14,8 @@
 # published partition metadata (plus two CDK region rules) by tools/aws/regen_partitions.py.
 # src/main/resources/aws/dynamodb-request-shapes.json is generated from botocore's DynamoDB
 # model by tools/aws/regen_dynamodb_shapes.py.
+# src/main/resources/aws/redshift-serverless-request-shapes.json is generated from botocore's Redshift
+# Serverless model by tools/aws/regen_redshift_serverless_shapes.py.
 # API Gateway integration types come from the public service model via tools/aws/regen_apigateway_types.py.
 
 PYTHON ?= python3
@@ -205,6 +207,7 @@ aws-data-sync: ## Regenerate src/main/resources/aws/*.json and the IAM managed-p
 	$(PYTHON) tools/aws/regen_partitions.py
 	$(PYTHON) tools/aws/regen_region_facts.py
 	$(PYTHON) tools/aws/regen_dynamodb_shapes.py
+	$(PYTHON) tools/aws/regen_redshift_serverless_shapes.py
 	$(PYTHON) tools/aws/regen_apigateway_types.py
 	$(PYTHON) tools/aws/regen_managed_policies.py
 
@@ -224,6 +227,12 @@ aws-data-check: ## CI gate: the vendored AWS data must match a fresh generation
 	@$(PYTHON) tools/aws/regen_dynamodb_shapes.py --check || { \
 		echo ""; \
 		echo "error: src/main/resources/aws/dynamodb-request-shapes.json is out of date."; \
+		echo "       Run 'make aws-data-sync' and commit the result."; \
+		exit 1; \
+	}
+	@$(PYTHON) tools/aws/regen_redshift_serverless_shapes.py --check || { \
+		echo ""; \
+		echo "error: src/main/resources/aws/redshift-serverless-request-shapes.json is out of date."; \
 		echo "       Run 'make aws-data-sync' and commit the result."; \
 		exit 1; \
 	}
