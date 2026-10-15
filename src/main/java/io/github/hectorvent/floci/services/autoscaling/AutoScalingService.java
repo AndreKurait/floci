@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.services.autoscaling;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
@@ -554,6 +556,65 @@ public class AutoScalingService {
         tagKeys.forEach(asg.getTagPropagateAtLaunch()::remove);
         groups.put(asgKey(region, asg.getAutoScalingGroupName()), asg);
     }
+
+    public TagPage describeTags(String region, List<TagFilter> filters, Integer maxRecords, String nextToken) {
+        int limit = maxRecords == null ? 50 : maxRecords;
+        if (limit < 1 || limit > 100) {
+            throw new AwsException("ValidationError", "MaxRecords must be between 1 and 100.", 400);
+        }
+        List<TagFilter> selectedFilters = new ArrayList<>();
+        for (TagFilter filter : filters == null ? List.<TagFilter>of() : filters) {
+            if (filter.name() == null || !Set.of("auto-scaling-group", "key", "value", "propagate-at-launch")
+                    .contains(filter.name().toLowerCase(Locale.ROOT))
+                    || filter.values() == null) {
+                throw new AwsException("ValidationError", "A valid tag filter name and values are required.", 400);
+            }
+            String name = filter.name().toLowerCase(Locale.ROOT);
+            List<String> values = filter.values();
+            if ("propagate-at-launch".equals(name)) {
+                values = values.stream().map(value -> {
+                    String normalized = value.trim().toLowerCase(Locale.ROOT);
+                    if (!"true".equals(normalized) && !"false".equals(normalized)) {
+                        throw new AwsException("ValidationError", "Boolean parameter can only be true or false", 400);
+                    }
+                    return normalized;
+                }).toList();
+            }
+            if (!values.isEmpty()) {
+                selectedFilters.add(new TagFilter(name, values));
+            }
+        }
+        List<TagDescription> matches = describeAutoScalingGroups(region, List.of()).stream()
+                .flatMap(group -> group.getTags().entrySet().stream().map(tag -> new TagDescription(
+                        group.getAutoScalingGroupName(), tag.getKey(), tag.getValue(),
+                        group.getTagPropagateAtLaunch().getOrDefault(tag.getKey(), false))))
+                .filter(tag -> selectedFilters.stream().allMatch(filter -> matchesTagFilter(tag, filter)))
+                .toList();
+        if (nextToken != null && nextToken.isBlank()) {
+            throw new AwsException("ValidationError", "The NextToken value is not valid.", 400);
+        }
+        PaginatedResult<TagDescription> page = Pagination.paginate(matches,
+                tag -> tag.resourceId() + "\u0000" + tag.key(), limit, nextToken, "autoscaling-tags",
+                token -> new AwsException("ValidationError", "The NextToken value is not valid.", 400));
+        return new TagPage(page.items(), page.nextToken());
+    }
+
+    private static boolean matchesTagFilter(TagDescription tag, TagFilter filter) {
+        String value = switch (filter.name()) {
+            case "auto-scaling-group" -> tag.resourceId();
+            case "key" -> tag.key();
+            case "value" -> tag.value();
+            case "propagate-at-launch" -> Boolean.toString(tag.propagateAtLaunch());
+            default -> throw new IllegalArgumentException("Unvalidated tag filter");
+        };
+        return filter.values().contains(value);
+    }
+
+    public record TagFilter(String name, List<String> values) {}
+
+    public record TagDescription(String resourceId, String key, String value, boolean propagateAtLaunch) {}
+
+    public record TagPage(List<TagDescription> tags, String nextToken) {}
 
     private AutoScalingGroup requireTaggableGroup(String region, String resourceId, String resourceType) {
         if (!"auto-scaling-group".equals(resourceType)) {

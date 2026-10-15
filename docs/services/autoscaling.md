@@ -10,7 +10,7 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 - `arn:aws:autoscaling:<region>:<account>:launchConfiguration:<uuid>:launchConfigurationName/<name>`
 - `arn:aws:autoscaling:<region>:<account>:scalingPolicy:<uuid>:autoScalingGroupName/<group>/policyName/<name>`
 
-## Supported Operations (47 total)
+## Supported Operations (53 total)
 
 ### Launch Configurations
 
@@ -60,6 +60,14 @@ For groups configured only with Availability Zones, Floci preserves its unpinned
 EC2 launch behavior and counts each member under the requested zone. This permits
 real zones outside the local subnet catalog, such as `us-east-1d`; the underlying
 EC2 instance can use a default subnet in a different zone.
+
+### Tags
+
+| Operation | Notes |
+|---|---|
+| `DescribeTags` | Returns stored group tags in the caller's account and region. Filters support `auto-scaling-group`, `key`, `value`, and `propagate-at-launch`, with AND across filters and OR across values. Names are case-insensitive; string values are case-sensitive. Boolean values accept case and surrounding whitespace. Empty `Values` ignores a valid filter; missing `Name` or `Values` raises `ValidationError`. `MaxRecords` defaults to 50 and accepts 1 to 100; `NextToken` continues the result |
+| `CreateOrUpdateTags` | Creates or updates tags and their `PropagateAtLaunch` values |
+| `DeleteTags` | Removes tags from the named group |
 
 ### Instance Management
 
