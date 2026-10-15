@@ -3408,6 +3408,7 @@ public class LambdaService implements ResourceProvider {
             String newSha256 = Base64.getEncoder().encodeToString(Digests.sha256(zipBytes));
             synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
                 fn.setCodeLocalPath(codePath.toAbsolutePath().normalize().toString());
+                fn.setHotReloadHostPath(null);
                 fn.setCodeSizeBytes(zipBytes.length);
                 if (newSha256 != null) {
                     fn.setCodeSha256(newSha256);
