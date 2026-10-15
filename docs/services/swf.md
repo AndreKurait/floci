@@ -89,6 +89,11 @@ fresh decision task. A closing decision must be last in the batch: a batch with 
 after it is rejected with `ValidationException` ("Close must be last decision in list") and
 no decision is applied.
 
+An empty decision response leaves the execution open and waits for a new event.
+It does not schedule another task merely because no activity, timer, or child is
+pending. A signal or outcome received during a started decision is retained and
+schedules one successor after that decision completes.
+
 ## Timeouts
 
 A background sweep expires timeouts and appends the matching event:

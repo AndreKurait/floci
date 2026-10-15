@@ -172,6 +172,38 @@ class SwfServiceTest {
                 "a second decider must not receive the same execution's task");
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void emptyDecisionCompletion_waitsForANewEventWithoutGrowingHistory(boolean omitDecisions) {
+        String runId = start("wf-idle");
+        SwfDecisionTask first = service.pollForDecisionTask(REGION, DOMAIN, "tl", "d1").orElseThrow();
+
+        service.respondDecisionTaskCompleted(first.getTaskToken(), omitDecisions ? null : List.of(), "waiting");
+        List<SwfHistoryEvent> history = service.getWorkflowExecutionHistory(
+                REGION, DOMAIN, "wf-idle", runId, false);
+        assertEquals(List.of("WorkflowExecutionStarted", "DecisionTaskScheduled",
+                "DecisionTaskStarted", "DecisionTaskCompleted"),
+                history.stream().map(SwfHistoryEvent::getEventType).toList());
+        assertEquals(first.getStartedEventId(), history.getLast().getAttributes().get("startedEventId"));
+        for (int i = 0; i < 5; i++) {
+            assertTrue(service.pollForDecisionTask(REGION, DOMAIN, "tl", "idle").isEmpty());
+            service.sweep();
+        }
+        SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-idle", runId);
+        assertTrue(execution.isOpen());
+        assertEquals("waiting", execution.getLatestExecutionContext());
+        assertEquals(4, execution.getEvents().size(), "idle polls must not manufacture history");
+        assertEquals(0, service.countPendingDecisionTasks(REGION, DOMAIN, "tl"));
+
+        service.signalWorkflowExecution(REGION, DOMAIN, "wf-idle", runId, "resume", null);
+        SwfDecisionTask resumed = service.pollForDecisionTask(REGION, DOMAIN, "tl", "d2").orElseThrow();
+        assertEquals(first.getStartedEventId(), resumed.getPreviousStartedEventId());
+        service.respondDecisionTaskCompleted(resumed.getTaskToken(),
+                List.of(new Decision("CompleteWorkflowExecution", Map.of("result", "done"))), null);
+        assertEquals("COMPLETED",
+                service.describeWorkflowExecution(REGION, DOMAIN, "wf-idle", runId).getCloseStatus());
+    }
+
     @Test
     void signalWhileDecisionOutstanding_defersTheNextTaskUntilTheCurrentOneCompletes() {
         String runId = start("wf-defer");
@@ -182,8 +214,40 @@ class SwfServiceTest {
                 "the signal must not create a concurrent decision task");
 
         service.respondDecisionTaskCompleted(first.getTaskToken(), List.of(), null);
-        assertTrue(service.pollForDecisionTask(REGION, DOMAIN, "tl", "d3").isPresent(),
-                "completing the outstanding task must release the deferred one");
+        SwfDecisionTask deferred = service.pollForDecisionTask(REGION, DOMAIN, "tl", "d3").orElseThrow();
+        assertEquals(first.getStartedEventId(), deferred.getPreviousStartedEventId());
+        service.respondDecisionTaskCompleted(deferred.getTaskToken(), List.of(), null);
+        assertTrue(service.pollForDecisionTask(REGION, DOMAIN, "tl", "d4").isEmpty(),
+                "the signal must schedule only one successor");
+    }
+
+    @Test
+    void activityAndTimerDuringDecision_deferOneSuccessorThenWait() {
+        String runId = start("wf-deferred-outcomes");
+        SwfDecisionTask first = service.pollForDecisionTask(REGION, DOMAIN, "tl", "d1").orElseThrow();
+        service.respondDecisionTaskCompleted(first.getTaskToken(), List.of(
+                new Decision("ScheduleActivityTask", Map.of("activityId", "act",
+                        "activityType", Map.of("name", "A", "version", "1"))),
+                new Decision("StartTimer", Map.of("timerId", "timer", "startToFireTimeout", "1"))), null);
+        service.signalWorkflowExecution(REGION, DOMAIN, "wf-deferred-outcomes", runId, "inspect", null);
+        SwfDecisionTask current = service.pollForDecisionTask(REGION, DOMAIN, "tl", "d2").orElseThrow();
+        SwfActivityTask activity = service.pollForActivityTask(REGION, DOMAIN, "act-tl", "worker").orElseThrow();
+        service.respondActivityTaskCompleted(activity.getTaskToken(), "done");
+        clock.advance(Duration.ofSeconds(2));
+        service.sweep();
+        assertTrue(service.pollForDecisionTask(REGION, DOMAIN, "tl", "d3").isEmpty(),
+                "outcomes must not create a task alongside the started one");
+
+        service.respondDecisionTaskCompleted(current.getTaskToken(), List.of(), null);
+        assertEquals(1, service.countPendingDecisionTasks(REGION, DOMAIN, "tl"));
+        List<SwfHistoryEvent> history = service.getWorkflowExecutionHistory(
+                REGION, DOMAIN, "wf-deferred-outcomes", runId, false);
+        assertTrue(history.stream().anyMatch(event -> "ActivityTaskCompleted".equals(event.getEventType())));
+        assertTrue(history.stream().anyMatch(event -> "TimerFired".equals(event.getEventType())));
+        SwfDecisionTask deferred = service.pollForDecisionTask(REGION, DOMAIN, "tl", "d4").orElseThrow();
+        assertEquals(current.getStartedEventId(), deferred.getPreviousStartedEventId());
+        service.respondDecisionTaskCompleted(deferred.getTaskToken(), List.of(), null);
+        assertTrue(service.pollForDecisionTask(REGION, DOMAIN, "tl", "d5").isEmpty());
     }
 
     @Test
@@ -1350,7 +1414,10 @@ class SwfServiceTest {
                 if (workflowId.equals(task.getWorkflowId())) {
                     return task;
                 }
-                // Release a sibling's task so its own poller can claim it.
+                // Explicitly wake a sibling for its own poller. An empty completion
+                // alone correctly leaves that execution waiting for a new event.
+                service.signalWorkflowExecution(REGION, DOMAIN, task.getWorkflowId(),
+                        task.getRunId(), "test-poller-handoff", null);
                 service.respondDecisionTaskCompleted(task.getTaskToken(), List.of(), null);
             }
             // Back off after a steal too, so the sibling's own poller gets a window to
