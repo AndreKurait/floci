@@ -459,6 +459,7 @@ class ContainerLauncherTest {
 
     @Test
     void launchFunction_appliesConfiguredDockerFlagsToRealContainer() throws Exception {
+        lenient().when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.4"));
         when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
                 "--env NODE_EXTRA_CA_CERTS=/opt/certs/root.pem "
                         + "--volume /tmp/certs:/opt/certs:ro --add-host api.local:host-gateway "
@@ -482,7 +483,7 @@ class ContainerLauncherTest {
         assertEquals(Map.of(5050, 5050), spec.portBindings());
         assertEquals(List.of(5050), spec.loopbackPortBindings());
         assertTrue(spec.extraHosts().contains("api.local:host-gateway"));
-        assertTrue(spec.dnsServers().contains("1.1.1.1"));
+        assertEquals(List.of("1.1.1.1"), spec.dnsServers());
         assertEquals("debug", spec.labels().get("purpose"));
         assertEquals("/opt/certs", spec.binds().getFirst().getVolume().getPath());
         assertEquals("/tmp/certs", spec.binds().getFirst().getPath());
