@@ -1371,14 +1371,10 @@ class ContainerLauncherTest {
         doThrow(new IllegalStateException("fixture copy failed"))
                 .when(dockerClient).copyArchiveToContainerCmd("helper-123");
 
-        long original = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+        withLoweredCodeVolumeThreshold(() -> {
             RuntimeException failure = assertThrows(RuntimeException.class, () -> launcher.launch(fn));
             assertTrue(failure.getMessage().contains("fixture copy failed"));
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = original;
-        }
+        });
 
         InOrder order = inOrder(lifecycleManager, dockerClient);
         order.verify(lifecycleManager).startCreated(eq("helper-123"), any());
@@ -2258,4 +2254,14 @@ class ContainerLauncherTest {
         assertEquals(List.of("/opt/extensions/lambda-adapter", "/opt/extensions/otel-collector"),
                 capturedLaunchPaths(launchCmds));
     }
+    private static void withLoweredCodeVolumeThreshold(Runnable action) {
+        long original = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            action.run();
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = original;
+        }
+    }
+
 }
