@@ -211,7 +211,7 @@ class ElbV2PreserveHostHeaderIntegrationTest {
                             .setURI("/stream"))
                     .toCompletionStage()
                     .toCompletableFuture()
-                    .get(10, TimeUnit.SECONDS);
+                    .get(2, TimeUnit.SECONDS);
             CompletableFuture<Buffer> bodyFuture = new CompletableFuture<>();
             CompletableFuture<HttpClientResponse> responseFuture = request.response()
                     .onSuccess(response -> response.bodyHandler(bodyFuture::complete))
@@ -222,10 +222,10 @@ class ElbV2PreserveHostHeaderIntegrationTest {
             request.write(Buffer.buffer("hello "));
             request.end(Buffer.buffer("world"));
 
-            HttpClientResponse response = responseFuture.get(10, TimeUnit.SECONDS);
+            HttpClientResponse response = responseFuture.get(2, TimeUnit.SECONDS);
             assertEquals(200, response.statusCode());
             assertEquals("11", response.getHeader("X-Received-Content-Length"));
-            assertEquals("stream-hello world", bodyFuture.get(10, TimeUnit.SECONDS).toString());
+            assertEquals("stream-hello world", bodyFuture.get(2, TimeUnit.SECONDS).toString());
         } finally {
             client.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
         }
