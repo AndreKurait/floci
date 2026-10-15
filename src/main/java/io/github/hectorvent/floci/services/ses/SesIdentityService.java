@@ -45,7 +45,7 @@ import java.util.concurrent.ConcurrentHashMap;
 @ApplicationScoped
 public class SesIdentityService implements SesTaggable {
 
-    static final String DKIM_SIGNING_HOSTED_ZONE = "dkim.amazonses.com";
+    public static final String DKIM_SIGNING_HOSTED_ZONE = "dkim.amazonses.com";
 
     private static final Logger LOG = Logger.getLogger(SesIdentityService.class);
 

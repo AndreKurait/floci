@@ -464,6 +464,8 @@ the stored or returned value. A client that signs in with `USER_PASSWORD_AUTH`, 
 
 ## User Attribute Update Verification
 
+`UpdateUserAttributes` and `AdminUpdateUserAttributes` delete attributes submitted with a blank value, including whitespace-only values. Deleting an email or phone number also removes its verified flag and pending value. Admin updates invalidate the matching pending verification code.
+
 `CreateUserPool`, `UpdateUserPool`, and `DescribeUserPool` support
 `UserAttributeUpdateSettings.AttributesRequireVerificationBeforeUpdate` for
 `email` and `phone_number`.
