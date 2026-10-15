@@ -880,6 +880,10 @@ being mounted as an empty local volume.
     `8.8.8.8`, `8.8.4.4`) after its own IP on each spawned container's DNS list,
     so name resolution still works if the embedded forwarder cannot answer.
 
+    Explicit `--dns` flags replace those automatic resolvers. In that case,
+    the injected `AWS_ENDPOINT_URL` uses the reachable Docker host address
+    instead of a hostname that requires Floci's resolver.
+
     Tune or disable this for offline / locked-down networks where those resolvers
     are blocked:
 
