@@ -539,11 +539,12 @@ public class NativeDynamoDbJsonHandler {
     private static final Set<String> VALID_RETURN_ITEM_COLLECTION_METRICS = Set.of("SIZE", "NONE");
 
     private static String returnConsumedCapacityError(JsonNode request) {
-        String value = request.has("ReturnConsumedCapacity") ? request.get("ReturnConsumedCapacity").asText() : null;
-        if (value == null || VALID_RETURN_CONSUMED_CAPACITY.contains(value)) {
+        // DynamoDB treats a JSON null here as an absent member.
+        JsonNode value = request.get("ReturnConsumedCapacity");
+        if (value == null || value.isNull() || VALID_RETURN_CONSUMED_CAPACITY.contains(value.asText())) {
             return null;
         }
-        return "Value '" + value + "' at 'returnConsumedCapacity' failed to satisfy constraint: "
+        return "Value '" + value.asText() + "' at 'returnConsumedCapacity' failed to satisfy constraint: "
                 + "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
     }
 
@@ -561,11 +562,7 @@ public class NativeDynamoDbJsonHandler {
                 ? request.get("ExpressionAttributeValues") : null;
 
         List<String> validationErrors = new ArrayList<>();
-        String rcc = request.has("ReturnConsumedCapacity") ? request.get("ReturnConsumedCapacity").asText() : null;
-        if (rcc != null && !VALID_RETURN_CONSUMED_CAPACITY.contains(rcc)) {
-            validationErrors.add("Value '" + rcc + "' at 'returnConsumedCapacity' failed to satisfy constraint: "
-                    + "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]");
-        }
+        addReturnConsumedCapacityError(request, validationErrors);
         String ricm = request.has("ReturnItemCollectionMetrics") ? request.get("ReturnItemCollectionMetrics").asText() : null;
         if (ricm != null && !VALID_RETURN_ITEM_COLLECTION_METRICS.contains(ricm)) {
             validationErrors.add("Value '" + ricm + "' at 'returnItemCollectionMetrics' failed to satisfy constraint: "
@@ -650,12 +647,7 @@ public class NativeDynamoDbJsonHandler {
         }
 
         // Validate enums before table lookup
-        String rccGet = request.has("ReturnConsumedCapacity") ? request.get("ReturnConsumedCapacity").asText() : null;
-        if (rccGet != null && !VALID_RETURN_CONSUMED_CAPACITY.contains(rccGet)) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + rccGet + "' at 'returnConsumedCapacity' failed to satisfy constraint: "
-                    + "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]", 400);
-        }
+        requireValidReturnConsumedCapacity(request);
 
         // Validate ProjectionExpression syntax and reserved words before item lookup
         if (projectionExpression != null) {
@@ -701,11 +693,7 @@ public class NativeDynamoDbJsonHandler {
 
         // Validate ReturnValues + ReturnConsumedCapacity together
         List<String> delValidationErrors = new ArrayList<>();
-        String rccDel = request.has("ReturnConsumedCapacity") ? request.get("ReturnConsumedCapacity").asText() : null;
-        if (rccDel != null && !VALID_RETURN_CONSUMED_CAPACITY.contains(rccDel)) {
-            delValidationErrors.add("Value '" + rccDel + "' at 'returnConsumedCapacity' failed to satisfy constraint: "
-                    + "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]");
-        }
+        addReturnConsumedCapacityError(request, delValidationErrors);
         if (!VALID_RETURN_VALUES_DELETE.contains(returnValues)) {
             delValidationErrors.add("Value '" + returnValues + "' at 'returnValues' failed to satisfy constraint: "
                     + "Member must satisfy enum value set: [NONE, ALL_OLD]");
@@ -778,19 +766,13 @@ public class NativeDynamoDbJsonHandler {
 
         // UpdateItem stops at the first invalid enum and reports one error, unlike PutItem
         // and DeleteItem which aggregate.
-        String rccUpd = request.has("ReturnConsumedCapacity") ? request.get("ReturnConsumedCapacity").asText() : null;
         if (!VALID_RETURN_VALUES_UPDATE.contains(returnValues)) {
             throw new AwsException("ValidationException",
                     "1 validation error detected: Value '" + returnValues + "' at 'returnValues' "
                     + "failed to satisfy constraint: "
                     + "Member must satisfy enum value set: [NONE, ALL_OLD, ALL_NEW, UPDATED_OLD, UPDATED_NEW]", 400);
         }
-        if (rccUpd != null && !VALID_RETURN_CONSUMED_CAPACITY.contains(rccUpd)) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + rccUpd + "' at 'returnConsumedCapacity' "
-                    + "failed to satisfy constraint: "
-                    + "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]", 400);
-        }
+        requireValidReturnConsumedCapacity(request);
         DynamoDbExpressionSize.checkWrite(updateExpression, "UpdateExpression");
         DynamoDbExpressionSize.checkWrite(conditionExpression, "ConditionExpression");
         DynamoDbAttributeValueValidator.requireNestingWithinLimit(exprAttrValues);
@@ -1375,15 +1357,12 @@ public class NativeDynamoDbJsonHandler {
         requireSearchVectorsMember(request, "IndexName");
         String tableName = request.path("TableName").asText();
         String indexName = request.get("IndexName").asText();
-        String rccSearch = request.has("ReturnConsumedCapacity")
-                ? request.get("ReturnConsumedCapacity").asText() : null;
-        if (rccSearch != null && !VALID_RETURN_CONSUMED_CAPACITY.contains(rccSearch)) {
+        String rccSearchError = returnConsumedCapacityError(request);
+        if (rccSearchError != null) {
             // No "N validation errors detected" envelope here, unlike every other operation.
-            throw new AwsException("ValidationException",
-                    "Value '" + rccSearch + "' at 'returnConsumedCapacity' "
-                    + "failed to satisfy constraint: Member must satisfy enum value set: "
-                    + "[INDEXES, TOTAL, NONE]", 400);
+            throw new AwsException("ValidationException", rccSearchError, 400);
         }
+        String rccSearch = request.path("ReturnConsumedCapacity").asText("NONE");
         requireSearchVectorsMember(request, "TopK");
         int topK = request.get("TopK").asInt();
         if (topK < 1) {
@@ -1425,7 +1404,7 @@ public class NativeDynamoDbJsonHandler {
             searchResults.add(searchResult);
         }
         response.set("SearchResults", searchResults);
-        if (rccSearch != null && !"NONE".equals(rccSearch)) {
+        if (!"NONE".equals(rccSearch)) {
             ObjectNode consumedCapacity = objectMapper.createObjectNode();
             consumedCapacity.put("VectorSearchRequestBytes", VECTOR_SEARCH_REQUEST_BYTES);
             response.set("ConsumedCapacity", consumedCapacity);
@@ -1525,12 +1504,7 @@ public class NativeDynamoDbJsonHandler {
 
         // The per-table write cost needs the stored images from before the batch runs.
         var returnCCBatch = request.path("ReturnConsumedCapacity").asText("NONE");
-        if (!VALID_RETURN_CONSUMED_CAPACITY.contains(returnCCBatch)) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + returnCCBatch
-                    + "' at 'returnConsumedCapacity' failed to satisfy constraint: "
-                    + "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]", 400);
-        }
+        requireValidReturnConsumedCapacity(request);
         Map<String, DynamoDbWriteCapacity.Cost> costs = null;
         if (!"NONE".equals(returnCCBatch)) {
             costs = new LinkedHashMap<>();
@@ -2018,10 +1992,9 @@ public class NativeDynamoDbJsonHandler {
     }
 
     private static void addReturnConsumedCapacityError(JsonNode request, List<String> validationErrors) {
-        String returnCC = request.has("ReturnConsumedCapacity") ? request.get("ReturnConsumedCapacity").asText() : null;
-        if (returnCC != null && !VALID_RETURN_CONSUMED_CAPACITY.contains(returnCC)) {
-            validationErrors.add("Value '" + returnCC + "' at 'returnConsumedCapacity' failed to satisfy constraint: "
-                    + "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]");
+        String error = returnConsumedCapacityError(request);
+        if (error != null) {
+            validationErrors.add(error);
         }
     }
 

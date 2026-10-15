@@ -55,8 +55,12 @@ reports or CloudWatch delivery logs.
 
 `AddPermission` and `RemovePermission` edit the topic's `Policy` attribute the way AWS does: the
 label becomes the statement's `Sid` and each account becomes its `root` principal. A topic with no
-policy set starts from the default one AWS gives a new topic. Floci stores the policy and returns
-it from `GetTopicAttributes`, but does not evaluate topic policies when authorizing requests.
+policy set starts from the default one AWS gives a new topic, and `GetTopicAttributes` returns it.
+Under IAM enforcement the topic policy decides what AWS services may publish to the topic, such as
+[SES's event destinations and notifications](ses.md#iam-enforcement), and takes part in an IAM
+caller's request the way any [resource-based policy](iam.md#resource-based-policies) does when the
+request names the topic in a JSON-protocol body. A Query-protocol request carries the topic in its
+form body, which enforcement does not read yet, so the topic policy plays no part in it.
 
 ## SMS sandbox and opt-out
 

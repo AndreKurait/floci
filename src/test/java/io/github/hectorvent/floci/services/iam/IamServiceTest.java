@@ -397,6 +397,27 @@ class IamServiceTest {
     }
 
     @Test
+    void callerArnsSayWhetherAPermissionsBoundaryIsAttached() {
+        IamService service = iamService(false);
+        String boundaryArn = service.createPolicy("bound", "/", null, ALL_S3, null).getArn();
+        service.createUser("alice", "/");
+        String aliceKey = service.createAccessKey("alice").getAccessKeyId();
+        service.createRole("Worker", "/", "{}", null, 3600, null);
+        service.registerSession("ASIABOUNDEDROLE", "secret", "token",
+                "arn:aws:iam::000000000000:role/Worker", Instant.parse("2100-01-01T00:00:00Z"), null,
+                "000000000000", "s", "AROAWORKER:s");
+
+        assertFalse(service.resolveCallerArns(aliceKey).orElseThrow().permissionsBoundary());
+        assertFalse(service.resolveCallerArns("ASIABOUNDEDROLE").orElseThrow().permissionsBoundary());
+
+        service.putUserPermissionsBoundary("alice", boundaryArn);
+        service.putRolePermissionsBoundary("Worker", boundaryArn);
+
+        assertTrue(service.resolveCallerArns(aliceKey).orElseThrow().permissionsBoundary());
+        assertTrue(service.resolveCallerArns("ASIABOUNDEDROLE").orElseThrow().permissionsBoundary());
+    }
+
+    @Test
     void sessionExpiryFollowsTheInjectedClock() {
         MutableClock clock = new MutableClock();
         IamService service = new IamService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),

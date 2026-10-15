@@ -54,7 +54,8 @@ class AcmIntegrationTest {
         .then()
             .statusCode(400)
             .body("__type", equalTo("ValidationException"))
-            .body("message", containsString("subjectAlternativeNames"));
+            .body("message", equalTo("1 validation error detected: Value '[]' at 'subjectAlternativeNames' "
+                + "failed to satisfy constraint: Member must have length greater than or equal to 1"));
     }
 
     @Test

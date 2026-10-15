@@ -77,9 +77,8 @@ class SchedulerStepFunctionsIntegrationTest {
     void recurringScheduleStartsOneExecutionPerOccurrence() {
         String stateMachineArn = createPassStateMachine();
         String scheduleName = uniqueName("sfn-rate");
-        harness.createSchedule(scheduleName, "rate(1 minute)", "ENABLED", stateMachineArn, "{\"kind\":\"recurring\"}");
-        Schedule schedule = schedulerService.getSchedule(scheduleName, null, REGION);
-        Instant firstFire = schedule.getCreationDate().plus(61, ChronoUnit.SECONDS);
+        Instant firstFire = harness.createRecurringSchedule(scheduleName, "rate(1 minute)", stateMachineArn,
+                "{\"kind\":\"recurring\"}");
         ScheduleDispatcher dispatcher = harness.dispatcherFor(scheduleName);
 
         dispatcher.tick(firstFire);
@@ -104,10 +103,8 @@ class SchedulerStepFunctionsIntegrationTest {
     void stepFunctionsDeleteScheduleStopsFutureOccurrence() {
         String targetStateMachineArn = createPassStateMachine();
         String scheduleName = uniqueName("sfn-delete");
-        harness.createSchedule(scheduleName, "rate(1 minute)", "ENABLED",
+        Instant fireAt = harness.createRecurringSchedule(scheduleName, "rate(1 minute)",
                 targetStateMachineArn, "{\"deleted\":false}");
-        Schedule schedule = schedulerService.getSchedule(scheduleName, null, REGION);
-        Instant fireAt = schedule.getCreationDate().plus(61, ChronoUnit.SECONDS);
         String deleterStateMachineArn = harness.createStateMachine(uniqueName("schedule-deleter"), """
                 {
                   "QueryLanguage": "JSONata",

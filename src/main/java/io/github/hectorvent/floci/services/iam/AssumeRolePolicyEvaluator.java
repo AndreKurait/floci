@@ -21,9 +21,10 @@ import java.util.regex.Pattern;
  * <p>Trust policies are principal-centric and carry no {@code Resource} element, so they cannot be
  * evaluated by {@link IamPolicyEvaluator} (which is identity/resource oriented). This focused
  * evaluator matches each statement's {@code Action} and {@code Principal} against the caller, hands
- * its {@code Condition} to {@link IamPolicyEvaluator#conditionMatches} with the request's context,
- * and applies AWS precedence: an explicit {@code Deny} wins, otherwise a matching {@code Allow}
- * grants.
+ * its {@code Condition} to {@link IamPolicyEvaluator#conditionMatches} with the request's context
+ * and the document's own {@code Version}, which is what decides whether a {@code ${...}} in a
+ * condition value is a policy variable, and applies AWS precedence: an explicit {@code Deny} wins,
+ * otherwise a matching {@code Allow} grants.
  *
  * <p>Only AWS principals are modeled (account-root, bare account id, exact principal ARN, and
  * {@code "*"}); {@code Service} and {@code Federated} principals never match a SigV4 caller and are
@@ -94,16 +95,18 @@ public class AssumeRolePolicyEvaluator {
         if (trustPolicyDocument == null || trustPolicyDocument.isBlank()) {
             return TrustDecision.NEUTRAL;
         }
-        JsonNode statements;
+        JsonNode root;
         try {
-            statements = objectMapper.readTree(trustPolicyDocument).path("Statement");
+            root = objectMapper.readTree(trustPolicyDocument);
         } catch (Exception e) {
             LOG.warnv("Failed to parse trust policy: {0}", e.getMessage());
             return TrustDecision.NEUTRAL;
         }
+        JsonNode statements = root.path("Statement");
         if (!isWellFormed(statements)) {
             return TrustDecision.NEUTRAL;
         }
+        String version = root.path("Version").asText(null);
         Map<String, List<String>> context = new HashMap<>(requestContext);
         if (principalArn != null) {
             context.put("aws:PrincipalArn", List.of(principalArn));
@@ -111,7 +114,8 @@ public class AssumeRolePolicyEvaluator {
         Iterable<JsonNode> statementList = statements.isArray() ? statements : List.of(statements);
         TrustDecision decision = TrustDecision.NEUTRAL;
         for (JsonNode stmt : statementList) {
-            TrustDecision match = evaluateStatement(stmt, callerArn, principalArn, callerAccount, context);
+            TrustDecision match =
+                    evaluateStatement(stmt, callerArn, principalArn, callerAccount, context, version);
             if (match == TrustDecision.EXPLICIT_DENY) {
                 return TrustDecision.EXPLICIT_DENY;
             }
@@ -165,16 +169,18 @@ public class AssumeRolePolicyEvaluator {
         if (trustPolicyDocument == null || trustPolicyDocument.isBlank()) {
             return false;
         }
-        JsonNode statements;
+        JsonNode root;
         try {
-            statements = objectMapper.readTree(trustPolicyDocument).path("Statement");
+            root = objectMapper.readTree(trustPolicyDocument);
         } catch (Exception e) {
             LOG.warnv("Failed to parse trust policy: {0}", e.getMessage());
             return false;
         }
+        JsonNode statements = root.path("Statement");
         if (!isWellFormed(statements)) {
             return false;
         }
+        String version = root.path("Version").asText(null);
         Map<String, List<String>> context = new HashMap<>();
         if (sourceArn != null) {
             context.put("aws:SourceArn", List.of(sourceArn));
@@ -185,14 +191,14 @@ public class AssumeRolePolicyEvaluator {
         boolean allow = false;
         if (statements.isArray()) {
             for (JsonNode statement : statements) {
-                switch (evaluateServiceStatement(statement, servicePrincipal, context)) {
+                switch (evaluateServiceStatement(statement, servicePrincipal, context, version)) {
                     case DENY -> { return false; }
                     case ALLOW -> allow = true;
                     case NO_MATCH -> { }
                 }
             }
         } else if (statements.isObject()) {
-            return evaluateServiceStatement(statements, servicePrincipal, context) == Match.ALLOW;
+            return evaluateServiceStatement(statements, servicePrincipal, context, version) == Match.ALLOW;
         }
         return allow;
     }
@@ -244,7 +250,8 @@ public class AssumeRolePolicyEvaluator {
     }
 
     private TrustDecision evaluateStatement(JsonNode stmt, String callerArn, String principalArn,
-                                            String callerAccount, Map<String, List<String>> context) {
+                                            String callerAccount, Map<String, List<String>> context,
+                                            String policyVersion) {
         if (!actionApplies(stmt)) {
             return TrustDecision.NEUTRAL;
         }
@@ -252,7 +259,7 @@ public class AssumeRolePolicyEvaluator {
         if (principal == PrincipalMatch.NONE) {
             return TrustDecision.NEUTRAL;
         }
-        if (!policyEvaluator.conditionMatches(stmt.get("Condition"), context)) {
+        if (!policyEvaluator.conditionMatches(stmt.get("Condition"), context, policyVersion)) {
             return TrustDecision.NEUTRAL;
         }
         return switch (effectOf(stmt)) {
@@ -270,11 +277,11 @@ public class AssumeRolePolicyEvaluator {
     }
 
     private Match evaluateServiceStatement(JsonNode stmt, String servicePrincipal,
-                                           Map<String, List<String>> context) {
+                                           Map<String, List<String>> context, String policyVersion) {
         if (!actionApplies(stmt) || !matchesServicePrincipal(stmt.get("Principal"), servicePrincipal)) {
             return Match.NO_MATCH;
         }
-        if (!policyEvaluator.conditionMatches(stmt.get("Condition"), context)) {
+        if (!policyEvaluator.conditionMatches(stmt.get("Condition"), context, policyVersion)) {
             return Match.NO_MATCH;
         }
         return effectOf(stmt);

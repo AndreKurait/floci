@@ -100,6 +100,15 @@ class LambdaTaskAuthorizerTest {
     }
 
     @Test
+    void aGrantToTheRolesAccountIsTheFunctionsHalfOnlySoTheRoleNeedsItsOwnPermission() {
+        roleWithPolicies(READ_OBJECTS);
+        functionPolicy(FUNCTION, FUNCTION_ACCOUNT, grant("{\"AWS\":\"arn:aws:iam::" + SFN_ACCOUNT + ":root\"}", FUNCTION));
+
+        assertEquals(denied(FUNCTION, "because no identity-based policy allows the lambda:InvokeFunction action"),
+                authorizer.refusal(ROLE, FUNCTION));
+    }
+
+    @Test
     void aDenyInTheRolesPolicyRefusesAGrantedFunction() {
         roleWithPolicies(INVOKE_ANYTHING, """
                 {"Version":"2012-10-17","Statement":[

@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.iam.IamService.PresignedScope;
 import io.github.hectorvent.floci.services.iam.RequestPrincipal;
 import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
 import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
+import io.github.hectorvent.floci.services.iam.ResourcePolicyProviders;
 import io.github.hectorvent.floci.services.iam.ScpProvider;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
@@ -287,6 +288,13 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if (!config.services().iam().enforcementEnabled()) {
             return;
         }
+        ProtocolClaim rpcV2Route = rpcV2RouteClaim(ctx);
+        if (rpcV2Route != null) {
+            // The claim filter runs before routing and can leave a call this endpoint serves
+            // unclaimed, as an unrecognised smithy-protocol value does. Every check below that reads
+            // the claim has to see the call that runs: unclaimed, an unsigned one would pass as REST.
+            ctx.setProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY, rpcV2Route);
+        }
 
         String auth = ctx.getHeaderString("Authorization");
         boolean emptyHeader = auth != null && auth.isBlank();
@@ -408,7 +416,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         }
 
         List<String> resources = resolveResourceArns(credentialScope,
-                arnBuilder.buildResources(credentialScope, ctx, region, accountId));
+                "logs".equals(credentialScope)
+                        ? arnBuilder.buildLogStreamResources(action, ctx, region, accountId, requestPartition())
+                        : arnBuilder.buildResources(credentialScope, ctx, region, accountId));
 
         Optional<PresignedScope> presignedScope = iamService.presignedScope(akid);
         if (presignedScope.isPresent()) {
@@ -546,8 +556,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     /**
      * Resolves both the IAM namespace and action from the service that will actually handle the
-     * request. Query traffic shares the dispatch resolver with {@link AwsQueryController}; REST
-     * traffic uses the JAX-RS resource class that won route matching.
+     * request. Query traffic shares the dispatch resolver with {@link AwsQueryController}; an RPC v2
+     * call takes the service and operation its route dispatches; REST traffic uses the JAX-RS
+     * resource class that won route matching.
      */
     private ResolvedAuthorization resolveAuthorization(String auth, String claimedScope,
                                                         ContainerRequestContext ctx) {
@@ -566,6 +577,18 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                     IamAuthorizedActions.actionFor(servingScope, queryAction));
         }
 
+        // Read from the route rather than the claim: a path the claim filter takes for RPC v2 can
+        // reach another route, and an X-Amz-Target header names an operation this endpoint ignores.
+        ProtocolClaim rpcV2Route = rpcV2RouteClaim(ctx);
+        if (rpcV2Route != null) {
+            if (rpcV2Route.service() == null) {
+                return new ResolvedAuthorization(claimedScope, null); // no service: the endpoint answers 404
+            }
+            String servingScope = iamServiceScope(rpcV2Route.service(), claimedScope);
+            return new ResolvedAuthorization(servingScope,
+                    IamAuthorizedActions.actionFor(servingScope, rpcV2Route.operation()));
+        }
+
         ResolvedAuthorization routeAuthorization = restRouteAuthorization(ctx);
         if (routeAuthorization != null) {
             return routeAuthorization;
@@ -577,6 +600,25 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         return new ResolvedAuthorization(servingScope, rest
                 ? actionRegistry.resolveRoute(servingScope, ctx)
                 : actionRegistry.resolve(servingScope, ctx));
+    }
+
+    /**
+     * The claim of a call JAX-RS routed to the Smithy RPC v2 endpoint, made from the service and
+     * operation in the route's path parameters, which are what that endpoint dispatches. Null for
+     * any other request.
+     */
+    private ProtocolClaim rpcV2RouteClaim(ContainerRequestContext ctx) {
+        if (resourceInfo == null || !AwsJsonCborController.class.equals(resourceInfo.getResourceClass())) {
+            return null;
+        }
+        MultivaluedMap<String, String> parameters = ctx.getUriInfo().getPathParameters();
+        String serviceId = parameters.getFirst(AwsJsonCborController.RPC_V2_SERVICE_PARAMETER);
+        String operation = parameters.getFirst(AwsJsonCborController.RPC_V2_OPERATION_PARAMETER);
+        if (serviceId == null || operation == null) {
+            return null;
+        }
+        return new ProtocolClaim(WireProtocol.RPCV2_CBOR, catalog.byCborSdkServiceId(serviceId).orElse(null),
+                operation, null);
     }
 
     /**
@@ -710,6 +752,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             for (Map<String, List<String>> targetContext : targetContexts) {
                 Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
                         targetContext, resource, region, accountId, resourceOwnerAccountId);
+                if ("logs".equals(credentialScope)
+                        && ("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action))) {
+                    effectiveContext.put("aws:ResourceAccount", List.of(accountId));
+                }
                 if ("dynamodb".equals(credentialScope)) {
                     Map<String, List<String>> batchContext =
                             conditionContextResolver.dynamoDbBatchConditionContext(action, ctx, resource);
@@ -1177,17 +1223,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     }
 
     private List<ResourcePolicyProvider.ResourcePolicy> resolveResourcePolicies(String credentialScope, String resourceArn) {
-        if (resourcePolicyProviders == null || resourcePolicyProviders.isUnsatisfied()) {
-            return List.of();
-        }
-        List<ResourcePolicyProvider.ResourcePolicy> policies = new ArrayList<>();
-        for (ResourcePolicyProvider provider : resourcePolicyProviders) {
-            List<ResourcePolicyProvider.ResourcePolicy> providerPolicies = provider.getResourcePolicies(credentialScope, resourceArn);
-            if (providerPolicies != null && !providerPolicies.isEmpty()) {
-                policies.addAll(providerPolicies);
-            }
-        }
-        return policies;
+        return ResourcePolicyProviders.policiesFor(resourcePolicyProviders, credentialScope, resourceArn);
     }
 
     /**

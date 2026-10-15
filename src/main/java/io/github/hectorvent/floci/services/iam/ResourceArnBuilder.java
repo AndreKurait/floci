@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.iam;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
@@ -14,6 +15,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.core.MediaType;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -43,6 +45,9 @@ public class ResourceArnBuilder {
 
     /** What a service-linked role deletion task identifier starts with; see its resolver. */
     private static final String DELETION_TASK_PREFIX = "task" + ServiceLinkedRoles.PATH;
+
+    /** Reads the CBOR bodies the RPC v2 and {@code x-amz-cbor-1.1} paths carry. */
+    private static final ObjectMapper CBOR_MAPPER = new ObjectMapper(new CBORFactory());
 
     private final ObjectMapper objectMapper;
     /**
@@ -90,6 +95,23 @@ public class ResourceArnBuilder {
             case "iam"            -> buildIamArns(ctx, region, accountId);
             default               -> List.of("*");
         };
+    }
+
+    /** Uses the serving operation, not an independently parsed target header. */
+    public List<String> buildLogStreamResources(String action, ContainerRequestContext ctx,
+                                                 String region, String accountId, String partition) {
+        if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action))) {
+            return List.of("*");
+        }
+        JsonNode body = readJsonBody(ctx);
+        if (body == null) {
+            return List.of("*");
+        }
+        // Match the handler's coercion and raw names, including whitespace and numeric values.
+        String group = body.path("logGroupName").asText();
+        String stream = body.path("logStreamName").asText();
+        return List.of(new AwsArnUtils.Arn(partition, "logs", region, accountId,
+                "log-group:" + group + ":log-stream:" + stream).toString());
     }
 
     // ── IAM ─────────────────────────────────────────────────────────────────────
@@ -929,12 +951,24 @@ public class ResourceArnBuilder {
             return null;
         }
         try {
-            JsonNode node = objectMapper.readTree(body);
+            JsonNode node = (isCbor(ctx.getMediaType()) ? CBOR_MAPPER : objectMapper).readTree(body);
             ctx.setProperty("floci.bufferedJsonBody", node);
             return node;
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * A CBOR body, which names its resources in the same members a JSON body does. Both CBOR
+     * content types arrive as {@code application/cbor}: {@code AwsCborContentTypeFilter} rewrites
+     * {@code x-amz-cbor-1.1} before routing.
+     */
+    private static boolean isCbor(MediaType mediaType) {
+        return mediaType != null
+                && "application".equalsIgnoreCase(mediaType.getType())
+                && ("cbor".equalsIgnoreCase(mediaType.getSubtype())
+                        || "x-amz-cbor-1.1".equalsIgnoreCase(mediaType.getSubtype()));
     }
 
     private String extractSegmentAfter(String path, String segment) {

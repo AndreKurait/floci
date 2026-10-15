@@ -1193,6 +1193,151 @@ class CognitoServiceTest {
         assertEquals(30, client.getRefreshTokenValidity());
     }
 
+    // =========================================================================
+    // Issue #5147: token validity within AWS's limits
+    // =========================================================================
+
+    /**
+     * AWS: access and ID tokens "Must be set to a value between 5 minutes and 1 day", refresh tokens
+     * "between 60 minutes and 3,650 days", in hours for access and ID tokens and days for refresh tokens
+     * when TokenValidityUnits names no unit.
+     */
+    @ParameterizedTest
+    @CsvSource({
+            "AccessToken, 1, minutes",
+            "AccessToken, 299, seconds",
+            "AccessToken, 25, ",
+            "IdToken, 4, minutes",
+            "IdToken, 1441, minutes",
+            "IdToken, 2, days",
+            "RefreshToken, 20, minutes",
+            "RefreshToken, 3599, seconds",
+            "RefreshToken, 3651, ",
+            "RefreshToken, 87601, hours",
+    })
+    void createUserPoolClientRejectsTokenValidityOutsideAwsLimits(String token, int validity, String unit) {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "ClientPool"), "us-east-1");
+
+        AwsException exception = assertThrows(AwsException.class,
+                () -> clientWithTokenValidity(pool, token, validity, unit));
+
+        assertEquals("InvalidParameterException", exception.getErrorCode());
+        assertEquals("Invalid range for token validity.", exception.getMessage());
+    }
+
+    /** The limits are inclusive, and a refresh token validity of 0 is AWS's 30-day default in any unit. */
+    @ParameterizedTest
+    @CsvSource({
+            "AccessToken, 5, minutes",
+            "AccessToken, 300, seconds",
+            "AccessToken, 24, ",
+            "IdToken, 1440, minutes",
+            "IdToken, 1, days",
+            "RefreshToken, 60, minutes",
+            "RefreshToken, 1, hours",
+            "RefreshToken, 3650, ",
+            "RefreshToken, 0, minutes",
+    })
+    void createUserPoolClientAcceptsTokenValidityAtAwsLimits(String token, int validity, String unit) {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "ClientPool"), "us-east-1");
+
+        assertNotNull(clientWithTokenValidity(pool, token, validity, unit).getClientId());
+    }
+
+    /**
+     * An update is checked as it is sent: a token validity or unit it omits is reset to its default rather
+     * than kept, so a units-only change no longer stretches the stored validity.
+     */
+    @Test
+    void updateUserPoolClientChecksTokenValidityAsSent() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "ClientPool"), "us-east-1");
+        UserPoolClient client = clientWithTokenValidity(pool, "AccessToken", 60, "minutes");
+
+        AwsException shorter = assertThrows(AwsException.class, () -> service.updateUserPoolClient(
+                pool.getId(), client.getClientId(), null, null, null, null, null, null, null, null,
+                4, null, null, null, null, null, null, Map.of("AccessToken", "minutes"), null, null, null));
+        assertEquals("Invalid range for token validity.", shorter.getMessage());
+        assertEquals(60, service.describeUserPoolClient(pool.getId(), client.getClientId()).getAccessTokenValidity());
+
+        UserPoolClient unitsOnly = service.updateUserPoolClient(
+                pool.getId(), client.getClientId(), null, null, null, null, null, null, null, null,
+                null, null, null, null, null, null, null, Map.of("AccessToken", "hours"), null, null, null);
+        assertNull(unitsOnly.getAccessTokenValidity());
+        assertEquals(Map.of("AccessToken", "hours"), unitsOnly.getTokenValidityUnits());
+    }
+
+    /**
+     * AWS: "If you don't provide a value for an attribute, Amazon Cognito sets it to its default value."
+     * The API documents no default name, so the name stays; the id and the secret are not settings.
+     */
+    @Test
+    void updateUserPoolClientResetsEveryOmittedSettingToItsDefault() {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "ClientPool"), "us-east-1");
+        UserPoolClient client = service.createUserPoolClient(pool.getId(), "configured", true, true,
+                List.of("code"), List.of("openid"), Map.of("ApplicationId", "app"), List.of("https://example.com"),
+                "https://example.com", List.of("ALLOW_USER_AUTH"), 15, 20, List.of("https://example.com/logout"),
+                "ENABLED", List.of("email"), 7, List.of("COGNITO", "Google"),
+                Map.of("AccessToken", "minutes", "IdToken", "minutes", "RefreshToken", "days"),
+                List.of("family_name"), Map.of("Feature", "ENABLED"), false, 10);
+        String secret = client.getClientSecret();
+
+        UserPoolClient updated = service.updateUserPoolClient(pool.getId(), client.getClientId(), null, null,
+                null, null, null, null, null, null, 2, null, null, null, null, null, null, null, null, null, null);
+
+        assertEquals("configured", updated.getClientName());
+        assertEquals(client.getClientId(), updated.getClientId());
+        assertEquals(secret, updated.getClientSecret());
+        assertEquals(2, updated.getAccessTokenValidity());
+        assertFalse(updated.isAllowedOAuthFlowsUserPoolClient());
+        assertEquals(List.of(), updated.getAllowedOAuthFlows());
+        assertEquals(List.of(), updated.getAllowedOAuthScopes());
+        assertNull(updated.getAnalyticsConfiguration());
+        assertEquals(List.of(), updated.getCallbackURLs());
+        assertNull(updated.getDefaultRedirectURI());
+        assertEquals(List.of(), updated.getExplicitAuthFlows());
+        assertNull(updated.getIdTokenValidity());
+        assertEquals(3, updated.getAuthSessionValidity());
+        assertEquals(List.of(), updated.getLogoutURLs());
+        assertNull(updated.getPreventUserExistenceErrors());
+        assertEquals(List.of(), updated.getReadAttributes());
+        assertNull(updated.getRefreshTokenValidity());
+        assertEquals(List.of("COGNITO"), updated.getSupportedIdentityProviders());
+        assertNull(updated.getTokenValidityUnits());
+        assertEquals(List.of(), updated.getWriteAttributes());
+        assertNull(updated.getRefreshTokenRotation());
+        assertTrue(updated.getEnableTokenRevocation());
+    }
+
+    /**
+     * AWS replaces a RefreshTokenValidity of 0 with "the default value of 30 days" whatever the refresh token
+     * unit, so the client issues 30-day refresh tokens, whether the 0 came on create or on update.
+     */
+    @ParameterizedTest
+    @CsvSource({"seconds, 2592000", "minutes, 43200", "hours, 720", "days, 30"})
+    void refreshTokenValidityZeroBecomesThirtyDaysInTheRefreshTokenUnit(String unit, int expected) {
+        UserPool pool = service.createUserPool(Map.of("PoolName", "ClientPool"), "us-east-1");
+        UserPoolClient client = clientWithTokenValidity(pool, "RefreshToken", 0, unit);
+        assertEquals(expected, client.getRefreshTokenValidity());
+        String issuedTwentyNineDaysAgo = String.valueOf(System.currentTimeMillis() - Duration.ofDays(29).toMillis());
+
+        assertFalse(service.isRefreshTokenExpired(client,
+                new String[] {pool.getId(), "alice", client.getClientId(), issuedTwentyNineDaysAgo, "token"}));
+        assertEquals(expected, service.updateUserPoolClient(pool.getId(), client.getClientId(), null, null, null,
+                null, null, null, null, null, null, null, null, null, null, 0, null, Map.of("RefreshToken", unit),
+                null, null, null).getRefreshTokenValidity());
+    }
+
+    /** A client whose {@code token} validity is {@code validity}, in {@code unit} or its default unit when null. */
+    private UserPoolClient clientWithTokenValidity(UserPool pool, String token, int validity, String unit) {
+        return service.createUserPoolClient(pool.getId(), "validity-client", false, false, List.of(), List.of(),
+                null, List.of(), null, List.of(),
+                "AccessToken".equals(token) ? validity : null,
+                "IdToken".equals(token) ? validity : null,
+                List.of(), null, List.of(),
+                "RefreshToken".equals(token) ? validity : null,
+                List.of(), unit == null ? null : Map.of(token, unit), List.of(), null, null);
+    }
+
     @Test
     void createUserPoolClientRejectsLogoutUrlsWhenOAuthFlowsUserPoolClientIsFalse() {
         UserPool pool = service.createUserPool(Map.of("PoolName", "ClientPool"), "us-east-1");
@@ -4540,16 +4685,16 @@ class CognitoServiceTest {
                 List.of(),
                 null,
                 List.of(),
-                1,
+                60,
                 List.of(),
-                Map.of("RefreshToken", "seconds"),
+                Map.of("RefreshToken", "minutes"),
                 List.of(),
                 null,
                 null
         );
 
-        long issuedAt = (System.currentTimeMillis() / 1000L) - 5;
-        String raw = pool.getId() + "|alice|" + client.getClientId() + "|" + issuedAt + "|" + java.util.UUID.randomUUID();
+        long issuedAtMillis = System.currentTimeMillis() - Duration.ofMinutes(61).toMillis();
+        String raw = pool.getId() + "|alice|" + client.getClientId() + "|" + issuedAtMillis + "|" + UUID.randomUUID();
         String expiredRefreshToken = signRawRefreshToken(pool, raw);
 
         AwsException exception = assertThrows(AwsException.class, () ->
@@ -4596,19 +4741,19 @@ class CognitoServiceTest {
                 List.of(),
                 null,
                 List.of(),
-                1,
+                60,
                 List.of(),
-                Map.of("RefreshToken", "seconds"),
+                Map.of("RefreshToken", "minutes"),
                 List.of(),
                 null,
                 null
         );
 
         // issued-at is epoch MILLISECONDS, exactly as buildRefreshToken writes it. A token
-        // issued 10s ago against a 1s refresh lifetime is expired only if isRefreshTokenExpired
+        // issued 61 minutes ago against a 60-minute refresh lifetime is expired only if isRefreshTokenExpired
         // converts millis to seconds before comparing — before the fix the InitiateAuth
         // REFRESH_TOKEN_AUTH path never called the check at all, so this minted fresh tokens.
-        long issuedAtMillis = System.currentTimeMillis() - 10_000L;
+        long issuedAtMillis = System.currentTimeMillis() - Duration.ofMinutes(61).toMillis();
         String raw = pool.getId() + "|alice|" + client.getClientId() + "|" + issuedAtMillis + "|"
                 + java.util.UUID.randomUUID();
         String expiredRefreshToken = signRawRefreshToken(pool, raw);

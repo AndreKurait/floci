@@ -1,4 +1,4 @@
-package io.github.hectorvent.floci.services.ses;
+package io.github.hectorvent.floci.services.ses.address;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;

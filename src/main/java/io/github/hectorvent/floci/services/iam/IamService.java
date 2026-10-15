@@ -5186,9 +5186,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * @param userId        the request's {@code aws:userid}, in the shape the guide gives for this
      *                      kind of principal, or null when it publishes none
      * @param userName      the request's {@code aws:username}, which only an IAM user has
+     * @param permissionsBoundary whether a permissions boundary is attached to the user, or to the
+     *                      role a session assumed, which a Deny's {@code NotPrincipal} never spares
      */
     public record CallerArns(String callerArn, String principalArn, String principalType,
-                             String userId, String userName) {
+                             String userId, String userName, boolean permissionsBoundary) {
 
         /**
          * The {@code aws:PrincipalType} values, from the IAM User Guide's principal key values
@@ -5205,6 +5207,12 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         /** The two ARNs alone, for a caller whose principal keys the site cannot derive. */
         public CallerArns(String callerArn, String principalArn) {
             this(callerArn, principalArn, null, null, null);
+        }
+
+        /** A caller with no permissions boundary attached. */
+        public CallerArns(String callerArn, String principalArn, String principalType, String userId,
+                          String userName) {
+            this(callerArn, principalArn, principalType, userId, userName, false);
         }
 
         /**
@@ -5244,7 +5252,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     private static CallerArns callerForUser(IamUser user) {
         return new CallerArns(user.getArn(), user.getArn(), CallerArns.TYPE_USER,
-                user.getUserId(), user.getUserName());
+                user.getUserId(), user.getUserName(), user.getPermissionsBoundaryArn() != null);
     }
 
 
@@ -5303,7 +5311,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             String sessionArn = AwsArnUtils.Arn.global(partition, "sts", accountId,
                     "assumed-role/" + roleName + "/" + sessionName).toString();
             return Optional.of(new CallerArns(sessionArn, roleArn, CallerArns.TYPE_ASSUMED_ROLE,
-                    sessionUserId(session).orElse(null), null));
+                    sessionUserId(session).orElse(null), null,
+                    roleFromArnOrName(roleArn).map(IamRole::getPermissionsBoundaryArn).isPresent()));
         }
 
         return Optional.empty();

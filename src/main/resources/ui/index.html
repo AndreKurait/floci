@@ -3,11 +3,19 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Floci: local AWS emulator</title>
+  <title>floci-aws: local AWS emulator</title>
   <script>
     // One file, two views: the dashboard, and the "starting Floci UI" wait page served at /_floci/ui.
     document.documentElement.dataset.view =
             /\/_(floci|localstack)\/ui\/?$/.test(location.pathname) ? "starting" : "dashboard";
+    // The theme is set before the stylesheet paints, so a light page never flashes dark: the stored
+    // choice, or the OS preference when there is none.
+    (function () {
+      var stored = null;
+      try { stored = localStorage.getItem("floci.theme"); } catch (e) { /* storage blocked: follow the OS */ }
+      var light = window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches;
+      document.documentElement.dataset.theme = stored === "light" || stored === "dark" ? stored : (light ? "light" : "dark");
+    })();
   </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -31,10 +39,38 @@
       --green: #22c55e;
       --amber: #e0b341;
       --red: #f87171;
+      --green-soft: rgba(34,197,94,.45);
+      --logo-dot: #7A7FD6;
+      --on-accent: #fff;
+      --code-text: #CFD3F5;
+      --error-text: #F5C2C2;
       --radius: 8px;
       --pad: 28px;
       --sans: "Sora", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       --mono: "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --bg: #F7F8FB;
+      --bg2: #EDEFF5;
+      --bg3: #FFFFFF;
+      --border: #E1E5EE;
+      --border-bright: #C5CCDA;
+      --text: #0F172A;
+      --text-body: #334155;
+      --text-muted: #556070;
+      --text-dim: #5E6978;
+      --accent: #4C52B5;
+      --accent-deep: #4C52B5;
+      --accent-mid: #5A60C6;
+      --accent-dim: rgba(85,89,167,.12);
+      --green: #15803D;
+      --amber: #A16207;
+      --red: #DC2626;
+      --green-soft: rgba(21,128,61,.45);
+      --logo-dot: #5A60C6;
+      --code-text: #2E3470;
+      --error-text: #B42318;
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; }
@@ -60,7 +96,7 @@
     }
     .floci-logo { height: 30px; width: auto; display: block; }
     .floci-text, .floci-cloud { fill: var(--text); }
-    .floci-dot { fill: #7A7FD6; }
+    .floci-dot { fill: var(--logo-dot); }
     .status { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 500; color: var(--text); }
     .status .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--text-dim); }
     .status.ready .dot { background: var(--green); }
@@ -76,11 +112,12 @@
       font-family: var(--mono); font-size: 12px; color: var(--text);
     }
     .build:empty { display: none; }
+    .emulator { font-family: var(--mono); font-size: 12.5px; color: var(--text-muted); }
     .top-end { margin-left: auto; display: flex; align-items: center; gap: 20px; }
     .btn {
       display: inline-flex; align-items: center; gap: 8px; padding: 9px 16px;
       border-radius: var(--radius); border: 1px solid transparent;
-      background: var(--accent-deep); color: #fff; font-weight: 600; font-size: 13.5px;
+      background: var(--accent-deep); color: var(--on-accent); font-weight: 600; font-size: 13.5px;
       transition: background .15s ease, transform .16s ease;
     }
     .btn:hover { background: var(--accent-mid); text-decoration: none; }
@@ -89,6 +126,15 @@
       background: transparent; border-color: var(--border-bright); color: var(--text); font-weight: 500;
     }
     .btn-quiet:hover { background: var(--bg2); }
+    .theme-toggle {
+      display: inline-grid; place-items: center; width: 34px; height: 34px; padding: 0;
+      border-radius: var(--radius); border: 1px solid var(--border-bright); background: transparent;
+      color: var(--text-muted); transition: color .15s ease, background .15s ease;
+    }
+    .theme-toggle:hover { color: var(--text); background: var(--bg2); }
+    .theme-toggle svg { width: 16px; height: 16px; display: block; }
+    [data-theme="light"] .theme-toggle .icon-sun,
+    [data-theme="dark"] .theme-toggle .icon-moon { display: none; }
 
     /* ── Layout ──────────────────────────────────────────── */
     .layout { flex: 1; display: grid; grid-template-columns: 1fr; }
@@ -136,7 +182,7 @@
       transition: color .15s ease, border-color .15s ease;
     }
     .copy:hover { color: var(--text); border-color: var(--text-dim); }
-    .copy.done { color: var(--green); border-color: rgba(34,197,94,.45); }
+    .copy.done { color: var(--green); border-color: var(--green-soft); }
 
     .tabs { display: flex; gap: 18px; margin-top: 22px; border-bottom: 1px solid var(--border); }
     .tab {
@@ -150,7 +196,7 @@
     .snippet pre {
       margin: 0; padding: 14px 14px 16px; border-radius: var(--radius); background: var(--bg3);
       border: 1px solid var(--border); overflow-x: auto;
-      font-family: var(--mono); font-size: 12px; line-height: 1.7; color: #CFD3F5;
+      font-family: var(--mono); font-size: 12px; line-height: 1.7; color: var(--code-text);
     }
 
     .stages { margin-top: 14px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
@@ -246,7 +292,7 @@
     .error {
       margin: 20px 0 0; padding: 14px; border-radius: var(--radius); background: var(--bg3);
       border: 1px solid var(--border); white-space: pre-wrap; overflow-wrap: anywhere;
-      font-family: var(--mono); font-size: 12px; line-height: 1.7; color: #F5C2C2;
+      font-family: var(--mono); font-size: 12px; line-height: 1.7; color: var(--error-text);
     }
     .actions { margin-top: 24px; display: flex; gap: 12px; flex-wrap: wrap; }
 
@@ -280,11 +326,17 @@
       </g>
     </svg>
   </a>
+  <!-- Which Floci emulator serves this page; the other emulators reuse the page with their own name. -->
+  <span class="emulator" id="emulator">floci-aws</span>
   <span class="status offline" id="status" role="status">
       <span class="dot"></span><span id="status-label">Connecting…</span>
     </span>
-  <span class="build" id="build" title="Floci version"></span>
+  <span class="build" id="build" title="floci-aws version"></span>
   <div class="top-end">
+    <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch theme" title="Switch theme">
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
     <a class="btn" href="/_floci/ui" id="ui-link">Open Floci UI &rarr;</a>
     <a class="home back" href="/">Back to dashboard</a>
   </div>
@@ -608,6 +660,33 @@
                 renderReleaseNote();
               })
               .finally(function () { refreshing = false; });
+    }
+
+    // ── Theme (follows the OS until the user picks one) ──
+    var THEME_KEY = "floci.theme";
+    var themeButton = $("theme-toggle");
+    var themeChosen = false;   // a click this page view, which wins over the OS even when storage is blocked
+    function storedTheme() {
+      try { var t = localStorage.getItem(THEME_KEY); return t === "light" || t === "dark" ? t : null; }
+      catch (e) { return null; /* storage blocked: the choice lasts for this page view */ }
+    }
+    function applyTheme(theme) {
+      document.documentElement.dataset.theme = theme;
+      var label = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+      themeButton.setAttribute("aria-label", label);
+      themeButton.title = label;
+    }
+    applyTheme(document.documentElement.dataset.theme === "light" ? "light" : "dark");
+    themeButton.addEventListener("click", function () {
+      var next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+      themeChosen = true;
+      applyTheme(next);
+      try { localStorage.setItem(THEME_KEY, next); } catch (e) { /* storage blocked: lasts for this page view */ }
+    });
+    if (window.matchMedia) {
+      var osLight = matchMedia("(prefers-color-scheme: light)");
+      var onOsChange = function (event) { if (!themeChosen && !storedTheme()) { applyTheme(event.matches ? "light" : "dark"); } };
+      if (osLight.addEventListener) { osLight.addEventListener("change", onOsChange); } else if (osLight.addListener) { osLight.addListener(onOsChange); }
     }
 
     // ── News (off until the user turns it on) ────────────

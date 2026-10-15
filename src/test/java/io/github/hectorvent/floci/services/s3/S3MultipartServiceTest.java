@@ -95,10 +95,15 @@ class S3MultipartServiceTest {
     @Test
     void uploadPartInvalidNumber() {
         MultipartUpload upload = s3Service.initiateMultipartUpload("test-bucket", "file.bin", null);
-        assertThrows(AwsException.class, () ->
-                s3Service.uploadPart("test-bucket", "file.bin", upload.getUploadId(), 0, new byte[1]));
-        assertThrows(AwsException.class, () ->
-                s3Service.uploadPart("test-bucket", "file.bin", upload.getUploadId(), 10001, new byte[1]));
+        for (int partNumber : new int[] {0, 10001}) {
+            AwsException error = assertThrows(AwsException.class, () ->
+                    s3Service.uploadPart("test-bucket", "file.bin", upload.getUploadId(), partNumber, new byte[1]));
+            assertEquals("InvalidArgument", error.getErrorCode());
+            assertEquals(400, error.getHttpStatus());
+            assertEquals("Part number must be an integer between 1 and 10000, inclusive", error.getMessage());
+            assertEquals(Map.of("ArgumentName", "partNumber", "ArgumentValue", Integer.toString(partNumber)),
+                    error.getExtendedData());
+        }
     }
 
     @Test

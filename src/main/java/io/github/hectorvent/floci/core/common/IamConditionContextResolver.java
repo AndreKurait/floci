@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbConditionKeys;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbTableNames;
@@ -56,6 +57,13 @@ public class IamConditionContextResolver {
     private static final String BUFFERED_FORM_BODY = "floci.bufferedFormBody";
     private static final String REQUEST_TAG_PREFIX = "aws:RequestTag/";
     private static final String RESOURCE_TAG_PREFIX = "aws:ResourceTag/";
+    /**
+     * The services that set {@code aws:SourceOwner} when they publish to an SNS topic, a deprecated key
+     * SNS keeps for the integrations that had it (SNS Developer Guide, "aws:SourceAccount versus
+     * aws:SourceOwner"). The guide lists more; these are the ones that call through
+     * {@link ServiceCallAuthorizer}.
+     */
+    private static final Set<String> SNS_SOURCE_OWNER_SERVICES = Set.of("ses");
     public static final String EXISTING_OBJECT_TAG_PREFIX = "s3:ExistingObjectTag/";
     public static final String REQUEST_OBJECT_TAG_PREFIX = "s3:RequestObjectTag/";
     public static final String REQUEST_OBJECT_TAG_KEYS = "s3:RequestObjectTagKeys";
@@ -63,6 +71,7 @@ public class IamConditionContextResolver {
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
     private final Instance<S3Service> s3Service;
+    private final Instance<CloudWatchLogsService> logsService;
     private final RequestContext requestContext;
     private final EmulatorConfig config;
 
@@ -70,11 +79,13 @@ public class IamConditionContextResolver {
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
                                        RequestContext requestContext,
                                        EmulatorConfig config) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
+        this.logsService = logsService;
         this.requestContext = requestContext;
         this.config = config;
     }
@@ -86,8 +97,38 @@ public class IamConditionContextResolver {
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
+            case "logs" -> logStreamConditionContext(action, ctx);
             default -> null;
         };
+    }
+
+    /** Stream access uses the owning log group's tags, in the handler's account and region. */
+    private Map<String, List<String>> logStreamConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action))) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !logsService.isResolvable()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, String> tags;
+        try {
+            tags = logsService.get().listTagsLogGroup(body.path("logGroupName").asText(), region);
+        } catch (AwsException e) {
+            if (!"ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            // Leave the handler to report a missing group; unexpected lookup errors must not hide a deny.
+            return null;
+        }
+        if (tags == null || tags.isEmpty()) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        tags.forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key,
+                List.of(value == null ? "" : value)));
+        return conditions;
     }
 
     private static Map<String, List<String>> iamConditionContext(String action, ContainerRequestContext ctx) {
@@ -121,6 +162,38 @@ public class IamConditionContextResolver {
         putIfPresent(conditions, "aws:RequestedRegion", region);
         // Enforcement evaluates signed IAM credentials, not direct AWS service principals.
         conditions.put("aws:PrincipalIsAWSService", List.of("false"));
+        return conditions;
+    }
+
+    /**
+     * The request context of a call an AWS service makes on its own behalf, such as SES publishing to
+     * a topic, from the IAM User Guide's global condition keys: {@code aws:PrincipalIsAWSService} is
+     * {@code true}; {@code aws:PrincipalServiceName} and {@code aws:PrincipalServiceNamesList} name the
+     * service; {@code aws:SourceArn} and {@code aws:SourceAccount} name the resource whose
+     * configuration triggered the call, when it has them; and {@code aws:ResourceAccount} and
+     * {@code aws:RequestedRegion} describe the target. The keys that describe an IAM principal,
+     * {@code aws:PrincipalArn} and {@code aws:PrincipalAccount} among them, are left out: no IAM
+     * principal makes the call. A call to an SNS topic from a service SNS lists as setting it also
+     * carries {@code aws:SourceOwner}, the source account, which is what the default topic policy
+     * checks.
+     */
+    public static Map<String, List<String>> serviceCallContext(String servicePrincipal, String resourceArn,
+                                                               String resourceOwnerAccountId,
+                                                               String sourceArn, String sourceAccount) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        conditions.put("aws:PrincipalIsAWSService", List.of("true"));
+        conditions.put("aws:PrincipalServiceName", List.of(servicePrincipal));
+        conditions.put("aws:PrincipalServiceNamesList", List.of(servicePrincipal));
+        putIfPresent(conditions, "aws:SourceArn", sourceArn);
+        putIfPresent(conditions, "aws:SourceAccount", sourceAccount);
+        if (SNS_SOURCE_OWNER_SERVICES.contains(ServicePrincipals.serviceName(servicePrincipal))
+                && AwsArnUtils.isArnFor(resourceArn, "sns")) {
+            putIfPresent(conditions, "aws:SourceOwner", sourceAccount);
+        }
+        String resourceAccount = accountFromArn(resourceArn);
+        putIfPresent(conditions, "aws:ResourceAccount",
+                resourceAccount == null || resourceAccount.isBlank() ? resourceOwnerAccountId : resourceAccount);
+        putIfPresent(conditions, "aws:RequestedRegion", AwsArnUtils.regionOrDefault(resourceArn, null));
         return conditions;
     }
 

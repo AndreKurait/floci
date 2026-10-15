@@ -142,8 +142,7 @@ public class LambdaTaskAuthorizer {
         // role's own policies have to allow the call too, as they do across accounts anyway.
         ResourcePolicyDecision trustGrant = switch (trust) {
             case ALLOW -> ResourcePolicyDecision.ALLOW;
-            case ALLOW_ACCOUNT -> relationship == ResourceAccountRelationship.CROSS_ACCOUNT
-                    ? ResourcePolicyDecision.ALLOW : ResourcePolicyDecision.NEUTRAL;
+            case ALLOW_ACCOUNT -> ResourcePolicyDecision.ALLOW_ACCOUNT;
             case EXPLICIT_DENY -> ResourcePolicyDecision.EXPLICIT_DENY;
             case NEUTRAL -> ResourcePolicyDecision.NEUTRAL;
         };
@@ -267,9 +266,10 @@ public class LambdaTaskAuthorizer {
                                  String deniedIn, String kind) {
 
         static ResourceGrant of(ResourcePolicyDecision functionPolicy) {
-            boolean allows = functionPolicy == ResourcePolicyDecision.ALLOW
+            boolean sufficient = functionPolicy == ResourcePolicyDecision.ALLOW
                     || functionPolicy == ResourcePolicyDecision.ALLOW_DIRECT_IAM_USER;
-            return new ResourceGrant(functionPolicy == ResourcePolicyDecision.EXPLICIT_DENY, allows, allows, false,
+            return new ResourceGrant(functionPolicy == ResourcePolicyDecision.EXPLICIT_DENY,
+                    sufficient || functionPolicy == ResourcePolicyDecision.ALLOW_ACCOUNT, sufficient, false,
                     "a resource-based policy", "resource-based policy");
         }
 

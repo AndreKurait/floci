@@ -1,4 +1,4 @@
-package io.github.hectorvent.floci.services.ses;
+package io.github.hectorvent.floci.services.ses.address;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ses.model.BulkEmailEntry;
@@ -27,7 +27,7 @@ import java.util.function.Consumer;
  * address but lets a missing {@code @} pass, as JavaMail's non-strict header parse does, and
  * reports one only on the first address, later and in its own wording (probe-confirmed).
  */
-final class SesAddressSyntax {
+public final class SesAddressSyntax {
 
     private static final List<String> RAW_CHECKED_HEADERS = List.of("To", "Cc", "Bcc");
     private static final String MISSING_FINAL_DOMAIN = "Missing final '@domain'";
@@ -37,11 +37,11 @@ final class SesAddressSyntax {
     private SesAddressSyntax() {
     }
 
-    static void requireEnvelope(SendEmailRequest request) {
+    public static void requireEnvelope(SendEmailRequest request) {
         SesSendAddresses.forEachEnvelope(request, SesAddressSyntax::require);
     }
 
-    static void requireRaw(SendEmailRequest request, EmailContent.Raw raw, Message message) {
+    public static void requireRaw(SendEmailRequest request, EmailContent.Raw raw, Message message) {
         SesSendAddresses.forEachRaw(request, message, RAW_CHECKED_HEADERS, fromHeaderCheck(request, raw),
                 SesAddressSyntax::require);
     }
@@ -90,7 +90,7 @@ final class SesAddressSyntax {
      * as JavaMail's "User name is missing" around that address's {@code toString()} form
      * (probe-confirmed; the same place relative to the length check is assumed).
      */
-    static void requireFromHeaderAt(SendEmailRequest request, EmailContent.Raw raw, Message message) {
+    public static void requireFromHeaderAt(SendEmailRequest request, EmailContent.Raw raw, Message message) {
         if (readsFromHeaderAsSender(request, raw)) {
             SesSendAddresses.forEachHeaderAddress(message, "From", SesAddressSyntax::requireAt);
         } else if (checksFromHeaderBesideSender(request, raw)) {
@@ -184,7 +184,7 @@ final class SesAddressSyntax {
      * address is assumed to be measured as on a single send). The v1 handler and the v2 controller
      * call it as soon as the address is read, ahead of the template lookup they perform.
      */
-    static void requireBulkAddress(String address) {
+    public static void requireBulkAddress(String address) {
         if (violation(address) != null || SesAddressLength.exceedsLimit(address)) {
             throw new AwsException("InvalidParameterValue", "Invalid email address<" + address + ">.", 400);
         }
@@ -196,7 +196,7 @@ final class SesAddressSyntax {
      * every entry, not as a request error (probe-confirmed). An address list of the wrong JSON type
      * never reaches this check: the controller rejects the whole request with SerializationException.
      */
-    static void requireBulkDestination(BulkEmailEntry entry, List<String> replyToAddresses) {
+    public static void requireBulkDestination(BulkEmailEntry entry, List<String> replyToAddresses) {
         for (List<String> addresses : Arrays.asList(entry.toAddresses(), entry.ccAddresses(), entry.bccAddresses(),
                 replyToAddresses)) {
             if (addresses != null) {

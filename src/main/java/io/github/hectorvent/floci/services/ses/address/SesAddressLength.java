@@ -1,4 +1,4 @@
-package io.github.hectorvent.floci.services.ses;
+package io.github.hectorvent.floci.services.ses.address;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ses.model.EmailContent;
@@ -14,7 +14,7 @@ import java.util.List;
  * a non-ASCII character or an RFC 822 special, an encoded-word name is measured undecoded, and the
  * error echoes that form. The v2 controller remaps the code to BadRequestException.
  */
-final class SesAddressLength {
+public final class SesAddressLength {
 
     static final int MAX_LENGTH = 320;
 
@@ -24,7 +24,7 @@ final class SesAddressLength {
     private SesAddressLength() {
     }
 
-    static void requireEnvelope(SendEmailRequest request) {
+    public static void requireEnvelope(SendEmailRequest request) {
         SesSendAddresses.forEachEnvelope(request, SesAddressLength::require);
     }
 
@@ -33,7 +33,7 @@ final class SesAddressLength {
      * encoded and escaped quotes count (probe-confirmed). Each address of a header is checked on its
      * own, so a header listing several short addresses passes however long it is.
      */
-    static void requireRaw(SendEmailRequest request, EmailContent.Raw raw, Message message) {
+    public static void requireRaw(SendEmailRequest request, EmailContent.Raw raw, Message message) {
         SesSendAddresses.forEachRaw(request, message, RAW_RECIPIENT_HEADERS,
                 raw.checksFromHeader(request.hasSource()) ? SesAddressLength::require : SesSendAddresses.UNCHECKED,
                 SesAddressLength::require);

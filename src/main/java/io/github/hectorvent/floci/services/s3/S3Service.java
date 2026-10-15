@@ -1387,7 +1387,8 @@ public class S3Service implements Resettable, ResourceProvider {
         if (decision == ResourcePolicyDecision.EXPLICIT_DENY) {
             throw accessDeniedException(bucketName, key);
         }
-        if (decision == ResourcePolicyDecision.ALLOW || decision == ResourcePolicyDecision.ALLOW_DIRECT_IAM_USER) {
+        if (decision == ResourcePolicyDecision.ALLOW || decision == ResourcePolicyDecision.ALLOW_DIRECT_IAM_USER
+                || decision == ResourcePolicyDecision.ALLOW_ACCOUNT) {
             return;
         }
         if (sameAccountAsOwner) {
@@ -3880,8 +3881,7 @@ public class S3Service implements Resettable, ResourceProvider {
         return withMultipartOperationLock(bucket, uploadId, () -> {
             MultipartUpload upload = getMultipartUpload(bucket, key, uploadId);
             if (partNumber < 1 || partNumber > 10000) {
-                throw new AwsException("InvalidArgument",
-                        "Part number must be between 1 and 10000.", 400);
+                throw PartRange.invalidPartNumber(Integer.toString(partNumber));
             }
             validateSseCustomerAccess(upload, sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
 
@@ -3935,8 +3935,7 @@ public class S3Service implements Resettable, ResourceProvider {
         ChecksumAlgorithm declared = withMultipartOperationLock(bucket, uploadId, () -> {
             MultipartUpload upload = getMultipartUpload(bucket, key, uploadId);
             if (partNumber < 1 || partNumber > 10000) {
-                throw new AwsException("InvalidArgument",
-                        "Part number must be between 1 and 10000.", 400);
+                throw PartRange.invalidPartNumber(Integer.toString(partNumber));
             }
             validateSseCustomerAccess(upload, sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
             return upload.getChecksumAlgorithm();

@@ -19,9 +19,12 @@ FAKE_ARN = "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-00
 class TestACMCertificateLifecycle:
     """Test ACM certificate lifecycle operations."""
 
-    def test_request_certificate_rejects_empty_sans(self, aws_config):
+    def test_request_certificate_rejects_empty_sans(self, aws_config, client_config):
+        """Disable SDK validation so the empty list reaches the server."""
         with closing(boto3.client(
-            "acm", config=Config(parameter_validation=False), **aws_config
+            "acm",
+            config=client_config.merge(Config(parameter_validation=False)),
+            **aws_config,
         )) as client:
             with pytest.raises(ClientError) as error:
                 response = client.request_certificate(
@@ -50,6 +53,9 @@ class TestACMCertificateLifecycle:
             StackName=stack, TemplateBody=json.dumps(template)
         )
         try:
+            cloudformation_client.get_waiter("stack_create_complete").wait(
+                StackName=stack, WaiterConfig={"Delay": 1, "MaxAttempts": 60}
+            )
             resource = cloudformation_client.describe_stack_resource(
                 StackName=stack, LogicalResourceId="Certificate"
             )["StackResourceDetail"]

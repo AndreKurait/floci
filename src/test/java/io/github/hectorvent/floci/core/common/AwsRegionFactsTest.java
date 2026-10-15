@@ -61,6 +61,26 @@ class AwsRegionFactsTest {
         assertTrue(AwsRegionFacts.consoleHost(null).isEmpty());
     }
 
+    /** The botocore model's example name for the commercial partition, the China guide for {@code aws-cn}. */
+    @Test
+    void cloudFrontDomainSuffixIsPerPartitionWhereCloudFrontExists() {
+        assertEquals(Optional.of("cloudfront.net"), AwsRegionFacts.cloudFrontDomainSuffix("aws"));
+        assertEquals(Optional.of("cloudfront.cn"), AwsRegionFacts.cloudFrontDomainSuffix("aws-cn"));
+        assertTrue(AwsRegionFacts.cloudFrontDomainSuffix("aws-us-gov").isEmpty());
+        assertTrue(AwsRegionFacts.cloudFrontDomainSuffix("aws-eusc").isEmpty());
+        assertTrue(AwsRegionFacts.cloudFrontDomainSuffix(null).isEmpty());
+    }
+
+    /** The GovCloud guide states the two regional endpoint zones; no source covers another region. */
+    @Test
+    void apiGatewayRegionalZoneIsPublishedForGovCloudOnly() {
+        assertEquals(Optional.of("Z1K6XKP9SAGWDV"), AwsRegionFacts.apiGatewayRegionalHostedZoneId("us-gov-west-1"));
+        assertEquals(Optional.of("Z3SE9ATJYCRCZJ"), AwsRegionFacts.apiGatewayRegionalHostedZoneId("us-gov-east-1"));
+        assertTrue(AwsRegionFacts.apiGatewayRegionalHostedZoneId("us-east-1").isEmpty());
+        assertTrue(AwsRegionFacts.apiGatewayRegionalHostedZoneId("cn-north-1").isEmpty());
+        assertTrue(AwsRegionFacts.apiGatewayRegionalHostedZoneId(null).isEmpty());
+    }
+
     @ParameterizedTest
     @CsvSource({
             "us-east-1,       s3,         com.amazonaws.us-east-1.s3",

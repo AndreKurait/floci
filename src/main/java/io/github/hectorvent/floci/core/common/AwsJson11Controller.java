@@ -314,7 +314,7 @@ public class AwsJson11Controller {
                 case "elasticmapreduce" -> emrHandler.handle(action, request, region);
                 case "wafv2" -> wafV2Handler.handle(action, request, region);
                 case "memorydb" -> memoryDbHandler.handle(action, request, region);
-                case "logs" -> cloudWatchLogsHandler.handle(action, request, region);
+                case "logs" -> cloudWatchLogsHandler.handle(action, request, regionResolver.getRegion());
                 case "secretsmanager" -> secretsManagerJsonHandler.handle(action, request, region,
                         IamEnforcementFilter.requestAuthorization(
                                 httpHeaders.getHeaderString("Authorization"), uriInfo.getQueryParameters()));

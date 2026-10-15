@@ -38,7 +38,20 @@ record PartRange(long first, long length, Part part) {
         } catch (NumberFormatException ignored) {
             // What is not a number is no part number either, so it is rejected the same way.
         }
-        throw new AwsException("InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive",
+        throw invalidPartNumber(value);
+    }
+
+    /** Parses an UploadPart or UploadPartCopy number, whose valid range is bounded by S3. */
+    static int parseUploadPartNumber(String value) {
+        BigInteger partNumber = parsePartNumber(value);
+        if (partNumber.compareTo(BigInteger.valueOf(10000)) > 0) {
+            throw invalidPartNumber(value);
+        }
+        return partNumber.intValue();
+    }
+
+    static AwsException invalidPartNumber(String value) {
+        return new AwsException("InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive",
                 400, Map.of("ArgumentName", "partNumber", "ArgumentValue", value));
     }
 

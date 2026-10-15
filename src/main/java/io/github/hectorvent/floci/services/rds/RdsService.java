@@ -702,6 +702,19 @@ public class RdsService implements Resettable, ResourceProvider {
                     "DB instance " + id + " already exists.", 400);
         }
 
+        if (dbClusterIdentifier != null && !dbClusterIdentifier.isBlank()) {
+            if (masterPassword != null) {
+                throw new AwsException("InvalidParameterCombination",
+                        "The requested DB Instance will be a member of a DB Cluster. "
+                                + "Set master user password for the DB Cluster.", 400);
+            }
+            if (masterUsername != null) {
+                throw new AwsException("InvalidParameterCombination",
+                        "The requested DB Instance will be a member of a DB Cluster. "
+                                + "Set master user name for the DB Cluster.", 400);
+            }
+        }
+
         DatabaseEngine engine = resolveEngine(engineParam);
         if (engine == DatabaseEngine.SQLSERVER && dbName != null && !dbName.isBlank()) {
             throw new AwsException("InvalidParameterCombination",
@@ -726,10 +739,12 @@ public class RdsService implements Resettable, ResourceProvider {
             throw new AwsException("InvalidParameterValue",
                     "MasterUsername must begin with a letter and contain only alphanumeric characters or underscores.", 400);
         }
-        if (manageMasterUserPassword && (masterPassword == null || masterPassword.isBlank())) {
+        boolean manageInstancePassword = manageMasterUserPassword
+                && (dbClusterIdentifier == null || dbClusterIdentifier.isBlank());
+        if (manageInstancePassword && (masterPassword == null || masterPassword.isBlank())) {
             masterPassword = generatedMasterPassword();
         }
-        String effectiveSecretKmsKeyId = manageMasterUserPassword
+        String effectiveSecretKmsKeyId = manageInstancePassword
                 ? resolveManagedSecretKmsKeyId(masterUserSecretKmsKeyId, effectiveRegion) : null;
         // Always reserve a unique port (even in mock) so endpoints stay distinct and usedPorts
         // is consistent; mock mode only skips starting the container and auth proxy.
@@ -860,9 +875,16 @@ public class RdsService implements Resettable, ResourceProvider {
                     instance.setContainerPort(backendPort);
                     iamEnabled = currentCluster.isIamDatabaseAuthenticationEnabled();
                     instance.setIamDatabaseAuthenticationEnabled(iamEnabled);
+                    // Incomplete cluster records retain the member's existing defaults for missing credentials.
+                    if (currentCluster.getMasterUsername() != null) {
+                        instance.setMasterUsername(currentCluster.getMasterUsername());
+                    }
+                    if (currentCluster.getMasterPassword() != null) {
+                        instance.setMasterPassword(currentCluster.getMasterPassword());
+                    }
                 }
             }
-            if (manageMasterUserPassword) {
+            if (manageInstancePassword) {
                 attachManagedMasterUserSecret(instance, effectiveRegion, masterUserSecretKmsKeyId, effectiveSecretKmsKeyId);
             }
             putInstanceForScope(accountId, effectiveRegion, id, instance);
@@ -873,7 +895,7 @@ public class RdsService implements Resettable, ResourceProvider {
                     proxyManager.startProxy(rdsResourceRelayKey(instance.getDbInstanceArn(), id),
                             engine, iamEnabled, proxyPort, backendHost, backendPort,
                             instance.getEndpoint().address(),
-                            masterUsername, masterPassword, dbName,
+                            instance.getMasterUsername(), instance.getMasterPassword(), dbName,
                             (user, pw) -> validateDbPasswordForScope(
                                     accountId, instanceRegion, id, user, pw),
                             proxyBinding(engine, instance.getEndpoint().address(), instance.getEndpoint().port(),
@@ -2984,7 +3006,10 @@ public class RdsService implements Resettable, ResourceProvider {
             instance.setOptionGroupName(optionGroupName);
         }
         boolean passwordRotated = false;
-        if (newPassword != null && !newPassword.isBlank()) {
+        boolean clusterMember = instance.getDbClusterIdentifier() != null
+                && !instance.getDbClusterIdentifier().isBlank();
+        // Aurora member master credentials are owned and changed by the cluster.
+        if (!clusterMember && newPassword != null && !newPassword.isBlank()) {
             String oldPassword = instance.getMasterPassword();
             boolean backendRunning = !config.services().rds().mock()
                     && instance.getDbClusterIdentifier() == null && instance.getContainerId() != null;
@@ -4753,8 +4778,9 @@ public class RdsService implements Resettable, ResourceProvider {
         } else {
             changeCredentials.run();
         }
-        boolean passwordRotated = credentialsChanged && rotateBackend;
-        if (credentialsChanged && hasNewPassword) {
+        boolean passwordAccepted = credentialsChanged && hasNewPassword;
+        boolean passwordChanged = passwordAccepted && !newPassword.equals(oldPassword);
+        if (passwordAccepted) {
             cluster.setMasterPassword(newPassword);
         }
         if (iamEnabled != null) {
@@ -4786,11 +4812,9 @@ public class RdsService implements Resettable, ResourceProvider {
             applyAutoPause(cluster);
         }
 
-        // A cluster rotation applies to every endpoint: the cluster's own proxy and each member
-        // instance's proxy hold start-time password snapshots, and member endpoints validate
-        // against the member's stored password, so propagate the rotated credential to all of
-        // them (AWS applies the cluster master password to every member endpoint).
-        if (passwordRotated) {
+        // Accepted credentials belong to every endpoint even before a backend is provisioned.
+        // Running backends have already accepted the rotation before metadata is published.
+        if (passwordChanged) {
             proxyManager.updateMasterPassword(
                     rdsResourceRelayKey(cluster.getDbClusterArn(), id), newPassword);
             updateClusterMembers(cluster, effectiveRegion,

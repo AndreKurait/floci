@@ -152,7 +152,7 @@ class DynamoDbFacadeTest {
         RequestContext requestContext = new RequestContext();
         requestContext.setRegion(OTHER_REGION);
         IamConditionContextResolver resolver = new IamConditionContextResolver(dynamoDb,
-                mock(Instance.class), mock(Instance.class), requestContext, mock(EmulatorConfig.class));
+                mock(Instance.class), mock(Instance.class), mock(Instance.class), requestContext, mock(EmulatorConfig.class));
         ContainerRequestContext request = mock(ContainerRequestContext.class);
         JsonNode body = mapper.readTree("""
                 {"TableName": "recorded-table", "Key": {"id": {"S": "USER_alice"}}}

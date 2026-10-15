@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.iam;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -644,6 +645,28 @@ class ResourceArnBuilderTest {
             when(ctx.getEntityStream()).thenReturn(newIn);
             return null;
         }).when(ctx).setEntityStream(any(InputStream.class));
+    }
+
+    @Test
+    void logStreamTargetsUseTheServingActionAndRequestPartition() {
+        for (String action : List.of("logs:CreateLogStream", "logs:DeleteLogStream")) {
+            for (String region : List.of("us-east-1", "cn-north-1", "us-gov-west-1")) {
+                setJsonBody("{\"logGroupName\":\" /group \",\"logStreamName\":42}");
+                when(ctx.getHeaderString("X-Amz-Target")).thenReturn("Logs_20140328.DeleteLogGroup");
+                assertEquals(List.of("arn:" + AwsRegions.partitionFor(region)
+                                + ":logs:" + region + ":123456789012:log-group: /group :log-stream:42"),
+                        builder.buildLogStreamResources(action, ctx, region, "123456789012", AwsRegions.partitionFor(region)));
+            }
+        }
+    }
+
+    @Test
+    void excludedLogsActionsKeepWildcardResources() {
+        for (String action : List.of("logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy",
+                "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource", "logs:PutLogEvents")) {
+            setJsonBody("{\"logGroupName\":\"group\",\"logStreamName\":\"stream\"}");
+            assertEquals(List.of("*"), builder.buildLogStreamResources(action, ctx, "us-east-1", ACCOUNT, "aws"));
+        }
     }
 
     // ── DynamoDB ─────────────────────────────────────────────────────────────────

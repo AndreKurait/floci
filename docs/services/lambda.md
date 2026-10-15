@@ -96,7 +96,9 @@ part in authorizing calls to the function:
 - Other operations act on the caller's own function of the name the ARN gives, whatever account
   the ARN names, and are authorized against that function. Floci does not serve them on another
   account's function, which AWS allows through a function policy.
-- Within one account, a statement naming the caller grants on its own.
+- Within one account, a statement naming the caller grants on its own. One naming only the
+  account, as `AddPermission --principal <account-id>` writes it, delegates to the account, so the
+  caller's identity policy has to allow the call too.
 - An invoke is authorized against the version or alias it names, in the function name or in
   `Qualifier`. A grant added with `Qualifier` covers that version or alias only, and a grant on the
   function does not cover a qualified invoke. Other operations are authorized against the

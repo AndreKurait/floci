@@ -65,6 +65,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -638,16 +639,36 @@ public class SnsService implements Resettable, ResourceProvider {
         attrs.putIfAbsent("Owner", regionResolver.getAccountId());
         attrs.putIfAbsent("EffectiveDeliveryPolicy", "{\"http\":{\"defaultHealthyRetryPolicy\":{\"minDelayTarget\":20,\"maxDelayTarget\":20,\"numRetries\":3,\"numMaxDelayRetries\":0,\"numNoDelayRetries\":0,\"numMinDelayRetries\":0,\"backoffFunction\":\"linear\"},\"disableSubscriptionOverrides\":false}}");
         if (!attrs.containsKey("Policy") || attrs.get("Policy") == null || attrs.get("Policy").isBlank()) {
-            attrs.put("Policy", defaultTopicPolicy(topicArn).toString());
+            attrs.put("Policy", defaultTopicPolicy(topicArn, regionResolver.getAccountId()).toString());
         }
         return attrs;
+    }
+
+    /**
+     * The access policy of the topic an ARN names, read in the account and Region the ARN names
+     * rather than the caller's: its {@code Policy} attribute, or the default a new topic has when
+     * that is not set. Empty when there is no such topic.
+     */
+    public Optional<String> findTopicPolicy(String topicArn) {
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(topicArn);
+        String key = topicKey(arn.region(), topicArn);
+        Optional<Topic> topic = topicStore instanceof AccountAwareStorageBackend<Topic> aware
+                ? aware.getForAccountMigratingLegacy(arn.accountId(), key,
+                        stored -> topicArn.equals(stored.getTopicArn()))
+                : topicStore.get(key);
+        return topic.map(stored -> {
+            String policy = stored.getAttributes().get("Policy");
+            return policy == null || policy.isBlank()
+                    ? defaultTopicPolicy(topicArn, arn.accountId()).toString()
+                    : policy;
+        });
     }
 
     /**
      * The policy a topic has until one is set, as AWS returns it for a new topic: its owner may
      * manage it, subscribe to it and publish to it.
      */
-    private ObjectNode defaultTopicPolicy(String topicArn) {
+    private ObjectNode defaultTopicPolicy(String topicArn, String ownerAccountId) {
         ObjectNode policy = objectMapper.createObjectNode();
         policy.put("Version", "2008-10-17");
         policy.put("Id", "__default_policy_ID");
@@ -659,7 +680,7 @@ public class SnsService implements Resettable, ResourceProvider {
         DEFAULT_TOPIC_POLICY_ACTIONS.forEach(actions::add);
         statement.put("Resource", topicArn);
         statement.putObject("Condition").putObject("StringEquals")
-                .put("AWS:SourceOwner", regionResolver.getAccountId());
+                .put("AWS:SourceOwner", ownerAccountId);
         return policy;
     }
 
@@ -753,7 +774,7 @@ public class SnsService implements Resettable, ResourceProvider {
     private ObjectNode topicPolicy(Topic topic, String topicArn) {
         String stored = topic.getAttributes().get("Policy");
         if (stored == null || stored.isBlank()) {
-            return defaultTopicPolicy(topicArn);
+            return defaultTopicPolicy(topicArn, regionResolver.getAccountId());
         }
         JsonNode parsed;
         try {

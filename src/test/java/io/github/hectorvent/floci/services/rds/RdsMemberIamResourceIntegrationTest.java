@@ -83,8 +83,6 @@ class RdsMemberIamResourceIntegrationTest {
                     .formParam("DBClusterIdentifier", clusterId)
                     .formParam("DBInstanceClass", "db.serverless")
                     .formParam("Engine", "aurora-postgresql")
-                    .formParam("MasterUsername", MASTER_USER)
-                    .formParam("MasterUserPassword", MASTER_PASSWORD)
                     .formParam("DBName", DATABASE)
                     .formParam("EnableIAMDatabaseAuthentication", "true")
                     .when().post("/").then().statusCode(200).extract().xmlPath();

@@ -12,6 +12,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -63,6 +64,23 @@ final class SchedulerTestHarness {
     }
 
     void createSchedule(String name, String expression, String state, String targetArn, String input) {
+        postSchedule(name, scheduleRequest(expression, state, targetArn, input));
+    }
+
+    /**
+     * Creates an enabled recurring schedule that starts a day from now, and returns that start, its
+     * first occurrence. The application's own dispatcher keeps ticking while a test runs, so a
+     * schedule that is already due could fire there as well as on the test's dispatcher.
+     */
+    Instant createRecurringSchedule(String name, String expression, String targetArn, String input) {
+        Instant startDate = Instant.now().plus(1, ChronoUnit.DAYS).truncatedTo(ChronoUnit.SECONDS);
+        ObjectNode request = scheduleRequest(expression, "ENABLED", targetArn, input);
+        request.put("StartDate", startDate.getEpochSecond());
+        postSchedule(name, request);
+        return startDate;
+    }
+
+    private static ObjectNode scheduleRequest(String expression, String state, String targetArn, String input) {
         ObjectNode request = MAPPER.createObjectNode();
         request.put("ScheduleExpression", expression);
         request.putObject("FlexibleTimeWindow").put("Mode", "OFF");
@@ -71,7 +89,10 @@ final class SchedulerTestHarness {
         target.put("Arn", targetArn);
         target.put("RoleArn", ROLE_ARN);
         target.put("Input", input);
+        return request;
+    }
 
+    private void postSchedule(String name, ObjectNode request) {
         given()
                 .contentType("application/json")
                 .body(request.toString())

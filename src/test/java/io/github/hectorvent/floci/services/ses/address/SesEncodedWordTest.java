@@ -1,4 +1,4 @@
-package io.github.hectorvent.floci.services.ses;
+package io.github.hectorvent.floci.services.ses.address;
 
 import org.junit.jupiter.api.Test;
 

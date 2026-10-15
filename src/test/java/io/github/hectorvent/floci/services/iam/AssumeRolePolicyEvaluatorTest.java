@@ -390,6 +390,42 @@ class AssumeRolePolicyEvaluatorTest {
                 "arn:aws:appsync:us-east-1:111111111111:apis/example", "111111111111"));
     }
 
+    /**
+     * A trust policy is a resource policy, and those take policy variables too. The caller's own
+     * account is one of the keys the request carries, so a session name can be held to it.
+     */
+    @Test
+    void aTrustConditionResolvesAPolicyVariable() {
+        String doc = """
+            {"Version":"2012-10-17","Statement":[
+              {"Effect":"Allow","Principal":{"AWS":"111111111111"},"Action":"sts:AssumeRole",
+               "Condition":{"StringLike":{"sts:RoleSessionName":"${aws:PrincipalAccount}-*"}}}]}
+            """;
+        assertTrue(evaluator.allows(doc, CALLER_ARN, CALLER_ARN, CALLER_ACCOUNT,
+                sessionNamed(CALLER_ACCOUNT + "-build")));
+        assertFalse(evaluator.allows(doc, CALLER_ARN, CALLER_ARN, CALLER_ACCOUNT,
+                sessionNamed("222222222222-build")));
+    }
+
+    /** The same condition under the version that predates variables compares the text itself. */
+    @Test
+    void aTrustConditionVariableStaysLiteralWithoutTheVersion() {
+        String doc = """
+            {"Statement":[
+              {"Effect":"Allow","Principal":{"AWS":"111111111111"},"Action":"sts:AssumeRole",
+               "Condition":{"StringLike":{"sts:RoleSessionName":"${aws:PrincipalAccount}-*"}}}]}
+            """;
+        assertFalse(evaluator.allows(doc, CALLER_ARN, CALLER_ARN, CALLER_ACCOUNT,
+                sessionNamed(CALLER_ACCOUNT + "-build")));
+        assertTrue(evaluator.allows(doc, CALLER_ARN, CALLER_ARN, CALLER_ACCOUNT,
+                sessionNamed("${aws:PrincipalAccount}-build")));
+    }
+
+    private static Map<String, List<String>> sessionNamed(String sessionName) {
+        return Map.of("aws:PrincipalAccount", List.of(CALLER_ACCOUNT),
+                "sts:RoleSessionName", List.of(sessionName));
+    }
+
     @Test
     void aGrantNamingTheCallerIsToldApartFromAGrantToItsAccount() {
         assertEquals(TrustDecision.ALLOW, evaluator.decide(trust("{\"AWS\":\"" + CALLER_ARN + "\"}"),

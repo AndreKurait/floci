@@ -1244,6 +1244,36 @@ class NativeDynamoDbJsonHandlerTest {
     }
 
     @Test
+    void nullReturnConsumedCapacityIsTreatedAsAbsent() throws Exception {
+        createUsersTable("eu-west-1");
+        String key = "{\"userId\": {\"S\": \"a\"}}";
+        String select = "\"SELECT * FROM \\\"Users\\\" WHERE userId = 'a'\"";
+        Map<String, String> requests = Map.ofEntries(
+                Map.entry("PutItem", "{\"TableName\": \"Users\", \"Item\": " + key),
+                Map.entry("GetItem", "{\"TableName\": \"Users\", \"Key\": " + key),
+                Map.entry("DeleteItem", "{\"TableName\": \"Users\", \"Key\": " + key),
+                Map.entry("UpdateItem", "{\"TableName\": \"Users\", \"Key\": " + key),
+                Map.entry("Query", "{\"TableName\": \"Users\", \"KeyConditionExpression\": \"userId = :u\", "
+                        + "\"ExpressionAttributeValues\": {\":u\": {\"S\": \"a\"}}"),
+                Map.entry("Scan", "{\"TableName\": \"Users\""),
+                Map.entry("BatchGetItem", "{\"RequestItems\": {\"Users\": {\"Keys\": [" + key + "]}}"),
+                Map.entry("BatchWriteItem", "{\"RequestItems\": {\"Users\": [{\"PutRequest\": {\"Item\": " + key + "}}]}"),
+                Map.entry("TransactGetItems", "{\"TransactItems\": [{\"Get\": {\"TableName\": \"Users\", \"Key\": " + key + "}}]"),
+                Map.entry("TransactWriteItems", "{\"TransactItems\": [{\"Put\": {\"TableName\": \"Users\", \"Item\": " + key + "}}]"),
+                Map.entry("ExecuteStatement", "{\"Statement\": " + select),
+                Map.entry("BatchExecuteStatement", "{\"Statements\": [{\"Statement\": " + select + "}]"),
+                Map.entry("ExecuteTransaction", "{\"TransactStatements\": [{\"Statement\": " + select + "}]"));
+
+        for (Map.Entry<String, String> request : requests.entrySet()) {
+            Response response = handler.handle(request.getKey(),
+                    json(request.getValue() + ", \"ReturnConsumedCapacity\": null}"), "eu-west-1");
+            assertEquals(200, response.getStatus(), request.getKey());
+            JsonNode body = mapper.convertValue(response.getEntity(), JsonNode.class);
+            assertFalse(body.has("ConsumedCapacity"), request.getKey());
+        }
+    }
+
+    @Test
     void scanReportsTheLimitBeforeReturnConsumedCapacity() {
         AwsException ex = expectValidationException("Scan", json("""
                 {"TableName": "Users", "Limit": 0, "ReturnConsumedCapacity": "BOGUS"}

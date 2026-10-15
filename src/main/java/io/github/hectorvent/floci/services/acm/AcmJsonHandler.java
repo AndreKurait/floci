@@ -103,8 +103,8 @@ public class AcmJsonHandler {
         JsonNode sanNode = request.path("SubjectAlternativeNames");
         if (sanNode.isArray() && sanNode.isEmpty()) {
             throw new AwsException("ValidationException",
-                "Value of the input at 'subjectAlternativeNames' failed to satisfy constraint: "
-                    + "Member must have length greater than or equal to 1", 400);
+                "1 validation error detected: Value '[]' at 'subjectAlternativeNames' failed to satisfy "
+                    + "constraint: Member must have length greater than or equal to 1", 400);
         }
         List<String> sans = parseStringList(sanNode);
         ValidationMethod validationMethod = parseValidationMethod(request.path("ValidationMethod").asText(null));

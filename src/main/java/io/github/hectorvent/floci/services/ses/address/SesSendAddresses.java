@@ -1,4 +1,4 @@
-package io.github.hectorvent.floci.services.ses;
+package io.github.hectorvent.floci.services.ses.address;
 
 import io.github.hectorvent.floci.services.ses.model.SendEmailRequest;
 import org.apache.james.mime4j.dom.Header;
