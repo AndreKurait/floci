@@ -55,8 +55,16 @@ The deprecated `ExecuteSql` operation is recognized at `POST /ExecuteSql` and re
 |---|---|---|
 | `FLOCI_SERVICES_RDS_DATA_ENABLED` | `true` | Enable or disable the RDS Data API service |
 | `FLOCI_SERVICES_RDS_DATA_TRANSACTION_TTL_SECONDS` | `180` | Idle timeout, in seconds, before leaked Data API transactions expire |
+| `FLOCI_SERVICES_RDS_DATA_DATABASE_RESUMING_EXCEPTION_ENABLED` | `false` | Return `DatabaseResumingException` (HTTP 400) while an auto-paused Aurora backend resumes, instead of waiting for it |
 
 The RDS Data API also requires the RDS service itself to be enabled because it resolves `resourceArn` values to local RDS containers.
+
+With `database-resuming-exception-enabled=true`, `ExecuteStatement`, `BatchExecuteStatement`,
+and `BeginTransaction` initiate resume in the background and return the retryable error before
+opening a database connection. Calls made while resume is in progress return the same error;
+retry after a few seconds. Once ready, requests run normally. Existing transactions keep their
+backend awake until commit, rollback, or expiry. The default remains blocking resume for local
+compatibility; TCP database connections and internal RDS commands always wait for resume.
 
 ## Example
 

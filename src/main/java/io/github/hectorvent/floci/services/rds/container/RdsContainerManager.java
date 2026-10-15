@@ -37,7 +37,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -486,12 +485,17 @@ public class RdsContainerManager implements RdsBackendGate, Resettable {
 
     @Override
     public Lease enter(String host, int port) throws InterruptedException {
+        return enter(host, port, true);
+    }
+
+    @Override
+    public Lease enter(String host, int port, boolean waitForResume) throws InterruptedException {
         if (host == null) {
             return Lease.NONE;
         }
         for (AutoPauseController controller : autoPauses.values()) {
             if (controller.serves(host, port)) {
-                return controller.acquire();
+                return controller.acquire(waitForResume);
             }
         }
         return Lease.NONE;
@@ -577,8 +581,7 @@ public class RdsContainerManager implements RdsBackendGate, Resettable {
                     () -> Thread.ofVirtual().name("rds-auto-pause").start(task),
                     delay.toMillis(), TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException e) {
-            LOG.debugv("RDS auto-pause timer is shut down; not scheduling: {0}", e.getMessage());
-            return CompletableFuture.completedFuture(null);
+            throw new IllegalStateException("RDS auto-pause timer is shut down", e);
         }
     }
 
