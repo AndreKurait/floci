@@ -96,7 +96,4 @@ public final class SwfConstants {
     private SwfConstants() {
     }
 
-    public static boolean isTarget(String target) {
-        return target != null && (target.startsWith(TARGET_PREFIX) || target.startsWith(LEGACY_TARGET_PREFIX));
-    }
 }
