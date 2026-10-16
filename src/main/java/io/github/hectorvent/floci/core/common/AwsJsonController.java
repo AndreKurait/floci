@@ -95,20 +95,20 @@ public class AwsJsonController {
     }
 
     /**
-     * SWF also accepts the documented JSON target used by Boto 2. Keep the wire
-     * headers intact and delegate the body, operation and faults to the same handler.
+     * Accept plain JSON only for catalog descriptors declaring that format.
+     * Keep the wire headers intact and delegate to the same JSON handler.
      */
     @POST
     @Consumes("application/json")
     @Produces("application/json")
-    public Response handleLegacySwfRequest(
+    public Response handlePlainJsonRequest(
             @HeaderParam("X-Amz-Target") String target,
             @Context HttpHeaders httpHeaders,
             String body) {
         if (target == null) {
             return JsonErrorResponseUtils.createMissingTargetErrorResponse();
         }
-        if (!SwfConstants.isTarget(target)) {
+        if (catalog.matchPlainJsonTarget(target).isEmpty()) {
             return JsonErrorResponseUtils.createUnknownOperationErrorResponse(target);
         }
         return Response.fromResponse(handleJsonRequest(target, httpHeaders, body))

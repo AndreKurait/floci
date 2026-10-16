@@ -111,8 +111,7 @@ public class ProtocolClaimer {
                 if (CONTENT_TYPE_JSON_1_1.equals(mediaType)) {
                     return Optional.of(targetClaim(WireProtocol.AWS_JSON_1_1, target));
                 }
-                // SWF's documented pre-Smithy JSON wire format, still emitted by Boto 2.
-                if ("application/json".equals(mediaType) && SwfConstants.isTarget(target)) {
+                if ("application/json".equals(mediaType) && catalog.matchPlainJsonTarget(target).isPresent()) {
                     return Optional.of(targetClaim(WireProtocol.AWS_JSON_1_0, target));
                 }
                 if (isCbor(mediaType)) {

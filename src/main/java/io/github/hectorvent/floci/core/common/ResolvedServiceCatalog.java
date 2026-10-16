@@ -296,7 +296,7 @@ public class ResolvedServiceCatalog {
                         Set.of("AWSStepFunctions."), Set.of("states"), Set.of("SFN"), Set.of()),
                 descriptor("swf", "swf", config.services().swf().enabled(), true,
                         "swf", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
-                        protocols(ServiceProtocol.JSON),
+                        protocols(ServiceProtocol.JSON, ServiceProtocol.PLAIN_JSON),
                         Set.of(SwfConstants.TARGET_PREFIX, SwfConstants.LEGACY_TARGET_PREFIX),
                         Set.of("swf"), Set.of(), Set.of()),
                 descriptor("cloudformation", "cloudformation", config.services().cloudformation().enabled(), true,
@@ -799,6 +799,10 @@ public class ResolvedServiceCatalog {
 
     public Optional<ServiceCatalog.TargetMatch> matchTarget(String target) {
         return catalog.matchTarget(target);
+    }
+
+    public Optional<ServiceCatalog.TargetMatch> matchPlainJsonTarget(String target) {
+        return catalog.matchPlainJsonTarget(target);
     }
 
     public Optional<ServiceDescriptor> byCredentialScope(String credentialScope) {
