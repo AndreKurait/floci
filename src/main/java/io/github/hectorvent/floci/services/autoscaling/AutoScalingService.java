@@ -809,8 +809,7 @@ public class AutoScalingService {
         synchronized (lockFor(region)) {
             synchronized (lockFor(asgKey(region, name))) {
                 AutoScalingGroup asg = requireGroup(region, name);
-                List<String> conflicts = groups.values().stream()
-                        .filter(group -> region.equals(group.getRegion()))
+                List<String> conflicts = describeAutoScalingGroups(region, List.of()).stream()
                         .flatMap(group -> group.getInstances().stream()
                                 .filter(instance -> instanceIds.contains(instance.getInstanceId()))
                                 .map(instance -> "The Instance: " + instance.getInstanceId()
