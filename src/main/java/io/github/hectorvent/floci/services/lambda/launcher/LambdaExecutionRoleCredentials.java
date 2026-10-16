@@ -54,7 +54,15 @@ public class LambdaExecutionRoleCredentials {
      * the existing container credential fallback rather than becoming an implicit deny-all caller.
      */
     public Optional<SessionCreds> forFunction(LambdaFunction function) {
-        return forRole(function.getRole(), sessionAccountId(function), function.getFunctionName());
+        Optional<SessionCreds> credentials = forRole(
+                function.getRole(), sessionAccountId(function), function.getFunctionName());
+        if (credentials.isPresent()) {
+            LambdaExecutionBinding binding = binding(function);
+            if (binding != null) {
+                iamService.bindLambdaExecution(sessionAccountId(function), credentials.get().accessKeyId(), binding);
+            }
+        }
+        return credentials;
     }
 
     /** A session for {@code roleArn} assumed on behalf of {@code functionName} in {@code functionAccountId}. */
@@ -92,10 +100,6 @@ public class LambdaExecutionRoleCredentials {
         iamService.registerLambdaExecutionRoleSession(
                 functionAccountId, credentials.accessKeyId(), credentials.secretAccessKey(),
                 credentials.sessionToken(), roleArn, functionName, assumedRoleId);
-        LambdaExecutionBinding binding = binding(function);
-        if (binding != null) {
-            iamService.bindLambdaExecution(functionAccountId, credentials.accessKeyId(), binding);
-        }
         return Optional.of(credentials);
     }
 
