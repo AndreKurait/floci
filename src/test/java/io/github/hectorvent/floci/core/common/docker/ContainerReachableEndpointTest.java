@@ -85,6 +85,7 @@ class ContainerReachableEndpointTest {
         when(dockerHostResolver.resolve()).thenReturn("172.18.0.2");
 
         assertEquals("http://172.18.0.2:4811", endpoint(4811).baseUrl());
+        assertEquals("http://172.18.0.2:4811", endpoint(4811).baseUrl(false));
     }
 
     @Test
@@ -97,5 +98,6 @@ class ContainerReachableEndpointTest {
         when(dockerHostResolver.resolve()).thenReturn("172.18.0.2");
 
         assertEquals("http://172.18.0.2:4566", endpoint(4510).baseUrl());
+        assertEquals("http://172.18.0.2:4566", endpoint(4510).baseUrl(false));
     }
 }
