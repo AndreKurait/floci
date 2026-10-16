@@ -996,6 +996,7 @@ class AutoScalingServiceTest {
         StorageBackedMap<AutoScalingGroup> groups = new StorageBackedMap<>(storage);
         groups.putAll(service.groups);
         service.groups = groups;
+        service.ec2Service = mock(Ec2Service.class);
         service.attachInstances(REGION, "test-asg", List.of("i-live"));
 
         assertFalse(service.describeAutoScalingGroups(null, null).contains(null));
