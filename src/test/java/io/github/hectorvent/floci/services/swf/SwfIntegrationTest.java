@@ -523,7 +523,6 @@ class SwfIntegrationTest {
                 .body("taskToken", org.hamcrest.Matchers.not(equalTo("")))
                 .body("events.eventType", hasItem("WorkflowExecutionSignaled"));
 
-        // Once the signal has been delivered, an empty completion waits for new work.
         call("RespondDecisionTaskCompleted", """
                 {"taskToken": "%s", "decisions": []}
                 """.formatted(deferred.path("taskToken").toString())).then().statusCode(200);
