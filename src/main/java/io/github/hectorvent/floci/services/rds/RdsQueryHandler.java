@@ -115,6 +115,8 @@ public class RdsQueryHandler {
                 case "DeleteDBClusterEndpoint" -> handleDeleteDbClusterEndpoint(params, region);
                 case "EnableHttpEndpoint" -> handleSetHttpEndpoint("EnableHttpEndpoint", params, region, true);
                 case "DisableHttpEndpoint" -> handleSetHttpEndpoint("DisableHttpEndpoint", params, region, false);
+                case "DescribeDBLogFiles" -> handleDescribeDbLogFiles(params, region);
+                case "DownloadDBLogFilePortion" -> handleDownloadDbLogFilePortion(params, region);
                 case "AddRoleToDBCluster" -> handleAddRoleToDbCluster(params, region);
                 case "RemoveRoleFromDBCluster" -> handleRemoveRoleFromDbCluster(params, region);
                 case "AddRoleToDBInstance" -> handleAddRoleToDbInstance(params, region);
@@ -378,6 +380,55 @@ public class RdsQueryHandler {
                 .elem("HttpEndpointEnabled", cluster.isHttpEndpointEnabled())
                 .build();
         return Response.ok(AwsQueryResponse.envelope(action, AwsNamespaces.RDS, result)).build();
+    }
+
+    private Response handleDescribeDbLogFiles(MultivaluedMap<String, String> params, String region) {
+        RdsService.LogFilePage page = service.describeDbLogFiles(region,
+                params.getFirst("DBInstanceIdentifier"),
+                params.getFirst("FilenameContains"),
+                optionalLong(params, "FileLastWritten"),
+                optionalLong(params, "FileSize"),
+                optionalInt(params.getFirst("MaxRecords")),
+                params.getFirst("Marker"));
+        XmlBuilder xml = new XmlBuilder().start("DescribeDBLogFiles");
+        for (RdsLogFiles.LogFile file : page.files()) {
+            xml.start("DescribeDBLogFilesDetails")
+               .elem("LogFileName", file.name())
+               .elem("LastWritten", file.lastWritten().toEpochMilli())
+               .elem("Size", file.size())
+               .end("DescribeDBLogFilesDetails");
+        }
+        xml.end("DescribeDBLogFiles");
+        if (page.marker() != null) {
+            xml.elem("Marker", page.marker());
+        }
+        return Response.ok(AwsQueryResponse.envelope("DescribeDBLogFiles", AwsNamespaces.RDS, xml.build())).build();
+    }
+
+    private Response handleDownloadDbLogFilePortion(MultivaluedMap<String, String> params, String region) {
+        RdsLogFiles.Portion portion = service.downloadDbLogFilePortion(region,
+                params.getFirst("DBInstanceIdentifier"),
+                params.getFirst("LogFileName"),
+                params.getFirst("Marker"),
+                optionalInt(params.getFirst("NumberOfLines")));
+        String result = new XmlBuilder()
+                .elem("LogFileData", portion.data())
+                .elem("Marker", portion.marker())
+                .elem("AdditionalDataPending", portion.additionalDataPending())
+                .build();
+        return Response.ok(AwsQueryResponse.envelope("DownloadDBLogFilePortion", AwsNamespaces.RDS, result)).build();
+    }
+
+    private static Long optionalLong(MultivaluedMap<String, String> params, String name) {
+        String value = params.getFirst(name);
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidParameterValue", name + " must be a number: " + value, 400);
+        }
     }
 
     private Response handleAddRoleToDbCluster(MultivaluedMap<String, String> params, String region) {

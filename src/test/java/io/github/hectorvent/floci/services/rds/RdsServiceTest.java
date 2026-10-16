@@ -511,6 +511,37 @@ class RdsServiceTest {
     }
 
     @Test
+    void logFilesRecoverAMissingContainerOnceThenReportTheInstanceNotReady() {
+        when(rdsConfig.mock()).thenReturn(true);
+        rdsService.createDbInstance("logs-db", "postgres", "16.3", "admin", "password", "appdb",
+                "db.t3.micro", 20, false, null, null, null, null, false, false, null,
+                Map.of(), List.of(), null, null, true, DbInstanceSettings.defaults());
+        when(rdsConfig.mock()).thenReturn(false);
+        RdsService service = spy(rdsService);
+        DbInstance recovered = new DbInstance();
+        recovered.setContainerId("fresh-container");
+        doReturn(recovered).when(service).ensureInstanceBackend(eq("logs-db"), any());
+
+        // No container id on file: the backend is found once and its log read.
+        when(containerManager.readLog("fresh-container"))
+                .thenReturn(List.of("2026-10-15T10:00:00Z LOG:  database system is ready to accept connections"));
+        assertEquals(List.of("error/postgresql.log.2026-10-15-10"),
+                service.describeDbLogFiles(null, "logs-db", null, null, null, null, null).files().stream()
+                        .map(RdsLogFiles.LogFile::name).toList());
+
+        // Docker does not know the recovered container either: the instance is not ready.
+        when(containerManager.readLog("fresh-container")).thenReturn(null);
+        AwsException notReady = assertThrows(AwsException.class,
+                () -> service.describeDbLogFiles(null, "logs-db", null, null, null, null, null));
+        assertEquals("DBInstanceNotReady", notReady.getErrorCode());
+
+        // A read that times out is a failure, not a short log.
+        when(containerManager.readLog("fresh-container")).thenThrow(new IllegalStateException("Timed out"));
+        assertEquals("InternalFailure", assertThrows(AwsException.class,
+                () -> service.describeDbLogFiles(null, "logs-db", null, null, null, null, null)).getErrorCode());
+    }
+
+    @Test
     void replacedClusterCannotReceiveAnOldMemberPublicationAndRetryReusesThePort() throws Exception {
         when(rdsConfig.mock()).thenReturn(false);
         rdsService.createDbCluster("replaced-cluster", "aurora-postgresql", "16.3",

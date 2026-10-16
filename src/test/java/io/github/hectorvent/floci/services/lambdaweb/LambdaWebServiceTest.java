@@ -529,9 +529,18 @@ class LambdaWebServiceTest {
         ObjectNode update = mapper.createObjectNode().put("description", "updated");
         first.updateEndpoint(REGION, "durable", "dev", update);
 
+        String domain = first.getEndpoint(REGION, "durable", "dev").domainName;
+        assertEquals("dev", first.locate(domain).orElseThrow().endpoint().endpointName);
+
         LambdaWebService second = service(new FileStorageFactory(storageDir));
         WebFunction restored = second.getFunction(REGION, "durable");
         assertEquals(created.functionArn, restored.functionArn);
+        LambdaWebService.WebFunctionTarget target = second.locate(domain).orElseThrow();
+        assertEquals(ACCOUNT_ID, target.accountId());
+        assertEquals(REGION, target.region());
+        assertEquals("durable", target.function().functionName);
+        assertEquals("dev", target.endpoint().endpointName);
+        assertTrue(second.locate("nope.001.lambda-web.us-east-1.localhost:4566").isEmpty());
         assertEquals(2, restored.revisions.size());
         WebFunctionEndpoint endpoint = second.getEndpoint(REGION, "durable", "dev");
         assertEquals("updated", endpoint.description);
@@ -541,6 +550,8 @@ class LambdaWebServiceTest {
         assertEquals(endpoint.revisionWeights.get(0).revisionId,
                 second.listRevisions(REGION, "durable", mapper.createObjectNode()).items().get(0).revisionId,
                 "the LatestRevision endpoint moved to the newer revision and that move was written back");
+        second.deleteEndpoint(REGION, "durable", "dev");
+        assertTrue(second.locate(domain).isEmpty(), "a deleted endpoint's domain is gone");
     }
 
     private static final class MemoryStorageFactory extends StorageFactory {

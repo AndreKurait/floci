@@ -268,19 +268,18 @@ state.
   itself has no JSON index support to pass through. Low practical risk in itself, since PEP 691
   requires clients to accept HTML as a fallback and pip/uv both do, but it is a real gap against
   AWS's documented surface, not just a quirk of the sidecar.
-- **`DescribePackageVersion` can't see Maven-, npm-, or pypi-uploaded package versions.** Those
-  three formats' repository endpoints are deliberately metadata-free passthroughs straight to
-  their sidecar container (Reposilite/Verdaccio/pypiserver) and never create the generic-format
-  package-version record this action depends on (`CodeArtifactService.describePackageVersion`
-  only ever looks up `packageVersions.getForAccount`, the record only the `generic` format's
-  `PublishPackageVersion` flow creates). `GetPackageVersionAsset` no longer has this gap: it
-  bridges to each format's own sidecar (via a new `RepositorySidecarManager.fetchPackageVersionAsset`
-  method each sidecar client implements) when there's no generic-format record, so it now works
-  uniformly across formats the way real CodeArtifact's does. `DescribePackageVersion` is a harder
-  problem for the same bridge: it describes every asset and the status of a whole version, not one
-  named file, and none of these sidecars expose that shape cheaply (Reposilite has no per-GAV
-  metadata beyond file listings; Verdaccio's own registry API could answer it for npm but Maven and
-  pypi have nothing equivalent), so it remains unbridged and still 404s for these three formats.
+- **`DescribePackageVersion` reports only format/namespace/packageName/version/revision/status/origin
+  for Maven, npm, and pypi, same as it does for generic.** Real CodeArtifact's `PackageVersionDescription`
+  can also carry `displayName`, `summary`, `homePage`, `sourceCodeRepository`, `licenses`, and
+  `publishedTime`, extracted from the package's own metadata; none of those are populated for any
+  format today, container-backed or generic. For Maven, npm, and pypi, the version's existence is
+  confirmed directly against its sidecar (`RepositorySidecarManager.packageVersionExists`) rather
+  than through the generic-format-only `packageVersions` record `GetPackageVersionAsset`'s own
+  bridge also moved past, and the revision is synthesized the same deterministic way
+  `GetPackageVersionAsset`'s bridge already does, so describing a version and then fetching one of
+  its assets see the same revision. Every sidecar-backed version reports `Published`: none of
+  these three formats' native publish paths (`mvn deploy`, `npm publish`, `twine upload`) can leave
+  a version in any other status the way a generic publish deliberately can with `unfinished=true`.
 - **`DescribePackage`'s origin controls default to `publish: ALLOW`/`upstream: BLOCK`** (the
   default for a package whose first version was published directly, since Floci never ingests
   packages from an upstream source) **until a caller sets them explicitly with
@@ -298,8 +297,9 @@ state.
 - **`DescribeDomain`'s `assetSizeBytes` only counts what was published after this field started
   being computed.** Generic-format bytes are summed live from the still-existing
   `PublishPackageVersion` records, so they're always current. Maven, npm, and pypi have no such
-  record to sum (the same gap `DescribePackageVersion` has), so each proxy reports its own
-  successfully-written byte count directly; a package published through one of those three formats
+  record to sum (the same absent generic-format record `DescribePackageVersion`'s own bridge works
+  around by asking the sidecar directly instead), so each proxy reports its own successfully-written
+  byte count directly; a package published through one of those three formats
   before this accounting existed was never reported and is not retroactively counted. A genuine
   conflict or an idempotent no-op retry (any of the three formats' own duplicate-publish
   protection) correctly adds nothing either way. Both `DeleteRepository` and `DeletePackage` clean

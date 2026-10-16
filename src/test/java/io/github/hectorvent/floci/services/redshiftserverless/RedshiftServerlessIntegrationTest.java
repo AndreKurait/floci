@@ -508,6 +508,91 @@ class RedshiftServerlessIntegrationTest {
                 .body("__type", equalTo("ValidationException"));
     }
 
+    @Test
+    void resourcePolicyRoundTripsOverTheWire() {
+        call("CreateNamespace", "{\"namespaceName\":\"policy-ns\",\"adminUsername\":\"admin\"}").statusCode(200);
+        String snapshotArn = call("CreateSnapshot", "{\"snapshotName\":\"policy-snap\",\"namespaceName\":\"policy-ns\"}")
+                .statusCode(200).extract().path("snapshot.snapshotArn");
+
+        call("PutResourcePolicy", "{\"resourceArn\":\"" + snapshotArn + "\",\"policy\":\"{\\\"Version\\\":\\\"2012-10-17\\\"}\"}")
+                .statusCode(200)
+                .body("resourcePolicy.resourceArn", equalTo(snapshotArn));
+        call("GetResourcePolicy", "{\"resourceArn\":\"" + snapshotArn + "\"}")
+                .statusCode(200)
+                .body("resourcePolicy.policy", equalTo("{\"Version\":\"2012-10-17\"}"));
+        call("DeleteResourcePolicy", "{\"resourceArn\":\"" + snapshotArn + "\"}").statusCode(200);
+        call("GetResourcePolicy", "{\"resourceArn\":\"" + snapshotArn + "\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ResourceNotFoundException"));
+        call("PutResourcePolicy", "{\"resourceArn\":\"" + snapshotArn + "\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"));
+        call("PutResourcePolicy", "{\"policy\":\"{\\\"Version\\\":\\\"2012-10-17\\\"}\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"));
+        call("GetResourcePolicy", "{\"resourceArn\":\"arn:aws:redshift-serverless:us-east-1:999999999999:snapshot/x\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo("resourceArn does not identify a snapshot in this account and Region."));
+        call("DeleteResourcePolicy", "{\"resourceArn\":\"arn:aws:redshift-serverless:us-east-1:999999999999:snapshot/x\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo("resourceArn does not identify a snapshot in this account and Region."));
+    }
+
+    @Test
+    void resourcePolicyIsIsolatedPerAccount() {
+        String accountA = "111122223333";
+        String accountB = "444455556666";
+        String policyJson = "{\"Version\":\"2012-10-17\"}";
+        String escapedPolicy = "{\\\"Version\\\":\\\"2012-10-17\\\"}";
+
+        callAs(accountA, "CreateNamespace", "{\"namespaceName\":\"acct-ns\",\"adminUsername\":\"admin\"}").statusCode(200);
+        String snapArnA = callAs(accountA, "CreateSnapshot", "{\"snapshotName\":\"acct-snap\",\"namespaceName\":\"acct-ns\"}")
+                .statusCode(200).extract().path("snapshot.snapshotArn");
+
+        callAs(accountA, "PutResourcePolicy", "{\"resourceArn\":\"" + snapArnA + "\",\"policy\":\"" + escapedPolicy + "\"}")
+                .statusCode(200)
+                .body("resourcePolicy.resourceArn", equalTo(snapArnA));
+
+        callAs(accountB, "GetResourcePolicy", "{\"resourceArn\":\"" + snapArnA + "\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo("resourceArn does not identify a snapshot in this account and Region."));
+        callAs(accountB, "DeleteResourcePolicy", "{\"resourceArn\":\"" + snapArnA + "\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo("resourceArn does not identify a snapshot in this account and Region."));
+        callAs(accountB, "PutResourcePolicy", "{\"resourceArn\":\"" + snapArnA + "\",\"policy\":\"" + escapedPolicy + "\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo("resourceArn does not identify a snapshot in this account and Region."));
+
+        callAs(accountB, "CreateNamespace", "{\"namespaceName\":\"acct-ns\",\"adminUsername\":\"admin\"}").statusCode(200);
+        String snapArnB = callAs(accountB, "CreateSnapshot", "{\"snapshotName\":\"acct-snap\",\"namespaceName\":\"acct-ns\"}")
+                .statusCode(200).extract().path("snapshot.snapshotArn");
+
+        callAs(accountB, "GetResourcePolicy", "{\"resourceArn\":\"" + snapArnB + "\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ResourceNotFoundException"));
+
+        callAs(accountA, "GetResourcePolicy", "{\"resourceArn\":\"" + snapArnA + "\"}")
+                .statusCode(200)
+                .body("resourcePolicy.policy", equalTo(policyJson));
+    }
+
+    private static io.restassured.response.ValidatableResponse callAs(String accountId, String action, String body) {
+        return given()
+                .header("X-Amz-Target", TARGET_PREFIX + action)
+                .header("Authorization", "AWS4-HMAC-SHA256 Credential=" + accountId
+                        + "/20260904/us-east-1/redshift-serverless/aws4_request")
+                .contentType(CONTENT_TYPE)
+                .body(body)
+                .when()
+                .post("/")
+                .then();
+    }
+
     private static io.restassured.response.ValidatableResponse call(String action, String body) {
         return given()
                 .header("X-Amz-Target", TARGET_PREFIX + action)

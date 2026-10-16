@@ -83,11 +83,22 @@ class RedshiftServerlessJsonHandlerTest {
         when(storageFactory.create(eq("redshiftserverless"), eq("redshiftserverless-usagelimits.json"),
                 any(TypeReference.class))).thenReturn((AccountAwareStorageBackend)
                 AccountAwareStorageBackend.inMemory(ACCOUNT_ID));
+        stubAdministrationStores(storageFactory);
         RedshiftServerlessService service =
                 new RedshiftServerlessService(storageFactory, regionResolver, endpoints, runtime, config);
         handler = new RedshiftServerlessJsonHandler(service, mapper, iamDbUserResolver,
                 new RedshiftServerlessUsageLimitService(storageFactory, regionResolver, service),
-                new RedshiftServerlessAdminJsonHandler(mapper));
+                new RedshiftServerlessAdminJsonHandler(mapper,
+                        new RedshiftServerlessResourcePolicyService(storageFactory, service, mapper)));
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void stubAdministrationStores(StorageFactory storageFactory) {
+        for (String file : List.of("resourcepolicies")) {
+            when(storageFactory.create(eq("redshiftserverless"), eq("redshiftserverless-" + file + ".json"),
+                    any(TypeReference.class))).thenReturn((AccountAwareStorageBackend)
+                    AccountAwareStorageBackend.inMemory(ACCOUNT_ID));
+        }
     }
 
     @Test

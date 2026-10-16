@@ -21,6 +21,7 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
  *   <li>{@code Ec2ContainerManager}, for the {@code AWS_ENDPOINT_URL} of EC2 instance containers</li>
  *   <li>{@code CustomResourceCfnProvisioner}, for the {@code ResponseURL} a custom resource
  *       Lambda PUTs its result to</li>
+ *   <li>{@code FlociDuckClient}, for the S3 endpoint the DuckDB sidecar calls</li>
  * </ul>
  *
  * <p>Kubernetes pods do not use it: {@code KubernetesFlociAddressResolver} builds their endpoint
@@ -61,10 +62,14 @@ public class ContainerReachableEndpoint {
 
     /** Uses the Docker host when the container does not receive Floci's DNS resolver. */
     public String baseUrl(boolean useEmbeddedDns) {
-        int flociPort = config.tls().enabled() ? config.port() : httpPort;
         String flociHostname = useEmbeddedDns && embeddedDnsServer.getServerIp().isPresent()
                 ? config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX)
                 : dockerHostResolver.resolve();
-        return "http://" + flociHostname + ":" + flociPort;
+        return "http://" + flociHostname + ":" + port();
+    }
+
+    /** The port of {@link #baseUrl()}: the one a launched container can reach Floci on. */
+    public int port() {
+        return config.tls().enabled() ? config.port() : httpPort;
     }
 }

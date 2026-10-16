@@ -288,6 +288,32 @@ class RedshiftServerlessTest {
         }
     }
 
+    @Test
+    void resourcePolicyUsesAwsSdk() {
+        assumeFalse(TestFixtures.isRealAws(), "Creates resources and asserts emulator-local behavior");
+
+        try (RedshiftServerlessClient client = TestFixtures.redshiftServerlessClient()) {
+            String namespaceName = "floci-compat-policy-ns";
+            String snapshotName = "floci-compat-policy-snap";
+            try {
+                client.createNamespace(request -> request.namespaceName(namespaceName).adminUsername("admin")
+                        .adminUserPassword("Secret123!"));
+                String snapshotArn = client.createSnapshot(request -> request
+                        .snapshotName(snapshotName).namespaceName(namespaceName)).snapshot().snapshotArn();
+
+                client.putResourcePolicy(request -> request.resourceArn(snapshotArn).policy("{\"Version\":\"2012-10-17\"}"));
+                assertThat(client.getResourcePolicy(request -> request.resourceArn(snapshotArn))
+                        .resourcePolicy().policy()).contains("2012-10-17");
+                client.deleteResourcePolicy(request -> request.resourceArn(snapshotArn));
+                assertThatThrownBy(() -> client.getResourcePolicy(request -> request.resourceArn(snapshotArn)))
+                        .isInstanceOf(ResourceNotFoundException.class);
+            } finally {
+                deleteSnapshotBestEffort(client, snapshotName);
+                deleteBestEffort(client, namespaceName);
+            }
+        }
+    }
+
     private static void deleteSnapshotBestEffort(RedshiftServerlessClient client, String snapshotName) {
         try {
             client.deleteSnapshot(request -> request.snapshotName(snapshotName));

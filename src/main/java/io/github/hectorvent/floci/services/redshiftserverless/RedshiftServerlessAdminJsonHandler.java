@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.services.redshiftserverless.model.ResourcePolicy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
@@ -25,14 +26,26 @@ public class RedshiftServerlessAdminJsonHandler {
     private static final List<String> TRACK_NAMES = RedshiftServerlessService.TRACK_NAMES;
 
     private final ObjectMapper objectMapper;
+    private final RedshiftServerlessResourcePolicyService resourcePolicies;
 
     @Inject
-    public RedshiftServerlessAdminJsonHandler(ObjectMapper objectMapper) {
+    public RedshiftServerlessAdminJsonHandler(ObjectMapper objectMapper,
+                                              RedshiftServerlessResourcePolicyService resourcePolicies) {
         this.objectMapper = objectMapper;
+        this.resourcePolicies = resourcePolicies;
     }
 
     Supplier<Response> operation(String action, JsonNode request, String region) {
         return switch (action) {
+            case "PutResourcePolicy" -> () -> resourcePolicyResponse(resourcePolicies.putResourcePolicy(
+                    ServerlessSupport.text(request, "resourceArn"), ServerlessSupport.text(request, "policy"),
+                    region));
+            case "GetResourcePolicy" -> () -> resourcePolicyResponse(resourcePolicies.getResourcePolicy(
+                    ServerlessSupport.text(request, "resourceArn"), region));
+            case "DeleteResourcePolicy" -> () -> {
+                resourcePolicies.deleteResourcePolicy(ServerlessSupport.text(request, "resourceArn"), region);
+                return Response.ok(objectMapper.createObjectNode()).build();
+            };
             case "GetTrack" -> () -> getTrack(ServerlessSupport.text(request, "trackName"));
             case "ListTracks" -> () -> listTracks(request);
             case "ListManagedWorkgroups" -> () -> listWithoutItems(request, "managedWorkgroups");
@@ -60,6 +73,17 @@ public class RedshiftServerlessAdminJsonHandler {
         ServerlessSupport.text(request, "clientToken");
         throw ServerlessSupport.notFound("The reservation offering "
                 + ServerlessSupport.text(request, "offeringId") + " was not found.");
+    }
+
+    // ── Resource policy ────────────────────────────────────────────────────
+
+    private Response resourcePolicyResponse(ResourcePolicy policy) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("policy", policy.getPolicy());
+        node.put("resourceArn", policy.getResourceArn());
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("resourcePolicy", node);
+        return Response.ok(response).build();
     }
 
     // ── Tracks, managed workgroups and reservations ────────────────────────

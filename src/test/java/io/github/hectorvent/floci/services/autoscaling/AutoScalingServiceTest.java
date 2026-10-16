@@ -998,11 +998,14 @@ class AutoScalingServiceTest {
         service.groups = groups;
         service.ec2Service = mock(Ec2Service.class);
         service.attachInstances(REGION, "test-asg", List.of("i-live"));
+        service.createOrUpdateTags(REGION, "test-asg", "auto-scaling-group", Map.of("k", "v"), Map.of());
 
         assertFalse(service.describeAutoScalingGroups(null, null).contains(null));
         assertEquals(List.of("test-asg"), service.describeAutoScalingGroups(REGION, null).stream()
                 .map(AutoScalingGroup::getAutoScalingGroupName).toList());
         assertEquals(1, service.describeAutoScalingInstances(REGION, null).size());
+        assertEquals(List.of("k"), service.describeTags(REGION, List.of(), null, null).tags().stream()
+                .map(AutoScalingService.TagDescription::key).toList());
 
         service.setInstanceHealth(REGION, "i-live", "Unhealthy", false);
         service.terminateInstanceInAutoScalingGroup(REGION, "i-live", false);

@@ -159,7 +159,7 @@ final class SesV2Json {
         if (node.isArray()) {
             throw unexpectedStartError(node);
         }
-        throw new AwsException("SerializationException", "Expected null", 400);
+        throw expectedNullError();
     }
 
     /** A string member with the AWS deserializer's message for each wrong JSON type. */
@@ -171,16 +171,7 @@ final class SesV2Json {
         if (node.isTextual()) {
             return node.textValue();
         }
-        if (node.isNumber()) {
-            throw new AwsException("SerializationException",
-                    "NUMBER_VALUE can not be converted to a String", 400);
-        }
-        if (node.isBoolean()) {
-            throw new AwsException("SerializationException",
-                    (node.booleanValue() ? "TRUE_VALUE" : "FALSE_VALUE")
-                            + " can not be converted to a String", 400);
-        }
-        throw unexpectedStartError(node);
+        throw scalarTypeError(node, "String");
     }
 
     /**
@@ -227,6 +218,33 @@ final class SesV2Json {
             }
         });
         return values;
+    }
+
+    /**
+     * The deserializer's message for a scalar member of type {@code target} (such as
+     * {@code "String"}, {@code "Blob"} or {@code "Boolean"}) given a value of another JSON type.
+     */
+    static AwsException scalarTypeError(JsonNode node, String target) {
+        if (node.isNumber()) {
+            return new AwsException("SerializationException",
+                    "NUMBER_VALUE can not be converted to a " + target, 400);
+        }
+        if (node.isBoolean()) {
+            return new AwsException("SerializationException",
+                    (node.booleanValue() ? "TRUE_VALUE" : "FALSE_VALUE") + " can not be converted to a " + target,
+                    400);
+        }
+        return unexpectedStartError(node);
+    }
+
+    /** The deserializer's message for a structure or map member given a scalar. */
+    static AwsException expectedNullError() {
+        return new AwsException("SerializationException", "Expected null", 400);
+    }
+
+    /** The deserializer's message for a list member given a scalar. */
+    static AwsException expectedListError() {
+        return new AwsException("SerializationException", "Expected list or null", 400);
     }
 
     static AwsException unexpectedStartError(JsonNode node) {

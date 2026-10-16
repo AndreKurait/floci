@@ -771,10 +771,65 @@ public class CodeArtifactService implements Resettable {
             validatePackageToken("namespace", namespace);
         }
         String owner = effectiveOwner(domainOwner);
+        // Maven, npm, and pypi are metadata-free passthroughs straight to their own sidecar, the
+        // same reason getPackageVersionAsset bridges to them (see
+        // getContainerBackedPackageVersionAsset): publish for these formats never goes through
+        // publishPackageVersion, so packageVersions can never hold a record for them.
+        if (CONTAINER_BACKED_FORMATS.contains(format)) {
+            return describeContainerBackedPackageVersion(region, domain, owner, repository, format, namespace,
+                    packageName, version);
+        }
         String key = packageVersionKey(region, domain, repository, format, namespace, packageName, version);
         return packageVersions.getForAccount(owner, key)
                 .orElseThrow(() -> notFound("Package version '" + version + "' of package '" + packageName
                         + "' was not found.", version, "package-version"));
+    }
+
+    /**
+     * Unlike {@code GetPackageVersionAsset}, real CodeArtifact's {@code DescribePackageVersion}
+     * response has no asset listing at all (confirmed against the wire model: {@code
+     * PackageVersionDescription} has no such member; enumerating a version's files is {@code
+     * ListPackageVersionAssets}'s job, a separate, still-unimplemented action). All this needs
+     * from a sidecar is a yes/no answer to "does this exact version exist," which is cheap for
+     * every one of the three: Verdaccio's packument already lists every version it holds,
+     * Reposilite's own details API answers directory existence the same way {@link
+     * #ensureFormatContainerId}'s readiness probe already relies on, and pypiserver's per-project
+     * JSON listing already groups files by version the same way {@code deletePackage} already
+     * reads it.
+     *
+     * <p>A sidecar-backed version is always reported {@code Published}: nothing here ever leaves
+     * one in {@code Unfinished}, the way a generic publish deliberately can, since a real {@code
+     * mvn deploy}/{@code npm publish}/{@code twine upload} only ever lands a version by completing
+     * it in one shot.
+     *
+     * <p>Namespace is validated through the same shared {@link #validatePackageCoordinates} every
+     * other package-level operation already uses, rather than a one-off maven-only check: a pypi
+     * version genuinely has no namespace, so a caller-supplied one must be rejected outright, not
+     * silently ignored and echoed back in the response as though it belonged to the package.
+     */
+    private CodeArtifactPackageVersion describeContainerBackedPackageVersion(String region, String domain,
+            String owner, String repository, String format, String namespace, String packageName, String version) {
+        validatePackageCoordinates(format, namespace, packageName, "describing a version of");
+        String repoId = ensureFormatContainerId(format, region, domain, owner, repository);
+        RepositorySidecarManager manager = sidecarRegistry.forFormat(format)
+                .orElseThrow(() -> notFound("Package version '" + version + "' of package '" + packageName
+                        + "' was not found.", version, "package-version"));
+        if (!manager.packageVersionExists(repoId, domain, repository, namespace, packageName, version)) {
+            throw notFound("Package version '" + version + "' of package '" + packageName
+                    + "' was not found.", version, "package-version");
+        }
+        CodeArtifactPackageVersion pv = new CodeArtifactPackageVersion();
+        pv.setDomainName(domain);
+        pv.setDomainOwner(owner);
+        pv.setRegion(region);
+        pv.setRepositoryName(repository);
+        pv.setFormat(format);
+        pv.setNamespace(namespace);
+        pv.setPackageName(packageName);
+        pv.setVersion(version);
+        pv.setStatus("Published");
+        pv.setRevision(synthesizeContainerBackedRevision(repoId, namespace, packageName, version));
+        return pv;
     }
 
     /**
@@ -1085,25 +1140,6 @@ public class CodeArtifactService implements Resettable {
         return new PackageVersionAssetResult(asset, pv.getRevision());
     }
 
-    /**
-     * There's no stored revision for a sidecar-backed format to compare against, so one is
-     * synthesized from the version coordinate itself (this repository's own sidecar container id,
-     * plus namespace/package/version), not the fetched asset's own bytes: a real revision is
-     * shared by every asset of one package version (a Maven version's JAR and POM alike), so
-     * hashing per-asset content would give a client that described the version once, then tried
-     * to fetch a second asset at that same revision, a spurious not-found on the second call even
-     * though both assets genuinely exist. Keying on the sidecar container id, not just the bare
-     * namespace/package/version strings, keeps two different repositories (even two with the
-     * identical coordinates) from ever synthesizing the same revision.
-     *
-     * <p>Doesn't change when a new asset is published to the version afterward, unlike a real
-     * stored revision: tracking that would mean enumerating every asset a sidecar holds for a
-     * version on every call, the same capability {@code DescribePackageVersion} would need and
-     * doesn't have either for these formats (see the Known limitations doc). Accepted for the
-     * same reason: nothing before this change ever let a client obtain a revision for these
-     * formats in the first place (not even a stale one), so this isn't a regression against any
-     * previously working staleness check.
-     */
     private PackageVersionAssetResult getContainerBackedPackageVersionAsset(String region, String domain,
             String owner, String repository, String format, String namespace, String packageName, String version,
             String assetName, String packageVersionRevision) {
@@ -1132,10 +1168,24 @@ public class CodeArtifactService implements Resettable {
     }
 
     /**
-     * The same synthesized revision {@link #getContainerBackedPackageVersionAsset} uses, shared
-     * so {@link #getPackageVersionReadme}'s npm/pypi answers report a revision consistent with
-     * whatever {@code GetPackageVersionAsset} would already report for the same version
-     * coordinate, rather than two independently-computed stand-ins that happen to differ.
+     * There's no stored revision for a sidecar-backed format to compare against, so one is
+     * synthesized from the version coordinate itself (this repository's own sidecar container id,
+     * plus namespace/package/version), not the fetched asset's own bytes: a real revision is
+     * shared by every asset of one package version (a Maven version's JAR and POM alike), so
+     * hashing per-asset content would give a client that described the version once, then tried
+     * to fetch a second asset at that same revision, a spurious not-found on the second call even
+     * though both assets genuinely exist. Keying on the sidecar container id, not just the bare
+     * namespace/package/version strings, keeps two different repositories (even two with the
+     * identical coordinates) from ever synthesizing the same revision.
+     *
+     * <p>Shared by {@link #getContainerBackedPackageVersionAsset}, {@link
+     * #describeContainerBackedPackageVersion}, and {@link #getPackageVersionReadme}'s npm/pypi
+     * answers, so a client calling any two of them for the same version coordinate always sees one
+     * consistent revision rather than independently-computed stand-ins that happen to differ.
+     * Doesn't change when a new asset is published to the version afterward, unlike a real stored
+     * revision would: nothing before this helper existed ever let a client obtain a revision for
+     * these formats in the first place (not even a stale one), so this isn't a regression against
+     * any previously working staleness check.
      */
     private static String synthesizeContainerBackedRevision(String repoId, String namespace, String packageName,
             String version) {

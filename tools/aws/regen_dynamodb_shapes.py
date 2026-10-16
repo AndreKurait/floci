@@ -31,8 +31,8 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/dynamodb-request-shapes.json"
 MODEL = Path("dynamodb/2012-08-10/service-2.json")
 
 
-def load_model(data: Path) -> dict:
-    plain = data / MODEL
+def load_model(data: Path, model: Path = MODEL) -> dict:
+    plain = data / model
     if plain.exists():
         return json.loads(plain.read_text(encoding="utf-8"))
     compressed = plain.with_name(plain.name + ".gz")

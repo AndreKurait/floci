@@ -1390,6 +1390,97 @@ class CodeArtifactServiceTest {
     }
 
     @Test
+    void describePackageVersionBridgesToReposiliteForMavenSinceNoGenericRecordCanExist() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        CodeArtifactRepository created =
+                service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        String repoId = created.getSidecarContainerIds().get("maven");
+        when(reposiliteClient.packageVersionExists(eq(repoId), eq("dom"), eq("repo"), eq("com.example"),
+                eq("my-artifact"), eq("1.0.0"))).thenReturn(true);
+
+        CodeArtifactPackageVersion pv = service.describePackageVersion(REGION, "dom", null, "repo", "maven",
+                "com.example", "my-artifact", "1.0.0");
+
+        assertEquals("maven", pv.getFormat());
+        assertEquals("com.example", pv.getNamespace());
+        assertEquals("my-artifact", pv.getPackageName());
+        assertEquals("1.0.0", pv.getVersion());
+        assertEquals("Published", pv.getStatus());
+        assertEquals(Digests.sha256Hex((repoId + "/com.example/my-artifact/1.0.0").getBytes(StandardCharsets.UTF_8)),
+                pv.getRevision());
+    }
+
+    @Test
+    void describePackageVersionSynthesizesTheSameRevisionGetPackageVersionAssetWouldFor() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        CodeArtifactRepository created =
+                service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        String repoId = created.getSidecarContainerIds().get("npm");
+        when(verdaccioClient.packageVersionExists(eq(repoId), eq("dom"), eq("repo"), isNull(), eq("my-pkg"),
+                eq("1.0.0"))).thenReturn(true);
+        when(verdaccioClient.fetchPackageVersionAsset(eq(repoId), eq("dom"), eq("repo"), isNull(), eq("my-pkg"),
+                eq("1.0.0"), eq("my-pkg-1.0.0.tgz")))
+                .thenReturn(Optional.of("tarball bytes".getBytes(StandardCharsets.UTF_8)));
+
+        CodeArtifactPackageVersion described = service.describePackageVersion(REGION, "dom", null, "repo", "npm",
+                null, "my-pkg", "1.0.0");
+        PackageVersionAssetResult asset = service.getPackageVersionAsset(REGION, "dom", null, "repo", "npm", null,
+                "my-pkg", "1.0.0", "my-pkg-1.0.0.tgz", null);
+
+        assertEquals(described.getRevision(), asset.packageVersionRevision());
+    }
+
+    @Test
+    void describePackageVersionBridgesToPypiserver() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        when(pypiserverClient.packageVersionExists(anyString(), eq("dom"), eq("repo"), isNull(), eq("my-pkg"),
+                eq("1.0.0"))).thenReturn(true);
+
+        CodeArtifactPackageVersion pv = service.describePackageVersion(REGION, "dom", null, "repo", "pypi", null,
+                "my-pkg", "1.0.0");
+
+        assertEquals("Published", pv.getStatus());
+        assertEquals("my-pkg", pv.getPackageName());
+    }
+
+    @Test
+    void describePackageVersionReturns404WhenTheSidecarHasNoSuchVersionForAContainerBackedFormat() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        when(pypiserverClient.packageVersionExists(anyString(), eq("dom"), eq("repo"), isNull(), eq("my-pkg"),
+                eq("2.0.0"))).thenReturn(false);
+
+        AwsException e = assertThrows(AwsException.class, () -> service.describePackageVersion(REGION, "dom", null,
+                "repo", "pypi", null, "my-pkg", "2.0.0"));
+        assertEquals("ResourceNotFoundException", e.getErrorCode());
+        assertEquals("2.0.0", e.getExtendedData().get("resourceId"));
+        assertEquals("package-version", e.getExtendedData().get("resourceType"));
+    }
+
+    @Test
+    void describePackageVersionRequiresNamespaceForMaven() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+
+        AwsException e = assertThrows(AwsException.class, () -> service.describePackageVersion(REGION, "dom", null,
+                "repo", "maven", null, "my-artifact", "1.0.0"));
+        assertEquals("ValidationException", e.getErrorCode());
+        verify(reposiliteClient, never()).packageVersionExists(any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void describePackageVersionRejectsANamespaceForPypi() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+
+        AwsException e = assertThrows(AwsException.class, () -> service.describePackageVersion(REGION, "dom", null,
+                "repo", "pypi", "ns", "my-pkg", "1.0.0"));
+        assertEquals("ValidationException", e.getErrorCode());
+        verify(pypiserverClient, never()).packageVersionExists(any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
     void describePackageReportsTheDirectPublishDefaultsAndMatchesExactly() {
         service.createDomain(REGION, "dom", null, Map.of());
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());

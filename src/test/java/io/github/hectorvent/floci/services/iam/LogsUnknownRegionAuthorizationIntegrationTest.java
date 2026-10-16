@@ -97,7 +97,7 @@ class LogsUnknownRegionAuthorizationIntegrationTest {
                 Map.of("logGroupName", group, "logStreamName", "s"));
         assertAll("preserve stored identity across an opted-in region delimiter",
                 () -> response.then().statusCode(400).body(containsString(
-                        conditional ? "AccessDeniedException" : "ResourceNotFoundException")),
+                        "InvalidSignatureException")),
                 () -> assertPresent(port, REGION, historical, historicalStream, delete),
                 () -> {
                     if (delete) {
@@ -119,7 +119,7 @@ class LogsUnknownRegionAuthorizationIntegrationTest {
     void resourceAccountUsesStorageOwnerInOptedInRegion(String action, String effect, boolean actualOwner) {
         int port = endpoint.getPort();
         String otherAccount = "222222222222";
-        String region = "custom:" + otherAccount;
+        String region = "custom-" + otherAccount;
         String group = "logs-resource-owner-" + UUID.randomUUID();
         cleanup.register(() -> call(port, ACCOUNT, region, "DeleteLogGroup", Map.of("logGroupName", group))
                 .then().statusCode(200));
@@ -145,7 +145,7 @@ class LogsUnknownRegionAuthorizationIntegrationTest {
                 .when().post("/").then().statusCode(200);
         boolean allowed = effect.equals("Allow") == actualOwner;
         Response response = call(port, caller, region, action, Map.of("logGroupName", group, "logStreamName", "s"));
-        assertAll("use the canonical account independently of region punctuation",
+        assertAll("use the owning account in an admitted custom region",
                 () -> response.then().statusCode(allowed ? 200 : 400),
                 () -> assertPresent(port, region, group, allowed != delete),
                 () -> {
