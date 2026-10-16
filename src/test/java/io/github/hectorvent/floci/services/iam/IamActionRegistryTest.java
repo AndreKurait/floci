@@ -437,10 +437,12 @@ class IamActionRegistryTest {
         assertEquals("s3:DeleteObjectVersion", s3Action("DELETE", "/bucket/key", "versionId=v1"));
         assertEquals("s3:GetObjectVersionAcl", s3Action("GET", "/bucket/key", "acl", "versionId=v1"));
         assertEquals("s3:PutObjectVersionAcl", s3Action("PUT", "/bucket/key", "acl", "versionId=v1"));
-        // Tagging keeps its own actions: the tagging operations act on the current version.
-        assertEquals("s3:GetObjectTagging", s3Action("GET", "/bucket/key", "tagging", "versionId=v1"));
-        assertEquals("s3:PutObjectTagging", s3Action("PUT", "/bucket/key", "tagging", "versionId=v1"));
-        assertEquals("s3:DeleteObjectTagging", s3Action("DELETE", "/bucket/key", "tagging", "versionId=v1"));
+        assertEquals("s3:GetObjectVersionTagging", s3Action("GET", "/bucket/key", "tagging", "versionId=v1"));
+        assertEquals("s3:PutObjectVersionTagging", s3Action("PUT", "/bucket/key", "tagging", "versionId=v1"));
+        assertEquals("s3:DeleteObjectVersionTagging",
+                s3Action("DELETE", "/bucket/key", "tagging", "versionId=v1"));
+        // "null" names the null version, which is a version as any other.
+        assertEquals("s3:GetObjectVersionTagging", s3Action("GET", "/bucket/key", "tagging", "versionId=null"));
         assertEquals("s3:GetObjectVersionAnnotation",
                 s3Action("GET", "/bucket/key", "annotation", "annotationName=n", "versionId=v1"));
         assertEquals("s3:GetObjectVersionAnnotation",

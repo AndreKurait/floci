@@ -58,6 +58,16 @@ class HostDefaultsConfigSourceTest {
     }
 
     @Test
+    void nativeHostRunNamespacesChildResourcesByPort() {
+        HostDefaultsConfigSource source = new HostDefaultsConfigSource(true);
+        assertThat(source.getValue(HostDefaultsConfigSource.RESOURCE_NAMESPACE), equalTo("host-${floci.port}"));
+
+        SmallRyeConfig config = configWith(source,
+                new PropertiesConfigSource(Map.of("floci.port", "4597"), "env", 300));
+        assertThat(config.getValue(HostDefaultsConfigSource.RESOURCE_NAMESPACE, String.class), equalTo("host-4597"));
+    }
+
+    @Test
     void ordinalOverridesOnlyTheBundledYaml() {
         // classpath application.yml is 255, config/application.yml in the working directory 265.
         assertThat(new HostDefaultsConfigSource(false).getOrdinal(), allOf(greaterThan(255), lessThan(265)));

@@ -6,8 +6,13 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Supplies {@link HostDataDir}'s per-user data directory as the storage path of a native binary
- * running outside a container.
+ * Defaults for a native binary running outside a container: {@link HostDataDir}'s per-user data
+ * directory as the storage path, and a Docker resource namespace of {@code host-<port>}.
+ *
+ * <p>The namespace keeps the binary's child containers and volumes apart from those of an image,
+ * or of a second binary on another port, sharing the same Docker daemon. Without it, both would
+ * name an RDS instance {@code mydb} the same, and the one created second would remove the
+ * other's container before starting its own.
  *
  * <p>The ordinal sits just above the bundled {@code application.yml} (255) and below every source
  * a user sets explicitly: {@code config/application.yml} in the working directory (265),
@@ -21,6 +26,8 @@ public class HostDefaultsConfigSource implements ConfigSource {
     static final String PERSISTENT_PATH = "floci.storage.persistent-path";
     static final String HOST_PERSISTENT_PATH = "floci.storage.host-persistent-path";
     static final String FOLLOW_PERSISTENT_PATH = "${" + PERSISTENT_PATH + "}";
+    static final String RESOURCE_NAMESPACE = "floci.docker.resource-namespace";
+    static final String HOST_NAMESPACE = "host-${floci.port}";
 
     private final Map<String, String> properties;
 
@@ -33,7 +40,8 @@ public class HostDefaultsConfigSource implements ConfigSource {
             String dir = HostDataDir.persistentPathDefault();
             // The binary and Docker share the host filesystem, so child containers bind the same path,
             // including one the user sets in config/application.yml.
-            this.properties = Map.of(PERSISTENT_PATH, dir, HOST_PERSISTENT_PATH, FOLLOW_PERSISTENT_PATH);
+            this.properties = Map.of(PERSISTENT_PATH, dir, HOST_PERSISTENT_PATH, FOLLOW_PERSISTENT_PATH,
+                    RESOURCE_NAMESPACE, HOST_NAMESPACE);
         } else {
             this.properties = Map.of();
         }

@@ -745,7 +745,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     /** Floci's account-root principal, which is both the caller and the request's aws:PrincipalArn. */
     private CallerArns accountRootArns(String accountId) {
         String rootArn = AwsArnUtils.Arn.global(requestPartition(), "iam", accountId, "root").toString();
-        return new CallerArns(rootArn, rootArn, CallerArns.TYPE_ACCOUNT, accountId, null);
+        return CallerArns.accountRoot(rootArn, accountId);
     }
 
     /**
@@ -1157,9 +1157,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             case "s3:ListAllMyBuckets" -> "ListBuckets";
             case "s3:GetObjectAcl", "s3:GetObjectVersionAcl" -> "GetObjectAcl";
             case "s3:PutObjectAcl", "s3:PutObjectVersionAcl" -> "PutObjectAcl";
-            case "s3:GetObjectTagging" -> "GetObjectTagging";
-            case "s3:PutObjectTagging" -> "PutObjectTagging";
-            case "s3:DeleteObjectTagging" -> "DeleteObjectTagging";
+            case "s3:GetObjectTagging", "s3:GetObjectVersionTagging" -> "GetObjectTagging";
+            case "s3:PutObjectTagging", "s3:PutObjectVersionTagging" -> "PutObjectTagging";
+            case "s3:DeleteObjectTagging", "s3:DeleteObjectVersionTagging" -> "DeleteObjectTagging";
             default -> null;
         };
     }

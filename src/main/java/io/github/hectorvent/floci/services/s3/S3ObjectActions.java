@@ -12,15 +12,16 @@ public final class S3ObjectActions {
     /**
      * The object actions that have a version counterpart, which AWS checks in their place when the
      * request names a {@code versionId}. Retention, legal hold, restore and the multipart actions
-     * have none, and are checked as they are. The tagging actions are left out although AWS gives
-     * them version counterparts: the tagging operations act on the current version whatever
-     * {@code versionId} names (see IamActionRegistry).
+     * have none, and are checked as they are.
      */
     private static final Map<String, String> VERSION_ACTIONS = Map.ofEntries(
             Map.entry("s3:GetObject", "s3:GetObjectVersion"),
             Map.entry("s3:DeleteObject", "s3:DeleteObjectVersion"),
             Map.entry("s3:GetObjectAcl", "s3:GetObjectVersionAcl"),
             Map.entry("s3:PutObjectAcl", "s3:PutObjectVersionAcl"),
+            Map.entry("s3:GetObjectTagging", "s3:GetObjectVersionTagging"),
+            Map.entry("s3:PutObjectTagging", "s3:PutObjectVersionTagging"),
+            Map.entry("s3:DeleteObjectTagging", "s3:DeleteObjectVersionTagging"),
             Map.entry("s3:GetObjectAnnotation", "s3:GetObjectVersionAnnotation"),
             Map.entry("s3:ListObjectAnnotations", "s3:ListObjectVersionAnnotations"),
             Map.entry("s3:PutObjectAnnotation", "s3:PutObjectVersionAnnotation"),

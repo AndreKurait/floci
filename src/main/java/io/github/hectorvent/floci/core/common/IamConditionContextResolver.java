@@ -244,15 +244,16 @@ public class IamConditionContextResolver {
             // The version actions IamActionRegistry checks for a request naming a versionId carry
             // the key as their base actions do, per the Service Reference, as do the annotation
             // actions, and the versionId picks whose tags are read.
-            case "s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectTagging", "s3:GetObjectAcl",
-                 "s3:GetObjectVersionAcl", "s3:PutObjectAcl", "s3:PutObjectVersionAcl", "s3:DeleteObjectTagging",
-                 "s3:GetObjectAnnotation", "s3:GetObjectVersionAnnotation", "s3:ListObjectAnnotations",
-                 "s3:ListObjectVersionAnnotations", "s3:PutObjectAnnotation", "s3:PutObjectVersionAnnotation",
-                 "s3:DeleteObjectAnnotation", "s3:DeleteObjectVersionAnnotation" ->
-                    s3ExistingObjectTagConditionContext(ctx);
+            case "s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectTagging",
+                 "s3:GetObjectVersionTagging", "s3:GetObjectAcl", "s3:GetObjectVersionAcl",
+                 "s3:PutObjectAcl", "s3:PutObjectVersionAcl", "s3:DeleteObjectTagging",
+                 "s3:DeleteObjectVersionTagging", "s3:GetObjectAnnotation", "s3:GetObjectVersionAnnotation",
+                 "s3:ListObjectAnnotations", "s3:ListObjectVersionAnnotations", "s3:PutObjectAnnotation",
+                 "s3:PutObjectVersionAnnotation", "s3:DeleteObjectAnnotation",
+                 "s3:DeleteObjectVersionAnnotation" -> s3ExistingObjectTagConditionContext(ctx);
             case "s3:PutObject" -> s3RequestObjectTagConditionContext(ctx);
-            case "s3:PutObjectTagging" -> merge(s3ExistingObjectTagConditionContext(ctx),
-                    s3PutObjectTaggingBodyConditionContext(ctx));
+            case "s3:PutObjectTagging", "s3:PutObjectVersionTagging" -> merge(
+                    s3ExistingObjectTagConditionContext(ctx), s3PutObjectTaggingBodyConditionContext(ctx));
             default -> null;
         };
     }

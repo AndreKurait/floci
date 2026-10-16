@@ -243,22 +243,48 @@ class S3ObjectOperationsIamEnforcementIntegrationTest {
     }
 
     @Test
-    void theTagsOfAVersionAreCheckedAsTheTaggingActions() {
-        // The tagging operations act on the current version whatever versionId names, so a version
-        // tagging action alone must not let a caller read or change the current version's tags.
+    void theTagsOfAVersionNeedTheVersionTaggingActions() {
         Fixture f = new Fixture("version-tags", true);
         String versionId = f.seedVersion("a/tagged");
 
-        f.policy(f.allow("s3:GetObjectVersionTagging", "s3:PutObjectVersionTagging"));
+        f.policy(f.allow("s3:GetObjectTagging", "s3:PutObjectTagging", "s3:DeleteObjectTagging"));
         denied(f.user().queryParam("tagging", "").queryParam("versionId", versionId)
-                .when().get(f.path("a/tagged")).then(), "s3:GetObjectTagging");
+                .when().get(f.path("a/tagged")).then(), "s3:GetObjectVersionTagging");
         denied(f.user().queryParam("tagging", "").queryParam("versionId", versionId)
                 .body("<Tagging><TagSet/></Tagging>").when().put(f.path("a/tagged")).then(),
-                "s3:PutObjectTagging");
+                "s3:PutObjectVersionTagging");
+        denied(f.user().queryParam("tagging", "").queryParam("versionId", versionId)
+                .when().delete(f.path("a/tagged")).then(), "s3:DeleteObjectVersionTagging");
 
-        f.policy(f.allow("s3:GetObjectTagging"));
+        f.policy(f.allow("s3:GetObjectVersionTagging", "s3:PutObjectVersionTagging",
+                "s3:DeleteObjectVersionTagging"));
+        f.user().queryParam("tagging", "").queryParam("versionId", versionId)
+                .body("<Tagging><TagSet/></Tagging>").when().put(f.path("a/tagged")).then().statusCode(200);
         f.user().queryParam("tagging", "").queryParam("versionId", versionId)
                 .when().get(f.path("a/tagged")).then().statusCode(200);
+        f.user().queryParam("tagging", "").queryParam("versionId", versionId)
+                .when().delete(f.path("a/tagged")).then().statusCode(204);
+    }
+
+    @Test
+    void theTagsAVersionTaggingConditionReadsAreThoseOfTheVersionItChanges() {
+        Fixture f = new Fixture("version-tag-condition", true);
+        String older = f.seedVersion("a/doc", "env=a");
+        String current = f.seedVersion("a/doc", "env=b");
+        f.policy(f.allowWhen("{\"StringEquals\":{\"s3:ExistingObjectTag/env\":\"a\"}}",
+                "s3:PutObjectVersionTagging"));
+        String tagging = "<Tagging><TagSet><Tag><Key>env</Key><Value>a</Value></Tag>"
+                + "<Tag><Key>seen</Key><Value>yes</Value></Tag></TagSet></Tagging>";
+
+        f.user().queryParam("tagging", "").queryParam("versionId", older).body(tagging)
+                .when().put(f.path("a/doc")).then().statusCode(200).header("x-amz-version-id", older);
+        denied(f.user().queryParam("tagging", "").queryParam("versionId", current).body(tagging)
+                .when().put(f.path("a/doc")).then(), "s3:PutObjectVersionTagging");
+
+        f.admin().queryParam("tagging", "").queryParam("versionId", older).when().get(f.path("a/doc"))
+                .then().statusCode(200).body(containsString("<Key>seen</Key>"));
+        f.admin().queryParam("tagging", "").when().get(f.path("a/doc"))
+                .then().statusCode(200).body(not(containsString("<Key>seen</Key>")));
     }
 
     @Test

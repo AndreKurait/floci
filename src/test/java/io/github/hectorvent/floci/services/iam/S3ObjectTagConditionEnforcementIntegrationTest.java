@@ -149,6 +149,21 @@ class S3ObjectTagConditionEnforcementIntegrationTest {
         assertEquals(403, f.put("a/bad", "%zz=a", null), "an undecodable key");
     }
 
+    @Test
+    void aReadNamingTheNullVersionIsAuthorizedAgainstTheVersionItServes() {
+        Fixture f = new Fixture("nullversion", true);
+        // Written with versioning on, the key has no null version. S3 answers a read naming one with
+        // NoSuchVersion, but floci serves it the current version, so that version's tags must decide
+        // or the deny on them would be skipped.
+        f.seedVersion("a/secret", "env=b");
+        f.policy(allow("\"s3:GetObject\",\"s3:GetObjectVersion\"", f.objects(), null) + ","
+                + "{\"Effect\":\"Deny\",\"Action\":[\"s3:GetObject\",\"s3:GetObjectVersion\"],"
+                + "\"Resource\":\"" + f.objects() + "\","
+                + "\"Condition\":{\"StringEquals\":{\"s3:ExistingObjectTag/env\":\"b\"}}}");
+        assertEquals(403, f.get("a/secret"), "the current version carries the denied tag");
+        assertEquals(403, f.getVersion("a/secret", "null"), "the same version, reached through versionId=null");
+    }
+
     private static String allow(String actions, String resource, String condition) {
         String action = actions.startsWith("\"") ? "[" + actions + "]" : "\"" + actions + "\"";
         return "{\"Effect\":\"Allow\",\"Action\":" + action + ",\"Resource\":\"" + resource + "\""

@@ -811,7 +811,8 @@ public class S3Controller {
 
             if (hasQueryParam(uriInfo, "tagging")) {
                 s3Service.authorizeObjectWrite(bucket, key, "s3:PutObjectTagging", authorization);
-                return handlePutObjectTagging(bucket, key, readWholeBody(body));
+                return handlePutObjectTagging(bucket, key, uriInfo.getQueryParameters().getFirst("versionId"),
+                        readWholeBody(body));
             }
             if (hasQueryParam(uriInfo, "retention")) {
                 s3Service.authorizeObjectWrite(bucket, key, "s3:PutObjectRetention", authorization);
@@ -981,7 +982,7 @@ public class S3Controller {
 
             if (hasQueryParam(uriInfo, "tagging")) {
                 s3Service.authorizeObjectRead(bucket, key, versionId, "s3:GetObjectTagging", authorization);
-                return handleGetObjectTagging(bucket, key);
+                return handleGetObjectTagging(bucket, key, versionId);
             }
             if (hasQueryParam(uriInfo, "annotation")) {
                 String annotationNameParam = uriInfo.getQueryParameters().getFirst("annotationName");
@@ -1484,8 +1485,8 @@ public class S3Controller {
 
             if (hasQueryParam(uriInfo, "tagging")) {
                 s3Service.authorizeObjectWrite(bucket, key, "s3:DeleteObjectTagging", authorization);
-                s3Service.deleteObjectTagging(bucket, key);
-                return Response.noContent().build();
+                return withVersionId(Response.noContent(), s3Service.deleteObjectTagging(bucket, key, versionId))
+                        .build();
             }
             if (hasQueryParam(uriInfo, "annotation")) {
                 boolean bypass = "true".equalsIgnoreCase(
@@ -2615,16 +2616,21 @@ public class S3Controller {
 
     // --- Object Tagging ---
 
-    private Response handlePutObjectTagging(String bucket, String key, byte[] body) {
+    private Response handlePutObjectTagging(String bucket, String key, String versionId, byte[] body) {
         String xml = new String(body, StandardCharsets.UTF_8);
         Map<String, String> tags = XmlParser.extractPairs(xml, "Tag", "Key", "Value");
-        s3Service.putObjectTagging(bucket, key, tags);
-        return Response.ok().build();
+        return withVersionId(Response.ok(), s3Service.putObjectTagging(bucket, key, versionId, tags)).build();
     }
 
-    private Response handleGetObjectTagging(String bucket, String key) {
-        Map<String, String> tags = s3Service.getObjectTagging(bucket, key);
-        return Response.ok(buildTaggingXml(tags)).type(MediaType.APPLICATION_XML).build();
+    private Response handleGetObjectTagging(String bucket, String key, String versionId) {
+        S3Service.ObjectTaggingResult tagging = s3Service.getObjectTaggingResult(bucket, key, versionId);
+        return withVersionId(Response.ok(buildTaggingXml(tagging.tags())), tagging.versionId())
+                .type(MediaType.APPLICATION_XML).build();
+    }
+
+    /** {@code resp} with the id of the version a request acted on, when that version has one. */
+    private static Response.ResponseBuilder withVersionId(Response.ResponseBuilder resp, String versionId) {
+        return versionId != null ? resp.header("x-amz-version-id", versionId) : resp;
     }
 
     private String buildTaggingXml(Map<String, String> tags) {
@@ -3573,10 +3579,12 @@ public class S3Controller {
         }
         // S3 InvalidArgument responses carry ArgumentName and ArgumentValue so the SDK can
         // surface which input was rejected, and EntityTooSmall and EntityTooLarge the proposed and
-        // allowed sizes. Multipart size errors also identify the rejected part.
+        // allowed sizes. Multipart size errors also identify the rejected part, and MethodNotAllowed
+        // the method and the kind of resource that refused it.
         // They travel through AwsException.extendedData.
         if (e.getExtendedData() != null) {
-            for (String field : List.of("ProposedSize", "MinSizeAllowed", "MaxSizeAllowed", "PartNumber", "ETag")) {
+            for (String field : List.of("Method", "ResourceType", "ProposedSize", "MinSizeAllowed",
+                    "MaxSizeAllowed", "PartNumber", "ETag")) {
                 Object value = e.getExtendedData().get(field);
                 if (value != null) {
                     xmlBuilder.elem(field, value.toString());
@@ -3612,7 +3620,13 @@ public class S3Controller {
                 .elem("RequestId", UUID.randomUUID().toString())
                 .end("Error")
                 .build();
-        return Response.status(e.getHttpStatus()).entity(xml).type(MediaType.APPLICATION_XML).build();
+        Response.ResponseBuilder response = Response.status(e.getHttpStatus())
+                .entity(xml).type(MediaType.APPLICATION_XML);
+        // A request refused because it reached a delete marker says so in x-amz-delete-marker.
+        if (e.getExtendedData() != null && "DeleteMarker".equals(e.getExtendedData().get("ResourceType"))) {
+            response.header("x-amz-delete-marker", "true");
+        }
+        return response.build();
     }
 
     private Response checkPreconditions(S3Object obj, String ifMatch, String ifNoneMatch,

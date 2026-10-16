@@ -5227,6 +5227,16 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             this(callerArn, principalArn, null, null, null);
         }
 
+        /**
+         * Floci's account-root principal, for a credential that names no IAM identity. The
+         * guide's principal key values give the root user the account id as its
+         * {@code aws:userid}, {@code Account} as its {@code aws:PrincipalType} and no
+         * {@code aws:username}.
+         */
+        public static CallerArns accountRoot(String rootArn, String accountId) {
+            return new CallerArns(rootArn, rootArn, TYPE_ACCOUNT, accountId, null);
+        }
+
         /** A caller with no permissions boundary attached. */
         public CallerArns(String callerArn, String principalArn, String principalType, String userId,
                           String userName) {

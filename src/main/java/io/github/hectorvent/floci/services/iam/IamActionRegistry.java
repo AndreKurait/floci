@@ -487,11 +487,8 @@ public class IamActionRegistry {
      * The operation an object sub-resource selects, checked in the order S3Controller dispatches
      * them: a request naming several runs the first, so it is checked as that one. A
      * {@code versionId} selects the version action AWS checks in place of an action that has one
-     * (see {@link S3ObjectActions#forVersion}). Tagging keeps its own actions: the tagging
-     * operations act on the current version whatever {@code versionId} names, so a version tagging
-     * action would authorize one version and let the request change another. Null where the
-     * controller falls through to the plain object operation on the current version, which the
-     * rules check.
+     * (see {@link S3ObjectActions#forVersion}). Null where the controller falls through to the plain
+     * object operation on the current version, which the rules check.
      */
     private static String objectSubResourceAction(String method, MultivaluedMap<String, String> params) {
         String versionId = params.getFirst("versionId");
@@ -501,7 +498,7 @@ public class IamActionRegistry {
                     yield "s3:ListMultipartUploadParts";
                 }
                 if (params.containsKey("tagging")) {
-                    yield "s3:GetObjectTagging";
+                    yield S3ObjectActions.forVersion("s3:GetObjectTagging", versionId);
                 }
                 if (params.containsKey("annotation")) {
                     yield S3ObjectActions.forVersion(annotationReadAction(params), versionId);
@@ -525,7 +522,7 @@ public class IamActionRegistry {
             }
             case "PUT" -> {
                 if (params.containsKey("tagging")) {
-                    yield "s3:PutObjectTagging";
+                    yield S3ObjectActions.forVersion("s3:PutObjectTagging", versionId);
                 }
                 if (params.containsKey("retention")) {
                     yield "s3:PutObjectRetention";
@@ -544,7 +541,7 @@ public class IamActionRegistry {
             }
             case "DELETE" -> {
                 if (params.containsKey("tagging")) {
-                    yield "s3:DeleteObjectTagging";
+                    yield S3ObjectActions.forVersion("s3:DeleteObjectTagging", versionId);
                 }
                 if (params.containsKey("annotation")) {
                     yield S3ObjectActions.forVersion("s3:DeleteObjectAnnotation", versionId);

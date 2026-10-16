@@ -289,6 +289,23 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void versionTaggingActionsCarryTheVersionAndItsTags() {
+        ContainerRequestContext request = s3Request("/bucket/object",
+                "<Tagging><TagSet><Tag><Key>Team</Key><Value>payments</Value></Tag></TagSet></Tagging>");
+        request.getUriInfo().getQueryParameters().putSingle("versionId", "v1");
+        when(s3Service.getObjectTagging("bucket", "object", "v1")).thenReturn(Map.of("env", "a"));
+        for (String action : List.of("s3:GetObjectVersionTagging", "s3:DeleteObjectVersionTagging")) {
+            Map<String, List<String>> conditions = resolver.resolve("s3", action, request);
+            assertEquals(List.of("v1"), conditions.get("s3:versionid"), action);
+            assertEquals(List.of("a"), conditions.get("s3:ExistingObjectTag/env"), action);
+        }
+        Map<String, List<String>> put = resolver.resolve("s3", "s3:PutObjectVersionTagging", request);
+        assertEquals(List.of("v1"), put.get("s3:versionid"));
+        assertEquals(List.of("a"), put.get("s3:ExistingObjectTag/env"));
+        assertEquals(List.of("payments"), put.get("s3:RequestObjectTag/Team"));
+    }
+
+    @Test
     void annotationActionsCarryTheObjectsTags() {
         when(s3Service.getObjectTagging("bucket", "object", null)).thenReturn(Map.of("env", "a"));
         for (String action : List.of("s3:GetObjectAnnotation", "s3:ListObjectAnnotations",

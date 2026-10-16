@@ -85,6 +85,12 @@ class IamEnforcementFilterUnitTest {
                 IamEnforcementFilter.mapS3ActionToEventName("s3:GetObjectVersionAcl", "GET"));
         assertEquals("PutObjectAcl",
                 IamEnforcementFilter.mapS3ActionToEventName("s3:PutObjectVersionAcl", "PUT"));
+        assertEquals("GetObjectTagging",
+                IamEnforcementFilter.mapS3ActionToEventName("s3:GetObjectVersionTagging", "GET"));
+        assertEquals("PutObjectTagging",
+                IamEnforcementFilter.mapS3ActionToEventName("s3:PutObjectVersionTagging", "PUT"));
+        assertEquals("DeleteObjectTagging",
+                IamEnforcementFilter.mapS3ActionToEventName("s3:DeleteObjectVersionTagging", "DELETE"));
     }
 
     @Test
