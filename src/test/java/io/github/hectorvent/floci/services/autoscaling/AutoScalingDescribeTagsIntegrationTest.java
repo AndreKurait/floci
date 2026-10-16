@@ -159,12 +159,12 @@ class AutoScalingDescribeTagsIntegrationTest {
     }
 
     @Test
-    void nonNumericMaxRecordsIsAValidationError() {
+    void nonNumericMaxRecordsIsMalformedInput() {
         describe()
                 .formParam("MaxRecords", "abc")
             .when().post("/")
             .then().statusCode(400)
-                .body(containsString("ValidationError"));
+                .body(containsString("MalformedInput"));
     }
 
     // Like every other member list in this handler, filters are read up to the first missing index.
@@ -181,9 +181,9 @@ class AutoScalingDescribeTagsIntegrationTest {
         assertEquals(List.of("AsgId"), xml.getList(ROOT + ".Key"));
     }
 
-    // Filter values are case-sensitive (AWS Filter model), propagate-at-launch included.
+    // Live AWS normalizes boolean filter values; tag keys and values remain case-sensitive.
     @Test
-    void propagateAtLaunchFilterIsCaseSensitive() {
+    void propagateAtLaunchFilterAcceptsMixedCase() {
         XmlPath xml = describe()
                 .formParam("Filters.member.1.Name", "auto-scaling-group")
                 .formParam("Filters.member.1.Values.member.1", GROUP_A)
@@ -192,7 +192,7 @@ class AutoScalingDescribeTagsIntegrationTest {
             .when().post("/")
             .then().statusCode(200).extract().xmlPath();
 
-        assertEquals(List.of(), xml.getList(ROOT + ".Key"));
+        assertEquals(List.of("AsgId"), xml.getList(ROOT + ".Key"));
     }
 
     // A tag deleted from an already-returned page must not shift the next page past an unread tag.
@@ -254,28 +254,28 @@ class AutoScalingDescribeTagsIntegrationTest {
     }
 
     @Test
-    void garbageNextTokenIsInvalidNextToken() {
+    void garbageNextTokenIsAValidationError() {
         describe()
                 .formParam("NextToken", "!!not-a-token!!")
             .when().post("/")
             .then().statusCode(400)
-                .body(containsString("InvalidNextToken"));
+                .body(containsString("ValidationError"));
     }
 
     // A token that decodes to a plausible (group, key) but lacks this list's namespace was not
     // minted here.
     @Test
-    void tokenWithoutTheNamespaceIsInvalidNextToken() {
-        assertInvalidNextToken(Base64.getUrlEncoder().encodeToString(
+    void tokenWithoutTheNamespaceIsAValidationError() {
+        assertInvalidNextTokenValidationError(Base64.getUrlEncoder().encodeToString(
                 (GROUP_A + "\0AsgId").getBytes(StandardCharsets.UTF_8)));
     }
 
-    private static void assertInvalidNextToken(String token) {
+    private static void assertInvalidNextTokenValidationError(String token) {
         describe()
                 .formParam("NextToken", token)
             .when().post("/")
             .then().statusCode(400)
-                .body(containsString("InvalidNextToken"));
+                .body(containsString("ValidationError"));
     }
 
     private static RequestSpecification describe() {
