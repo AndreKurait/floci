@@ -614,8 +614,6 @@ public class SwfService implements Resettable {
 
             applyDecisions(execution, decisions, queued, decisionEventId);
 
-            // An idle execution may be waiting for a signal. Only an event that needs
-            // another decision should wake it; completing an empty batch is not one.
             if (execution.isOpen() && execution.isDecisionNeeded()) {
                 execution.setDecisionNeeded(false);
                 scheduleDecisionTask(execution);
@@ -1038,6 +1036,7 @@ public class SwfService implements Resettable {
                 .attr("workflowExecution", Map.of("workflowId", target.getWorkflowId(),
                         "runId", target.getRunId()))
                 .attr("initiatedEventId", initiated.getEventId());
+        execution.setDecisionNeeded(true);
     }
 
     private void cancelExternal(SwfWorkflowExecution execution, Decision decision, long decisionEventId) {
@@ -1069,6 +1068,7 @@ public class SwfService implements Resettable {
                 .attr("workflowExecution", Map.of("workflowId", target.getWorkflowId(),
                         "runId", target.getRunId()))
                 .attr("initiatedEventId", initiated.getEventId());
+        execution.setDecisionNeeded(true);
     }
 
     private void startChild(SwfWorkflowExecution execution, Decision decision, long decisionEventId) {

@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
@@ -1195,6 +1196,39 @@ class SwfServiceTest {
         assertNotNull(lastAttribute(sender, "ExternalWorkflowExecutionSignaled", "initiatedEventId"));
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "SignalExternalWorkflowExecution, ExternalWorkflowExecutionSignaled, WorkflowExecutionSignaled",
+            "RequestCancelExternalWorkflowExecution, ExternalWorkflowExecutionCancelRequested, WorkflowExecutionCancelRequested"
+    })
+    void successfulExternalOutcome_deliversOneSuccessorToTheSender(
+            String decisionType, String outcomeEvent, String targetEvent) {
+        String senderRun = start("wf-sender");
+        SwfDecisionTask first = service.pollForDecisionTask(REGION, DOMAIN, "tl", "sender").orElseThrow();
+        String receiverRun = service.startWorkflowExecution(new StartWorkflowExecutionRequest(
+                REGION, DOMAIN, "wf-receiver", "W", "1", "receiver-tl", null, null, null, null, null, null, null));
+        Map<String, Object> attributes = "SignalExternalWorkflowExecution".equals(decisionType)
+                ? Map.of("workflowId", "wf-receiver", "runId", receiverRun, "signalName", "ping")
+                : Map.of("workflowId", "wf-receiver", "runId", receiverRun);
+
+        service.respondDecisionTaskCompleted(first.getTaskToken(),
+                List.of(new Decision(decisionType, attributes)), null);
+
+        SwfWorkflowExecution sender = service.describeWorkflowExecution(REGION, DOMAIN, "wf-sender", senderRun);
+        SwfWorkflowExecution receiver = service.describeWorkflowExecution(REGION, DOMAIN, "wf-receiver", receiverRun);
+        assertNotNull(lastAttribute(sender, outcomeEvent, "initiatedEventId"));
+        assertNotNull(lastAttribute(receiver, targetEvent, "externalInitiatedEventId"));
+        assertEquals(1, service.countPendingDecisionTasks(REGION, DOMAIN, "tl"));
+        SwfDecisionTask successor = service.pollForDecisionTask(REGION, DOMAIN, "tl", "sender").orElseThrow();
+        assertEquals(senderRun, successor.getRunId());
+        assertEquals(first.getStartedEventId(), successor.getPreviousStartedEventId());
+        assertTrue(service.pollForDecisionTask(REGION, DOMAIN, "tl", "other").isEmpty());
+
+        service.respondDecisionTaskCompleted(successor.getTaskToken(), List.of(), null);
+        assertEquals(0, service.countPendingDecisionTasks(REGION, DOMAIN, "tl"));
+        assertTrue(service.pollForDecisionTask(REGION, DOMAIN, "tl", "sender").isEmpty());
+    }
+
     @Test
     void signalUnknownExternalExecution_recordsFailureRatherThanThrowing() {
         start("wf-lonely");
@@ -1282,8 +1316,6 @@ class SwfServiceTest {
                 if (workflowId.equals(task.getWorkflowId())) {
                     return task;
                 }
-                // Explicitly wake a sibling for its own poller. An empty completion
-                // alone correctly leaves that execution waiting for a new event.
                 service.signalWorkflowExecution(REGION, DOMAIN, task.getWorkflowId(),
                         task.getRunId(), "test-poller-handoff", null);
                 service.respondDecisionTaskCompleted(task.getTaskToken(), List.of(), null);
