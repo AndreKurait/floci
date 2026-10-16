@@ -121,7 +121,6 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
             applyPublicAccessBlockConfiguration(bucketName, props, ctx);
             applyBucketEncryption(bucketName, props, ctx);
             applyLifecycleConfiguration(bucketName, props, ctx);
-            applyOwnershipControls(bucketName, props, ctx);
             applyBucketTags(bucketName, props, ctx);
             applyBucketOwnershipControls(bucketName, ownershipControlsXml, ctx);
         } catch (RuntimeException failure) {
@@ -281,30 +280,6 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
         s3Service.putBucketTagging(bucketName, ctx.resolveTags(props, "Tags"));
     }
 
-    private void applyOwnershipControls(String bucketName, JsonNode props, ProvisionContext ctx) {
-        JsonNode declaredControls = declared(props, "OwnershipControls");
-        JsonNode controls = declaredControls == null
-                ? null : ctx.engine().resolveNodeOmittingNoValue(declaredControls);
-        if (controls == null || controls.isNull() || controls.isMissingNode()) {
-            if (ctx.reusesPriorEntity(bucketName) && ctx.previouslyDeclared("OwnershipControls")) {
-                s3Service.deleteBucketOwnershipControls(bucketName);
-            }
-            return;
-        }
-        JsonNode rules = controls.get("Rules");
-        if (rules == null || !rules.isArray() || rules.size() != 1) {
-            throw new AwsException("InvalidRequest", "OwnershipControls requires exactly one rule", 400);
-        }
-        String ownership = ctx.resolveOptional(rules.get(0), "ObjectOwnership");
-        if (ownership == null
-                || !Set.of("BucketOwnerEnforced", "BucketOwnerPreferred", "ObjectWriter").contains(ownership)) {
-            throw new AwsException("InvalidRequest", "Invalid ObjectOwnership", 400);
-        }
-        String xml = new XmlBuilder().start("OwnershipControls", AwsNamespaces.S3)
-                .start("Rule").elem("ObjectOwnership", ownership).end("Rule").end("OwnershipControls").build();
-        s3Service.putBucketOwnershipControls(bucketName, xml);
-    }
-
     /** What a provision changed that a failure has to undo. */
     private static final class Unwind {
         private boolean created;
@@ -335,6 +310,9 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public boolean rollbackUpdate(StackResource resource) {
+        if (ReplacementCleanup.rollback(resource, this::delete)) {
+            return true;
+        }
         if (!BUCKET.equals(resource.getResourceType())) {
             return false;
         }
@@ -349,6 +327,10 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
+        UpdateCleanupResult replacement = ReplacementCleanup.complete(resource, this::delete);
+        if (replacement.applicable()) {
+            return replacement;
+        }
         return resource.getAttributes().containsKey(CfnRollback.S3_BUCKET_UPDATE_SNAPSHOT_ATTR)
                 ? new UpdateCleanupResult(true, true, null, 0, null)
                 : UpdateCleanupResult.notApplicable();
@@ -357,6 +339,7 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
     @Override
     public void clearUpdate(StackResource resource) {
         resource.getAttributes().remove(CfnRollback.S3_BUCKET_UPDATE_SNAPSHOT_ATTR);
+        ReplacementCleanup.clear(resource);
     }
 
     private static boolean sameConfiguration(NotificationConfiguration desired, NotificationConfiguration current) {
@@ -651,21 +634,6 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
     @Override
     public String updateCleanupPhysicalId(StackResource resource) {
         return ReplacementCleanup.cleanupPhysicalId(resource);
-    }
-
-    @Override
-    public UpdateCleanupResult completeUpdate(StackResource resource) {
-        return ReplacementCleanup.complete(resource, this::delete);
-    }
-
-    @Override
-    public void clearUpdate(StackResource resource) {
-        ReplacementCleanup.clear(resource);
-    }
-
-    @Override
-    public boolean rollbackUpdate(StackResource resource) {
-        return ReplacementCleanup.rollback(resource, this::delete);
     }
 
     @Override
