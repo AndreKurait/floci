@@ -41,7 +41,7 @@ The `Lambda Web` service model (apiVersion 2025-03-07, `aws lambda-web` in the A
 - **ARNs** given as identifiers must name the request's region and the caller's account, as on AWS. A revision or endpoint ARN resolves by its id or name only.
 - **Page tokens** are base64 cursors that carry the request and the position of the page, not the UUIDs AWS issues. A token reused with other parameters gets the AWS "does not match the request" error, and any other token the "invalid or has expired" error.
 - **Domain names** take the form `<id>.001.lambda-web.<region>.<floci host>` and `<id>.lambda-web.global.<floci host>`, with the host and port of `floci.base-url`. A `PerRegion` endpoint gets one domain per region in `regionalEndpoints`.
-- **Not implemented yet:** invoking a function through its endpoint domain, execution environments, `IamAuth` on requests, the automatic deletion of revisions past 50, and the `AWS::Lambda::WebFunction*` CloudFormation types. The endpoint domain does not answer requests yet.
+- **Not implemented yet:** invoking a function through its endpoint domain, execution environments, `IamAuth` on requests, and the automatic deletion of revisions past 50. The endpoint domain does not answer requests yet.
 
 ### `aws lambda-web deploy`
 
@@ -52,3 +52,9 @@ AWS_ENDPOINT_URL=http://localhost:4566 aws lambda-web deploy --name my-app --hel
 ```
 
 The command passes `--endpoint-url` only to the Lambda Web client. Its STS, S3 and IAM calls use the default endpoints, so the environment variable is what routes them to Floci. The `endpointUrl` it prints is the Floci domain name behind `https://`, which Floci does not serve yet.
+
+## CloudFormation
+
+`AWS::Lambda::WebFunction`, `AWS::Lambda::WebFunctionRevision` and `AWS::Lambda::WebFunctionEndpoint` provision through the resource registry. `Ref` of each is its ARN. Every property of a revision is createOnly, so a changed revision mints a new one and the displaced revision is deleted once the update commits. An endpoint keeps its identity while its function, name, type and regions stay the same. A changed type or region list under the same name is refused the way CloudFormation refuses to replace a custom-named resource. `Fn::GetAtt` on `RegionalEndpoints` is not supported yet.
+
+CloudFormation has no `AutoDeploymentMode` property, so an endpoint it creates is always `Disabled` and needs `RevisionWeights`, as on AWS. Name the revision with `Fn::GetAtt` so a replaced revision moves the endpoint with it. A stack update that fails after an in-place change to a function's tags or an endpoint's configuration puts the previous values back.

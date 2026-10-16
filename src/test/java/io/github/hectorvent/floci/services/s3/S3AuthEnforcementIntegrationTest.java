@@ -2403,6 +2403,54 @@ class S3AuthEnforcementIntegrationTest {
             .body(equalTo("private data"));
     }
 
+    @Test
+    @Order(58)
+    void enforcedOwnershipIgnoresExistingPublicAclsUntilReenabled() {
+        String bucket = "auth-enforced-acl-bucket";
+        String controls = """
+                <OwnershipControls xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule>
+                </OwnershipControls>
+                """;
+        given().filter(LOCAL_SIGNER).when().put("/" + bucket).then().statusCode(200);
+        given().filter(LOCAL_SIGNER).header("x-amz-acl", "public-read").body("public data")
+            .when().put("/" + bucket + "/data.txt")
+            .then().statusCode(200);
+        given().filter(LOCAL_SIGNER).header("x-amz-acl", "public-read")
+            .when().put("/" + bucket + "?acl")
+            .then().statusCode(200);
+        given().when().get("/" + bucket + "/data.txt").then().statusCode(200);
+        given().when().get("/" + bucket + "?list-type=2").then().statusCode(200);
+
+        given().filter(LOCAL_SIGNER).body(controls)
+            .when().put("/" + bucket + "?ownershipControls")
+            .then().statusCode(400).body(containsString("InvalidBucketAclWithObjectOwnership"));
+        given().filter(LOCAL_SIGNER).when().get("/" + bucket + "?ownershipControls")
+            .then().statusCode(404);
+        given().filter(LOCAL_SIGNER).header("x-amz-acl", "private")
+            .when().put("/" + bucket + "?acl")
+            .then().statusCode(200);
+        given().filter(LOCAL_SIGNER).body(controls)
+            .when().put("/" + bucket + "?ownershipControls")
+            .then().statusCode(200);
+
+        given().when().get("/" + bucket + "/data.txt").then().statusCode(403);
+        given().when().get("/" + bucket + "?list-type=2").then().statusCode(403);
+        given().filter(LOCAL_SIGNER).when().get("/" + bucket + "?acl")
+            .then().statusCode(200).body(not(containsString("AllUsers")));
+        given().filter(LOCAL_SIGNER).when().get("/" + bucket + "/data.txt?acl")
+            .then().statusCode(200).body(not(containsString("AllUsers")));
+
+        given().filter(LOCAL_SIGNER).when().delete("/" + bucket + "?ownershipControls")
+            .then().statusCode(204);
+        given().when().get("/" + bucket + "/data.txt").then().statusCode(200);
+        given().when().get("/" + bucket + "?list-type=2").then().statusCode(403);
+        given().filter(LOCAL_SIGNER).header("x-amz-acl", "public-read")
+            .when().put("/" + bucket + "?acl")
+            .then().statusCode(200);
+        given().when().get("/" + bucket + "?list-type=2").then().statusCode(200);
+    }
+
     private static String publicObjectActionPolicy(String bucket, String action) {
         return publicObjectActionPolicy(bucket, "*", action);
     }

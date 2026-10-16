@@ -154,6 +154,31 @@ an atomic ownership check against another stack or a direct Cognito API writer r
 Failed in-place restoration preserves the original name and scopes for a `ContinueUpdateRollback`
 retry. Deleting the current server keeps this snapshot if deletion fails.
 
+## SSM parameters
+
+Like AWS's resource handler, `AWS::SSM::Parameter` is created with one `PutParameter` that carries
+the template's tags and does not overwrite. A name that already exists outside the stack fails the
+resource with `ParameterAlreadyExists`; the stack never overwrites, adopts or deletes that
+parameter. Floci applies the `Name`, `Type`, `Value` and `Tags` properties.
+
+An update that keeps `Name` overwrites the parameter. When a later resource fails the update, the
+rollback writes the prior value and settings back, as a new SSM version when they changed (the
+version history is not rewound, as on AWS), and returns the tags the previous or the failed
+template set to their prior values; other tags are left alone. As on AWS, the update first checks
+that the parameter exists: one deleted outside the stack fails it with `ParameterNotFound` before
+anything is written. A rollback that finds the parameter gone fails the same way, leaving the stack
+in `UPDATE_ROLLBACK_FAILED`.
+
+Giving `Name` a new value replaces the parameter. The previous parameter stays until the update
+commits, and is then deleted unless `UpdateReplacePolicy` is `Retain`; a failed update deletes the
+replacement instead. A restore or delete that fails during the rollback leaves the stack in
+`UPDATE_ROLLBACK_FAILED`, and `ContinueUpdateRollback` retries it (see
+[Failed update rollbacks](#failed-update-rollbacks)). Deleting a parameter that is already gone
+counts as deleted. Known differences: removing an explicit `Name` keeps the parameter under that
+name, where AWS replaces it with one under a generated name; and an update in place of a parameter
+deleted outside the stack ends in `UPDATE_ROLLBACK_COMPLETE`, since nothing was written, where AWS's
+rollback repeats the existence check and likely ends in `UPDATE_ROLLBACK_FAILED`.
+
 ## Supported Resource Types
 
 Resource types provisioned during `CreateStack` / `UpdateStack` / `DeleteStack`. Each delegates to
@@ -173,7 +198,7 @@ cross-resource references.
 | SNS | `Topic`, `Subscription`, `TopicPolicy` |
 | SES | `EmailIdentity` (BYODKIM is not supported by this resource; Easy DKIM DNS attributes use the shared emulator signing zone `dkim.amazonses.com` rather than AWS's region- and identity-specific zone assignment) |
 | DynamoDB | `Table` (`TimeToLiveSpecification` applied on create and update; to rename an enabled TTL attribute, disable TTL in one update and enable the new attribute in a later one), `GlobalTable` |
-| Lambda | `Function` (Zip via S3/inline `ZipFile`, Image, and the `hot-reload` bind-mount bucket), `LayerVersion`, `EventSourceMapping` (SQS, Kinesis, DynamoDB Streams; `ParallelizationFactor` and `TumblingWindowInSeconds` are ignored), `Version`, `Alias` (also what SAM's `AutoPublishAlias` expands into), `Permission`, `EventInvokeConfig` (also what a SAM function's `EventInvokeConfig` expands into), `MicrovmImage`, `NetworkConnector`, `Url`. Inline `ZipFile` packages include the `cfn-response` (Node.js) / `cfnresponse` (Python) module AWS injects for that code path, so Solutions-style custom-resource handlers work. |
+| Lambda | `Function` (Zip via S3/inline `ZipFile`, Image, and the `hot-reload` bind-mount bucket), `LayerVersion`, `EventSourceMapping` (SQS, Kinesis, DynamoDB Streams; `ParallelizationFactor` and `TumblingWindowInSeconds` are ignored), `Version`, `Alias` (also what SAM's `AutoPublishAlias` expands into), `Permission`, `EventInvokeConfig` (also what a SAM function's `EventInvokeConfig` expands into), `MicrovmImage`, `NetworkConnector`, `Url`, `WebFunction` (control plane only; the endpoint domain does not serve requests yet), `WebFunctionEndpoint` (`RegionalEndpoints` is not exposed to `Fn::GetAtt` yet), `WebFunctionRevision` (every property is createOnly, so a change mints a new revision). Inline `ZipFile` packages include the `cfn-response` (Node.js) / `cfnresponse` (Python) module AWS injects for that code path, so Solutions-style custom-resource handlers work. |
 | IAM | `Role`, `User` (template `LoginProfile` and `PermissionsBoundary` are ignored; an API-created login profile is removed on delete), `AccessKey`, `Policy`, `ManagedPolicy`, `InstanceProfile` |
 | Organizations | `Organization`, `OrganizationalUnit`, `Account`, `Policy`, `ResourcePolicy` |
 | SSM | `Parameter` |
@@ -446,6 +471,19 @@ before provisioning:
   tags, bucket names) from Parameter Store.
 - `AWS::SSM::Parameter::Value<List<String>>` and `AWS::SSM::Parameter::Name` typed parameters are
   **not yet** resolved — they are passed through as their literal input.
+- **A declared parameter needs a value.** One that the request gives no value and the template no
+  `Default` fails `CreateStack`, `UpdateStack` and `CreateChangeSet` with `ValidationError`
+  `Parameters: [Env] must have values`, naming each such parameter, before anything changes. An
+  empty value counts as a value. An update does not carry values over: set `UsePreviousValue` to
+  keep the deployed one. `UsePreviousValue` on a parameter that has no deployed value passes none.
+  The values are checked before the template's dependency checks (a cycle, an unresolved
+  dependency, a malformed condition), which read them, so a template with a cycle and a missing
+  value gets this error. A request for a stack that does not exist, cannot be updated, or already
+  exists gets that stack error instead of this one; a dependency error still comes before the
+  stack error. The same check
+  refuses `CreateStackSet` and `UpdateStackSet`, and fails a nested stack's resource whose
+  `Parameters` leave a child parameter without a value. A parameter that an `AWS::Include` defines
+  is not checked, nor is any parameter in a section that carries an `AWS::Include` of its own.
 
 The `AWS::SSM::Parameter` **resource** type exposes `Value`, `Type`, `Name`, and `Arn` attributes through
 `Ref` / `Fn::GetAtt` so downstream resources can consume a parameter the same stack creates.
@@ -544,6 +582,17 @@ Template `Conditions` are evaluated before provisioning. A resource whose `Condi
 **false is skipped** — it is never provisioned, does not appear in `DescribeStackResources`, and its
 `Ref` / `Fn::GetAtt` are not required to resolve. This matches CloudFormation and is required for the
 condition-heavy templates CDK and LZA emit.
+
+The operands of `Fn::Equals` are resolved as resource property values are, so `Ref` to a parameter
+or a pseudo parameter (`AWS::StackName` and `AWS::StackId` included) and `Fn::FindInMap`, the
+functions CloudFormation supports there, work inside a condition. The dependency check a create runs
+before the stack exists sees the `AWS::StackId` the stack is then given. An operand Floci cannot
+resolve compares as an empty string. `AWS::NotificationARNs` is the empty list everywhere, as
+Floci keeps no notification ARNs. `Fn::ImportValue` is not allowed in a condition, as in CloudFormation: `CreateStack`,
+`UpdateStack` and `CreateChangeSet` refuse such a template, with the message `Template error: Cannot
+use Fn::ImportValue in Conditions.` A SAM template's change set fails with that reason instead, and
+so does the stack when CreateStack or UpdateStack executes it; an `AWS::Include` template fails when
+it is executed.
 
 ## Custom Resources and the CDK Provider Framework
 
@@ -692,8 +741,10 @@ Deviations from AWS to be aware of:
   removals as well.
 - After `DeleteStack` completes, a retained resource's `DELETE_SKIPPED` record is only visible
   through `DescribeStackEvents` for the deleted stack, not `DescribeStackResources`.
-- `UpdateReplacePolicy`, and the `RetainExceptOnCreate` request parameter of `CreateStack` /
-  `UpdateStack`, are not implemented.
+- `UpdateReplacePolicy` is honored only by the resource types that delete a displaced resource once
+  the update commits, such as an SSM parameter or a log stream; other types keep the displaced
+  resource, or delete it during the update, whatever the policy. The `RetainExceptOnCreate` request
+  parameter of `CreateStack` / `UpdateStack` is not implemented.
 
 ## StackSets
 

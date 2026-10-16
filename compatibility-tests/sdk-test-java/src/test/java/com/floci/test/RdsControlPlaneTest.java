@@ -57,6 +57,7 @@ import software.amazon.awssdk.services.rds.model.OptionGroupNotFoundException;
 import software.amazon.awssdk.services.rds.model.OptionSetting;
 import software.amazon.awssdk.services.rds.model.RdsException;
 import software.amazon.awssdk.services.rds.model.RegisterDbProxyTargetsResponse;
+import software.amazon.awssdk.services.rds.model.ResourceNotFoundException;
 import software.amazon.awssdk.services.rds.model.Tag;
 import software.amazon.awssdk.services.rds.model.UpgradeTarget;
 import software.amazon.awssdk.services.rds.model.ValidStorageOptions;
@@ -756,6 +757,32 @@ class RdsControlPlaneTest {
             }
             deleteDbInstance(rds, readerName);
             deleteDbInstance(rds, writerName);
+            try {
+                rds.deleteDBCluster(b -> b.dbClusterIdentifier(clusterName).skipFinalSnapshot(true));
+            } catch (Exception e) {
+                LOG.log(Level.WARNING, "Failed to clean up RDS cluster " + clusterName, e);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Data API endpoint: enable, describe and disable on an Aurora cluster")
+    void sdkTogglesTheDataApiEndpoint() {
+        String clusterName = TestFixtures.uniqueName("rds-data-api");
+        try {
+            String arn = rds.createDBCluster(b -> b
+                    .dbClusterIdentifier(clusterName)
+                    .engine("aurora-postgresql")
+                    .engineVersion("16.3")
+                    .masterUsername("admin")
+                    .masterUserPassword("data-api-secret")).dbCluster().dbClusterArn();
+            assertThat(rds.enableHttpEndpoint(b -> b.resourceArn(arn)).httpEndpointEnabled()).isTrue();
+            assertThat(rds.describeDBClusters(b -> b.dbClusterIdentifier(clusterName))
+                    .dbClusters().get(0).httpEndpointEnabled()).isTrue();
+            assertThat(rds.disableHttpEndpoint(b -> b.resourceArn(arn)).httpEndpointEnabled()).isFalse();
+            assertThatThrownBy(() -> rds.enableHttpEndpoint(b -> b.resourceArn(arn + "-missing")))
+                    .isInstanceOf(ResourceNotFoundException.class);
+        } finally {
             try {
                 rds.deleteDBCluster(b -> b.dbClusterIdentifier(clusterName).skipFinalSnapshot(true));
             } catch (Exception e) {

@@ -128,6 +128,9 @@ public class StackSetService {
         if ("SELF_MANAGED".equals(resolvedPermissionModel) && (autoDeploymentEnabled || retainStacksOnAccountRemoval)) {
             throw new AwsException("ValidationError", "AutoDeployment is valid only for SERVICE_MANAGED StackSets.", 400);
         }
+        // Every instance is deployed with these parameters, so a template parameter left without a
+        // value would fail each one; refuse the stack set instead.
+        cfnService.requireParameterValues(templateBody, parameters);
 
         StackSet ss = new StackSet();
         ss.setStackSetName(name);
@@ -194,6 +197,11 @@ public class StackSetService {
                                                          Boolean retainStacksOnAccountRemoval,
                                                          Boolean managedExecutionActive) {
         StackSet ss = getStackSetOrThrow(name);
+        // Checked against the template and parameters the update leaves the stack set with, before
+        // either is changed or an operation is recorded.
+        cfnService.requireParameterValues(
+                templateBody != null && !templateBody.isBlank() ? templateBody : ss.getTemplateBody(),
+                parameters != null && !parameters.isEmpty() ? parameters : ss.getParameters());
         String operationId = reserveOperation(name, "UPDATE", requestedOperationId).getOperationId();
         if (templateBody != null && !templateBody.isBlank()) {
             ss.setTemplateBody(templateBody);
@@ -311,36 +319,42 @@ public class StackSetService {
         for (String ou : targetOus) validateOuOrRoot(ou);
 
         String operationId = reserveOperation(name, "CREATE", requestedOperationId).getOperationId();
-        List<TargetAccount> targets = !directAccounts.isEmpty()
-                ? directAccounts.stream().map(account -> new TargetAccount(account, Set.of())).toList()
-                : resolveOrganizationTargets(targetOus, regions, name);
-
         List<StackInstance> deployed = new ArrayList<>();
-        for (TargetAccount target : targets) {
-            for (String region : regions) {
-                String instanceKey = instanceKey(name, target.accountId(), region);
-                StackInstance existing = instances.get(instanceKey).orElse(null);
-                if (existing != null && !"OUTDATED".equals(existing.getStatus())) {
-                    if (!target.organizationalUnitIds().isEmpty()) {
-                        Set<String> associations = deploymentTargetsFor(existing);
-                        if (associations.addAll(target.organizationalUnitIds())) {
-                            applyDeploymentTargets(existing, associations);
-                            instances.put(instanceKey, existing);
+        try {
+            List<TargetAccount> targets = !directAccounts.isEmpty()
+                    ? directAccounts.stream().map(account -> new TargetAccount(account, Set.of())).toList()
+                    : resolveOrganizationTargets(targetOus, regions, name);
+            for (TargetAccount target : targets) {
+                for (String region : regions) {
+                    String instanceKey = instanceKey(name, target.accountId(), region);
+                    StackInstance existing = instances.get(instanceKey).orElse(null);
+                    if (existing != null && !"OUTDATED".equals(existing.getStatus())) {
+                        if (!target.organizationalUnitIds().isEmpty()) {
+                            Set<String> associations = deploymentTargetsFor(existing);
+                            if (associations.addAll(target.organizationalUnitIds())) {
+                                applyDeploymentTargets(existing, associations);
+                                instances.put(instanceKey, existing);
+                            }
                         }
+                        continue;
                     }
-                    continue;
+                    StackInstance inst = deployInstance(ss, target.accountId(), region, INSTANCE_CHANGE_SET, "CREATE");
+                    Set<String> associations = existing == null
+                            ? new LinkedHashSet<>() : deploymentTargetsFor(existing);
+                    associations.addAll(target.organizationalUnitIds());
+                    applyDeploymentTargets(inst, associations);
+                    instances.put(instanceKey, inst);
+                    deployed.add(inst);
                 }
-                StackInstance inst = deployInstance(ss, target.accountId(), region, INSTANCE_CHANGE_SET, "CREATE");
-                Set<String> associations = existing == null
-                        ? new LinkedHashSet<>() : deploymentTargetsFor(existing);
-                associations.addAll(target.organizationalUnitIds());
-                applyDeploymentTargets(inst, associations);
-                instances.put(instanceKey, inst);
-                deployed.add(inst);
             }
+            completeOperation(name, operationId, deriveOperationStatus(deployed));
+            return describeStackSetOperation(name, operationId);
+        } catch (RuntimeException e) {
+            // An organizational unit that cannot be resolved, or an instance whose change set is
+            // refused: the operation fails rather than stay RUNNING, which would refuse every later one.
+            completeOperation(name, operationId, "FAILED");
+            throw e;
         }
-        completeOperation(name, operationId, deriveOperationStatus(deployed));
-        return describeStackSetOperation(name, operationId);
     }
 
     public List<StackSetAutoDeploymentTarget> listStackSetAutoDeploymentTargets(String name) {

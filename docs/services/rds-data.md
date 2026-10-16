@@ -47,7 +47,7 @@ The deprecated `ExecuteSql` operation is recognized at `POST /ExecuteSql` and re
 - SQL errors are returned as `DatabaseErrorException` so AWS SDK callers can handle database failures with normal AWS error decoding.
 - If `secretArn` points to a local Secrets Manager secret with JSON credentials (`username` or `user`, plus `password`), those credentials are used. A missing or unavailable secret returns `SecretsErrorException`; malformed or incomplete credentials return `InvalidSecretException`. Floci does not fall back to the resolved RDS resource's master credentials when a secret ARN was supplied.
 - `formatRecordsAs=JSON`, `formattedRecords`, and `resultSetOptions` are not implemented yet, and `ExecuteStatement` requests asking for those result modes return `BadRequestException`. They are `ExecuteStatement`-only fields in the AWS API, so `BatchExecuteStatement` — whose input is limited to `resourceArn`, `secretArn`, `sql`, `database`, `schema`, `parameterSets`, and `transactionId` — ignores them as AWS does rather than rejecting them.
-- RDS `HttpEndpointEnabled` control-plane gating is not modeled locally; availability is controlled by `FLOCI_SERVICES_RDS_DATA_ENABLED` and whether the target local RDS resource is running.
+- RDS records a cluster's `HttpEndpointEnabled` (`EnableHttpEndpoint` / `DisableHttpEndpoint`, see [RDS](rds.md#data-api-endpoint)), but the Data API does not check it: availability is controlled by `FLOCI_SERVICES_RDS_DATA_ENABLED` and whether the target local RDS resource is running.
 
 ## Configuration
 

@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.s3;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -113,6 +115,8 @@ public class S3Service implements Resettable, ResourceProvider {
     private static final String AUTHENTICATED_USERS_GROUP_URI = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
     private static final String LOG_DELIVERY_GROUP_URI = "http://acs.amazonaws.com/groups/s3/LogDelivery";
     private static final String LEGACY_ACCESS_KEY_ID = "test";
+    private static final String S3_XML_SCHEMA_ERROR =
+            "The XML you provided was not well-formed or did not validate against our published schema.";
     private static final Set<String> SUPPORTED_SERVER_SIDE_ENCRYPTION_VALUES = Set.of("AES256", "aws:kms", "aws:kms:dsse", "aws:fsx");
     private static final String SSE_C_ALGORITHM = "AES256";
     private static final int SSE_C_KEY_BYTES = 32;
@@ -644,6 +648,7 @@ public class S3Service implements Resettable, ResourceProvider {
         AccountAwareStorageBackend.OwnedEntry<Bucket> checkedBucket = resolveBucketEntry(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
                         "The specified bucket does not exist.", 404));
+        rejectUploadAclWhenOwnershipEnforced(checkedBucket.value(), checkedBucket.account(), effectiveOptions);
         rejectConflictingServerSideEncryption(
                 normalizeServerSideEncryption(effectiveOptions.getServerSideEncryption()),
                 validateSseCustomerKey(effectiveOptions.getSseCustomerAlgorithm(),
@@ -825,6 +830,7 @@ public class S3Service implements Resettable, ResourceProvider {
             object.setSseCustomerAlgorithm(sseCustomerKey.algorithm());
             object.setSseCustomerKeyMd5(sseCustomerKey.keyMd5());
         }
+        rejectUploadAclWhenOwnershipEnforced(bucket, bucketOwnerAccount, effectiveOptions);
         String objectAcl = resolveObjectAclXml(bucketOwnerAccount,
                 effectiveOptions.getAcl(), effectiveOptions.getGrantRead(),
                 effectiveOptions.getGrantWrite(), effectiveOptions.getGrantFullControl(),
@@ -1134,7 +1140,7 @@ public class S3Service implements Resettable, ResourceProvider {
             throw new AwsException("AccessDenied", "Access Denied", 403);
         }
         if (decision == S3PublicAccessEvaluator.PublicAccessDecision.ALLOW
-                || canonicalUserObjectAclAllowsRead(bucketName, key, canonicalUserId)) {
+                || canonicalUserObjectAclAllowsRead(bucket, bucketName, key, canonicalUserId)) {
             return;
         }
         throw new AwsException("AccessDenied", "Access Denied", 403);
@@ -1271,6 +1277,9 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     private boolean publicBucketAclAllowsWrite(Bucket bucket) {
+        if (ownershipIsEnforced(bucket)) {
+            return false;
+        }
         return Optional.ofNullable(bucket.getAcl())
                 .map(S3AclPublicAccessEvaluator::aclAllowsPublicWrite)
                 .orElse(false);
@@ -1313,7 +1322,8 @@ public class S3Service implements Resettable, ResourceProvider {
             return;
         }
         if (!blockPublicAccess.ignorePublicAcls()) {
-            if (key != null && isObjectDataReadAction(action) && publicObjectAclAllowsRead(bucketName, key, versionId)) {
+            if (key != null && isObjectDataReadAction(action)
+                    && publicObjectAclAllowsRead(bucket, bucketName, key, versionId)) {
                 return;
             }
             if (key == null && "s3:ListBucket".equals(action) && publicBucketAclAllowsRead(bucket)) {
@@ -1530,12 +1540,18 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     private boolean publicBucketAclAllowsRead(Bucket bucket) {
+        if (ownershipIsEnforced(bucket)) {
+            return false;
+        }
         return Optional.ofNullable(bucket.getAcl())
                 .map(S3AclPublicAccessEvaluator::aclAllowsPublicRead)
                 .orElse(false);
     }
 
-    private boolean publicObjectAclAllowsRead(String bucketName, String key, String versionId) {
+    private boolean publicObjectAclAllowsRead(Bucket bucket, String bucketName, String key, String versionId) {
+        if (ownershipIsEnforced(bucket)) {
+            return false;
+        }
         String storeKey = versionId != null ? versionedKey(bucketName, key, versionId) : objectKey(bucketName, key);
         return objectStore.get(storeKey)
                 .filter(object -> !object.isDeleteMarker())
@@ -1545,8 +1561,8 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     private boolean canonicalUserObjectAclAllowsRead(
-            String bucketName, String key, String canonicalUserId) {
-        if (canonicalUserId == null || canonicalUserId.isBlank()) {
+            Bucket bucket, String bucketName, String key, String canonicalUserId) {
+        if (ownershipIsEnforced(bucket) || canonicalUserId == null || canonicalUserId.isBlank()) {
             return false;
         }
         return objectStore.get(objectKey(bucketName, key))
@@ -2502,6 +2518,78 @@ public class S3Service implements Resettable, ResourceProvider {
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
                         "The specified bucket does not exist.", 404));
         return bucket.getVersioningStatus();
+    }
+
+    /** Captures only the bucket settings CloudFormation can change during an in-place update. */
+    public String snapshotBucketConfiguration(String bucketName) {
+        Bucket bucket = bucketStore.get(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket",
+                        "The specified bucket does not exist.", 404));
+        ObjectNode snapshot = objectMapper.createObjectNode();
+        snapshot.put("bucketName", bucketName);
+        snapshot.put("versioningStatus", bucket.getVersioningStatus());
+        snapshot.put("corsConfiguration", bucket.getCorsConfiguration());
+        snapshot.put("publicAccessBlockConfiguration", bucket.getPublicAccessBlockConfiguration());
+        snapshot.put("publicAccessBlockDeleted", bucket.isPublicAccessBlockDeleted());
+        snapshot.put("encryptionConfiguration", bucket.getEncryptionConfiguration());
+        snapshot.put("lifecycleConfiguration", bucket.getLifecycleConfiguration());
+        snapshot.put("transitionDefaultMinimumObjectSize", bucket.getTransitionDefaultMinimumObjectSize());
+        snapshot.put("ownershipControlsConfiguration", bucket.getOwnershipControlsConfiguration());
+        snapshot.set("tags", objectMapper.valueToTree(bucket.getTags()));
+        snapshot.set("notificationConfiguration", objectMapper.valueToTree(bucket.getNotificationConfiguration()));
+        return snapshot.toString();
+    }
+
+    /** Restores a CloudFormation update snapshot without revalidating notification destinations. */
+    public void restoreBucketConfiguration(String bucketName, String rawSnapshot) {
+        JsonNode snapshot;
+        NotificationConfiguration notifications;
+        Map<String, String> tags;
+        try {
+            snapshot = objectMapper.readTree(rawSnapshot);
+            if (snapshot == null || !snapshot.isObject() || !bucketName.equals(snapshot.path("bucketName").asText())
+                    || !snapshot.has("notificationConfiguration") || !snapshot.path("tags").isObject()) {
+                throw new IllegalArgumentException("Invalid bucket configuration snapshot for " + bucketName);
+            }
+            JsonNode notificationNode = snapshot.get("notificationConfiguration");
+            notifications = notificationNode.isNull() ? null
+                    : objectMapper.treeToValue(notificationNode, NotificationConfiguration.class);
+            tags = objectMapper.convertValue(snapshot.get("tags"), new TypeReference<Map<String, String>>() {});
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Could not read bucket configuration snapshot for " + bucketName, e);
+        }
+        String versioning = snapshotText(snapshot, "versioningStatus");
+        String cors = snapshotText(snapshot, "corsConfiguration");
+        String publicAccessBlock = snapshotText(snapshot, "publicAccessBlockConfiguration");
+        String encryption = snapshotText(snapshot, "encryptionConfiguration");
+        String lifecycle = snapshotText(snapshot, "lifecycleConfiguration");
+        String transitionSize = snapshotText(snapshot, "transitionDefaultMinimumObjectSize");
+        String ownership = snapshotText(snapshot, "ownershipControlsConfiguration");
+        if (!snapshot.path("publicAccessBlockDeleted").isBoolean()) {
+            throw new IllegalArgumentException("Missing bucket public access block snapshot state");
+        }
+        Bucket bucket = bucketStore.get(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket",
+                        "The specified bucket does not exist.", 404));
+        bucket.setVersioningStatus(versioning);
+        bucket.setCorsConfiguration(cors);
+        bucket.setPublicAccessBlockConfiguration(publicAccessBlock);
+        bucket.setPublicAccessBlockDeleted(snapshot.path("publicAccessBlockDeleted").asBoolean());
+        bucket.setEncryptionConfiguration(encryption);
+        bucket.setLifecycleConfiguration(lifecycle);
+        bucket.setTransitionDefaultMinimumObjectSize(transitionSize);
+        bucket.setOwnershipControlsConfiguration(ownership);
+        bucket.setTags(tags);
+        bucket.setNotificationConfiguration(notifications);
+        bucketStore.put(bucketName, bucket);
+    }
+
+    private static String snapshotText(JsonNode snapshot, String field) {
+        JsonNode value = snapshot.get(field);
+        if (value == null) {
+            throw new IllegalArgumentException("Missing bucket configuration snapshot field: " + field);
+        }
+        return value.isNull() ? null : value.asText();
     }
 
     public record ListVersionsResult(List<S3Object> versions, List<String> commonPrefixes, boolean isTruncated,
@@ -3824,6 +3912,13 @@ public class S3Service implements Resettable, ResourceProvider {
                                                    Map<String, String> tagging) {
         return withMultipartBucketReadLock(bucket, () -> {
             ensureBucketExists(bucket);
+            Bucket destination = resolveBucket(bucket)
+                    .orElseThrow(() -> new AwsException("NoSuchBucket",
+                            "The specified bucket does not exist.", 404));
+            if (ownershipIsEnforced(destination) && !isBlank(acl)
+                    && !"bucket-owner-full-control".equals(acl)) {
+                throw new AwsException("AccessControlListNotSupported", "The bucket does not allow ACLs", 400);
+            }
             if (acl != null && !acl.isBlank()) {
                 cannedObjectAclXml(acl);
             }
@@ -4847,13 +4942,15 @@ public class S3Service implements Resettable, ResourceProvider {
     public String getBucketAcl(String bucketName) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
-        return bucket.getAcl() != null ? bucket.getAcl() : defaultAclXml(ownerId(), DEFAULT_OWNER_DISPLAY_NAME);
+        return !ownershipIsEnforced(bucket) && bucket.getAcl() != null
+                ? bucket.getAcl() : defaultAclXml(ownerId(), DEFAULT_OWNER_DISPLAY_NAME);
     }
 
     public void putBucketAcl(String bucketName, String bodyAcl, String cannedAcl, String grantRead,
                               String grantWrite, String grantFullControl, String grantReadAcp, String grantWriteAcp) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
+        rejectAclWhenOwnershipEnforced(bucket);
         String resolvedAcl = resolveObjectAclXml(
                 cannedAcl, grantRead, grantWrite, grantFullControl, grantReadAcp, grantWriteAcp);
         String newAcl = resolvedAcl != null ? resolvedAcl : (bodyAcl.isBlank() ? null : bodyAcl);
@@ -4866,7 +4963,9 @@ public class S3Service implements Resettable, ResourceProvider {
         AccountAwareStorageBackend.OwnedEntry<S3Object> ownedObject =
                 getStoredObjectEntry(bucketName, key, versionId);
         S3Object obj = ownedObject.value();
-        return obj.getAcl() != null
+        Bucket bucket = resolveBucket(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
+        return !ownershipIsEnforced(bucket) && obj.getAcl() != null
                 ? obj.getAcl()
                 : defaultAclXml(ownedObject.account(), DEFAULT_OWNER_DISPLAY_NAME);
     }
@@ -4877,12 +4976,56 @@ public class S3Service implements Resettable, ResourceProvider {
         AccountAwareStorageBackend.OwnedEntry<S3Object> ownedObject =
                 getStoredObjectEntry(bucketName, key, versionId);
         S3Object obj = ownedObject.value();
+        Bucket bucket = resolveBucket(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
+        rejectAclWhenOwnershipEnforced(bucket);
         String resolvedAcl = resolveObjectAclXml(ownedObject.account(), cannedAcl, grantRead,
                 grantWrite, grantFullControl, grantReadAcp, grantWriteAcp);
         String newAcl = resolvedAcl != null ? resolvedAcl : (bodyAcl.isBlank() ? null : bodyAcl);
         rejectPublicAclWhenBlocked(bucketName, newAcl);
         obj.setAcl(newAcl);
         putObjectMetadataForAccount(ownedObject.account(), bucketName, key, obj);
+    }
+
+    private static void rejectAclWhenOwnershipEnforced(Bucket bucket) {
+        if (ownershipIsEnforced(bucket)) {
+            throw new AwsException("AccessControlListNotSupported", "The bucket does not allow ACLs", 400);
+        }
+    }
+
+    private static void rejectUploadAclWhenOwnershipEnforced(Bucket bucket, String ownerAccount,
+                                                              PutObjectOptions options) {
+        if (!ownershipIsEnforced(bucket)) {
+            return;
+        }
+        boolean otherGrants = !isBlank(options.getGrantRead()) || !isBlank(options.getGrantWrite())
+                || !isBlank(options.getGrantReadAcp()) || !isBlank(options.getGrantWriteAcp());
+        boolean ownerGrant = isOnlyOwnerFullControlGrant(ownerAccount, options.getGrantFullControl());
+        boolean withoutAcl = isBlank(options.getAcl())
+                && (isBlank(options.getGrantFullControl()) || ownerGrant);
+        boolean ownerFullControlAcl = "bucket-owner-full-control".equals(options.getAcl())
+                && isBlank(options.getGrantFullControl());
+        if (!otherGrants && (withoutAcl || ownerFullControlAcl)) {
+            return;
+        }
+        throw new AwsException("AccessControlListNotSupported", "The bucket does not allow ACLs", 400);
+    }
+
+    private static boolean isOnlyOwnerFullControlGrant(String ownerAccount, String header) {
+        if (isBlank(header)) {
+            return false;
+        }
+        for (String grantee : header.split(",", -1)) {
+            if (!("id=\"" + ownerAccount + "\"").equals(grantee.trim())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean ownershipIsEnforced(Bucket bucket) {
+        return XmlParser.containsValue(bucket.getOwnershipControlsConfiguration(),
+                "ObjectOwnership", "BucketOwnerEnforced");
     }
 
     /**
@@ -5065,8 +5208,35 @@ public class S3Service implements Resettable, ResourceProvider {
     public void putBucketOwnershipControls(String bucketName, String ownershipControlsXml) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
+        validateOwnershipControls(ownershipControlsXml);
+        if (XmlParser.containsValue(ownershipControlsXml, "ObjectOwnership", "BucketOwnerEnforced")
+                && S3AclPublicAccessEvaluator.aclGrantsNonOwner(bucket.getAcl(), ownerId())) {
+            throw new AwsException("InvalidBucketAclWithObjectOwnership",
+                    "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting", 400);
+        }
         bucket.setOwnershipControlsConfiguration(ownershipControlsXml);
         bucketStore.put(bucketName, bucket);
+    }
+
+    /** Validates the same ownership document for direct S3 calls and CloudFormation templates. */
+    public static void validateOwnershipControls(String xml) {
+        if (!"OwnershipControls".equals(XmlParser.rootElementName(xml))) {
+            throw new AwsException("MalformedXML", S3_XML_SCHEMA_ERROR, 400);
+        }
+        XmlParser.XmlElement controls = XmlParser.extractElementTree(xml, "OwnershipControls");
+        long ruleCount = controls.count("Rule");
+        if (ruleCount != 1) {
+            throw new AwsException("MalformedXML", S3_XML_SCHEMA_ERROR, 400);
+        }
+        XmlParser.XmlElement rule = controls.child("Rule");
+        XmlParser.XmlElement ownership = rule.child("ObjectOwnership");
+        if (rule.count("ObjectOwnership") != 1 || ownership == null) {
+            throw new AwsException("MalformedXML", S3_XML_SCHEMA_ERROR, 400);
+        }
+        if (!Set.of("BucketOwnerPreferred", "ObjectWriter", "BucketOwnerEnforced")
+                .contains(ownership.text())) {
+            throw new AwsException("MalformedXML", S3_XML_SCHEMA_ERROR, 400);
+        }
     }
 
     public void deleteBucketOwnershipControls(String bucketName) {

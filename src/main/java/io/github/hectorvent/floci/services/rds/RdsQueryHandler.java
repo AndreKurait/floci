@@ -113,6 +113,8 @@ public class RdsQueryHandler {
                 case "DescribeDBClusterEndpoints" -> handleDescribeDbClusterEndpoints(params, region);
                 case "ModifyDBClusterEndpoint" -> handleModifyDbClusterEndpoint(params, region);
                 case "DeleteDBClusterEndpoint" -> handleDeleteDbClusterEndpoint(params, region);
+                case "EnableHttpEndpoint" -> handleSetHttpEndpoint("EnableHttpEndpoint", params, region, true);
+                case "DisableHttpEndpoint" -> handleSetHttpEndpoint("DisableHttpEndpoint", params, region, false);
                 case "AddRoleToDBCluster" -> handleAddRoleToDbCluster(params, region);
                 case "RemoveRoleFromDBCluster" -> handleRemoveRoleFromDbCluster(params, region);
                 case "AddRoleToDBInstance" -> handleAddRoleToDbInstance(params, region);
@@ -366,6 +368,16 @@ public class RdsQueryHandler {
                 params.getFirst("SubscriptionName"));
         return Response.ok(AwsQueryResponse.envelope("DeleteEventSubscription", AwsNamespaces.RDS,
                 new XmlBuilder().raw(eventSubscriptionXml(subscription)).build())).build();
+    }
+
+    private Response handleSetHttpEndpoint(String action, MultivaluedMap<String, String> params, String region,
+                                           boolean enabled) {
+        DbCluster cluster = service.setHttpEndpointByArn(region, params.getFirst("ResourceArn"), enabled);
+        String result = new XmlBuilder()
+                .elem("ResourceArn", cluster.getDbClusterArn())
+                .elem("HttpEndpointEnabled", cluster.isHttpEndpointEnabled())
+                .build();
+        return Response.ok(AwsQueryResponse.envelope(action, AwsNamespaces.RDS, result)).build();
     }
 
     private Response handleAddRoleToDbCluster(MultivaluedMap<String, String> params, String region) {
@@ -1180,6 +1192,12 @@ public class RdsQueryHandler {
         try {
             List<DbRoleAssociation> associatedRoles = parseAssociatedRoles(params);
             service.validateClusterRoleAssociations(id, engine, associatedRoles);
+            boolean enableHttpEndpoint = Boolean.TRUE.equals(parseOptionalBoolean(params, "EnableHttpEndpoint"));
+            String globalCluster = params.getFirst("GlobalClusterIdentifier");
+            if (enableHttpEndpoint && (globalCluster == null || globalCluster.isBlank())) {
+                // A global cluster's members take its Aurora engine; any other create names its own.
+                RdsService.requireDataApiEngine(engine);
+            }
             Double serverlessV2Min = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MinCapacity");
             Double serverlessV2Max = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MaxCapacity");
             Integer serverlessV2SecondsUntilAutoPause = parseIntegerParam(
@@ -1221,6 +1239,9 @@ public class RdsQueryHandler {
                     service.deleteDbCluster(id, region);
                     throw e;
                 }
+            }
+            if (enableHttpEndpoint) {
+                cluster = service.setHttpEndpoint(region, id, true);
             }
             String result = dbClusterXml(cluster);
             return Response.ok(AwsQueryResponse.envelope("CreateDBCluster", AwsNamespaces.RDS, result)).build();
@@ -1331,9 +1352,16 @@ public class RdsQueryHandler {
             Double serverlessV2Max = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MaxCapacity");
             Integer serverlessV2SecondsUntilAutoPause = parseIntegerParam(
                     params, "ServerlessV2ScalingConfiguration.SecondsUntilAutoPause");
+            Boolean enableHttpEndpoint = parseOptionalBoolean(params, "EnableHttpEndpoint");
+            if (Boolean.TRUE.equals(enableHttpEndpoint)) {
+                RdsService.requireDataApiEngine(service.getDbCluster(id, region).getEngineIdentifier());
+            }
             DbCluster cluster = service.modifyDbCluster(id, newPassword, iamEnabled,
                     serverlessV2Min, serverlessV2Max, serverlessV2SecondsUntilAutoPause,
                     manageMasterUserPassword, masterUserSecretKmsKeyId, region);
+            if (enableHttpEndpoint != null) {
+                cluster = service.setHttpEndpoint(region, id, enableHttpEndpoint);
+            }
             String result = dbClusterXml(cluster);
             return Response.ok(AwsQueryResponse.envelope("ModifyDBCluster", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -2918,6 +2946,7 @@ public class RdsQueryHandler {
                .elem("LatestRestorableTime", Instant.now().toString());
         }
         xml.elem("IAMDatabaseAuthenticationEnabled", c.isIamDatabaseAuthenticationEnabled())
+           .elem("HttpEndpointEnabled", c.isHttpEndpointEnabled())
            .elem("MultiAZ", c.isMultiAz())
            .elem("StorageEncrypted", c.isStorageEncrypted())
            .elem("AvailabilityZone", c.getAvailabilityZone() != null ? c.getAvailabilityZone() : config.defaultAvailabilityZone())

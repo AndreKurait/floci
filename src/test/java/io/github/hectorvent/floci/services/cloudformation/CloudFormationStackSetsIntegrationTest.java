@@ -752,6 +752,249 @@ class CloudFormationStackSetsIntegrationTest {
     }
 
     @Test
+    void createStackSetWithoutAParameterValueIsRefused() {
+        // Every instance is deployed with the stack set's parameters, so a declared one the stack
+        // set has no value for is refused up front, as a stack's CreateStack refuses it.
+        String setName = "noval-" + UUID.randomUUID().toString().substring(0, 8);
+        String queue = "noval-q-" + UUID.randomUUID().toString().substring(0, 8);
+        String template = """
+            {"Parameters":{"Suffix":{"Type":"String"}},
+             "Resources":{"Q":{"Type":"AWS::SQS::Queue","Properties":{"QueueName":{"Fn::Sub":"%s-${Suffix}"}}}}}
+            """.formatted(queue);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", template)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(400)
+            .body(containsString("<Code>ValidationError</Code>"))
+            .body(containsString("<Message>Parameters: [Suffix] must have values</Message>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackSet")
+            .formParam("StackSetName", setName)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(404)
+            .body(containsString("StackSetNotFoundException"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", template)
+            .formParam("Parameters.member.1.ParameterKey", "Suffix")
+            .formParam("Parameters.member.1.ParameterValue", "b")
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackInstances")
+            .formParam("StackSetName", setName)
+            .formParam("Accounts.member.1", ACCOUNT_B)
+            .formParam("Regions.member.1", REGION)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+        assertQueueVisible(ACCOUNT_B, queue + "-b");
+    }
+
+    @Test
+    void updateStackSetWithoutAParameterValueChangesNothing() {
+        // Checked against the template and parameters the update would leave the stack set with,
+        // before either changes or an operation is recorded.
+        String setName = "noval-update-" + UUID.randomUUID().toString().substring(0, 8);
+        String queue = "noval-update-q-" + UUID.randomUUID().toString().substring(0, 8);
+        String template = """
+            {"Parameters":{"Suffix":{"Type":"String"}},
+             "Resources":{"Q":{"Type":"AWS::SQS::Queue","Properties":{"QueueName":{"Fn::Sub":"%s-${Suffix}"}}}}}
+            """.formatted(queue);
+        String withExtra = """
+            {"Parameters":{"Suffix":{"Type":"String"},"Extra":{"Type":"String"}},
+             "Resources":{"Q":{"Type":"AWS::SQS::Queue","Properties":{"QueueName":{"Fn::Sub":"%s-${Suffix}"},
+               "Tags":[{"Key":"extra","Value":{"Ref":"Extra"}}]}}}}
+            """.formatted(queue);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", template)
+            .formParam("Parameters.member.1.ParameterKey", "Suffix")
+            .formParam("Parameters.member.1.ParameterValue", "a")
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackInstances")
+            .formParam("StackSetName", setName)
+            .formParam("Accounts.member.1", ACCOUNT_B)
+            .formParam("Regions.member.1", REGION)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+        assertQueueVisible(ACCOUNT_B, queue + "-a");
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", withExtra)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(400)
+            .body(containsString("<Message>Parameters: [Extra] must have values</Message>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackSet")
+            .formParam("StackSetName", setName)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200)
+            .body(not(containsString("Extra")));
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ListStackSetOperations")
+            .formParam("StackSetName", setName)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200)
+            .body(not(containsString("<Action>UPDATE</Action>")));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", withExtra)
+            .formParam("Parameters.member.1.ParameterKey", "Suffix")
+            .formParam("Parameters.member.1.UsePreviousValue", "true")
+            .formParam("Parameters.member.2.ParameterKey", "Extra")
+            .formParam("Parameters.member.2.ParameterValue", "x")
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ListStackSetOperations")
+            .formParam("StackSetName", setName)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200)
+            .body(containsString("<Action>UPDATE</Action>"))
+            .body(not(containsString("<Status>FAILED</Status>")));
+    }
+
+    @Test
+    void updateStackSetUsePreviousValueKeepsAValueTheStackSetTookFromItsDefault() {
+        // A stack set keeps only the values it was given, so UsePreviousValue also reads the
+        // previous template's Default: the instances deployed with it, and an update that drops
+        // that Default keeps them on it.
+        String setName = "upv-default-" + UUID.randomUUID().toString().substring(0, 8);
+        String queue = "upv-default-q-" + UUID.randomUUID().toString().substring(0, 8);
+        String template = """
+            {"Parameters":{"Suffix":{"Type":"String"%s}},
+             "Resources":{"Q":{"Type":"AWS::SQS::Queue","Properties":{"QueueName":{"Fn::Sub":"%s-${Suffix}"}}}}}
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", template.formatted(",\"Default\":\"d1\"", queue))
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackInstances")
+            .formParam("StackSetName", setName)
+            .formParam("Accounts.member.1", ACCOUNT_B)
+            .formParam("Regions.member.1", REGION)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+        assertQueueVisible(ACCOUNT_B, queue + "-d1");
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", template.formatted("", queue))
+            .formParam("Parameters.member.1.ParameterKey", "Suffix")
+            .formParam("Parameters.member.1.UsePreviousValue", "true")
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackSet")
+            .formParam("StackSetName", setName)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200)
+            .body(containsString("<ParameterValue>d1</ParameterValue>"));
+        assertQueueVisible(ACCOUNT_B, queue + "-d1");
+    }
+
+    @Test
+    void createStackInstancesThatIsRefusedFailsItsOperation() {
+        // An instance whose change set is refused fails the operation instead of leaving it
+        // RUNNING, which would refuse every later operation on the stack set.
+        String setName = "refused-op-" + UUID.randomUUID().toString().substring(0, 8);
+        String conditional = "refused-c-" + UUID.randomUUID().toString().substring(0, 8);
+        String dependent = "refused-d-" + UUID.randomUUID().toString().substring(0, 8);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackSet")
+            .formParam("StackSetName", setName)
+            .formParam("TemplateBody", conditionalDependentTemplate(ACCOUNT_B, conditional, dependent))
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackInstances")
+            .formParam("StackSetName", setName)
+            .formParam("Accounts.member.1", ACCOUNT_C)
+            .formParam("Regions.member.1", REGION)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(400)
+            .body(containsString("Unresolved resource dependencies"));
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ListStackSetOperations")
+            .formParam("StackSetName", setName)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200)
+            .body(containsString("<Status>FAILED</Status>"))
+            .body(not(containsString("<Status>RUNNING</Status>")));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStackInstances")
+            .formParam("StackSetName", setName)
+            .formParam("Accounts.member.1", ACCOUNT_B)
+            .formParam("Regions.member.1", REGION)
+            .header("Authorization", auth(ADMIN, "cloudformation"))
+        .when().post("/")
+        .then().statusCode(200);
+        assertQueueVisible(ACCOUNT_B, conditional);
+        assertQueueVisible(ACCOUNT_B, dependent);
+    }
+
+    @Test
     void createStackInstancesRejectsInvalidAccountBeforeDeployment() {
         String setName = "invalid-account-" + UUID.randomUUID().toString().substring(0, 8);
         String queue = "invalid-account-q-" + UUID.randomUUID().toString().substring(0, 8);

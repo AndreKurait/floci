@@ -898,7 +898,8 @@ members it sets, and the rest keep the template's values; devices only one side 
 given. An Auto Scaling group launching from a template gets the template's mappings the same
 way. The root volume's type comes from the mapping for the AMI's root device, else from the
 AMI's own root mapping, else `gp3`, and `CreateImage` records that type on the new AMI's root
-mapping. A mapping naming a `VolumeType` outside the service model's enum fails with
+mapping. A mapping with `NoDevice` set removes its device whatever else it names, so it sets no
+type and its `VolumeType` is not checked. A mapping naming a `VolumeType` outside the service model's enum fails with
 `InvalidParameterValue`, as `ModifyVolume` does. Template versions are not checked when they are
 stored, so a template naming an unknown `VolumeType` is accepted by `CreateLaunchTemplate` and
 fails at launch.

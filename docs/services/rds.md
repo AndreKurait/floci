@@ -71,6 +71,8 @@ RDS Data API (`rds-data`) is documented separately because it uses REST JSON rou
 | `DescribeDBClusterEndpoints` | List a cluster's built-in writer and reader endpoints and its custom endpoints, with the four documented filters |
 | `ModifyDBClusterEndpoint` | Change a custom endpoint's type or member list |
 | `DeleteDBClusterEndpoint` | Delete a custom endpoint |
+| `EnableHttpEndpoint` | Turn on an Aurora cluster's Data API endpoint by ARN; see [Data API endpoint](#data-api-endpoint) |
+| `DisableHttpEndpoint` | Turn off a cluster's Data API endpoint by ARN |
 | `AddRoleToDBCluster` | Associate an IAM role with a cluster, optionally for a feature; see [IAM role associations](#iam-role-associations) |
 | `RemoveRoleFromDBCluster` | Remove a role from a cluster |
 | `AddRoleToDBInstance` | Associate an IAM role with an instance for a feature |
@@ -615,6 +617,19 @@ Custom endpoints are modelled, not routed: a custom endpoint reports the cluster
 (read from the cluster each time, so it follows a restart onto another proxy port), so it is
 reachable, but connections through it go where the cluster endpoint sends them rather than being
 spread across the chosen members.
+
+## Data API endpoint
+
+`EnableHttpEndpoint` and `DisableHttpEndpoint` turn a cluster's Data API endpoint on and off by the
+cluster's ARN, and `DescribeDBClusters` reports it as `HttpEndpointEnabled`. `CreateDBCluster` and
+`ModifyDBCluster` take `EnableHttpEndpoint` too, as does the `AWS::RDS::DBCluster` CloudFormation
+property, so Terraform's `enable_http_endpoint` and CDK's `enableDataApi` read back what they set.
+
+The Data API is offered for Aurora PostgreSQL and Aurora MySQL clusters, so turning it on for any
+other engine is `InvalidParameterCombination` (a create checks before the cluster exists); turning
+it off is always accepted. An ARN that names no cluster in the caller's account and Region is
+`ResourceNotFoundFault`, and a cluster that is not available is `InvalidResourceStateFault`. The flag
+is recorded and reported only: the Data API (`rds-data`) does not refuse a cluster with it off.
 
 ## IAM role associations
 
