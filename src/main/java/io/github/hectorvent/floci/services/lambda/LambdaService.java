@@ -39,11 +39,9 @@ import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
 import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
-import io.github.hectorvent.floci.services.s3.model.S3ObjectUpdatedEvent;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -765,9 +763,9 @@ public class LambdaService implements ResourceProvider {
         requireMatchingRevisionId(fn, request);
 
         if (zipFileBase64 != null) {
+            extractZipCode(fn, zipFileBase64, region);
             fn.setS3Bucket(null);
             fn.setS3Key(null);
-            extractZipCode(fn, zipFileBase64, region);
         }
         if (imageUri != null) {
             fn.setImageUri(imageUri);
@@ -2292,14 +2290,7 @@ public class LambdaService implements ResourceProvider {
                 .max(java.util.Comparator.comparingLong(v -> Long.parseLong(v.getVersion())));
     }
 
-    /**
-     * Copies the function's current code into a directory belonging to this version, falling back
-     * to {@code $LATEST}'s path if there is nothing to copy or the copy fails.
-     *
-     * <p>A copy failure must not fail the publish: the version is still a correct snapshot of the
-     * configuration, and falling back leaves it exactly as good as every version published before
-     * this existed, rather than turning a working call into an error.
-     */
+    /** Publishes an owned code snapshot; a failed copy must not reference mutable {@code $LATEST}. */
     private String versionCodePath(String region, LambdaFunction fn, String version) {
         String current = fn.getCodeLocalPath();
         if (current == null || fn.getHotReloadHostPath() != null) {
@@ -2308,12 +2299,14 @@ public class LambdaService implements ResourceProvider {
         try {
             Path copied = codeStore.copyForVersion(
                     ownerAccount(fn), region, fn.getFunctionName(), version, Path.of(current));
-            return copied == null ? current : copied.toAbsolutePath().normalize().toString();
+            if (copied == null) {
+                throw new IOException("Code directory is missing: " + current);
+            }
+            return copied.toAbsolutePath().normalize().toString();
         } catch (IOException e) {
-            LOG.warnv("Could not give version {0} of {1} its own code directory, "
-                            + "falling back to the shared one: {2}",
-                    version, fn.getFunctionName(), e.getMessage());
-            return current;
+            throw new AwsException("ServiceException",
+                    "Could not create a code snapshot for version " + version + " of "
+                            + fn.getFunctionName() + ": " + e.getMessage(), 500);
         }
     }
 
@@ -2323,10 +2316,9 @@ public class LambdaService implements ResourceProvider {
             if (current == null && legacyCounterKey != null) {
                 // Counters persisted before the key carried the owning account. Starting over
                 // from 0 here would re-issue a version number that already names a snapshot.
-                current = versionCounters.remove(legacyCounterKey);
+                current = versionCounters.get(legacyCounterKey);
             }
             int next = (current != null ? current : 0) + 1;
-            versionCounters.put(counterKey, next);
             return next;
         }
     }
@@ -2398,8 +2390,10 @@ public class LambdaService implements ResourceProvider {
                         + "returning it rather than creating a duplicate", functionName, unchanged.getVersion());
                 return unchanged;
             }
-            int version = nextVersionNumber(versionCounterKey(region, fn),
-                    legacyVersionCounterKey(region, functionName));
+            String counterKey = versionCounterKey(region, fn);
+            String legacyCounterKey = legacyVersionCounterKey(region, functionName);
+            boolean migrateLegacyCounter = !versionCounters.containsKey(counterKey);
+            int version = nextVersionNumber(counterKey, legacyCounterKey);
             LambdaFunction snapshot = new LambdaFunction();
             snapshot.setAccountId(fn.getAccountId());
             snapshot.setFunctionName(fn.getFunctionName());
@@ -2460,6 +2454,10 @@ public class LambdaService implements ResourceProvider {
             snapshot.setDurableKmsKeyArn(fn.getDurableKmsKeyArn());
 
             functionStore.save(region, snapshot);
+            versionCounters.put(counterKey, version);
+            if (migrateLegacyCounter) {
+                versionCounters.remove(legacyCounterKey);
+            }
             LOG.infov("Published version {0} for function {1}", version, functionName);
             return snapshot;
         }
@@ -3405,25 +3403,24 @@ public class LambdaService implements ResourceProvider {
     private void extractZipCodeBytes(LambdaFunction fn, byte[] zipBytes, String region) {
         Path codePath = codeStore.getCodePath(ownerAccount(fn), region, fn.getFunctionName());
         try {
-            zipExtractor.extractTo(zipBytes, codePath, configuredZipMaxEntries());
+            zipExtractor.extractTo(zipBytes, codePath, configuredZipMaxEntries(),
+                    () -> storeDeploymentPackage(fn, zipBytes, region));
             // Publish the new code identity under the same per-function lock publishVersion holds.
             // PublishVersion's CodeSha256 precondition is a check-then-act: it compares the hash and
             // then snapshots the code. Mutating these fields without the lock lets an overlapping
             // deploy move $LATEST between those two steps, so a version would carry code whose hash
-            // the caller never authorised even though the check passed. Extraction to disk stays
-            // outside the lock; only the fields that decide what a snapshot copies are inside it.
+            // the caller never authorised even though the check passed. UpdateFunctionCode holds
+            // this same monitor across extraction too; a new function is saved after extraction.
             String newSha256 = Base64.getEncoder().encodeToString(Digests.sha256(zipBytes));
             synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
                 fn.setCodeLocalPath(codePath.toAbsolutePath().normalize().toString());
+                fn.setHotReloadHostPath(null);
                 fn.setCodeSizeBytes(zipBytes.length);
                 if (newSha256 != null) {
                     fn.setCodeSha256(newSha256);
                 }
             }
 
-            // Deploy succeeded: keep the exact package so GetFunction can serve
-            // a real Code.Location.
-            storeDeploymentPackage(fn, zipBytes, region);
             // Reclaim a directory left behind by a function created before account-scoping;
             // codePath above is already the new location, so this is a no-op once migrated.
             // Locked against publishVersion (see its own comment) so a version cannot be
@@ -3507,8 +3504,6 @@ public class LambdaService implements ResourceProvider {
             throw new AwsException("ServiceUnavailableException", "S3 service not available", 503);
         }
 
-        fn.setS3Bucket(s3Bucket);
-        fn.setS3Key(s3Key);
         S3Object obj;
         try {
             obj = s3Service.getObject(s3Bucket, s3Key);
@@ -3517,6 +3512,8 @@ public class LambdaService implements ResourceProvider {
                     "Unable to fetch code from s3://" + s3Bucket + "/" + s3Key + ": " + e.getMessage(), 400);
         }
         extractZipCodeBytes(fn, obj.getData(), region);
+        fn.setS3Bucket(s3Bucket);
+        fn.setS3Key(s3Key);
     }
 
     private void applyHotReload(LambdaFunction fn, String hostPath) {
@@ -4092,39 +4089,4 @@ public class LambdaService implements ResourceProvider {
         }
     }
 
-    /**
-     * Observes S3 object updates and triggers reactive sync for any Lambda
-     * functions linked to the updated object.
-     */
-    public void onS3ObjectUpdated(@Observes S3ObjectUpdatedEvent event) {
-        LOG.debugv("Observing S3 update: {0}/{1}", event.bucketName(), event.key());
-        // For simplicity, we scan all functions in the default region
-        // Most local dev setups use a single region.
-        // This runs on the CDI event thread with no RequestContext, so an ambient scan
-        // would only ever see the default account's partition — a function owned by any
-        // other account would silently never hot-reload from S3.
-        String region = regionResolver.getDefaultRegion();
-        List<LambdaFunction> functions = functionStore.listAllAccounts(region);
-        for (LambdaFunction fn : functions) {
-            if (fn.isHotReload()) {
-                continue;
-            }
-            if (event.bucketName().equals(fn.getS3Bucket()) && event.key().equals(fn.getS3Key())) {
-                LOG.infov("Reactive S3 Sync: updating function {0} from s3://{1}/{2}",
-                        fn.getFunctionName(), event.bucketName(), event.key());
-                try {
-                    S3Object obj = s3Service.getObject(event.bucketName(), event.key());
-                    extractZipCodeBytes(fn, obj.getData(), region);
-                    fn.setLastModified(Instant.now().toEpochMilli());
-                    fn.setRevisionId(UUID.randomUUID().toString());
-                    functionStore.saveForAccount(ownerAccount(fn), region, fn);
-
-                    // Push to warm workers
-                    warmPool.pushCodeUpdate(fn);
-                } catch (Exception e) {
-                    LOG.warnv("Failed reactive sync for function {0}: {1}", fn.getFunctionName(), e.getMessage());
-                }
-            }
-        }
-    }
 }
