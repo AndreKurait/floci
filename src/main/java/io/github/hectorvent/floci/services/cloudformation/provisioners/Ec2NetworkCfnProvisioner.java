@@ -11,7 +11,9 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
+import io.github.hectorvent.floci.services.ec2.model.ManagedPrefixList;
 import io.github.hectorvent.floci.services.ec2.model.NatGateway;
+import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.Route;
 import io.github.hectorvent.floci.services.ec2.model.RouteTable;
 import io.github.hectorvent.floci.services.ec2.model.RouteTableAssociation;
@@ -32,7 +34,7 @@ import java.util.function.Supplier;
 /**
  * CloudFormation provisioning for the EC2 networking types: {@code AWS::EC2::Subnet},
  * {@code InternetGateway}, {@code RouteTable}, {@code Route}, {@code NatGateway}, {@code EIP} and
- * {@code SubnetRouteTableAssociation}. Extracted from the former CloudFormation monolith as
+ * {@code PrefixList} and {@code SubnetRouteTableAssociation}. Extracted from the former CloudFormation monolith as
  * part of the per-service decomposition. The physical id is the EC2 id the service assigns, except
  * for a Route, whose id is the registry primary identifier {@code <RouteTableId>|<destination>} (what
  * Ref returns on AWS and what a delete needs), and an EIP, whose Ref is its public IP.
@@ -56,6 +58,7 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
     private static final String ROUTE = "AWS::EC2::Route";
     private static final String NAT_GATEWAY = "AWS::EC2::NatGateway";
     private static final String EIP = "AWS::EC2::EIP";
+    private static final String PREFIX_LIST = "AWS::EC2::PrefixList";
     private static final String SUBNET_ROUTE_TABLE_ASSOCIATION = "AWS::EC2::SubnetRouteTableAssociation";
     private static final String ROUTE_ID_SEPARATOR = "|";
     private static final Logger LOG = Logger.getLogger(Ec2NetworkCfnProvisioner.class);
@@ -76,7 +79,8 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public Set<String> resourceTypes() {
-        return Set.of(SUBNET, INTERNET_GATEWAY, ROUTE_TABLE, ROUTE, NAT_GATEWAY, EIP, SUBNET_ROUTE_TABLE_ASSOCIATION);
+        return Set.of(SUBNET, INTERNET_GATEWAY, ROUTE_TABLE, ROUTE, NAT_GATEWAY, EIP,
+                PREFIX_LIST, SUBNET_ROUTE_TABLE_ASSOCIATION);
     }
 
     @Override
@@ -89,6 +93,7 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
             case ROUTE -> provisionRoute(r, props, ctx);
             case NAT_GATEWAY -> provisionNatGateway(r, props, ctx);
             case EIP -> provisionEip(r, props, ctx);
+            case PREFIX_LIST -> provisionPrefixList(r, props, ctx);
             case SUBNET_ROUTE_TABLE_ASSOCIATION -> provisionSubnetRouteTableAssociation(r, props, ctx);
             default -> throw new IllegalStateException("Ec2NetworkCfnProvisioner cannot handle " + r.getResourceType());
         }
@@ -171,6 +176,13 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
         if (prior.has("mapPublicIpOnLaunch")) {
             ec2Service.modifySubnetAttribute(region, entityId, "mapPublicIpOnLaunch", prior.get("mapPublicIpOnLaunch").asText());
         }
+        if (prior.has("prefixList")) {
+            JsonNode prefix = prior.get("prefixList");
+            ManagedPrefixList restored = reconcilePrefixList(region, findPrefixList(entityId, region),
+                    prefix.path("name").asText(), prefix.path("maxEntries").asInt(),
+                    prefixEntries(prefix.path("Entries")));
+            resource.getAttributes().put("Version", Long.toString(restored.getVersion()));
+        }
         if (prior.has("route")) {
             ObjectNode target = (ObjectNode) prior.get("route");
             String routeTableId = target.path("routeTableId").asText();
@@ -239,6 +251,8 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
             case NAT_GATEWAY -> CfnDeletes.safeDelete("NAT gateway", physicalId,
                     () -> ec2Service.deleteNatGateway(region, physicalId), "NatGatewayNotFound");
             case EIP -> releaseByPublicIp(physicalId, region);
+            case PREFIX_LIST -> CfnDeletes.safeDelete("prefix list", physicalId,
+                    () -> ec2Service.deleteManagedPrefixList(region, physicalId), "InvalidPrefixListID.NotFound");
             case SUBNET_ROUTE_TABLE_ASSOCIATION -> CfnDeletes.safeDelete("route table association", physicalId,
                     () -> ec2Service.disassociateRouteTable(region, physicalId), "InvalidAssociationID.NotFound");
             default -> { }
@@ -349,6 +363,109 @@ public class Ec2NetworkCfnProvisioner implements CfnResourceProvisioner {
                 ? ec2Service.describeAddresses(region, List.of(allocationId), Map.of())
                 : ec2Service.describeAddresses(region, List.of(), Map.of("public-ip", List.of(publicIp)));
         return matches.stream().findFirst().orElse(null);
+    }
+
+    private ManagedPrefixList findPrefixList(String id, String region) {
+        return ec2Service.describeManagedPrefixLists(region, List.of(id), Map.of()).getFirst();
+    }
+
+    private void provisionPrefixList(StackResource resource, JsonNode props, ProvisionContext ctx) {
+        String name = ctx.resolveOptional(props, "PrefixListName");
+        String family = ctx.resolveOptional(props, "AddressFamily");
+        require(PREFIX_LIST, "PrefixListName", name);
+        require(PREFIX_LIST, "AddressFamily", family);
+        String maximum = ctx.resolveOptional(props, "MaxEntries");
+        Integer maxEntries;
+        try {
+            maxEntries = maximum == null ? null : Integer.valueOf(maximum);
+        } catch (NumberFormatException e) {
+            throw new AwsException("ValidationError", "MaxEntries must be an integer", 400);
+        }
+        List<PrefixListEntry> entries = prefixEntries(ctx.engine().resolveNode(props.path("Entries")));
+        ManagedPrefixList list;
+        if (ctx.isUpdate()) {
+            list = findPrefixList(ctx.priorPhysicalId(), ctx.region());
+            if (!family.equals(list.getAddressFamily())) {
+                throw new AwsException("ValidationError", "You cannot modify the address family.", 400);
+            }
+            ObjectNode prior = inPlacePrior(resource, list.getPrefixListId(), ctx);
+            ObjectNode prefix = prior.putObject("prefixList");
+            prefix.put("name", list.getPrefixListName());
+            prefix.put("maxEntries", list.getMaxEntries());
+            ArrayNode oldEntries = prefix.putArray("Entries");
+            for (PrefixListEntry entry : list.currentEntries()) {
+                oldEntries.addObject().put("Cidr", entry.getCidr()).put("Description", entry.getDescription());
+            }
+            writeInPlacePrior(resource, prior);
+            ManagedPrefixList current = list;
+            CfnRollback.guarded(resource, ctx, false, () -> { }, () -> undoInPlace(resource), () -> {
+                reconcilePrefixList(ctx.region(), current, name,
+                        maxEntries == null ? current.getMaxEntries() : maxEntries, entries);
+                ObjectNode tagProps = props.deepCopy();
+                if (!tagProps.has("Tags")) {
+                    tagProps.putArray("Tags");
+                }
+                applyTags(resource, true, current.getPrefixListId(), current.getTags(), tagProps, ctx);
+            });
+            list = findPrefixList(ctx.priorPhysicalId(), ctx.region());
+        } else {
+            list = ec2Service.createManagedPrefixList(ctx.region(), name, family,
+                    maxEntries, entries, tagList(props, ctx));
+        }
+        resource.setPhysicalId(list.getPrefixListId());
+        resource.getAttributes().put("PrefixListId", list.getPrefixListId());
+        resource.getAttributes().put("Arn", list.getPrefixListArn());
+        resource.getAttributes().put("OwnerId", list.getOwnerId());
+        resource.getAttributes().put("Version", Long.toString(list.getVersion()));
+    }
+
+    private static List<PrefixListEntry> prefixEntries(JsonNode rows) {
+        if (rows == null || rows.isMissingNode() || rows.isNull()) {
+            return List.of();
+        }
+        if (!rows.isArray()) {
+            throw new AwsException("ValidationError", "Prefix list Entries must be an array", 400);
+        }
+        List<PrefixListEntry> entries = new ArrayList<>();
+        for (JsonNode row : rows) {
+            String cidr = row.path("Cidr").asText(null);
+            require(PREFIX_LIST, "Entries.Cidr", cidr);
+            entries.add(new PrefixListEntry(CidrCanonicalizer.canonicalize(cidr).orElse(cidr),
+                    row.path("Description").asText(null)));
+        }
+        return entries;
+    }
+
+    private ManagedPrefixList reconcilePrefixList(String region, ManagedPrefixList list, String name,
+                                                  int maxEntries, List<PrefixListEntry> desired) {
+        List<PrefixListEntry> existing = list.currentEntries();
+        List<String> remove = existing.stream()
+                .filter(old -> desired.stream().noneMatch(entry -> sameEntry(old, entry)))
+                .map(PrefixListEntry::getCidr).toList();
+        List<PrefixListEntry> add = desired.stream()
+                .filter(entry -> existing.stream().noneMatch(old -> sameEntry(old, entry))).toList();
+        boolean entriesChanged = !remove.isEmpty() || !add.isEmpty();
+        boolean capacityChanged = maxEntries != list.getMaxEntries();
+        if (capacityChanged && entriesChanged) {
+            throw new AwsException("ValidationError",
+                    "You cannot modify the entries and the maximum number of entries "
+                            + "for the prefix list in the same request.", 400);
+        }
+        if (capacityChanged && maxEntries < existing.size()) {
+            throw new AwsException("InvalidPrefixListModification",
+                    "The requested maximum entries of (" + maxEntries
+                            + ") is less than the current entry count of (" + existing.size() + ").", 400);
+        }
+        if (capacityChanged || entriesChanged || !name.equals(list.getPrefixListName())) {
+            list = ec2Service.modifyManagedPrefixList(region, list.getPrefixListId(), list.getVersion(),
+                    name, capacityChanged ? maxEntries : null, add, remove);
+        }
+        return list;
+    }
+
+    private static boolean sameEntry(PrefixListEntry first, PrefixListEntry second) {
+        return CidrCanonicalizer.sameBlock(first.getCidr(), second.getCidr())
+                && Objects.equals(first.getDescription(), second.getDescription());
     }
 
     private Route findRoute(String routeTableId, String destination, String region) {
