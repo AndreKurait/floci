@@ -55,8 +55,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @QuarkusTest
 @TestProfile(EksRegistryHostsDockerIntegrationTest.Profile.class)
-// Bounded cluster/node/workload waits total 345 s; allow Docker setup and cleanup as well.
-@Timeout(value = 8, unit = TimeUnit.MINUTES)
+// Bounded cluster/workload waits total 285 s; allow Docker setup and cleanup as well.
+@Timeout(value = 6, unit = TimeUnit.MINUTES)
 class EksRegistryHostsDockerIntegrationTest {
 
     private static final Logger LOG = Logger.getLogger(EksRegistryHostsDockerIntegrationTest.class);
@@ -214,39 +214,27 @@ class EksRegistryHostsDockerIntegrationTest {
                 "the configured header must survive container restart");
 
         long saDeadline = System.currentTimeMillis() + 30000;
-        boolean saReady = false;
+        boolean ready = false;
         while (System.currentTimeMillis() < saDeadline) {
             ExecResult saResult = execInContainerWithExitCode(containerId,
-                    new String[]{"kubectl", "get", "serviceaccount", "default"});
-            if (saResult.exitCode() == 0) {
-                saReady = true;
-                break;
-            }
-            Thread.sleep(1000);
-        }
-        assertTrue(saReady, "default serviceaccount must be created within 30 seconds");
-
-        long nodeDeadline = System.currentTimeMillis() + 60000;
-        ExecResult nodeReady;
-        boolean freshHeartbeat = false;
-        do {
-            nodeReady = execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "--request-timeout=2s", "get", "serviceaccount", "default"});
+            ExecResult nodeReady = execInContainerWithExitCode(containerId,
                     new String[]{"kubectl", "--request-timeout=2s", "wait",
                             "--for=condition=Ready", "nodes", "--all", "--timeout=1s"});
             ExecResult leases = execInContainerWithExitCode(containerId,
                     new String[]{"kubectl", "--request-timeout=2s", "get", "leases", "-n", "kube-node-lease",
                             "-o", "jsonpath={.items[*].spec.renewTime}"});
             String renewals = leases.stdout().trim();
-            freshHeartbeat = leases.exitCode() == 0 && !renewals.isEmpty()
+            boolean freshHeartbeat = leases.exitCode() == 0 && !renewals.isEmpty()
                     && Arrays.stream(renewals.split("\\s+"))
                             .allMatch(renewal -> Instant.parse(renewal).isAfter(restartCompletedAt));
-            if (nodeReady.exitCode() == 0 && freshHeartbeat) {
+            if (saResult.exitCode() == 0 && nodeReady.exitCode() == 0 && freshHeartbeat) {
+                ready = true;
                 break;
             }
             Thread.sleep(1000);
-        } while (System.currentTimeMillis() < nodeDeadline);
-        assertEquals(0, nodeReady.exitCode(), "node must become Ready after restart: " + nodeReady.stdout());
-        assertTrue(freshHeartbeat, "kubelet must renew its node Lease after restart");
+        }
+        assertTrue(ready, "serviceaccount and Ready nodes with renewed Leases must be available within 30 seconds");
 
         String podYaml = """
                 apiVersion: v1
