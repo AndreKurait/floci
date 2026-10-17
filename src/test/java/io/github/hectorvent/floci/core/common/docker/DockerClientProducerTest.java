@@ -736,10 +736,13 @@ class DockerClientProducerTest {
                             });
                 }
 
-                assertNotNull(accepted.poll(10, TimeUnit.SECONDS), "first stream should connect");
-                assertNotNull(accepted.poll(10, TimeUnit.SECONDS), "second stream should connect");
-                assertNull(accepted.poll(1, TimeUnit.SECONDS),
-                        "third stream should wait for a pooled connection instead of opening one");
+                try (Socket first = accepted.poll(10, TimeUnit.SECONDS);
+                     Socket second = accepted.poll(10, TimeUnit.SECONDS);
+                     Socket third = accepted.poll(1, TimeUnit.SECONDS)) {
+                    assertNotNull(first, "first stream should connect");
+                    assertNotNull(second, "second stream should connect");
+                    assertNull(third, "third stream should wait for a pooled connection instead of opening one");
+                }
             } finally {
                 client.close();
                 for (Socket socket : accepted) {
