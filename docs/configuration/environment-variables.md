@@ -173,6 +173,7 @@ With TLS, set `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` as an environment variable (or `-D
 
 | Variable | Default | Description |
 |---|---|---|
+| `FLOCI_INIT_HOOKS_DIR` | `/etc/floci/init` | Root of the Floci hook directories (`boot.d`, `start.d`, `ready.d`, `stop.d`, `shutdown.d`) |
 | `FLOCI_INIT_HOOKS_SHELL_EXECUTABLE` | `/bin/sh` | Shell used to execute hook scripts |
 | `FLOCI_INIT_HOOKS_TIMEOUT_SECONDS` | `30` | Maximum time a single hook script may run |
 | `FLOCI_INIT_HOOKS_SHUTDOWN_GRACE_PERIOD_SECONDS` | `2` | Time allowed for stop hooks to complete during shutdown |

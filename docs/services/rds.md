@@ -134,6 +134,9 @@ RDS Data API (`rds-data`) is documented separately because it uses REST JSON rou
 | `RestoreDBClusterToPointInTime` | Create a cluster from a source cluster at a time in its restorable window; see [Point in time restore](#point-in-time-restore) |
 | `DescribeDBClusterSnapshotAttributes` | Return the `restore` attribute of a cluster snapshot |
 | `ModifyDBClusterSnapshotAttribute` | Add or remove `restore` values (account ids or `all`) on a cluster snapshot |
+| `StartExportTask` | Start an export task for a DB snapshot or DB cluster snapshot; see [Exporting snapshots to Amazon S3](#exporting-snapshots-to-amazon-s3) |
+| `DescribeExportTasks` | List export tasks, by `ExportTaskIdentifier`, `SourceArn`, `SourceType` and the `export-task-identifier`, `s3-bucket`, `source-arn` and `status` filters |
+| `CancelExportTask` | Cancel a running export task; what it already wrote stays in the bucket |
 | `DescribeGlobalClusters` | List the account's global clusters with their primary and secondary members; see [Global clusters](#global-clusters) |
 | `CreateGlobalCluster` | Create an Aurora global database, empty or with an existing Aurora cluster as its primary |
 | `ModifyGlobalCluster` | Rename a global cluster, set deletion protection, or upgrade its engine version (members follow) |
@@ -720,6 +723,40 @@ target is seeded from a `pg_dumpall` of the source taken when the request arrive
 replicas use, so the restored data is the source's latest state whatever time in the window is
 asked for; this is also why `LatestRestorableTime` is always the current time. As with
 `CreateDBSnapshot`, only PostgreSQL sources are accepted.
+
+## Exporting snapshots to Amazon S3
+
+`StartExportTask`, `DescribeExportTasks` and `CancelExportTask` manage RDS snapshot export tasks.
+`ExportTaskIdentifier`, `SourceArn`, `S3BucketName`, `IamRoleArn` and `KmsKeyId` are required,
+`S3Prefix` and `ExportOnly` are optional.
+
+A task reports `STARTING`, then `IN_PROGRESS` with a `PercentProgress` while its tables are written,
+then `COMPLETE` or `FAILED` with a `FailureCause`. `CancelExportTask` moves a running task to
+`CANCELING`; it stops before its next table and becomes `CANCELED`, and the data it already wrote
+stays in the bucket, as on RDS. A table the export skips is named in `WarningMessage`. A task still
+running when Floci stops is `FAILED` as soon as Floci starts again, or `CANCELED` if it was being
+canceled. A `StartExportTask` that arrives while Floci is resetting waits for the reset to finish,
+and is refused with `Throttling` if it lasts more than 30 seconds.
+
+Floci does not write snapshot data to S3 yet. In [mock mode](#mock-mode-ci-tests) a task completes
+without writing anything, unless its bucket is in another region (see below). Outside mock mode a task is accepted and then ends `FAILED` with the
+`FailureCause` `Floci does not write snapshot data to S3 yet: export tasks complete only in mock
+mode (FLOCI_SERVICES_RDS_MOCK=true)`.
+
+`ExportOnly` takes `database`, `database.schema` or `database.schema.table` entries made of
+letters, digits, `$` and `_`, and refuses anything else with `InvalidExportOnly`, since RDS supports
+a partial export only for such names.
+
+What differs from RDS:
+
+- The IAM role is not assumed and the KMS key encrypts nothing: both are recorded and reported back
+  as given. The bucket must exist, or the request fails with `InvalidS3BucketFault`. A bucket in
+  another region than the snapshot's is accepted and the task then ends `FAILED`, as on RDS.
+- Only PostgreSQL snapshots can be exported, since Floci's snapshots hold PostgreSQL data only.
+  Any other source is refused with `InvalidExportSourceState`, and so is a snapshot that is not
+  `available`.
+- `SourceArn` must name a snapshot: exporting a live DB cluster (`SourceType` `CLUSTER`) is not
+  supported.
 
 ## Global clusters
 

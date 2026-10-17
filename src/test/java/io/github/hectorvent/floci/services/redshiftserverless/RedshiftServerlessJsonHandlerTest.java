@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.redshift.RedshiftIamDbUserResolver;
 import io.github.hectorvent.floci.services.redshift.TempCredential;
 import io.github.hectorvent.floci.services.redshift.model.Endpoint;
@@ -86,15 +87,22 @@ class RedshiftServerlessJsonHandlerTest {
         stubAdministrationStores(storageFactory);
         RedshiftServerlessService service =
                 new RedshiftServerlessService(storageFactory, regionResolver, endpoints, runtime, config);
+        AcmService acmService = mock(AcmService.class);
+        RedshiftServerlessCustomDomainService customDomains =
+                new RedshiftServerlessCustomDomainService(storageFactory, service, acmService);
         handler = new RedshiftServerlessJsonHandler(service, mapper, iamDbUserResolver,
                 new RedshiftServerlessUsageLimitService(storageFactory, regionResolver, service),
                 new RedshiftServerlessAdminJsonHandler(mapper,
-                        new RedshiftServerlessResourcePolicyService(storageFactory, service, mapper)));
+                        new RedshiftServerlessResourcePolicyService(storageFactory, service, mapper),
+                        new RedshiftServerlessEndpointAccessService(storageFactory, regionResolver, service),
+                        customDomains,
+                        new RedshiftServerlessSnapshotCopyService(storageFactory, regionResolver, service)),
+                customDomains);
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private static void stubAdministrationStores(StorageFactory storageFactory) {
-        for (String file : List.of("resourcepolicies")) {
+        for (String file : List.of("resourcepolicies", "endpointaccess", "customdomains", "snapshotcopyconfigurations")) {
             when(storageFactory.create(eq("redshiftserverless"), eq("redshiftserverless-" + file + ".json"),
                     any(TypeReference.class))).thenReturn((AccountAwareStorageBackend)
                     AccountAwareStorageBackend.inMemory(ACCOUNT_ID));

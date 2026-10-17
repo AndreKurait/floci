@@ -65,6 +65,12 @@ was started with `us-east-1`, so one process can serve several partitions at onc
 without a credential, and background work (pollers, schedulers, startup hooks), use the
 deployment's partition.
 
+JSON 1.1 service dispatch uses the region selected for the request, including a presigned
+`X-Amz-Credential` query scope when the request filter accepts it. An applicable
+`Authorization` header takes precedence over query credentials; requests without an admitted
+credential scope use the configured default region. Authorization and execution therefore use
+the same regional namespace.
+
 The scope region of a global service is its *signing* region, not a place to put regional
 resources: China IAM always signs `cn-north-1` even from Ningxia, GovCloud IAM signs
 `us-gov-west-1`. Floci uses it to pick the partition and nothing else. The

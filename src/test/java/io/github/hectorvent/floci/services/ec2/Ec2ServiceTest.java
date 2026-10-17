@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
+import io.github.hectorvent.floci.services.ec2.model.EgressOnlyInternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
@@ -69,6 +70,7 @@ import org.mockito.InOrder;
 
 import java.io.StringReader;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.security.interfaces.RSAPrivateCrtKey;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -803,16 +805,90 @@ class Ec2ServiceTest {
                 "tag-value", List.of("TeamA"));
 
         for (Map.Entry<String, List<String>> filter : supportedFilters.entrySet()) {
-            assertTrue(service.describeEgressOnlyInternetGatewayIds(
+            assertTrue(service.describeEgressOnlyInternetGateways("us-east-1", List.of(),
                     Map.of(filter.getKey(), filter.getValue())).isEmpty());
         }
 
         AwsException filterError = assertThrows(AwsException.class,
-                () -> service.describeEgressOnlyInternetGatewayIds(
+                () -> service.describeEgressOnlyInternetGateways("us-east-1", List.of(),
                         Map.of("unsupported", List.of("value"))));
         assertEquals("InvalidParameterValue", filterError.getErrorCode());
         assertEquals("The filter 'unsupported' is invalid", filterError.getMessage());
         assertEquals(400, filterError.getHttpStatus());
+    }
+
+    @Test
+    void egressOnlyInternetGatewayDeleteWaitsForTheLockTagWritesTake() throws Exception {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.43.0.0/16", false).getVpcId();
+        String eigwId = service.createEgressOnlyInternetGateway(region, vpcId, null, List.of())
+                .getEgressOnlyInternetGatewayId();
+        Method lockFor = Ec2Service.class.getDeclaredMethod("lockFor", String.class);
+        lockFor.setAccessible(true);
+        Object tagLock = lockFor.invoke(service, region + "::" + eigwId);
+        AtomicReference<Thread> deleter = new AtomicReference<>();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> deleting;
+            synchronized (tagLock) {
+                deleting = worker.submit(() -> {
+                    deleter.set(Thread.currentThread());
+                    service.deleteEgressOnlyInternetGateway(region, eigwId);
+                });
+                Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> deleting.isDone()
+                        || (deleter.get() != null && deleter.get().getState() == Thread.State.BLOCKED));
+                assertFalse(deleting.isDone(), "delete must take the gateway's tag lock");
+            }
+            deleting.get(5, TimeUnit.SECONDS);
+            assertTrue(service.describeEgressOnlyInternetGateways(region, List.of(eigwId), Map.of()).isEmpty());
+        } finally {
+            worker.shutdownNow();
+            assertTrue(worker.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void egressOnlyInternetGatewayIsCreatedDescribedAndDeleted() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.42.0.0/16", false).getVpcId();
+
+        AwsException noVpc = assertThrows(AwsException.class,
+                () -> service.createEgressOnlyInternetGateway(region, "vpc-00000000000000000", null, List.of()));
+        assertEquals("InvalidVpcID.NotFound", noVpc.getErrorCode());
+
+        String eigwId = service.createEgressOnlyInternetGateway(region, vpcId, null, List.of())
+                .getEgressOnlyInternetGatewayId();
+        assertTrue(eigwId.matches("eigw-[0-9a-f]{17}"), eigwId);
+        service.createTags(region, List.of(eigwId), List.of(new Tag("Owner", "TeamA")));
+
+        List<EgressOnlyInternetGateway> found = service.describeEgressOnlyInternetGateways(region, List.of(eigwId), Map.of());
+        assertEquals(1, found.size());
+        assertEquals(vpcId, found.getFirst().getAttachments().getFirst().getVpcId());
+        assertEquals("attached", found.getFirst().getAttachments().getFirst().getState());
+        assertEquals("TeamA", found.getFirst().getTags().getFirst().getValue());
+        assertEquals(1, service.describeEgressOnlyInternetGateways(region, List.of(),
+                Map.of("attachment.vpc-id", List.of(vpcId), "tag:Owner", List.of("TeamA"))).size());
+        assertTrue(service.describeEgressOnlyInternetGateways(region, List.of(),
+                Map.of("attachment.state", List.of("detached"))).isEmpty());
+        assertTrue(service.describeEgressOnlyInternetGateways("eu-west-1", List.of(eigwId), Map.of()).isEmpty());
+
+        AwsException vpcInUse = assertThrows(AwsException.class, () -> service.deleteVpc(region, vpcId));
+        assertEquals("DependencyViolation", vpcInUse.getErrorCode());
+
+        service.deleteEgressOnlyInternetGateway(region, eigwId);
+        assertTrue(service.describeEgressOnlyInternetGateways(region, List.of(eigwId), Map.of()).isEmpty());
+        AwsException gone = assertThrows(AwsException.class,
+                () -> service.deleteEgressOnlyInternetGateway(region, eigwId));
+        assertEquals("InvalidGatewayID.NotFound", gone.getErrorCode());
+        service.deleteVpc(region, vpcId);
     }
 
     @Test
@@ -3420,18 +3496,9 @@ class Ec2ServiceTest {
 
     @Test
     void runInstancesRejectsIncompatibleInstanceTypeForCreatedArmImage() {
-        Ec2ImageCatalog catalog = mock(Ec2ImageCatalog.class);
-        Ec2ImageCatalog.CatalogImage source = new Ec2ImageCatalog.CatalogImage();
-        source.imageId = "ami-arm-source";
-        source.architecture = "arm64";
-        source.rootDeviceName = "/dev/xvda";
-        when(catalog.findByIdOrAlias("ami-arm-source")).thenReturn(Optional.of(source));
-
         AmiImageResolver resolver = mock(AmiImageResolver.class);
-        when(resolver.resolveImage("ami-arm-source"))
-                .thenReturn(new ResolvedAmiImage("arm-image", ResolvedAmiImage.DEFAULT_RUNTIME, false,
-                        "linux/arm64"));
-        Ec2Service service = liveService(capturingContainerManager(), resolver, catalog);
+        Ec2Service service = serviceWithCatalogImage(resolver, "ami-arm-source", "arm64", "arm-image",
+                "linux/arm64");
         Reservation sourceReservation = service.runInstances("us-east-1", "ami-arm-source", "t4g.medium",
                 1, 1, null, List.of(), null, null, List.of(), null, null);
 
@@ -3449,6 +3516,35 @@ class Ec2ServiceTest {
         Reservation compatible = service.runInstances("us-east-1", createdAmi, "t4g.medium", 1, 1,
                 null, List.of(), null, null, List.of(), null, null);
         assertEquals("arm64", compatible.getInstances().getFirst().getArchitecture());
+    }
+
+    @Test
+    void runInstancesAcceptsI386ImageOnT2MediumAndRefusesItOnT2Large() {
+        Ec2Service service = serviceWithCatalogImage(mock(AmiImageResolver.class), "ami-i386", "i386",
+                "i386/alpine:3", "linux/386");
+
+        Reservation medium = service.runInstances("us-east-1", "ami-i386", "t2.medium", 1, 1,
+                null, List.of(), null, null, List.of(), null, null);
+        assertEquals("i386", medium.getInstances().getFirst().getArchitecture());
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.runInstances("us-east-1", "ami-i386", "t2.large", 1, 1,
+                        null, List.of(), null, null, List.of(), null, null));
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+    }
+
+    private Ec2Service serviceWithCatalogImage(AmiImageResolver resolver, String imageId, String architecture,
+                                               String dockerImage, String dockerPlatform) {
+        Ec2ImageCatalog catalog = mock(Ec2ImageCatalog.class);
+        Ec2ImageCatalog.CatalogImage source = new Ec2ImageCatalog.CatalogImage();
+        source.imageId = imageId;
+        source.architecture = architecture;
+        source.rootDeviceName = "/dev/xvda";
+        when(catalog.findByIdOrAlias(imageId)).thenReturn(Optional.of(source));
+        when(resolver.resolveImage(imageId))
+                .thenReturn(new ResolvedAmiImage(dockerImage, ResolvedAmiImage.DEFAULT_RUNTIME, false,
+                        dockerPlatform));
+        return liveService(capturingContainerManager(), resolver, catalog);
     }
 
     @Test

@@ -180,10 +180,8 @@ public class CognitoService implements ResourceProvider {
     private final TlsCertificateManager certificateManager;
     private final boolean enforceTokenValidityLimits;
     private final Object[] userLocks = newUserLockStripes();
-    // The userKey of each username an AdminCreateUser is creating, from before its existence check
-    // until it stores the user or fails, so an overlapping request for the same username is refused
-    // instead of invoking the PreSignUp trigger again. Only the request that adds a key removes it.
-    private final Set<String> adminCreatesInFlight = ConcurrentHashMap.newKeySet();
+    // Reserve names per account through registration callbacks, without blocking their admin requests.
+    private final Set<String> userCreatesInFlight = ConcurrentHashMap.newKeySet();
 
     // Keyed by session token; contains SRP ephemeral state (bPrivate, B, A, secretBlock)
     private final CognitoAuthFlowHandler authFlowHandler;
@@ -2187,8 +2185,8 @@ public class CognitoService implements ResourceProvider {
         // Claimed before the username is checked, so an overlapping request for it is refused here
         // rather than passing the check while this one is in its trigger and invoking the trigger
         // again. That includes a function calling back for the username it was given.
-        String inFlightKey = userKey(userPoolId, username);
-        if (!adminCreatesInFlight.add(inFlightKey)) {
+        String inFlightKey = regionResolver.getAccountId() + "::" + userKey(userPoolId, username);
+        if (!userCreatesInFlight.add(inFlightKey)) {
             throw new AwsException("UsernameExistsException", "User already exists", 400);
         }
         try {
@@ -2207,7 +2205,7 @@ public class CognitoService implements ResourceProvider {
                         invitation);
             }
         } finally {
-            adminCreatesInFlight.remove(inFlightKey);
+            userCreatesInFlight.remove(inFlightKey);
         }
     }
 
@@ -2628,6 +2626,10 @@ public class CognitoService implements ResourceProvider {
 
     private void adminDeleteUserUnderUserLock(String userPoolId, String username) {
         CognitoUser user = adminGetUser(userPoolId, username);
+        deleteUserRecordAndGroups(userPoolId, user);
+    }
+
+    private void deleteUserRecordAndGroups(String userPoolId, CognitoUser user) {
         for (String groupName : new ArrayList<>(user.getGroupNames())) {
             groupStore.get(groupKey(userPoolId, groupName)).ifPresent(group -> {
                 group.removeUserName(user.getUsername());
@@ -3285,16 +3287,21 @@ public class CognitoService implements ResourceProvider {
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found",
                         400));
         String userPoolId = client.getUserPoolId();
-        // Locked on the requested username/alias, same reasoning as adminCreateUser: an alias
-        // pool has no canonical id to lock on until creation succeeds.
-        synchronized (userLock(userPoolId, username)) {
-            return signUpUnderUserLock(client, userPoolId, username, password, attributes);
+        String inFlightKey = regionResolver.getAccountId() + "::" + userKey(userPoolId, username);
+        if (!userCreatesInFlight.add(inFlightKey)) {
+            throw new AwsException("UsernameExistsException", "User already exists", 400);
+        }
+        try {
+            return signUpWithReservedUsername(client, userPoolId, username, password, attributes);
+        } finally {
+            userCreatesInFlight.remove(inFlightKey);
         }
     }
 
-    private CognitoUser signUpUnderUserLock(UserPoolClient client, String userPoolId,
+    private CognitoUser signUpWithReservedUsername(UserPoolClient client, String userPoolId,
             String username, String password, Map<String, String> attributes) {
         UserPool pool = describeUserPool(userPoolId);
+        requireAvailableSignUpUsername(pool, username);
 
         boolean aliasPool = usesAliasUsernames(pool);
         Map<String, String> resolvedAttributes = attributes == null
@@ -3302,14 +3309,9 @@ public class CognitoService implements ResourceProvider {
         String canonicalUsername = username;
         if (aliasPool) {
             String aliasAttribute = aliasAttributeForValue(pool, username);
-            if (findUserByAlias(userPoolId, aliasAttribute, username) != null) {
-                throw new AwsException("UsernameExistsException", "User already exists", 400);
-            }
             resolvedAttributes.put(aliasAttribute, username);
             canonicalUsername = UUID.randomUUID().toString();
             resolvedAttributes.put("sub", canonicalUsername);
-        } else if (userStore.get(userKey(userPoolId, username)).isPresent()) {
-            throw new AwsException("UsernameExistsException", "User already exists", 400);
         }
 
         validateEmailAttribute(resolvedAttributes, false);
@@ -3328,7 +3330,7 @@ public class CognitoService implements ResourceProvider {
             user.getAttributes().put("sub", UUID.randomUUID().toString());
         }
 
-        // Fire PreSignUp BEFORE persisting — allows the trigger to block signup
+        // Fire PreSignUp BEFORE persisting: allows the trigger to block signup
         // (via lambda error) or auto-confirm/auto-verify the user (via response).
         CognitoAuthFlowHandler.PreSignUpResponse preSignUp = authFlowHandler.firePreSignUp(
                 pool, client, user, Map.of(), Map.of(), "PreSignUp_SignUp");
@@ -3354,7 +3356,16 @@ public class CognitoService implements ResourceProvider {
             }
         }
 
-        userStore.put(key, user);
+        // Capture trigger data before publishing the live, mutable user to admin requests.
+        CognitoUser triggerUser = MAPPER.convertValue(user, CognitoUser.class);
+        synchronized (userLock(userPoolId, username)) {
+            UserPool currentPool = describeUserPool(userPoolId);
+            if (clientStore.get(client.getClientId()).isEmpty()) {
+                throw new AwsException("ResourceNotFoundException", "Client not found", 400);
+            }
+            requireAvailableSignUpUsername(currentPool, username);
+            userStore.put(key, user);
+        }
         LOG.infov("Signed up user {0} in pool {1} (status={2})",
                 username, userPoolId, user.getUserStatus());
 
@@ -3363,14 +3374,14 @@ public class CognitoService implements ResourceProvider {
                 String code = verificationCodeService.issue(pool.getId(), user.getUsername(),
                         VerificationCode.Purpose.SIGNUP_CONFIRMATION, Duration.ofHours(24));
                 Map<String, Object> customMessage = authFlowHandler.fireCustomMessage(
-                        pool, client, user, "CustomMessage_SignUp");
-                messageDispatcher.dispatch(pool, user, VerificationCode.Purpose.SIGNUP_CONFIRMATION,
+                        pool, client, triggerUser, "CustomMessage_SignUp");
+                messageDispatcher.dispatch(pool, triggerUser, VerificationCode.Purpose.SIGNUP_CONFIRMATION,
                         code, List.of(deliveryTarget.deliveryMedium()), customMessage);
             } catch (VerificationCodeException e) {
-                rollbackSignUpConfirmationArtifacts(pool.getId(), user.getUsername(), key);
+                rollbackSignUpConfirmationArtifacts(user);
                 throw mapVerificationCodeException(e);
             } catch (RuntimeException e) {
-                rollbackSignUpConfirmationArtifacts(pool.getId(), user.getUsername(), key);
+                rollbackSignUpConfirmationArtifacts(user);
                 throw new AwsException("CodeDeliveryFailureException",
                         "Failed to deliver the message.", 400);
             }
@@ -3379,9 +3390,21 @@ public class CognitoService implements ResourceProvider {
         // When PreSignUp auto-confirms, AWS Cognito also fires PostConfirmation.
         // See: docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-sign-up.html
         if (preSignUp.autoConfirmUser()) {
-            authFlowHandler.firePostConfirmation(pool, client, user, Map.of(), "PostConfirmation_ConfirmSignUp");
+            authFlowHandler.firePostConfirmation(pool, client, triggerUser, Map.of(), "PostConfirmation_ConfirmSignUp");
         }
-        return user;
+        synchronized (userLock(userPoolId, user.getUsername())) {
+            triggerUser.setUserStatus(user.getUserStatus());
+        }
+        return triggerUser;
+    }
+
+    private void requireAvailableSignUpUsername(UserPool pool, String username) {
+        boolean exists = usesAliasUsernames(pool)
+                ? findUserByAlias(pool.getId(), aliasAttributeForValue(pool, username), username) != null
+                : userStore.get(userKey(pool.getId(), username)).isPresent();
+        if (exists) {
+            throw new AwsException("UsernameExistsException", "User already exists", 400);
+        }
     }
 
     public void confirmSignUp(String clientId, String username) {
@@ -3398,15 +3421,19 @@ public class CognitoService implements ResourceProvider {
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found",
                         400));
         String userPoolId = client.getUserPoolId();
-        synchronized (userLock(userPoolId, username)) {
-            confirmSignUpUnderUserLock(client, userPoolId, username, confirmationCode, clientMetadata);
+        CognitoUser resolvedUser = adminGetUser(userPoolId, username);
+        UserPool pool;
+        CognitoUser triggerUser;
+        synchronized (userLock(userPoolId, resolvedUser.getUsername())) {
+            pool = poolStore.get(userPoolId).orElseThrow(() -> userPoolNotFound(userPoolId));
+            triggerUser = confirmSignUpUnderUserLock(client, pool, resolvedUser.getUsername(), confirmationCode);
         }
+        authFlowHandler.firePostConfirmation(pool, client, triggerUser,
+                clientMetadata, "PostConfirmation_ConfirmSignUp");
     }
 
-    private void confirmSignUpUnderUserLock(UserPoolClient client, String userPoolId, String username,
-            String confirmationCode, Map<String, String> clientMetadata) {
-        UserPool pool = poolStore.get(userPoolId)
-                .orElseThrow(() -> userPoolNotFound(userPoolId));
+    private CognitoUser confirmSignUpUnderUserLock(UserPoolClient client, UserPool pool, String username,
+            String confirmationCode) {
         CognitoUser user = adminGetUser(client.getUserPoolId(), username);
         if (verificationCodeService != null && isSignUpConfirmationEnabled(pool)) {
             try {
@@ -3430,7 +3457,7 @@ public class CognitoService implements ResourceProvider {
         user.setUserStatus("CONFIRMED");
         user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
         userStore.put(userKey(client.getUserPoolId(), user.getUsername()), user);
-        authFlowHandler.firePostConfirmation(pool, client, user, clientMetadata, "PostConfirmation_ConfirmSignUp");
+        return MAPPER.convertValue(user, CognitoUser.class);
     }
 
     Map<String, String> signUpCodeDeliveryDetails(CognitoUser user) {
@@ -5958,12 +5985,22 @@ public class CognitoService implements ResourceProvider {
         return null;
     }
 
-    private void rollbackSignUpConfirmationArtifacts(String userPoolId, String username,
-            String userKey) {
-        userStore.delete(userKey);
-        if (verificationCodeService != null) {
-            verificationCodeService.invalidatePrevious(userPoolId, username,
-                    VerificationCode.Purpose.SIGNUP_CONFIRMATION);
+    private void rollbackSignUpConfirmationArtifacts(CognitoUser expectedUser) {
+        String poolId = expectedUser.getUserPoolId();
+        String username = expectedUser.getUsername();
+        synchronized (userLock(poolId, username)) {
+            CognitoUser current = userStore.get(userKey(poolId, username)).orElse(null);
+            // Admin callbacks can edit sub, so only the stored instance identifies this signup.
+            if (current != null && current != expectedUser) {
+                return;
+            }
+            if (current != null) {
+                deleteUserRecordAndGroups(poolId, current);
+            }
+            if (verificationCodeService != null) {
+                verificationCodeService.invalidatePrevious(poolId, username,
+                        VerificationCode.Purpose.SIGNUP_CONFIRMATION);
+            }
         }
     }
 

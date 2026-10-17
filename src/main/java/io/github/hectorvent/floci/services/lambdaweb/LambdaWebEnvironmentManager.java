@@ -1,11 +1,11 @@
 package io.github.hectorvent.floci.services.lambdaweb;
 
+import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.WaitContainerResultCallback;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Frame;
-import com.github.dockerjava.api.model.WaitResponse;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.RequestScopes;
@@ -18,6 +18,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
+import io.github.hectorvent.floci.core.common.docker.StreamingDocker;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageResolver;
@@ -86,6 +87,7 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
     private static final int LOG_TAIL_LINES = 20;
     private static final Duration LOG_TAIL_TIMEOUT = Duration.ofSeconds(2);
     private static final Duration EXIT_WATCH_REARM = Duration.ofSeconds(1);
+    private static final Duration EXIT_STATUS_TIMEOUT = Duration.ofSeconds(5);
 
     /**
      * One container of an endpoint's pool. It joins the pool before it starts, so requests that
@@ -106,7 +108,8 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
         private final AtomicInteger inFlight = new AtomicInteger();
         private final AtomicLong lastUsed = new AtomicLong(System.nanoTime());
         private final AtomicBoolean alive = new AtomicBoolean(true);
-        private final AtomicReference<Instant> exitedAt = new AtomicReference<>();
+        /** The {@link System#nanoTime()} at which Floci saw the process end. */
+        private final CompletableFuture<Long> exitSeen = new CompletableFuture<>();
 
         Environment(String poolKey, String revisionId, String accountId) {
             this.poolKey = poolKey;
@@ -147,6 +150,25 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
             inFlight.incrementAndGet();
             lastUsed.set(System.nanoTime());
         }
+
+        /**
+         * Whether Floci saw the process end before {@code nanoTime}. A request sent after that never
+         * reached the app, so it gets a fresh environment, as on AWS. Floci sees an exit tens of
+         * milliseconds after it happens. A request sent in between fails, so it never runs twice.
+         */
+        public boolean exitedBefore(long nanoTime) {
+            Long seen = exitSeen.getNow(null);
+            return seen != null && seen - nanoTime < 0;
+        }
+
+        /** Completes once Floci has seen the process end, or after {@code limit} while it still runs. */
+        public CompletableFuture<Void> awaitExit(Duration limit) {
+            return exitSeen.copy().orTimeout(limit.toNanos(), TimeUnit.NANOSECONDS).handle((seen, timedOut) -> null);
+        }
+
+        void sawExit(long nanoTime) {
+            exitSeen.complete(nanoTime);
+        }
     }
 
     /** The environment did not come up. {@code page} is what the endpoint answers. */
@@ -173,6 +195,7 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
     private final EmulatorConfig config;
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
+    private final DockerClient streamingDocker;
     private final ImageResolver imageResolver;
     private final EcrRegistryManager ecrRegistryManager;
     private final S3Service s3Service;
@@ -189,13 +212,15 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
 
     @Inject
     public LambdaWebEnvironmentManager(EmulatorConfig config, ContainerBuilder containerBuilder,
-                                       ContainerLifecycleManager lifecycleManager, ImageResolver imageResolver,
+                                       ContainerLifecycleManager lifecycleManager,
+                                       @StreamingDocker DockerClient streamingDocker, ImageResolver imageResolver,
                                        EcrRegistryManager ecrRegistryManager, S3Service s3Service,
                                        ZipExtractor zipExtractor, LaunchedContainerAwsEnv awsEnv,
                                        LambdaExecutionRoleCredentials executionRoleCredentials) {
         this.config = config;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
+        this.streamingDocker = streamingDocker;
         this.imageResolver = imageResolver;
         this.ecrRegistryManager = ecrRegistryManager;
         this.s3Service = s3Service;
@@ -342,25 +367,17 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
         }
     }
 
-    /**
-     * Whether the process had already exited when a request that found it dead was sent. Such a
-     * request gets a fresh environment, as on AWS, while a process that dies under a request fails it.
-     * A container that is already gone answers no: nothing proves the exit came first.
-     */
-    public boolean exitedBefore(Environment environment, Instant moment) {
-        Instant exited = environment.exitedAt.get();
-        if (exited == null) {
-            exited = finishedAt(environment.containerId).orElse(null);
-            if (exited != null) {
-                environment.exitedAt.compareAndSet(null, exited);
-            }
-        }
-        return exited != null && exited.isBefore(moment);
-    }
-
     @Override
     public void stopManagedContainers() {
         allEnvironments().forEach(this::discard);
+    }
+
+    /** The live environment that writes {@code logStream}, the one a response names. */
+    Environment environmentOf(String logStream) {
+        return allEnvironments().stream()
+                .filter(each -> logStream.equals(each.logStream))
+                .findFirst()
+                .orElseThrow();
     }
 
     private List<Environment> allEnvironments() {
@@ -612,31 +629,32 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
         });
     }
 
-    private Optional<Instant> finishedAt(String containerId) {
+    private Integer exitStatus(String containerId) {
         try {
-            return stoppedState(containerId).map(state -> {
-                String finishedAt = state.getFinishedAt();
-                return finishedAt == null || finishedAt.startsWith("0001") ? Instant.now() : Instant.parse(finishedAt);
-            });
+            return lifecycleManager.getDockerClient().waitContainerCmd(containerId)
+                    .exec(new WaitContainerResultCallback())
+                    .awaitStatusCode(EXIT_STATUS_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         } catch (RuntimeException e) {
-            LOG.debugv(e, "Could not inspect the Lambda Web environment {0}", containerId);
-            return Optional.empty();
+            LOG.debugv(e, "Could not read the exit status of the Lambda Web environment {0}", containerId);
+            return null;
         }
     }
 
     /**
      * A process that exits between requests is invisible to clients: the next request starts anew.
-     * The wait stream can drop on a quiet container, so a dropped watch looks at the container and
-     * arms itself again while the environment lives.
+     * The attach stream ends when the process exits, and Floci times that on its own clock. The exit
+     * time Docker records comes from the daemon's clock, which can be seconds off. The output is
+     * dropped here. A reader that falls behind would block the app's writes.
      */
     private void watchExit(Environment environment) {
         try {
-            lifecycleManager.getDockerClient().waitContainerCmd(environment.containerId)
-                    .exec(new WaitContainerResultCallback() {
+            streamingDocker.attachContainerCmd(environment.containerId)
+                    .withStdOut(true).withStdErr(true).withFollowStream(true)
+                    .exec(new ResultCallback.Adapter<Frame>() {
                         @Override
-                        public void onNext(WaitResponse response) {
-                            super.onNext(response);
-                            exited(environment, response.getStatusCode());
+                        public void onComplete() {
+                            super.onComplete();
+                            exited(environment, System.nanoTime());
                         }
 
                         @Override
@@ -668,24 +686,29 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
                 stopped = Optional.empty();
             }
             if (stopped.isPresent()) {
-                exited(environment, stopped.get().getExitCodeLong() == null
-                        ? null : stopped.get().getExitCodeLong().intValue());
+                exited(environment, System.nanoTime());
                 return;
             }
             watchExit(environment);
         }, EXIT_WATCH_REARM.toMillis(), TimeUnit.MILLISECONDS);
     }
 
-    private void exited(Environment environment, Integer statusCode) {
-        if (!environment.alive.compareAndSet(true, false)) {
+    /** The environment leaves the pool before waiters hear of the exit, so the request after a failed one starts anew. */
+    private void exited(Environment environment, long seenAt) {
+        boolean running = environment.alive.compareAndSet(true, false);
+        if (running) {
+            removeFromPool(environment);
+        }
+        environment.sawExit(seenAt);
+        if (!running) {
             return;
         }
-        environment.exitedAt.compareAndSet(null, finishedAt(environment.containerId).orElse(Instant.now()));
-        removeFromPool(environment);
-        reaper.execute(() -> {
+        // Docker can take seconds to report the status under load. The reaper stays free to rearm dropped watches.
+        Thread.ofVirtual().name("lambda-web-exit").start(() -> {
             try {
                 LOG.infov("The Lambda Web environment {0} exited with status {1}: {2}",
-                        environment.containerId, statusCode, lastLogLines(environment.containerId));
+                        environment.containerId, exitStatus(environment.containerId),
+                        lastLogLines(environment.containerId));
                 lifecycleManager.stopAndRemove(environment.containerId, null, 0);
             } finally {
                 forgetCredentials(environment);

@@ -14,6 +14,10 @@ import java.util.Map;
  * {@code aws/sesv2-request-shapes.json}, generated from botocore's SES v2 model by
  * {@code tools/aws/regen_sesv2_shapes.py}.
  *
+ * <p>An operation calls this when its body nests a structure in a structure or holds a list of
+ * structures, where member-by-member checks drift apart. A flat body, a {@code Tags}-only body and
+ * a list operation's map {@code Filter} keep the {@link SesV2Json} member helpers.
+ *
  * <p>AWS reads the body in order and reports the first bad member, without naming it. A JSON null
  * counts as an absent member, a null list element is left to the operation's own validation, and
  * a member the model does not know is ignored. A map container answers like a structure, as the

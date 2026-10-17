@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.s3;
 
 import io.quarkus.test.junit.QuarkusTest;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -24,6 +25,9 @@ class S3OwnershipControlsIntegrationTest {
     private static final String SCHEMA_MESSAGE =
             "The XML you provided was not well-formed or did not validate against our published schema.";
 
+    @Inject
+    S3Service s3Service;
+
     @Test
     @Order(1)
     void createBucket() {
@@ -36,13 +40,136 @@ class S3OwnershipControlsIntegrationTest {
 
     @Test
     @Order(2)
-    void getOwnershipControlsBeforePutReturns404() {
+    void newBucketDefaultsToEnforcedOwnershipAndRejectsAclWrites() {
+        String bucket = BUCKET + "-default";
+        given().when().put("/" + bucket).then().statusCode(200);
+
         given()
         .when()
-            .get("/" + BUCKET + "?ownershipControls")
+            .get("/" + bucket + "?ownershipControls")
         .then()
-            .statusCode(404)
-            .body(containsString("OwnershipControlsNotFoundError"));
+            .statusCode(200)
+            .body(containsString("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"));
+
+        given()
+            .header("x-amz-acl", "public-read")
+        .when()
+            .put("/" + bucket + "?acl")
+        .then()
+            .statusCode(400)
+            .body(containsString("AccessControlListNotSupported"));
+    }
+
+    @Test
+    @Order(2)
+    void createBucketHonorsExplicitOwnershipAndRejectsIncompatibleAcl() {
+        String legacyBucket = BUCKET + "-explicit-writer";
+        given()
+            .header("x-amz-object-ownership", "ObjectWriter")
+        .when()
+            .put("/" + legacyBucket)
+        .then()
+            .statusCode(200);
+
+        given().when().get("/" + legacyBucket + "?ownershipControls")
+                .then().statusCode(200).body(containsString("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
+        String grantedBucket = BUCKET + "-explicit-grant";
+        given().header("x-amz-object-ownership", "ObjectWriter")
+                .header("x-amz-grant-read", "id=\"123456789012\"")
+                .when().put("/" + grantedBucket)
+                .then().statusCode(200);
+        given().when().get("/" + grantedBucket + "?acl")
+                .then().statusCode(200).body(containsString("123456789012"));
+        given().header("x-amz-acl", "public-read")
+                .when().put("/" + BUCKET + "-invalid-acl")
+                .then().statusCode(400).body(containsString("InvalidBucketAclWithObjectOwnership"));
+        given().header("x-amz-grant-read", "id=\"123456789012\"")
+                .when().put("/" + BUCKET + "-invalid-grant")
+                .then().statusCode(400).body(containsString("InvalidBucketAclWithObjectOwnership"));
+        given().header("x-amz-object-ownership", "InvalidOwnership")
+                .when().put("/" + BUCKET + "-invalid-mode")
+                .then().statusCode(400).body(containsString("InvalidArgument"));
+    }
+
+    @Test
+    @Order(2)
+    void createBucketAcceptsCannedAclsAndRejectsConflictingGrants() {
+        for (String cannedAcl : new String[] {
+                "log-delivery-write", "aws-exec-read", "bucket-owner-read", "bucket-owner-full-control"}) {
+            given().header("x-amz-object-ownership", "ObjectWriter")
+                    .header("x-amz-acl", cannedAcl)
+                    .when().put("/" + BUCKET + "-canned-" + cannedAcl)
+                    .then().statusCode(200);
+        }
+        given().header("x-amz-object-ownership", "ObjectWriter")
+                .header("x-amz-acl", "private")
+                .header("x-amz-grant-read", "id=\"123456789012\"")
+                .when().put("/" + BUCKET + "-conflicting-acl")
+                .then().statusCode(400)
+                .body(containsString("<Code>InvalidRequest</Code>"))
+                .body(containsString("Specifying both Canned ACLs and Header Grants is not allowed"));
+    }
+
+    @Test
+    @Order(2)
+    void createBucketRejectsPublicAclRegardlessOfAccountBlockSetting() {
+        given().header("x-amz-object-ownership", "ObjectWriter")
+                .header("x-amz-acl", "public-read")
+                .when().put("/" + BUCKET + "-public-unblocked")
+                .then().statusCode(400)
+                .body(containsString("<Code>InvalidBucketAclWithBlockPublicAccessError</Code>"));
+
+        s3Service.putAccountPublicAccessBlock("000000000000", """
+                <PublicAccessBlockConfiguration>
+                    <BlockPublicAcls>true</BlockPublicAcls>
+                </PublicAccessBlockConfiguration>
+                """);
+        try {
+            given().header("x-amz-object-ownership", "ObjectWriter")
+                    .header("x-amz-acl", "public-read")
+                    .when().put("/" + BUCKET + "-public-blocked")
+                    .then().statusCode(400)
+                    .body(containsString("<Code>InvalidBucketAclWithBlockPublicAccessError</Code>"));
+        } finally {
+            s3Service.deleteAccountPublicAccessBlock("000000000000");
+        }
+    }
+
+    @Test
+    @Order(2)
+    void multipartInitiationRejectsGrantsOnEnforcedBucket() {
+        String bucket = BUCKET + "-multipart-grants";
+        given().when().put("/" + bucket).then().statusCode(200);
+
+        given().header("x-amz-grant-read", "id=\"123456789012\"")
+                .when().post("/" + bucket + "/rejected?uploads")
+                .then().statusCode(400).body(containsString("AccessControlListNotSupported"));
+        given().header("x-amz-grant-full-control", "id=\"000000000000\"")
+                .when().post("/" + bucket + "/accepted?uploads")
+                .then().statusCode(200).body(containsString("<UploadId>"));
+    }
+
+    @Test
+    @Order(2)
+    void multipartGrantSurvivesCompletionOnObjectWriterBucket() {
+        String bucket = BUCKET + "-multipart-writer";
+        String key = "granted-object";
+        given().header("x-amz-object-ownership", "ObjectWriter")
+                .when().put("/" + bucket).then().statusCode(200);
+        String uploadId = given().header("x-amz-grant-read", "id=\"123456789012\"")
+                .when().post("/" + bucket + "/" + key + "?uploads")
+                .then().statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        String partETag = given().body("part-one")
+                .when().put("/" + bucket + "/" + key + "?uploadId=" + uploadId + "&partNumber=1")
+                .then().statusCode(200).extract().header("ETag");
+        String completeXml = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"
+                + partETag + "</ETag></Part></CompleteMultipartUpload>";
+        given().contentType("application/xml").body(completeXml)
+                .when().post("/" + bucket + "/" + key + "?uploadId=" + uploadId)
+                .then().statusCode(200);
+        given().when().get("/" + bucket + "/" + key + "?acl")
+                .then().statusCode(200).body(containsString("123456789012"));
     }
 
     @Test
@@ -167,6 +294,14 @@ class S3OwnershipControlsIntegrationTest {
             .body(containsString("AccessControlListNotSupported"));
 
         given()
+            .header("x-amz-grant-read", "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"")
+        .when()
+            .post("/" + BUCKET + "/rejected-multipart-grant?uploads")
+        .then()
+            .statusCode(400)
+            .body(containsString("AccessControlListNotSupported"));
+
+        given()
             .body("new object")
         .when()
             .put("/" + BUCKET + "/no-acl-object")
@@ -219,11 +354,14 @@ class S3OwnershipControlsIntegrationTest {
         String enforced = OWNERSHIP_CONTROLS_XML.replace("BucketOwnerPreferred", "BucketOwnerEnforced");
 
         given().when().put("/" + bucket).then().statusCode(200);
+        given().body(OWNERSHIP_CONTROLS_XML.replace("BucketOwnerPreferred", "ObjectWriter"))
+                .when().put("/" + bucket + "?ownershipControls").then().statusCode(200);
         given().body(acl).when().put("/" + bucket + "?acl").then().statusCode(200);
         given().body(enforced).when().put("/" + bucket + "?ownershipControls")
                 .then().statusCode(400).body(containsString("InvalidBucketAclWithObjectOwnership"));
         given().when().get("/" + bucket + "?ownershipControls")
-                .then().statusCode(404);
+                .then().statusCode(200)
+                .body(containsString("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
 
         given().header("x-amz-acl", "private").when().put("/" + bucket + "?acl")
                 .then().statusCode(200);

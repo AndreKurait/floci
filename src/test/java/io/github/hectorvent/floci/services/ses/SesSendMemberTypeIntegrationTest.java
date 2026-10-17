@@ -6,8 +6,13 @@ import org.junit.jupiter.api.Test;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
-import static io.restassured.RestAssured.given;
-import static org.hamcrest.Matchers.equalTo;
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.EXPECTED_LIST;
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.EXPECTED_NULL;
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.LIST;
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.NUMBER;
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.STRUCTURE;
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.assertError;
+import static io.github.hectorvent.floci.services.ses.SesV2SerializationErrors.assertSerializationException;
 
 /**
  * A v2 send member of the wrong JSON type fails deserialization on AWS with a
@@ -18,8 +23,6 @@ import static org.hamcrest.Matchers.equalTo;
 @QuarkusTest
 class SesSendMemberTypeIntegrationTest {
 
-    private static final String AUTH =
-            "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request";
     private static final String TO = "success@simulator.amazonses.com";
     private static final String SEND = "/v2/email/outbound-emails";
     private static final String BULK = "/v2/email/outbound-bulk-emails";
@@ -28,27 +31,6 @@ class SesSendMemberTypeIntegrationTest {
             "{\"Simple\": {\"Subject\": {\"Data\": \"s\"}, \"Body\": {\"Text\": {\"Data\": \"b\"}}}}";
     private static final String INLINE_TEMPLATE =
             "{\"Template\": {\"TemplateContent\": {\"Subject\": \"s\", \"Text\": \"b\"}, \"TemplateData\": \"{}\"}}";
-    private static final String STRUCTURE = "Start of structure or map found where not expected.";
-    private static final String LIST = "Start of list found where not expected";
-    private static final String NUMBER = "NUMBER_VALUE can not be converted to a String";
-    private static final String EXPECTED_LIST = "Expected list or null";
-
-    private static void assertError(String path, String body, String type, String message) {
-        given()
-            .contentType("application/json")
-            .header("Authorization", AUTH)
-            .body(body)
-        .when()
-            .post(path)
-        .then()
-            .statusCode(400)
-            .body("__type", equalTo(type))
-            .body("message", equalTo(message));
-    }
-
-    private static void assertSerializationException(String path, String body, String message) {
-        assertError(path, body, "SerializationException", message);
-    }
 
     private static String send(String members, String content) {
         return "{" + members + "\"Content\": " + content + "}";
@@ -66,39 +48,39 @@ class SesSendMemberTypeIntegrationTest {
 
     @Test
     void v2SendEmail_objectFromEmailAddress_isNotReadAsAbsent() {
-        assertSerializationException(SEND, send("\"FromEmailAddress\": {},",
+        assertSerializationException("POST", SEND, send("\"FromEmailAddress\": {},",
                 "{\"Raw\": {\"Data\": \"" + rawData() + "\"}}"), STRUCTURE);
     }
 
     @Test
     void v2SendEmail_numericConfigurationSetName_returnsSerializationException() {
-        assertSerializationException(SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
+        assertSerializationException("POST", SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
                 + "\"Destination\": {\"ToAddresses\": [\"" + TO + "\"]}, \"ConfigurationSetName\": 123,", SIMPLE),
                 NUMBER);
     }
 
     @Test
     void v2SendEmail_numericRawData_namesTheBlobType() {
-        assertSerializationException(SEND, send("\"FromEmailAddress\": \"sender@example.com\",",
+        assertSerializationException("POST", SEND, send("\"FromEmailAddress\": \"sender@example.com\",",
                 "{\"Raw\": {\"Data\": 123}}"), "NUMBER_VALUE can not be converted to a Blob");
     }
 
     @Test
     void v2SendEmail_simpleContentTypeErrorPrecedesMissingSender() {
-        assertSerializationException(SEND, send("\"Destination\": {\"ToAddresses\": [\"" + TO + "\"]},",
+        assertSerializationException("POST", SEND, send("\"Destination\": {\"ToAddresses\": [\"" + TO + "\"]},",
                 "{\"Simple\": {\"Subject\": {\"Data\": 123}, \"Body\": {\"Text\": {\"Data\": \"b\"}}}}"), NUMBER);
     }
 
     @Test
     void v2SendEmail_stringSubject_returnsExpectedNull() {
-        assertSerializationException(SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
+        assertSerializationException("POST", SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
                 + "\"Destination\": {\"ToAddresses\": [\"" + TO + "\"]},",
-                "{\"Simple\": {\"Subject\": \"s\", \"Body\": {\"Text\": {\"Data\": \"b\"}}}}"), "Expected null");
+                "{\"Simple\": {\"Subject\": \"s\", \"Body\": {\"Text\": {\"Data\": \"b\"}}}}"), EXPECTED_NULL);
     }
 
     @Test
     void v2SendEmail_stringHeaders_returnsExpectedList() {
-        assertSerializationException(SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
+        assertSerializationException("POST", SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
                 + "\"Destination\": {\"ToAddresses\": [\"" + TO + "\"]},",
                 "{\"Simple\": {\"Subject\": {\"Data\": \"s\"}, \"Body\": {\"Text\": {\"Data\": \"b\"}}, "
                         + "\"Headers\": \"X-A: b\"}}"), EXPECTED_LIST);
@@ -106,83 +88,83 @@ class SesSendMemberTypeIntegrationTest {
 
     @Test
     void v2SendEmail_templateNameTypeErrorPrecedesMissingSender() {
-        assertSerializationException(SEND, send("\"Destination\": {\"ToAddresses\": [\"" + TO + "\"]},",
+        assertSerializationException("POST", SEND, send("\"Destination\": {\"ToAddresses\": [\"" + TO + "\"]},",
                 "{\"Template\": {\"TemplateName\": 123, \"TemplateData\": \"{}\"}}"), NUMBER);
     }
 
     @Test
     void v2SendEmail_stringDestination_returnsExpectedNull() {
-        assertSerializationException(SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
-                + "\"Destination\": \"" + TO + "\",", SIMPLE), "Expected null");
+        assertSerializationException("POST", SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
+                + "\"Destination\": \"" + TO + "\",", SIMPLE), EXPECTED_NULL);
     }
 
     @Test
     void v2SendEmail_arrayDestination_returnsStartOfList() {
-        assertSerializationException(SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
+        assertSerializationException("POST", SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
                 + "\"Destination\": [\"" + TO + "\"],", SIMPLE), LIST);
     }
 
     @Test
     void v2SendEmail_nonArrayReplyTo_returnsExpectedList() {
-        assertSerializationException(SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
+        assertSerializationException("POST", SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
                 + "\"Destination\": {\"ToAddresses\": [\"" + TO + "\"]}, "
                 + "\"ReplyToAddresses\": \"reply@example.com\",", SIMPLE), EXPECTED_LIST);
     }
 
     @Test
     void v2SendEmail_nullReplyToElement_isAnInvalidAddress() {
-        assertError(SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
+        assertError("POST", SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
                 + "\"Destination\": {\"ToAddresses\": [\"" + TO + "\"]}, \"ReplyToAddresses\": [null],", SIMPLE),
                 "BadRequestException", "Invalid email address null.");
     }
 
     @Test
     void v2SendEmail_nullAddressElementIsReportedAfterContentTypeErrors() {
-        assertSerializationException(SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
+        assertSerializationException("POST", SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
                 + "\"Destination\": {\"ToAddresses\": [\"" + TO + "\"]}, \"ReplyToAddresses\": [null],",
                 "{\"Simple\": {\"Subject\": {\"Data\": 123}, \"Body\": {\"Text\": {\"Data\": \"b\"}}}}"), NUMBER);
     }
 
     @Test
     void v2SendEmail_contentTypeErrorPrecedesEmailTagValidation() {
-        assertSerializationException(SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
+        assertSerializationException("POST", SEND, send("\"FromEmailAddress\": \"sender@example.com\", "
                 + "\"EmailTags\": [{\"Name\": \"\", \"Value\": \"v\"}],",
                 "{\"Raw\": {\"Data\": 123}}"), "NUMBER_VALUE can not be converted to a Blob");
     }
 
     @Test
     void v2SendBulkEmail_replyToTypeErrorPrecedesMissingSender() {
-        assertSerializationException(BULK, bulkSend("\"ReplyToAddresses\": \"reply@example.com\",",
+        assertSerializationException("POST", BULK, bulkSend("\"ReplyToAddresses\": \"reply@example.com\",",
                 "{\"ToAddresses\": [\"" + TO + "\"]}"), EXPECTED_LIST);
     }
 
     @Test
     void v2SendBulkEmail_entryDestinationTypeErrorPrecedesMalformedSender() {
-        assertSerializationException(BULK, bulkSend("\"FromEmailAddress\": \"sender@\",",
+        assertSerializationException("POST", BULK, bulkSend("\"FromEmailAddress\": \"sender@\",",
                 "{\"ToAddresses\": [\"" + TO + "\"], \"CcAddresses\": \"bad-shape\"}"), EXPECTED_LIST);
     }
 
     @Test
     void v2SendBulkEmail_arrayEntryDestination_returnsStartOfList() {
-        assertSerializationException(BULK, bulkSend("\"FromEmailAddress\": \"sender@example.com\",",
+        assertSerializationException("POST", BULK, bulkSend("\"FromEmailAddress\": \"sender@example.com\",",
                 "[\"" + TO + "\"]"), LIST);
     }
 
     @Test
     void v2SendBulkEmail_numericFromEmailAddress_returnsSerializationException() {
-        assertSerializationException(BULK, bulkSend("\"FromEmailAddress\": 123,",
+        assertSerializationException("POST", BULK, bulkSend("\"FromEmailAddress\": 123,",
                 "{\"ToAddresses\": [\"" + TO + "\"]}"), NUMBER);
     }
 
     @Test
     void v2SendBulkEmail_nullReplyToElementIsReportedAfterEntryTypeErrors() {
-        assertSerializationException(BULK, bulkSend("\"FromEmailAddress\": \"sender@example.com\", "
+        assertSerializationException("POST", BULK, bulkSend("\"FromEmailAddress\": \"sender@example.com\", "
                 + "\"ReplyToAddresses\": [null],", "{\"ToAddresses\": [1]}"), NUMBER);
     }
 
     @Test
     void v2SendBulkEmail_entryReplacementTypeErrorPrecedesMissingStoredTemplate() {
-        assertSerializationException(BULK, """
+        assertSerializationException("POST", BULK, """
             {
                 "FromEmailAddress": "sender@example.com",
                 "DefaultContent": {"Template": {"TemplateName": "no-such-template", "TemplateData": "{}"}},
@@ -193,7 +175,7 @@ class SesSendMemberTypeIntegrationTest {
 
     @Test
     void v2SendBulkEmail_entryTypeErrorPrecedesMissingStoredTemplate() {
-        assertSerializationException(BULK, """
+        assertSerializationException("POST", BULK, """
             {
                 "FromEmailAddress": "sender@example.com",
                 "DefaultContent": {"Template": {"TemplateName": "no-such-template", "TemplateData": "{}"}},
@@ -204,6 +186,6 @@ class SesSendMemberTypeIntegrationTest {
 
     @Test
     void v2SendCustomVerificationEmail_numericEmailAddress_returnsSerializationException() {
-        assertSerializationException(VERIFY, "{\"EmailAddress\": 123, \"TemplateName\": \"t\"}", NUMBER);
+        assertSerializationException("POST", VERIFY, "{\"EmailAddress\": 123, \"TemplateName\": \"t\"}", NUMBER);
     }
 }

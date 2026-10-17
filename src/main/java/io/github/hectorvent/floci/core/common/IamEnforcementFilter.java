@@ -417,7 +417,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
         List<String> resources = resolveResourceArns(credentialScope,
                 "logs".equals(credentialScope)
-                        ? arnBuilder.buildLogStreamResources(action, ctx, region, accountId, requestPartition())
+                        ? arnBuilder.buildLogResources(action, ctx, region, accountId, requestPartition())
                         : arnBuilder.buildResources(credentialScope, ctx, region, accountId));
 
         Optional<PresignedScope> presignedScope = iamService.presignedScope(akid);
@@ -516,6 +516,25 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if (abortIfDenied(ctx, caller, principal, action, credentialScope, resources, targetContexts,
                 region, accountId, akid)) {
             return;
+        }
+
+        // Tagged group creation requires either tagging permission, using the same resolved
+        // caller (including session, boundary and SCP ceilings) as the primary operation.
+        if ("logs:CreateLogGroup".equals(action) && conditionContext != null
+                && !conditionContext.getOrDefault("aws:TagKeys", List.of()).isEmpty()) {
+            String groupResource = resources.getFirst();
+            String taggingResource = groupResource.substring(0, groupResource.length() - 2);
+            Map<String, List<String>> taggingContext = IamConditionContextResolver.withGlobalContext(
+                    conditionContext, taggingResource, region, accountId, accountId);
+            Map<String, List<String>> groupContext = IamConditionContextResolver.withGlobalContext(
+                    conditionContext, groupResource, region, accountId, accountId);
+            if (evaluator.evaluate(caller, null, "logs:TagResource", taggingResource, taggingContext) == Decision.DENY
+                    && evaluator.evaluate(caller, null, "logs:TagLogGroup", groupResource, groupContext) == Decision.DENY) {
+                LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}",
+                        akid, "logs:TagResource", taggingResource);
+                ctx.abortWith(accessDeniedForRequest("logs:TagResource", credentialScope, ctx, taggingResource));
+                return;
+            }
         }
 
         // A PutObject carrying If-Match compares against the object it replaces, and S3 authorizes

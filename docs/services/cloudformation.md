@@ -413,6 +413,40 @@ the same validation the Auto Scaling API applies. The resource schema requires
 enables all of them), and on `UpdateStack` the group's enabled metrics are
 set to exactly what the template lists. Removing the property leaves collection as it was.
 
+## Updates With Nothing to Change
+
+An `UpdateStack` that changes none of the stack's resources and outputs is refused with
+`ValidationError` `No updates are to be performed.` and changes nothing, as on AWS. What is compared
+is what CloudFormation compares (measured on AWS): of each active resource its `Type`, `Properties`,
+`Metadata`, `DeletionPolicy`, `UpdateReplacePolicy` and `UpdatePolicy`, and of each active output its
+`Value`, `Description` and `Export`, with whatever does not depend on a resource resolved first:
+parameters, mappings, conditions, pseudo parameters, and dynamic references, whose stored value is
+compared with the one the stack was deployed with. A literal written as `Fn::Join`, a parameter
+written as `Fn::Sub`, or an `Fn::If` whose other branch changed is therefore no change, while a used
+mapping value, a used `AWS::SSM::Parameter::Value` parameter whose stored value moved, or a dynamic
+reference whose value moved is. A `Ref` or `Fn::GetAtt` of a resource, `Fn::ImportValue` and
+`Fn::GetStackOutput` are compared as written. A new `Description`, template `Metadata` or `Rules`,
+an unused parameter, mapping or condition, a `DependsOn`, a `CreationPolicy`, or an output whose
+condition is false is not an update; tags that differ from the stack's are, and a template with a
+nested stack is always updated, since its child template is read again. The template is processed
+as CloudFormation processes it: `AWS::Include` fragments are read again and merged and the SAM
+transform is applied with the stack's parameter values. The same comparison decides which resources
+a change set modifies.
+
+What each dynamic reference resolved to is kept on the stack when an operation completes, as an
+HMAC-SHA256 under a random key of the stack's own, so no resolved value is stored. An update that
+fails and rolls back keeps the values of the last deployment. A stack set instance whose stack has
+nothing to change is left as it is and succeeds, and the change set that found it so is not kept.
+
+A `CreateChangeSet` for such an update is created `FAILED`, `UNAVAILABLE`, with `The submitted
+information didn't contain changes. Submit different information to create a change set.`, which is
+what the AWS CLI's `deploy` and the CDK read as "no changes".
+
+The CDK then deletes that change set, and before its next deploy deletes it again by name. A
+`DeleteChangeSet` for a change set the stack does not have succeeds, as on AWS, whatever the stack's
+status, named with its stack or by its ARN alone; a `StackName` that names no stack is still a
+`ValidationError`.
+
 ## Lambda Stack Updates
 
 `AWS::Lambda::Function` resources are reconciled during `UpdateStack` in the same shape as CloudFormation/CDK deployments:

@@ -91,4 +91,26 @@ public interface RepositorySidecarManager {
             String packageName) {
         throw new UnsupportedOperationException(format() + " packages cannot be deleted through this sidecar");
     }
+
+    /**
+     * Live readme/descriptive-text lookup for one package version, for a sidecar capable of
+     * answering this for a specific, possibly historical version after the fact. {@code empty()}
+     * by default: Verdaccio (npm) only ever exposes the most-recently-published version's readme,
+     * and pypiserver exposes none at all, so neither can implement this and {@code
+     * CodeArtifactService#getPackageVersionReadme} instead answers npm and pypi from a record
+     * captured at publish time ({@link CodeArtifactService#recordPublishedPackageVersionReadme}).
+     * {@code BagetterSidecarClient} overrides this: BaGetter keeps every version's own readme
+     * addressable by exact version for as long as that version exists, so nuget needs no such
+     * capture step.
+     *
+     * <p>Returning {@code empty()} here is read by the caller as "this sidecar cannot answer
+     * live", not "this version has no readme": an override distinguishes the two with {@code
+     * Optional.of("")} for a published version with nothing to show versus {@code empty()} for a
+     * version that was never published, the same convention {@link #fetchPackageVersionAsset}
+     * already uses for "found, but empty" versus "not found".
+     */
+    default Optional<String> fetchPackageVersionReadme(String repositoryContainerId, String domain, String repository,
+            String namespace, String packageName, String version) {
+        return Optional.empty();
+    }
 }

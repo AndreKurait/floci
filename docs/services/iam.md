@@ -1210,6 +1210,7 @@ When `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED` is active, Floci also queries regi
 - For detailed S3 bucket policy behavior and configuration, see [S3 Bucket Policy Enforcement](s3.md#bucket-policy-enforcement).
 - Lambda function policies, the statements `AddPermission` adds, take part the same way. An invoke of another account's function by ARN runs it in that account, so its function policy has to allow the caller as well; see [Function policies under IAM enforcement](lambda.md#function-policies-under-iam-enforcement).
 - SNS topic policies take part the same way for a request that names the topic in a JSON-protocol body; a topic with no policy set has the default one AWS gives a new topic. See [SNS](sns.md).
+- SQS queue and API Gateway REST API policies are stored but not evaluated.
 - A call an AWS service makes to another service's resource on its own behalf, such as SES publishing an event or a notification to an SNS topic, has no IAM principal, so the target's resource policy decides it alone and has to allow the calling service, through `{"Service": "<service>.amazonaws.com"}` or `{"AWS": "*"}`. A target with no policy refuses it. Its request context holds `aws:PrincipalIsAWSService` (`true`), `aws:PrincipalServiceName` and `aws:PrincipalServiceNamesList`, `aws:SourceArn` and `aws:SourceAccount` for the resource whose configuration triggered the call, `aws:ResourceAccount` and `aws:RequestedRegion`, and none of the keys that describe an IAM principal. A publish to an SNS topic from SES also carries `aws:SourceOwner`, the key the SNS Developer Guide lists SES among the services setting, which is what the default topic policy checks, so that policy admits SES acting for the topic owner's account and no other. SES is the one service checked this way so far; see [SES IAM enforcement](ses.md#iam-enforcement).
 
 ### Service control policies (SCPs)
@@ -1266,10 +1267,38 @@ These identities always bypass enforcement (backward-compatible defaults):
 specific log-stream ARN, so policies can allow or deny one stream within a group. Their
 `aws:ResourceTag/<key>` conditions read the owning log group's current tags in the request's
 account and region. Both stream operations check the documented group and stream name constraints
-before changing storage, preventing delimiter aliases from targeting another stream. Other Logs
-actions retain their existing wildcard resource evaluation.
+before changing storage, preventing delimiter aliases from targeting another stream.
 These checks also apply to deletion: legacy streams with names containing `:` or `*` cannot be
 deleted through `DeleteLogStream`. Existing stored names are not automatically migrated.
+
+**CloudWatch Logs groups.** `CreateLogGroup`, `DeleteLogGroup`, `PutRetentionPolicy` and
+`DeleteRetentionPolicy` accept policy resources naming the selected group with a bare ARN
+or its legacy `:*` form. Both forms participate in each statement, including explicit denies
+and `NotResource`, without bypassing session, boundary or SCP ceilings. The three operations on
+existing groups read that group's resource tags; creation uses the request's `tags` for
+`aws:RequestTag/<key>` and `aws:TagKeys`. Tagged creation additionally requires either
+`logs:TagResource` on the bare group ARN or `logs:TagLogGroup` on either group ARN form.
+The group name constraints apply before mutation, and deletion preserves streams and filters
+whose stored group identity belongs to another historical group. These four operations reject `:`
+or `*` in a group name. Historical names remain taggable through the ARN tagging APIs below;
+they cannot be newly created or deleted through the group lifecycle APIs. Stored names are not migrated.
+
+**CloudWatch Logs ARN tagging.** For log groups, `logs:TagResource`, `logs:UntagResource`
+and `logs:ListTagsForResource` evaluate the group's ARN without a trailing `:*`. The ARN must
+identify a group in the request's account, region and partition; a different owner or resource
+kind returns `ResourceNotFoundException` without reading or changing a local group's tags.
+All three actions use the group's existing `aws:ResourceTag/<key>` conditions. `TagResource`
+also provides `aws:RequestTag/<key>` and `aws:TagKeys`; `UntagResource` provides `aws:TagKeys`.
+An unauthorized request cannot partially add or remove tags. These ownership checks also apply
+when IAM enforcement is disabled. Shared tag mutations reject storage aliases whose stored group
+name differs from the requested name, without migrating historical records.
+
+This support covers log groups. Tagging destinations and other CloudWatch Logs resource types
+remains unsupported. Plain-name inputs are used literally, including incomplete prefixes such as
+`arn:archive`; arbitrary `:log-group:` substrings never select a different group. Structurally complete
+ARNs take precedence over plain-name interpretation and must identify a local group. A trailing `:*`
+is accepted on a canonical local group ARN. These compatibility forms are not a claim that AWS accepts
+them for these APIs. Other Logs actions retain their existing wildcard resource evaluation.
 
 **IAM's own resources are named.** When enforcement evaluates a request, the target resource comes
 from `ResourceArnBuilder`, which builds an ARN for S3, Lambda, SQS, SNS, DynamoDB, Kinesis, Secrets
@@ -1449,7 +1478,9 @@ floci populates:
   `ResourceId.N` or `InstanceId.N`), and for `s3:GetBucketTagging`, `s3:DeleteBucket` and the
   `s3:PutBucketTagging` that `DeleteBucketTagging` is checked as (the bucket). A request naming several EC2 resources is evaluated
   once per resource and denied when any of them fails the condition, as on AWS.
-  `logs:CreateLogStream` and `logs:DeleteLogStream` use the owning log group's tags.
+  `logs:CreateLogStream`, `logs:DeleteLogStream`, `logs:TagResource`, `logs:UntagResource`,
+  `logs:ListTagsForResource`, `logs:DeleteLogGroup`, `logs:PutRetentionPolicy` and
+  `logs:DeleteRetentionPolicy` use the owning log group's tags.
 - `s3:ExistingObjectTag/<key>`: the tags already on the target object version, for
   `s3:GetObject`, `s3:GetObjectTagging`, `s3:GetObjectAcl`, `s3:PutObjectAcl`,
   `s3:DeleteObjectTagging`, `s3:PutObjectTagging` and the annotation actions, and for their

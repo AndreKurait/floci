@@ -29,6 +29,7 @@ import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -64,6 +65,8 @@ public class LambdaWebDataPlane {
     private static final String BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     private static final int REQUEST_ID_LENGTH = 26;
     private static final DateTimeFormatter HTTP_DATE = DateTimeFormatter.RFC_1123_DATE_TIME.withZone(ZoneOffset.UTC);
+    /** Floci sees an exit some tens of milliseconds after it. A process that keeps running is not waited for longer. */
+    private static final Duration EXIT_WAIT = Duration.ofSeconds(1);
 
     private final LambdaWebService service;
     private final LambdaWebEnvironmentManager environments;
@@ -172,7 +175,7 @@ public class LambdaWebDataPlane {
      */
     private void forward(HttpServerRequest request, String host, WebFunctionTarget target,
                          WebFunctionRevision revision, Environment environment, String requestId, boolean firstTry) {
-        Instant started = Instant.now();
+        long started = System.nanoTime();
         Exchange exchange = new Exchange(request, environment);
         boolean hasBody = hasRequestBody(request);
         AtomicBoolean bodyIn = new AtomicBoolean(!hasBody);
@@ -235,18 +238,19 @@ public class LambdaWebDataPlane {
     /**
      * A process that exited before the request arrived is invisible to the client, which gets a
      * fresh environment, as on AWS. One that died under the request, or that cannot be retried
-     * because the body is spent, fails the request.
+     * because the body is spent, fails the request. The answer waits for Floci to see the exit, so
+     * the next request does not meet the dead environment.
      */
     private void failed(HttpServerRequest request, String host, WebFunctionTarget target,
-                        WebFunctionRevision revision, Exchange exchange, String requestId, Instant started,
+                        WebFunctionRevision revision, Exchange exchange, String requestId, long started,
                         boolean retry) {
         if (!exchange.finish()) {
             return;
         }
         Environment environment = exchange.environment;
-        vertx.<Boolean>executeBlocking(() -> environments.exitedBefore(environment, started), false)
-                .onComplete(exited -> {
-                    if (retry && exited.succeeded() && exited.result()) {
+        Future.fromCompletionStage(environment.awaitExit(EXIT_WAIT), vertx.getOrCreateContext())
+                .onComplete(ignored -> {
+                    if (retry && environment.exitedBefore(started)) {
                         acquire(request, host, target, revision, requestId, environment);
                         return;
                     }

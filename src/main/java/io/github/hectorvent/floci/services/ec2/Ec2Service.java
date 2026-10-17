@@ -25,6 +25,8 @@ import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.CapacityReservation;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
+import io.github.hectorvent.floci.services.ec2.model.EgressOnlyInternetGateway;
+import io.github.hectorvent.floci.services.ec2.model.EgressOnlyInternetGatewayListResult;
 import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
 import io.github.hectorvent.floci.services.ec2.model.Host;
 import io.github.hectorvent.floci.services.ec2.model.IamInstanceProfileAssociation;
@@ -277,6 +279,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final StorageBackend<String, List<Tag>> tags;
     private final StorageBackend<String, CapacityReservation> capacityReservations;
     private final StorageBackend<String, Host> hosts;
+    private final StorageBackend<String, EgressOnlyInternetGateway> egressOnlyInternetGateways;
     // Serialises a launch onto a host against ModifyHosts/ReleaseHosts, so a host cannot be
     // released between the launch's availability check and the store of its instance.
     private final Object hostLock = new Object();
@@ -517,7 +520,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 requestContextInstance, iamService, volumeBlockDeviceManager,
                 storageFactory.create("ec2", "ec2-hosts.json", new TypeReference<Map<String, Host>>() {}),
                 storageFactory.create("ec2", "ec2-transit-gateway-peering-attachments.json",
-                        new TypeReference<Map<String, TransitGatewayPeeringAttachment>>() {}));
+                        new TypeReference<Map<String, TransitGatewayPeeringAttachment>>() {}),
+                storageFactory.create("ec2", "ec2-egress-only-internet-gateways.json",
+                        new TypeReference<Map<String, EgressOnlyInternetGateway>>() {}));
     }
 
     // Package-private for hermetic tests (pass in-memory or temp-dir-backed StorageBackends directly).
@@ -725,11 +730,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 transitGatewayPropagations, transitGatewayRoutes, vpcPeeringConnections,
                 networkInterfaces, capacityReservations, volumeModifications,
                 requestContextInstance, iamService, volumeBlockDeviceManager, new InMemoryStorage<>(),
-                new InMemoryStorage<>());
+                new InMemoryStorage<>(), new InMemoryStorage<>());
     }
 
-    // The terminal constructor. Dedicated Hosts and transit gateway peering attachments ride on
-    // their own parameters so the shorter overloads above keep their arity for existing fixtures.
+    // The terminal constructor. Dedicated Hosts, transit gateway peering attachments and egress-only
+    // internet gateways ride on their own parameters so the shorter overloads above keep their
+    // arity for existing fixtures.
     Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
                Ec2PortForwardManager portForwardManager,
                AmiImageResolver amiImageResolver, Ec2ImageCatalog imageCatalog,
@@ -766,8 +772,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                IamService iamService,
                Ec2VolumeBlockDeviceManager volumeBlockDeviceManager,
                StorageBackend<String, Host> hosts,
-               StorageBackend<String, TransitGatewayPeeringAttachment> transitGatewayPeeringAttachments) {
+               StorageBackend<String, TransitGatewayPeeringAttachment> transitGatewayPeeringAttachments,
+               StorageBackend<String, EgressOnlyInternetGateway> egressOnlyInternetGateways) {
         this.hosts = hosts;
+        this.egressOnlyInternetGateways = egressOnlyInternetGateways;
         this.transitGatewayPeeringAttachments = transitGatewayPeeringAttachments;
         this.iamService = iamService;
         this.volumeBlockDeviceManager = volumeBlockDeviceManager;
@@ -4938,11 +4946,120 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return List.of();
     }
 
+    // ─── Egress-only Internet Gateways ─────────────────────────────────────────
+
+    // Created already attached: AWS has no attach/detach call for this gateway, the VPC is fixed at creation.
+    // ClientToken replays return the gateway the first call made, unchanged; a reused token with
+    // another VpcId or other creation tags fails with IdempotentParameterMismatch, as the EC2
+    // idempotency guide documents. Tags are applied here, with the gateway, so a replay never re-tags.
+    public EgressOnlyInternetGateway createEgressOnlyInternetGateway(String region, String vpcId,
+                                                                     String clientToken, List<Tag> tagList) {
+        ensureDefaultResources(region);
+        if (vpcId == null || vpcId.isBlank()) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter vpcId", 400);
+        }
+        String token = clientToken != null && !clientToken.isBlank() ? clientToken : null;
+        synchronized (attachmentTopologyLock(region)) {
+            if (token != null) {
+                for (EgressOnlyInternetGateway existing : egressOnlyInternetGateways.scan(
+                        k -> k.startsWith(region + "::"))) {
+                    if (token.equals(existing.getClientToken())) {
+                        if (!vpcId.equals(existing.getAttachments().get(0).getVpcId())
+                                || !tagMap(tagList).equals(tagMap(existing.getCreationTags()))) {
+                            throw new AwsException("IdempotentParameterMismatch",
+                                    "The client token '" + token + "' was already used with different parameters", 400);
+                        }
+                        return existing;
+                    }
+                }
+            }
+            getRequiredVpc(region, vpcId);
+            EgressOnlyInternetGateway eigw = new EgressOnlyInternetGateway();
+            eigw.setEgressOnlyInternetGatewayId("eigw-" + randomHex(17));
+            eigw.setRegion(region);
+            eigw.setClientToken(token);
+            eigw.getAttachments().add(new InternetGatewayAttachment(vpcId, "attached"));
+            eigw.setCreationTags(new ArrayList<>(tagList));
+            eigw.setTags(new ArrayList<>(tagList));
+            if (!tagList.isEmpty()) {
+                tags.put(eigw.getEgressOnlyInternetGatewayId(), new ArrayList<>(tagList));
+            }
+            egressOnlyInternetGateways.put(key(region, eigw.getEgressOnlyInternetGatewayId()), eigw);
+            return eigw;
+        }
+    }
+
     // AWS answers an unknown egress-only gateway ID with an empty set, not an error; callers such as
     // the Terraform provider treat the empty result as "not found".
-    public List<String> describeEgressOnlyInternetGatewayIds(Map<String, List<String>> filters) {
+    public List<EgressOnlyInternetGateway> describeEgressOnlyInternetGateways(String region, List<String> ids,
+                                                                             Map<String, List<String>> filters) {
         requireSupportedFilters(filters.keySet(), EGRESS_ONLY_INTERNET_GATEWAY_FILTERS);
-        return List.of();
+        return egressOnlyInternetGateways.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(eigw -> ids.isEmpty() || ids.contains(eigw.getEgressOnlyInternetGatewayId()))
+                .filter(eigw -> matchesFilters(eigw, filters, region))
+                .sorted(Comparator.comparing(EgressOnlyInternetGateway::getEgressOnlyInternetGatewayId))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * The paginated form. MaxResults is 5 to 255 in the EC2 model; null means the request left it
+     * out and gets every match in one page.
+     */
+    public EgressOnlyInternetGatewayListResult describeEgressOnlyInternetGateways(
+            String region, List<String> ids, Map<String, List<String>> filters, Integer maxResults,
+            String nextToken) {
+        if (maxResults != null && (maxResults < 5 || maxResults > 255)) {
+            throw new AwsException("InvalidMaxResults",
+                    "Value (" + maxResults + ") for parameter MaxResults is invalid. "
+                            + "Expecting a value between 5 and 255.", 400);
+        }
+        int offset = decodeToken(nextToken);
+        List<EgressOnlyInternetGateway> all = describeEgressOnlyInternetGateways(region, ids, filters);
+        int total = all.size();
+        int toIndex = maxResults != null ? Math.min(offset + maxResults, total) : total;
+        List<EgressOnlyInternetGateway> page = offset < total
+                ? new ArrayList<>(all.subList(offset, toIndex))
+                : new ArrayList<>();
+        return new EgressOnlyInternetGatewayListResult(page, toIndex < total ? encodeToken(toIndex) : null);
+    }
+
+    private static Map<String, String> tagMap(List<Tag> tagList) {
+        Map<String, String> map = new HashMap<>();
+        for (Tag tag : tagList == null ? List.<Tag>of() : tagList) {
+            map.put(tag.getKey(), tag.getValue());
+        }
+        return map;
+    }
+
+    // Under the gateway's resource lock, the one createSystemTags takes, so a concurrent tag write
+    // cannot put the gateway back after it is gone. A route that targeted the gateway stays in its
+    // table as a blackhole: AWS documents that state for a route whose target is no longer available.
+    public void deleteEgressOnlyInternetGateway(String region, String eigwId) {
+        synchronized (lockFor(key(region, eigwId))) {
+            if (egressOnlyInternetGateways.get(key(region, eigwId)).isEmpty()) {
+                throw new AwsException("InvalidGatewayID.NotFound",
+                        "The eigw ID '" + eigwId + "' does not exist", 400);
+            }
+            egressOnlyInternetGateways.delete(key(region, eigwId));
+            tags.delete(eigwId);
+        }
+        for (RouteTable table : routeTables.scan(k -> k.startsWith(region + "::"))) {
+            if (table.getRoutes().stream().noneMatch(r -> eigwId.equals(r.getEgressOnlyInternetGatewayId()))) {
+                continue;
+            }
+            synchronized (lockFor(key(region, table.getRouteTableId()))) {
+                RouteTable current = routeTables.get(key(region, table.getRouteTableId())).orElse(null);
+                if (current == null) {
+                    continue;
+                }
+                current.getRoutes().stream()
+                        .filter(r -> eigwId.equals(r.getEgressOnlyInternetGatewayId()))
+                        .forEach(r -> r.setState("blackhole"));
+                routeTables.put(key(region, current.getRouteTableId()), current);
+                notifyRouteTableUpdated(region, current);
+            }
+        }
     }
 
     private void requireSupportedFilters(Collection<String> filterNames, Set<String> supportedFilters) {
@@ -5001,6 +5118,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         .anyMatch(acl -> vpcId.equals(acl.getVpcId()) && !acl.isDefault())
                 || internetGateways.scan(k -> k.startsWith(region + "::")).stream()
                         .anyMatch(igw -> igw.getAttachments().stream()
+                                .anyMatch(attachment -> vpcId.equals(attachment.getVpcId())))
+                || egressOnlyInternetGateways.scan(k -> k.startsWith(region + "::")).stream()
+                        .anyMatch(eigw -> eigw.getAttachments().stream()
                                 .anyMatch(attachment -> vpcId.equals(attachment.getVpcId())))
                 || vpcEndpoints.scan(k -> k.startsWith(region + "::")).stream()
                         .anyMatch(endpoint -> vpcId.equals(endpoint.getVpcId()));
@@ -8661,6 +8781,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (sgRule != null) { sgRule.setTags(new ArrayList<>(tagList)); securityGroupRules.put(storeKey, sgRule); return; }
         InternetGateway igw = internetGateways.get(storeKey).orElse(null);
         if (igw != null) { igw.setTags(new ArrayList<>(tagList)); internetGateways.put(storeKey, igw); return; }
+        EgressOnlyInternetGateway eigw = egressOnlyInternetGateways.get(storeKey).orElse(null);
+        if (eigw != null) {
+            eigw.setTags(new ArrayList<>(tagList));
+            egressOnlyInternetGateways.put(storeKey, eigw);
+            return;
+        }
         RouteTable rt = routeTables.get(storeKey).orElse(null);
         if (rt != null) { rt.setTags(new ArrayList<>(tagList)); routeTables.put(storeKey, rt); return; }
         KeyPair kp = keyPairs.get(storeKey).orElse(null);
@@ -8801,6 +8927,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         if (resourceId.startsWith("igw-")) {
             return "internet-gateway";
+        }
+        if (resourceId.startsWith("eigw-")) {
+            return "egress-only-internet-gateway";
         }
         if (resourceId.startsWith("rtb-")) {
             return "route-table";
@@ -10853,6 +10982,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 default -> true;
             };
         }
+        if (resource instanceof EgressOnlyInternetGateway eigw) {
+            return switch (filterName) {
+                case "egress-only-internet-gateway-id" -> matchesValue(values, eigw.getEgressOnlyInternetGatewayId());
+                case "attachment.vpc-id" -> eigw.getAttachments().stream()
+                        .anyMatch(a -> matchesValue(values, a.getVpcId()));
+                case "attachment.state" -> eigw.getAttachments().stream()
+                        .anyMatch(a -> matchesValue(values, a.getState()));
+                default -> true;
+            };
+        }
         if (resource instanceof RouteTable rt) {
             return switch (filterName) {
                 case "route-table-id" -> matchesValue(values, rt.getRouteTableId());
@@ -11042,6 +11181,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (resource instanceof Subnet subnet) return subnet.getTags();
         if (resource instanceof SecurityGroup sg) return sg.getTags();
         if (resource instanceof InternetGateway igw) return igw.getTags();
+        if (resource instanceof EgressOnlyInternetGateway eigw) return eigw.getTags();
         if (resource instanceof RouteTable rt) return rt.getTags();
         if (resource instanceof KeyPair kp) return kp.getTags();
         if (resource instanceof Address addr) return addr.getTags();

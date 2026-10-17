@@ -84,7 +84,7 @@ The platform answers these cases itself, with the AWS HTML pages and `lambda-web
 | 429 | `Platform.EndpointRequestThrottle` | The requests exceed the endpoint's `rateLimit` |
 | 502 | `Application.TimeoutListenError`, `Application.InitCodeError`, `Runtime.Exit` | The server did not listen within 10 seconds, threw at import, or exited at start |
 | 503 | `Platform.EndpointDisabled` | The endpoint's `rateLimit` is 0 |
-| 503 | `Runtime.OriginRequestError` | The process died while handling the request |
+| 503 | `Runtime.OriginRequestError` | The process died while handling the request, or tens of milliseconds before it |
 | 504 | `Runtime.RequestTimeout` | No response within the revision's `timeoutSeconds` |
 | 505 | `Platform.UnsupportedHttpVersion` | HTTP/1.0 |
 

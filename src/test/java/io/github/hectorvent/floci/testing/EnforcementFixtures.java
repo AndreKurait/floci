@@ -111,7 +111,17 @@ public final class EnforcementFixtures {
      * the request has to be signed for real instead.
      */
     public static String auth(String accessKeyId, String service) {
-        return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260629/us-east-1/" + service
+        return auth(accessKeyId, "us-east-1", service);
+    }
+
+    /** A placeholder signature scoped to the caller's selected region and service. */
+    public static String auth(String accessKeyId, String region, String service) {
+        return auth(accessKeyId, "20260629", region, service);
+    }
+
+    /** A placeholder signature retaining the date selected by an existing request fixture. */
+    public static String auth(String accessKeyId, String date, String region, String service) {
+        return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/" + date + "/" + region + "/" + service
                 + "/aws4_request, SignedHeaders=host, Signature=abc";
     }
 

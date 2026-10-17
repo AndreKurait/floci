@@ -44,17 +44,20 @@ public class RedshiftServerlessJsonHandler {
     private final RedshiftIamDbUserResolver iamDbUserResolver;
     private final RedshiftServerlessUsageLimitService usageLimits;
     private final RedshiftServerlessAdminJsonHandler admin;
+    private final RedshiftServerlessCustomDomainService customDomains;
 
     @Inject
     public RedshiftServerlessJsonHandler(RedshiftServerlessService service, ObjectMapper objectMapper,
                                          RedshiftIamDbUserResolver iamDbUserResolver,
                                          RedshiftServerlessUsageLimitService usageLimits,
-                                         RedshiftServerlessAdminJsonHandler admin) {
+                                         RedshiftServerlessAdminJsonHandler admin,
+                                         RedshiftServerlessCustomDomainService customDomains) {
         this.service = service;
         this.objectMapper = objectMapper;
         this.iamDbUserResolver = iamDbUserResolver;
         this.usageLimits = usageLimits;
         this.admin = admin;
+        this.customDomains = customDomains;
     }
 
     public Response handle(String action, JsonNode request, String region) {
@@ -163,11 +166,11 @@ public class RedshiftServerlessJsonHandler {
                 parseWorkgroupSettings(request),
                 parseTagList(request.path("tags"), "tags"),
                 region);
-        return workgroupResponse(workgroup);
+        return workgroupResponse(workgroup, region);
     }
 
     private Response handleGetWorkgroup(JsonNode request, String region) {
-        return workgroupResponse(service.getWorkgroup(ServerlessSupport.text(request, "workgroupName"), region));
+        return workgroupResponse(service.getWorkgroup(ServerlessSupport.text(request, "workgroupName"), region), region);
     }
 
     private Response handleListWorkgroups(JsonNode request, String region) {
@@ -175,7 +178,7 @@ public class RedshiftServerlessJsonHandler {
                 region, ServerlessSupport.maxResults(request), ServerlessSupport.text(request, "nextToken"));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode items = response.putArray("workgroups");
-        page.items().forEach(workgroup -> items.add(workgroupNode(workgroup)));
+        page.items().forEach(workgroup -> items.add(workgroupNode(workgroup, region)));
         if (page.nextToken() != null) {
             response.put("nextToken", page.nextToken());
         }
@@ -184,11 +187,11 @@ public class RedshiftServerlessJsonHandler {
 
     private Response handleUpdateWorkgroup(JsonNode request, String region) {
         return workgroupResponse(service.updateWorkgroup(
-                ServerlessSupport.text(request, "workgroupName"), parseWorkgroupSettings(request), region));
+                ServerlessSupport.text(request, "workgroupName"), parseWorkgroupSettings(request), region), region);
     }
 
     private Response handleDeleteWorkgroup(JsonNode request, String region) {
-        return workgroupResponse(service.deleteWorkgroup(ServerlessSupport.text(request, "workgroupName"), region));
+        return workgroupResponse(service.deleteWorkgroup(ServerlessSupport.text(request, "workgroupName"), region), region);
     }
 
     /**
@@ -420,24 +423,26 @@ public class RedshiftServerlessJsonHandler {
         return node;
     }
 
-    private Response workgroupResponse(Workgroup workgroup) {
+    private Response workgroupResponse(Workgroup workgroup, String region) {
         ObjectNode response = objectMapper.createObjectNode();
-        response.set("workgroup", workgroupNode(workgroup));
+        response.set("workgroup", workgroupNode(workgroup, region));
         return Response.ok(response).build();
     }
 
     /**
      * Members the emulator does not model ({@code workgroupVersion}, {@code patchVersion},
-     * {@code crossAccountVpcs}, the custom domain members and {@code endpoint.vpcEndpoints}) are
+     * {@code crossAccountVpcs} and {@code endpoint.vpcEndpoints}) are
      * omitted rather than invented; all of them are optional in the API model.
      */
-    private ObjectNode workgroupNode(Workgroup workgroup) {
+    private ObjectNode workgroupNode(Workgroup workgroup, String region) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("workgroupName", workgroup.getWorkgroupName());
         node.put("workgroupId", workgroup.getWorkgroupId());
         node.put("workgroupArn", workgroup.getWorkgroupArn());
         node.put("namespaceName", workgroup.getNamespaceName());
         node.put("status", workgroup.getStatus());
+        customDomains.findForWorkgroup(workgroup.getWorkgroupName(), region)
+                .ifPresent(association -> ServerlessSupport.populateCustomDomain(node, association));
         if (workgroup.getBaseCapacity() != null) {
             node.put("baseCapacity", workgroup.getBaseCapacity());
         }

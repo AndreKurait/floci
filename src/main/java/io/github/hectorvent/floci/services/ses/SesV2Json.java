@@ -140,11 +140,7 @@ final class SesV2Json {
         if (node.isNull()) {
             throw new AwsException("SerializationException", null, 400);
         }
-        if (node.isNumber()) {
-            throw new AwsException("SerializationException",
-                    "NUMBER_VALUE can not be converted to a Boolean", 400);
-        }
-        throw unexpectedStartError(node);
+        throw scalarTypeError(node, "Boolean");
     }
 
     /**
@@ -313,36 +309,16 @@ final class SesV2Json {
     }
 
     /**
-     * Parses a {@code SuppressedReasons} JSON array into a list, validating
-     * structure only; reason values are validated by the service layer.
-     * Structural violations reproduce the AWS deserialization-layer errors
-     * (verified against real AWS SES V2 on 2026-06-13): a non-array node and
-     * non-string scalar / container elements fail with
-     * {@code SerializationException}, while {@code null} elements pass
-     * deserialization and are rejected by the service-layer value validation,
-     * exactly as AWS does. Missing / null yields an empty list for the PUT
-     * path, which AWS treats as an explicit empty override.
+     * Reads a {@code SuppressedReasons} member whose type {@link SesV2RequestShapes} has already
+     * checked; reason values are validated by the service layer. A {@code null} element is kept, so
+     * that validation rejects it as AWS does (verified against real AWS SES V2 on 2026-06-13).
+     * Missing / null yields an empty list for the PUT path, which AWS treats as an explicit empty
+     * override.
      */
     static List<String> parseSuppressedReasons(JsonNode reasonsNode) {
         List<String> reasons = new ArrayList<>();
-        if (!reasonsNode.isMissingNode() && !reasonsNode.isNull()) {
-            if (!reasonsNode.isArray()) {
-                throw new AwsException("SerializationException", "Expected list or null", 400);
-            }
-            for (JsonNode r : reasonsNode) {
-                if (r.isTextual() || r.isNull()) {
-                    reasons.add(r.asText(null));
-                } else if (r.isNumber()) {
-                    throw new AwsException("SerializationException",
-                            "NUMBER_VALUE can not be converted to a String", 400);
-                } else if (r.isBoolean()) {
-                    throw new AwsException("SerializationException",
-                            (r.booleanValue() ? "TRUE_VALUE" : "FALSE_VALUE")
-                                    + " can not be converted to a String", 400);
-                } else {
-                    throw unexpectedStartError(r);
-                }
-            }
+        for (JsonNode r : reasonsNode) {
+            reasons.add(r.textValue());
         }
         return reasons;
     }

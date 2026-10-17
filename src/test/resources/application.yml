@@ -111,6 +111,7 @@ floci:
     allow-private-jwt-targets: true
 
   init-hooks:
+    dir: /etc/floci/init
     shell-executable: /bin/sh
     timeout-seconds: 5
     shutdown-grace-period-seconds: 2

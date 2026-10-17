@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
+import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbConditionKeys;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbTableNames;
@@ -99,35 +100,73 @@ public class IamConditionContextResolver {
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
-            case "logs" -> logStreamConditionContext(action, ctx);
+            case "logs" -> logsConditionContext(action, ctx);
             default -> null;
         };
     }
 
-    /** Stream access uses the owning log group's tags, in the handler's account and region. */
-    private Map<String, List<String>> logStreamConditionContext(String action, ContainerRequestContext ctx) {
-        if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action))) {
+    /** Group mutations and stream access use the handler's group and request scope. */
+    private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
+                || LogGroupTagTarget.supports(action) || "logs:CreateLogGroup".equals(action) || "logs:DeleteLogGroup".equals(action)
+                || "logs:PutRetentionPolicy".equals(action) || "logs:DeleteRetentionPolicy".equals(action))) {
             return null;
         }
         JsonNode body = bufferedJsonBody(ctx);
-        if (body == null || !logsService.isResolvable()) {
+        if (body == null) {
+            return null;
+        }
+        if ("logs:CreateLogGroup".equals(action)) {
+            JsonNode tags = body.path("tags");
+            if (!tags.isObject() || tags.isEmpty()) {
+                return null;
+            }
+            Map<String, List<String>> conditions = new LinkedHashMap<>();
+            List<String> keys = new ArrayList<>();
+            tags.properties().forEach(entry -> {
+                keys.add(entry.getKey());
+                conditions.put("aws:RequestTag/" + entry.getKey(), List.of(entry.getValue().asText()));
+            });
+            conditions.put("aws:TagKeys", keys);
+            return conditions;
+        }
+        if (!logsService.isResolvable()) {
             return null;
         }
         String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        boolean direct = LogGroupTagTarget.supports(action);
+        if ("logs:TagResource".equals(action) && body.path("tags").isObject()) {
+            List<String> keys = new ArrayList<>();
+            body.path("tags").fields().forEachRemaining(entry -> {
+                keys.add(entry.getKey());
+                conditions.put(REQUEST_TAG_PREFIX + entry.getKey(), List.of(entry.getValue().asText()));
+            });
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", keys);
+            }
+        } else if ("logs:UntagResource".equals(action)) {
+            List<String> keys = new ArrayList<>();
+            body.path("tagKeys").forEach(key -> keys.add(key.asText()));
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", keys);
+            }
+        }
+        String group = direct ? logsService.get().resolveTagTarget(body.path("resourceArn").asText(), region).name()
+                : body.path("logGroupName").asText();
         Map<String, String> tags;
         try {
-            tags = logsService.get().listTagsLogGroup(body.path("logGroupName").asText(), region);
+            tags = logsService.get().listTagsLogGroup(group, region);
         } catch (AwsException e) {
             if (!"ResourceNotFoundException".equals(e.getErrorCode())) {
                 throw e;
             }
             // Leave the handler to report a missing group; unexpected lookup errors must not hide a deny.
-            return null;
+            return conditions.isEmpty() ? null : conditions;
         }
         if (tags == null || tags.isEmpty()) {
-            return null;
+            return conditions.isEmpty() ? null : conditions;
         }
-        Map<String, List<String>> conditions = new LinkedHashMap<>();
         tags.forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key,
                 List.of(value == null ? "" : value)));
         return conditions;

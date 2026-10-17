@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.lambdaweb;
 
 import com.github.dockerjava.api.DockerClient;
+import io.github.hectorvent.floci.services.lambdaweb.LambdaWebEnvironmentManager.Environment;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
@@ -18,6 +19,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -74,6 +76,7 @@ class LambdaWebDataPlaneDockerIntegrationTest {
                 res.writeHead(Number(req.url.split('/')[2]), {'x-app': 'yes'}); res.end('status body'); return;
               }
               if (req.url.startsWith('/crash')) { setTimeout(() => process.exit(1), 50); return; }
+              if (req.url.startsWith('/exit')) { res.end('bye', () => process.exit(0)); return; }
               let body = '';
               req.on('data', (chunk) => { body += chunk; });
               req.on('end', () => {
@@ -190,6 +193,22 @@ class LambdaWebDataPlaneDockerIntegrationTest {
         Response after = given().header("Host", domain).when().get("/status/200");
         after.then().statusCode(200).header("lambda-web-logstream", not(equalTo(logStream)));
         assertNotEquals(logStream, after.header("lambda-web-logstream"), "a new environment serves the next request");
+    }
+
+    @Test
+    @Timeout(180)
+    void anEnvironmentThatExitsBetweenRequestsIsReplacedUnseen() throws Exception {
+        String domain = createFunction(30);
+        String logStream = given().header("Host", domain).when().get("/status/200")
+                .then().statusCode(200).extract().header("lambda-web-logstream");
+        Environment environment = environments.environmentOf(logStream);
+
+        given().header("Host", domain).when().get("/exit").then().statusCode(200).body(equalTo("bye"));
+        environment.awaitExit(Duration.ofSeconds(30)).get();
+        assertTrue(environment.exitedBefore(System.nanoTime()), "Floci did not see the environment exit");
+
+        given().header("Host", domain).when().get("/status/200")
+                .then().statusCode(200).header("lambda-web-logstream", not(equalTo(logStream)));
     }
 
     @Test
