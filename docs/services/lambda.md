@@ -244,24 +244,44 @@ Not emulated yet:
   destinations for durable executions.
 - The per-execution limits of 3,000 operations and 100 MB of persisted payload.
 
-## Deploying Code from S3
+## Hot-Reloading via Reactive S3 Sync
 
-Deployments using `S3Bucket` and `S3Key` copy the package when you call
-`CreateFunction` or `UpdateFunctionCode`. Overwriting the S3 object alone does not
-redeploy `$LATEST`, invalidate warm containers, or change published versions.
-This follows Lambda's default `COPY` deployment behavior.
+Floci supports automatic hot reload for S3 deployments as a local development convenience.
+AWS normally copies the deployment package: overwriting its S3 object alone does not redeploy the function.
+
+When a Lambda function is created using an S3 bucket and key, Floci maintains a link between the function and its source object. Any subsequent update to that S3 object (e.g., via `s3:PutObject`) automatically triggers a reactive synchronization:
+
+1.  **Detection**: Floci detects the S3 update via an internal event system.
+2.  **Synchronization**: The new code is automatically re-extracted to the local code storage.
+3.  **Invalidation**: Any active "warm" containers for that function are proactively drained.
+4.  **Reload**: The very next invocation starts a fresh container with the updated code.
+
+This allows you to update your Lambda code by simply re-uploading your ZIP to S3, without having to manually call `UpdateFunctionCode` or restart any containers.
+
+Published versions retain their own code snapshots. Reactive sync updates only `$LATEST`;
+publication and extraction share the per-function lock so a version cannot capture a partial update.
+
+### Example
 
 ```bash
-# Upload and explicitly deploy new code
-aws s3 cp updated-function.zip s3://my-bucket/function.zip
-aws lambda update-function-code \
+# 1. Create a function linked to S3
+aws lambda create-function \
   --function-name my-function \
-  --s3-bucket my-bucket --s3-key function.zip
+  --code S3Bucket=my-bucket,S3Key=function.zip \
+  ...
+
+# 2. Invoke (starts a warm container)
+aws lambda invoke --function-name my-function out.json
+
+# 3. Update the code in S3 (Triggers Reactive Sync)
+aws s3 cp updated-function.zip s3://my-bucket/function.zip
+
+# 4. Invoke again (automatically picks up the new code)
+aws lambda invoke --function-name my-function out.json
 ```
 
-For CloudFormation/CDK deployments, change the package key in the template so
-CloudFormation detects the code change. For local edits without
-packaging and redeploying, explicitly enable bind-mount hot reload below.
+!!! note "Local development behavior"
+    This mechanism requires no custom configuration or special strings. It uses standard AWS SDK and CLI calls; automatic redeployment after an S3 upload is a Floci convenience.
 
 ## Hot-Reload via Bind Mount
 
@@ -329,6 +349,18 @@ disabled fails with Lambda's error as the resource status reason.
 - The `S3Key` path is interpreted by the **Docker daemon**, not by Floci. When Floci itself runs inside Docker, the path must exist on the Docker host machine, not inside the Floci container.
 - Hot-reload containers are always ephemeral, so there is no warm-container reuse. Each invocation pays a cold-start penalty.
 - `UpdateFunctionCode` on a hot-reload function converts it back to a standard Zip function (the hot-reload bind-mount is removed).
+
+- S3 reactive sync is skipped for hot-reload functions because edits are picked up directly from disk.
+
+### Difference from Reactive S3 Sync
+
+| | Reactive S3 Sync | Bind-Mount Hot-Reload |
+|---|---|---|
+| Trigger | Upload a new ZIP to S3 | Edit files on disk |
+| Cold start | Only after upload | Every invocation |
+| Requires upload step | Yes | No |
+| Works without `hot-reload` enabled | Yes | No |
+| Path on host required | No | Yes |
 
 !!! note "Concurrency enforcement"
     Reserved concurrency is enforced function-wide: invocations of every
@@ -753,7 +785,7 @@ entries; only clients of the emulator itself use port 4566.
 
 #### Limitations
 
-- Bind-mount hot reload and
+- Hot reload (both bind-mount and Reactive S3 Sync bind variants) and
   `FLOCI_SERVICES_LAMBDA_AWS_CONFIG_PATH` rely on bind mounts and are not
   supported; hot-reload functions fail to launch with a clear error.
 - `Image` package type URIs are passed to the kubelet unchanged. Images in

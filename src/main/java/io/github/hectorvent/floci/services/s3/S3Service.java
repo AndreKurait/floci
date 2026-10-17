@@ -38,6 +38,7 @@ import io.github.hectorvent.floci.services.s3.model.*;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Event;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MultivaluedHashMap;
@@ -255,6 +256,7 @@ public class S3Service implements Resettable, ResourceProvider {
     private final Instance<LambdaService> lambdaServiceProvider;
     private final LambdaInvoker lambdaInvoker;
     private final EventBridgeService eventBridgeService;
+    private final Event<S3ObjectUpdatedEvent> s3UpdatedEvent;
     private final RegionResolver regionResolver;
     private final String baseUrl;
     private final ObjectMapper objectMapper;
@@ -269,6 +271,7 @@ public class S3Service implements Resettable, ResourceProvider {
                      SqsService sqsService, SnsService snsService,
                      Instance<LambdaService> lambdaServiceProvider,
                      EventBridgeService eventBridgeService,
+                     Event<S3ObjectUpdatedEvent> s3UpdatedEvent,
                      RegionResolver regionResolver,
                      ObjectMapper objectMapper,
                      IamService iamService) {
@@ -288,7 +291,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 Path.of(config.storage().persistentPath()).resolve("s3"),
                 "memory".equals(config.storage().services().s3().mode().orElse(config.storage().mode())),
                 sqsService, snsService, null, lambdaServiceProvider, null,
-                eventBridgeService,
+                eventBridgeService, s3UpdatedEvent,
                 regionResolver,
                 config.effectiveBaseUrl(), objectMapper,
                 config.services().s3().enforceAuth(), config.services().iam().enforcementEnabled(), iamService,
@@ -303,7 +306,7 @@ public class S3Service implements Resettable, ResourceProvider {
               StorageBackend<String, S3Object> objectStore,
               Path dataRoot, boolean inMemory) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
-                dataRoot, inMemory, null, null, null, null, null, null,
+                dataRoot, inMemory, null, null, null, null, null, null, null,
                 null, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
     }
 
@@ -312,7 +315,7 @@ public class S3Service implements Resettable, ResourceProvider {
               Path dataRoot, boolean inMemory,
               boolean enforceAuth, IamService iamService) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
-                dataRoot, inMemory, null, null, null, null, null, null,
+                dataRoot, inMemory, null, null, null, null, null, null, null,
                 null, "http://localhost:4566", new ObjectMapper(), enforceAuth, false, iamService, false);
     }
 
@@ -322,7 +325,7 @@ public class S3Service implements Resettable, ResourceProvider {
               AccountAwareStorageBackend<String> accountPublicAccessBlockStore,
               Path dataRoot, boolean inMemory) {
         this(bucketStore, objectStore, defaultAnnotationStore(), accountPublicAccessBlockStore,
-                dataRoot, inMemory, null, null, null, null, null, null,
+                dataRoot, inMemory, null, null, null, null, null, null, null,
                 null, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
     }
 
@@ -331,7 +334,7 @@ public class S3Service implements Resettable, ResourceProvider {
               StorageBackend<String, S3Object> objectStore,
               Path dataRoot, boolean inMemory, boolean globalBucketNamespace) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
-                dataRoot, inMemory, null, null, null, null, null, null,
+                dataRoot, inMemory, null, null, null, null, null, null, null,
                 null, "http://localhost:4566", new ObjectMapper(), false, false, null, globalBucketNamespace);
     }
 
@@ -341,7 +344,7 @@ public class S3Service implements Resettable, ResourceProvider {
               LambdaService lambdaService,
               RegionResolver regionResolver) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
-                dataRoot, inMemory, null, null, lambdaService, null, null, null,
+                dataRoot, inMemory, null, null, lambdaService, null, null, null, null,
                 regionResolver, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
     }
 
@@ -351,7 +354,7 @@ public class S3Service implements Resettable, ResourceProvider {
               LambdaInvoker lambdaInvoker,
               RegionResolver regionResolver) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
-                dataRoot, inMemory, null, null, null, null, lambdaInvoker, null,
+                dataRoot, inMemory, null, null, null, null, lambdaInvoker, null, null,
                 regionResolver, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
     }
 
@@ -374,7 +377,8 @@ public class S3Service implements Resettable, ResourceProvider {
                       Instance<LambdaService> lambdaServiceProvider,
                       LambdaInvoker lambdaInvoker,
                       EventBridgeService eventBridgeService,
-                       RegionResolver regionResolver, String baseUrl, ObjectMapper objectMapper,
+                      Event<S3ObjectUpdatedEvent> s3UpdatedEvent,
+                      RegionResolver regionResolver, String baseUrl, ObjectMapper objectMapper,
                       boolean enforceAuth, boolean enforceIam, IamService iamService,
                       boolean globalBucketNamespace) {
         this.bucketStore = bucketStore;
@@ -389,6 +393,7 @@ public class S3Service implements Resettable, ResourceProvider {
         this.lambdaServiceProvider = lambdaServiceProvider;
         this.lambdaInvoker = lambdaInvoker;
         this.eventBridgeService = eventBridgeService;
+        this.s3UpdatedEvent = s3UpdatedEvent;
         this.regionResolver = regionResolver;
         this.baseUrl = baseUrl;
         this.objectMapper = objectMapper;
@@ -6201,6 +6206,9 @@ public class S3Service implements Resettable, ResourceProvider {
      */
     private void fireNotifications(String bucketName, String key, String eventName, S3Object obj,
                                    String sequencer) {
+        if (s3UpdatedEvent != null && eventName.startsWith("ObjectCreated")) {
+            s3UpdatedEvent.fire(new S3ObjectUpdatedEvent(bucketName, key));
+        }
         if (sqsService == null && snsService == null && lambdaService == null
                 && lambdaServiceProvider == null && lambdaInvoker == null && eventBridgeService == null) {
             return;

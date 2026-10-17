@@ -12,6 +12,9 @@ import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.LambdaUrlConfig;
 import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
 import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
+import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.s3.model.S3Object;
+import io.github.hectorvent.floci.services.s3.model.S3ObjectUpdatedEvent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -2257,6 +2260,61 @@ class LambdaServiceTest {
         assertTrue(Files.isDirectory(v2Path), "a surviving version's code must be left alone");
         assertEquals("v2", Files.readString(v2Path.resolve("index.js")).trim());
         assertTrue(Files.isDirectory(latestPath), "$LATEST's code must be left alone");
+    }
+
+    @Test
+    void reactiveSyncHoldsThePublicationLockThroughExtraction() throws Exception {
+        S3Service s3 = mock(S3Service.class);
+        WarmPool warmPool = mock(WarmPool.class);
+        ZipExtractor extractor = spy(new ZipExtractor());
+        StorageFactory storageFactory = mock(StorageFactory.class);
+        when(storageFactory.create(anyString(), anyString(), any()))
+                .thenAnswer(inv -> AccountAwareStorageBackend.inMemory("000000000000"));
+        LambdaFunctionStore functionStore = new LambdaFunctionStore(new InMemoryStorage<String, LambdaFunction>());
+        LambdaAliasStore aliasStore = new LambdaAliasStore(storageFactory);
+        LambdaService syncingService = new LambdaService(functionStore, null, new LambdaConcurrencyLimiter(),
+                warmPool, new CodeStore(Path.of("target/test-data/lambda-code")), extractor, null,
+                new RegionResolver(REGION, "000000000000"), null, aliasStore,
+                new LambdaTargetResolver(functionStore, aliasStore), s3, null, null, null, null,
+                storageFactory, null, null, null, null, new com.fasterxml.jackson.databind.ObjectMapper());
+        String name = "reactive-snapshot-" + UUID.randomUUID();
+        when(s3.getObject("code-bucket", "function.zip"))
+                .thenReturn(new S3Object("code-bucket", "function.zip",
+                        Base64.getDecoder().decode(zipWithBody("v1")), "application/zip"))
+                .thenReturn(new S3Object("code-bucket", "function.zip",
+                        Base64.getDecoder().decode(zipWithBody("v2")), "application/zip"));
+        Map<String, Object> request = baseRequest(name);
+        request.put("Code", Map.of("S3Bucket", "code-bucket", "S3Key", "function.zip"));
+        LambdaFunction latest = syncingService.createFunction(REGION, request);
+        LambdaFunction first = syncingService.publishVersion(REGION, name, null);
+        CountDownLatch extracting = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(inv -> {
+            assertTrue(Thread.holdsLock(syncingService.lockForConcurrencyOp(latest.getFunctionArn())));
+            extracting.countDown();
+            assertTrue(release.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            return inv.callRealMethod();
+        }).when(extractor).extractTo(any(byte[].class), any(Path.class), anyInt(), any(Runnable.class));
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> sync = workers.submit(() -> syncingService.onS3ObjectUpdated(
+                    new S3ObjectUpdatedEvent("code-bucket", "function.zip")));
+            assertTrue(extracting.await(2, java.util.concurrent.TimeUnit.SECONDS));
+            Future<LambdaFunction> publication = workers.submit(
+                    () -> syncingService.publishVersion(REGION, name, null));
+            assertThrows(java.util.concurrent.TimeoutException.class,
+                    () -> publication.get(200, java.util.concurrent.TimeUnit.MILLISECONDS));
+            release.countDown();
+            sync.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            LambdaFunction second = publication.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            assertEquals("v1", Files.readString(Path.of(first.getCodeLocalPath()).resolve("index.js")).trim());
+            assertEquals("v2", Files.readString(Path.of(second.getCodeLocalPath()).resolve("index.js")).trim());
+            assertEquals(latest.getCodeSha256(), second.getCodeSha256());
+            verify(warmPool).pushCodeUpdate(latest);
+        } finally {
+            release.countDown();
+            workers.shutdownNow();
+        }
     }
 
     @Test

@@ -27,8 +27,10 @@ import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.Bucket;
 import io.github.hectorvent.floci.services.s3.model.ObjectAnnotation;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
+import io.github.hectorvent.floci.services.s3.model.S3ObjectUpdatedEvent;
 import io.quarkus.test.junit.QuarkusTest;
 import io.vertx.core.Vertx;
+import jakarta.enterprise.event.Event;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
@@ -943,7 +945,7 @@ class DynamoDbStreamsEventSourcePollerTest {
                 storageFactory, config,
                 mock(io.github.hectorvent.floci.services.sqs.SqsService.class),
                 mock(io.github.hectorvent.floci.services.sns.SnsService.class),
-                mock(Instance.class), mock(EventBridgeService.class),
+                mock(Instance.class), mock(EventBridgeService.class), mock(Event.class),
                 regionResolver, OBJECT_MAPPER, mock(IamService.class));
 
         pollerWith(store).pollAndInvoke(esm);

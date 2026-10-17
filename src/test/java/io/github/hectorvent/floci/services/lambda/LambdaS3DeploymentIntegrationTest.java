@@ -17,7 +17,7 @@ import static org.hamcrest.Matchers.equalTo;
 class LambdaS3DeploymentIntegrationTest {
 
     @Test
-    void overwritingS3CodeRequiresExplicitDeploymentAndPreservesPublishedVersions() throws Exception {
+    void reactiveS3SyncPreservesPublishedVersions() throws Exception {
         String name = "s3-deployment-" + UUID.randomUUID().toString().substring(0, 8);
         String key = "function.zip";
         String functionPath = "/2015-03-31/functions/" + name;
@@ -39,14 +39,6 @@ class LambdaS3DeploymentIntegrationTest {
                         .then().statusCode(200).body("body", equalTo("v1"));
 
                 given().body(makeZip("v2")).when().put("/" + name + "/" + key).then().statusCode(200);
-                given().when().get(functionPath + "/configuration")
-                        .then().statusCode(200).body("CodeSha256", equalTo(codeHash));
-                given().body("{}").when().post(functionPath + "/invocations")
-                        .then().statusCode(200).body("body", equalTo("v1"));
-
-                given().contentType("application/json")
-                        .body(Map.of("S3Bucket", name, "S3Key", key))
-                        .when().put(functionPath + "/code").then().statusCode(200);
                 given().body("{}").when().post(functionPath + "/invocations")
                         .then().statusCode(200).body("body", equalTo("v2"));
                 given().queryParam("Qualifier", version).body("{}")
