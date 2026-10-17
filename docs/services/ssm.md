@@ -61,7 +61,25 @@ on restart.
 
     To get a container that both answers IMDS and runs `SendCommand` directly, launch it with EC2 `RunInstances` first and then register that same container's SSM agent. Floci logs a warning when an agent registers from a container that is not backed by a Floci EC2 instance.
 
-Direct command output follows the AWS inline output limits: first 24,000 characters of stdout and first 8,000 characters of stderr. Commands that exceed `TimeoutSeconds` are constrained inside the target container when the container has the `timeout` command available, and terminal timeout results are marked `TimedOut` with `StatusDetails` set to `Execution Timed Out`; commands with nonzero exit codes are marked `Failed`.
+Direct command output follows the AWS inline output limits: first 24,000 characters of stdout and first 8,000 characters of stderr. Commands that exceed their execution budget are constrained inside the target container when the container has the `timeout` command available, and terminal timeout results are marked `TimedOut` with `StatusDetails` set to `Execution Timed Out`; commands with nonzero exit codes are marked `Failed`.
+
+### Shell command timeout budgets
+
+For public `SendCommand` requests using the exact `AWS-RunShellScript` document name,
+`TimeoutSeconds` is the delivery/start allowance. `Parameters.executionTimeout` is a separate
+execution allowance, defaulting to 3600 seconds and accepting one decimal string from 1 to
+172800. The direct worker uses this execution allowance; agent payloads retain the public
+document's 3600-second default and carry an explicit parameter unchanged.
+
+`Command.TimeoutSeconds` still reports the delivery allowance. `ExpiresAfter` includes both
+allowances for these shell requests. This corrects metadata and execution budgets; it does not
+add automatic delivery expiration, restart recovery, cleanup retries or late-start fencing.
+Internal CodeDeploy hook budgets and non-shell document handling keep their existing behavior.
+Missing or empty `commands`, malformed shell parameter wire shapes and invalid execution limits
+are refused before command creation
+with `InvalidParameters`/HTTP400. This is Floci's chosen mapping; exact AWS error wording and
+empty-list normalization were not observed live. Other document parameters and delivery-timeout
+coercion/upper-bound handling are not a complete document-schema implementation.
 
 ## Configuration
 

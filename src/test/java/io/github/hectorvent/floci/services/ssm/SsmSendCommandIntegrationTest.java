@@ -419,7 +419,7 @@ class SsmSendCommandIntegrationTest {
                 eq("i-direct-container"),
                 eq("AWS-RunShellScript"),
                 any(),
-                eq(60)))
+                eq(3600)))
                 .thenReturn(Optional.of(new SsmDirectCommandExecutor.ExecutionResult(
                         "Success", "direct-output\n", "", 0, start, end)));
 

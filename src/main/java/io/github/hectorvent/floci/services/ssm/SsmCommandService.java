@@ -23,6 +23,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -47,6 +48,8 @@ public class SsmCommandService implements Resettable {
     private static final Logger LOG = Logger.getLogger(SsmCommandService.class);
     private static final int MIN_TIMEOUT_SECONDS = 30;
     private static final int MAX_INSTANCE_IDS = 50;
+    private static final int DEFAULT_SHELL_EXECUTION_TIMEOUT_SECONDS = 3600;
+    private static final int MAX_SHELL_EXECUTION_TIMEOUT_SECONDS = 172800;
     static final int MAX_STDOUT_CHARS = 24000;
     static final int MAX_STDERR_CHARS = 8000;
 
@@ -75,7 +78,7 @@ public class SsmCommandService implements Resettable {
         this.objectMapper = objectMapper;
         this.regionResolver = regionResolver;
         this.directCommandExecutor = directCommandExecutor;
-        // Each direct execution blocks for the whole container exec, up to TimeoutSeconds, so every
+        // Each direct execution blocks for the whole container exec, up to its execution budget, so every
         // target gets its own virtual thread instead of a platform thread.
         this.directExecutionExecutor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("floci-ssm-direct-execution").factory());
@@ -159,10 +162,14 @@ public class SsmCommandService implements Resettable {
                     400);
         }
 
-        Map<String, List<String>> parameters = parseParameters(request.path("Parameters"));
+        boolean publicShell = "AWS-RunShellScript".equals(documentName);
+        Map<String, List<String>> parameters = publicShell
+                ? parseShellParameters(request.path("Parameters")) : parseParameters(request.path("Parameters"));
         String comment = request.path("Comment").asText("");
         int timeoutSeconds = request.path("TimeoutSeconds").asInt(3600);
         validateTimeoutSeconds(timeoutSeconds);
+        int executionTimeoutSeconds = publicShell ? shellExecutionTimeout(parameters) : timeoutSeconds;
+        int documentTimeoutDefault = publicShell ? DEFAULT_SHELL_EXECUTION_TIMEOUT_SECONDS : timeoutSeconds;
         String documentVersion = request.path("DocumentVersion").asText("$DEFAULT");
         String outputS3Bucket = request.path("OutputS3BucketName").asText("");
         String outputS3Prefix = request.path("OutputS3KeyPrefix").asText("");
@@ -187,7 +194,8 @@ public class SsmCommandService implements Resettable {
         command.setOutputS3KeyPrefix(outputS3Prefix.isEmpty() ? null : outputS3Prefix);
         command.setOutputS3Region(region);
         command.setRegion(region);
-        command.setExpiresAfter(now.plusSeconds(timeoutSeconds));
+        command.setExpiresAfter(now.plusSeconds((long) timeoutSeconds
+                + (publicShell ? executionTimeoutSeconds : 0)));
 
         command.setStatus("InProgress");
         command.setStatusDetails(statusDetails("InProgress"));
@@ -215,7 +223,7 @@ public class SsmCommandService implements Resettable {
             }
             else {
                 invocationStore.put(invocationKey(region, commandId, instanceId), inv);
-                queueMessage(commandId, instanceId, documentName, parameters, timeoutSeconds, region);
+                queueMessage(commandId, instanceId, documentName, parameters, documentTimeoutDefault, region);
             }
         }
 
@@ -228,10 +236,60 @@ public class SsmCommandService implements Resettable {
                     directExecutionRequest.instanceId(),
                     directExecutionRequest.documentName(),
                     directExecutionRequest.parameters(),
-                    timeoutSeconds,
+                    executionTimeoutSeconds,
+                    documentTimeoutDefault,
                     region);
         }
         return response;
+    }
+
+    private static int shellExecutionTimeout(Map<String, List<String>> parameters) {
+        if (!parameters.containsKey("executionTimeout")) {
+            return DEFAULT_SHELL_EXECUTION_TIMEOUT_SECONDS;
+        }
+        List<String> values = parameters.get("executionTimeout");
+        if (values.size() != 1 || !values.getFirst().matches("[1-9][0-9]{0,5}")) {
+            throw invalidShellParameters();
+        }
+        int seconds = Integer.parseInt(values.getFirst());
+        if (seconds > MAX_SHELL_EXECUTION_TIMEOUT_SECONDS) {
+            throw invalidShellParameters();
+        }
+        return seconds;
+    }
+
+    private static Map<String, List<String>> parseShellParameters(JsonNode node) {
+        if (node.isMissingNode() || node.isNull()) {
+            throw invalidShellParameters();
+        }
+        if (!node.isObject()) {
+            throw invalidShellParameters();
+        }
+        Map<String, List<String>> parameters = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonNode> field : node.properties()) {
+            if (!field.getValue().isArray()) {
+                throw invalidShellParameters();
+            }
+            List<String> values = new ArrayList<>();
+            for (JsonNode value : field.getValue()) {
+                if (!value.isTextual()) {
+                    throw invalidShellParameters();
+                }
+                values.add(value.textValue());
+            }
+            parameters.put(field.getKey(), values);
+        }
+        List<String> commands = parameters.get("commands");
+        if (commands == null || commands.isEmpty()) {
+            throw invalidShellParameters();
+        }
+        return parameters;
+    }
+
+    private static AwsException invalidShellParameters() {
+        return new AwsException("InvalidParameters",
+                "AWS-RunShellScript requires at least one command and string-list parameters; "
+                        + "executionTimeout must contain one integer from 1 to 172800.", 400);
     }
 
     private static void validateTimeoutSeconds(int timeoutSeconds) {
@@ -573,6 +631,7 @@ public class SsmCommandService implements Resettable {
             String documentName,
             Map<String, List<String>> parameters,
             int timeoutSeconds,
+            int documentTimeoutDefault,
             String region) {
         CompletableFuture.runAsync(() -> RequestScopes.runAs(accountId, region, () -> {
             String invKey = invocationKey(region, commandId, instanceId);
@@ -593,7 +652,7 @@ public class SsmCommandService implements Resettable {
                     invocation.setStatusDetails(statusDetails("Pending"));
                     invocationStore.put(invKey, invocation);
                 }
-                queueMessage(commandId, instanceId, documentName, parameters, timeoutSeconds, region);
+                queueMessage(commandId, instanceId, documentName, parameters, documentTimeoutDefault, region);
                 updateCommandStatus(commandId, region);
                 return;
             }
