@@ -4116,6 +4116,9 @@ public class LambdaService implements ResourceProvider {
         String region = regionResolver.getDefaultRegion();
         List<LambdaFunction> functions = functionStore.listAllAccounts(region);
         for (LambdaFunction fn : functions) {
+            if (!event.bucketName().equals(fn.getS3Bucket()) || !event.key().equals(fn.getS3Key())) {
+                continue;
+            }
             synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
                 if (fn.isHotReload()) {
                     continue;

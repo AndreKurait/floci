@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -37,11 +38,14 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
@@ -1217,7 +1221,7 @@ class LambdaServiceTest {
 
     @Test
     void hotReload_convertFromS3Backed_clearsBucketAndKey() {
-        // Converting to bind-mount code clears the previous S3 deployment location.
+        // Clear the previous S3 location so reactive sync cannot overwrite the bind-mounted code.
         LambdaService svc = serviceWithHotReload(true, null);
         Map<String, Object> req = baseRequest("hr-convert");
         req.put("Code", Map.of("S3Bucket", "my-code-bucket", "S3Key", "fn.zip"));
@@ -2263,6 +2267,29 @@ class LambdaServiceTest {
     }
 
     @Test
+    void unrelatedS3EventsDoNotAcquireOtherFunctionsDeploymentLocks() throws Exception {
+        LambdaFunction first = service.createFunction(REGION, baseRequest("unrelated-sync-first"));
+        LambdaFunction second = service.createFunction(REGION, baseRequest("unrelated-sync-second"));
+        first.setS3Bucket("source-bucket");
+        first.setS3Key("first.zip");
+        second.setS3Bucket("source-bucket");
+        second.setS3Key("second.zip");
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            synchronized (service.lockForConcurrencyOp(first.getFunctionArn())) {
+                Future<?> deployment = worker.submit(() -> {
+                    synchronized (service.lockForConcurrencyOp(second.getFunctionArn())) {
+                        service.onS3ObjectUpdated(new S3ObjectUpdatedEvent("tasks-bucket", "deployment.zip"));
+                    }
+                });
+                deployment.get(2, TimeUnit.SECONDS);
+            }
+        } finally {
+            worker.shutdownNow();
+        }
+    }
+
+    @Test
     void reactiveSyncHoldsThePublicationLockThroughExtraction() throws Exception {
         S3Service s3 = mock(S3Service.class);
         WarmPool warmPool = mock(WarmPool.class);
@@ -2276,7 +2303,7 @@ class LambdaServiceTest {
                 warmPool, new CodeStore(Path.of("target/test-data/lambda-code")), extractor, null,
                 new RegionResolver(REGION, "000000000000"), null, aliasStore,
                 new LambdaTargetResolver(functionStore, aliasStore), s3, null, null, null, null,
-                storageFactory, null, null, null, null, new com.fasterxml.jackson.databind.ObjectMapper());
+                storageFactory, null, null, null, null, new ObjectMapper());
         String name = "reactive-snapshot-" + UUID.randomUUID();
         when(s3.getObject("code-bucket", "function.zip"))
                 .thenReturn(new S3Object("code-bucket", "function.zip",
@@ -2292,21 +2319,25 @@ class LambdaServiceTest {
         doAnswer(inv -> {
             assertTrue(Thread.holdsLock(syncingService.lockForConcurrencyOp(latest.getFunctionArn())));
             extracting.countDown();
-            assertTrue(release.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertTrue(release.await(5, TimeUnit.SECONDS));
             return inv.callRealMethod();
         }).when(extractor).extractTo(any(byte[].class), any(Path.class), anyInt(), any(Runnable.class));
         ExecutorService workers = Executors.newFixedThreadPool(2);
         try {
             Future<?> sync = workers.submit(() -> syncingService.onS3ObjectUpdated(
                     new S3ObjectUpdatedEvent("code-bucket", "function.zip")));
-            assertTrue(extracting.await(2, java.util.concurrent.TimeUnit.SECONDS));
-            Future<LambdaFunction> publication = workers.submit(
-                    () -> syncingService.publishVersion(REGION, name, null));
-            assertThrows(java.util.concurrent.TimeoutException.class,
-                    () -> publication.get(200, java.util.concurrent.TimeUnit.MILLISECONDS));
+            assertTrue(extracting.await(2, TimeUnit.SECONDS));
+            AtomicReference<Thread> publicationThread = new AtomicReference<>();
+            Future<LambdaFunction> publication = workers.submit(() -> {
+                publicationThread.set(Thread.currentThread());
+                return syncingService.publishVersion(REGION, name, null);
+            });
+            await().atMost(2, TimeUnit.SECONDS).until(() -> publicationThread.get() != null
+                    && publicationThread.get().getState() == Thread.State.BLOCKED);
+            assertFalse(publication.isDone());
             release.countDown();
-            sync.get(5, java.util.concurrent.TimeUnit.SECONDS);
-            LambdaFunction second = publication.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            sync.get(5, TimeUnit.SECONDS);
+            LambdaFunction second = publication.get(5, TimeUnit.SECONDS);
             assertEquals("v1", Files.readString(Path.of(first.getCodeLocalPath()).resolve("index.js")).trim());
             assertEquals("v2", Files.readString(Path.of(second.getCodeLocalPath()).resolve("index.js")).trim());
             assertEquals(latest.getCodeSha256(), second.getCodeSha256());
