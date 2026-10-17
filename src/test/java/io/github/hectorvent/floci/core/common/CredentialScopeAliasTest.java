@@ -51,6 +51,30 @@ class CredentialScopeAliasTest {
     }
 
     @Test
+    void monitoringAliasResolvesTheCloudWatchQueryAction() {
+        UriInfo uriInfo = mock(UriInfo.class);
+        MultivaluedHashMap<String, String> query = new MultivaluedHashMap<>();
+        query.add("Action", "GetMetricStatistics");
+        query.add("Version", "2010-08-01");
+        when(uriInfo.getPath()).thenReturn("");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/?Action=GetMetricStatistics"));
+        when(uriInfo.getBaseUri()).thenReturn(URI.create("http://localhost:4566/"));
+        when(uriInfo.getQueryParameters()).thenReturn(query);
+
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getMethod()).thenReturn("GET");
+        when(ctx.getUriInfo()).thenReturn(uriInfo);
+        when(ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY))
+                .thenReturn(new ProtocolClaim(WireProtocol.AWS_QUERY, null, "GetMetricStatistics", null));
+        when(ctx.getHeaderString("Authorization")).thenReturn(
+                "AWS4-HMAC-SHA256 Credential=AKIAUSER/20261013/us-east-1/monitoring/aws4_request");
+
+        String canonicalScope = catalog.canonicalCredentialScope("monitoring");
+        assertEquals("cloudwatch", canonicalScope);
+        assertEquals("cloudwatch:GetMetricStatistics", actionRegistry.resolve(canonicalScope, ctx));
+    }
+
+    @Test
     void canonicalScopeIsUnchanged() {
         assertEquals("s3", catalog.canonicalCredentialScope("s3"));
         assertEquals("dynamodb", catalog.canonicalCredentialScope("dynamodb"));
