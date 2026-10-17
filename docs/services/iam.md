@@ -1153,14 +1153,34 @@ An S3 object operation is checked as the action the S3 documentation gives it:
     `s3:PutObject`.
   - `AbortMultipartUpload` is checked as `s3:AbortMultipartUpload`.
   - `ListParts` is checked as `s3:ListMultipartUploadParts`.
+- **Creating an object:** a `PutObject`, `CopyObject` or `CreateMultipartUpload` also needs
+  the action for each setting it applies to the new object, as the S3 user guide's permissions
+  table marks them conditionally required:
+  - `s3:PutObjectTagging` for tags: the `x-amz-tagging` header, which a copy applies only with
+    `x-amz-tagging-directive: REPLACE`, or a tagged source's tags, which a copy keeps under the
+    default `COPY`;
+  - `s3:PutObjectAcl` for a canned ACL or a grant header;
+  - `s3:PutObjectRetention` for `x-amz-object-lock-mode` or `x-amz-object-lock-retain-until-date`;
+  - `s3:PutObjectLegalHold` for `x-amz-object-lock-legal-hold`.
+
+  S3's own access check under `floci.services.s3.enforce-auth`, which evaluates bucket policies
+  and ACLs, checks only `s3:PutObject` for these operations.
 - **Restore and select:** `RestoreObject` is checked as `s3:RestoreObject`, and
   `SelectObjectContent` as `s3:GetObject`, or `s3:GetObjectVersion` when it names a version.
-- **Object lock:** object retention and legal hold use their own actions: `s3:GetObjectRetention`,
-  `s3:PutObjectRetention`, `s3:GetObjectLegalHold` and `s3:PutObjectLegalHold`.
+- **Attributes:** `GetObjectAttributes` needs `s3:GetObject` and `s3:GetObjectAttributes`, as its
+  API reference says.
+- **Object lock:**
+  - Object retention and legal hold use their own actions: `s3:GetObjectRetention`,
+    `s3:PutObjectRetention`, `s3:GetObjectLegalHold` and `s3:PutObjectLegalHold`.
+  - A `PutObjectRetention` or `DeleteObject` that sends `x-amz-bypass-governance-retention: true`
+    also needs `s3:BypassGovernanceRetention`, as their API references say. The S3 user guide says
+    the permission does not apply to annotation operations, so deleting an annotation does not
+    need it.
 - **Annotations:** object annotations use the `s3:*ObjectAnnotation` actions, and
   `s3:ListObjectAnnotations` when no annotation name is given.
 - **Versions:** a `versionId` selects the version action AWS checks.
-  - Reading or heading a version needs `s3:GetObjectVersion`; `s3:GetObject` is not needed.
+  - Reading or heading a version needs `s3:GetObjectVersion`; `s3:GetObject` is not needed. Its
+    attributes need `s3:GetObjectVersion` and `s3:GetObjectVersionAttributes`.
   - Deleting a version needs `s3:DeleteObjectVersion`, so a deny on it stops permanent deletes
     while a plain delete still adds a delete marker.
   - A version's ACL, tags and annotations use `s3:GetObjectVersionAcl`, `s3:PutObjectVersionAcl`,
@@ -1498,7 +1518,9 @@ floci populates:
   be gated on tags an object does not have yet.
 - `s3:RequestObjectTag/<key>`: a tag the request asks to attach. `s3:PutObject` reads these
   from the `x-amz-tagging` header, or its query parameter when the header is absent,
-  and `s3:PutObjectTagging` from the `<Tagging>` body. Any pair
+  and `s3:PutObjectTagging` from the `<Tagging>` body. A `CopyObject` offers them only with
+  `x-amz-tagging-directive: REPLACE`: under the default `COPY` the copy keeps the source's tags and
+  ignores the header. Any pair
   that does not decode is dropped, so a policy conditioned on the key denies such a request. Where
   enforcement lets it through, the handler still answers a malformed header with
   `400 InvalidTag`.
@@ -1509,6 +1531,15 @@ floci populates:
   omitted or empty tag set still follows the absent-key rules above. Existing object tags
   do not contribute to this requested set. See the [AWS object-tag policy guidance](https://docs.aws.amazon.com/AmazonS3/latest/userguide/tagging-and-policies.html).
 - `s3:versionid`: the `versionId` of the request, for the version actions it selects.
+- `s3:object-lock-mode`, `s3:object-lock-retain-until-date`,
+  `s3:object-lock-remaining-retention-days` and `s3:object-lock-legal-hold`: the Object Lock
+  settings a request applies, for `s3:PutObject` (from its `x-amz-object-lock-*` headers),
+  `s3:PutObjectRetention` (the `<Retention>` body) and `s3:PutObjectLegalHold` (the `<LegalHold>`
+  body). AWS does not document how it counts the remaining retention days; floci counts a part
+  day as a whole one, so a Deny on retention longer than N days refuses a date a few hours past
+  N days.
+- An object creation offers its tag and Object Lock keys to each action it is checked as: its
+  `s3:PutObject` and the extra actions its settings need.
 - A `PutObject` carrying `If-Match` is authorized as `s3:GetObject` as well, and that second
   check is made without the object's tags in the context, as measured on AWS. `CopyObject` and
   `CompleteMultipartUpload`, the other operations the S3 user guide lists for `If-Match`, get the

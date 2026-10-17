@@ -69,7 +69,7 @@ class IamTagKeysEnforcementIntegrationTest {
     @ValueSource(strings = {"Admin", "team"})
     void s3ObjectUploadRestrictsAllRequestedKeysWithoutNullGuard(String forbiddenKey) {
         String bucket = bucket();
-        String key = scopedUser("s3:PutObject", "s3:RequestObjectTagKeys");
+        String key = scopedUploader();
         String path = "/" + bucket + "/object";
         given().header("Authorization", auth(key, "s3")).header("x-amz-tagging", "%54eam=payments")
                 .body("original").put(path).then().statusCode(200);
@@ -117,7 +117,7 @@ class IamTagKeysEnforcementIntegrationTest {
     @ValueSource(strings = {"Admin", "team"})
     void s3QueryTagKeysAreCheckedBeforeAnUpload(String forbiddenKey) {
         String bucket = bucket();
-        String key = scopedUser("s3:PutObject", "s3:RequestObjectTagKeys");
+        String key = scopedUploader();
         String path = "/" + bucket + "/object";
         given().header("Authorization", auth(key, "s3")).queryParam("x-amz-tagging", "%54eam=payments")
                 .body("original").put(path).then().statusCode(200);
@@ -134,7 +134,7 @@ class IamTagKeysEnforcementIntegrationTest {
     @Test
     void s3TagHeaderTakesPrecedenceOverTheQuery() {
         String bucket = bucket();
-        String key = scopedUser("s3:PutObject", "s3:RequestObjectTagKeys");
+        String key = scopedUploader();
         String path = "/" + bucket + "/object";
         given().header("Authorization", auth(key, "s3")).header("x-amz-tagging", "Team=payments")
                 .queryParam("x-amz-tagging", "Admin=true").body("original").put(path).then().statusCode(200);
@@ -155,7 +155,7 @@ class IamTagKeysEnforcementIntegrationTest {
                 .put(path).then().statusCode(200).extract().header("ETag");
         String key = userWithPolicy("""
                 {"Version":"2012-10-17","Statement":[
-                  {"Effect":"Allow","Action":"s3:PutObject","Resource":"*"},
+                  {"Effect":"Allow","Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"*"},
                   {"Effect":"Allow","Action":"s3:GetObject","Resource":"*",
                    "Condition":{"ForAnyValue:StringEquals":{"s3:RequestObjectTagKeys":["Team"]}}}]}
                 """);
@@ -165,7 +165,7 @@ class IamTagKeysEnforcementIntegrationTest {
                 .then().statusCode(200).body(equalTo("original"));
         String allowedKey = userWithPolicy("""
                 {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
-                  "Action":["s3:PutObject","s3:GetObject"],"Resource":"*"}]}
+                  "Action":["s3:PutObject","s3:PutObjectTagging","s3:GetObject"],"Resource":"*"}]}
                 """);
         given().header("Authorization", auth(allowedKey, "s3")).header("x-amz-tagging", "Team=payments")
                 .header("If-Match", etag).body("allowed").put(path).then().statusCode(200);
@@ -186,6 +186,15 @@ class IamTagKeysEnforcementIntegrationTest {
                 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"%s",
                  "Resource":"*","Condition":{"ForAllValues:StringEquals":{"%s":["Team"]}}}]}
                 """.formatted(action, conditionKey));
+    }
+
+    /** A tagged upload needs s3:PutObjectTagging beside s3:PutObject, and both are held to the keys. */
+    private String scopedUploader() {
+        return userWithPolicy("""
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                 "Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"*",
+                 "Condition":{"ForAllValues:StringEquals":{"s3:RequestObjectTagKeys":["Team"]}}}]}
+                """);
     }
 
     private String userWithPolicy(String policy) {

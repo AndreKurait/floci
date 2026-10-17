@@ -222,6 +222,22 @@ class GeneratedPreSignedUrlAuthEnforcementIntegrationTest {
     }
 
     @Test
+    void generatedPutUrlCannotSetAnAclWithoutAclPermission() {
+        String bucket = "generated-presign-acl-" + UUID.randomUUID().toString().substring(0, 8);
+        given().filter(OWNER).when().put("/" + bucket).then().statusCode(200);
+
+        URI uri = URI.create(presignGenerator.generatePresignedUrl(
+                "http://localhost:" + RestAssured.port, bucket, "object.txt", "PUT", 60));
+        String pathAndQuery = uri.getRawPath() + "?" + uri.getRawQuery();
+
+        given().urlEncodingEnabled(false).header("x-amz-acl", "bucket-owner-full-control").body("with acl")
+                .when().put(pathAndQuery)
+                .then().statusCode(403).body("Error.Code", equalTo("AccessDenied"));
+        given().urlEncodingEnabled(false).body("without acl")
+                .when().put(pathAndQuery).then().statusCode(200);
+    }
+
+    @Test
     void generatedUrlsKeepLeadingSlashKeysDistinctUnderEnforcedIam() throws Exception {
         String bucket = "generated-presign-slash-" + UUID.randomUUID().toString().substring(0, 8);
         String baseUrl = "http://localhost:" + RestAssured.port;

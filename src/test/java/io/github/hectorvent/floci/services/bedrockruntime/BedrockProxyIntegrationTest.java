@@ -6,8 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpServer;
+import io.github.hectorvent.floci.testing.BedrockProxyBackendProfile;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
@@ -20,9 +20,10 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static io.github.hectorvent.floci.testing.BedrockProxyBackendProfile.MAPPED_MODEL_ID;
+import static io.github.hectorvent.floci.testing.BedrockProxyBackendProfile.PORT;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
@@ -37,15 +38,19 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Verifies the Bedrock Runtime {@code proxy} backend translates Converse requests to
  * OpenAI Chat Completions and translates the response back to the Bedrock shape,
  * against a real (mock) OpenAI-compatible backend.
+ *
+ * <p>The backend, its URL, the API key and the model mapping come from
+ * {@link BedrockProxyBackendProfile}, which this class shares with the other proxy classes that
+ * talk to a stand-in. That profile also turns passthrough on, which no test here reaches, since
+ * every call names the mapped model id. The case with no mapping, no default model and no
+ * passthrough is in {@code BedrockProxyTimeoutIntegrationTest}, where passthrough stays off.
  */
 @QuarkusTest
-@TestProfile(BedrockProxyIntegrationTest.ProxyBackendProfile.class)
+@TestProfile(BedrockProxyBackendProfile.class)
 class BedrockProxyIntegrationTest {
 
     private static final String AUTH_HEADER =
             "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/bedrock/aws4_request";
-    private static final int PORT = 18930;
-    private static final String MAPPED_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0";
 
     @Inject
     ObjectMapper objectMapper;
@@ -1321,33 +1326,5 @@ class BedrockProxyIntegrationTest {
         .then()
             .statusCode(400)
             .body("__type", equalTo("ValidationException"));
-    }
-
-    @Test
-    void converse_noMappingNoDefaultNoPassthrough_returns400() {
-        given()
-            .contentType("application/json")
-            .header("Authorization", AUTH_HEADER)
-            .body("""
-                {"messages": [{"role": "user", "content": [{"text": "hi"}]}]}
-                """)
-        .when()
-            .post("/model/unmapped.model-v1:0/converse")
-        .then()
-            .statusCode(400)
-            .body("__type", equalTo("ValidationException"));
-    }
-
-    public static final class ProxyBackendProfile implements QuarkusTestProfile {
-        @Override
-        public Map<String, String> getConfigOverrides() {
-            return Map.of(
-                    "floci.services.bedrock-runtime.backend", "proxy",
-                    "floci.services.bedrock-runtime.proxy.url", "http://127.0.0.1:" + PORT + "/v1",
-                    "floci.services.bedrock-runtime.proxy.api-key", "test-key",
-                    "floci.services.bedrock-runtime.proxy.model-mapping",
-                            MAPPED_MODEL_ID + "=claude-3-haiku"
-            );
-        }
     }
 }

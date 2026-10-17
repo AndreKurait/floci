@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.bedrockruntime;
 
 import com.sun.net.httpserver.HttpServer;
 import io.github.hectorvent.floci.services.bedrockruntime.backend.ProxyBackend;
+import io.github.hectorvent.floci.testing.BedrockProxyBackendProfile;
 import io.github.hectorvent.floci.testutil.LogCapture;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -25,6 +26,7 @@ import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.SimpleFormatter;
 
+import static io.github.hectorvent.floci.testing.BedrockProxyBackendProfile.PORT;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
@@ -32,8 +34,16 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/**
+ * Verifies that an upstream error reaches the caller as ModelErrorException with a bounded
+ * description, while the operational log keeps the status and leaves out the upstream body.
+ *
+ * <p>The backend URL and passthrough come from {@link BedrockProxyBackendProfile}, which this class
+ * shares with the other proxy classes that talk to a stand-in. The {@code fixture} model id is not
+ * in that profile's mapping, so it reaches the stand-in through passthrough.
+ */
 @QuarkusTest
-@TestProfile(BedrockProxyCancellationIntegrationTest.Profile.class)
+@TestProfile(BedrockProxyBackendProfile.class)
 class BedrockProxyLoggingIntegrationTest {
 
     @TestHTTPResource
@@ -43,7 +53,7 @@ class BedrockProxyLoggingIntegrationTest {
     @ValueSource(strings = {"converse", "converse-stream"})
     void upstreamErrorIsLoggedWithoutResponseBody(String operation) throws IOException {
         String marker = "synthetic-private-upstream-content";
-        HttpServer backend = HttpServer.create(new InetSocketAddress("127.0.0.1", 18939), 0);
+        HttpServer backend = HttpServer.create(new InetSocketAddress("127.0.0.1", PORT), 0);
         backend.createContext("/v1/chat/completions", exchange -> {
             exchange.getRequestBody().readAllBytes();
             byte[] body = ("{\"error\":\"" + marker + "\"}").getBytes(StandardCharsets.UTF_8);
@@ -80,7 +90,7 @@ class BedrockProxyLoggingIntegrationTest {
     @Test
     void streamingErrorBodyReadIsBoundedWithoutWaitingForEof() throws Exception {
         CountDownLatch release = new CountDownLatch(1);
-        HttpServer backend = HttpServer.create(new InetSocketAddress("127.0.0.1", 18939), 0);
+        HttpServer backend = HttpServer.create(new InetSocketAddress("127.0.0.1", PORT), 0);
         backend.createContext("/v1/chat/completions", exchange -> {
             exchange.getRequestBody().readAllBytes();
             exchange.sendResponseHeaders(503, 32768);

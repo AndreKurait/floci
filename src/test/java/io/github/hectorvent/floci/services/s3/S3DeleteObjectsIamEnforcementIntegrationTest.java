@@ -14,11 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.net.URI;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
@@ -42,10 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 class S3DeleteObjectsIamEnforcementIntegrationTest {
 
     private static final String ADMIN = "test";
-    private static final String REGION = "us-east-1";
     private static final String ACCOUNT = "000000000000";
-    private static final DateTimeFormatter AMZ_DATE =
-            DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
 
     @Inject
     IamService iamService;
@@ -428,16 +421,7 @@ class S3DeleteObjectsIamEnforcementIntegrationTest {
     }
 
     private static String presignedDeletePath(String bucket, String accessKeyId) {
-        String amzDate = AMZ_DATE.format(Instant.now());
-        String credential = URLEncoder.encode(
-                accessKeyId + "/" + amzDate.substring(0, 8) + "/" + REGION + "/s3/aws4_request", StandardCharsets.UTF_8);
-        return "/" + bucket + "?delete"
-                + "&X-Amz-Algorithm=AWS4-HMAC-SHA256"
-                + "&X-Amz-Credential=" + credential
-                + "&X-Amz-Date=" + amzDate
-                + "&X-Amz-Expires=3600"
-                + "&X-Amz-SignedHeaders=host"
-                + "&X-Amz-Signature=fakesig";
+        return "/" + bucket + "?delete&" + EnforcementFixtures.presignedQuery(accessKeyId, "s3");
     }
 
     private static String bucket(String prefix) {

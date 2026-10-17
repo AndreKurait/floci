@@ -2115,6 +2115,386 @@ class CodeArtifactServiceTest {
         verify(pypiserverClient, never()).deletePackage(any(), any(), any(), any(), any());
     }
 
+    // ----------------------------------------------------- copyPackageVersions
+
+    private void publishGeneric(String repository, String packageName, String version, byte[] content) {
+        service.publishPackageVersion(REGION, "dom", null, repository, "generic", "ns", packageName, version,
+                "a.txt", Digests.sha256Hex(content), "false", content);
+    }
+
+    @Test
+    void copyPackageVersionsCopiesEveryRequestedVersionAndTheyDescribeIdenticallyAtTheDestination() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        byte[] contentA = "version-a".getBytes(StandardCharsets.UTF_8);
+        byte[] contentB = "version-b".getBytes(StandardCharsets.UTF_8);
+        publishGeneric("src", "my-pkg", "1.0.0", contentA);
+        publishGeneric("src", "my-pkg", "2.0.0", contentB);
+
+        CodeArtifactService.CopyPackageVersionsResult result = service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0", "2.0.0"), null, false, false);
+
+        assertEquals(2, result.successfulVersions().size());
+        assertTrue(result.failedVersions().isEmpty());
+        assertEquals("Published", result.successfulVersions().get("1.0.0").status());
+        assertTrue(result.successfulVersions().get("1.0.0").revision() != null
+                && !result.successfulVersions().get("1.0.0").revision().isBlank());
+
+        PackageVersionAssetResult copied = service.getPackageVersionAsset(REGION, "dom", null, "dst", "generic",
+                "ns", "my-pkg", "1.0.0", "a.txt", null);
+        assertEquals("version-a", new String(copied.asset().getContent(), StandardCharsets.UTF_8));
+        // The destination's revision is its own, never the source's: see copyPackageVersions's
+        // own javadoc for why.
+        CodeArtifactPackageVersion sourcePv = service.describePackageVersion(REGION, "dom", null, "src", "generic",
+                "ns", "my-pkg", "1.0.0");
+        assertTrue(!sourcePv.getRevision().equals(result.successfulVersions().get("1.0.0").revision()));
+    }
+
+    @Test
+    void copyPackageVersionsRejectsBothVersionsAndVersionRevisionsTogether() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0"), Map.of("1.0.0", "rev"), false, false));
+        assertEquals("ValidationException", e.getErrorCode());
+    }
+
+    @Test
+    void copyPackageVersionsRejectsNeitherVersionsNorVersionRevisions() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of(), Map.of(), false, false));
+        assertEquals("ValidationException", e.getErrorCode());
+    }
+
+    @Test
+    void copyPackageVersionsRejectsANonGenericFormat() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "npm", null, "my-pkg", List.of("1.0.0"), null, false, false));
+        assertEquals("ValidationException", e.getErrorCode());
+    }
+
+    @Test
+    void copyPackageVersionsFailsNotFoundForAVersionMissingFromTheSourceRepository() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+
+        CodeArtifactService.CopyPackageVersionsResult result = service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("9.9.9"), null, false, false);
+        assertTrue(result.successfulVersions().isEmpty());
+        assertEquals("NOT_FOUND", result.failedVersions().get("9.9.9").errorCode());
+    }
+
+    /**
+     * AWS's own documented example (array-unique 0.2.0/5.6.7): one requested version missing from
+     * the source repository fails the whole call, and every other requested version that would
+     * otherwise have copied cleanly is reported SKIPPED instead of actually being copied.
+     */
+    @Test
+    void copyPackageVersionsSkipsAVersionThatWouldHaveSucceededWhenASiblingVersionIsNotFound() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        publishGeneric("src", "my-pkg", "1.0.0", "x".getBytes(StandardCharsets.UTF_8));
+
+        CodeArtifactService.CopyPackageVersionsResult result = service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0", "9.9.9"), null, false, false);
+
+        assertTrue(result.successfulVersions().isEmpty());
+        assertEquals("NOT_FOUND", result.failedVersions().get("9.9.9").errorCode());
+        assertEquals("SKIPPED", result.failedVersions().get("1.0.0").errorCode());
+        AwsException notCopied = assertThrows(AwsException.class, () -> service.describePackageVersion(REGION,
+                "dom", null, "dst", "generic", "ns", "my-pkg", "1.0.0"));
+        assertEquals("ResourceNotFoundException", notCopied.getErrorCode());
+    }
+
+    /**
+     * AWS's own documented example (array-unique 0.2.1 already identical in both repositories):
+     * a version that is already byte- and metadata-identical at the destination is a successful
+     * no-op, not copied again and not listed in either response map.
+     */
+    @Test
+    void copyPackageVersionsTreatsAByteIdenticalAlreadyPresentVersionAsANoOpNotListedEitherWay() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        byte[] content = "same-bytes".getBytes(StandardCharsets.UTF_8);
+        publishGeneric("src", "my-pkg", "1.0.0", content);
+        publishGeneric("dst", "my-pkg", "1.0.0", content);
+
+        CodeArtifactService.CopyPackageVersionsResult result = service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0"), null, false, false);
+
+        assertTrue(result.successfulVersions().isEmpty());
+        assertTrue(result.failedVersions().isEmpty());
+    }
+
+    /**
+     * AWS's own documented example (array-unique 0.3.2 present in both but different content):
+     * fails ALREADY_EXISTS without allowOverwrite.
+     */
+    @Test
+    void copyPackageVersionsFailsAlreadyExistsForADifferentVersionAlreadyAtTheDestinationWithoutAllowOverwrite() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        publishGeneric("src", "my-pkg", "1.0.0", "source-bytes".getBytes(StandardCharsets.UTF_8));
+        publishGeneric("dst", "my-pkg", "1.0.0", "different-bytes".getBytes(StandardCharsets.UTF_8));
+
+        CodeArtifactService.CopyPackageVersionsResult result = service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0"), null, false, false);
+
+        assertTrue(result.successfulVersions().isEmpty());
+        assertEquals("ALREADY_EXISTS", result.failedVersions().get("1.0.0").errorCode());
+    }
+
+    @Test
+    void copyPackageVersionsOverwritesADifferentExistingVersionWhenAllowOverwriteIsTrue() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        publishGeneric("src", "my-pkg", "1.0.0", "source-bytes".getBytes(StandardCharsets.UTF_8));
+        publishGeneric("dst", "my-pkg", "1.0.0", "different-bytes".getBytes(StandardCharsets.UTF_8));
+
+        CodeArtifactService.CopyPackageVersionsResult result = service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0"), null, true, false);
+
+        assertTrue(result.failedVersions().isEmpty());
+        assertEquals("Published", result.successfulVersions().get("1.0.0").status());
+        PackageVersionAssetResult overwritten = service.getPackageVersionAsset(REGION, "dom", null, "dst", "generic",
+                "ns", "my-pkg", "1.0.0", "a.txt", null);
+        assertEquals("source-bytes", new String(overwritten.asset().getContent(), StandardCharsets.UTF_8));
+    }
+
+    /**
+     * An allowOverwrite copy makes the destination's asset set exactly the source's: an asset the
+     * old destination version had that the source version does not is removed, not left behind
+     * unreferenced.
+     */
+    @Test
+    void copyPackageVersionsOverwriteRemovesAnAssetTheDestinationHadThatTheSourceDoesNot() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        byte[] sourceContent = "source-bytes".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "src", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
+                Digests.sha256Hex(sourceContent), "false", sourceContent);
+        byte[] destContent = "dest-only".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "dst", "generic", "ns", "my-pkg", "1.0.0", "b.txt",
+                Digests.sha256Hex(destContent), "false", destContent);
+
+        service.copyPackageVersions(REGION, "dom", null, "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0"),
+                null, true, false);
+
+        AwsException goneAsset = assertThrows(AwsException.class, () -> service.getPackageVersionAsset(REGION,
+                "dom", null, "dst", "generic", "ns", "my-pkg", "1.0.0", "b.txt", null));
+        assertEquals("ResourceNotFoundException", goneAsset.getErrorCode());
+        PackageVersionAssetResult kept = service.getPackageVersionAsset(REGION, "dom", null, "dst", "generic", "ns",
+                "my-pkg", "1.0.0", "a.txt", null);
+        assertEquals("source-bytes", new String(kept.asset().getContent(), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void copyPackageVersionsFailsMismatchedRevisionWhenTheVersionRevisionsEntryDoesNotMatchTheSource() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        publishGeneric("src", "my-pkg", "1.0.0", "x".getBytes(StandardCharsets.UTF_8));
+
+        CodeArtifactService.CopyPackageVersionsResult result = service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", null, Map.of("1.0.0", "not-the-real-revision"), false,
+                false);
+
+        assertTrue(result.successfulVersions().isEmpty());
+        assertEquals("MISMATCHED_REVISION", result.failedVersions().get("1.0.0").errorCode());
+    }
+
+    @Test
+    void copyPackageVersionsSucceedsWhenTheVersionRevisionsEntryMatchesTheSource() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        PublishPackageVersionResult published = service.publishPackageVersion(REGION, "dom", null, "src", "generic",
+                "ns", "my-pkg", "1.0.0", "a.txt", Digests.sha256Hex("x".getBytes(StandardCharsets.UTF_8)), "false",
+                "x".getBytes(StandardCharsets.UTF_8));
+
+        CodeArtifactService.CopyPackageVersionsResult result = service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", null,
+                Map.of("1.0.0", published.packageVersion().getRevision()), false, false);
+
+        assertTrue(result.failedVersions().isEmpty());
+        assertEquals("Published", result.successfulVersions().get("1.0.0").status());
+    }
+
+    @Test
+    void copyPackageVersionsRequiresNamespaceForGeneric() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", null, "my-pkg", List.of("1.0.0"), null, false, false));
+        assertEquals("ValidationException", e.getErrorCode());
+    }
+
+    @Test
+    void copyPackageVersionsRequiresTheSourceRepositoryToExist() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "no-such-repo", "dst", "generic", "ns", "my-pkg", List.of("1.0.0"), null, false, false));
+        assertEquals("ResourceNotFoundException", e.getErrorCode());
+    }
+
+    @Test
+    void copyPackageVersionsRequiresTheDestinationRepositoryToExist() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "no-such-repo", "generic", "ns", "my-pkg", List.of("1.0.0"), null, false, false));
+        assertEquals("ResourceNotFoundException", e.getErrorCode());
+    }
+
+    @Test
+    void copyPackageVersionsRejectsMoreThanOneHundredRequestedVersions() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        List<String> tooMany = new ArrayList<>();
+        for (int i = 0; i < 101; i++) {
+            tooMany.add("1.0." + i);
+        }
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", tooMany, null, false, false));
+        assertEquals("ValidationException", e.getErrorCode());
+    }
+
+    /**
+     * The 100-member cap AWS documents is on the request's own array, not on how many distinct
+     * versions remain after collapsing repeats: 101 entries that happen to repeat the same two
+     * versions must still be rejected, not quietly accepted because deduplication made the count
+     * look small.
+     */
+    @Test
+    void copyPackageVersionsRejectsMoreThanOneHundredRequestedVersionsEvenWhenMostAreDuplicates() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        List<String> tooManyWithDuplicates = new ArrayList<>();
+        for (int i = 0; i < 101; i++) {
+            tooManyWithDuplicates.add(i % 2 == 0 ? "1.0.0" : "2.0.0");
+        }
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", tooManyWithDuplicates, null, false, false));
+        assertEquals("ValidationException", e.getErrorCode());
+    }
+
+    @Test
+    void copyPackageVersionsRejectsAVersionRevisionsValueContainingWhitespace() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        publishGeneric("src", "my-pkg", "1.0.0", "x".getBytes(StandardCharsets.UTF_8));
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", null, Map.of("1.0.0", "rev with space"), false, false));
+        assertEquals("ValidationException", e.getErrorCode());
+    }
+
+    @Test
+    void copyPackageVersionsRejectsAVersionRevisionsValueOverFiftyCharacters() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        publishGeneric("src", "my-pkg", "1.0.0", "x".getBytes(StandardCharsets.UTF_8));
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", null, Map.of("1.0.0", "r".repeat(51)), false, false));
+        assertEquals("ValidationException", e.getErrorCode());
+    }
+
+    /**
+     * A caller-configured publish:BLOCK on the destination package does NOT gate
+     * CopyPackageVersions: the User Guide's own definition of the "Publish" origin control scopes
+     * it to direct publish "using package managers or similar tools," a mechanism Copy is not,
+     * and nothing in the API reference or the "Editing package origin controls" chapter ties the
+     * two together. A regression guard against re-adding that check without real evidence for it.
+     */
+    @Test
+    void copyPackageVersionsIgnoresADestinationBlockOnDirectPublishSinceCopyIsNotDirectPublish() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        publishGeneric("src", "my-pkg", "1.0.0", "x".getBytes(StandardCharsets.UTF_8));
+        service.putPackageOriginConfiguration(REGION, "dom", null, "dst", "generic", "ns", "my-pkg", "BLOCK",
+                "ALLOW");
+
+        CodeArtifactService.CopyPackageVersionsResult result = service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0"), null, false, false);
+        assertTrue(result.failedVersions().isEmpty());
+        assertEquals("Published", result.successfulVersions().get("1.0.0").status());
+    }
+
+    @Test
+    void copyPackageVersionsAllowsTheCallWhenTheDestinationPackageHasNoBlockingOriginConfiguration() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        publishGeneric("src", "my-pkg", "1.0.0", "x".getBytes(StandardCharsets.UTF_8));
+        service.putPackageOriginConfiguration(REGION, "dom", null, "dst", "generic", "ns", "my-pkg", "ALLOW",
+                "ALLOW");
+
+        CodeArtifactService.CopyPackageVersionsResult result = service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0"), null, false, false);
+        assertTrue(result.failedVersions().isEmpty());
+        assertEquals("Published", result.successfulVersions().get("1.0.0").status());
+    }
+
+    @Test
+    void copyPackageVersionsRejectsABlankVersionRevisionsValueAsAValidationErrorRatherThanAMismatch() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        publishGeneric("src", "my-pkg", "1.0.0", "x".getBytes(StandardCharsets.UTF_8));
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", null, Map.of("1.0.0", " "), false, false));
+        assertEquals("ValidationException", e.getErrorCode());
+    }
+
+    /**
+     * A caller-supplied duplicate requested version must be copied (and counted) exactly once,
+     * not reported or processed as though two separate versions were requested.
+     */
+    @Test
+    void copyPackageVersionsDeduplicatesARepeatedRequestedVersion() {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        publishGeneric("src", "my-pkg", "1.0.0", "x".getBytes(StandardCharsets.UTF_8));
+
+        CodeArtifactService.CopyPackageVersionsResult result = service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0", "1.0.0"), null, false, false);
+
+        assertEquals(1, result.successfulVersions().size());
+        assertTrue(result.failedVersions().isEmpty());
+    }
+
     @Test
     void getPackageVersionAssetReturnsExactBytesAndValidatesRevision() {
         service.createDomain(REGION, "dom", null, Map.of());

@@ -25,7 +25,9 @@ import static org.hamcrest.Matchers.not;
  * and the other POST operations, which no rule mapped, the multipart operations that were checked as
  * a plain read or delete, the object-lock operations, the version actions a versionId selects, and
  * the bucket configurations. A request naming several sub-resources is checked as the one S3 runs,
- * and the version actions carry the version id and the version's tags.
+ * and the version actions carry the version id and the version's tags. An operation also needs the
+ * actions it requires besides its own: an object creation those of the settings it applies,
+ * GetObjectAttributes its own action beside the read, and a governance bypass its permission.
  */
 @QuarkusTest
 @TestProfile(IamEnforcementProfile.class)
@@ -176,6 +178,216 @@ class S3ObjectOperationsIamEnforcementIntegrationTest {
         f.policy(f.allow("s3:PutObjectRetention", "s3:GetObjectRetention"));
         f.putRetention("a/locked", "2031-01-01T00:00:00Z").statusCode(200);
         f.user().queryParam("retention", "").when().get(f.path("a/locked")).then().statusCode(200);
+    }
+
+    @Test
+    void bypassingGovernanceRetentionNeedsBypassGovernanceRetention() {
+        Fixture f = new Fixture("bypass", true);
+        f.seed("a/governed");
+        f.admin().queryParam("retention", "")
+                .body(retention("2031-01-01T00:00:00Z"))
+                .when().put(f.path("a/governed")).then().statusCode(200);
+
+        f.policy(f.allow("s3:PutObjectRetention"));
+        denied(f.putRetention("a/governed", "2030-01-01T00:00:00Z", true), "s3:BypassGovernanceRetention");
+
+        f.policy(f.allow("s3:PutObjectRetention", "s3:BypassGovernanceRetention"));
+        f.putRetention("a/governed", "2030-01-01T00:00:00Z", true).statusCode(200);
+    }
+
+    @Test
+    void deletingWithTheBypassNeedsBypassGovernanceRetention() {
+        // The DeleteObject API reference: "To use this header, you must have the
+        // s3:BypassGovernanceRetention permission", whether or not the request names a version.
+        Fixture f = new Fixture("delete-bypass", true);
+        String versionId = f.seedVersion("a/governed");
+        f.admin().queryParam("retention", "").queryParam("versionId", versionId)
+                .body(retention("2031-01-01T00:00:00Z"))
+                .when().put(f.path("a/governed")).then().statusCode(200);
+
+        f.policy(f.allow("s3:DeleteObject", "s3:DeleteObjectVersion"));
+        denied(f.user().header("x-amz-bypass-governance-retention", "true")
+                .when().delete(f.path("a/governed")).then(), "s3:BypassGovernanceRetention");
+        denied(f.user().header("x-amz-bypass-governance-retention", "true").queryParam("versionId", versionId)
+                .when().delete(f.path("a/governed")).then(), "s3:BypassGovernanceRetention");
+
+        f.policy(f.allow("s3:DeleteObjectVersion", "s3:BypassGovernanceRetention"));
+        f.user().header("x-amz-bypass-governance-retention", "true").queryParam("versionId", versionId)
+                .when().delete(f.path("a/governed")).then().statusCode(204);
+    }
+
+    @Test
+    void deletingAnAnnotationWithTheBypassHeaderNeedsNoBypassPermission() {
+        // The user guide: "The BypassGovernanceRetention permission does not apply to annotation
+        // operations."
+        Fixture f = new Fixture("annotation-bypass", false);
+        f.seed("a/doc");
+        f.admin().queryParam("annotation", "").queryParam("annotationName", "labels").body("x")
+                .when().put(f.path("a/doc")).then().statusCode(200);
+
+        f.policy(f.allow("s3:DeleteObjectAnnotation"));
+        f.annotation(null).header("x-amz-bypass-governance-retention", "true")
+                .when().delete(f.path("a/doc")).then().statusCode(204);
+    }
+
+    @Test
+    void getObjectAttributesNeedsItsOwnActionAndTheRead() {
+        // The API reference: s3:GetObject and s3:GetObjectAttributes, or for a version
+        // s3:GetObjectVersion and s3:GetObjectVersionAttributes.
+        Fixture f = new Fixture("attributes", true);
+        String versionId = f.seedVersion("a/doc");
+
+        f.policy(f.allow("s3:GetObject", "s3:GetObjectVersion"));
+        denied(f.attributes("a/doc", null), "s3:GetObjectAttributes");
+        denied(f.attributes("a/doc", versionId), "s3:GetObjectVersionAttributes");
+
+        f.policy(f.allow("s3:GetObjectAttributes", "s3:GetObjectVersionAttributes"));
+        denied(f.attributes("a/doc", null), "s3:GetObject");
+        denied(f.attributes("a/doc", versionId), "s3:GetObjectVersion");
+
+        f.policy(f.allow("s3:GetObject", "s3:GetObjectAttributes"));
+        f.attributes("a/doc", null).statusCode(200);
+        f.policy(f.allow("s3:GetObjectVersion", "s3:GetObjectVersionAttributes"));
+        f.attributes("a/doc", versionId).statusCode(200);
+    }
+
+    @Test
+    void anObjectCreatedWithTagsOrAnAclNeedsThoseActionsToo() {
+        // The permissions table: s3:PutObjectTagging and s3:PutObjectAcl are conditionally required
+        // for PutObject, CopyObject and CreateMultipartUpload.
+        Fixture f = new Fixture("create-extras", false);
+        f.seed("a/source");
+
+        f.policy(f.allow("s3:PutObject", "s3:GetObject"));
+        f.user().body("plain").when().put(f.path("a/plain")).then().statusCode(200);
+        denied(f.user().header("x-amz-tagging", "env=a").body("tagged").when().put(f.path("a/tagged")).then(),
+                "s3:PutObjectTagging");
+        denied(f.user().header("x-amz-acl", "bucket-owner-full-control").body("acl")
+                .when().put(f.path("a/acl")).then(), "s3:PutObjectAcl");
+        denied(f.user().header("x-amz-grant-read", "id=000000000000").body("grant")
+                .when().put(f.path("a/grant")).then(), "s3:PutObjectAcl");
+        denied(f.user().header("x-amz-tagging", "env=a").queryParam("uploads", "")
+                .when().post(f.path("a/upload")).then(), "s3:PutObjectTagging");
+        denied(f.user().header("x-amz-acl", "private").queryParam("uploads", "")
+                .when().post(f.path("a/upload")).then(), "s3:PutObjectAcl");
+        denied(f.copy().header("x-amz-tagging-directive", "REPLACE").header("x-amz-tagging", "env=a")
+                .when().put(f.path("a/copy")).then(), "s3:PutObjectTagging");
+        denied(f.copy().header("x-amz-tagging-directive", "REPLACE").header("x-amz-acl", "private")
+                .when().put(f.path("a/copy")).then(), "s3:PutObjectAcl");
+        // Without REPLACE a copy puts the source's tags on the new object, so a tagged source needs
+        // the tagging action too, and an untagged one does not, whatever tags the request sends.
+        denied(f.copy().when().put(f.path("a/copy")).then(), "s3:PutObjectTagging");
+        f.admin().body("untagged").when().put(f.path("a/untagged")).then().statusCode(200);
+        f.copyOf("a/untagged").header("x-amz-tagging", "env=a").when().put(f.path("a/copy")).then()
+                .statusCode(200);
+
+        f.policy(f.allow("s3:PutObject", "s3:GetObject", "s3:PutObjectTagging", "s3:PutObjectAcl"));
+        f.user().header("x-amz-tagging", "env=a").body("tagged").when().put(f.path("a/tagged")).then()
+                .statusCode(200);
+        f.user().header("x-amz-acl", "bucket-owner-full-control").body("acl").when().put(f.path("a/acl")).then()
+                .statusCode(200);
+        f.copy().header("x-amz-tagging-directive", "REPLACE").header("x-amz-tagging", "env=a")
+                .when().put(f.path("a/copy")).then().statusCode(200);
+        f.copy().when().put(f.path("a/copied-tags")).then().statusCode(200);
+        f.admin().queryParam("tagging", "").when().get(f.path("a/copied-tags")).then()
+                .statusCode(200).body(containsString("<Value>a</Value>"));
+    }
+
+    @Test
+    void aCopyIsNotAuthorizedByTheTagsItIgnores() {
+        // Under the default COPY directive a copy ignores x-amz-tagging, so the tags it names cannot
+        // satisfy a condition on the new object's tags, on s3:PutObject or on an extra action.
+        Fixture f = new Fixture("copy-ignored-tags", false);
+        f.admin().body("untagged").when().put(f.path("a/untagged")).then().statusCode(200);
+        String taggedB = "{\"StringEquals\":{\"s3:RequestObjectTag/env\":\"b\"}}";
+
+        f.policy(f.allow("s3:GetObject") + "," + f.allowWhen(taggedB, "s3:PutObject"));
+        denied(f.copyOf("a/untagged").header("x-amz-tagging", "env=b").when().put(f.path("a/copy")).then(),
+                "s3:PutObject");
+
+        f.policy(f.allow("s3:GetObject", "s3:PutObject") + ","
+                + f.allowWhen(taggedB, "s3:PutObjectAcl", "s3:PutObjectTagging"));
+        denied(f.copyOf("a/untagged").header("x-amz-tagging", "env=b").header("x-amz-acl", "bucket-owner-full-control")
+                .when().put(f.path("a/copy")).then(), "s3:PutObjectAcl");
+        f.copyOf("a/untagged").header("x-amz-tagging-directive", "REPLACE").header("x-amz-tagging", "env=b")
+                .header("x-amz-acl", "bucket-owner-full-control").when().put(f.path("a/copy")).then().statusCode(200);
+    }
+
+    @Test
+    void aPresignedCopyOfATaggedSourceNeedsTheTaggingActionToo() {
+        // The source's tags are checked against the presigned URL's credential, as a signed copy's
+        // are against its Authorization header, and an empty header does not shed that credential.
+        Fixture f = new Fixture("presigned-copy", false);
+        f.seed("a/source");
+        String source = "/" + f.bucket + "/a/source";
+
+        f.policy(f.allow("s3:PutObject", "s3:GetObject"));
+        denied(f.presigned().header("x-amz-copy-source", source)
+                .when().put(f.presignedPath("a/copy")).then(), "s3:PutObjectTagging");
+        denied(f.presigned().header("Authorization", "").header("x-amz-copy-source", source)
+                .when().put(f.presignedPath("a/copy")).then(), "s3:PutObjectTagging");
+
+        f.policy(f.allow("s3:PutObject", "s3:GetObject", "s3:PutObjectTagging"));
+        f.presigned().header("x-amz-copy-source", source)
+                .when().put(f.presignedPath("a/copy")).then().statusCode(200);
+    }
+
+    @Test
+    void aCopyFromAMissingSourceIsReportedMissing() {
+        // A source that is not there has no tags to check, and the copy answers for it.
+        Fixture f = new Fixture("copy-missing", false);
+        f.policy(f.allow("s3:PutObject", "s3:GetObject"));
+        f.copyOf("a/missing").when().put(f.path("a/copy")).then()
+                .statusCode(404).body(containsString("NoSuchKey"));
+    }
+
+    @Test
+    void anObjectCreatedWithObjectLockSettingsNeedsTheirActions() {
+        // The permissions table: s3:PutObjectRetention and s3:PutObjectLegalHold are conditionally
+        // required for PutObject, CopyObject and CreateMultipartUpload.
+        Fixture f = new Fixture("create-lock", true);
+
+        f.policy(f.allow("s3:PutObject"));
+        denied(f.user().header("x-amz-object-lock-mode", "GOVERNANCE")
+                .header("x-amz-object-lock-retain-until-date", "2031-01-01T00:00:00Z").body("locked")
+                .when().put(f.path("a/retained")).then(), "s3:PutObjectRetention");
+        denied(f.user().header("x-amz-object-lock-legal-hold", "OFF").body("held")
+                .when().put(f.path("a/held")).then(), "s3:PutObjectLegalHold");
+        denied(f.user().header("x-amz-object-lock-legal-hold", "OFF").queryParam("uploads", "")
+                .when().post(f.path("a/upload")).then(), "s3:PutObjectLegalHold");
+
+        f.policy(f.allow("s3:PutObject", "s3:PutObjectRetention", "s3:PutObjectLegalHold"));
+        f.user().header("x-amz-object-lock-mode", "GOVERNANCE")
+                .header("x-amz-object-lock-retain-until-date", "2031-01-01T00:00:00Z").body("locked")
+                .when().put(f.path("a/retained")).then().statusCode(200);
+        f.user().header("x-amz-object-lock-legal-hold", "OFF").body("held")
+                .when().put(f.path("a/held")).then().statusCode(200);
+    }
+
+    @Test
+    void objectLockConditionKeysLimitWhatARequestMaySet() {
+        // The keys come from the retention and legal-hold bodies, and from an object creation's
+        // headers, which reach the extra actions it is checked as.
+        Fixture f = new Fixture("lock-keys", true);
+        f.seed("a/locked");
+        f.policy(f.allow("s3:PutObject", "s3:PutObjectRetention", "s3:PutObjectLegalHold") + ","
+                + "{\"Effect\":\"Deny\",\"Action\":\"s3:PutObjectRetention\",\"Resource\":\"arn:aws:s3:::"
+                + f.bucket + "/*\",\"Condition\":{\"DateGreaterThan\":"
+                + "{\"s3:object-lock-retain-until-date\":\"2035-01-01T00:00:00Z\"}}},"
+                + "{\"Effect\":\"Deny\",\"Action\":\"s3:PutObjectLegalHold\",\"Resource\":\"arn:aws:s3:::"
+                + f.bucket + "/*\",\"Condition\":{\"StringEquals\":{\"s3:object-lock-legal-hold\":\"ON\"}}}");
+
+        denied(f.putRetention("a/locked", "2036-01-01T00:00:00Z"), "s3:PutObjectRetention");
+        f.putRetention("a/locked", "2031-01-01T00:00:00Z").statusCode(200);
+        denied(f.legalHold("a/locked", "ON"), "s3:PutObjectLegalHold");
+        f.legalHold("a/locked", "OFF").statusCode(200);
+
+        denied(f.user().header("x-amz-object-lock-mode", "GOVERNANCE")
+                .header("x-amz-object-lock-retain-until-date", "2036-01-01T00:00:00Z").body("locked")
+                .when().put(f.path("a/created")).then(), "s3:PutObjectRetention");
+        f.user().header("x-amz-object-lock-mode", "GOVERNANCE")
+                .header("x-amz-object-lock-retain-until-date", "2031-01-01T00:00:00Z").body("locked")
+                .when().put(f.path("a/created")).then().statusCode(200);
     }
 
     @Test
@@ -510,7 +722,48 @@ class S3ObjectOperationsIamEnforcementIntegrationTest {
         }
 
         ValidatableResponse putRetention(String key, String until) {
-            return user().queryParam("retention", "").body(retention(until)).when().put(path(key)).then();
+            return putRetention(key, until, false);
+        }
+
+        ValidatableResponse putRetention(String key, String until, boolean bypass) {
+            RequestSpecification request = user().queryParam("retention", "").body(retention(until));
+            if (bypass) {
+                request = request.header("x-amz-bypass-governance-retention", "true");
+            }
+            return request.when().put(path(key)).then();
+        }
+
+        ValidatableResponse legalHold(String key, String status) {
+            return user().queryParam("legal-hold", "")
+                    .body("<LegalHold><Status>" + status + "</Status></LegalHold>")
+                    .when().put(path(key)).then();
+        }
+
+        ValidatableResponse attributes(String key, String versionId) {
+            RequestSpecification request = user().queryParam("attributes", "")
+                    .header("x-amz-object-attributes", "ETag");
+            if (versionId != null) {
+                request = request.queryParam("versionId", versionId);
+            }
+            return request.when().get(path(key)).then();
+        }
+
+        /** A user CopyObject request from the seeded {@code a/source}. */
+        RequestSpecification copy() {
+            return copyOf("a/source");
+        }
+
+        RequestSpecification copyOf(String key) {
+            return user().header("x-amz-copy-source", "/" + bucket + "/" + key);
+        }
+
+        /** A request the user presigns with {@link #presignedPath}, which carries its credential. */
+        RequestSpecification presigned() {
+            return given().urlEncodingEnabled(false);
+        }
+
+        String presignedPath(String key) {
+            return path(key) + "?" + EnforcementFixtures.presignedQuery(accessKeyId, "s3");
         }
 
         /**

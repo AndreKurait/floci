@@ -27,6 +27,9 @@ import org.mockito.ArgumentCaptor;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -48,6 +51,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class IamConditionContextResolverTest {
+
+    private static final Instant LOCK_NOW = Instant.parse("2026-01-01T00:00:00Z");
 
     private final ObjectMapper mapper = new ObjectMapper();
     private DynamoDbService dynamoDbService;
@@ -313,6 +318,48 @@ class IamConditionContextResolverTest {
             assertEquals(List.of("a"), resolver.resolve("s3", action, s3Request("/bucket/object", ""))
                     .get("s3:ExistingObjectTag/env"), action);
         }
+    }
+
+    @Test
+    void objectLockKeysComeFromTheHeadersOfTheObjectCreated() {
+        ContainerRequestContext request = s3Request("/bucket/object", "");
+        when(request.getHeaderString("x-amz-object-lock-mode")).thenReturn("GOVERNANCE");
+        when(request.getHeaderString("x-amz-object-lock-retain-until-date")).thenReturn("2026-01-11T00:00:00Z");
+        when(request.getHeaderString("x-amz-object-lock-legal-hold")).thenReturn("ON");
+        Map<String, List<String>> conditions = resolverAt(LOCK_NOW).resolve("s3", "s3:PutObject", request);
+        assertEquals(List.of("GOVERNANCE"), conditions.get("s3:object-lock-mode"));
+        assertEquals(List.of("2026-01-11T00:00:00Z"), conditions.get("s3:object-lock-retain-until-date"));
+        assertEquals(List.of("10"), conditions.get("s3:object-lock-remaining-retention-days"));
+        assertEquals(List.of("ON"), conditions.get("s3:object-lock-legal-hold"));
+    }
+
+    @Test
+    void remainingRetentionDaysCountAPartDayAsAWholeOne() {
+        assertEquals(List.of("10"), remainingRetentionDays("2026-01-11T00:00:00Z"));
+        assertEquals(List.of("11"), remainingRetentionDays("2026-01-11T00:00:01Z"));
+        assertEquals(List.of("1"), remainingRetentionDays("2026-01-01T00:00:01Z"));
+        assertEquals(List.of("0"), remainingRetentionDays("2025-12-31T00:00:00Z"));
+        assertNull(remainingRetentionDays("not-a-date"), "a date S3 would not parse offers no count");
+    }
+
+    @Test
+    void legalHoldStatusComesFromTheBody() {
+        ContainerRequestContext request = s3Request("/bucket/object", "<LegalHold><Status>OFF</Status></LegalHold>");
+        assertEquals(Map.of("s3:object-lock-legal-hold", List.of("OFF")),
+                resolver.resolve("s3", "s3:PutObjectLegalHold", request));
+    }
+
+    private List<String> remainingRetentionDays(String until) {
+        ContainerRequestContext request = s3Request("/bucket/object",
+                "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>" + until + "</RetainUntilDate></Retention>");
+        return resolverAt(LOCK_NOW).resolve("s3", "s3:PutObjectRetention", request)
+                .get("s3:object-lock-remaining-retention-days");
+    }
+
+    @SuppressWarnings("unchecked")
+    private IamConditionContextResolver resolverAt(Instant now) {
+        return new IamConditionContextResolver(mock(Instance.class), mock(Instance.class), mock(Instance.class),
+                mock(Instance.class), requestContext, config, Clock.fixed(now, ZoneOffset.UTC));
     }
 
     @Test

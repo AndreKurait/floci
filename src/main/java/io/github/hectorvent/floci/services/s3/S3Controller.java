@@ -107,6 +107,9 @@ public class S3Controller {
             "ObjectLockConfigurationNotFoundError", "OwnershipControlsNotFoundError",
             "ReplicationConfigurationNotFoundError");
 
+    /** The errors S3Service answers a read of an object that is not there with. */
+    private static final Set<String> MISSING_OBJECT_ERRORS = Set.of("NoSuchBucket", "NoSuchKey", "NoSuchVersion");
+
     private static final Logger LOG = Logger.getLogger(S3Controller.class);
     private static final DateTimeFormatter ISO_FORMAT = DateTimeFormatter
             .ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'")
@@ -1719,14 +1722,7 @@ public class S3Controller {
         S3Service.RequestAuthorization authorization = S3RequestAuthorizationParser.parseIfRequired(
                 s3Service.isAuthEnforced(), httpHeaders, uriInfo);
         s3Service.authorizeSignedRequest(authorization);
-        // A blank header counts as absent, as it does in IamEnforcementFilter.filter(), so a presigned
-        // request cannot shed its query credential, and with it every per-key check, by adding one.
-        String authorizationHeader = httpHeaders.getHeaderString("Authorization");
-        if (authorizationHeader != null && authorizationHeader.isBlank()) {
-            authorizationHeader = null;
-        }
-        String iamCredential = IamEnforcementFilter.requestAuthorization(
-                authorizationHeader, uriInfo.getQueryParameters());
+        String iamCredential = iamCredential(httpHeaders, uriInfo);
         List<XmlParser.KeyVersion> authorizedEntries = new ArrayList<>();
         List<S3Service.DeleteError> authorizationErrors = new ArrayList<>();
         for (XmlParser.KeyVersion entry : entries) {
@@ -3072,6 +3068,7 @@ public class S3Controller {
         CopySourceRef sourceObject = parseCopySource(copySource);
         String sourceBucket = sourceObject.bucket();
         authorizeCopySourceRead(httpHeaders, sourceObject, authorization);
+        authorizeCopiedTags(httpHeaders, uriInfo, sourceObject, destBucket, destKey, authorization);
         String copyContentEncoding = toPersistedContentEncoding(httpHeaders.getHeaderString("Content-Encoding"));
         String copyContentDisposition = httpHeaders.getHeaderString("Content-Disposition");
         String copyCacheControl = httpHeaders.getHeaderString("Cache-Control");
@@ -4394,6 +4391,56 @@ public class S3Controller {
                 resourcePolicyEvaluation.decision(), resourcePolicyEvaluation.resourceOwnerAccountId());
         s3Service.authorizeGetObject(
                 source.bucket(), source.objectKey(), source.versionId(), authorization);
+    }
+
+    /**
+     * A copy under the default {@code COPY} tagging directive gives the new object the source's tags,
+     * and the permissions table makes a copy that puts the object with tags need s3:PutObjectTagging
+     * on the destination, as an object created with tags does. IamEnforcementFilter checks the tags a
+     * request sends; only the source tells whether a copy carries any, so this checks them here, once
+     * {@link #authorizeCopySourceRead} has allowed the source to be read. The source is read only when
+     * IAM enforcement is on and the request names a credential, the header's or a presigned URL's.
+     */
+    private void authorizeCopiedTags(HttpHeaders httpHeaders, UriInfo uriInfo, CopySourceRef source,
+                                     String destBucket, String destKey, S3Service.RequestAuthorization authorization) {
+        String credential = iamCredential(httpHeaders, uriInfo);
+        if (!config.services().iam().enforcementEnabled() || credential == null
+                || "REPLACE".equalsIgnoreCase(httpHeaders.getHeaderString("x-amz-tagging-directive"))) {
+            return;
+        }
+        Map<String, String> sourceTags;
+        try {
+            sourceTags = s3Service.getObjectTagging(source.bucket(), source.objectKey(), source.versionId());
+        } catch (AwsException e) {
+            if (!MISSING_OBJECT_ERRORS.contains(e.getErrorCode())) {
+                throw e;
+            }
+            // A missing source has no tags to copy, and the copy reports it missing.
+            return;
+        }
+        if (sourceTags.isEmpty()) {
+            return;
+        }
+        String action = "s3:PutObjectTagging";
+        String resource = S3PublicAccessEvaluator.objectArn(s3Service.bucketPartition(destBucket), destBucket, destKey);
+        S3Service.SignedPrincipalResourcePolicyEvaluation resourcePolicyEvaluation =
+                s3Service.signedPrincipalResourcePolicyDecision(destBucket, action, resource, authorization);
+        iamEnforcementFilter.authorizeAdditionalResource(credential, action, resource,
+                resourcePolicyEvaluation.decision(), resourcePolicyEvaluation.resourceOwnerAccountId());
+    }
+
+    /**
+     * The credential IAM evaluates a check S3Controller makes itself against: the Authorization header,
+     * or a presigned request's query credential. A blank header counts as absent, as it does in
+     * IamEnforcementFilter.filter(), so a presigned request cannot shed its query credential, and with
+     * it the check, by adding one.
+     */
+    private static String iamCredential(HttpHeaders httpHeaders, UriInfo uriInfo) {
+        String authorizationHeader = httpHeaders.getHeaderString("Authorization");
+        if (authorizationHeader != null && authorizationHeader.isBlank()) {
+            authorizationHeader = null;
+        }
+        return IamEnforcementFilter.requestAuthorization(authorizationHeader, uriInfo.getQueryParameters());
     }
 
     /**

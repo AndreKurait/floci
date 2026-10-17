@@ -1,8 +1,8 @@
 package io.github.hectorvent.floci.services.bedrockruntime;
 
+import io.github.hectorvent.floci.testing.BedrockProxyBackendProfile;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.Test;
 
@@ -17,17 +17,26 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import static io.github.hectorvent.floci.testing.BedrockProxyBackendProfile.PORT;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/**
+ * Verifies that a caller who disconnects closes the upstream request, whether the upstream has
+ * sent nothing yet, part of a response, or one streamed token.
+ *
+ * <p>The backend URL and passthrough come from {@link BedrockProxyBackendProfile}, which this class
+ * shares with the other proxy classes that talk to a stand-in. The {@code fixture} model id is not
+ * in that profile's mapping, so it reaches the stand-in through passthrough. The profile keeps the
+ * default 60-second request timeout, far longer than these tests wait, so only the disconnect can
+ * close an upstream that stalls before its headers.
+ */
 @QuarkusTest
-@TestProfile(BedrockProxyCancellationIntegrationTest.Profile.class)
+@TestProfile(BedrockProxyBackendProfile.class)
 class BedrockProxyCancellationIntegrationTest {
-    private static final int PORT = 18939;
     @TestHTTPResource
     URI base;
 
@@ -167,15 +176,6 @@ class BedrockProxyCancellationIntegrationTest {
                 upstream.interrupt();
                 upstream.join(1000);
             }
-        }
-    }
-
-    public static final class Profile implements QuarkusTestProfile {
-        @Override
-        public Map<String, String> getConfigOverrides() {
-            return Map.of("floci.services.bedrock-runtime.backend", "proxy",
-                "floci.services.bedrock-runtime.proxy.url", "http://127.0.0.1:" + PORT + "/v1",
-                "floci.services.bedrock-runtime.proxy.passthrough", "true");
         }
     }
 }

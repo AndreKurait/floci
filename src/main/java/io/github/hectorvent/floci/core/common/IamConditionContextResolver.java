@@ -28,6 +28,7 @@ import java.io.InputStream;
 import java.net.URLDecoder;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -70,6 +71,10 @@ public class IamConditionContextResolver {
     public static final String REQUEST_OBJECT_TAG_PREFIX = "s3:RequestObjectTag/";
     public static final String REQUEST_OBJECT_TAG_KEYS = "s3:RequestObjectTagKeys";
     public static final String VERSION_ID = "s3:versionid";
+    public static final String OBJECT_LOCK_MODE = "s3:object-lock-mode";
+    public static final String OBJECT_LOCK_RETAIN_UNTIL_DATE = "s3:object-lock-retain-until-date";
+    public static final String OBJECT_LOCK_REMAINING_RETENTION_DAYS = "s3:object-lock-remaining-retention-days";
+    public static final String OBJECT_LOCK_LEGAL_HOLD = "s3:object-lock-legal-hold";
 
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
@@ -77,7 +82,12 @@ public class IamConditionContextResolver {
     private final Instance<CloudWatchLogsService> logsService;
     private final RequestContext requestContext;
     private final EmulatorConfig config;
+    private final Clock clock;
 
+    /**
+     * The system clock, not the CDI one: Object Lock's remaining retention days has to count from the
+     * same now as S3Service, which checks retention against {@code Instant.now()}.
+     */
     @Inject
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
@@ -85,12 +95,23 @@ public class IamConditionContextResolver {
                                        Instance<CloudWatchLogsService> logsService,
                                        RequestContext requestContext,
                                        EmulatorConfig config) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, requestContext, config, Clock.systemUTC());
+    }
+
+    IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<CloudWatchLogsService> logsService,
+                                RequestContext requestContext,
+                                EmulatorConfig config,
+                                Clock clock) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
         this.logsService = logsService;
         this.requestContext = requestContext;
         this.config = config;
+        this.clock = clock;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
@@ -290,11 +311,26 @@ public class IamConditionContextResolver {
                  "s3:ListObjectAnnotations", "s3:ListObjectVersionAnnotations", "s3:PutObjectAnnotation",
                  "s3:PutObjectVersionAnnotation", "s3:DeleteObjectAnnotation",
                  "s3:DeleteObjectVersionAnnotation" -> s3ExistingObjectTagConditionContext(ctx);
-            case "s3:PutObject" -> s3RequestObjectTagConditionContext(ctx);
+            // The Object Lock keys come from what the request sets: an object creation's headers, the
+            // retention and legal-hold bodies.
+            case "s3:PutObject" -> S3ObjectActions.objectCreationConditions(
+                    ctx::getHeaderString, s3RequestTagging(ctx), clock.instant());
+            case "s3:PutObjectRetention" -> {
+                String body = bodyText(ctx);
+                yield S3ObjectActions.objectLockConditions(XmlParser.extractFirst(body, "Mode", null),
+                        XmlParser.extractFirst(body, "RetainUntilDate", null), null, clock.instant());
+            }
+            case "s3:PutObjectLegalHold" -> S3ObjectActions.objectLockConditions(null, null,
+                    XmlParser.extractFirst(bodyText(ctx), "Status", null), clock.instant());
             case "s3:PutObjectTagging", "s3:PutObjectVersionTagging" -> merge(
                     s3ExistingObjectTagConditionContext(ctx), s3PutObjectTaggingBodyConditionContext(ctx));
             default -> null;
         };
+    }
+
+    private static String bodyText(ContainerRequestContext ctx) {
+        byte[] body = bufferEntity(ctx);
+        return body == null ? null : new String(body, StandardCharsets.UTF_8);
     }
 
     /**
@@ -334,37 +370,16 @@ public class IamConditionContextResolver {
     }
 
     /**
-     * {@code s3:RequestObjectTag/<key>} from a PutObject's {@code x-amz-tagging} header, or the
-     * query parameter where a presigner may place it. The header takes precedence, including
-     * an empty header, matching the source the S3 controller applies to the object.
+     * A PutObject's {@code x-amz-tagging}: the header, or the query parameter where a presigner may
+     * place it. The header takes precedence, including an empty header, matching the source the S3
+     * controller applies to the object.
      */
-    private Map<String, List<String>> s3RequestObjectTagConditionContext(ContainerRequestContext ctx) {
+    private static String s3RequestTagging(ContainerRequestContext ctx) {
         String header = ctx.getHeaderString("x-amz-tagging");
         if (header == null && ctx.getUriInfo() != null) {
             header = ctx.getUriInfo().getQueryParameters().getFirst("x-amz-tagging");
         }
-        if (header == null || header.isBlank()) {
-            return null;
-        }
-        Map<String, List<String>> conditions = new LinkedHashMap<>();
-        Set<String> requestedKeys = new LinkedHashSet<>();
-        for (String pair : header.split("&")) {
-            int eq = pair.indexOf('=');
-            if (eq <= 0) {
-                continue;
-            }
-            String name = urlDecode(pair.substring(0, eq));
-            String value = urlDecode(pair.substring(eq + 1));
-            if (name == null || value == null) {
-                continue;
-            }
-            conditions.put(REQUEST_OBJECT_TAG_PREFIX + name, List.of(value));
-            requestedKeys.add(name);
-        }
-        if (!requestedKeys.isEmpty()) {
-            conditions.put(REQUEST_OBJECT_TAG_KEYS, new ArrayList<>(requestedKeys));
-        }
-        return conditions.isEmpty() ? null : conditions;
+        return header;
     }
 
     /** {@code s3:RequestObjectTag/<key>} from the {@code <Tagging>} XML body of PutObjectTagging. */
@@ -394,21 +409,6 @@ public class IamConditionContextResolver {
         Map<String, List<String>> merged = new LinkedHashMap<>(a);
         merged.putAll(b);
         return merged;
-    }
-
-    /**
-     * Null for a value {@code URLDecoder} refuses, such as the {@code %zz} of a malformed
-     * {@code x-amz-tagging} header. The caller drops the pair rather than letting the
-     * {@code IllegalArgumentException} out of the filter, where it becomes a 500 in place of the
-     * 400 {@code InvalidTag} the handler returns for the same header.
-     */
-    private static String urlDecode(String value) {
-        try {
-            return URLDecoder.decode(value, StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException e) {
-            LOG.debugv(e, "Undecodable tag component in the IAM condition context: {0}", value);
-            return null;
-        }
     }
 
     /** The object key of a path-style (or filter-rewritten) S3 path, null for a bucket-level one. */

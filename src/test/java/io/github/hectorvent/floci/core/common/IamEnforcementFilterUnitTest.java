@@ -94,6 +94,16 @@ class IamEnforcementFilterUnitTest {
     }
 
     @Test
+    void extraActionChecks_emitAsTheOperationTheyRefuse() {
+        assertEquals("PutObjectRetention",
+                IamEnforcementFilter.mapS3ActionToEventName("s3:PutObjectRetention", "PUT"));
+        assertEquals("GetObjectAttributes",
+                IamEnforcementFilter.mapS3ActionToEventName("s3:GetObjectAttributes", "GET"));
+        assertEquals("GetObjectAttributes",
+                IamEnforcementFilter.mapS3ActionToEventName("s3:GetObjectVersionAttributes", "GET"));
+    }
+
+    @Test
     void postOperations_returnNullRatherThanTheWrongName() {
         // CreateMultipartUpload and CompleteMultipartUpload are checked as s3:PutObject, and
         // SelectObjectContent as s3:GetObject; neither name is the operation that ran.

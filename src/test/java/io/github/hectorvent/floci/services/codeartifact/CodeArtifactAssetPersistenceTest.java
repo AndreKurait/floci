@@ -463,6 +463,48 @@ class CodeArtifactAssetPersistenceTest {
         }
     }
 
+    /**
+     * Found by Qodo review: {@code copyPackageVersions} used to read and write each version's
+     * assets inline inside its own commit loop, so a later version's corrupted source bytes
+     * would be discovered only after an earlier, otherwise-valid version in the same batch was
+     * already committed to the destination — the per-call all-or-nothing contract AWS documents
+     * for the caller-visible failure codes, silently broken for this emulator-internal one.
+     * Every pending version's source assets are now verified against their persisted hashes
+     * before any version in the batch has anything written to the destination at all.
+     */
+    @Test
+    void copyPackageVersionsVerifiesEveryPendingVersionBeforeCommittingAnyOfThem(@TempDir Path dir)
+            throws IOException {
+        CodeArtifactService service = newService(dir);
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "src", null, null, Map.of());
+        service.createRepository(REGION, "dom", null, "dst", null, null, Map.of());
+        byte[] contentGood = "version one, intact".getBytes(StandardCharsets.UTF_8);
+        byte[] contentBad = "version two, about to be corrupted".getBytes(StandardCharsets.UTF_8);
+        service.publishPackageVersion(REGION, "dom", null, "src", "generic", "ns", "my-pkg", "1.0.0", "a.txt",
+                Digests.sha256Hex(contentGood), "false", contentGood);
+        service.publishPackageVersion(REGION, "dom", null, "src", "generic", "ns", "my-pkg", "2.0.0", "a.txt",
+                Digests.sha256Hex(contentBad), "false", contentBad);
+
+        Path corruptedFile;
+        try (Stream<Path> paths = Files.walk(dir.resolve("codeartifact-assets"))) {
+            corruptedFile = paths.filter(Files::isRegularFile)
+                    .filter(p -> matchesContent(p, contentBad))
+                    .findFirst().orElseThrow();
+        }
+        Files.write(corruptedFile, "corrupted on disk".getBytes(StandardCharsets.UTF_8));
+
+        AwsException e = assertThrows(AwsException.class, () -> service.copyPackageVersions(REGION, "dom", null,
+                "src", "dst", "generic", "ns", "my-pkg", List.of("1.0.0", "2.0.0"), null, false, false));
+        assertEquals("InternalServerException", e.getErrorCode());
+
+        AwsException notCopied = assertThrows(AwsException.class, () -> service.describePackageVersion(REGION,
+                "dom", null, "dst", "generic", "ns", "my-pkg", "1.0.0"));
+        assertEquals("ResourceNotFoundException", notCopied.getErrorCode(),
+                "version 1.0.0 was valid on its own, but must not have been committed ahead of the batch "
+                        + "discovering version 2.0.0's corrupted bytes");
+    }
+
     @Test
     void distinctAssetNamesNeverCollideOnDisk(@TempDir Path dir) {
         CodeArtifactService service = newService(dir);

@@ -7,6 +7,9 @@ import io.restassured.specification.RequestSpecification;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Supplier;
@@ -33,6 +36,9 @@ import static io.restassured.RestAssured.given;
  * URI as the only place to read it from.
  */
 public final class EnforcementFixtures {
+
+    private static final DateTimeFormatter AMZ_DATE =
+            DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
 
     private EnforcementFixtures() {
         // Utility class, prevent instantiation
@@ -169,6 +175,25 @@ public final class EnforcementFixtures {
     public static String auth(String accessKeyId, String date, String region, String service) {
         return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/" + date + "/" + region + "/" + service
                 + "/aws4_request, SignedHeaders=host, Signature=abc";
+    }
+
+    /**
+     * The {@code X-Amz-*} query parameters of a SigV4 presigned request naming {@code accessKeyId},
+     * scoped to {@code service} in {@code us-east-1}, to append to a path after {@code ?} or
+     * {@code &}. They are dated now, so the URL has not expired, and the signature is a placeholder,
+     * as {@link #auth}'s is.
+     */
+    public static String presignedQuery(String accessKeyId, String service) {
+        String amzDate = AMZ_DATE.format(Instant.now());
+        String credential = URLEncoder.encode(
+                accessKeyId + "/" + amzDate.substring(0, 8) + "/us-east-1/" + service + "/aws4_request",
+                StandardCharsets.UTF_8);
+        return "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+                + "&X-Amz-Credential=" + credential
+                + "&X-Amz-Date=" + amzDate
+                + "&X-Amz-Expires=3600"
+                + "&X-Amz-SignedHeaders=host"
+                + "&X-Amz-Signature=fakesig";
     }
 
     /**

@@ -40,6 +40,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -99,11 +100,21 @@ public class CodeArtifactService implements Resettable {
     // control/format/unassigned/surrogate/private-use characters. Without this, an asset name
     // containing '\r'/'\n' would be echoed back verbatim in the X-AssetName response header.
     private static final Pattern ASSET_NAME = Pattern.compile("\\P{C}+");
+    // CopyPackageVersionsRequest.versionRevisions' map value pattern: "\S+", no whitespace
+    // anywhere in the string (not merely non-blank; a value containing an interior space is
+    // just as malformed as an all-whitespace one).
+    private static final Pattern VERSION_REVISION_VALUE = Pattern.compile("\\S+");
     private static final List<String> ASSET_HASH_ALGORITHMS = List.of("MD5", "SHA-1", "SHA-256", "SHA-512");
     // Package-private: reused by CodeArtifactMavenController so the Maven proxy enforces the same
     // documented 5 GB AWS quota rather than duplicating the constant.
     static final long MAX_ASSET_FILE_SIZE_BYTES = 5L * 1024 * 1024 * 1024;
     private static final int MAX_ASSETS_PER_PACKAGE_VERSION = 350;
+    // AWS's own wire model: CopyPackageVersionsRequest.versions has "Array Members: Maximum
+    // number of 100 items." Applied the same way to versionRevisions, the alternate way of
+    // naming the same set of versions to copy.
+    private static final int MAX_COPY_VERSIONS_PER_CALL = 100;
+    // CopyPackageVersionsRequest.versionRevisions' map value: "Maximum length of 50."
+    private static final int MAX_REVISION_LENGTH = 50;
     private static final int MAX_DOMAINS_PER_ACCOUNT = 10;
     private static final int MAX_REPOSITORIES_PER_DOMAIN = 1000;
     private static final String ASSET_STORAGE_DIR = "codeartifact-assets";
@@ -118,6 +129,10 @@ public class CodeArtifactService implements Resettable {
     public record PackageVersionAssetResult(PackageAsset asset, String packageVersionRevision) {}
     public record PackageVersionReadmeResult(String format, String namespace, String packageName, String version,
             String versionRevision, String readme) {}
+    public record PackageVersionCopyOutcome(String revision, String status) {}
+    public record PackageVersionCopyFailure(String errorCode, String errorMessage) {}
+    public record CopyPackageVersionsResult(Map<String, PackageVersionCopyOutcome> successfulVersions,
+                                              Map<String, PackageVersionCopyFailure> failedVersions) {}
     public record AuthorizationToken(String token, long expirationEpochSeconds) {}
     public record AuthorizationTokenScope(String owner, String region) {}
     private record AuthorizationTokenRecord(String owner, String region, String domain, Instant expiration) {}
@@ -1192,6 +1207,309 @@ public class CodeArtifactService implements Resettable {
             String version) {
         String revisionKey = repoId + "/" + (namespace == null ? "" : namespace) + "/" + packageName + "/" + version;
         return Digests.sha256Hex(revisionKey.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Copies one or more versions of a package from one repository to another in the same
+     * domain. Only {@code generic} is supported today — unlike real AWS, which does not
+     * restrict this action's {@code format} the way it restricts {@link #publishPackageVersion}'s
+     * to {@code generic} alone (confirmed against the wire model: {@code
+     * CopyPackageVersionsRequest.format}'s own doc carries no such restriction). This is a Floci
+     * implementation gap, not an AWS restriction being mirrored: Maven, npm, pypi, and nuget
+     * publish straight to their own sidecar and keep no {@code packageVersions} record this could
+     * read from or write to, so bridging them needs the same per-sidecar fetch-then-republish
+     * shape {@code GetPackageVersionAsset}'s own bridge already uses, not yet built here.
+     *
+     * <p>Confirmed against the CodeArtifact User Guide's own worked examples ("Copy package
+     * versions"), not assumed from the shared {@code PackageVersionError} error-code enum alone,
+     * since that enum is reused across several batch actions and not every code it lists applies
+     * to this one:
+     * <ul>
+     * <li>Exactly one of {@code versions}/{@code versionRevisions} must be given.
+     * <li>A requested version absent from the source repository fails {@code NOT_FOUND}.
+     * <li>A {@code versionRevisions} entry whose expected revision doesn't match the source's
+     * actual one fails {@code MISMATCHED_REVISION}.
+     * <li>A version already present in the destination, byte- and metadata-identical to the
+     * source, is treated as an already-successful no-op: not copied, and not listed in either
+     * response map at all.
+     * <li>A version already present in the destination with different content fails {@code
+     * ALREADY_EXISTS} unless {@code allowOverwrite} is set, in which case the destination's
+     * asset set is replaced outright with the source's.
+     * <li>The whole call is all-or-nothing: one requested version failing any of the above
+     * aborts every other version that would otherwise have copied cleanly, each reported {@code
+     * SKIPPED} rather than performing a partial copy.
+     * </ul>
+     * {@code NOT_ALLOWED}, {@code MISMATCHED_STATUS}, and the top-level {@code ConflictException}
+     * are all part of this action's documented error surface but have no documented trigger
+     * specific to {@code CopyPackageVersions} (unlike, say, {@code UpdatePackageVersionsStatus}'s
+     * own {@code expectedStatus} parameter, which {@code CopyPackageVersionsRequest} has no
+     * equivalent of, or {@code PublishPackageVersion}'s origin-configuration check, which the User
+     * Guide's own definition of the "Publish" origin control scopes to direct publish "using
+     * package managers or similar tools" — a mechanism {@code CopyPackageVersions} is not) — this
+     * never produces any of the three, rather than guessing at a condition AWS never actually
+     * documents for this action.
+     *
+     * <p>{@code includeFromUpstream} is accepted for wire compatibility but has no effect: Floci
+     * has no upstream-ingestion path for any format (see {@code docs/services/codeartifact.md}'s
+     * Known limitations), so there is never a separate upstream repository to also search.
+     *
+     * <p>A freshly copied version gets a new revision of its own ({@link #newRevision()}, never
+     * the source's): the User Guide's own definition of "package version revision" is explicit
+     * that "each time a package version is updated, a new package version revision is created,"
+     * and landing a version in a repository it previously had no record in is such an update at
+     * the destination — the same reason {@link #publishPackageVersion} always mints its own rather
+     * than ever accepting a caller-supplied one. An identical-content no-op (see above) is
+     * correctly the opposite case: nothing was updated at the destination, so its existing
+     * revision, whatever it already was, is left untouched.
+     *
+     * <p>{@code synchronized} for the same reason every other package-mutating method here is: a
+     * concurrent publish or delete on either repository must never interleave with this method's
+     * own read-then-write of the destination's {@code packageVersions} record.
+     */
+    public synchronized CopyPackageVersionsResult copyPackageVersions(String region, String domain,
+            String domainOwner, String sourceRepository, String destinationRepository, String format,
+            String namespace, String packageName, List<String> versions, Map<String, String> versionRevisions,
+            boolean allowOverwrite, boolean includeFromUpstream) {
+        if (!"generic".equals(format)) {
+            throw validation("format must be 'generic'; CopyPackageVersions only supports the generic package "
+                    + "format.");
+        }
+        boolean hasVersions = versions != null && !versions.isEmpty();
+        boolean hasRevisions = versionRevisions != null && !versionRevisions.isEmpty();
+        if (hasVersions == hasRevisions) {
+            throw validation("Exactly one of versions or versionRevisions must be specified.");
+        }
+        // AWS's own wire model caps the versions array itself (and, by the same limit applied to
+        // the alternate way of naming the same set, versionRevisions) at 100 members; checked
+        // against the raw caller-supplied count, before any deduplication below, so a request
+        // that only looks small after collapsing repeats still gets rejected.
+        int rawRequestedCount = hasVersions ? versions.size() : versionRevisions.size();
+        if (rawRequestedCount > MAX_COPY_VERSIONS_PER_CALL) {
+            throw validation("A single CopyPackageVersions call can copy at most " + MAX_COPY_VERSIONS_PER_CALL
+                    + " versions.");
+        }
+        // A duplicate requested version (whether from a caller-supplied repeat in versions, or
+        // simply because a Set was never guaranteed here) must not be processed twice: besides
+        // the wasted work, double-copying would also waste the per-call quota check below.
+        List<String> requestedVersions = List.copyOf(
+                new LinkedHashSet<>(hasVersions ? versions : versionRevisions.keySet()));
+        validatePackageCoordinates(format, namespace, packageName, "copying");
+        for (String requestedVersion : requestedVersions) {
+            validatePackageToken("packageVersion", requestedVersion);
+            // AWS's own wire model: versionRevisions' map value has "Length Constraints: Minimum
+            // length of 1. Maximum length of 50" and "Value Pattern: \S+". A value outside that
+            // shape is a malformed request, not a per-version MISMATCHED_REVISION outcome the
+            // batch should otherwise report.
+            if (hasRevisions) {
+                String expectedRevision = versionRevisions.get(requestedVersion);
+                if (expectedRevision == null || expectedRevision.length() > MAX_REVISION_LENGTH
+                        || !VERSION_REVISION_VALUE.matcher(expectedRevision).matches()) {
+                    throw validation("versionRevisions['" + requestedVersion + "'] must be 1-" + MAX_REVISION_LENGTH
+                            + " characters with no whitespace.");
+                }
+            }
+        }
+        requireNonBlank(domain, "domain");
+        String owner = effectiveOwner(domainOwner);
+        requireRepository(owner, repositoryKey(region, domain, sourceRepository), sourceRepository);
+        requireRepository(owner, repositoryKey(region, domain, destinationRepository), destinationRepository);
+        // Deliberately does NOT check the destination package's origin configuration (see
+        // putPackageOriginConfiguration): the User Guide's own definition of the "Publish" origin
+        // control scopes it exactly to "publish directly to the repository using package managers
+        // or similar tools," and "Upstream" to ingestion from an external connection or a
+        // configured upstream repository. CopyPackageVersions is a distinct, explicit API action
+        // reached through neither mechanism, and nothing in the User Guide's "Editing package
+        // origin controls" chapter or the API reference ties the two together. ConflictException
+        // is part of this action's documented error list (so it's a real possible response), but
+        // this codebase has no confirmed trigger for it on this action and does not guess one.
+
+        Map<String, PackageVersionCopyFailure> failures = new LinkedHashMap<>();
+        List<String> pendingCopies = new ArrayList<>();
+        Map<String, CodeArtifactPackageVersion> sourceByVersion = new LinkedHashMap<>();
+        for (String version : requestedVersions) {
+            String sourceKey = packageVersionKey(region, domain, sourceRepository, format, namespace, packageName,
+                    version);
+            CodeArtifactPackageVersion sourcePv = packageVersions.getForAccount(owner, sourceKey).orElse(null);
+            if (sourcePv == null) {
+                failures.put(version, new PackageVersionCopyFailure("NOT_FOUND", "Could not find version "
+                        + version));
+                continue;
+            }
+            if (hasRevisions) {
+                String expectedRevision = versionRevisions.get(version);
+                if (!sourcePv.getRevision().equals(expectedRevision)) {
+                    failures.put(version, new PackageVersionCopyFailure("MISMATCHED_REVISION",
+                            "current revision: " + sourcePv.getRevision() + ", expected revision: "
+                                    + expectedRevision));
+                    continue;
+                }
+            }
+            String destKey = packageVersionKey(region, domain, destinationRepository, format, namespace,
+                    packageName, version);
+            CodeArtifactPackageVersion destPv = packageVersions.getForAccount(owner, destKey).orElse(null);
+            if (destPv != null) {
+                if (packageVersionContentMatches(sourcePv, destPv)) {
+                    // Identical in both repositories already: AWS's own documented behavior is to
+                    // treat this as an already-successful no-op, not copied and not listed in
+                    // either response map at all, so this requested version is simply dropped
+                    // here rather than added to either failures or pendingCopies.
+                    continue;
+                }
+                if (!allowOverwrite) {
+                    failures.put(version, new PackageVersionCopyFailure("ALREADY_EXISTS",
+                            "Version " + version + " already exists"));
+                    continue;
+                }
+            }
+            sourceByVersion.put(version, sourcePv);
+            pendingCopies.add(version);
+        }
+
+        if (!failures.isEmpty()) {
+            for (String version : pendingCopies) {
+                failures.put(version, new PackageVersionCopyFailure("SKIPPED", "Version " + version
+                        + " was skipped"));
+            }
+            return new CopyPackageVersionsResult(Map.of(), failures);
+        }
+
+        // Every pending version's source assets are read and verified against their persisted
+        // hashes before any version in this same batch has anything written to the destination
+        // or committed: a missing or corrupted source asset for version 3 of 5 must never leave
+        // versions 1 and 2 committed while the batch as a whole fails, and must never be
+        // discovered only after this method already started mutating the destination.
+        Map<String, Map<String, byte[]>> verifiedContentByVersion = new LinkedHashMap<>();
+        for (String version : pendingCopies) {
+            verifiedContentByVersion.put(version, verifyAndReadSourceAssets(owner, sourceByVersion.get(version)));
+        }
+
+        Map<String, PackageVersionCopyOutcome> successes = new LinkedHashMap<>();
+        for (String version : pendingCopies) {
+            CodeArtifactPackageVersion copied = copyGenericPackageVersionAssets(owner, region, domain,
+                    destinationRepository, format, namespace, packageName, version, sourceByVersion.get(version),
+                    verifiedContentByVersion.get(version));
+            successes.put(version, new PackageVersionCopyOutcome(copied.getRevision(), copied.getStatus()));
+        }
+        return new CopyPackageVersionsResult(successes, Map.of());
+    }
+
+    /**
+     * Reads every one of {@code source}'s assets and confirms each one's actual bytes still hash
+     * to what its own persisted metadata claims, returning the verified bytes keyed by asset name.
+     * Guards against two distinct ways {@link #readAssetContent} can otherwise hand back the
+     * wrong bytes silently: a missing in-memory entry, which it answers with an empty array
+     * rather than an error, and disk corruption independent of Floci, which it never checks at
+     * all. Thrown as {@code InternalServerException} rather than folded into a per-version
+     * {@code CopyPackageVersionsResult} failure: this is this emulator's own storage integrity
+     * failing, not a caller-facing outcome any AWS-documented error code for this action
+     * describes.
+     */
+    private Map<String, byte[]> verifyAndReadSourceAssets(String owner, CodeArtifactPackageVersion source) {
+        String sourceKey = packageVersionKey(source.getRegion(), source.getDomainName(), source.getRepositoryName(),
+                source.getFormat(), source.getNamespace(), source.getPackageName(), source.getVersion());
+        Map<String, byte[]> verified = new LinkedHashMap<>();
+        for (PackageAsset sourceAsset : source.getAssets().values()) {
+            byte[] content = readAssetContent(owner, sourceKey, sourceAsset.getName());
+            String actualSha256 = computeHashes(content).get("SHA-256");
+            String expectedSha256 = sourceAsset.getHashes().get("SHA-256");
+            if (expectedSha256 == null || !expectedSha256.equalsIgnoreCase(actualSha256)) {
+                throw new AwsException("InternalServerException", "Could not copy version '" + source.getVersion()
+                        + "' of package '" + source.getPackageName() + "': its asset '" + sourceAsset.getName()
+                        + "' is missing from the source repository's storage or no longer matches its recorded "
+                        + "hash.", 500);
+            }
+            verified.put(sourceAsset.getName(), content);
+        }
+        return verified;
+    }
+
+    /**
+     * {@code true} only when {@code source} and {@code dest} would look identical to a client
+     * describing either one: same status, and the exact same set of asset names each hashing to
+     * the same SHA-256. Compared against the assets' own persisted hashes, the same way {@link
+     * #contentMatchesExisting} does for a single asset, rather than re-reading every asset's
+     * bytes from both repositories' asset stores.
+     */
+    private static boolean packageVersionContentMatches(CodeArtifactPackageVersion source,
+                                                          CodeArtifactPackageVersion dest) {
+        if (!source.getStatus().equals(dest.getStatus())) {
+            return false;
+        }
+        Map<String, PackageAsset> sourceAssets = source.getAssets();
+        Map<String, PackageAsset> destAssets = dest.getAssets();
+        if (!sourceAssets.keySet().equals(destAssets.keySet())) {
+            return false;
+        }
+        for (Map.Entry<String, PackageAsset> entry : sourceAssets.entrySet()) {
+            String sourceSha256 = entry.getValue().getHashes().get("SHA-256");
+            String destSha256 = destAssets.get(entry.getKey()).getHashes().get("SHA-256");
+            if (sourceSha256 == null || !sourceSha256.equalsIgnoreCase(destSha256)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Actually performs one version's copy: every asset's bytes are read from the source
+     * repository's asset store and written into the destination's under the destination's own
+     * key, and the destination gets a package-version record of its own with a freshly minted
+     * revision (see {@link #copyPackageVersions}'s own javadoc for why it is never the source's).
+     *
+     * <p>{@code verifiedContent} is every one of {@code source}'s assets, already confirmed by
+     * {@link #verifyAndReadSourceAssets} to hash correctly, before this method or any other
+     * version in the same batch call had anything written to a destination; this method only
+     * ever writes bytes it did not itself have to read or validate.
+     *
+     * <p>The only way this is reached with an existing destination record already there is the
+     * {@code allowOverwrite} path, and the destination ends up with exactly the source's asset
+     * set afterward: any asset the old destination version had that the source version does not
+     * is deleted, not left behind as an orphan the new record no longer references. That cleanup
+     * runs last, after the new assets are written and the new record is committed, not first: a
+     * failure partway through writing the new assets must leave the old record and the old assets
+     * it still points to both intact and consistent, not a surviving old record pointing at bytes
+     * this method already deleted out from under it.
+     */
+    private CodeArtifactPackageVersion copyGenericPackageVersionAssets(String owner, String region, String domain,
+            String destinationRepository, String format, String namespace, String packageName, String version,
+            CodeArtifactPackageVersion source, Map<String, byte[]> verifiedContent) {
+        String destKey = packageVersionKey(region, domain, destinationRepository, format, namespace, packageName,
+                version);
+        CodeArtifactPackageVersion existingDest = packageVersions.getForAccount(owner, destKey).orElse(null);
+        Map<String, PackageAsset> copiedAssets = new LinkedHashMap<>();
+        for (PackageAsset sourceAsset : source.getAssets().values()) {
+            writeAssetContent(owner, destKey, sourceAsset.getName(), verifiedContent.get(sourceAsset.getName()));
+            PackageAsset copy = new PackageAsset();
+            copy.setName(sourceAsset.getName());
+            copy.setSize(sourceAsset.getSize());
+            copy.setHashes(sourceAsset.getHashes());
+            copiedAssets.put(sourceAsset.getName(), copy);
+        }
+        CodeArtifactPackageVersion dest = new CodeArtifactPackageVersion();
+        dest.setDomainName(domain);
+        dest.setDomainOwner(owner);
+        dest.setRegion(region);
+        dest.setRepositoryName(destinationRepository);
+        dest.setFormat(format);
+        dest.setNamespace(namespace);
+        dest.setPackageName(packageName);
+        dest.setVersion(version);
+        dest.setStatus(source.getStatus());
+        // publishedTime reflects when this version entered THIS repository, not the source
+        // repository's own publish time; an Unfinished version carries no publishedTime yet,
+        // matching publishPackageVersion's own rule for a version that hasn't been finalized.
+        dest.setPublishedTime("Unfinished".equals(source.getStatus()) ? null : Instant.now().getEpochSecond());
+        dest.setRevision(newRevision());
+        dest.setAssets(copiedAssets);
+        packageVersions.putForAccount(owner, destKey, dest);
+        if (existingDest != null) {
+            for (String staleAssetName : existingDest.getAssets().keySet()) {
+                if (!source.getAssets().containsKey(staleAssetName)) {
+                    deleteAssetContent(owner, destKey, staleAssetName);
+                }
+            }
+        }
+        return dest;
     }
 
     /**

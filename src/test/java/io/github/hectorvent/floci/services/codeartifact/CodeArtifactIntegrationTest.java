@@ -7,6 +7,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.emptyIterable;
@@ -291,6 +292,70 @@ class CodeArtifactIntegrationTest {
                 .get("/v1/package?domain=origin-config-domain&repository=repo&format=generic&namespace=ns"
                         + "&package=never-published")
                 .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
+    }
+
+    @Test
+    void copyPackageVersionsCopiesOneVersionAndSkipsASiblingWhenAnotherVersionIsNotFound() {
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{}").post("/v1/domain?domain=copy-domain").then().statusCode(200);
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{}").post("/v1/repository?domain=copy-domain&repository=src-repo").then().statusCode(200);
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{}").post("/v1/repository?domain=copy-domain&repository=dst-repo").then().statusCode(200);
+
+        byte[] content = "copy-me".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", AUTH).header("x-amz-content-sha256", Digests.sha256Hex(content))
+                .contentType("application/octet-stream").body(content)
+                .post("/v1/package/version/publish?domain=copy-domain&repository=src-repo&format=generic"
+                        + "&namespace=ns&package=my-pkg&version=1.0.0&asset=a.txt")
+                .then().statusCode(200);
+
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\"]}")
+                .post("/v1/package/versions/copy?domain=copy-domain&source-repository=src-repo"
+                        + "&destination-repository=dst-repo&format=generic&namespace=ns&package=my-pkg")
+                .then().statusCode(200)
+                .body("successfulVersions.'1.0.0'.status", equalTo("Published"))
+                .body("successfulVersions.'1.0.0'.revision", notNullValue())
+                .body("failedVersions", equalTo(Map.of()));
+
+        byte[] copied = given().header("Authorization", AUTH)
+                .get("/v1/package/version/asset?domain=copy-domain&repository=dst-repo&format=generic&namespace=ns"
+                        + "&package=my-pkg&version=1.0.0&asset=a.txt")
+                .then().statusCode(200)
+                .extract().asByteArray();
+        assertArrayEquals(content, copied);
+
+        given().header("Authorization", AUTH).header("x-amz-content-sha256", Digests.sha256Hex(content))
+                .contentType("application/octet-stream").body(content)
+                .post("/v1/package/version/publish?domain=copy-domain&repository=src-repo&format=generic"
+                        + "&namespace=ns&package=my-pkg&version=2.0.0&asset=a.txt")
+                .then().statusCode(200);
+
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"2.0.0\",\"9.9.9\"]}")
+                .post("/v1/package/versions/copy?domain=copy-domain&source-repository=src-repo"
+                        + "&destination-repository=dst-repo&format=generic&namespace=ns&package=my-pkg")
+                .then().statusCode(200)
+                .body("successfulVersions", equalTo(Map.of()))
+                .body("failedVersions.'9.9.9'.errorCode", equalTo("NOT_FOUND"))
+                .body("failedVersions.'2.0.0'.errorCode", equalTo("SKIPPED"));
+    }
+
+    /**
+     * Found by Qodo review: a non-string element in the versions array (e.g. a bare number) used
+     * to become a null list entry that reached List.copyOf before any validation ran, throwing an
+     * unhandled NullPointerException instead of a clean ValidationException. This shape error is
+     * caught while parsing the request body, before any domain or repository lookup, so (unlike
+     * every other test in this class) it needs no domain/repository of its own to demonstrate.
+     */
+    @Test
+    void copyPackageVersionsRejectsANonStringVersionsElementAsAValidationErrorNotAServerError() {
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\",123]}")
+                .post("/v1/package/versions/copy?domain=no-such-domain&source-repository=no-such-repo"
+                        + "&destination-repository=no-such-repo&format=generic&namespace=ns&package=my-pkg")
+                .then().statusCode(400).body("__type", equalTo("ValidationException"));
     }
 
     @Test
