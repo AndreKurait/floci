@@ -221,6 +221,8 @@ class RedshiftClusterCfnIntegrationTest {
     }
 
     private static String describeStacks(String stack, String expectedStatus) {
+        CfnStackWaits.StackState state = CfnStackWaits.awaitTerminal(stack, CFN_AUTH);
+        assertEquals(expectedStatus, state.status(), state.reason());
         return given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", CFN_AUTH)
