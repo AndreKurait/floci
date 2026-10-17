@@ -45,7 +45,7 @@ import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
-import static org.awaitility.Awaitility.await;
+import static io.github.hectorvent.floci.testing.ThreadStates.awaitBlockedOrDone;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
@@ -2332,8 +2332,7 @@ class LambdaServiceTest {
                 publicationThread.set(Thread.currentThread());
                 return syncingService.publishVersion(REGION, name, null);
             });
-            await().atMost(2, TimeUnit.SECONDS).until(() -> publicationThread.get() != null
-                    && publicationThread.get().getState() == Thread.State.BLOCKED);
+            awaitBlockedOrDone(publicationThread, publication);
             assertFalse(publication.isDone());
             release.countDown();
             sync.get(5, TimeUnit.SECONDS);
