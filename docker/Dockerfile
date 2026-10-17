@@ -50,7 +50,7 @@ COPY --from=build /build/target/quarkus-app/ quarkus-app/
 RUN chown -R 1001:root /app/quarkus-app
 
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-COPY --chmod=755 docker/localstack-parity.sh docker/healthcheck.sh /usr/local/bin/
+COPY --chmod=755 docker/healthcheck.sh /usr/local/bin/
 
 ARG VERSION=latest
 ENV FLOCI_VERSION=${VERSION}
