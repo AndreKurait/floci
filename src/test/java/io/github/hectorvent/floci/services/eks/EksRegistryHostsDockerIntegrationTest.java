@@ -30,6 +30,8 @@ import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -53,8 +55,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @QuarkusTest
 @TestProfile(EksRegistryHostsDockerIntegrationTest.Profile.class)
-// Three 60 s cluster-ready waits plus 30 s, 30 s and 45 s polls: past the suite's 2-minute default.
-@Timeout(value = 6, unit = TimeUnit.MINUTES)
+// Bounded cluster/node/workload waits total 345 s; allow Docker setup and cleanup as well.
+@Timeout(value = 8, unit = TimeUnit.MINUTES)
 class EksRegistryHostsDockerIntegrationTest {
 
     private static final Logger LOG = Logger.getLogger(EksRegistryHostsDockerIntegrationTest.class);
@@ -194,6 +196,7 @@ class EksRegistryHostsDockerIntegrationTest {
 
         // Verify hosts.toml survives container restart
         dockerClient.restartContainerCmd(containerId).exec();
+        Instant restartCompletedAt = Instant.now();
         waitUntilReady(cluster);
         String hostsTomlAfterRestart = null;
         long restartDeadline = System.currentTimeMillis() + 30000;
@@ -223,18 +226,27 @@ class EksRegistryHostsDockerIntegrationTest {
         }
         assertTrue(saReady, "default serviceaccount must be created within 30 seconds");
 
-        // ACTIVE survives a Docker restart; wait for kubelet readiness before testing image pulls.
         long nodeDeadline = System.currentTimeMillis() + 60000;
         ExecResult nodeReady;
+        boolean freshHeartbeat = false;
         do {
             nodeReady = execInContainerWithExitCode(containerId,
-                    new String[]{"kubectl", "wait", "--for=condition=Ready", "nodes", "--all", "--timeout=1s"});
-            if (nodeReady.exitCode() == 0) {
+                    new String[]{"kubectl", "--request-timeout=2s", "wait",
+                            "--for=condition=Ready", "nodes", "--all", "--timeout=1s"});
+            ExecResult leases = execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "--request-timeout=2s", "get", "leases", "-n", "kube-node-lease",
+                            "-o", "jsonpath={.items[*].spec.renewTime}"});
+            String renewals = leases.stdout().trim();
+            freshHeartbeat = leases.exitCode() == 0 && !renewals.isEmpty()
+                    && Arrays.stream(renewals.split("\\s+"))
+                            .allMatch(renewal -> Instant.parse(renewal).isAfter(restartCompletedAt));
+            if (nodeReady.exitCode() == 0 && freshHeartbeat) {
                 break;
             }
             Thread.sleep(1000);
         } while (System.currentTimeMillis() < nodeDeadline);
         assertEquals(0, nodeReady.exitCode(), "node must become Ready after restart: " + nodeReady.stdout());
+        assertTrue(freshHeartbeat, "kubelet must renew its node Lease after restart");
 
         String podYaml = """
                 apiVersion: v1
@@ -261,11 +273,7 @@ class EksRegistryHostsDockerIntegrationTest {
             }
             Thread.sleep(2000);
         }
-        assertTrue(running, "registry-hosts-pod must reach Running, pulling its image through the configured host"
-                + (running ? "" : "\n" + execInContainerWithExitCode(containerId,
-                        new String[]{"kubectl", "describe", "pod", "registry-hosts-pod"}).stdout()
-                        + "\n" + execInContainerWithExitCode(containerId,
-                        new String[]{"kubectl", "describe", "nodes"}).stdout()));
+        assertTrue(running, "registry-hosts-pod must reach Running, pulling its image through the configured host");
         execInContainerWithExitCode(containerId, new String[]{"kubectl", "delete", "pod", "registry-hosts-pod", "--now"});
     }
 
