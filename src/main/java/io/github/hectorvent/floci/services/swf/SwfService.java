@@ -548,6 +548,7 @@ public class SwfService implements Resettable {
             }
 
             task.setState(SwfDecisionTask.STATE_STARTED);
+            execution.setDecisionNeeded(false);
             task.setIdentity(identity);
             task.setStartedTimestamp(now());
             SwfHistoryEvent started = appendEvent(execution, "DecisionTaskStarted");
@@ -1275,11 +1276,7 @@ public class SwfService implements Resettable {
                     .attr("reason", reason)
                     .attr("details", details)
                     .attr("result", result);
-            if (hasNothingPending(execution)) {
-                scheduleDecisionTask(execution);
-            } else {
-                execution.setDecisionNeeded(true);
-            }
+            scheduleDecisionTaskIfIdle(execution);
             executionStore.put(pending.executionKey(), execution);
         }
     }
