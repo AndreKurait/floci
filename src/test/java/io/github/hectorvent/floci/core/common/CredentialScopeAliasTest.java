@@ -31,6 +31,9 @@ class CredentialScopeAliasTest {
     @Inject
     IamActionRegistry actionRegistry;
 
+    @Inject
+    ProtocolClaimer claimer;
+
     @Test
     void s3ExpressAliasNormalisesToS3() {
         assertEquals("s3", catalog.canonicalCredentialScope("s3express"));
@@ -48,6 +51,32 @@ class CredentialScopeAliasTest {
     @Test
     void ssoPortalAliasNormalisesToSso() {
         assertEquals("sso", catalog.canonicalCredentialScope("awsssoportal"));
+    }
+
+    @Test
+    void monitoringAliasResolvesTheCloudWatchQueryAction() {
+        UriInfo uriInfo = mock(UriInfo.class);
+        MultivaluedHashMap<String, String> query = new MultivaluedHashMap<>();
+        query.add("Action", "GetMetricStatistics");
+        query.add("Version", "2010-08-01");
+        when(uriInfo.getPath()).thenReturn("");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/?Action=GetMetricStatistics"));
+        when(uriInfo.getBaseUri()).thenReturn(URI.create("http://localhost:4566/"));
+        when(uriInfo.getQueryParameters()).thenReturn(query);
+
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getMethod()).thenReturn("GET");
+        when(ctx.getUriInfo()).thenReturn(uriInfo);
+        when(ctx.getHeaderString("Authorization")).thenReturn(
+                "AWS4-HMAC-SHA256 Credential=AKIAUSER/20261013/us-east-1/monitoring/aws4_request");
+
+        ProtocolClaim claim = claimer.claim(ClaimSignals.from(ctx)).orElseThrow();
+        assertEquals(WireProtocol.AWS_QUERY, claim.protocol());
+        when(ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY)).thenReturn(claim);
+
+        String canonicalScope = catalog.canonicalCredentialScope("monitoring");
+        assertEquals("cloudwatch", canonicalScope);
+        assertEquals("cloudwatch:GetMetricStatistics", actionRegistry.resolve(canonicalScope, ctx));
     }
 
     @Test
