@@ -367,6 +367,10 @@ public class WarmPool implements ContainerTeardown {
      * Called on function deletion and emulator shutdown.
      */
     public void drainFunction(String functionName) {
+        stopInParallel(detachFunction(functionName));
+    }
+
+    private List<ContainerHandle> detachFunction(String functionName) {
         PoolState poolState = poolStates.computeIfAbsent(functionName, ignored -> new PoolState());
         List<ContainerHandle> toStop;
         synchronized (poolState) {
@@ -376,7 +380,7 @@ public class WarmPool implements ContainerTeardown {
             poolState.idleByEnvironment.clear();
         }
         LOG.infov("Draining {0} container(s) for function: {1}", toStop.size(), functionName);
-        stopInParallel(toStop);
+        return toStop;
     }
 
     private void stopInParallel(List<ContainerHandle> handles) {
@@ -404,9 +408,11 @@ public class WarmPool implements ContainerTeardown {
     }
 
     private void drainAll() {
+        List<ContainerHandle> toStop = new ArrayList<>();
         for (String functionName : new ArrayList<>(poolStates.keySet())) {
-            drainFunction(functionName);
+            toStop.addAll(detachFunction(functionName));
         }
+        stopInParallel(toStop);
     }
 
     private void evictIdleContainers() {
