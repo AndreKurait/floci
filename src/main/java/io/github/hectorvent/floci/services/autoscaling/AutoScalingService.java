@@ -607,64 +607,61 @@ public class AutoScalingService {
         groups.put(asgKey(region, asg.getAutoScalingGroupName()), asg);
     }
 
-    public TagPage describeTags(String region, List<TagFilter> filters, Integer maxRecords, String nextToken) {
-        int limit = maxRecords == null ? 50 : maxRecords;
-        if (limit < 1 || limit > 100) {
+    // AWS: values inside one filter are ORed, separate filters are ANDed; only these four
+    // filter names exist. Ordered by (group, key); NextToken is the last pair returned, so tags
+    // added or removed between pages neither skip nor repeat an entry.
+    public PaginatedResult<TagDescription> describeTags(String region, List<Map.Entry<String, List<String>>> filters,
+                                                         Integer maxRecords, String nextToken) {
+        List<Map.Entry<String, List<String>>> normalizedFilters = new ArrayList<>();
+        for (Map.Entry<String, List<String>> filter : filters) {
+            String name = filter.getKey() == null ? "" : filter.getKey().toLowerCase(Locale.ROOT);
+            if (!Set.of("auto-scaling-group", "key", "value", "propagate-at-launch").contains(name)) {
+                throw new AwsException("ValidationError", "Filter name '" + filter.getKey() + "' is not valid.", 400);
+            }
+            if (filter.getValue() == null) {
+                throw new AwsException("ValidationError", "The Values attribute and one or more filter values are required.", 400);
+            }
+            List<String> values = filter.getValue();
+            if ("propagate-at-launch".equals(name)) {
+                values = values.stream().map(value -> value.trim().toLowerCase(Locale.ROOT)).toList();
+                if (values.stream().anyMatch(value -> !Set.of("true", "false").contains(value))) {
+                    throw new AwsException("ValidationError", "The propagate-at-launch filter requires true or false.", 400);
+                }
+            }
+            normalizedFilters.add(Map.entry(name, values));
+        }
+        if (maxRecords != null && (maxRecords < 1 || maxRecords > 100)) {
             throw new AwsException("ValidationError", "MaxRecords must be between 1 and 100.", 400);
         }
-        List<TagFilter> selectedFilters = new ArrayList<>();
-        for (TagFilter filter : filters == null ? List.<TagFilter>of() : filters) {
-            if (filter.name() == null || !Set.of("auto-scaling-group", "key", "value", "propagate-at-launch")
-                    .contains(filter.name().toLowerCase(Locale.ROOT))
-                    || filter.values() == null) {
-                throw new AwsException("ValidationError", "A valid tag filter name and values are required.", 400);
-            }
-            String name = filter.name().toLowerCase(Locale.ROOT);
-            List<String> values = filter.values();
-            if ("propagate-at-launch".equals(name)) {
-                values = values.stream().map(value -> {
-                    String normalized = value.trim().toLowerCase(Locale.ROOT);
-                    if (!"true".equals(normalized) && !"false".equals(normalized)) {
-                        throw new AwsException("ValidationError", "Boolean parameter can only be true or false", 400);
-                    }
-                    return normalized;
-                }).toList();
-            }
-            if (!values.isEmpty()) {
-                selectedFilters.add(new TagFilter(name, values));
-            }
-        }
-        List<TagDescription> matches = describeAutoScalingGroups(region, List.of()).stream()
-                .flatMap(group -> group.getTags().entrySet().stream().map(tag -> new TagDescription(
-                        group.getAutoScalingGroupName(), tag.getKey(), tag.getValue(),
-                        group.getTagPropagateAtLaunch().getOrDefault(tag.getKey(), false))))
-                .filter(tag -> selectedFilters.stream().allMatch(filter -> matchesTagFilter(tag, filter)))
-                .toList();
         if (nextToken != null && nextToken.isBlank()) {
             throw new AwsException("ValidationError", "The NextToken value is not valid.", 400);
         }
-        PaginatedResult<TagDescription> page = Pagination.paginate(matches,
-                tag -> tag.resourceId() + "\u0000" + tag.key(), limit, nextToken, "autoscaling-tags",
+        int limit = maxRecords != null ? maxRecords : 50;
+        List<TagDescription> matches = groups.values().stream()
+                .filter(Objects::nonNull) // group deleted between key snapshot and value read
+                .filter(g -> region.equals(g.getRegion()))
+                .flatMap(g -> g.getTags().entrySet().stream()
+                        .map(t -> new TagDescription(g.getAutoScalingGroupName(), t.getKey(), t.getValue(),
+                                g.getTagPropagateAtLaunch().getOrDefault(t.getKey(), false))))
+                .filter(t -> matchesFilter(normalizedFilters, "auto-scaling-group", t.resourceId())
+                        && matchesFilter(normalizedFilters, "key", t.key())
+                        && matchesFilter(normalizedFilters, "value", t.value())
+                        && matchesFilter(normalizedFilters, "propagate-at-launch", String.valueOf(t.propagateAtLaunch())))
+                .collect(Collectors.toList());
+        // "\0" sorts below every other character, so the cursor orders as the (group, key) pair.
+        return Pagination.paginate(matches,
+                t -> t.resourceId() + "\0" + t.key(), limit, nextToken, "autoscaling-tags",
                 token -> new AwsException("ValidationError", "The NextToken value is not valid.", 400));
-        return new TagPage(page.items(), page.nextToken());
     }
 
-    private static boolean matchesTagFilter(TagDescription tag, TagFilter filter) {
-        String value = switch (filter.name()) {
-            case "auto-scaling-group" -> tag.resourceId();
-            case "key" -> tag.key();
-            case "value" -> tag.value();
-            case "propagate-at-launch" -> Boolean.toString(tag.propagateAtLaunch());
-            default -> throw new IllegalArgumentException("Unvalidated tag filter");
-        };
-        return filter.values().contains(value);
+    // Every filter of this name must match (a repeated name is a second filter, ANDed).
+    private static boolean matchesFilter(List<Map.Entry<String, List<String>>> filters, String name, String actual) {
+        return filters.stream()
+                .filter(f -> f.getKey().equals(name) && !f.getValue().isEmpty())
+                .allMatch(f -> f.getValue().contains(actual));
     }
-
-    public record TagFilter(String name, List<String> values) {}
 
     public record TagDescription(String resourceId, String key, String value, boolean propagateAtLaunch) {}
-
-    public record TagPage(List<TagDescription> tags, String nextToken) {}
 
     private AutoScalingGroup requireTaggableGroup(String region, String resourceId, String resourceType) {
         if (!"auto-scaling-group".equals(resourceType)) {

@@ -1,10 +1,12 @@
 package io.github.hectorvent.floci.services.autoscaling;
 
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgOptionalFields;
 import org.junit.jupiter.api.Test;
 
+import java.util.AbstractMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,31 +27,31 @@ class AutoScalingDescribeTagsServiceTest {
         group(service, REGION, "b", Map.of("environment", "development"));
         group(service, "us-west-2", "foreign", Map.of("environment", "Production"));
 
-        List<AutoScalingService.TagFilter> filters = List.of(
-                new AutoScalingService.TagFilter("Key", List.of("environment")),
-                new AutoScalingService.TagFilter("value", List.of("Production", "development")));
-        AutoScalingService.TagPage page = service.describeTags(REGION, filters, null, null);
-        assertEquals(List.of("a", "b"), page.tags().stream()
+        List<Map.Entry<String, List<String>>> filters = List.of(
+                new AbstractMap.SimpleImmutableEntry<>("Key", List.of("environment")),
+                new AbstractMap.SimpleImmutableEntry<>("value", List.of("Production", "development")));
+        PaginatedResult<AutoScalingService.TagDescription> page = service.describeTags(REGION, filters, null, null);
+        assertEquals(List.of("a", "b"), page.items().stream()
                 .map(AutoScalingService.TagDescription::resourceId).toList());
         assertTrue(service.describeTags(REGION, List.of(
-                new AutoScalingService.TagFilter("key", List.of("environment")),
-                new AutoScalingService.TagFilter("value", List.of("different"))), null, null).tags().isEmpty());
+                new AbstractMap.SimpleImmutableEntry<>("key", List.of("environment")),
+                new AbstractMap.SimpleImmutableEntry<>("value", List.of("different"))), null, null).items().isEmpty());
         assertTrue(service.describeTags(REGION, List.of(
-                new AutoScalingService.TagFilter("value", List.of("production"))), null, null).tags().isEmpty());
+                new AbstractMap.SimpleImmutableEntry<>("value", List.of("production"))), null, null).items().isEmpty());
 
         service.createOrUpdateTags(REGION, "a", "auto-scaling-group",
                 Map.of("environment", "updated"), Map.of("environment", true));
         AutoScalingService.TagDescription tag = service.describeTags(REGION, List.of(
-                new AutoScalingService.TagFilter("auto-scaling-group", List.of("a")),
-                new AutoScalingService.TagFilter("propagate-at-launch", List.of("true"))), null, null)
-                .tags().getFirst();
+                new AbstractMap.SimpleImmutableEntry<>("auto-scaling-group", List.of("a")),
+                new AbstractMap.SimpleImmutableEntry<>("propagate-at-launch", List.of("true"))), null, null)
+                .items().getFirst();
         assertEquals("environment", tag.key());
         assertEquals("updated", tag.value());
         assertTrue(tag.propagateAtLaunch());
         service.deleteTags(REGION, "a", "auto-scaling-group", List.of("environment"));
         assertTrue(service.describeTags(REGION, List.of(
-                new AutoScalingService.TagFilter("propagate-at-launch", List.of("true"))), null, null)
-                .tags().isEmpty());
+                new AbstractMap.SimpleImmutableEntry<>("propagate-at-launch", List.of("true"))), null, null)
+                .items().isEmpty());
     }
 
     @Test
@@ -61,14 +63,14 @@ class AutoScalingDescribeTagsServiceTest {
         }
         group(service, REGION, "b", tags);
         group(service, REGION, "a", tags);
-        AutoScalingService.TagPage first = service.describeTags(REGION, List.of(), null, null);
-        assertEquals(50, first.tags().size());
-        assertEquals("a", first.tags().getFirst().resourceId());
-        AutoScalingService.TagPage second = service.describeTags(REGION, List.of(), null, first.nextToken());
-        assertEquals(10, second.tags().size());
-        assertEquals("key-20", second.tags().getFirst().key());
+        PaginatedResult<AutoScalingService.TagDescription> first = service.describeTags(REGION, List.of(), null, null);
+        assertEquals(50, first.items().size());
+        assertEquals("a", first.items().getFirst().resourceId());
+        PaginatedResult<AutoScalingService.TagDescription> second = service.describeTags(REGION, List.of(), null, first.nextToken());
+        assertEquals(10, second.items().size());
+        assertEquals("key-20", second.items().getFirst().key());
         assertNull(second.nextToken());
-        assertEquals(60, service.describeTags(REGION, List.of(), 100, null).tags().size());
+        assertEquals(60, service.describeTags(REGION, List.of(), 100, null).items().size());
         for (int limit : List.of(-1, 0, 101)) {
             AwsException error = assertThrows(AwsException.class,
                     () -> service.describeTags(REGION, List.of(), limit, null));
@@ -84,15 +86,15 @@ class AutoScalingDescribeTagsServiceTest {
     @Test
     void invalidFiltersDoNotSilentlyReturnUnfilteredTags() {
         AutoScalingService service = service();
-        for (AutoScalingService.TagFilter filter : List.of(
-                new AutoScalingService.TagFilter("unknown", List.of("value")),
-                new AutoScalingService.TagFilter("unknown", List.of()),
-                new AutoScalingService.TagFilter(null, List.of("value")),
-                new AutoScalingService.TagFilter("", List.of("value")),
-                new AutoScalingService.TagFilter(" key ", List.of("value")),
-                new AutoScalingService.TagFilter("key", null),
-                new AutoScalingService.TagFilter("propagate-at-launch", List.of("invalid")),
-                new AutoScalingService.TagFilter("propagate-at-launch", List.of("true", "1")))) {
+        for (Map.Entry<String, List<String>> filter : List.<Map.Entry<String, List<String>>>of(
+                new AbstractMap.SimpleImmutableEntry<>("unknown", List.of("value")),
+                new AbstractMap.SimpleImmutableEntry<>("unknown", List.of()),
+                new AbstractMap.SimpleImmutableEntry<>(null, List.of("value")),
+                new AbstractMap.SimpleImmutableEntry<>("", List.of("value")),
+                new AbstractMap.SimpleImmutableEntry<>(" key ", List.of("value")),
+                new AbstractMap.SimpleImmutableEntry<>("key", null),
+                new AbstractMap.SimpleImmutableEntry<>("propagate-at-launch", List.of("invalid")),
+                new AbstractMap.SimpleImmutableEntry<>("propagate-at-launch", List.of("true", "1")))) {
             AwsException error = assertThrows(AwsException.class,
                     () -> service.describeTags(REGION, List.of(filter), null, null));
             assertEquals("ValidationError", error.getErrorCode());
@@ -107,22 +109,22 @@ class AutoScalingDescribeTagsServiceTest {
                 Map.of("key", "value"), Map.of("key", true));
         for (String name : List.of("auto-scaling-group", "key", "value", "propagate-at-launch")) {
             assertEquals(2, service.describeTags(REGION,
-                    List.of(new AutoScalingService.TagFilter(name, List.of())), null, null).tags().size());
+                    List.of(new AbstractMap.SimpleImmutableEntry<>(name, List.of())), null, null).items().size());
         }
         assertEquals("key", service.describeTags(REGION,
-                List.of(new AutoScalingService.TagFilter("\u212Aey", List.of("key"))), null, null)
-                .tags().getFirst().key());
+                List.of(new AbstractMap.SimpleImmutableEntry<>("\u212Aey", List.of("key"))), null, null)
+                .items().getFirst().key());
         for (String value : List.of("true", "TRUE", "TrUe", " true ", "\tTRUE\n")) {
             assertEquals("key", service.describeTags(REGION,
-                    List.of(new AutoScalingService.TagFilter("propagate-at-launch", List.of(value))), null, null)
-                    .tags().getFirst().key());
+                    List.of(new AbstractMap.SimpleImmutableEntry<>("propagate-at-launch", List.of(value))), null, null)
+                    .items().getFirst().key());
         }
         assertEquals("other", service.describeTags(REGION,
-                List.of(new AutoScalingService.TagFilter("propagate-at-launch", List.of(" FALSE "))), null, null)
-                .tags().getFirst().key());
+                List.of(new AbstractMap.SimpleImmutableEntry<>("propagate-at-launch", List.of(" FALSE "))), null, null)
+                .items().getFirst().key());
         assertEquals(2, service.describeTags(REGION,
-                List.of(new AutoScalingService.TagFilter("propagate-at-launch", List.of("TrUe", " FALSE "))),
-                null, null).tags().size());
+                List.of(new AbstractMap.SimpleImmutableEntry<>("propagate-at-launch", List.of("TrUe", " FALSE "))),
+                null, null).items().size());
     }
 
     private static AutoScalingService service() {

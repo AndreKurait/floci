@@ -5,6 +5,8 @@ import io.restassured.path.xml.XmlPath;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
@@ -158,10 +160,11 @@ class AutoScalingDescribeTagsIntegrationTest {
                 .body(containsString("ValidationError"));
     }
 
-    @Test
-    void nonNumericMaxRecordsIsMalformedInput() {
+    @ParameterizedTest
+    @ValueSource(strings = {"abc", "", "1.5"})
+    void nonNumericMaxRecordsIsMalformedInput(String count) {
         describe()
-                .formParam("MaxRecords", "abc")
+                .formParam("MaxRecords", count)
             .when().post("/")
             .then().statusCode(400)
                 .body(containsString("MalformedInput"));
@@ -181,18 +184,78 @@ class AutoScalingDescribeTagsIntegrationTest {
         assertEquals(List.of("AsgId"), xml.getList(ROOT + ".Key"));
     }
 
-    // Live AWS normalizes boolean filter values; tag keys and values remain case-sensitive.
-    @Test
-    void propagateAtLaunchFilterAcceptsMixedCase() {
+    @ParameterizedTest
+    @ValueSource(strings = {"True", " TRUE ", "\tTrUe\n"})
+    void propagateAtLaunchFilterNormalizesBooleanValues(String value) {
         XmlPath xml = describe()
                 .formParam("Filters.member.1.Name", "auto-scaling-group")
                 .formParam("Filters.member.1.Values.member.1", GROUP_A)
                 .formParam("Filters.member.2.Name", "propagate-at-launch")
-                .formParam("Filters.member.2.Values.member.1", "True")
+                .formParam("Filters.member.2.Values.member.1", value)
             .when().post("/")
             .then().statusCode(200).extract().xmlPath();
 
         assertEquals(List.of("AsgId"), xml.getList(ROOT + ".Key"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"KEY", "\u212Aey"})
+    void filterNamesAreCaseInsensitive(String name) {
+        XmlPath xml = describe()
+                .formParam("Filters.member.1.Name", "auto-scaling-group")
+                .formParam("Filters.member.1.Values.member.1", GROUP_A)
+                .formParam("Filters.member.2.Name", name)
+                .formParam("Filters.member.2.Values.member.1", "AsgId")
+            .when().post("/")
+            .then().statusCode(200).extract().xmlPath();
+        assertEquals(List.of("AsgId"), xml.getList(ROOT + ".Key"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1", "tru e", ""})
+    void invalidBooleanFiltersAreRejected(String value) {
+        describe().formParam("Filters.member.1.Name", "propagate-at-launch")
+                .formParam("Filters.member.1.Values.member.1", value)
+            .when().post("/")
+            .then().statusCode(400).body(containsString("ValidationError"));
+    }
+
+    @Test
+    void missingValuesAreRejectedButAnEmptyListIsIgnored() {
+        describe().formParam("Filters.member.1.Name", "key")
+            .when().post("/")
+            .then().statusCode(400).body(containsString("ValidationError"));
+        XmlPath xml = describe()
+                .formParam("Filters.member.1.Name", "auto-scaling-group")
+                .formParam("Filters.member.1.Values.member.1", GROUP_A)
+                .formParam("Filters.member.2.Name", "key")
+                .formParam("Filters.member.2.Values", "")
+            .when().post("/")
+            .then().statusCode(200).extract().xmlPath();
+        assertEquals(List.of("AsgId", "team"), xml.getList(ROOT + ".Key"));
+    }
+
+    @Test
+    void missingFilterNameIsRejected() {
+        describe().formParam("Filters.member.1.Values.member.1", "AsgId")
+            .when().post("/")
+            .then().statusCode(400).body(containsString("ValidationError"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 0, 101})
+    void outOfRangeMaxRecordsIsRejected(int count) {
+        describe().formParam("MaxRecords", count)
+            .when().post("/")
+            .then().statusCode(400).body(containsString("ValidationError"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"invalid", ""})
+    void invalidNextTokenIsAValidationError(String token) {
+        describe().formParam("NextToken", token)
+            .when().post("/")
+            .then().statusCode(400).body(containsString("ValidationError"));
     }
 
     // A tag deleted from an already-returned page must not shift the next page past an unread tag.
@@ -266,11 +329,11 @@ class AutoScalingDescribeTagsIntegrationTest {
     // minted here.
     @Test
     void tokenWithoutTheNamespaceIsAValidationError() {
-        assertInvalidNextTokenValidationError(Base64.getUrlEncoder().encodeToString(
+        assertInvalidNextToken(Base64.getUrlEncoder().encodeToString(
                 (GROUP_A + "\0AsgId").getBytes(StandardCharsets.UTF_8)));
     }
 
-    private static void assertInvalidNextTokenValidationError(String token) {
+    private static void assertInvalidNextToken(String token) {
         describe()
                 .formParam("NextToken", token)
             .when().post("/")
@@ -279,7 +342,8 @@ class AutoScalingDescribeTagsIntegrationTest {
     }
 
     private static RequestSpecification describe() {
-        return given().formParam("Action", "DescribeTags").header("Authorization", AUTH);
+        return given().contentType("application/x-www-form-urlencoded; charset=UTF-8")
+                .formParam("Action", "DescribeTags").header("Authorization", AUTH);
     }
 
     private static void createGroup(String name, String key, String value, boolean propagate) {

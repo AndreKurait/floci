@@ -1004,7 +1004,7 @@ class AutoScalingServiceTest {
         assertEquals(List.of("test-asg"), service.describeAutoScalingGroups(REGION, null).stream()
                 .map(AutoScalingGroup::getAutoScalingGroupName).toList());
         assertEquals(1, service.describeAutoScalingInstances(REGION, null).size());
-        assertEquals(List.of("k"), service.describeTags(REGION, List.of(), null, null).tags().stream()
+        assertEquals(List.of("k"), service.describeTags(REGION, List.of(), null, null).items().stream()
                 .map(AutoScalingService.TagDescription::key).toList());
 
         service.setInstanceHealth(REGION, "i-live", "Unhealthy", false);

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.autoscaling;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.autoscaling.model.*;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
@@ -548,41 +549,47 @@ public class AutoScalingQueryHandler {
     }
 
     private Response handleDescribeTags(MultivaluedMap<String, String> p, String region) {
-        List<AutoScalingService.TagFilter> filters = new ArrayList<>();
+        List<Map.Entry<String, List<String>>> filters = new ArrayList<>();
         for (int i = 1; ; i++) {
             String prefix = "Filters.member." + i;
             String name = p.getFirst(prefix + ".Name");
-            boolean hasValues = p.containsKey(prefix + ".Values")
-                    || p.containsKey(prefix + ".Values.member.1");
+            boolean hasValues = p.containsKey(prefix + ".Values") || p.containsKey(prefix + ".Values.member.1");
             if (name == null && !hasValues) { break; }
-            filters.add(new AutoScalingService.TagFilter(name,
+            filters.add(new AbstractMap.SimpleImmutableEntry<>(name,
                     hasValues ? memberList(p, prefix + ".Values") : null));
         }
-        Integer maxRecords = null;
-        if (p.getFirst("MaxRecords") != null) {
+        String maxRecords = p.getFirst("MaxRecords");
+        Integer limit = null;
+        if (maxRecords != null) {
             try {
-                maxRecords = Integer.valueOf(p.getFirst("MaxRecords"));
-            } catch (NumberFormatException error) {
-                throw new AwsException("MalformedInput", "MaxRecords must be an integer.", 400);
+                limit = Integer.parseInt(maxRecords);
+            } catch (NumberFormatException e) {
+                throw new AwsException("MalformedInput", "MaxRecords '" + maxRecords + "' is not a valid integer.", 400);
             }
         }
-        AutoScalingService.TagPage page = service.describeTags(
-                region, filters, maxRecords, p.getFirst("NextToken"));
-        XmlBuilder xml = new XmlBuilder().start("DescribeTagsResponse", NS)
-                .start("DescribeTagsResult").start("Tags");
-        for (AutoScalingService.TagDescription tag : page.tags()) {
+        PaginatedResult<AutoScalingService.TagDescription> page = service.describeTags(region, filters,
+                limit, p.getFirst("NextToken"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeTagsResponse", NS)
+                  .start("DescribeTagsResult")
+                    .start("Tags");
+        for (AutoScalingService.TagDescription tag : page.items()) {
             xml.start("member")
-                    .elem("ResourceId", tag.resourceId())
-                    .elem("ResourceType", "auto-scaling-group")
-                    .elem("Key", tag.key())
-                    .elem("Value", tag.value())
-                    .elem("PropagateAtLaunch", Boolean.toString(tag.propagateAtLaunch()))
-                    .end("member");
+               .elem("ResourceId", tag.resourceId())
+               .elem("ResourceType", "auto-scaling-group")
+               .elem("Key", tag.key())
+               .elem("Value", tag.value())
+               .elem("PropagateAtLaunch", String.valueOf(tag.propagateAtLaunch()))
+               .end("member");
         }
         xml.end("Tags");
-        if (page.nextToken() != null) { xml.elem("NextToken", page.nextToken()); }
-        return ok(xml.end("DescribeTagsResult").raw(AwsQueryResponse.responseMetadata())
-                .end("DescribeTagsResponse").build());
+        if (page.nextToken() != null) {
+            xml.elem("NextToken", page.nextToken());
+        }
+        xml.end("DescribeTagsResult")
+           .raw(AwsQueryResponse.responseMetadata())
+           .end("DescribeTagsResponse");
+        return ok(xml.build());
     }
 
     // ── Instances ─────────────────────────────────────────────────────────────
