@@ -10,12 +10,19 @@ import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogStream;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.SubscriptionFilter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -339,6 +346,115 @@ class CloudWatchLogsServiceTest {
     }
 
     @Test
+    void aStreamDeletedAfterThePutChecksItLeavesNoEventsBehind() {
+        // The stream is deleted between the put's first look at it and the put taking the lock.
+        AtomicReference<Runnable> deleteLater = new AtomicReference<>();
+        InMemoryStorage<String, LogStream> streams = new InMemoryStorage<>() {
+            private boolean seen;
+
+            @Override
+            public Optional<LogStream> get(String key) {
+                Optional<LogStream> stream = super.get(key);
+                if (!seen && stream.isPresent() && stream.get().getLogStreamName().equals("doomed")) {
+                    seen = true;
+                    deleteLater.get().run();
+                }
+                return stream;
+            }
+        };
+        InMemoryStorage<String, LogEvent> events = new InMemoryStorage<>();
+        CloudWatchLogsService logs = new CloudWatchLogsService(new InMemoryStorage<>(), streams, events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), 10000, 10000,
+                new RegionResolver(REGION, "000000000000"));
+        logs.createLogGroup("/app", null, null, REGION);
+        logs.createLogStream("/app", "doomed", REGION);
+        deleteLater.set(() -> logs.deleteLogStream("/app", "doomed", REGION));
+
+        assertThrows(AwsException.class,
+                () -> logs.putLogEvents("/app", "doomed", eventsAt(System.currentTimeMillis()), REGION));
+        assertEquals(List.of(), List.copyOf(events.keys()));
+    }
+
+    @Test
+    @Timeout(value = 10, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void aStreamRecreatedWhileTheOldOneIsDeletedKeepsItsNewEvents() throws InterruptedException {
+        // As the old stream's record goes, another caller recreates it and writes to it.
+        AtomicReference<Thread> recreate = new AtomicReference<>();
+        InMemoryStorage<String, LogStream> streams = new InMemoryStorage<>() {
+            @Override
+            public void delete(String key) {
+                super.delete(key);
+                Thread writer = recreate.getAndSet(null);
+                if (writer == null) {
+                    return;
+                }
+                startAndWaitUntilFinishedOrStuck(writer);
+            }
+        };
+        InMemoryStorage<String, LogEvent> events = new InMemoryStorage<>();
+        CloudWatchLogsService logs = new CloudWatchLogsService(new InMemoryStorage<>(), streams, events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), 10000, 10000,
+                new RegionResolver(REGION, "000000000000"));
+        logs.createLogGroup("/app", null, null, REGION);
+        logs.createLogStream("/app", "reused", REGION);
+        long now = System.currentTimeMillis();
+        logs.putLogEvents("/app", "reused", eventsAt(now - 1000), REGION);
+        Thread writer = new Thread(() -> {
+            logs.createLogStream("/app", "reused", REGION);
+            logs.putLogEvents("/app", "reused", eventsAt(now), REGION);
+        });
+        recreate.set(writer);
+
+        logs.deleteLogStream("/app", "reused", REGION);
+        writer.join();
+
+        assertEquals(List.of(now), storedTimestamps(logs, "/app", "reused"));
+    }
+
+    @Test
+    @Timeout(value = 10, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void aStreamDeletedAsThePutRecordsItsMetadataStaysDeleted() throws InterruptedException {
+        // The delete arrives as the put writes the stream's metadata back.
+        AtomicReference<Thread> deleter = new AtomicReference<>();
+        InMemoryStorage<String, LogStream> streams = new InMemoryStorage<>() {
+            @Override
+            public void put(String key, LogStream value) {
+                Thread delete = deleter.getAndSet(null);
+                if (delete != null) {
+                    startAndWaitUntilFinishedOrStuck(delete);
+                }
+                super.put(key, value);
+            }
+        };
+        CloudWatchLogsService logs = new CloudWatchLogsService(new InMemoryStorage<>(), streams,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), 10000, 10000,
+                new RegionResolver(REGION, "000000000000"));
+        logs.createLogGroup("/app", null, null, REGION);
+        logs.createLogStream("/app", "doomed", REGION);
+        Thread delete = new Thread(() -> logs.deleteLogStream("/app", "doomed", REGION));
+        deleter.set(delete);
+
+        logs.putLogEvents("/app", "doomed", eventsAt(System.currentTimeMillis()), REGION);
+        delete.join();
+
+        assertEquals(List.of(), logs.describeLogStreams("/app", null, REGION));
+    }
+
+    /** Runs the thread until it ends or waits on a lock the caller may hold. */
+    private static void startAndWaitUntilFinishedOrStuck(Thread thread) {
+        thread.start();
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (thread.isAlive() && System.nanoTime() < deadline) {
+            Thread.State state = thread.getState();
+            if (state == Thread.State.BLOCKED || state == Thread.State.WAITING
+                    || state == Thread.State.TIMED_WAITING) {
+                return;
+            }
+            Thread.onSpinWait();
+        }
+    }
+
+    @Test
     void putLogEventsLeavesOtherGroupsAloneWhenApplyingRetention() {
         service.createLogGroup("/short", 1, null, REGION);
         service.createLogStream("/short", "stream-1", REGION);
@@ -352,6 +468,399 @@ class CloudWatchLogsServiceTest {
 
         assertEquals(List.of(twoDaysAgo), storedTimestamps(service, "/forever", "stream-1"));
         assertEquals(List.of(), storedTimestamps(service, "/short", "stream-1"));
+    }
+
+    @Test
+    void putLogEventsAtTheCeilingDoesNotEnumerateTheStorePerCall() {
+        CountingStorage<LogEvent> events = new CountingStorage<>();
+        CloudWatchLogsService capped = new CloudWatchLogsService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                10000, 100, new RegionResolver(REGION, "000000000000"));
+        capped.createLogGroup("/app/logs", 30, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        long now = System.currentTimeMillis();
+        events.enumerations = 0;
+
+        for (int i = 0; i < 1_000; i++) {
+            capped.putLogEvents("/app/logs", "stream-1", eventsAt(now + i), REGION);
+        }
+
+        // Exactly once: the first call fills the index.
+        int listed = events.enumerations;
+        assertEquals(100, events.keys().size(), "the store stays at the ceiling");
+        assertEquals(1, listed,
+                "1,000 single-event calls listed the whole store " + listed
+                        + " times; the index fills once and eviction should not grow with the store");
+    }
+
+    @Test
+    void putLogEventsEvictsExactlyAfterAStreamIsDeleted() {
+        CloudWatchLogsService capped = serviceWithStoredEventCeiling(3);
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "kept", REGION);
+        capped.createLogStream("/app/logs", "deleted", REGION);
+        capped.putLogEvents("/app/logs", "kept", eventsAt(1000), REGION);
+        capped.putLogEvents("/app/logs", "deleted", eventsAt(2000, 3000), REGION);
+
+        capped.deleteLogStream("/app/logs", "deleted", REGION);
+        capped.putLogEvents("/app/logs", "kept", eventsAt(4000), REGION);
+
+        assertEquals(List.of(1000L, 4000L), storedTimestamps(capped, "/app/logs", "kept"),
+                "the deleted stream's events no longer count toward the ceiling");
+    }
+
+    @Test
+    void putLogEventsEvictsExactlyAfterAGroupIsDeleted() {
+        CloudWatchLogsService capped = serviceWithStoredEventCeiling(3);
+        capped.createLogGroup("/kept", null, null, REGION);
+        capped.createLogStream("/kept", "stream-1", REGION);
+        capped.createLogGroup("/deleted", null, null, REGION);
+        capped.createLogStream("/deleted", "stream-1", REGION);
+        capped.putLogEvents("/kept", "stream-1", eventsAt(1000), REGION);
+        capped.putLogEvents("/deleted", "stream-1", eventsAt(2000, 3000), REGION);
+
+        capped.deleteLogGroup("/deleted", REGION);
+        capped.putLogEvents("/kept", "stream-1", eventsAt(4000), REGION);
+
+        assertEquals(List.of(1000L, 4000L), storedTimestamps(capped, "/kept", "stream-1"));
+    }
+
+    @Test
+    void putLogEventsCountsEventsStoredBeforeARestart() {
+        InMemoryStorage<String, LogGroup> groups = new InMemoryStorage<>();
+        InMemoryStorage<String, LogStream> streams = new InMemoryStorage<>();
+        InMemoryStorage<String, LogEvent> events = new InMemoryStorage<>();
+        CloudWatchLogsService before = new CloudWatchLogsService(groups, streams, events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), 10000, 3,
+                new RegionResolver(REGION, "000000000000"));
+        before.createLogGroup("/app/logs", null, null, REGION);
+        before.createLogStream("/app/logs", "stream-1", REGION);
+        before.putLogEvents("/app/logs", "stream-1", eventsAt(1000, 2000, 3000), REGION);
+
+        CloudWatchLogsService after = new CloudWatchLogsService(groups, streams, events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), 10000, 3,
+                new RegionResolver(REGION, "000000000000"));
+        after.putLogEvents("/app/logs", "stream-1", eventsAt(4000), REGION);
+
+        assertEquals(List.of(2000L, 3000L, 4000L), storedTimestamps(after, "/app/logs", "stream-1"));
+    }
+
+    @Test
+    void putLogEventsDropsAnExpiredEventThatArrivesAfterNewerOnes() {
+        service.createLogGroup("/app/logs", 1, null, REGION);
+        service.createLogStream("/app/logs", "stream-1", REGION);
+        long now = System.currentTimeMillis();
+
+        service.putLogEvents("/app/logs", "stream-1", eventsAt(now), REGION);
+        service.putLogEvents("/app/logs", "stream-1", eventsAt(now - 2 * 86_400_000L), REGION);
+
+        assertEquals(List.of(now), storedTimestamps(service, "/app/logs", "stream-1"));
+    }
+
+    @Test
+    void putLogEventsAfterAResetCountsOnlyWhatIsStoredSinceTheReset() {
+        InMemoryStorage<String, LogGroup> groups = new InMemoryStorage<>();
+        InMemoryStorage<String, LogStream> streams = new InMemoryStorage<>();
+        InMemoryStorage<String, LogEvent> events = new InMemoryStorage<>();
+        CloudWatchLogsService capped = new CloudWatchLogsService(groups, streams, events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), 10000, 3,
+                new RegionResolver(REGION, "000000000000"));
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(1000, 2000, 3000), REGION);
+
+        groups.clear();
+        streams.clear();
+        events.clear();
+        capped.clear();
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(500), REGION);
+
+        assertEquals(List.of(500L), storedTimestamps(capped, "/app/logs", "stream-1"),
+                "events wiped by the reset no longer count toward the ceiling");
+    }
+
+    @Test
+    void eachAccountKeepsItsOwnCeiling() {
+        InMemoryStorage<String, LogEvent> rawEvents = new InMemoryStorage<>();
+        String accountA = "111111111111";
+        String accountB = "222222222222";
+        CloudWatchLogsService accountService = new CloudWatchLogsService(
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, accountB),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, accountB),
+                new AccountAwareStorageBackend<>(rawEvents, null, accountB),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, accountB),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, accountB),
+                10_000, 2, new RegionResolver(REGION, accountB));
+        for (String account : List.of(accountA, accountB)) {
+            accountService.createLogGroupForAccount(account, "/app/logs", null, null, REGION);
+            accountService.createLogStreamForAccount(account, "/app/logs", "stream", REGION);
+        }
+
+        accountService.putLogEventsForAccount(accountA, "/app/logs", "stream", eventsAt(1, 2, 3), REGION);
+        accountService.putLogEventsForAccount(accountB, "/app/logs", "stream", eventsAt(4), REGION);
+        accountService.putLogEventsForAccount(accountA, "/app/logs", "stream", eventsAt(5), REGION);
+
+        assertEquals(List.of(3L, 5L), rawTimestamps(rawEvents, accountA),
+                "account A drops its own oldest, whatever account B stores");
+        assertEquals(List.of(4L), rawTimestamps(rawEvents, accountB));
+    }
+
+    private static List<Long> rawTimestamps(InMemoryStorage<String, LogEvent> rawEvents, String account) {
+        return rawEvents.keys().stream()
+                .filter(key -> key.startsWith(account + "/"))
+                .map(key -> rawEvents.get(key).orElseThrow().getTimestamp())
+                .sorted()
+                .toList();
+    }
+
+    @Test
+    void aStreamDeletedInTheRequestAccountLeavesThatAccountsCeilingExact() {
+        String account = "222222222222";
+        CloudWatchLogsService accountService = new CloudWatchLogsService(
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, account),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, account),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, account),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, account),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, account),
+                10_000, 3, new RegionResolver(REGION, account));
+        accountService.createLogGroupForAccount(account, "/app/logs", null, null, REGION);
+        accountService.createLogStreamForAccount(account, "/app/logs", "kept", REGION);
+        accountService.createLogStreamForAccount(account, "/app/logs", "deleted", REGION);
+        accountService.putLogEventsForAccount(account, "/app/logs", "kept", eventsAt(1000), REGION);
+        accountService.putLogEventsForAccount(account, "/app/logs", "deleted", eventsAt(2000, 3000), REGION);
+
+        accountService.deleteLogStream("/app/logs", "deleted", REGION);
+        accountService.putLogEventsForAccount(account, "/app/logs", "kept", eventsAt(4000), REGION);
+
+        assertEquals(List.of(1000L, 4000L), storedTimestamps(accountService, "/app/logs", "kept"));
+    }
+
+    @Test
+    // Unsynchronized writers can corrupt a TreeSet into a loop that never ends: fail, don't hang.
+    @Timeout(60)
+    void concurrentPutsAtTheCeilingKeepExactlyTheNewestEvents() throws InterruptedException {
+        CeilingWatchStorage events = new CeilingWatchStorage();
+        CloudWatchLogsService capped = new CloudWatchLogsService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                10000, 100, new RegionResolver(REGION, "000000000000"));
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        int threads = 8;
+        int perThread = 250;
+        List<Thread> workers = new ArrayList<>();
+        List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
+        for (int t = 0; t < threads; t++) {
+            int base = t * perThread;
+            Thread worker = new Thread(() -> {
+                try {
+                    for (int i = 0; i < perThread; i++) {
+                        capped.putLogEvents("/app/logs", "stream-1", eventsAt(1000L + base + i), REGION);
+                    }
+                } catch (Throwable e) {
+                    failures.add(e);
+                }
+            });
+            workers.add(worker);
+            worker.start();
+        }
+        for (Thread worker : workers) {
+            worker.join();
+        }
+
+        assertEquals(List.of(), failures);
+        assertTrue(events.largestBeforeAWrite.get() <= 100,
+                "a write began with " + events.largestBeforeAWrite.get() + " events stored, over the ceiling");
+        List<Long> newest = new ArrayList<>();
+        for (long ts = 1000L + threads * perThread - 100; ts < 1000L + threads * perThread; ts++) {
+            newest.add(ts);
+        }
+        assertEquals(newest, storedTimestamps(capped, "/app/logs", "stream-1"));
+    }
+
+    @Test
+    void aStoreWriteThatFailsPartWayIsCountedOnTheNextCall() {
+        FailingOnceStorage events = new FailingOnceStorage();
+        CloudWatchLogsService capped = new CloudWatchLogsService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                10000, 3, new RegionResolver(REGION, "000000000000"));
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(1000, 2000), REGION);
+
+        events.failNextPutAll = true;
+        assertThrows(IllegalStateException.class,
+                () -> capped.putLogEvents("/app/logs", "stream-1", eventsAt(3000, 4000), REGION));
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(5000), REGION);
+
+        assertEquals(List.of(3000L, 4000L, 5000L), storedTimestamps(capped, "/app/logs", "stream-1"),
+                "events the failed call did store still count toward the ceiling");
+    }
+
+    @Test
+    void anErrorAfterTheStoreWriteIsCountedOnTheNextCall() {
+        FailingOnceStorage events = new FailingOnceStorage();
+        CloudWatchLogsService capped = new CloudWatchLogsService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                10000, 3, new RegionResolver(REGION, "000000000000"));
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(1000, 2000), REGION);
+
+        events.errorNextPutAll = true;
+        assertThrows(OutOfMemoryError.class,
+                () -> capped.putLogEvents("/app/logs", "stream-1", eventsAt(3000, 4000), REGION));
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(5000), REGION);
+
+        assertEquals(List.of(3000L, 4000L, 5000L), storedTimestamps(capped, "/app/logs", "stream-1"),
+                "an Error, not only a RuntimeException, leaves the index to be refilled");
+    }
+
+    @Test
+    void anAccountKeepsOneIndexThroughAFailedWriteAndAReset() {
+        // Writers queued on an index's monitor must never find a different index in the map,
+        // or two writers would change one account's events under two locks.
+        FailingOnceStorage events = new FailingOnceStorage();
+        CloudWatchLogsService capped = new CloudWatchLogsService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                10000, 3, new RegionResolver(REGION, "000000000000"));
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(1000), REGION);
+        LogEventIndex index = capped.eventIndex("");
+
+        events.failNextPutAll = true;
+        assertThrows(IllegalStateException.class,
+                () -> capped.putLogEvents("/app/logs", "stream-1", eventsAt(2000), REGION));
+        assertSame(index, capped.eventIndex(""), "a failed write keeps the account's index");
+
+        capped.beforeReset();
+        capped.clear();
+        capped.afterReset();
+        assertSame(index, capped.eventIndex(""), "a reset keeps the account's index");
+    }
+
+    @Test
+    void aResetReleasesTheIndexedEventsWithoutWaitingForTheNextWrite() {
+        CloudWatchLogsService capped = serviceWithStoredEventCeiling(10);
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(1000, 2000, 3000), REGION);
+        LogEventIndex index = capped.eventIndex("");
+        assertEquals(3, index.size());
+
+        capped.beforeReset();
+        assertEquals(0, index.size(), "beforeReset() alone releases the entries");
+        assertTrue(index.isStale(), "the next write still refills from the store");
+
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(4000), REGION);
+        capped.clear();
+        assertEquals(0, index.size(), "clear() alone releases what was written during the reset");
+        assertTrue(index.isStale());
+
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(5000), REGION);
+        capped.afterReset();
+        assertEquals(0, index.size(), "afterReset() alone releases what was written before it");
+        assertTrue(index.isStale());
+    }
+
+    @Test
+    void putLogEventsDuringAResetDoNotSkewTheCeilingAfterIt() {
+        InMemoryStorage<String, LogGroup> groups = new InMemoryStorage<>();
+        InMemoryStorage<String, LogStream> streams = new InMemoryStorage<>();
+        InMemoryStorage<String, LogEvent> events = new InMemoryStorage<>();
+        CloudWatchLogsService capped = new CloudWatchLogsService(groups, streams, events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), 10000, 3,
+                new RegionResolver(REGION, "000000000000"));
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(1000, 2000, 3000), REGION);
+
+        // The order EmulatorInfoController resets in: beforeReset, the storage wipe, clear,
+        // afterReset. Calls land on both sides of the wipe, before the service is told.
+        capped.beforeReset();
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(4000), REGION);
+        groups.clear();
+        streams.clear();
+        events.clear();
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(500), REGION);
+        capped.clear();
+        capped.afterReset();
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(600, 700), REGION);
+
+        assertEquals(List.of(500L, 600L, 700L), storedTimestamps(capped, "/app/logs", "stream-1"),
+                "events wiped by the reset do not count toward the ceiling, before clear() or after");
+    }
+
+    @Test
+    void aStoredEventWithoutAnIdDoesNotBreakIngest() {
+        InMemoryStorage<String, LogEvent> events = new InMemoryStorage<>();
+        CloudWatchLogsService capped = new CloudWatchLogsService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), events,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                10000, 2, new RegionResolver(REGION, "000000000000"));
+        capped.createLogGroup("/app/logs", null, null, REGION);
+        capped.createLogStream("/app/logs", "stream-1", REGION);
+        LogEvent legacy = new LogEvent();
+        legacy.setTimestamp(1000);
+        legacy.setMessage("legacy");
+        events.put(REGION + "::/app/logs::stream-1::000000000001000::legacy", legacy);
+
+        capped.putLogEvents("/app/logs", "stream-1", eventsAt(2000, 3000), REGION);
+
+        assertEquals(List.of(2000L, 3000L), storedTimestamps(capped, "/app/logs", "stream-1"));
+    }
+
+    private static final class FailingOnceStorage extends InMemoryStorage<String, LogEvent> {
+        boolean failNextPutAll;
+        boolean errorNextPutAll;
+
+        @Override
+        public void putAll(Map<String, LogEvent> entries) {
+            super.putAll(entries);
+            if (failNextPutAll) {
+                failNextPutAll = false;
+                throw new IllegalStateException("journal write failed after the entries were stored");
+            }
+            if (errorNextPutAll) {
+                errorNextPutAll = false;
+                throw new OutOfMemoryError("ran out after the entries were stored");
+            }
+        }
+    }
+
+    private static final class CeilingWatchStorage extends InMemoryStorage<String, LogEvent> {
+        final AtomicInteger largestBeforeAWrite = new AtomicInteger();
+
+        @Override
+        public void putAll(Map<String, LogEvent> entries) {
+            largestBeforeAWrite.accumulateAndGet(keys().size(), Math::max);
+            super.putAll(entries);
+        }
+    }
+
+    private static final class CountingStorage<V> extends InMemoryStorage<String, V> {
+        int enumerations;
+
+        @Override
+        public Set<String> keys() {
+            enumerations++;
+            return super.keys();
+        }
+
+        @Override
+        public List<V> scan(Predicate<String> keyFilter) {
+            enumerations++;
+            return super.scan(keyFilter);
+        }
     }
 
     // ──────────────────────────── KMS key association ────────────────────────────

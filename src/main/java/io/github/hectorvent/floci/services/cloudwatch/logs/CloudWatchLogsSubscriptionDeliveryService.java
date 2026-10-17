@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudwatch.logs;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -13,8 +14,10 @@ import io.github.hectorvent.floci.services.firehose.FirehoseService;
 import io.github.hectorvent.floci.services.firehose.model.Record;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
+import io.github.hectorvent.floci.services.lambda.LambdaLogDestinations;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
@@ -46,7 +49,6 @@ public class CloudWatchLogsSubscriptionDeliveryService {
 
     private static final Logger LOG = Logger.getLogger(CloudWatchLogsSubscriptionDeliveryService.class);
     private static final String DATA_MESSAGE = "DATA_MESSAGE";
-    private static final String LAMBDA_LOG_PREFIX = "/aws/lambda/";
     /** Max compressed record size for Kinesis and Firehose delivery (1 MB). */
     private static final int MAX_RECORD_PAYLOAD_BYTES = 1_000_000;
 
@@ -163,9 +165,9 @@ public class CloudWatchLogsSubscriptionDeliveryService {
         String service = arn.service();
 
         if ("lambda".equals(service)) {
-            if (isSelfSubscribedLambda(event.logGroupName(), destinationArn)) {
-                LOG.warnv("Skipping delivery to Lambda destination {0} to prevent recursive loop on its own log group {1}",
-                        destinationArn, event.logGroupName());
+            if (isOwnOutput(event, destinationArn)) {
+                LOG.warnv("Skipping delivery to Lambda destination {0} to prevent recursive loop on its own log stream {1} in {2}",
+                        destinationArn, event.logStreamName(), event.logGroupName());
                 return;
             }
             deliverChunks(filter, event, account, matching, gzipped -> deliverToLambda(destinationArn, gzipped));
@@ -180,17 +182,38 @@ public class CloudWatchLogsSubscriptionDeliveryService {
         }
     }
 
-    private boolean isSelfSubscribedLambda(String logGroupName, String functionArn) {
-        if (logGroupName == null || functionArn == null || !logGroupName.startsWith(LAMBDA_LOG_PREFIX)) {
+    /**
+     * Whether the event is the destination function's own output, which delivering would feed back
+     * to it forever. Floci skips only that: the function is the one the destination ARN names, with
+     * its account, Region and version or alias, and its output is in the group its LoggingConfig
+     * names, or else {@code /aws/lambda/<name>}. A named group can be shared, so there only the
+     * function's own streams are skipped, and another function's logs in it still reach it.
+     */
+    private boolean isOwnOutput(LogEventsIngested event, String functionArn) {
+        String logGroupName = event.logGroupName();
+        if (logGroupName == null) {
             return false;
         }
-        String logFunctionName = logGroupName.substring(LAMBDA_LOG_PREFIX.length());
+        String functionName;
         try {
-            String targetFunctionName = LambdaArnUtils.resolve(functionArn).name();
-            return logFunctionName.equals(targetFunctionName);
-        } catch (Exception e) {
+            functionName = LambdaArnUtils.resolve(functionArn).name();
+        } catch (AwsException e) {
+            // Not a function ARN: invoking it fails as well, so there is no loop to break.
             return false;
         }
+        LambdaFunction target = null;
+        if (lambdaService != null) {
+            try {
+                target = lambdaService.getFunctionByArn(functionArn);
+            } catch (AwsException e) {
+                LOG.debugv("Destination function {0} not found: {1}", functionArn, e.getMessage());
+            }
+        }
+        if (target == null) {
+            return logGroupName.equals(LambdaLogDestinations.defaultLogGroup(functionName));
+        }
+        return logGroupName.equals(LambdaLogDestinations.logGroup(target))
+                && LambdaLogDestinations.isOwnStream(target, event.logStreamName());
     }
 
     @FunctionalInterface
