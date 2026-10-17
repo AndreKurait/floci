@@ -14,8 +14,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static io.github.hectorvent.floci.testing.ThreadStates.awaitBlockedOrDone;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -29,14 +29,21 @@ import static org.mockito.Mockito.when;
 class ContainerLifecycleManagerTeardownTest {
 
     @Test
-    void cancellationBeforeAdmissionLeavesContainerUntouchedAndReleasesNoOtherSlot() throws Exception {
+    void interruptedWaitersStillCleanUpWithoutReleasingAnotherOwnersSlot() throws Exception {
         DockerClient docker = mock(DockerClient.class);
         ContainerLifecycleManager manager = new ContainerLifecycleManager(docker, null, null, null, null);
         StopContainerCmd stop = mock(StopContainerCmd.class);
         when(docker.stopContainerCmd(anyString())).thenReturn(stop);
         when(stop.withTimeout(anyInt())).thenReturn(stop);
         RemoveContainerCmd remove = mock(RemoveContainerCmd.class);
-        when(docker.removeContainerCmd(anyString())).thenReturn(remove);
+        when(docker.removeContainerCmd(anyString())).thenAnswer(invocation -> {
+            if (invocation.<String>getArgument(0).startsWith("owned-")) {
+                return remove;
+            }
+            RemoveContainerCmd waitingRemove = mock(RemoveContainerCmd.class);
+            when(waitingRemove.withForce(true)).thenReturn(waitingRemove);
+            return waitingRemove;
+        });
         when(remove.withForce(true)).thenReturn(remove);
         CountDownLatch removing = new CountDownLatch(8);
         CountDownLatch release = new CountDownLatch(1);
@@ -62,44 +69,52 @@ class ContainerLifecycleManagerTeardownTest {
                 }
             }));
         }
-        AtomicReference<Throwable> cancellation = new AtomicReference<>();
-        AtomicBoolean interrupted = new AtomicBoolean();
-        CountDownLatch requestingSlot = new CountDownLatch(1);
-        Thread waiter = null;
+        List<Thread> waiters = new ArrayList<>();
+        List<AtomicBoolean> interrupted = new ArrayList<>();
         try {
             assertTrue(removing.await(10, TimeUnit.SECONDS));
-            waiter = Thread.ofVirtual().start(() -> {
-                try {
-                    requestingSlot.countDown();
-                    manager.stopAndRemoveStrict("waiting", null);
-                } catch (Throwable problem) {
-                    cancellation.set(problem);
-                    interrupted.set(Thread.currentThread().isInterrupted());
-                }
-            });
-            assertTrue(requestingSlot.await(10, TimeUnit.SECONDS));
-            waiter.interrupt();
-            waiter.join(10000);
-            assertFalse(waiter.isAlive());
-            assertInstanceOf(InterruptedException.class, cancellation.get().getCause());
-            assertTrue(interrupted.get());
-            verify(docker, never()).stopContainerCmd("waiting");
-            verify(docker, never()).removeContainerCmd("waiting");
-        } finally {
-            if (waiter != null) {
+            for (boolean strict : List.of(false, true)) {
+                String id = "waiting-" + strict;
+                AtomicBoolean preservedInterrupt = new AtomicBoolean();
+                interrupted.add(preservedInterrupt);
+                Thread waiter = Thread.ofVirtual().start(() -> {
+                    try {
+                        if (strict) {
+                            manager.stopAndRemoveStrict(id, null);
+                        } else {
+                            manager.stopAndRemove(id, null);
+                        }
+                        preservedInterrupt.set(Thread.currentThread().isInterrupted());
+                    } catch (Throwable problem) {
+                        failure.compareAndSet(null, problem);
+                    }
+                });
+                waiters.add(waiter);
+                awaitBlockedOrDone(waiter);
                 waiter.interrupt();
-                waiter.join(10000);
+                assertTrue(waiter.isAlive());
+                verify(docker, never()).stopContainerCmd(id);
+                verify(docker, never()).removeContainerCmd(id);
             }
+        } finally {
             release.countDown();
-            for (Thread owner : owners) {
-                owner.join(10000);
-                assertFalse(owner.isAlive());
+            for (Thread thread : owners) {
+                thread.join(10000);
+                assertFalse(thread.isAlive());
+            }
+            for (Thread thread : waiters) {
+                thread.join(10000);
+                assertFalse(thread.isAlive());
             }
         }
         assertNull(failure.get());
-        // A retained owner can retry after cancellation; all admitted operations released slots.
-        manager.stopAndRemoveStrict("waiting", null);
-        verify(docker).removeContainerCmd("waiting");
+        for (AtomicBoolean preservedInterrupt : interrupted) {
+            assertTrue(preservedInterrupt.get());
+        }
+        for (boolean strict : List.of(false, true)) {
+            verify(docker).stopContainerCmd("waiting-" + strict);
+            verify(docker).removeContainerCmd("waiting-" + strict);
+        }
     }
 
     @Test

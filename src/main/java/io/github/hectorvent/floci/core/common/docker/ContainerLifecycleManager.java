@@ -588,12 +588,7 @@ public class ContainerLifecycleManager {
     }
 
     private void withTeardownSlot(Runnable stopAndRemove) {
-        try {
-            teardownSlots.acquire();
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Container teardown interrupted before admission", interrupted);
-        }
+        teardownSlots.acquireUninterruptibly();
         try {
             stopAndRemove.run();
         } finally {
