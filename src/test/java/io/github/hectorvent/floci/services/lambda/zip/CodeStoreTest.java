@@ -180,7 +180,7 @@ class CodeStoreTest {
     }
 
     @Test
-    void versionFilesShareStorageWithoutReinterpretingRelativeSymlinks(@TempDir Path baseDir)
+    void versionFilesRemainIndependentAfterInPlaceHostEdits(@TempDir Path baseDir)
             throws IOException {
         CodeStore store = new CodeStore(baseDir);
         Path latest = store.getCodePath(ACCOUNT_A, REGION, "fn");
@@ -189,7 +189,9 @@ class CodeStoreTest {
 
         Path version = store.copyForVersion(ACCOUNT_A, REGION, "fn", "1", latest);
 
-        assertTrue(Files.isSameFile(latest.resolve("lib/index.js"), version.resolve("lib/index.js")));
+        assertFalse(Files.isSameFile(latest.resolve("lib/index.js"), version.resolve("lib/index.js")));
+        Files.writeString(latest.resolve("lib/index.js"), "changed in place");
+        assertEquals("handler", Files.readString(version.resolve("lib/index.js")));
         assertFalse(Files.isSymbolicLink(version.resolve("index.js")));
         assertFalse(Files.isSameFile(latest.resolve("index.js"), version.resolve("index.js")));
         assertEquals("handler", Files.readString(version.resolve("index.js")));
@@ -197,7 +199,7 @@ class CodeStoreTest {
 
     @ParameterizedTest
     @CsvSource({"true, false", "false, true", "true, true"})
-    void unsupportedLinksFallBackToIndependentCopies(boolean zipSource, boolean zipTarget, @TempDir Path baseDir)
+    void versionCopiesWorkAcrossFilesystemProviders(boolean zipSource, boolean zipTarget, @TempDir Path baseDir)
             throws IOException {
         try (FileSystem zip = FileSystems.newFileSystem(baseDir.resolve("code.zip"), Map.of("create", "true"))) {
             CodeStore store = new CodeStore(zipTarget ? zip.getPath("/code") : baseDir.resolve("code"));

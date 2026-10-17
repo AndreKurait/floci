@@ -455,7 +455,7 @@ status, named with its stack or by its ARN alone; a `StackName` that names no st
 - Code and mutable configuration changes update the existing function in place.
 - Replacement-only changes such as `FunctionName` or `PackageType` changes create a replacement function and remove the old one.
 - A changed `DurableConfig` updates the function in place. A `RetentionPeriodInDays` the template leaves out goes back to 14, and a `KMSKeyArn` it leaves out is cleared. Adding or removing `DurableConfig` replaces the function, since Lambda cannot do either in place. A durable function created without `Timeout` gets `min(ExecutionTimeout, 900)`, while an update without it sets 3, as on AWS.
-- Overwriting an S3 deployment package alone does not redeploy the function. Change its package key in the template so CloudFormation detects the code change.
+- Overwriting an S3 deployment package alone does not redeploy the function. Change its package key in the template so CloudFormation detects the code change. Changing only `S3ObjectVersion` is not yet supported: Floci compares bucket/key and fetches the latest object, so use a new key to deploy a different package.
 - Hot-reload code (`S3Bucket: hot-reload`) is compared by host path: the same path is a no-op, a different path updates the bind mount in place.
 - `Tags` are applied when the function is created, including a replacement function. On `UpdateStack` the template's tags are applied and only the keys the previous template set and the new one drops are removed, so a tag added outside the template is kept, as in AWS.
 
@@ -476,8 +476,8 @@ code or configuration changed since its last version. floci does not give the fu
 The version a new id replaces stays published: like SAM, floci gives the version
 `DeletionPolicy: Retain` unless the function sets a `DeletionPolicy`, and the update reports it
 `DELETE_SKIPPED`. With `Delete` floci reports the old version `DELETE_COMPLETE` but never deletes
-it, where AWS does. Changes made to `$LATEST` outside the stack, including Lambda's reactive S3
-sync, do not reach the alias until an update publishes a new version. Event sources and API
+it, where AWS does. Changes made to `$LATEST` outside the stack, including explicit code or configuration
+updates, do not reach the alias until an update publishes a new version. Event sources and API
 integrations still invoke the function rather than the alias, so they run `$LATEST`.
 
 ## RDS Credential Dynamic References
