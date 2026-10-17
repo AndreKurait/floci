@@ -87,6 +87,11 @@ public class RedshiftServerlessCustomDomainService implements Resettable {
                 .map(association -> withCertificateExpiry(association, region));
     }
 
+    public synchronized Optional<CustomDomainAssociation> findForCustomDomain(String customDomainName, String region) {
+        return Optional.ofNullable(findByDomain(customDomainName, region))
+                .map(association -> withCertificateExpiry(association, region));
+    }
+
     public synchronized PaginatedResult<CustomDomainAssociation> listCustomDomainAssociations(
             String customDomainName, String certificateArn, String region, Integer maxResults, String nextToken) {
         int limit = ServerlessSupport.pageSize(maxResults);

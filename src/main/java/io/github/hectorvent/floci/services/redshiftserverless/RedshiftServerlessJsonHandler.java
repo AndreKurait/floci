@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.services.redshift.RedshiftIamDbUserResolver;
 import io.github.hectorvent.floci.services.redshift.TempCredential;
 import io.github.hectorvent.floci.services.redshiftserverless.model.ConfigParameter;
+import io.github.hectorvent.floci.services.redshiftserverless.model.CustomDomainAssociation;
 import io.github.hectorvent.floci.services.redshiftserverless.model.Namespace;
 import io.github.hectorvent.floci.services.redshiftserverless.model.PricePerformanceTarget;
 import io.github.hectorvent.floci.services.redshiftserverless.model.RedshiftServerlessSnapshot;
@@ -200,11 +201,8 @@ public class RedshiftServerlessJsonHandler {
      * refreshes an authorization early, so the refresh time is the expiry.
      */
     private Response handleGetCredentials(JsonNode request, String region, String authorizationHeader) {
-        if (request.hasNonNull("customDomainName")) {
-            throw ServerlessSupport.validation("customDomainName is not supported; use workgroupName.");
-        }
         TempCredential credential = service.getCredentials(
-                ServerlessSupport.text(request, "workgroupName"),
+                workgroupNameOf(request, region),
                 ServerlessSupport.text(request, "dbName"),
                 ServerlessSupport.integer(request, "durationSeconds"),
                 iamDbUserResolver.resolveDbUser(authorizationHeader),
@@ -215,6 +213,28 @@ public class RedshiftServerlessJsonHandler {
         response.put("expiration", credential.expiresAt().getEpochSecond());
         response.put("nextRefreshTime", credential.expiresAt().getEpochSecond());
         return Response.ok(response).build();
+    }
+
+    /**
+     * Resolves the workgroup name from {@code workgroupName}, or from {@code customDomainName} when given.
+     * AWS requires exactly one of the two to identify the target workgroup.
+     */
+    private String workgroupNameOf(JsonNode request, String region) {
+        String workgroupName = ServerlessSupport.text(request, "workgroupName");
+        String customDomainName = ServerlessSupport.text(request, "customDomainName");
+        if (workgroupName != null && customDomainName != null) {
+            throw ServerlessSupport.validation("workgroupName and customDomainName cannot both be specified.");
+        }
+        if (workgroupName == null && customDomainName == null) {
+            throw ServerlessSupport.validation(
+                    "The custom domain name or the workgroup name must be included in the request.");
+        }
+        if (customDomainName != null) {
+            return customDomains.findForCustomDomain(customDomainName, region)
+                    .map(CustomDomainAssociation::getWorkgroupName)
+                    .orElseThrow(() -> ServerlessSupport.notFound("The custom domain " + customDomainName + " was not found."));
+        }
+        return workgroupName;
     }
 
     private Response handleCreateSnapshot(JsonNode request, String region) {

@@ -475,6 +475,11 @@ public class RedshiftServerlessService implements Resettable {
         return snapshotArn.substring(prefix.length());
     }
 
+    /** Whether {@code namespaceName} names a namespace in {@code region}; never throws for an unknown name. */
+    public boolean namespaceExists(String namespaceName, String region) {
+        return namespaceName != null && namespaces.get(storageKey(region, namespaceName)).isPresent();
+    }
+
     /** The workgroup called {@code workgroupName} in {@code region}, empty when there is none. */
     public Optional<Workgroup> findWorkgroup(String workgroupName, String region) {
         return workgroupName == null ? Optional.empty() : workgroups.get(storageKey(region, workgroupName));

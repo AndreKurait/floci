@@ -72,6 +72,9 @@ class RedshiftServerlessIntegrationTest {
         when(runtime.start(any(String.class), any(String.class), any(String.class), any(String.class),
                 any(String.class), any(String.class), any(Endpoint.class), anyBoolean(), any()))
                 .thenReturn(new RedshiftServerlessRuntime.Backend("127.0.0.1", 55432));
+        when(runtime.issueCredential(any(), any(), any(), any(), anyInt()))
+                .thenAnswer(invocation -> new TempCredential(invocation.getArgument(3), "temporary-password",
+                        Instant.now().plusSeconds(900), List.of()));
     }
 
     @ParameterizedTest
@@ -700,11 +703,24 @@ class RedshiftServerlessIntegrationTest {
         call("ListCustomDomainAssociations", "{\"customDomainName\":\"db.example.com\"}")
                 .statusCode(200)
                 .body("associations", hasSize(1));
+        call("GetCredentials", "{\"customDomainName\":\"db.example.com\"}")
+                .statusCode(200)
+                .body("dbUser", notNullValue())
+                .body("dbPassword", notNullValue());
+        call("GetCredentials", "{\"customDomainName\":\"db.example.com\",\"workgroupName\":\"domain-wg\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"));
+        call("GetCredentials", "{\"customDomainName\":\"missing.example.com\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ResourceNotFoundException"));
         call("DeleteCustomDomainAssociation",
                 "{\"workgroupName\":\"domain-wg\",\"customDomainName\":\"db.example.com\"}").statusCode(200);
         call("GetWorkgroup", "{\"workgroupName\":\"domain-wg\"}")
                 .statusCode(200)
                 .body("workgroup.customDomainName", nullValue());
+        call("GetCredentials", "{\"customDomainName\":\"db.example.com\"}")
+                .statusCode(400)
+                .body("__type", equalTo("ResourceNotFoundException"));
     }
 
     @Test
@@ -734,6 +750,24 @@ class RedshiftServerlessIntegrationTest {
                 .body("__type", equalTo("InvalidPaginationException"));
         call("DeleteSnapshotCopyConfiguration", "{\"snapshotCopyConfigurationId\":\"" + replacementCopyId + "\"}")
                 .statusCode(200);
+    }
+
+    @Test
+    void scheduledActionRoundTripsOverTheWire() {
+        call("CreateNamespace", "{\"namespaceName\":\"sched-ns\",\"adminUsername\":\"admin\"}").statusCode(200);
+
+        call("CreateScheduledAction", "{\"scheduledActionName\":\"admin-sched\",\"namespaceName\":\"sched-ns\","
+                + "\"roleArn\":\"arn:aws:iam::000000000000:role/r\",\"schedule\":{\"cron\":\"cron(0 3 * * ? *)\"},"
+                + "\"targetAction\":{\"createSnapshot\":{\"namespaceName\":\"sched-ns\",\"snapshotNamePrefix\":\"p\"}}}")
+                .statusCode(200)
+                .body("scheduledAction.state", equalTo("ACTIVE"))
+                .body("scheduledAction.schedule.cron", equalTo("cron(0 3 * * ? *)"));
+        call("CreateScheduledAction", "{\"scheduledActionName\":\"BAD_NAME\",\"namespaceName\":\"sched-ns\","
+                + "\"roleArn\":\"arn:aws:iam::000000000000:role/r\",\"schedule\":{\"cron\":\"x\"},"
+                + "\"targetAction\":{\"createSnapshot\":{\"namespaceName\":\"sched-ns\",\"snapshotNamePrefix\":\"p\"}}}")
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"));
+        call("DeleteScheduledAction", "{\"scheduledActionName\":\"admin-sched\"}").statusCode(200);
     }
 
     private static io.restassured.response.ValidatableResponse call(String action, String body) {

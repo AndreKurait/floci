@@ -1300,6 +1300,14 @@ ARNs take precedence over plain-name interpretation and must identify a local gr
 is accepted on a canonical local group ARN. These compatibility forms are not a claim that AWS accepts
 them for these APIs. Other Logs actions retain their existing wildcard resource evaluation.
 
+**Secrets Manager secrets.** A request that names a secret by its name, or by a partial ARN without
+the random suffix, is evaluated against the stored secret's full ARN, suffix included, so a
+`secret:<name>-??????` resource, the pattern the Secrets Manager User Guide documents, matches it as
+it does on AWS, and a `Deny` on the full ARN applies. `CreateSecret` is evaluated against
+`secret:<Name>-??????`, standing in for the suffix the secret is assigned when it is created, so a
+policy scoped to a name prefix such as `secret:app/*` allows it. A name that matches no secret in the
+request's account and region is evaluated as `secret:<name>`, and an ARN that matches none as given.
+
 **IAM's own resources are named.** When enforcement evaluates a request, the target resource comes
 from `ResourceArnBuilder`, which builds an ARN for S3, Lambda, SQS, SNS, DynamoDB, Kinesis, Secrets
 Manager, SSM, KMS and IAM. Within IAM the resource type each action is evaluated against is the one

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.testing.EnforcementFixtures;
+import io.github.hectorvent.floci.testing.EnforcementFixtures.Session;
 import io.github.hectorvent.floci.testing.IamEnforcementProfile;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.quarkus.test.common.http.TestHTTPResource;
@@ -219,9 +220,6 @@ class AssumeRoleTrustConditionsIntegrationTest {
         return spec.when().post("/");
     }
 
-    private record Session(String accessKeyId, String sessionToken) {
-    }
-
     /** A user in {@link #OTHER_ACCOUNT} carrying the sts:AssumeRole its own policies have to allow. */
     private String createCallerUser(String user) {
         String accessKeyId = EnforcementFixtures.createUser(cleanup, baseUri.getPort(),
@@ -234,24 +232,12 @@ class AssumeRoleTrustConditionsIntegrationTest {
 
     /** A role in the trusted account that its own account may assume, allowed to call AssumeRole. */
     private void createCallerRole(String name, String path) {
-        cleanup.register(() -> EnforcementFixtures.removeRole(baseUri.getPort(),
-                auth(TRUSTED_ACCOUNT, "iam"), name));
-        given().formParam("Action", "CreateRole").formParam("RoleName", name).formParam("Path", path)
-                .formParam("AssumeRolePolicyDocument", trustAccountRoot(TRUSTED_ACCOUNT))
-                .header("Authorization", auth(TRUSTED_ACCOUNT, "iam")).when().post("/").then().statusCode(200);
-        given().formParam("Action", "PutRolePolicy").formParam("RoleName", name).formParam("PolicyName", "p")
-                .formParam("PolicyDocument", ALLOW_ASSUME_ROLE)
-                .header("Authorization", auth(TRUSTED_ACCOUNT, "iam")).when().post("/").then().statusCode(200);
+        EnforcementFixtures.createRole(cleanup, baseUri.getPort(), TRUSTED_ACCOUNT, path, name, ALLOW_ASSUME_ROLE);
     }
 
-    private static Session assumeCallerRole(String name, String path) {
-        Response response = given().formParam("Action", "AssumeRole")
-                .formParam("RoleArn", "arn:aws:iam::" + TRUSTED_ACCOUNT + ":role" + path + name)
-                .formParam("RoleSessionName", "s")
-                .header("Authorization", auth(TRUSTED_ACCOUNT, "sts")).when().post("/");
-        response.then().statusCode(200);
-        return new Session(response.path("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId"),
-                response.path("AssumeRoleResponse.AssumeRoleResult.Credentials.SessionToken"));
+    private Session assumeCallerRole(String name, String path) {
+        return EnforcementFixtures.assumeRole(baseUri.getPort(), TRUSTED_ACCOUNT,
+                "arn:aws:iam::" + TRUSTED_ACCOUNT + ":role" + path + name);
     }
 
     private static Response assumeRoleWithSession(Session session, String role) {

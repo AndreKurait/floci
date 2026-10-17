@@ -9,15 +9,19 @@ import software.amazon.awssdk.services.redshiftdata.model.ExecuteStatementRespon
 import software.amazon.awssdk.services.redshiftdata.model.StatusString;
 import software.amazon.awssdk.services.redshiftserverless.RedshiftServerlessClient;
 import software.amazon.awssdk.services.redshiftserverless.model.ConflictException;
+import software.amazon.awssdk.services.redshiftserverless.model.CreateSnapshotScheduleActionParameters;
 import software.amazon.awssdk.services.redshiftserverless.model.EndpointAccess;
 import software.amazon.awssdk.services.redshiftserverless.model.GetCredentialsResponse;
 import software.amazon.awssdk.services.redshiftserverless.model.InvalidPaginationException;
 import software.amazon.awssdk.services.redshiftserverless.model.Namespace;
 import software.amazon.awssdk.services.redshiftserverless.model.NamespaceStatus;
 import software.amazon.awssdk.services.redshiftserverless.model.ResourceNotFoundException;
+import software.amazon.awssdk.services.redshiftserverless.model.Schedule;
+import software.amazon.awssdk.services.redshiftserverless.model.ScheduledActionResponse;
 import software.amazon.awssdk.services.redshiftserverless.model.ServerlessTrack;
 import software.amazon.awssdk.services.redshiftserverless.model.Snapshot;
 import software.amazon.awssdk.services.redshiftserverless.model.Tag;
+import software.amazon.awssdk.services.redshiftserverless.model.TargetAction;
 import software.amazon.awssdk.services.redshiftserverless.model.UsageLimit;
 import software.amazon.awssdk.services.redshiftserverless.model.UsageLimitBreachAction;
 import software.amazon.awssdk.services.redshiftserverless.model.UsageLimitPeriod;
@@ -365,8 +369,25 @@ class RedshiftServerlessTest {
                         .customDomainName("db.example.com").customDomainCertificateArn(certificate));
                 assertThat(client.listCustomDomainAssociations(request -> request.customDomainName("db.example.com"))
                         .associations()).hasSize(1);
+
+                GetCredentialsResponse credentials = client.getCredentials(request -> request
+                        .customDomainName("db.example.com")
+                        .dbName("dev"));
+                assertThat(credentials.dbUser()).isNotBlank();
+                assertThat(credentials.dbPassword()).isNotBlank();
+                assertThat(credentials.expiration()).isAfter(Instant.now());
+
+                assertThatThrownBy(() -> client.getCredentials(request -> request
+                        .customDomainName("db.example.com")
+                        .workgroupName(workgroupName)))
+                        .isInstanceOf(ValidationException.class);
+
                 client.deleteCustomDomainAssociation(request -> request.workgroupName(workgroupName)
                         .customDomainName("db.example.com"));
+
+                assertThatThrownBy(() -> client.getCredentials(request -> request
+                        .customDomainName("db.example.com")))
+                        .isInstanceOf(ResourceNotFoundException.class);
             } finally {
                 deleteWorkgroupBestEffort(client, workgroupName);
                 deleteBestEffort(client, namespaceName);
@@ -407,6 +428,31 @@ class RedshiftServerlessTest {
         }
     }
 
+    @Test
+    void scheduledActionUsesAwsSdk() {
+        assumeFalse(TestFixtures.isRealAws(), "Creates resources and asserts emulator-local behavior");
+
+        try (RedshiftServerlessClient client = TestFixtures.redshiftServerlessClient()) {
+            String namespaceName = "floci-compat-sched-ns";
+            try {
+                client.createNamespace(request -> request.namespaceName(namespaceName).adminUsername("admin")
+                        .adminUserPassword("Secret123!"));
+
+                ScheduledActionResponse action = client.createScheduledAction(request -> request
+                        .scheduledActionName("floci-compat-sched").namespaceName(namespaceName)
+                        .roleArn("arn:aws:iam::000000000000:role/r")
+                        .schedule(Schedule.builder().cron("cron(0 3 * * ? *)").build())
+                        .targetAction(TargetAction.builder().createSnapshot(CreateSnapshotScheduleActionParameters
+                                .builder().namespaceName(namespaceName).snapshotNamePrefix("nightly").build())
+                                .build())).scheduledAction();
+                assertThat(action.state().toString()).isEqualTo("ACTIVE");
+                assertThat(action.schedule().cron()).isEqualTo("cron(0 3 * * ? *)");
+                client.deleteScheduledAction(request -> request.scheduledActionName("floci-compat-sched"));
+            } finally {
+                deleteBestEffort(client, namespaceName);
+            }
+        }
+    }
     private static void deleteSnapshotBestEffort(RedshiftServerlessClient client, String snapshotName) {
         try {
             client.deleteSnapshot(request -> request.snapshotName(snapshotName));

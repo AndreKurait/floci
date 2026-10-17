@@ -9,12 +9,16 @@ import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.services.redshiftserverless.model.CustomDomainAssociation;
 import io.github.hectorvent.floci.services.redshiftserverless.model.EndpointAccess;
 import io.github.hectorvent.floci.services.redshiftserverless.model.ResourcePolicy;
+import io.github.hectorvent.floci.services.redshiftserverless.model.ScheduledAction;
 import io.github.hectorvent.floci.services.redshiftserverless.model.SnapshotCopyConfiguration;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Supplier;
 
 /**
@@ -33,18 +37,21 @@ public class RedshiftServerlessAdminJsonHandler {
     private final RedshiftServerlessEndpointAccessService endpointAccess;
     private final RedshiftServerlessResourcePolicyService resourcePolicies;
     private final RedshiftServerlessSnapshotCopyService snapshotCopies;
+    private final RedshiftServerlessScheduledActionService scheduledActions;
 
     @Inject
     public RedshiftServerlessAdminJsonHandler(ObjectMapper objectMapper,
                                               RedshiftServerlessResourcePolicyService resourcePolicies,
                                               RedshiftServerlessEndpointAccessService endpointAccess,
                                               RedshiftServerlessCustomDomainService customDomains,
-                                              RedshiftServerlessSnapshotCopyService snapshotCopies) {
+                                              RedshiftServerlessSnapshotCopyService snapshotCopies,
+                                              RedshiftServerlessScheduledActionService scheduledActions) {
         this.objectMapper = objectMapper;
         this.resourcePolicies = resourcePolicies;
         this.endpointAccess = endpointAccess;
         this.customDomains = customDomains;
         this.snapshotCopies = snapshotCopies;
+        this.scheduledActions = scheduledActions;
     }
 
     Supplier<Response> operation(String action, JsonNode request, String region) {
@@ -112,6 +119,15 @@ public class RedshiftServerlessAdminJsonHandler {
             case "DeleteSnapshotCopyConfiguration" -> () -> snapshotCopyResponse(
                     snapshotCopies.deleteSnapshotCopyConfiguration(
                             ServerlessSupport.text(request, "snapshotCopyConfigurationId"), region));
+            case "CreateScheduledAction" -> () -> scheduledActionResponse(
+                    scheduledActions.createScheduledAction(parseScheduledAction(request), region));
+            case "GetScheduledAction" -> () -> scheduledActionResponse(
+                    scheduledActions.getScheduledAction(ServerlessSupport.text(request, "scheduledActionName"), region));
+            case "ListScheduledActions" -> () -> listScheduledActions(request, region);
+            case "UpdateScheduledAction" -> () -> scheduledActionResponse(
+                    scheduledActions.updateScheduledAction(parseScheduledAction(request), region));
+            case "DeleteScheduledAction" -> () -> scheduledActionResponse(
+                    scheduledActions.deleteScheduledAction(ServerlessSupport.text(request, "scheduledActionName"), region));
             default -> null;
         };
     }
@@ -252,6 +268,131 @@ public class RedshiftServerlessAdminJsonHandler {
             node.put("snapshotRetentionPeriod", configuration.getSnapshotRetentionPeriod());
         }
         return node;
+    }
+
+    // ── Scheduled action ───────────────────────────────────────────────────
+
+    private ScheduledAction parseScheduledAction(JsonNode request) {
+        ScheduledAction action = new ScheduledAction();
+        action.setScheduledActionName(ServerlessSupport.text(request, "scheduledActionName"));
+        action.setNamespaceName(ServerlessSupport.text(request, "namespaceName"));
+        action.setRoleArn(ServerlessSupport.text(request, "roleArn"));
+        action.setDescription(ServerlessSupport.text(request, "scheduledActionDescription"));
+        action.setEnabled(ServerlessSupport.bool(request, "enabled"));
+        action.setStartTime(ServerlessSupport.epochSeconds(request, "startTime"));
+        action.setEndTime(ServerlessSupport.epochSeconds(request, "endTime"));
+        JsonNode schedule = ServerlessSupport.object(request, "schedule");
+        if (schedule != null) {
+            action.setScheduleSpecified(true);
+            action.setScheduleAt(ServerlessSupport.epochSeconds(schedule, "at"));
+            action.setScheduleCron(ServerlessSupport.text(schedule, "cron"));
+        }
+        JsonNode target = ServerlessSupport.object(request, "targetAction");
+        if (target != null) {
+            JsonNode snapshot = ServerlessSupport.object(target, "createSnapshot");
+            if (snapshot == null) {
+                throw ServerlessSupport.validation("targetAction must set createSnapshot.");
+            }
+            action.setTargetSpecified(true);
+            action.setTargetNamespaceName(ServerlessSupport.text(snapshot, "namespaceName"));
+            action.setSnapshotNamePrefix(ServerlessSupport.text(snapshot, "snapshotNamePrefix"));
+            action.setRetentionPeriod(ServerlessSupport.integer(snapshot, "retentionPeriod"));
+            action.setSnapshotTags(parseTags(snapshot.path("tags")));
+        }
+        return action;
+    }
+
+    private static Map<String, String> parseTags(JsonNode tags) {
+        if (tags.isMissingNode() || tags.isNull()) {
+            return null;
+        }
+        if (!tags.isArray()) {
+            throw ServerlessSupport.validation("tags must be an array of tags.");
+        }
+        Map<String, String> parsed = new LinkedHashMap<>();
+        for (JsonNode tag : tags) {
+            if (!tag.isObject()) {
+                throw ServerlessSupport.validation("tags must contain only tag objects.");
+            }
+            if (!tag.path("key").isTextual() || !tag.path("value").isTextual()) {
+                throw ServerlessSupport.validation("every tag needs a string key and a string value.");
+            }
+            parsed.put(tag.path("key").textValue(), tag.path("value").textValue());
+        }
+        return parsed;
+    }
+
+    private Response listScheduledActions(JsonNode request, String region) {
+        PaginatedResult<ScheduledAction> page = scheduledActions.listScheduledActions(
+                ServerlessSupport.text(request, "namespaceName"), region, ServerlessSupport.maxResults(request),
+                ServerlessSupport.text(request, "nextToken"));
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode items = response.putArray("scheduledActions");
+        for (ScheduledAction action : page.items()) {
+            ObjectNode item = items.addObject();
+            item.put("namespaceName", action.getNamespaceName());
+            item.put("scheduledActionName", action.getScheduledActionName());
+        }
+        putNextToken(response, page);
+        return Response.ok(response).build();
+    }
+
+    private Response scheduledActionResponse(ScheduledAction action) {
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("scheduledAction", scheduledActionNode(action));
+        return Response.ok(response).build();
+    }
+
+    /** A one-off schedule reports its own time while it is ahead and within its active window on an enabled action; a cron schedule reports none, as Floci never computes them. */
+    private ObjectNode scheduledActionNode(ScheduledAction action) {
+        ObjectNode node = objectMapper.createObjectNode();
+        if (action.getEndTime() != null) {
+            node.put("endTime", epoch(action.getEndTime()));
+        }
+        node.put("namespaceName", action.getNamespaceName());
+        ArrayNode invocations = node.putArray("nextInvocations");
+        if (action.getScheduleAt() != null
+                && !Boolean.FALSE.equals(action.getEnabled())
+                && action.getScheduleAt().isAfter(Instant.now())
+                && (action.getStartTime() == null || !action.getScheduleAt().isBefore(action.getStartTime()))
+                && (action.getEndTime() == null || !action.getScheduleAt().isAfter(action.getEndTime()))) {
+            invocations.add(epoch(action.getScheduleAt()));
+        }
+        node.put("roleArn", action.getRoleArn());
+        ObjectNode schedule = node.putObject("schedule");
+        if (action.getScheduleAt() != null) {
+            schedule.put("at", epoch(action.getScheduleAt()));
+        } else {
+            schedule.put("cron", action.getScheduleCron());
+        }
+        if (action.getDescription() != null) {
+            node.put("scheduledActionDescription", action.getDescription());
+        }
+        node.put("scheduledActionName", action.getScheduledActionName());
+        node.put("scheduledActionUuid", action.getScheduledActionUuid());
+        if (action.getStartTime() != null) {
+            node.put("startTime", epoch(action.getStartTime()));
+        }
+        node.put("state", Boolean.FALSE.equals(action.getEnabled()) ? "DISABLED" : "ACTIVE");
+        ObjectNode createSnapshot = node.putObject("targetAction").putObject("createSnapshot");
+        createSnapshot.put("namespaceName", action.getTargetNamespaceName());
+        if (action.getRetentionPeriod() != null) {
+            createSnapshot.put("retentionPeriod", action.getRetentionPeriod());
+        }
+        createSnapshot.put("snapshotNamePrefix", action.getSnapshotNamePrefix());
+        if (action.getSnapshotTags() != null) {
+            ArrayNode tags = createSnapshot.putArray("tags");
+            action.getSnapshotTags().forEach((key, value) -> {
+                ObjectNode tag = tags.addObject();
+                tag.put("key", key);
+                tag.put("value", value);
+            });
+        }
+        return node;
+    }
+
+    private static double epoch(Instant instant) {
+        return instant.toEpochMilli() / 1000.0;
     }
     // ── Tracks, managed workgroups and reservations ────────────────────────
 

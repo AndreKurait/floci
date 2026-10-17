@@ -51,7 +51,7 @@ class RedshiftServerlessAdministrationHandlerTest {
     void setUp() {
         StorageFactory storageFactory = mock(StorageFactory.class);
         for (String file : List.of("namespaces", "workgroups", "snapshots", "usagelimits", "resourcepolicies",
-                "endpointaccess", "customdomains", "snapshotcopyconfigurations")) {
+                "endpointaccess", "customdomains", "snapshotcopyconfigurations", "scheduledactions")) {
             when(storageFactory.create(eq("redshiftserverless"), eq("redshiftserverless-" + file + ".json"),
                 any(TypeReference.class))).thenReturn((AccountAwareStorageBackend)
                 AccountAwareStorageBackend.inMemory(ACCOUNT_ID));
@@ -92,7 +92,8 @@ class RedshiftServerlessAdministrationHandlerTest {
                         new RedshiftServerlessResourcePolicyService(storageFactory, serverlessService, mapper),
                         new RedshiftServerlessEndpointAccessService(storageFactory, regionResolver, serverlessService),
                         customDomains,
-                        new RedshiftServerlessSnapshotCopyService(storageFactory, regionResolver, serverlessService)),
+                        new RedshiftServerlessSnapshotCopyService(storageFactory, regionResolver, serverlessService),
+                        new RedshiftServerlessScheduledActionService(storageFactory, serverlessService)),
                 customDomains);
     }
 
@@ -523,6 +524,79 @@ class RedshiftServerlessAdministrationHandlerTest {
     }
 
     @Test
+    void scheduledActionIsStoredAndNeverRun() {
+        namespace("sched-ns");
+        long future = Instant.now().plusSeconds(3600).getEpochSecond();
+        String target = "\"targetAction\":{\"createSnapshot\":{\"namespaceName\":\"sched-ns\","
+                + "\"snapshotNamePrefix\":\"nightly\",\"retentionPeriod\":7,"
+                + "\"tags\":[{\"key\":\"env\",\"value\":\"dev\"}]}}";
+
+        JsonNode created = ok("CreateScheduledAction", "{\"scheduledActionName\":\"nightly-snap\","
+                + "\"namespaceName\":\"sched-ns\",\"roleArn\":\"arn:aws:iam::" + ACCOUNT_ID + ":role/r\","
+                + "\"schedule\":{\"cron\":\"cron(0 3 * * ? *)\"}," + target + ","
+                + "\"scheduledActionDescription\":\"nightly\"}").get("scheduledAction");
+        assertEquals("ACTIVE", created.get("state").textValue());
+        assertEquals("cron(0 3 * * ? *)", created.get("schedule").get("cron").textValue());
+        assertEquals("nightly", created.get("targetAction").get("createSnapshot").get("snapshotNamePrefix").textValue());
+        assertEquals(7, created.get("targetAction").get("createSnapshot").get("retentionPeriod").intValue());
+        assertEquals("env", created.get("targetAction").get("createSnapshot").get("tags").get(0).get("key").textValue());
+        assertEquals("nightly", created.get("scheduledActionDescription").textValue());
+        assertEquals(0, created.get("nextInvocations").size());
+        assertTrue(created.get("scheduledActionUuid").textValue().length() > 8);
+
+        assertEquals("ConflictException", errorType("CreateScheduledAction", "{\"scheduledActionName\":\"nightly-snap\","
+                + "\"namespaceName\":\"sched-ns\",\"roleArn\":\"r\",\"schedule\":{\"cron\":\"cron(0 3 * * ? *)\"},"
+                + target + "}"));
+        assertEquals("ValidationException", errorType("CreateScheduledAction", "{\"scheduledActionName\":\"both-sched\","
+                + "\"namespaceName\":\"sched-ns\",\"roleArn\":\"r\",\"schedule\":{\"cron\":\"x\",\"at\":" + future
+                + "}," + target + "}"));
+        assertEquals("ValidationException", errorType("CreateScheduledAction", "{\"scheduledActionName\":\"Bad_Name\","
+                + "\"namespaceName\":\"sched-ns\",\"roleArn\":\"r\",\"schedule\":{\"cron\":\"x\"}," + target + "}"));
+        assertEquals("ResourceNotFoundException", errorType("CreateScheduledAction",
+                "{\"scheduledActionName\":\"no-ns-sched\",\"namespaceName\":\"nope-ns\",\"roleArn\":\"r\","
+                        + "\"schedule\":{\"cron\":\"x\"}," + target + "}"));
+
+        JsonNode oneOff = ok("UpdateScheduledAction", "{\"scheduledActionName\":\"nightly-snap\","
+                + "\"enabled\":false,\"schedule\":{\"at\":" + future + "}}").get("scheduledAction");
+        assertEquals("DISABLED", oneOff.get("state").textValue());
+        assertEquals(0, oneOff.get("nextInvocations").size());
+        assertEquals(future, oneOff.get("schedule").get("at").longValue());
+        assertEquals("sched-ns", oneOff.get("namespaceName").textValue());
+
+        JsonNode activeOneOff = ok("UpdateScheduledAction", "{\"scheduledActionName\":\"nightly-snap\","
+                + "\"enabled\":true}").get("scheduledAction");
+        assertEquals("ACTIVE", activeOneOff.get("state").textValue());
+        assertEquals(1, activeOneOff.get("nextInvocations").size());
+
+        JsonNode afterEnd = ok("UpdateScheduledAction", "{\"scheduledActionName\":\"nightly-snap\","
+                + "\"endTime\":" + (future - 100) + "}").get("scheduledAction");
+        assertEquals(0, afterEnd.get("nextInvocations").size());
+
+        JsonNode beforeStart = ok("UpdateScheduledAction", "{\"scheduledActionName\":\"nightly-snap\","
+                + "\"endTime\":" + (future + 1000) + ",\"startTime\":" + (future + 100) + "}").get("scheduledAction");
+        assertEquals(0, beforeStart.get("nextInvocations").size());
+
+        JsonNode inWindow = ok("UpdateScheduledAction", "{\"scheduledActionName\":\"nightly-snap\","
+                + "\"startTime\":" + (future - 100) + "}").get("scheduledAction");
+        assertEquals(1, inWindow.get("nextInvocations").size());
+
+        assertEquals("ValidationException",
+                errorType("ListScheduledActions", "{\"maxResults\":0}"));
+        assertEquals("ValidationException",
+                errorType("ListScheduledActions", "{\"maxResults\":101}"));
+        assertEquals("InvalidPaginationException",
+                errorType("ListScheduledActions", "{\"nextToken\":\"bad-token\"}"));
+
+        JsonNode listed = ok("ListScheduledActions", "{\"namespaceName\":\"sched-ns\"}").get("scheduledActions");
+        assertEquals(1, listed.size());
+        assertEquals("nightly-snap", listed.get(0).get("scheduledActionName").textValue());
+        assertEquals("nightly-snap", ok("DeleteScheduledAction", "{\"scheduledActionName\":\"nightly-snap\"}")
+                .get("scheduledAction").get("scheduledActionName").textValue());
+        assertEquals("ResourceNotFoundException",
+                errorType("GetScheduledAction", "{\"scheduledActionName\":\"nightly-snap\"}"));
+    }
+
+    @Test
     void tracksAreTheTwoAwsReleaseTracks() {
         JsonNode track = ok("GetTrack", "{\"trackName\":\"trailing\"}").get("track");
         assertEquals("trailing", track.get("trackName").textValue());
@@ -619,6 +693,23 @@ class RedshiftServerlessAdministrationHandlerTest {
     }
 
     @Test
+    void aNamespaceRecreatedUnderTheSameNameDoesNotInheritActions() {
+        namespace("recreate-ns");
+        ok("CreateScheduledAction", "{\"scheduledActionName\":\"old-action\",\"namespaceName\":\"recreate-ns\","
+                + "\"roleArn\":\"r\",\"schedule\":{\"cron\":\"x\"},\"targetAction\":{\"createSnapshot\":"
+                + "{\"namespaceName\":\"recreate-ns\",\"snapshotNamePrefix\":\"p\"}}}");
+
+        ok("DeleteNamespace", "{\"namespaceName\":\"recreate-ns\"}");
+        namespace("recreate-ns");
+
+        assertEquals("ResourceNotFoundException", errorType("GetScheduledAction",
+                "{\"scheduledActionName\":\"old-action\"}"));
+        ok("CreateScheduledAction", "{\"scheduledActionName\":\"old-action\",\"namespaceName\":\"recreate-ns\","
+                + "\"roleArn\":\"r\",\"schedule\":{\"cron\":\"x\"},\"targetAction\":{\"createSnapshot\":"
+                + "{\"namespaceName\":\"recreate-ns\",\"snapshotNamePrefix\":\"p\"}}}");
+    }
+
+    @Test
     void aSnapshotRecreatedUnderTheSameNameDoesNotInheritItsPolicy() {
         String arn = snapshot("recreate-snap-ns", "recreate-snap");
         ok("PutResourcePolicy", "{\"resourceArn\":\"" + arn + "\",\"policy\":\"{}\"}");
@@ -627,6 +718,45 @@ class RedshiftServerlessAdministrationHandlerTest {
         ok("CreateSnapshot", "{\"snapshotName\":\"recreate-snap\",\"namespaceName\":\"recreate-snap-ns\"}");
 
         assertEquals("ResourceNotFoundException", errorType("GetResourcePolicy", "{\"resourceArn\":\"" + arn + "\"}"));
+    }
+
+    @Test
+    void scheduledActionUpdateRejectsAPartialTargetAndATagWithoutAKey() {
+        namespace("partial-ns");
+        String create = "{\"scheduledActionName\":\"partial-action\",\"namespaceName\":\"partial-ns\",\"roleArn\":\"r\","
+                + "\"schedule\":{\"cron\":\"x\"},\"targetAction\":{\"createSnapshot\":"
+                + "{\"namespaceName\":\"partial-ns\",\"snapshotNamePrefix\":\"p\"";
+        ok("CreateScheduledAction", create + "}}}");
+
+        assertEquals("ValidationException", errorType("UpdateScheduledAction",
+                "{\"scheduledActionName\":\"partial-action\",\"targetAction\":{\"createSnapshot\":"
+                        + "{\"retentionPeriod\":5}}}"));
+        assertEquals("ValidationException", errorType("UpdateScheduledAction",
+                "{\"scheduledActionName\":\"partial-action\",\"targetAction\":{}}"));
+        assertEquals("ValidationException", errorType("UpdateScheduledAction",
+                "{\"scheduledActionName\":\"partial-action\",\"schedule\":{}}"));
+        JsonNode unchanged = ok("UpdateScheduledAction",
+                "{\"scheduledActionName\":\"partial-action\",\"enabled\":false}").get("scheduledAction");
+        assertEquals("x", unchanged.get("schedule").get("cron").textValue());
+        assertEquals("DISABLED", unchanged.get("state").textValue());
+
+        assertEquals("ValidationException", errorType("CreateScheduledAction",
+                "{\"scheduledActionName\":\"empty-target\",\"namespaceName\":\"partial-ns\",\"roleArn\":\"r\","
+                        + "\"schedule\":{\"cron\":\"x\"},\"targetAction\":{}}"));
+        assertEquals("ValidationException", errorType("CreateScheduledAction",
+                create.replace("partial-action", "tag-action") + ",\"tags\":[{\"value\":\"v\"}]}}}"));
+        assertEquals("ValidationException", errorType("CreateScheduledAction",
+                create.replace("partial-action", "tag-noval") + ",\"tags\":[{\"key\":\"k\"}]}}}"));
+        assertEquals("ValidationException", errorType("CreateScheduledAction",
+                create.replace("partial-action", "tag-numval") + ",\"tags\":[{\"key\":\"k\",\"value\":123}]}}}"));
+        assertEquals("ValidationException", errorType("CreateScheduledAction",
+                create.replace("partial-action", "tag-boolval") + ",\"tags\":[{\"key\":\"k\",\"value\":true}]}}}"));
+        assertEquals("ResourceNotFoundException", errorType("GetScheduledAction",
+                "{\"scheduledActionName\":\"tag-noval\"}"));
+        assertEquals("ResourceNotFoundException", errorType("GetScheduledAction",
+                "{\"scheduledActionName\":\"tag-numval\"}"));
+        assertEquals("ResourceNotFoundException", errorType("GetScheduledAction",
+                "{\"scheduledActionName\":\"tag-boolval\"}"));
     }
 
     @Test

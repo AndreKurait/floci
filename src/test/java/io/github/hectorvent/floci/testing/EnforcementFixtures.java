@@ -15,11 +15,12 @@ import static io.restassured.RestAssured.given;
 
 /**
  * Takes an IAM user or an S3 bucket that a test created back out of the shared application, and
- * makes the users an enforcement test signs as ({@link #createUser}, {@link #auth}) and the SNS
- * topics it publishes to ({@link #createTopic}), registering each one's removal as it goes. A {@code @QuarkusTest} shares one application with every other
- * test class, so a fixture left behind outlives the class that made it and is visible to the next
- * class that lists users or buckets unscoped. Registered with {@link PartitionCleanup} as each
- * fixture is made.
+ * makes the users, roles and role sessions an enforcement test signs as ({@link #createUser},
+ * {@link #createRole}, {@link #assumeRole}, {@link #auth}) and the SNS topics it publishes to
+ * ({@link #createTopic}), registering each one's removal as it goes. A {@code @QuarkusTest} shares
+ * one application with every other test class, so a fixture left behind outlives the class that
+ * made it and is visible to the next class that lists users or buckets unscoped. Registered with
+ * {@link PartitionCleanup} as each fixture is made.
  *
  * <p>Both read back what is attached rather than taking it as an argument, and both return
  * quietly when the thing is not there. That is what makes them safe to register before the create
@@ -103,6 +104,42 @@ public final class EnforcementFixtures {
         return new UserCredentials(
                 key.getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId"),
                 key.getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.SecretAccessKey"));
+    }
+
+    /**
+     * Creates a role under {@code path} that the root of its own {@code account} may assume, with
+     * {@code policy} inline, registering its {@link #removeRole} with {@code cleanup} before the
+     * create runs, and returns the role's ARN.
+     */
+    public static String createRole(PartitionCleanup cleanup, int port, String account, String path,
+                                    String roleName, String policy) {
+        String authorization = auth(account, "iam");
+        cleanup.register(() -> removeRole(port, authorization, roleName));
+        iam(port, authorization, "CreateRole", "RoleName", roleName, "Path", path,
+                "AssumeRolePolicyDocument", """
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                          "Principal":{"AWS":"arn:aws:iam::%s:root"},"Action":"sts:AssumeRole"}]}"""
+                        .formatted(account)).statusCode(200);
+        iam(port, authorization, "PutRolePolicy", "RoleName", roleName, "PolicyName", "p",
+                "PolicyDocument", policy).statusCode(200);
+        return "arn:aws:iam::" + account + ":role" + path + roleName;
+    }
+
+    /** The temporary credentials of a role session, which a request signs with and sends as its token. */
+    public record Session(String accessKeyId, String sessionToken) {
+    }
+
+    /**
+     * Assumes {@code roleArn} as {@code callerAccessKeyId}, in a session named {@code s}, and returns
+     * the session's credentials. The role's trust policy has to admit the caller.
+     */
+    public static Session assumeRole(int port, String callerAccessKeyId, String roleArn) {
+        XmlPath credentials = query(port, auth(callerAccessKeyId, "sts"), "AssumeRole",
+                "RoleArn", roleArn, "RoleSessionName", "s")
+                .statusCode(200).extract().xmlPath();
+        return new Session(
+                credentials.getString("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId"),
+                credentials.getString("AssumeRoleResponse.AssumeRoleResult.Credentials.SessionToken"));
     }
 
     /**
