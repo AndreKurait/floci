@@ -31,6 +31,9 @@ class CredentialScopeAliasTest {
     @Inject
     IamActionRegistry actionRegistry;
 
+    @Inject
+    ProtocolClaimer claimer;
+
     @Test
     void s3ExpressAliasNormalisesToS3() {
         assertEquals("s3", catalog.canonicalCredentialScope("s3express"));
@@ -64,10 +67,12 @@ class CredentialScopeAliasTest {
         ContainerRequestContext ctx = mock(ContainerRequestContext.class);
         when(ctx.getMethod()).thenReturn("GET");
         when(ctx.getUriInfo()).thenReturn(uriInfo);
-        when(ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY))
-                .thenReturn(new ProtocolClaim(WireProtocol.AWS_QUERY, null, "GetMetricStatistics", null));
         when(ctx.getHeaderString("Authorization")).thenReturn(
                 "AWS4-HMAC-SHA256 Credential=AKIAUSER/20261013/us-east-1/monitoring/aws4_request");
+
+        ProtocolClaim claim = claimer.claim(ClaimSignals.from(ctx)).orElseThrow();
+        assertEquals(WireProtocol.AWS_QUERY, claim.protocol());
+        when(ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY)).thenReturn(claim);
 
         String canonicalScope = catalog.canonicalCredentialScope("monitoring");
         assertEquals("cloudwatch", canonicalScope);
