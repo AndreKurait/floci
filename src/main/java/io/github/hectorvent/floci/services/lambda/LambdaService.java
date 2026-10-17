@@ -763,9 +763,9 @@ public class LambdaService implements ResourceProvider {
         requireMatchingRevisionId(fn, request);
 
         if (zipFileBase64 != null) {
+            extractZipCode(fn, zipFileBase64, region);
             fn.setS3Bucket(null);
             fn.setS3Key(null);
-            extractZipCode(fn, zipFileBase64, region);
         }
         if (imageUri != null) {
             fn.setImageUri(imageUri);
@@ -2316,10 +2316,9 @@ public class LambdaService implements ResourceProvider {
             if (current == null && legacyCounterKey != null) {
                 // Counters persisted before the key carried the owning account. Starting over
                 // from 0 here would re-issue a version number that already names a snapshot.
-                current = versionCounters.remove(legacyCounterKey);
+                current = versionCounters.get(legacyCounterKey);
             }
             int next = (current != null ? current : 0) + 1;
-            versionCounters.put(counterKey, next);
             return next;
         }
     }
@@ -2453,6 +2452,8 @@ public class LambdaService implements ResourceProvider {
             snapshot.setDurableKmsKeyArn(fn.getDurableKmsKeyArn());
 
             functionStore.save(region, snapshot);
+            versionCounters.put(versionCounterKey(region, fn), version);
+            versionCounters.remove(legacyVersionCounterKey(region, functionName));
             LOG.infov("Published version {0} for function {1}", version, functionName);
             return snapshot;
         }
@@ -3398,7 +3399,8 @@ public class LambdaService implements ResourceProvider {
     private void extractZipCodeBytes(LambdaFunction fn, byte[] zipBytes, String region) {
         Path codePath = codeStore.getCodePath(ownerAccount(fn), region, fn.getFunctionName());
         try {
-            zipExtractor.extractTo(zipBytes, codePath, configuredZipMaxEntries());
+            zipExtractor.extractTo(zipBytes, codePath, configuredZipMaxEntries(),
+                    () -> storeDeploymentPackage(fn, zipBytes, region));
             // Publish the new code identity under the same per-function lock publishVersion holds.
             // PublishVersion's CodeSha256 precondition is a check-then-act: it compares the hash and
             // then snapshots the code. Mutating these fields without the lock lets an overlapping
@@ -3415,9 +3417,6 @@ public class LambdaService implements ResourceProvider {
                 }
             }
 
-            // Deploy succeeded: keep the exact package so GetFunction can serve
-            // a real Code.Location.
-            storeDeploymentPackage(fn, zipBytes, region);
             // Reclaim a directory left behind by a function created before account-scoping;
             // codePath above is already the new location, so this is a no-op once migrated.
             // Locked against publishVersion (see its own comment) so a version cannot be
@@ -3501,8 +3500,6 @@ public class LambdaService implements ResourceProvider {
             throw new AwsException("ServiceUnavailableException", "S3 service not available", 503);
         }
 
-        fn.setS3Bucket(s3Bucket);
-        fn.setS3Key(s3Key);
         S3Object obj;
         try {
             obj = s3Service.getObject(s3Bucket, s3Key);
@@ -3511,6 +3508,8 @@ public class LambdaService implements ResourceProvider {
                     "Unable to fetch code from s3://" + s3Bucket + "/" + s3Key + ": " + e.getMessage(), 400);
         }
         extractZipCodeBytes(fn, obj.getData(), region);
+        fn.setS3Bucket(s3Bucket);
+        fn.setS3Key(s3Key);
     }
 
     private void applyHotReload(LambdaFunction fn, String hostPath) {

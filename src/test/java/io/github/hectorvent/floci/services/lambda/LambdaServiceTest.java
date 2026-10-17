@@ -977,6 +977,11 @@ class LambdaServiceTest {
 
     private LambdaService serviceWithHotReload(boolean enabled, List<String> allowedPaths,
                                                int zipMaxEntries) {
+        return serviceWithHotReload(enabled, allowedPaths, zipMaxEntries, "docker");
+    }
+
+    private LambdaService serviceWithHotReload(boolean enabled, List<String> allowedPaths,
+                                               int zipMaxEntries, String executor) {
         EmulatorConfig cfg = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig svc = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.LambdaServiceConfig lambdaCfg = mock(EmulatorConfig.LambdaServiceConfig.class);
@@ -988,7 +993,7 @@ class LambdaServiceTest {
         when(lambdaCfg.defaultTimeoutSeconds()).thenReturn(3);
         when(lambdaCfg.defaultMemoryMb()).thenReturn(128);
         when(lambdaCfg.zipMaxEntries()).thenReturn(zipMaxEntries);
-        when(lambdaCfg.executor()).thenReturn("docker");
+        when(lambdaCfg.executor()).thenReturn(executor);
         when(hr.enabled()).thenReturn(enabled);
         when(hr.allowedPaths()).thenReturn(allowedPaths == null ? Optional.empty() : Optional.of(allowedPaths));
 
@@ -1226,6 +1231,29 @@ class LambdaServiceTest {
         assertNull(updated.getS3Bucket(), "s3Bucket must be cleared after hot-reload conversion");
         assertNull(updated.getS3Key(), "s3Key must be cleared after hot-reload conversion");
         assertEquals("/tmp/converted", updated.getHotReloadHostPath());
+    }
+
+    @Test
+    void requiredPackageStorageFailurePreservesHotReloadState() {
+        LambdaService svc = serviceWithHotReload(true, null, ZipExtractor.DEFAULT_MAX_ENTRIES, "kubernetes");
+        String name = "hot-reload-storage-failure";
+        Map<String, Object> request = baseRequest(name);
+        request.put("Code", Map.of("S3Bucket", "hot-reload", "S3Key", "/tmp/host-code"));
+        LambdaFunction original = svc.createFunction(REGION, request);
+        String revision = original.getRevisionId();
+        long modified = original.getLastModified();
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> svc.updateFunctionCode(REGION, name, Map.of("ZipFile", zipWithBody("new"))));
+
+        assertEquals("ServiceException", failure.getErrorCode());
+        LambdaFunction unchanged = svc.getFunction(REGION, name);
+        assertTrue(unchanged.isHotReload());
+        assertEquals("/tmp/host-code", unchanged.getHotReloadHostPath());
+        assertNull(unchanged.getCodeLocalPath());
+        assertEquals(revision, unchanged.getRevisionId());
+        assertEquals(modified, unchanged.getLastModified());
+        assertEquals("", unchanged.getCodeSha256());
     }
 
     @Test
@@ -2164,7 +2192,7 @@ class LambdaServiceTest {
 
         assertTrue(Files.isDirectory(v1Path), "a published version must have its own code directory");
         assertEquals("v1", Files.readString(v1Path.resolve("index.js")).trim());
-        assertTrue(Files.isSameFile(v1Path.resolve("index.js"),
+        assertFalse(Files.isSameFile(v1Path.resolve("index.js"),
                 Path.of(service.getFunction(REGION, "version-code-isolation-fn").getCodeLocalPath())
                         .resolve("index.js")));
 
@@ -2232,7 +2260,7 @@ class LambdaServiceTest {
     }
 
     @Test
-    void deletingOneVersionDoesNotRemoveSharedCodeFromAnotherVersionOrLatest() throws Exception {
+    void deletingOneVersionPreservesAnotherVersionAndLatest() throws Exception {
         String name = "shared-version-code";
         Map<String, Object> request = baseRequest(name);
         request.put("Code", Map.of("ZipFile", zipWithBody("shared")));
@@ -2243,8 +2271,8 @@ class LambdaServiceTest {
         Path firstFile = Path.of(first.getCodeLocalPath()).resolve("index.js");
         Path secondFile = Path.of(second.getCodeLocalPath()).resolve("index.js");
         Path latestFile = Path.of(latest.getCodeLocalPath()).resolve("index.js");
-        assertTrue(Files.isSameFile(firstFile, secondFile));
-        assertTrue(Files.isSameFile(secondFile, latestFile));
+        assertFalse(Files.isSameFile(firstFile, secondFile));
+        assertFalse(Files.isSameFile(secondFile, latestFile));
 
         service.deleteFunction(REGION, name, first.getVersion());
 
@@ -2286,6 +2314,7 @@ class LambdaServiceTest {
             Files.delete(unreadable);
         }
         LambdaFunction retry = service.publishVersion(REGION, name, null);
+        assertEquals("2", retry.getVersion(), "failed publication must not consume a version number");
         assertNotEquals(latestPath, Path.of(retry.getCodeLocalPath()));
         assertEquals(latest.getCodeSha256(), retry.getCodeSha256());
         assertEquals("v2", Files.readString(Path.of(retry.getCodeLocalPath()).resolve("index.js")).trim());
