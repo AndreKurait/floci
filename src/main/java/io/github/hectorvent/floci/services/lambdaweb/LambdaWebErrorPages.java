@@ -15,6 +15,8 @@ final class LambdaWebErrorPages {
 
     static final Page UNSUPPORTED_HTTP_VERSION = new Page(505, "HTTP Version Not Supported",
             "Platform.UnsupportedHttpVersion", "The provided HTTP version is not supported. Please use HTTP/1.1.");
+    /** An IamAuth refusal names no error type. */
+    static final Page FORBIDDEN = new Page(403, "Forbidden", null, "You are not authorized to access this endpoint.");
     static final Page INVALID_ENDPOINT = new Page(404, "Not Found", "Platform.InvalidEndpoint",
             "The requested endpoint could not be found.");
     static final Page ENDPOINT_DISABLED = new Page(503, "Service Unavailable", "Platform.EndpointDisabled",

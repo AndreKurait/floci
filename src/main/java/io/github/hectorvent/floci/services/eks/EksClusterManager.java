@@ -2306,7 +2306,7 @@ public class EksClusterManager
             }
 
             if (metadataServer != null) {
-                metadataServer.reconcileContainerAddresses(containerIps.allIps(), nodeInstance);
+                metadataServer.reconcileClusterNodeAddresses(containerIps.allIps(), nodeInstance);
             }
 
             ContainerExec.Result install = execInContainerForResult(containerId,
@@ -2832,6 +2832,8 @@ public class EksClusterManager
         // node instance profile identity so /latest/meta-data/iam/info returns a valid profile ARN.
         String nodeProfileName = safeClusterName + "-node-profile";
         inst.setIamInstanceProfileArn(regionResolver.buildGlobalArn("iam", safeAccountId, "instance-profile/" + nodeProfileName));
+        // IAM holds no such profile, so the node carries its own stable id, shaped like IAM's.
+        inst.setIamInstanceProfileId("AIPA" + instanceId.substring(2).toUpperCase(Locale.ROOT));
 
         if (cluster.getResourcesVpcConfig() != null) {
             inst.setVpcId(cluster.getResourcesVpcConfig().getVpcId());

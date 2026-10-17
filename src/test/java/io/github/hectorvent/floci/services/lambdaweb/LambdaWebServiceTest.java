@@ -475,6 +475,21 @@ class LambdaWebServiceTest {
                 + " input and try again.", message(() -> service.putResourcePolicy(REGION, missing,
                 policy("{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"*\"},"
                         + "\"Action\":\"lambda:InvokeWebFunctionEndpoint\",\"Resource\":\"" + resource + "\"}]}"))));
+        // An ARN may carry a path, any other AWS principal may not.
+        assertEquals("The provided input'arn:aws:iam::000000000000:role/has space'was invalid. Member must satisfy"
+                + " expression: [\\w+=/:,.@-]* Please check your input and try again.",
+                message(() -> service.putResourcePolicy(REGION, missing,
+                        policy(members.formatted("{\"AWS\":\"arn:aws:iam::000000000000:role/has space\"}", invoke,
+                                "\"" + resource + "\"")))));
+        assertEquals("The provided input'foo/bar'was invalid. Member must satisfy expression: [\\w+=,.@\\:-]*"
+                + " Please check your input and try again.", message(() -> service.putResourcePolicy(REGION, missing,
+                policy(members.formatted("{\"AWS\":\"foo/bar\"}", invoke, "\"" + resource + "\"")))));
+        assertEquals("ResourceNotFoundException", error(() -> service.putResourcePolicy(REGION, missing,
+                policy(members.formatted("{\"AWS\":\"arn:aws:iam::000000000000:user/path/alice\"}", invoke,
+                        "\"" + resource + "\"")))).getErrorCode());
+        assertEquals("ValidationException", error(() -> service.putResourcePolicy(REGION, missing,
+                policy(members.formatted("{\"CanonicalUser\":\"arn:aws:iam::000000000000:foo/bar\"}", invoke,
+                        "\"" + resource + "\"")))).getErrorCode(), "only an AWS principal may carry a path");
         assertEquals("Lambda blocked the creation of this policy because it would grant public access to your function.",
                 message(() -> service.putResourcePolicy(REGION, missing, policy("{\"Statement\":[{\"Effect\":\"Allow\","
                         + "\"Principal\":{\"AWS\":[\"arn:aws:iam::000000000000:root\",\"*\"]},"

@@ -1469,6 +1469,7 @@ class EksClusterManagerTest {
             assertEquals("172.17.0.2", instance.getPrivateIpAddress());
             assertEquals("i-0e413a1bfb5c3cd79.us-west-2.compute.internal", instance.getPrivateDnsName());
             assertEquals("arn:aws:iam::123456789012:instance-profile/prod-cluster-node-profile", instance.getIamInstanceProfileArn());
+            assertEquals("AIPA0E413A1BFB5C3CD79", instance.getIamInstanceProfileId());
             assertNotEquals(cluster.getRoleArn(), instance.getIamInstanceProfileArn());
             assertEquals("running", instance.getState().getName());
         }
@@ -1594,7 +1595,7 @@ class EksClusterManagerTest {
 
             manager.configureLinkLocalMetadataEndpoint(cluster, "container-42");
 
-            verify(metadataServer).reconcileContainerAddresses(any(), any());
+            verify(metadataServer).reconcileClusterNodeAddresses(any(), any());
             // imds=true, imdsPodNetwork=false (default): 2 commands (install probe, start proxy)
             assertEquals(2, capturedCmds.size());
             // First command: install probe
@@ -1616,7 +1617,7 @@ class EksClusterManagerTest {
 
             manager.configureLinkLocalMetadataEndpoint(cluster, "container-42");
 
-            verify(metadataServer).reconcileContainerAddresses(any(), any());
+            verify(metadataServer).reconcileClusterNodeAddresses(any(), any());
             assertEquals(3, capturedCmds.size());
             // First command: install probe
             assertTrue(capturedCmds.get(0)[2].contains("command -v socat"));

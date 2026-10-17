@@ -161,6 +161,51 @@ class LambdaWebDataPlaneDockerIntegrationTest {
         assertTrue(chunked.startsWith("HTTP/1.1 200 "), chunked);
         assertTrue(chunked.contains("\"bodyLength\":17"), chunked);
         assertTrue(chunked.contains("\"transfer-encoding\":\"chunked\""), chunked);
+
+        // The app gets the path without dot segments, as on AWS. Repeated slashes stay.
+        String dotted = raw("GET /a//b/./c/../d?x=1 HTTP/1.1\r\nHost: " + domain + "\r\nConnection: close\r\n\r\n");
+        assertTrue(dotted.contains("\"url\":\"/a//b/d?x=1\""), dotted);
+
+        // An AWS signature and its session token never reach the app. Other credentials do.
+        given().header("Host", domain).header("Authorization", "Bearer abc").header("X-Amz-Security-Token", "tok")
+                .when().get("/")
+                .then().statusCode(200)
+                .body("headers.authorization", equalTo("Bearer abc"))
+                .body("headers.x-amz-security-token", equalTo("tok"));
+        given().header("Host", domain).header("Authorization", "AWS4-HMAC-SHA256 Credential=x")
+                .header("X-Amz-Security-Token", "tok").header("X-Amz-Date", "20260101T000000Z")
+                .when().get("/")
+                .then().statusCode(200)
+                .body("headers.authorization", nullValue())
+                .body("headers.x-amz-security-token", nullValue())
+                .body("headers.x-amz-date", equalTo("20260101T000000Z"));
+    }
+
+    @Test
+    @Timeout(180)
+    void anIamAuthEndpointServesSignedRequestsWithoutTheirSignature() throws Exception {
+        String domain = createFunction(30);
+        given().contentType("application/json").body("{\"authType\": \"IamAuth\"}")
+                .when().patch(BASE + "/web-functions/" + functionName + "/endpoints/dev")
+                .then().statusCode(202);
+        given().header("Host", domain).when().get("/").then().statusCode(403);
+
+        LambdaWebRequestSigner.Signed signed = new LambdaWebRequestSigner().sign("POST", domain, "/items?b=2&a=1");
+        given().urlEncodingEnabled(false).header("Host", domain).headers(signed.headers()).body("hello body")
+                .when().post(signed.pathAndQuery())
+                .then().statusCode(200)
+                .body("url", equalTo(signed.pathAndQuery()))
+                .body("bodyLength", equalTo(10))
+                .body("headers.authorization", nullValue())
+                .body("headers.x-amz-content-sha256", equalTo("UNSIGNED-PAYLOAD"))
+                .body("headers.x-amz-date", equalTo(signed.headers().get("X-Amz-Date")));
+
+        // A presigned request reaches the app with its query as sent.
+        LambdaWebRequestSigner.Signed presigned = new LambdaWebRequestSigner().presigned().sign("GET", domain, "/q");
+        given().urlEncodingEnabled(false).header("Host", domain).headers(presigned.headers())
+                .when().get(presigned.pathAndQuery())
+                .then().statusCode(200)
+                .body("url", equalTo(presigned.pathAndQuery()));
     }
 
     @Test

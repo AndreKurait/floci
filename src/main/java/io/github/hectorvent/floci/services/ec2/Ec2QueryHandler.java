@@ -796,6 +796,9 @@ public class Ec2QueryHandler {
         // ResourceType=network-interface specification - never by the instance's own tags.
         List<Tag> instanceTags = parseTagsForResource(p, "instance");
         List<Tag> networkInterfaceTags = parseTagsForResource(p, "network-interface");
+        // Resolved after tag parsing so reserved tags are refused before any service call.
+        String iamInstanceProfileArn = service.resolveLaunchIamInstanceProfileArn(
+                p.getFirst("IamInstanceProfile.Name"), p.getFirst("IamInstanceProfile.Arn"));
 
         String iamInstanceProfileArn = service.resolveLaunchIamInstanceProfileArn(
                 p.getFirst("IamInstanceProfile.Name"), p.getFirst("IamInstanceProfile.Arn"));
@@ -4502,7 +4505,7 @@ public class Ec2QueryHandler {
 
     private Response handleAllocateAddress(MultivaluedMap<String, String> p, String region) {
         List<Tag> resourceTags = parseTagsForResource(p, "elastic-ip");
-        Address addr = service.allocateAddress(region);
+        Address addr = service.allocateAddress(region, p.getFirst("PublicIpv4Pool"), p.getFirst("NetworkBorderGroup"));
         applyResourceTags(resourceTags, region, addr.getAllocationId());
         XmlBuilder xml = new XmlBuilder()
                 .start("AllocateAddressResponse", AwsNamespaces.EC2)
@@ -4510,6 +4513,8 @@ public class Ec2QueryHandler {
                 .elem("publicIp", addr.getPublicIp())
                 .elem("domain", addr.getDomain())
                 .elem("allocationId", addr.getAllocationId())
+                .elem("publicIpv4Pool", addr.getPublicIpv4Pool())
+                .elem("networkBorderGroup", addr.getNetworkBorderGroup())
                 .end("AllocateAddressResponse");
         return xmlResponse(xml.build());
     }
@@ -6117,6 +6122,8 @@ public class Ec2QueryHandler {
                 .elem("publicIp", addr.getPublicIp())
                 .elem("allocationId", addr.getAllocationId())
                 .elem("domain", addr.getDomain())
+                .elem("publicIpv4Pool", addr.getPublicIpv4Pool())
+                .elem("networkBorderGroup", addr.getNetworkBorderGroup())
                 .elem("instanceId", addr.getInstanceId())
                 .elem("associationId", addr.getAssociationId())
                 .elem("networkInterfaceId", addr.getNetworkInterfaceId())

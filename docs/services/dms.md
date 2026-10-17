@@ -51,7 +51,9 @@ those subnets actually have. No data is migrated: the resources are control-plan
   group is one DMS manages for a zero-ETL integration, which Floci does not emulate.
 - The `default` group is synthesised from the region's default-VPC subnets, and only
   exists once `CreateReplicationInstance` has put an instance in it (an instance created
-  without `ReplicationSubnetGroupIdentifier`), as AWS creates it the first time it is needed.
+  without `ReplicationSubnetGroupIdentifier`, or naming `default` explicitly, which is
+  accepted whenever the region has default subnets), as AWS creates it the first time it
+  is needed.
   Until then it is neither listed nor found by the filter. Unlike AWS, it disappears again
   once no instance in the region uses it.
 - `DescribeReplicationSubnetGroups` supports the `replication-subnet-group-id` filter.

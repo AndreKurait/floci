@@ -15,6 +15,7 @@ class LambdaWebErrorPagesTest {
 
     @Test
     void pagesHaveTheRecordedContentLengths() {
+        assertEquals(230, length(LambdaWebErrorPages.FORBIDDEN));
         assertEquals(225, length(LambdaWebErrorPages.INVALID_ENDPOINT));
         assertEquals(264, length(LambdaWebErrorPages.UNSUPPORTED_HTTP_VERSION));
         assertEquals(274, length(LambdaWebErrorPages.ENDPOINT_DISABLED));

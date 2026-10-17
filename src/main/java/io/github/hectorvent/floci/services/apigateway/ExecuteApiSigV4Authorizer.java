@@ -3,9 +3,9 @@ package io.github.hectorvent.floci.services.apigateway;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.auth.CredentialScope;
-import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
+import io.github.hectorvent.floci.core.common.auth.SigV4SignedRequest;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.AccessKey;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
@@ -20,9 +20,6 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeFormatter;
-import java.util.Locale;
 
 /**
  * Verifies the SigV4 signature on an execute-api data-plane request, so a route or method whose
@@ -56,20 +53,7 @@ public class ExecuteApiSigV4Authorizer {
 
     private static final Logger LOG = Logger.getLogger(ExecuteApiSigV4Authorizer.class);
 
-    private static final String ALGORITHM = "AWS4-HMAC-SHA256";
     private static final String SIGNING_SERVICE = "execute-api";
-    private static final DateTimeFormatter AMZ_DATE =
-            DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
-
-    /**
-     * Real API Gateway rejects a header-signed request whose {@code X-Amz-Date} is more than five
-     * minutes from the service's clock. Emulating it keeps a captured request from being replayed
-     * indefinitely against a route the caller is testing authorization on.
-     */
-    private static final long MAX_CLOCK_SKEW_SECONDS = 300;
-
-    /** Longest {@code X-Amz-Expires} AWS accepts on a presigned request (7 days). */
-    private static final long MAX_PRESIGNED_EXPIRY_SECONDS = 604800;
 
     /** Where a temporary credential's session token rides: a header, or a presigned query parameter. */
     private static final String SECURITY_TOKEN = "X-Amz-Security-Token";
@@ -135,15 +119,15 @@ public class ExecuteApiSigV4Authorizer {
                           String signedRequestPath) throws Exception {
         MultivaluedMap<String, String> queryParameters = uriInfo.getQueryParameters();
         String authorization = headers == null ? null : headers.getHeaderString(HttpHeaders.AUTHORIZATION);
-        boolean presigned = ALGORITHM.equals(queryParameters.getFirst("X-Amz-Algorithm"));
+        boolean presigned = SigV4SignedRequest.ALGORITHM.equals(queryParameters.getFirst("X-Amz-Algorithm"));
 
         if (!presigned && (authorization == null || authorization.isBlank())) {
             return Result.rejected(Failure.MISSING, "request is not SigV4-signed");
         }
 
-        SignedRequest signed = presigned
-                ? presignedRequest(queryParameters)
-                : headerSignedRequest(authorization, headers);
+        SigV4SignedRequest signed = presigned
+                ? SigV4SignedRequest.fromQuery(queryParameters::getFirst)
+                : SigV4SignedRequest.fromHeader(authorization, amzDate(headers));
         if (signed == null) {
             return Result.rejected(Failure.MALFORMED, "SigV4 credentials are incomplete");
         }
@@ -169,8 +153,7 @@ public class ExecuteApiSigV4Authorizer {
             return Result.rejected(Failure.MALFORMED, "SignedHeaders does not cover host");
         }
 
-        Instant signedAt = Instant.from(AMZ_DATE.parse(signed.amzDate()));
-        Result expiry = checkExpiry(signedAt, signed.expiresSeconds(), presigned);
+        Result expiry = checkExpiry(signed);
         if (expiry != null) {
             return expiry;
         }
@@ -208,26 +191,23 @@ public class ExecuteApiSigV4Authorizer {
         return Result.rejected(Failure.MISMATCH, "signature does not match");
     }
 
-    private Result checkExpiry(Instant signedAt, Long expiresSeconds, boolean presigned) {
-        Instant now = Instant.now();
-        if (presigned) {
-            if (expiresSeconds == null || expiresSeconds < 1 || expiresSeconds > MAX_PRESIGNED_EXPIRY_SECONDS) {
-                return Result.rejected(Failure.MALFORMED, "X-Amz-Expires is missing or out of range");
-            }
-            if (now.isAfter(signedAt.plusSeconds(expiresSeconds))) {
-                return Result.rejected(Failure.EXPIRED, "presigned request expired");
-            }
+    /**
+     * Real API Gateway rejects a header-signed request whose {@code X-Amz-Date} is more than five
+     * minutes from the service's clock. Emulating it keeps a captured request from being replayed
+     * indefinitely against a route the caller is testing authorization on.
+     */
+    private static Result checkExpiry(SigV4SignedRequest signed) {
+        return switch (signed.freshness(Instant.now())) {
+            case FRESH -> null;
+            case MALFORMED_DATE -> Result.rejected(Failure.MALFORMED, "signature could not be verified");
+            case BAD_EXPIRES -> Result.rejected(Failure.MALFORMED, "X-Amz-Expires is missing or out of range");
+            case EXPIRED -> Result.rejected(Failure.EXPIRED, signed.presigned() ? "presigned request expired"
+                    : "signature date " + signed.amzDate() + " is outside the accepted window");
             // A presigned URL signed in the future is still a forgery attempt, not a slow clock.
-            if (signedAt.isAfter(now.plusSeconds(MAX_CLOCK_SKEW_SECONDS))) {
-                return Result.rejected(Failure.EXPIRED, "presigned request is not yet valid");
-            }
-            return null;
-        }
-        if (Math.abs(now.getEpochSecond() - signedAt.getEpochSecond()) > MAX_CLOCK_SKEW_SECONDS) {
-            return Result.rejected(Failure.EXPIRED,
-                    "signature date " + AMZ_DATE.format(signedAt) + " is outside the accepted window");
-        }
-        return null;
+            case NOT_YET_VALID -> Result.rejected(Failure.EXPIRED, signed.presigned()
+                    ? "presigned request is not yet valid"
+                    : "signature date " + signed.amzDate() + " is outside the accepted window");
+        };
     }
 
     /**
@@ -329,47 +309,10 @@ public class ExecuteApiSigV4Authorizer {
         });
     }
 
-    // ──────────────────────────── Signed-request parsing ────────────────────────────
-
-    private record SignedRequest(String credential, String signedHeaders, String signature,
-                                 String amzDate, Long expiresSeconds) {}
-
-    private static SignedRequest headerSignedRequest(String authorization, HttpHeaders headers) {
-        SigV4AuthorizationHeader parsed = SigV4AuthorizationHeader.parse(authorization);
-        if (parsed == null) {
-            return null;
-        }
+    /** The signing time of a header signature: {@code X-Amz-Date}, or {@code Date} when it is absent. */
+    private static String amzDate(HttpHeaders headers) {
         String amzDate = headers.getHeaderString("X-Amz-Date");
-        if (amzDate == null || amzDate.isBlank()) {
-            amzDate = headers.getHeaderString("Date");
-        }
-        if (isBlank(parsed.credential()) || isBlank(parsed.signedHeaders())
-                || isBlank(parsed.signature()) || isBlank(amzDate)) {
-            return null;
-        }
-        return new SignedRequest(parsed.credential(), parsed.signedHeaders().toLowerCase(Locale.ROOT),
-                parsed.signature(), amzDate, null);
-    }
-
-    private static SignedRequest presignedRequest(MultivaluedMap<String, String> queryParameters) {
-        String credential = queryParameters.getFirst("X-Amz-Credential");
-        String signedHeaders = queryParameters.getFirst("X-Amz-SignedHeaders");
-        String signature = queryParameters.getFirst("X-Amz-Signature");
-        String amzDate = queryParameters.getFirst("X-Amz-Date");
-        String expires = queryParameters.getFirst("X-Amz-Expires");
-        if (isBlank(credential) || isBlank(signedHeaders) || isBlank(signature) || isBlank(amzDate)) {
-            return null;
-        }
-        Long expiresSeconds;
-        try {
-            expiresSeconds = expires == null ? null : Long.valueOf(expires.trim());
-        } catch (NumberFormatException e) {
-            LOG.debugv("execute-api presigned request carries a non-numeric X-Amz-Expires: {0}",
-                    SigV4RequestValidator.sanitizeForLog(expires));
-            expiresSeconds = null;
-        }
-        return new SignedRequest(credential, signedHeaders.toLowerCase(Locale.ROOT), signature,
-                amzDate, expiresSeconds);
+        return isBlank(amzDate) ? headers.getHeaderString("Date") : amzDate;
     }
 
     // ──────────────────────────── Canonical request ────────────────────────────

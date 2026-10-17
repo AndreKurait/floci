@@ -4791,6 +4791,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         copy.setEbsOptimized(source.isEbsOptimized());
         copy.setEnaSupport(source.isEnaSupport());
         copy.setIamInstanceProfileArn(source.getIamInstanceProfileArn());
+        copy.setIamInstanceProfileId(source.getIamInstanceProfileId());
         copy.setIamInstanceProfileAssociationTime(source.getIamInstanceProfileAssociationTime());
         copy.setStateReasonCode(source.getStateReasonCode());
         copy.setStateReasonMessage(source.getStateReasonMessage());
@@ -8035,18 +8036,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (data == null) {
             return;
         }
+        // A malformed profile ARN fails here, but a template naming both selectors is stored as
+        // given: AWS does not fully validate template parameters, so the pair fails at launch.
         LaunchTemplateData.IamInstanceProfile profile = data.getIamInstanceProfile();
-        if (profile != null) {
-            validateLaunchProfileSelectors(profile.getName(), profile.getArn());
-            if (isSet(profile.getArn())) {
-                AwsArnUtils.Arn arn = AwsArnUtils.isArn(profile.getArn()) ? AwsArnUtils.parse(profile.getArn()) : null;
-                if (arn == null || !AwsRegions.partitionFor(region).equals(arn.partition())
-                        || !"iam".equals(arn.service()) || !arn.region().isEmpty()
-                        || !arn.accountId().matches("\\d{12}")
-                        || !arn.resource().startsWith("instance-profile/") || arn.resource().endsWith("/")) {
-                    throw new AwsException("InvalidIamInstanceProfileArn.Malformed",
-                            "Invalid IAM instance profile ARN: " + profile.getArn(), 400);
-                }
+        if (profile != null && isSet(profile.getArn())) {
+            AwsArnUtils.Arn arn = AwsArnUtils.isArn(profile.getArn()) ? AwsArnUtils.parse(profile.getArn()) : null;
+            if (arn == null || !AwsRegions.partitionFor(region).equals(arn.partition())
+                    || !"iam".equals(arn.service()) || !arn.region().isEmpty()
+                    || !arn.accountId().matches("\\d{12}")
+                    || !arn.resource().startsWith("instance-profile/") || arn.resource().endsWith("/")) {
+                throw new AwsException("InvalidIamInstanceProfileArn.Malformed",
+                        "Invalid IAM instance profile ARN: " + profile.getArn(), 400);
             }
         }
         requireInstanceTypeOrInstanceRequirements(data);
@@ -8274,7 +8274,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return resolveIamInstanceProfileArn(name, arn);
     }
 
-    private static void validateLaunchProfileSelectors(String name, String arn) {
+    public static void validateLaunchProfileSelectors(String name, String arn) {
         if (isSet(name) && isSet(arn)) {
             throw new AwsException("InvalidParameterCombination",
                     "The parameter iamInstanceProfile.name may not be used with iamInstanceProfile.arn.", 400);
@@ -10316,6 +10316,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // ─── Elastic IPs ───────────────────────────────────────────────────────────
 
     public Address allocateAddress(String region) {
+        return allocateAddress(region, null, null);
+    }
+
+    public Address allocateAddress(String region, String publicIpv4Pool, String networkBorderGroup) {
         ensureDefaultResources(region);
         String allocId = "eipalloc-" + randomHex(17);
         String ip = "54." + (new Random().nextInt(256)) + "." + (new Random().nextInt(256)) + "." + (new Random().nextInt(256));
@@ -10323,6 +10327,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         addr.setAllocationId(allocId);
         addr.setPublicIp(ip);
         addr.setRegion(region);
+        // shortcut: pool and border group are metadata until real pool allocation is modeled.
+        addr.setPublicIpv4Pool(publicIpv4Pool);
+        addr.setNetworkBorderGroup(networkBorderGroup);
         addresses.put(key(region, allocId), addr);
         return addr;
     }
@@ -11124,14 +11131,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             };
         }
         // These are the AWS-documented DescribeAddresses filters this store can back with
-        // real data; two documented filters (network-border-group,
-        // network-interface-owner-id) are omitted because Address has no such field and
+        // real data; network-interface-owner-id is omitted because Address has no such field and
         // fabricating one would be its own wrong answer.
         if (resource instanceof Address addr) {
             return switch (filterName) {
                 case "allocation-id" -> matchesValue(values, addr.getAllocationId());
                 case "public-ip" -> matchesValue(values, addr.getPublicIp());
                 case "domain" -> matchesValue(values, addr.getDomain());
+                case "network-border-group" -> matchesValue(values, addr.getNetworkBorderGroup());
                 case "association-id" -> addr.getAssociationId() != null
                         && matchesValue(values, addr.getAssociationId());
                 case "instance-id" -> addr.getInstanceId() != null

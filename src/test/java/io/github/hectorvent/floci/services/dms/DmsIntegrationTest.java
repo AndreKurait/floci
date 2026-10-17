@@ -205,6 +205,34 @@ class DmsIntegrationTest {
                 .body("ReplicationSubnetGroups[0].VpcId", equalTo("vpc-default-ap-southeast-2"));
     }
 
+    /**
+     * Naming {@code default} explicitly is how an instance brings it into use, so it is accepted
+     * before it is listed, and listed afterwards. Own region for the same reason as above.
+     */
+    @Test
+    void createInstanceNamingDefaultExplicitlyBringsTheDefaultGroupIntoUse() {
+        String region = "ca-central-1";
+        dms("CreateReplicationInstance", region)
+                .body("{\"ReplicationInstanceIdentifier\":\"tf-explicit-default\","
+                        + "\"ReplicationInstanceClass\":\"dms.t3.micro\","
+                        + "\"ReplicationSubnetGroupIdentifier\":\"Default\"}")
+        .when()
+                .post("/")
+        .then()
+                .statusCode(200)
+                .body("ReplicationInstance.ReplicationSubnetGroup.ReplicationSubnetGroupIdentifier",
+                        equalTo("default"));
+
+        dms("DescribeReplicationSubnetGroups", region)
+                .body("{\"Filters\":[{\"Name\":\"replication-subnet-group-id\",\"Values\":[\"default\"]}]}")
+        .when()
+                .post("/")
+        .then()
+                .statusCode(200)
+                .body("ReplicationSubnetGroups", hasSize(1))
+                .body("ReplicationSubnetGroups[0].VpcId", equalTo("vpc-default-ca-central-1"));
+    }
+
     @Test
     void describeRejectsMaxRecordsOutsideTheDocumentedRange() {
         for (int outOfRange : new int[] {19, 101}) {

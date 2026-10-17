@@ -296,8 +296,12 @@ No listener or local address is installed on port 80, so applications may
 continue to use that port.
 
 When `HttpTokens=required`, metadata reads without a valid IMDSv2 token return 401
-before resolving the requested data. `iam/info` returns the attached IAM profile's
-stored ARN and ID rather than an ID derived from the instance.
+before resolving the requested data.
+
+`iam/info` returns the ARN and ID that IAM holds for the attached profile, and 404 when that
+profile is missing, has no role or does not match the attached ARN. An EKS cluster node, whose
+profile Floci synthesizes, reports the synthesized ARN and a stable ID instead while IAM holds no
+such profile.
 
 Both IMDSv1 (no token) and IMDSv2 (token-based) flows are supported:
 
@@ -823,6 +827,14 @@ fixed socket/core/vCPU shape rather than one derived from the instance family.
 | DisassociateAddress | Removes an Elastic IP address association. |
 | ReleaseAddress | Releases an Elastic IP address record. |
 
+`AllocateAddress` and `DescribeAddresses` return `PublicIpv4Pool` and `NetworkBorderGroup`.
+Omitted values default to `amazon` and the request Region, including for older persisted
+allocations without these fields. Explicit values survive association, disassociation and
+restart. `DescribeAddresses` also supports the `network-border-group` filter. These values
+are stored as metadata; Floci does not allocate real BYOIP addresses or route by border group.
+See [AllocateAddress](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_AllocateAddress.html)
+and [Elastic IP allocation](https://docs.aws.amazon.com/vpc/latest/userguide/WorkWithEIPs.html).
+
 `ReleaseAddress` automatically disassociates an instance's Elastic IP only in the default VPC.
 In a nondefault VPC it returns `InvalidIPAddress.InUse` without changing the association;
 call `DisassociateAddress` first, as specified by the
@@ -972,15 +984,18 @@ prefix lists, `EnaSrdSpecification`, `PrimaryIpv6` and `EnaQueueCount` are likew
 
 Launches and association changes resolve both names and ARNs against IAM in the
 caller's account. Unknown profiles and foreign-account ARNs fail with
-`InvalidParameterValue` before allocation or association changes. Launches and launch
-template creation reject simultaneous name/ARN selectors with
-`InvalidParameterCombination`; association replacement uses the ARN when both are
-provided. Launch templates reject malformed profile ARNs at creation with
-`InvalidIamInstanceProfileArn.Malformed`.
-EC2 stores and returns IAM's profile ID, including for launch-template and Auto Scaling
-instances. Persisted instances from older versions omit the unknown ID until the
+`InvalidParameterValue` before allocation or association changes. A RunInstances launch
+that names both a profile name and an ARN, directly or through its launch template, and a
+CreateFleet launch through such a template, fail with `InvalidParameterCombination`;
+association replacement uses the ARN when both are provided. Launch templates reject
+malformed profile ARNs at creation with `InvalidIamInstanceProfileArn.Malformed` but, as
+on AWS, store a name and ARN pair as given; the pair fails when something uses the
+template, and Auto Scaling refuses a group over it.
+EC2 stores and returns IAM's profile ID, including for launch-template, EC2 Fleet and
+Auto Scaling instances. Persisted instances from older versions omit the unknown ID until the
 profile is reassociated; looking up the ARN could misidentify a deleted and recreated
-profile. The `client-token` instance filter selects only matching launches.
+profile.
+The `client-token` instance filter selects only matching launches.
 
 ### Network Interfaces
 

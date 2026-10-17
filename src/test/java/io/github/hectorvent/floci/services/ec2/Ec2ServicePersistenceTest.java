@@ -63,6 +63,46 @@ class Ec2ServicePersistenceTest {
     private static final String REGION = "us-east-1";
 
     @Test
+    void elasticIpMetadataSurvivesRestart(@TempDir Path dir) {
+        String region = "us-west-2";
+        String pool = "ipv4pool-ec2-0123456789abcdef0";
+        String borderGroup = "us-west-2-lax-1";
+        Ec2Service first = newService(dir);
+        Address allocated = first.allocateAddress(region, pool, borderGroup);
+
+        Ec2Service restarted = newService(dir);
+        Address described = restarted.describeAddresses(
+                region, List.of(allocated.getAllocationId()), Map.of()).getFirst();
+
+        assertEquals(allocated.getAllocationId(), described.getAllocationId());
+        assertEquals(pool, described.getPublicIpv4Pool());
+        assertEquals(borderGroup, described.getNetworkBorderGroup());
+    }
+
+    @Test
+    void legacyElasticIpMetadataDefaultsToAmazonAndItsStoredRegion(@TempDir Path dir) throws IOException {
+        String region = "us-west-2";
+        String allocationId = "eipalloc-0123456789abcdef0";
+        String legacyJson = """
+                {
+                  "%s::%s": {
+                    "allocationId": "%s",
+                    "publicIp": "54.1.2.3",
+                    "domain": "vpc",
+                    "region": "%s"
+                  }
+                }
+                """.formatted(region, allocationId, allocationId, region);
+        Files.writeString(dir.resolve("ec2-addresses.json"), legacyJson);
+
+        Ec2Service restarted = newService(dir);
+        Address described = restarted.describeAddresses(region, List.of(allocationId), Map.of()).getFirst();
+
+        assertEquals("amazon", described.getPublicIpv4Pool());
+        assertEquals(region, described.getNetworkBorderGroup());
+    }
+
+    @Test
     void deletedVpcDefaultResourcesRemainAbsentAfterRestart(@TempDir Path dir) {
         Ec2Service first = newService(dir);
         Vpc vpc = first.createVpc(REGION, "10.77.0.0/16", false);

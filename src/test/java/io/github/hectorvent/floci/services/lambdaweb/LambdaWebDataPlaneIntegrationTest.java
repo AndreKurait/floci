@@ -17,6 +17,7 @@ import java.util.Map;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.matchesPattern;
+import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -100,6 +101,39 @@ class LambdaWebDataPlaneIntegrationTest {
     }
 
     @Test
+    void anIamAuthEndpointRefusesARequestWithoutAValidSignature() {
+        String functionName = "dp-iam-" + Long.toString(System.nanoTime(), 36);
+        String domain = createFunction(functionName, "IamAuth");
+
+        Response unsigned = given().header("Host", domain).when().get("/");
+        unsigned.then().statusCode(403)
+                .header("content-type", "text/html")
+                .header("connection", "keep-alive")
+                .header("lambda-web-error-type", nullValue())
+                .header("lambda-web-request-id", matchesPattern(REQUEST_ID))
+                .header("content-length", "230")
+                .body(equalTo(LambdaWebErrorPages.html(LambdaWebErrorPages.FORBIDDEN,
+                        unsigned.header("lambda-web-request-id"))));
+        given().header("Host", domain).when().head("/")
+                .then().statusCode(403).header("content-length", "230").body(equalTo(""));
+        given().header("Host", domain).header("Authorization", "Bearer abc").when().get("/")
+                .then().statusCode(403);
+        LambdaWebRequestSigner.Signed forged = new LambdaWebRequestSigner()
+                .credentials("test", "not-the-secret", null).sign("GET", domain, "/");
+        given().header("Host", domain).headers(forged.headers()).when().get("/")
+                .then().statusCode(403);
+
+        // A disabled endpoint answers before the signature is checked.
+        given().contentType("application/json").body("{\"throttleConfig\": {\"rateLimit\": 0}}")
+                .when().patch(BASE + "/web-functions/" + functionName + "/endpoints/dev")
+                .then().statusCode(202);
+        given().header("Host", domain).when().get("/")
+                .then().statusCode(503).header("lambda-web-error-type", "Platform.EndpointDisabled");
+
+        given().when().delete(BASE + "/web-functions/" + functionName).then().statusCode(204);
+    }
+
+    @Test
     void httpOneDotZeroIsRefused() throws IOException {
         String response = raw("GET / HTTP/1.0\r\nHost: " + UNKNOWN_HOST + "\r\n\r\n");
         assertTrue(response.startsWith("HTTP/1.0 505 HTTP Version Not Supported\r\n"), response);
@@ -124,6 +158,10 @@ class LambdaWebDataPlaneIntegrationTest {
     }
 
     private String createFunction(String functionName) {
+        return createFunction(functionName, "ApplicationManaged");
+    }
+
+    private String createFunction(String functionName, String authType) {
         s3Service.createBucket(BUCKET, "us-east-1");
         s3Service.putObject(BUCKET, "app.zip", "zip".getBytes(StandardCharsets.UTF_8), "application/zip", Map.of());
         return given().contentType("application/json")
@@ -134,8 +172,8 @@ class LambdaWebDataPlaneIntegrationTest {
                                            "runtimeConfig": {"runtime": "nodejs24.x"}},
                            "serviceConfig": {"executionRoleArn": "%s"}},
                          "endpointConfig": {"endpointName": "dev", "endpointType": "HomeRegion",
-                                            "authType": "ApplicationManaged", "autoDeploymentMode": "LatestRevision"}}
-                        """.formatted(functionName, BUCKET, ROLE))
+                                            "authType": "%s", "autoDeploymentMode": "LatestRevision"}}
+                        """.formatted(functionName, BUCKET, ROLE, authType))
                 .when().put(BASE + "/web-functions")
                 .then().statusCode(202)
                 .extract().path("endpoint.domainName");

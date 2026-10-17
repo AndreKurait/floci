@@ -122,6 +122,7 @@ public class LambdaWebService implements Resettable {
     private static final Pattern FILTER_NAME = Pattern.compile("[a-zA-Z0-9]+");
     private static final Pattern FILTER_VALUE = Pattern.compile("[a-zA-Z0-9_-]+");
     private static final Pattern PRINCIPAL_AWS = Pattern.compile("[\\w+=,.@\\:-]*");
+    private static final Pattern PRINCIPAL_AWS_ARN = Pattern.compile("[\\w+=/:,.@-]*");
     private static final Pattern PRINCIPAL_SERVICE = Pattern.compile("[\\w+=,.@-]*");
 
     /** AWS assigns one shard label per cell. */
@@ -1198,11 +1199,12 @@ public class LambdaWebService implements Resettable {
             if (!PRINCIPAL_KEYS.contains(field.getKey())) {
                 throw policySyntax();
             }
-            Pattern allowed = "Service".equals(field.getKey()) ? PRINCIPAL_SERVICE : PRINCIPAL_AWS;
             if (field.getValue().isArray() && field.getValue().isEmpty()) {
                 throw new AwsException("ValidationException", INVALID_PRINCIPAL, 400);
             }
             for (String value : policyValues(field.getValue())) {
+                Pattern allowed = "Service".equals(field.getKey()) ? PRINCIPAL_SERVICE
+                        : "AWS".equals(field.getKey()) && AwsArnUtils.isArn(value) ? PRINCIPAL_AWS_ARN : PRINCIPAL_AWS;
                 if (!"*".equals(value) && !allowed.matcher(value).matches()) {
                     throw new AwsException("ValidationException", "The provided input'" + value
                             + "'was invalid. Member must satisfy expression: " + allowed.pattern()

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ec2;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.testing.EnforcementFixtures;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
 import io.restassured.response.ValidatableResponse;
@@ -25,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 class Ec2InstanceProfileIdentityIntegrationTest {
     private static final String ACCOUNT = "246813579012";
     private static final String OTHER = "135792468013";
+    private static final String LAUNCH_TAG = "floci-test-launch";
     @Inject Ec2Service ec2;
     @Inject ObjectMapper mapper;
 
@@ -36,9 +38,8 @@ class Ec2InstanceProfileIdentityIntegrationTest {
         List<String> instances = new ArrayList<>();
         String templateId = null;
         try {
-            RequestSpecification run = request(ACCOUNT, "ec2", "RunInstances")
-                    .formParam("MinCount", "2").formParam("MaxCount", "2")
-                    .formParam("ClientToken", name);
+            RequestSpecification run = tagged(request(ACCOUNT, "ec2", "RunInstances")
+                    .formParam("MinCount", "2").formParam("MaxCount", "2"), name);
             String value = field.equals("Name") ? name : profile.arn();
             if (template) {
                 templateId = request(ACCOUNT, "ec2", "CreateLaunchTemplate")
@@ -57,11 +58,7 @@ class Ec2InstanceProfileIdentityIntegrationTest {
             instances.addAll(response.getList("RunInstancesResponse.instancesSet.item.instanceId"));
             assertEquals(List.of(profile.id(), profile.id()),
                     response.getList("RunInstancesResponse.instancesSet.item.iamInstanceProfile.id"));
-            List<String> filtered = request(ACCOUNT, "ec2", "DescribeInstances")
-                    .formParam("Filter.1.Name", "client-token").formParam("Filter.1.Value.1", name)
-                    .post("/").then().statusCode(200).extract().xmlPath()
-                    .getList("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceId");
-            assertEquals(instances.stream().sorted().toList(), filtered.stream().sorted().toList());
+            assertEquals(instances.stream().sorted().toList(), launchedWith(name).stream().sorted().toList());
             for (String id : instances) {
                 assertProfile(id, profile);
             }
@@ -88,15 +85,14 @@ class Ec2InstanceProfileIdentityIntegrationTest {
                     own.arn().replace("/workers/", "/other/"),
                     own.arn().replace(":instance-profile/", ":role/"),
                     own.arn().replace("arn:aws:", "arn:aws-cn:"))) {
-                String token = UUID.randomUUID().toString();
+                String launchTag = UUID.randomUUID().toString();
                 String templateId = null;
                 try {
-                    RequestSpecification run = request(ACCOUNT, "ec2", "RunInstances")
-                            .formParam("MinCount", "1").formParam("MaxCount", "1")
-                            .formParam("ClientToken", token);
+                    RequestSpecification run = tagged(request(ACCOUNT, "ec2", "RunInstances")
+                            .formParam("MinCount", "1").formParam("MaxCount", "1"), launchTag);
                     if (template) {
                         ValidatableResponse created = request(ACCOUNT, "ec2", "CreateLaunchTemplate")
-                                .formParam("LaunchTemplateName", "invalid-" + token)
+                                .formParam("LaunchTemplateName", "invalid-" + launchTag)
                                 .formParam("LaunchTemplateData.ImageId", "ami-0abcdef1234567890")
                                 .formParam("LaunchTemplateData.InstanceType", "t3.micro")
                                 .formParam("LaunchTemplateData.IamInstanceProfile.Arn", arn)
@@ -115,9 +111,7 @@ class Ec2InstanceProfileIdentityIntegrationTest {
                     }
                     run.post("/").then().statusCode(400)
                             .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
-                    request(ACCOUNT, "ec2", "DescribeInstances").formParam("Filter.1.Name", "client-token")
-                            .formParam("Filter.1.Value.1", token).post("/").then().statusCode(200)
-                            .body("DescribeInstancesResponse.reservationSet.item.size()", equalTo(0));
+                    assertEquals(List.of(), launchedWith(launchTag));
                 } finally {
                     if (templateId != null) {
                         request(ACCOUNT, "ec2", "DeleteLaunchTemplate").formParam("LaunchTemplateId", templateId)
@@ -190,20 +184,35 @@ class Ec2InstanceProfileIdentityIntegrationTest {
     void launchRejectsBothProfileSelectors(boolean template) {
         String name = "profile-selectors-" + UUID.randomUUID().toString().substring(0, 8);
         Profile profile = createProfile(ACCOUNT, name);
+        String launchTag = UUID.randomUUID().toString();
+        String templateId = null;
         try {
-            RequestSpecification request = request(ACCOUNT, "ec2",
-                    template ? "CreateLaunchTemplate" : "RunInstances");
-            String prefix = template ? "LaunchTemplateData." : "";
-            request.formParam(prefix + "ImageId", "ami-0abcdef1234567890")
-                    .formParam(prefix + "InstanceType", "t3.micro")
-                    .formParam(prefix + "IamInstanceProfile.Name", name)
-                    .formParam(prefix + "IamInstanceProfile.Arn", profile.arn());
+            RequestSpecification run = tagged(request(ACCOUNT, "ec2", "RunInstances"), launchTag);
             if (template) {
-                request.formParam("LaunchTemplateName", name);
+                // As on AWS, a template is not fully validated when it is created: the pair is
+                // stored, and the launch from it is what fails.
+                templateId = request(ACCOUNT, "ec2", "CreateLaunchTemplate")
+                        .formParam("LaunchTemplateName", name)
+                        .formParam("LaunchTemplateData.ImageId", "ami-0abcdef1234567890")
+                        .formParam("LaunchTemplateData.InstanceType", "t3.micro")
+                        .formParam("LaunchTemplateData.IamInstanceProfile.Name", name)
+                        .formParam("LaunchTemplateData.IamInstanceProfile.Arn", profile.arn())
+                        .post("/").then().statusCode(200)
+                        .extract().path("CreateLaunchTemplateResponse.launchTemplate.launchTemplateId");
+                run.formParam("LaunchTemplate.LaunchTemplateId", templateId);
+            } else {
+                run.formParam("ImageId", "ami-0abcdef1234567890").formParam("InstanceType", "t3.micro")
+                        .formParam("IamInstanceProfile.Name", name)
+                        .formParam("IamInstanceProfile.Arn", profile.arn());
             }
-            request.post("/").then().statusCode(400)
+            run.post("/").then().statusCode(400)
                     .body("Response.Errors.Error.Code", equalTo("InvalidParameterCombination"));
+            assertEquals(List.of(), launchedWith(launchTag));
         } finally {
+            if (templateId != null) {
+                request(ACCOUNT, "ec2", "DeleteLaunchTemplate").formParam("LaunchTemplateId", templateId)
+                        .post("/").then().statusCode(200);
+            }
             deleteProfile(ACCOUNT, name);
         }
     }
@@ -235,14 +244,26 @@ class Ec2InstanceProfileIdentityIntegrationTest {
                 .post("/").then().statusCode(200);
     }
 
+    /** Tags the launch's instances with a value unique to this test run, so a lookup finds only them. */
+    private static RequestSpecification tagged(RequestSpecification run, String value) {
+        return run.formParam("TagSpecification.1.ResourceType", "instance")
+                .formParam("TagSpecification.1.Tag.1.Key", LAUNCH_TAG)
+                .formParam("TagSpecification.1.Tag.1.Value", value);
+    }
+
+    private static List<String> launchedWith(String value) {
+        return request(ACCOUNT, "ec2", "DescribeInstances").formParam("Filter.1.Name", "tag:" + LAUNCH_TAG)
+                .formParam("Filter.1.Value.1", value).post("/").then().statusCode(200).extract().xmlPath()
+                .getList("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceId");
+    }
+
     private static void terminate(String instanceId) {
         request(ACCOUNT, "ec2", "TerminateInstances").formParam("InstanceId.1", instanceId)
                 .post("/").then().statusCode(200);
     }
 
     private static RequestSpecification request(String account, String service, String action) {
-        return given().header("Authorization", "AWS4-HMAC-SHA256 Credential=" + account
-                + "/20261010/us-east-1/" + service + "/aws4_request, SignedHeaders=host, Signature=abc")
+        return given().header("Authorization", EnforcementFixtures.auth(account, service))
                 .formParam("Action", action);
     }
 

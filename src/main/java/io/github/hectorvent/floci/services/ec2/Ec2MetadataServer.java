@@ -62,6 +62,8 @@ public class Ec2MetadataServer {
     private final Map<String, SessionToken> tokens = new ConcurrentHashMap<>();
     /** IMDSv1 fallback: container bridge IP → Instance */
     private final Map<String, Instance> containerIpToInstance = new ConcurrentHashMap<>();
+    /** Cluster nodes whose instance-profile identity their registrar synthesizes rather than IAM holding it. */
+    private final Set<Instance> synthesizedProfiles = ConcurrentHashMap.newKeySet();
 
     private volatile HttpServer httpServer;
 
@@ -102,8 +104,19 @@ public class Ec2MetadataServer {
                 entry.getValue() == instance && !addresses.contains(entry.getKey()));
     }
 
+    /**
+     * Registers a cluster node that another service synthesizes instead of EC2 launching it. Its
+     * instance-profile ARN and ID are the registrar's own, so {@code iam/info} reports them while IAM
+     * holds no such profile.
+     */
+    public void reconcileClusterNodeAddresses(Set<String> addresses, Instance instance) {
+        synthesizedProfiles.add(instance);
+        reconcileContainerAddresses(addresses, instance);
+    }
+
     public void unregisterInstance(Instance instance) {
         if (instance != null) {
+            synthesizedProfiles.remove(instance);
             credentials.unregister(instance);
             tokens.values().removeIf(token -> token.instance() == instance);
             containerIpToInstance.entrySet().removeIf(entry -> entry.getValue() == instance);
@@ -180,6 +193,7 @@ public class Ec2MetadataServer {
         credentials.clear();
         tokens.clear();
         containerIpToInstance.clear();
+        synthesizedProfiles.clear();
         if (httpServer != null) {
             httpServer.close();
             httpServer = null;
@@ -292,16 +306,24 @@ public class Ec2MetadataServer {
             return;
         }
         Optional<InstanceProfile> resolved = credentials.profile(inst);
-        if (resolved.isEmpty()) {
+        String profileArn;
+        String profileId;
+        if (resolved.isPresent()) {
+            profileArn = resolved.get().getArn();
+            profileId = resolved.get().getInstanceProfileId();
+        } else if (synthesizedProfiles.contains(inst) && inst.getIamInstanceProfileArn() != null
+                && !credentials.holdsProfile(inst)) {
+            profileArn = inst.getIamInstanceProfileArn();
+            profileId = inst.getIamInstanceProfileId();
+        } else {
             ctx.response().setStatusCode(404).end("{}");
             return;
         }
-        InstanceProfile profile = resolved.get();
         ctx.response().setStatusCode(200)
                 .putHeader("content-type", "application/json")
                 .end(new JsonObject().put("Code", "Success").put("LastUpdated", now())
-                        .put("InstanceProfileArn", profile.getArn())
-                        .put("InstanceProfileId", profile.getInstanceProfileId()).encode());
+                        .put("InstanceProfileArn", profileArn)
+                        .put("InstanceProfileId", profileId).encode());
     }
 
     private void handleCredentialsList(RoutingContext ctx) {

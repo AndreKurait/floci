@@ -33,8 +33,9 @@ import java.util.stream.Collectors;
 public class AutoScalingService {
 
     static final String GROUP_NAME_TAG = "aws:autoscaling:groupName";
+    private static final String FULLY_FORMED_LAUNCH_TEMPLATE = "You must use a valid fully-formed launch template. ";
     static final String MISSING_LAUNCH_TEMPLATE_IMAGE_ID_MESSAGE =
-            "You must use a valid fully-formed launch template. The request must contain the parameter ImageId";
+            FULLY_FORMED_LAUNCH_TEMPLATE + "The request must contain the parameter ImageId";
     static final String INVALID_LAUNCH_TEMPLATE_MESSAGE =
             "The specified launch template does not exist.";
     static final String INVALID_LAUNCH_CONFIGURATION_PARAMETERS_MESSAGE =
@@ -237,6 +238,7 @@ public class AutoScalingService {
         }
         resolveLaunchConfigurationProfile(iamInstanceProfile);
         Ec2UserDataDecoder.decode(userData);
+        resolveLaunchConfigurationProfile(iamInstanceProfile);
         LaunchConfiguration lc = new LaunchConfiguration();
         lc.setLaunchConfigurationName(name);
         lc.setLaunchConfigurationArn(
@@ -1714,8 +1716,19 @@ public class AutoScalingService {
         if (launchTemplateVersions.isEmpty()) {
             throw invalidLaunchTemplate();
         }
-        if (isBlank(launchTemplateVersions.getFirst().getData().getImageId())) {
+        LaunchTemplateData data = launchTemplateVersions.getFirst().getData();
+        if (isBlank(data.getImageId())) {
             throw missingLaunchTemplateImageId();
+        }
+        // EC2 stores a template naming both profile selectors; the group's launch would fail, so
+        // the group is refused up front, as AWS does.
+        if (data.getIamInstanceProfile() != null) {
+            try {
+                Ec2Service.validateLaunchProfileSelectors(data.getIamInstanceProfile().getName(),
+                        data.getIamInstanceProfile().getArn());
+            } catch (AwsException invalid) {
+                throw new AwsException("ValidationError", FULLY_FORMED_LAUNCH_TEMPLATE + invalid.getMessage(), 400);
+            }
         }
     }
 

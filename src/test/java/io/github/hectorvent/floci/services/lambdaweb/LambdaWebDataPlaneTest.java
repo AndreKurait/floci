@@ -28,6 +28,20 @@ class LambdaWebDataPlaneTest {
     }
 
     @Test
+    void theAppGetsThePathWithoutDotSegmentsAndWithItsRepeatedSlashes() {
+        assertEquals("/a/c", LambdaWebDataPlane.withoutDotSegments("/a/./b/../c"));
+        assertEquals("/a/", LambdaWebDataPlane.withoutDotSegments("/a/b/.."));
+        assertEquals("/a/b/", LambdaWebDataPlane.withoutDotSegments("/a/b/."));
+        assertEquals("/a", LambdaWebDataPlane.withoutDotSegments("/./a"));
+        assertEquals("/a", LambdaWebDataPlane.withoutDotSegments("/../a"));
+        assertEquals("/a/b/", LambdaWebDataPlane.withoutDotSegments("/a/b/"));
+        assertEquals("/", LambdaWebDataPlane.withoutDotSegments("/"));
+        assertEquals("/a//b", LambdaWebDataPlane.withoutDotSegments("/a//b"));
+        assertEquals("//a", LambdaWebDataPlane.withoutDotSegments("//a"));
+        assertEquals("/a/%2e%2e/b", LambdaWebDataPlane.withoutDotSegments("/a/%2e%2e/b"));
+    }
+
+    @Test
     void thePortComesFromTheHostOrTheScheme() {
         assertEquals(4566, LambdaWebDataPlane.port("x.001.lambda-web.us-east-1.localhost:4566", "http"));
         assertEquals(80, LambdaWebDataPlane.port("x.001.lambda-web.us-east-1.localhost", "http"));

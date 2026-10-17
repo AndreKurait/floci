@@ -205,19 +205,30 @@ public class DmsService implements Resettable {
         putText(attributes, request, "KmsKeyId");
         putText(attributes, request, "DnsNameServers");
 
+        applyInstanceMembers(attributes, request);
+        // Resolved only once every other check has passed: resolving "default" reads the region's
+        // subnets, which seeds its default VPC, and a rejected request must not leave that behind.
+        return create(instances, region, identifier, attributes, request,
+                () -> attributes.putObject("ReplicationSubnetGroup")
+                        .put("ReplicationSubnetGroupIdentifier", resolveInstanceSubnetGroup(request, region)));
+    }
+
+    private String resolveInstanceSubnetGroup(JsonNode request, String region) {
         String subnetGroup = text(request, "ReplicationSubnetGroupIdentifier");
         if (subnetGroup == null) {
             // DMS falls back to the account's "default" group, which is why that name is reserved.
-            subnetGroup = "default";
-        } else {
-            subnetGroup = subnetGroup.toLowerCase(Locale.ROOT);
-            if (subnetGroups.get(storageKey(region, subnetGroup)).isEmpty()) {
-                throw notFound(subnetGroup);
-            }
+            return "default";
         }
-        attributes.putObject("ReplicationSubnetGroup").put("ReplicationSubnetGroupIdentifier", subnetGroup);
-        applyInstanceMembers(attributes, request);
-        return create(instances, region, identifier, attributes, request);
+        subnetGroup = subnetGroup.toLowerCase(Locale.ROOT);
+        // Naming "default" explicitly is how it comes into existence: AWS creates it from the
+        // default-VPC subnets on first use, so it is not stored and is not yet listed here.
+        boolean exists = "default".equals(subnetGroup)
+                ? defaultSubnetGroup(region, subnetGroup).isPresent()
+                : subnetGroups.get(storageKey(region, subnetGroup)).isPresent();
+        if (!exists) {
+            throw notFound(subnetGroup);
+        }
+        return subnetGroup;
     }
 
     public PaginatedResult<DmsResource> describeReplicationInstances(JsonNode request, String region) {
@@ -261,6 +272,10 @@ public class DmsService implements Resettable {
         if (!subnetGroupInUse(region, identifier)) {
             return Optional.empty();
         }
+        return defaultSubnetGroup(region, identifier);
+    }
+
+    private Optional<ReplicationSubnetGroup> defaultSubnetGroup(String region, String identifier) {
         List<String> defaultSubnets = ec2Service.describeSubnets(region, List.of(), Map.of()).stream()
                 .filter(Subnet::isDefaultForAz)
                 .map(Subnet::getSubnetId)
@@ -459,6 +474,12 @@ public class DmsService implements Resettable {
 
     private DmsResource create(Kind kind, String region, String identifier, ObjectNode attributes,
                                JsonNode request) {
+        return create(kind, region, identifier, attributes, request, () -> { });
+    }
+
+    /** {@code beforeStore} runs after every create-time check, so its side effects never follow a rejection. */
+    private DmsResource create(Kind kind, String region, String identifier, ObjectNode attributes,
+                               JsonNode request, Runnable beforeStore) {
         if (findByIdentifier(kind, region, identifier).isPresent()) {
             throw new AwsException("ResourceAlreadyExistsFault",
                     kind.label() + " " + identifier + " already exists.", 400);
@@ -476,11 +497,13 @@ public class DmsService implements Resettable {
             throw new AwsException("ResourceAlreadyExistsFault",
                     "ResourceIdentifier " + resourceId + " is already in use.", 400);
         }
+        Map<String, String> tags = readTags(request.get("Tags"));
+        beforeStore.run();
         attributes.put(kind.idMember(), identifier);
         attributes.put(kind.arnMember(), regionResolver.buildArn("dms", region, kind.arnType() + ":" + resourceId));
         DmsResource resource = new DmsResource();
         resource.setAttributes(attributes);
-        resource.setTags(readTags(request.get("Tags")));
+        resource.setTags(tags);
         kind.store().put(key, resource);
         return resource;
     }
