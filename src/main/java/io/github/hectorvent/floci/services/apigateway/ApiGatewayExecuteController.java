@@ -3007,6 +3007,9 @@ public class ApiGatewayExecuteController {
                     "Incomplete Signature", GatewayResponseType.INVALID_SIGNATURE);
             case UNKNOWN_KEY -> new RestIamError("UnrecognizedClientException",
                     "The security token included in the request is invalid.", GatewayResponseType.ACCESS_DENIED);
+            // AWS drops the period when a session token came and does not fit the key.
+            case INVALID_TOKEN -> new RestIamError("UnrecognizedClientException",
+                    "The security token included in the request is invalid", GatewayResponseType.ACCESS_DENIED);
             case EXPIRED -> new RestIamError("InvalidSignatureException",
                     "Signature expired", GatewayResponseType.EXPIRED_TOKEN);
             case MISMATCH -> new RestIamError("InvalidSignatureException",

@@ -1004,7 +1004,8 @@ final class CognitoAuthFlowHandler {
         firePreAuthentication(pool, client, user, null, clientMetadata, false);
         VerificationCode.Purpose purpose = "EMAIL_OTP".equals(challengeName)
                 ? VerificationCode.Purpose.EMAIL_OTP : VerificationCode.Purpose.SMS_OTP;
-        Map<String, Object> customMessage = fireCustomMessage(pool, client, user, "CustomMessage_Authentication");
+        Map<String, Object> customMessage = fireCustomMessage(pool, client, user, "CustomMessage_Authentication",
+                Map.of());
         Map<String, String> challengeParams = new HashMap<>(
                 service.issueSignInOtp(pool, user, purpose, attributeName, deliveryMedium, customMessage));
         challengeParams.put("USERNAME", user.getUsername());
@@ -1856,11 +1857,11 @@ final class CognitoAuthFlowHandler {
      * {@link #firePostConfirmation} tolerates errors.
      */
     Map<String, Object> fireCustomMessage(UserPool pool, UserPoolClient client, CognitoUser user,
-                                           String triggerSource) {
+                                           String triggerSource, Map<String, String> clientMetadata) {
         Map<String, Object> req = new HashMap<>();
         req.put("codeParameter", CUSTOM_MESSAGE_CODE_PARAMETER);
         req.put("usernameParameter", user.getUsername());
-        req.put("clientMetadata", Map.of());
+        req.put("clientMetadata", clientMetadata == null ? Map.of() : clientMetadata);
         return customMessageResponse(pool, client, user, triggerSource, req);
     }
 
@@ -2131,7 +2132,8 @@ final class CognitoAuthFlowHandler {
             return totpChallenge(pool, client, user, TotpPhase.CODE_REQUIRED, triggerSource, metadata);
         }
         boolean sms = "SMS_MFA".equals(factor);
-        Map<String, Object> customMessage = fireCustomMessage(pool, client, user, "CustomMessage_Authentication");
+        Map<String, Object> customMessage = fireCustomMessage(pool, client, user, "CustomMessage_Authentication",
+                Map.of());
         Map<String, String> parameters = new HashMap<>(service.issueMfaCode(pool, user,
                 sms ? VerificationCode.Purpose.SMS_MFA : VerificationCode.Purpose.EMAIL_MFA,
                 sms ? "phone_number" : "email", sms ? "SMS" : "EMAIL", customMessage));

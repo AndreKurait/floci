@@ -341,7 +341,8 @@ class DynamoDbAccessPathIntegrationTest {
                 """.formatted(TABLE))
             .statusCode(400)
             .body("__type", equalTo("ValidationException"))
-            .body("message", equalTo("The provided starting key is invalid"));
+            .body("message", equalTo("One or more parameter values were invalid: Type mismatch for Index Key sk "
+                    + "Expected: S Actual: BOOL IndexName: alternate-index"));
 
         request("DynamoDB_20120810.Query", """
                 {

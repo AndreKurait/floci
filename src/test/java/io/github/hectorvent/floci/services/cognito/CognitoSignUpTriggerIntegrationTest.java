@@ -22,8 +22,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import static io.github.hectorvent.floci.services.cognito.CognitoRestAssuredUtils.cognitoAction;
 import static io.github.hectorvent.floci.services.cognito.CognitoRestAssuredUtils.cognitoJson;
@@ -183,11 +181,9 @@ class CognitoSignUpTriggerIntegrationTest {
             if (!autoConfirm) {
                 JsonNode messages = SesMailbox.messagesTo(email);
                 assertEquals(1, messages.size());
-                Matcher code = Pattern.compile("\\b(\\d{6})\\b")
-                        .matcher(messages.get(0).path("Body").path("text_part").asText());
-                assertTrue(code.find(), "signup email must contain the confirmation code");
+                String code = CognitoCodes.sixDigitCode(messages.get(0).path("Body").path("text_part").asText());
                 cognitoAction("ConfirmSignUp", MAPPER.writeValueAsString(Map.of("ClientId", clientId,
-                        "Username", username, "ConfirmationCode", code.group(1),
+                        "Username", username, "ConfirmationCode", code,
                         "ClientMetadata", Map.of("source", "http-confirm")))).then().statusCode(200);
             }
             assertNull(callbackFailure.get(), () -> "PostConfirmation HTTP callback failed before Lambda returned: "

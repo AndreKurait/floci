@@ -88,7 +88,11 @@ public final class VerificationCodeService {
             }
         }
 
-        String code = String.format("%06d", random.nextInt(1_000_000));
+        // Measured on AWS: the code of an email sign-in (USER_AUTH's EMAIL_OTP) has eight digits,
+        // a sign-up, forgotten-password or attribute verification code six.
+        String code = purpose == VerificationCode.Purpose.EMAIL_OTP
+            ? String.format("%08d", random.nextInt(100_000_000))
+            : String.format("%06d", random.nextInt(1_000_000));
         String salt = HexFormat.of().formatHex(randomBytes(SALT_BYTES));
         String hash = Digests.sha256Hex(code + salt);
         Instant now = clock.instant();

@@ -84,6 +84,7 @@ class CloudFormationServiceRollbackTest {
                 provisioner,
                 mock(S3Service.class),
                 mock(SsmService.class),
+                mock(GetStackOutputRoleAuthorizer.class),
                 mock(CfnDynamicReferences.class),
                 new ObjectMapper(),
                 config,
@@ -462,8 +463,8 @@ class CloudFormationServiceRollbackTest {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.defaultAccountId()).thenReturn(ACCOUNT);
         CloudFormationService deleteService = new CloudFormationService(cleanupDispatcher, mock(S3Service.class),
-                mock(SsmService.class), mock(CfnDynamicReferences.class), new ObjectMapper(), config,
-                mock(RegionResolver.class), Clock.systemUTC(), new InMemoryStorageFactory());
+                mock(SsmService.class), mock(GetStackOutputRoleAuthorizer.class), mock(CfnDynamicReferences.class), new ObjectMapper(),
+                config, mock(RegionResolver.class), Clock.systemUTC(), new InMemoryStorageFactory());
 
         assertThrows(IllegalStateException.class, () -> deleteService.deleteStackResources(stack, REGION, ACCOUNT));
         assertEquals("DELETE_FAILED", stack.getStatus());
@@ -796,8 +797,8 @@ class CloudFormationServiceRollbackTest {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.defaultAccountId()).thenReturn(ACCOUNT);
         return new CloudFormationService(provisioner, mock(S3Service.class), mock(SsmService.class),
-                mock(CfnDynamicReferences.class), new ObjectMapper(), config, regionResolver, clock,
-                new InMemoryStorageFactory());
+                mock(GetStackOutputRoleAuthorizer.class), mock(CfnDynamicReferences.class), new ObjectMapper(), config,
+                regionResolver, clock, new InMemoryStorageFactory());
     }
 
     /** The stack as {@code PersistentStorage} writes it and reads it back. */

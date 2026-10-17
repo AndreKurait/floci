@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.IamConditionContextResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.auth.CredentialScope;
+import io.github.hectorvent.floci.core.common.auth.SessionTokenCheck;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.core.common.auth.SigV4SignedRequest;
@@ -171,16 +172,14 @@ public class LambdaWebIamAuth {
     }
 
     /**
-     * The secret of a key Floci issued. A temporary key needs its session token, and a long-term
-     * key with a session token is refused, as on AWS. The local {@code test} key signs with
-     * {@code test}.
+     * The secret of a key Floci issued, when the session token fits it. The local {@code test} key
+     * signs with {@code test}.
      */
     private String secretKey(String accessKeyId, String sessionToken) {
         if (TEST_ACCESS_KEY.equals(accessKeyId)) {
             return TEST_ACCESS_KEY;
         }
-        boolean temporary = IamService.isTemporaryAccessKey(accessKeyId);
-        if (temporary && isBlank(sessionToken) || !temporary && !isBlank(sessionToken)) {
+        if (SessionTokenCheck.of(iamService, accessKeyId, sessionToken) != SessionTokenCheck.VALID) {
             return null;
         }
         return iamService.findSecretKeyInAnyAccount(accessKeyId, sessionToken)

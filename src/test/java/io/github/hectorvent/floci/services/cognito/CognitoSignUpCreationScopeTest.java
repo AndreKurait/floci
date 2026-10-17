@@ -98,13 +98,13 @@ class CognitoSignUpCreationScopeTest {
                             ? service.adminCreateUser(POOL_ID, "alice", Map.of("name", "first"),
                                     "Perm1234!", "SUPPRESS")
                             : service.signUp(firstClient.getClientId(), "alice", "Perm1234!",
-                                    Map.of("name", "first"))));
+                                    Map.of("name", "first"), Map.of(), Map.of())));
             pending.add(first);
             assertTrue(firstTriggerEntered.await(5, TimeUnit.SECONDS), "first request must enter PreSignUp");
 
             Future<CognitoUser> overlapping = requests.submit(() -> inAccount(overlappingAccount, () ->
                     service.signUp(overlappingClient.getClientId(), "alice", "Perm1234!",
-                            Map.of("name", "overlapping"))));
+                            Map.of("name", "overlapping"), Map.of(), Map.of())));
             pending.add(overlapping);
             if (differentAccount) {
                 assertEquals("overlapping", overlapping.get(5, TimeUnit.SECONDS).getAttributes().get("name"));

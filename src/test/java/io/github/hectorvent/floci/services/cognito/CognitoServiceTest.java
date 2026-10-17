@@ -257,7 +257,7 @@ class CognitoServiceTest {
         Map<String, String> attributes = Map.of("email", email, "name", "must-not-be-saved");
         for (Runnable operation : List.<Runnable>of(
                 () -> service.adminCreateUser(pool.getId(), "invalid-admin", attributes, "TempPass1!"),
-                () -> service.signUp(client.getClientId(), "invalid-signup", "Pass1234!", attributes),
+                () -> service.signUp(client.getClientId(), "invalid-signup", "Pass1234!", attributes, Map.of(), Map.of()),
                 () -> service.adminUpdateUserAttributes(pool.getId(), "alice", attributes),
                 () -> service.updateUserAttributes(token, attributes))) {
             AwsException error = assertThrows(AwsException.class, operation::run);
@@ -649,7 +649,7 @@ class CognitoServiceTest {
                 service.signUp(client.getClientId(), "alice@example.com", password, Map.of(
                         "email", "alice@example.com",
                         "phone_number", "+4915112345678"
-                )));
+                ), Map.of(), Map.of()));
 
         assertEquals("InvalidPasswordException", exception.getErrorCode());
     }
@@ -665,7 +665,7 @@ class CognitoServiceTest {
                 "alice@example.com",
                 "ValidPassword1!",
                 Map.of("email", "alice@example.com", "phone_number", "+4915112345678")
-        );
+        , Map.of(), Map.of());
 
         assertEquals("alice@example.com", user.getUsername());
     }
@@ -908,7 +908,7 @@ class CognitoServiceTest {
                 pool.getId(), "no-requirements-client", false, false, List.of(), List.of());
         assertDoesNotThrow(() -> service.signUp(
                 client.getClientId(), "alice@example.com", "abcdefg", Map.of(
-                        "email", "alice@example.com", "phone_number", "+4915112345678")));
+                        "email", "alice@example.com", "phone_number", "+4915112345678"), Map.of(), Map.of()));
     }
 
     @Test
@@ -2291,7 +2291,7 @@ class CognitoServiceTest {
                 false, false, List.of(), List.of());
 
         CognitoUser user = service.signUp(client.getClientId(),
-                "carol", "Pass1234!", Map.of("email", "carol@example.com"));
+                "carol", "Pass1234!", Map.of("email", "carol@example.com"), Map.of(), Map.of());
 
         assertTrue(user.getAttributes().containsKey("sub"),
                 "signUp should auto-generate a sub attribute");
@@ -2326,7 +2326,7 @@ class CognitoServiceTest {
         UserPoolClient client = openClient(serviceWithVerification, pool.getId(), "test-client", false);
 
         AwsException ex = assertThrows(AwsException.class, () ->
-                serviceWithVerification.signUp(client.getClientId(), "carol", "Pass1234!", Map.of()));
+                serviceWithVerification.signUp(client.getClientId(), "carol", "Pass1234!", Map.of(), Map.of(), Map.of()));
         assertEquals("InvalidParameterException", ex.getErrorCode());
 
         AwsException lookupEx = assertThrows(AwsException.class, () ->
@@ -2368,7 +2368,7 @@ class CognitoServiceTest {
 
         AwsException ex = assertThrows(AwsException.class, () ->
                 serviceWithVerification.signUp(client.getClientId(), "carol", "Pass1234!",
-                        Map.of("email", "carol@example.com")));
+                        Map.of("email", "carol@example.com"), Map.of(), Map.of()));
         assertEquals("CodeDeliveryFailureException", ex.getErrorCode());
         assertEquals(400, ex.getHttpStatus());
         assertEquals("Failed to deliver the message.", ex.getMessage());
@@ -2383,7 +2383,7 @@ class CognitoServiceTest {
     @Test
     void signUpReturnsResourceNotFoundAsBadRequestWhenClientMissing() {
         AwsException ex = assertThrows(AwsException.class, () ->
-                service.signUp("missing-client", "carol", "Pass1234!", Map.of("email", "carol@example.com")));
+                service.signUp("missing-client", "carol", "Pass1234!", Map.of("email", "carol@example.com"), Map.of(), Map.of()));
         assertEquals("ResourceNotFoundException", ex.getErrorCode());
         assertEquals(400, ex.getHttpStatus());
     }
@@ -2858,7 +2858,7 @@ class CognitoServiceTest {
     void initiateAuthWithUserSrpAuthRejectsUnconfirmedUser() {
         UserPool pool = service.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
         UserPoolClient client = service.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
-        service.signUp(client.getClientId(), "bob", "Password123!", Map.of("email", "bob@example.com"));
+        service.signUp(client.getClientId(), "bob", "Password123!", Map.of("email", "bob@example.com"), Map.of(), Map.of());
 
         AwsException ex = assertThrows(AwsException.class, () ->
                 service.initiateAuth(client.getClientId(), "USER_SRP_AUTH",
@@ -5586,7 +5586,7 @@ class CognitoServiceTest {
                     pool.getId(), "c", false, false, List.of(), List.of());
 
             svc.signUp(client.getClientId(), username, password,
-                    Map.of("email", username));
+                    Map.of("email", username), Map.of(), Map.of());
             svc.confirmSignUp(client.getClientId(), username, "123456");
 
             CognitoUser user = svc.adminGetUser(pool.getId(), username);
@@ -5613,7 +5613,7 @@ class CognitoServiceTest {
                     pool.getId(), "c", false, false, List.of(), List.of());
 
             svc.signUp(client.getClientId(), username, password,
-                    Map.of("phone_number", phoneNumber));
+                    Map.of("phone_number", phoneNumber), Map.of(), Map.of());
             svc.confirmSignUp(client.getClientId(), username, "123456");
 
             CognitoUser user = svc.adminGetUser(pool.getId(), username);
@@ -5640,7 +5640,7 @@ class CognitoServiceTest {
                     pool.getId(), "c", false, false, List.of(), List.of());
 
             svc.signUp(client.getClientId(), email, password,
-                    Map.of("email", email, "phone_number", phoneNumber));
+                    Map.of("email", email, "phone_number", phoneNumber), Map.of(), Map.of());
             svc.confirmSignUp(client.getClientId(), email, "123456");
 
             CognitoUser user = svc.adminGetUser(pool.getId(), email);
@@ -5667,7 +5667,7 @@ class CognitoServiceTest {
                     pool.getId(), "c", false, false, List.of(), List.of());
 
             svc.signUp(client.getClientId(), email, password,
-                    Map.of("email", email, "phone_number", phoneNumber));
+                    Map.of("email", email, "phone_number", phoneNumber), Map.of(), Map.of());
             svc.confirmSignUp(client.getClientId(), email, "123456");
 
             CognitoUser user = svc.adminGetUser(pool.getId(), email);
@@ -5690,7 +5690,7 @@ class CognitoServiceTest {
                     pool.getId(), "c", false, false, List.of(), List.of());
 
             svc.signUp(client.getClientId(), username, password,
-                    Map.of("email", username));
+                    Map.of("email", username), Map.of(), Map.of());
             svc.confirmSignUp(client.getClientId(), username, "123456");
 
             CognitoUser user = svc.adminGetUser(pool.getId(), username);
@@ -5717,7 +5717,7 @@ class CognitoServiceTest {
                     pool.getId(), "c", false, false, List.of(), List.of());
 
             service.signUp(client.getClientId(), username, password,
-                    Map.of("email", username));
+                    Map.of("email", username), Map.of(), Map.of());
 
             service.confirmSignUp(client.getClientId(), username);
 
@@ -5744,7 +5744,7 @@ class CognitoServiceTest {
                     pool.getId(), "c", false, false, List.of(), List.of());
 
             svc.signUp(client.getClientId(), username, password,
-                    Map.of("email", username));
+                    Map.of("email", username), Map.of(), Map.of());
             svc.updateUserPool(Map.of(
                     "UserPoolId", pool.getId(),
                     "AutoVerifiedAttributes", List.of("phone_number")

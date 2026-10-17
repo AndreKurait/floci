@@ -4095,16 +4095,10 @@ public class DynamoDbService {
             throw new KeySchemaMismatchException("The provided key element does not match the schema");
         }
         if (attr.has("S") && attr.get("S").asText().isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "One or more parameter values are not valid. "
-                    + "The AttributeValue for a key attribute cannot contain an empty string value. Key: "
-                    + keyName, 400);
+            throw DynamoDbKeyValueErrors.emptyKeyValue("S", keyName);
         }
         if (attr.has("B") && attr.get("B").asText().isEmpty()) {
-            throw new AwsException("ValidationException",
-                    "One or more parameter values are not valid. "
-                    + "The AttributeValue for a key attribute cannot contain an empty binary value. Key: "
-                    + keyName, 400);
+            throw DynamoDbKeyValueErrors.emptyKeyValue("B", keyName);
         }
     }
 
@@ -4199,33 +4193,29 @@ public class DynamoDbService {
             validateAttributeValueShape(attr);
             String expectedType = keyAttributeType(table, attrName);
             if (expectedType != null && !attr.has(expectedType)) {
-                throw new KeySchemaMismatchException(
-                        "One or more parameter values were invalid: Type mismatch for Index Key " + attrName
-                        + " Expected: " + expectedType + " Actual: " + attr.fieldNames().next()
-                        + " IndexName: " + indexName);
+                throw DynamoDbKeyValueErrors.indexKeyTypeMismatch(attrName, expectedType,
+                        attr.fieldNames().next(), indexName);
             }
             if (attr.has("S") && attr.get("S").asText().isEmpty()) {
-                throw emptyIndexKeyValue("empty string value", indexName, attrName, isUpdate);
+                throw emptyIndexKeyValue("S", indexName, attrName, isUpdate);
             }
             if (attr.has("B") && attr.get("B").asText().isEmpty()) {
-                throw emptyIndexKeyValue("empty binary value", indexName, attrName, isUpdate);
+                throw emptyIndexKeyValue("B", indexName, attrName, isUpdate);
             }
         }
     }
 
     // AWS uses different wording for UpdateItem than for writes of a whole item.
-    private static AwsException emptyIndexKeyValue(String what, String indexName, String attrName,
+    private static AwsException emptyIndexKeyValue(String type, String indexName, String attrName,
                                                    boolean isUpdate) {
         if (isUpdate) {
             return new AwsException("ValidationException",
                     "One or more parameter values are not valid. The update expression attempted to "
                     + "update a secondary index key to a value that is not supported. "
-                    + "The AttributeValue for a key attribute cannot contain an " + what + ".", 400);
+                    + "The AttributeValue for a key attribute cannot contain an "
+                    + DynamoDbKeyValueErrors.emptyValueKind(type) + ".", 400);
         }
-        return new AwsException("ValidationException",
-                "One or more parameter values are not valid. A value specified for a secondary "
-                + "index key is not supported. The AttributeValue for a key attribute cannot "
-                + "contain an " + what + ". IndexName: " + indexName + ", IndexKey: " + attrName, 400);
+        return DynamoDbKeyValueErrors.emptyIndexKeyValue(type, indexName, attrName);
     }
 
     private String buildItemKeyFromNode(JsonNode item, String pkName, String skName) {

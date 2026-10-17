@@ -50,6 +50,25 @@ class VerificationCodeServiceTest {
         assertTrue(code.matches("\\d{6}"), "code is digits");
     }
 
+    /**
+     * Measured on AWS (eu-west-1, 2026-10-16), the codes Cognito handed a custom email sender:
+     * an email sign-in code had eight digits, sign-up, resent, forgotten-password and attribute
+     * verification codes six.
+     */
+    @Test
+    void issue_emailSignInCode_hasEightDigits() {
+        for (int i = 0; i < 50; i++) {
+            String signIn = service.issue("pool", "alice-" + i,
+                VerificationCode.Purpose.EMAIL_OTP, Duration.ofMinutes(5));
+            assertTrue(signIn.matches("\\d{8}"), signIn);
+        }
+        for (VerificationCode.Purpose purpose : List.of(VerificationCode.Purpose.PASSWORD_RESET,
+                VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION, VerificationCode.Purpose.EMAIL_MFA)) {
+            String code = service.issue("pool", "bob-" + purpose, purpose, Duration.ofHours(1));
+            assertTrue(code.matches("\\d{6}"), purpose + " " + code);
+        }
+    }
+
     @Test
     void consume_validCode_succeeds() {
         String code = service.issue("pool", "alice",

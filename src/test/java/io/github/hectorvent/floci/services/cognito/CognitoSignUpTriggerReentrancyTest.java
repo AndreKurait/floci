@@ -102,7 +102,7 @@ class CognitoSignUpTriggerReentrancyTest {
         UserPool pool = pool(Map.of("PostConfirmation", FUNCTION));
         UserPoolClient client = client(pool);
         CognitoUser user = service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("phone_number", PHONE));
+                Map.of("phone_number", PHONE), Map.of(), Map.of());
         String code = sns.getSentMessages().getFirst().getMessage().replaceAll("\\D", "");
         AtomicReference<Throwable> callbackFailure = new AtomicReference<>();
         when(lambdaService.invoke(anyString(), eq(FUNCTION), any(byte[].class),
@@ -158,7 +158,7 @@ class CognitoSignUpTriggerReentrancyTest {
                 new CognitoMessageDispatcher(null, sns, "us-east-1"), null);
         UserPool pool = pool(Map.of("PostConfirmation", FUNCTION));
         UserPoolClient client = client(pool);
-        service.signUp(client.getClientId(), "alice", "Perm1234!", Map.of("phone_number", PHONE));
+        service.signUp(client.getClientId(), "alice", "Perm1234!", Map.of("phone_number", PHONE), Map.of(), Map.of());
         confirmationCode.set(sns.getSentMessages().getFirst().getMessage().replaceAll("\\D", ""));
         AtomicReference<JsonNode> event = new AtomicReference<>();
         when(lambdaService.invoke(anyString(), eq(FUNCTION), any(byte[].class),
@@ -196,7 +196,7 @@ class CognitoSignUpTriggerReentrancyTest {
                 });
 
         CognitoUser user = service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("phone_number", PHONE));
+                Map.of("phone_number", PHONE), Map.of(), Map.of());
 
         assertNull(callbackFailure.get(), () -> "auto-confirm PostConfirmation callback failed before returning: "
                 + callbackFailure.get());
@@ -221,7 +221,7 @@ class CognitoSignUpTriggerReentrancyTest {
                 });
 
         CognitoUser user = service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("phone_number", PHONE));
+                Map.of("phone_number", PHONE), Map.of(), Map.of());
 
         assertNull(callbackFailure.get(), () -> "CustomMessage callback failed before returning: "
                 + callbackFailure.get());
@@ -254,7 +254,7 @@ class CognitoSignUpTriggerReentrancyTest {
                 });
 
         service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("phone_number", PHONE, "name", "created by signup"));
+                Map.of("phone_number", PHONE, "name", "created by signup"), Map.of(), Map.of());
 
         assertNull(callbackFailure.get(), () -> "PreSignUp callback failed before returning: "
                 + callbackFailure.get());
@@ -277,7 +277,7 @@ class CognitoSignUpTriggerReentrancyTest {
                     return response(Map.of());
                 });
 
-        service.signUp(client.getClientId(), "Aa", "Perm1234!", Map.of("phone_number", PHONE));
+        service.signUp(client.getClientId(), "Aa", "Perm1234!", Map.of("phone_number", PHONE), Map.of(), Map.of());
 
         assertNull(callbackFailure.get());
         assertEquals("updated by PreSignUp", service.adminGetUser(pool.getId(), "BB").getAttributes().get("name"));
@@ -302,7 +302,7 @@ class CognitoSignUpTriggerReentrancyTest {
                     return response(Map.of());
                 });
 
-        CognitoUser result = service.signUp(client.getClientId(), "alice", "Perm1234!", Map.of("phone_number", PHONE));
+        CognitoUser result = service.signUp(client.getClientId(), "alice", "Perm1234!", Map.of("phone_number", PHONE), Map.of(), Map.of());
 
         assertNull(callbackFailure.get());
         assertEquals(1, sns.getSentMessages().size());
@@ -333,7 +333,7 @@ class CognitoSignUpTriggerReentrancyTest {
                 });
 
         AwsException failure = assertThrows(AwsException.class, () -> service.signUp(client.getClientId(),
-                "alice", "Perm1234!", Map.of("phone_number", PHONE)));
+                "alice", "Perm1234!", Map.of("phone_number", PHONE), Map.of(), Map.of()));
 
         assertEquals("CodeDeliveryFailureException", failure.getErrorCode());
         assertNull(callbackFailure.get());
@@ -366,7 +366,7 @@ class CognitoSignUpTriggerReentrancyTest {
                 });
 
         AwsException failure = assertThrows(AwsException.class, () -> service.signUp(client.getClientId(),
-                "alice", "Perm1234!", Map.of("phone_number", PHONE)));
+                "alice", "Perm1234!", Map.of("phone_number", PHONE), Map.of(), Map.of()));
 
         assertEquals("CodeDeliveryFailureException", failure.getErrorCode());
         assertNull(callbackFailure.get());
@@ -380,7 +380,7 @@ class CognitoSignUpTriggerReentrancyTest {
         UserPool pool = pool(Map.of("PostConfirmation", FUNCTION));
         UserPoolClient client = client(pool);
         service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("phone_number", PHONE, "name", "at confirmation"));
+                Map.of("phone_number", PHONE, "name", "at confirmation"), Map.of(), Map.of());
         CognitoUser user = service.adminGetUser(pool.getId(), "alice");
         String code = sns.getSentMessages().getFirst().getMessage().replaceAll("\\D", "");
         AtomicBoolean captureStarted = new AtomicBoolean();

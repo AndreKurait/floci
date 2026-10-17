@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.MissingNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.TextNode;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import org.jboss.logging.Logger;
@@ -17,6 +18,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
@@ -24,11 +26,30 @@ import java.util.regex.Pattern;
 /**
  * Resolves CloudFormation intrinsic functions and pseudo-parameters in template nodes.
  * Supported: Ref, Fn::Sub, Fn::Join, Fn::Select, Fn::If, Fn::Split, Fn::Base64,
- * Fn::GetAtt, Fn::GetAZs, Fn::Cidr, Fn::FindInMap, Fn::ImportValue, Condition.
+ * Fn::GetAtt, Fn::GetAZs, Fn::Cidr, Fn::FindInMap, Fn::ImportValue, Fn::GetStackOutput, Condition.
  */
 public class CloudFormationTemplateEngine {
 
     private static final Logger LOG = Logger.getLogger(CloudFormationTemplateEngine.class);
+
+    static final String GET_STACK_OUTPUT = "Fn::GetStackOutput";
+
+    /**
+     * Reads an output of another stack for {@code Fn::GetStackOutput}, the way CloudFormation does
+     * with DescribeStacks in the referenced account and Region.
+     */
+    @FunctionalInterface
+    public interface StackOutputResolver {
+
+        /**
+         * @param region  the Region of the referenced stack, already validated
+         * @param roleArn the role to read it with, or {@code null} for the stack's own account
+         * @return the output's value; never {@code null}
+         * @throws AwsException when the stack or the output does not exist, or the role cannot
+         *                      be assumed
+         */
+        String resolve(String stackName, String outputName, String region, String roleArn);
+    }
 
     private final String accountId;
     private final String region;
@@ -42,7 +63,13 @@ public class CloudFormationTemplateEngine {
     private final ObjectMapper objectMapper;
     private final Function<String, String> importValueResolver;
     private final UnaryOperator<String> dynamicReferenceResolver;
+    private final StackOutputResolver stackOutputResolver;
     private final List<String> unresolvedIntrinsics = new ArrayList<>();
+    /**
+     * Above zero while {@code Fn::GetStackOutput}'s arguments resolve: CloudFormation hands them on
+     * with their dynamic references unresolved.
+     */
+    private int dynamicReferencesSuspended;
 
     /**
      * A minimal engine for a resource provisioned outside any stack (Cloud Control CreateResource).
@@ -89,6 +116,24 @@ public class CloudFormationTemplateEngine {
                                  ObjectMapper objectMapper,
                                  Function<String, String> importValueResolver,
                                  UnaryOperator<String> dynamicReferenceResolver) {
+        this(accountId, region, stackName, stackId, parameters, physicalIds, resourceAttributes,
+                conditions, mappings, objectMapper, importValueResolver, dynamicReferenceResolver, null);
+    }
+
+    /**
+     * @param stackOutputResolver reads another stack's output for {@code Fn::GetStackOutput};
+     *                            {@code null} fails every such reference, as nothing can answer it
+     */
+    CloudFormationTemplateEngine(String accountId, String region, String stackName, String stackId,
+                                 Map<String, String> parameters,
+                                 Map<String, String> physicalIds,
+                                 Map<String, Map<String, String>> resourceAttributes,
+                                 Map<String, Boolean> conditions,
+                                 Map<String, JsonNode> mappings,
+                                 ObjectMapper objectMapper,
+                                 Function<String, String> importValueResolver,
+                                 UnaryOperator<String> dynamicReferenceResolver,
+                                 StackOutputResolver stackOutputResolver) {
         this.accountId = accountId;
         this.region = region;
         this.stackName = stackName;
@@ -101,6 +146,7 @@ public class CloudFormationTemplateEngine {
         this.objectMapper = objectMapper;
         this.importValueResolver = importValueResolver;
         this.dynamicReferenceResolver = dynamicReferenceResolver;
+        this.stackOutputResolver = stackOutputResolver;
     }
 
     /** The id of the stack this engine resolves for, as {@code AWS::StackId} returns it. */
@@ -181,6 +227,9 @@ public class CloudFormationTemplateEngine {
             if (node.has("Fn::FindInMap")) {
                 return resolveFindInMap(node.get("Fn::FindInMap"));
             }
+            if (node.has(GET_STACK_OUTPUT)) {
+                return resolveGetStackOutput(node.get(GET_STACK_OUTPUT));
+            }
         }
         return node.asText();
     }
@@ -208,7 +257,7 @@ public class CloudFormationTemplateEngine {
             if (node.has("Fn::Split") || node.has("Fn::GetAZs") || node.has("Fn::Cidr")) {
                 return objectMapper.valueToTree(resolveList(node));
             }
-            if (isIntrinsic(node)) {
+            if (isIntrinsic(node) || node.has(GET_STACK_OUTPUT)) {
                 return TextNode.valueOf(resolve(node));
             }
             // Plain object: resolve each field.
@@ -294,7 +343,8 @@ public class CloudFormationTemplateEngine {
      * text an intrinsic function (e.g. {@code Fn::Sub}) produces.
      */
     private TextNode resolveDynamicReferences(String value) {
-        if (dynamicReferenceResolver == null || value == null || !value.contains("{{resolve:")) {
+        if (dynamicReferenceResolver == null || dynamicReferencesSuspended > 0 || value == null
+                || !value.contains("{{resolve:")) {
             return TextNode.valueOf(value);
         }
         return TextNode.valueOf(dynamicReferenceResolver.apply(value));
@@ -696,5 +746,93 @@ public class CloudFormationTemplateEngine {
         }
         LOG.warnv("Unresolved Fn::ImportValue: {0}", exportName);
         throw new AwsException("ValidationError", "No export named " + exportName + " found", 400);
+    }
+
+    /** Whether {@code node} holds {@code Fn::GetStackOutput} anywhere inside it. */
+    static boolean containsGetStackOutput(JsonNode node) {
+        return node != null && !node.findValues(GET_STACK_OUTPUT).isEmpty();
+    }
+
+    /**
+     * {@code Fn::GetStackOutput}: the value of another stack's output, read when this resource is
+     * created or updated. A stack or an output that does not exist fails the operation, as on AWS;
+     * the reference never resolves to an empty string.
+     *
+     * <p>What AWS does, measured rather than read: a parameter value may use any intrinsic,
+     * a resource's {@code Ref} or {@code Fn::GetAtt} included, and it is resolved like any other
+     * property; a key the function does not define is ignored; {@code Region} defaults to this
+     * stack's, and one of another partition fails the call the way an invalid token does;
+     * {@code RoleArn} must parse as an ARN, and whether it can be assumed is the resolver's call.
+     * The positions AWS's page lists as unsupported (an Fn::Sub variable map, Fn::Base64, a
+     * direct Outputs value) resolve; Conditions and Fn::ImportValue are refused when the stack
+     * operation is requested, before this runs.
+     */
+    private String resolveGetStackOutput(JsonNode args) {
+        if (args == null || !args.isObject()) {
+            throw new AwsException("ValidationError",
+                    "TemplateError: Fn::GetStackOutput requires a map of named parameters", 400);
+        }
+        String referencedStack = getStackOutputParameter(args, "StackName");
+        String outputName = getStackOutputParameter(args, "OutputName");
+        String referencedRegion = getStackOutputParameter(args, "Region");
+        String roleArn = getStackOutputParameter(args, "RoleArn");
+        if (referencedStack.isEmpty()) {
+            throw new AwsException("ValidationError", "GetStackOutput: StackName is required", 400);
+        }
+        if (outputName.isEmpty()) {
+            throw new AwsException("ValidationError", "GetStackOutput: OutputName is required", 400);
+        }
+        if (referencedRegion.isEmpty()) {
+            referencedRegion = region;
+        } else if (!referencedRegion.equals(region)) {
+            if (!AwsRegions.isRegionId(referencedRegion)) {
+                throw new AwsException("ValidationError", "TemplateError: Region " + referencedRegion
+                        + " in Fn::GetStackOutput is not a valid AWS region.", 400);
+            }
+            if (!AwsRegions.partitionFor(referencedRegion).equals(AwsRegions.partitionFor(region))) {
+                throw new AwsException("InvalidClientTokenId", sdkErrorMessage(
+                        "The security token included in the request is invalid", "AmazonCloudFormation", 403,
+                        "InvalidClientTokenId"), 403);
+            }
+        }
+        if (roleArn.isEmpty()) {
+            roleArn = null;
+        } else if (!AwsArnUtils.isArn(roleArn)) {
+            throw new AwsException("ValidationError",
+                    "TemplateError: Invalid RoleArn parameter " + roleArn + " in Fn::GetStackOutput", 400);
+        }
+        if (stackOutputResolver == null) {
+            throw new AwsException("ValidationError",
+                    "Template error: Fn::GetStackOutput cannot be resolved outside a stack", 400);
+        }
+        return stackOutputResolver.resolve(referencedStack, outputName, referencedRegion, roleArn);
+    }
+
+    /**
+     * A parameter's value, with every dynamic reference in it left as written, one inside an
+     * {@code Fn::Sub} variable map included: CloudFormation does not resolve them there, so the
+     * stack name reaches DescribeStacks unresolved and fails its name constraint (measured,
+     * eu-west-1, 2026-10-17).
+     */
+    private String getStackOutputParameter(JsonNode args, String name) {
+        JsonNode value = args.get(name);
+        if (value == null || value.isNull()) {
+            return "";
+        }
+        dynamicReferencesSuspended++;
+        try {
+            return resolveIntrinsic(value);
+        } finally {
+            dynamicReferencesSuspended--;
+        }
+    }
+
+    /**
+     * The message CloudFormation reports for an error a service call returned while it resolved a
+     * reference: the service's message followed by the SDK's description of the call.
+     */
+    static String sdkErrorMessage(String message, String service, int status, String errorCode) {
+        return message + " (Service: " + service + "; Status Code: " + status + "; Error Code: " + errorCode
+                + "; Request ID: " + UUID.randomUUID() + "; Proxy: null)";
     }
 }

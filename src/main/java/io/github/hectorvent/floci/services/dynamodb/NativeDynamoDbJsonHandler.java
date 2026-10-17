@@ -1305,7 +1305,7 @@ public class NativeDynamoDbJsonHandler {
         rejectConsistentReadOnGsi(request, scanAccessPath);
 
         if (exclusiveStartKey != null) {
-            DynamoDbAccessPathValidator.validateExclusiveStartKey(exclusiveStartKey, scanTable, scanAccessPath);
+            DynamoDbAccessPathValidator.validateScanExclusiveStartKey(exclusiveStartKey, scanTable, scanAccessPath);
         }
 
         DynamoDbService.ScanResult result = dynamoDbService.scan(

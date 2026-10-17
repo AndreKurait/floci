@@ -67,7 +67,6 @@ class CognitoManagedLoginIntegrationTest {
     private static final String INCORRECT_CREDENTIALS = "Incorrect username or password";
     private static final Pattern HIDDEN_FIELD = Pattern.compile("<input type=\"hidden\" name=\"([^\"]*)\" value=\"([^\"]*)\">");
     private static final Pattern FORM_ACTION = Pattern.compile("<form method=\"post\" action=\"([^\"]*)\">");
-    private static final Pattern SIX_DIGIT_CODE = Pattern.compile("\\b(\\d{6})\\b");
     private static final String PRE_TOKEN_GENERATION_ARN = "arn:aws:lambda:::pre-token-generation";
     private static final String ADMIN_SCOPE = "aws.cognito.signin.user.admin";
     private static final String POST_AUTHENTICATION_ARN = "arn:aws:lambda:::post-authentication";
@@ -1371,9 +1370,7 @@ class CognitoManagedLoginIntegrationTest {
     private static String latestEmailCode(String email) throws Exception {
         JsonNode messages = emailsTo(email);
         assertEquals(1, messages.size(), messages.toString());
-        Matcher matcher = SIX_DIGIT_CODE.matcher(messages.get(0).path("Body").path("text_part").asText());
-        assertTrue(matcher.find(), messages.toString());
-        return matcher.group(1);
+        return CognitoCodes.emailSignInCode(messages.get(0).path("Body").path("text_part").asText());
     }
 
     private static JsonNode emailsTo(String email) {

@@ -152,6 +152,14 @@ class LambdaWebIamAuthTest {
     }
 
     @Test
+    void theSessionTokenIsReadFromWhereTheSignatureIsAndMayNotBeEmpty() {
+        LambdaWebRequestSigner longTerm = signer().credentials(USER_KEY, USER_SECRET, null);
+        assertFalse(allows(longTerm.sign("GET", HOST, "/").withHeader("X-Amz-Security-Token", "")));
+        assertTrue(allows(longTerm.sign("GET", HOST, "/x?X-Amz-Security-Token=bogus")));
+        assertTrue(allows(longTerm.presigned().sign("GET", HOST, "/").withHeader("X-Amz-Security-Token", "bogus")));
+    }
+
+    @Test
     void aMalformedDateOrQueryIsRefused() {
         assertFalse(allows(signer().sign("GET", HOST, "/").withHeader("X-Amz-Date", "20261017T99")));
         assertFalse(allows(signer().sign("GET", HOST, "/q?x=1").withPathAndQuery("/q?x=%zz")));

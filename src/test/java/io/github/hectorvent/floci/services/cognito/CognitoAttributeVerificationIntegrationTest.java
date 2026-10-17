@@ -12,8 +12,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
 import java.util.UUID;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import static io.github.hectorvent.floci.services.cognito.CognitoRestAssuredUtils.cognitoAction;
 import static io.github.hectorvent.floci.services.cognito.CognitoRestAssuredUtils.cognitoJson;
@@ -28,7 +26,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class CognitoAttributeVerificationIntegrationTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final Pattern SIX_DIGIT_CODE = Pattern.compile("\\b(\\d{6})\\b");
     private static final String USERNAME = "verify+" + UUID.randomUUID() + "@example.com";
     private static final String PASSWORD = "Verify1234!";
 
@@ -414,7 +411,7 @@ class CognitoAttributeVerificationIntegrationTest {
     private static String fetchLatestSesVerificationCode(String recipient) throws Exception {
         JsonNode messages = SesMailbox.messagesTo(recipient);
         assertTrue(messages.isArray() && !messages.isEmpty());
-        return extractVerificationCode(messages.get(0).path("Body").path("text_part").asText());
+        return CognitoCodes.sixDigitCode(messages.get(0).path("Body").path("text_part").asText());
     }
 
     private static String fetchLatestSnsVerificationCode(String phoneNumber) throws Exception {
@@ -427,13 +424,7 @@ class CognitoAttributeVerificationIntegrationTest {
                 .asString();
         JsonNode messages = JSON.readTree(response).path("messages");
         assertTrue(messages.isArray() && !messages.isEmpty());
-        return extractVerificationCode(messages.get(0).path("Message").asText());
-    }
-
-    private static String extractVerificationCode(String message) {
-        Matcher matcher = SIX_DIGIT_CODE.matcher(message);
-        assertTrue(matcher.find());
-        return matcher.group(1);
+        return CognitoCodes.sixDigitCode(messages.get(0).path("Message").asText());
     }
 
     private static String differentCode(String code) {

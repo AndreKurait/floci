@@ -18,8 +18,10 @@ import io.github.hectorvent.floci.services.dynamodb.ExpressionEvaluator.TokenTyp
 import io.github.hectorvent.floci.services.dynamodb.model.AttributeDefinition;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -439,38 +441,100 @@ final class DynamoDbAccessPathValidator {
     static void validateExclusiveStartKey(JsonNode exclusiveStartKey, TableDefinition table,
                                           DynamoDbAccessPath accessPath) {
         if (exclusiveStartKey == null || exclusiveStartKey.isNull()) return;
-        Set<String> expected = new HashSet<>();
-        expected.add(table.getPartitionKeyName());
-        String sortKey = table.getSortKeyName();
-        if (sortKey != null) {
-            expected.add(sortKey);
-        }
-        if (accessPath.isIndex()) {
-            expected.addAll(accessPath.keyAttributeNames());
+        Set<String> expected = startKeyAttributeNames(table, accessPath);
+        for (String attribute : expected) {
+            JsonNode value = exclusiveStartKey.get(attribute);
+            if (value == null) {
+                continue;
+            }
+            String expectedType = startKeyAttributeType(table, attribute);
+            if (isEmptyKeyValue(value, expectedType)) {
+                throw DynamoDbKeyValueErrors.emptyKeyValue(expectedType, attribute);
+            }
+            if (expectedType == null || hasInvalidScalarValue(value, expectedType)) {
+                throw invalidStartingKey();
+            }
         }
         Set<String> actual = new HashSet<>();
         exclusiveStartKey.fieldNames().forEachRemaining(actual::add);
-        if (!actual.equals(expected) || hasInvalidKeyValue(exclusiveStartKey, table, expected)) {
+        if (!actual.equals(expected)) {
             throw invalidStartingKey();
         }
     }
 
-    private static boolean hasInvalidKeyValue(JsonNode exclusiveStartKey, TableDefinition table,
-                                              Set<String> expected) {
-        if (table.getAttributeDefinitions() == null) {
-            return true;
+    // A Scan of a table with secondary indexes checks the key values against each index,
+    // in index name order, and names the index in the error. A Scan of an index checks
+    // only that index. With several bad values AWS reports one in no fixed order.
+    static void validateScanExclusiveStartKey(JsonNode exclusiveStartKey, TableDefinition table,
+                                              DynamoDbAccessPath accessPath) {
+        if (exclusiveStartKey == null || exclusiveStartKey.isNull()) {
+            return;
         }
-        for (String attribute : expected) {
-            String expectedType = table.getAttributeDefinitions().stream()
-                    .filter(definition -> attribute.equals(definition.getAttributeName()))
-                    .map(AttributeDefinition::getAttributeType)
-                    .findFirst()
-                    .orElse(null);
-            if (expectedType == null || hasInvalidScalarValue(exclusiveStartKey.get(attribute), expectedType)) {
-                return true;
+        List<DynamoDbAccessPath> indexes = accessPath.isIndex()
+                ? List.of(accessPath)
+                : secondaryIndexNames(table).stream()
+                        .map(indexName -> DynamoDbAccessPath.resolve(table, indexName))
+                        .toList();
+        for (DynamoDbAccessPath index : indexes) {
+            Set<String> attributes = startKeyAttributeNames(table, index);
+            for (String attribute : attributes) {
+                JsonNode value = exclusiveStartKey.get(attribute);
+                String expectedType = startKeyAttributeType(table, attribute);
+                if (value != null && value.isObject() && !value.isEmpty()
+                        && expectedType != null && !value.has(expectedType)) {
+                    throw DynamoDbKeyValueErrors.indexKeyTypeMismatch(attribute, expectedType,
+                            value.fieldNames().next(), index.indexName());
+                }
+            }
+            for (String attribute : attributes) {
+                JsonNode value = exclusiveStartKey.get(attribute);
+                String expectedType = startKeyAttributeType(table, attribute);
+                if (value != null && isEmptyKeyValue(value, expectedType)) {
+                    throw DynamoDbKeyValueErrors.emptyIndexKeyValue(expectedType, index.indexName(), attribute);
+                }
             }
         }
-        return false;
+        validateExclusiveStartKey(exclusiveStartKey, table, accessPath);
+    }
+
+    private static Set<String> startKeyAttributeNames(TableDefinition table, DynamoDbAccessPath accessPath) {
+        Set<String> names = new LinkedHashSet<>();
+        if (accessPath.isIndex()) {
+            accessPath.keySchema().forEach(key -> names.add(key.getAttributeName()));
+        }
+        names.add(table.getPartitionKeyName());
+        if (table.getSortKeyName() != null) {
+            names.add(table.getSortKeyName());
+        }
+        return names;
+    }
+
+    private static List<String> secondaryIndexNames(TableDefinition table) {
+        List<String> names = new ArrayList<>();
+        if (table.getGlobalSecondaryIndexes() != null) {
+            table.getGlobalSecondaryIndexes().forEach(gsi -> names.add(gsi.getIndexName()));
+        }
+        if (table.getLocalSecondaryIndexes() != null) {
+            table.getLocalSecondaryIndexes().forEach(lsi -> names.add(lsi.getIndexName()));
+        }
+        return names.stream().sorted().toList();
+    }
+
+    private static String startKeyAttributeType(TableDefinition table, String attribute) {
+        if (table.getAttributeDefinitions() == null) {
+            return null;
+        }
+        return table.getAttributeDefinitions().stream()
+                .filter(definition -> attribute.equals(definition.getAttributeName()))
+                .map(AttributeDefinition::getAttributeType)
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static boolean isEmptyKeyValue(JsonNode value, String expectedType) {
+        return ("S".equals(expectedType) || "B".equals(expectedType))
+                && value.isObject() && value.size() == 1
+                && value.path(expectedType).isTextual() && value.get(expectedType).textValue().isEmpty();
     }
 
     private static boolean hasInvalidScalarValue(JsonNode value, String expectedType) {

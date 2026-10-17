@@ -66,6 +66,45 @@ class AssumeRolePolicyEvaluatorTest {
     }
 
     @Test
+    void anyPrincipalOfTheAccount_throughItsRootOrAPrincipalItNames() {
+        assertTrue(evaluator.allowsAnyPrincipalOf(trust("{\"AWS\":\"arn:aws:iam::111111111111:root\"}"),
+                CALLER_ACCOUNT, "aws"));
+        assertTrue(evaluator.allowsAnyPrincipalOf(trust("{\"AWS\":\"111111111111\"}"), CALLER_ACCOUNT, "aws"));
+        assertTrue(evaluator.allowsAnyPrincipalOf(trust("\"*\""), CALLER_ACCOUNT, "aws"));
+        assertTrue(evaluator.allowsAnyPrincipalOf(
+                trust("{\"AWS\":[\"arn:aws:iam::999999999999:root\",\"arn:aws:iam::111111111111:role/cfn-exec\"]}"),
+                CALLER_ACCOUNT, "aws"));
+        assertTrue(evaluator.allowsAnyPrincipalOf(trust("{\"AWS\":\"arn:aws:iam::111111111111:user/alice\"}"),
+                CALLER_ACCOUNT, "aws"));
+    }
+
+    @Test
+    void anyPrincipalOfTheAccount_notAnotherAccountNorAService() {
+        assertFalse(evaluator.allowsAnyPrincipalOf(trust("{\"AWS\":\"arn:aws:iam::999999999999:root\"}"),
+                CALLER_ACCOUNT, "aws"));
+        assertFalse(evaluator.allowsAnyPrincipalOf(trust("{\"AWS\":\"arn:aws:iam::999999999999:role/cfn-exec\"}"),
+                CALLER_ACCOUNT, "aws"));
+        assertFalse(evaluator.allowsAnyPrincipalOf(trust("{\"Service\":\"lambda.amazonaws.com\"}"),
+                CALLER_ACCOUNT, "aws"));
+        assertFalse(evaluator.allowsAnyPrincipalOf(null, CALLER_ACCOUNT, "aws"));
+    }
+
+    /** A Deny on the account reaches each of its principals; a condition no key here answers grants nothing. */
+    @Test
+    void anyPrincipalOfTheAccount_honoursDenyAndConditions() {
+        assertFalse(evaluator.allowsAnyPrincipalOf("""
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111111111111:role/cfn-exec"},"Action":"sts:AssumeRole"},
+                  {"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::111111111111:root"},"Action":"sts:AssumeRole"}]}
+                """, CALLER_ACCOUNT, "aws"));
+        assertFalse(evaluator.allowsAnyPrincipalOf("""
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111111111111:root"},"Action":"sts:AssumeRole",
+                   "Condition":{"StringEquals":{"sts:ExternalId":"secret"}}}]}
+                """, CALLER_ACCOUNT, "aws"));
+    }
+
+    @Test
     void allowsAccountRootPrincipal() {
         assertTrue(evaluator.allows(
                 trust("{\"AWS\":\"arn:aws:iam::111111111111:root\"}"),

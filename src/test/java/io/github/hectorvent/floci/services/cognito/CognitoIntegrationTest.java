@@ -54,7 +54,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class CognitoIntegrationTest {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-    private static final Pattern SIX_DIGIT_CODE = Pattern.compile("\\b(\\d{6})\\b");
 
     private static String poolId;
     private static String clientId;
@@ -3639,10 +3638,8 @@ class CognitoIntegrationTest {
     }
 
     private static String fetchLatestSesVerificationCode(String recipient) throws Exception {
-        String body = SesMailbox.messagesTo(recipient).get(0).path("Body").path("text_part").asText();
-        Matcher matcher = SIX_DIGIT_CODE.matcher(body);
-        assertTrue(matcher.find(), "verification code email should contain a 6-digit code");
-        return matcher.group(1);
+        return CognitoCodes.sixDigitCode(
+                SesMailbox.messagesTo(recipient).get(0).path("Body").path("text_part").asText());
     }
 
     private static String padBase64(String value) {

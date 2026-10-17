@@ -67,6 +67,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -423,7 +424,7 @@ class CognitoLambdaTriggersTest {
 
         // SignUp creates an UNCONFIRMED user
         service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("email", "alice@example.com"));
+                Map.of("email", "alice@example.com"), Map.of(), Map.of());
 
         when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::post-confirm"),
                 any(byte[].class), eq(InvocationType.RequestResponse)))
@@ -448,7 +449,7 @@ class CognitoLambdaTriggersTest {
     void postConfirmationFiresOnAdminConfirmSignUp() throws Exception {
         UserPool pool = createPoolWithLambdaConfig(Map.of("PostConfirmation", "arn:aws:lambda:::post-confirm"));
         UserPoolClient client = createClient(pool);
-        service.signUp(client.getClientId(), "alice", "Perm1234!", Map.of("email", "alice@example.com"));
+        service.signUp(client.getClientId(), "alice", "Perm1234!", Map.of("email", "alice@example.com"), Map.of(), Map.of());
         ArgumentCaptor<byte[]> payload = ArgumentCaptor.forClass(byte[].class);
         when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::post-confirm"),
                 any(byte[].class), eq(InvocationType.RequestResponse))).thenReturn(ok(Map.of()));
@@ -503,7 +504,7 @@ class CognitoLambdaTriggersTest {
         UserPoolClient client = createClient(pool);
 
         service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("email", "alice@example.com"));
+                Map.of("email", "alice@example.com"), Map.of(), Map.of());
 
         when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::post-confirm"),
                 any(byte[].class), any()))
@@ -520,7 +521,7 @@ class CognitoLambdaTriggersTest {
         UserPoolClient client = createClient(pool);
 
         service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("email", "alice@example.com"));
+                Map.of("email", "alice@example.com"), Map.of(), Map.of());
         service.confirmSignUp(client.getClientId(), "alice");
 
         verify(lambdaService, never())
@@ -541,13 +542,74 @@ class CognitoLambdaTriggersTest {
                 .thenReturn(ok(Map.of()));
 
         service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("email", "alice@example.com"));
+                Map.of("email", "alice@example.com"), Map.of(), Map.of());
 
         ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
         verify(lambdaService).invoke(anyString(), eq("arn:aws:lambda:::pre-signup"),
                 payloadCaptor.capture(), eq(InvocationType.RequestResponse));
         assertFalse(MAPPER.readTree(payloadCaptor.getValue()).path("request")
                 .path("userAttributes").has("cognito:user_status"));
+    }
+
+    @Test
+    void preSignUpFiresOnSignUpWithValidationDataAndClientMetadata() throws Exception {
+        UserPool pool = createPoolWithLambdaConfig(Map.of("PreSignUp", "arn:aws:lambda:::pre-signup"));
+        UserPoolClient client = createClient(pool);
+
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::pre-signup"),
+                any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(ok(Map.of()));
+
+        ObjectNode request = MAPPER.createObjectNode();
+        request.put("ClientId", client.getClientId());
+        request.put("Username", "alice");
+        request.put("Password", "Perm1234!");
+        request.putArray("UserAttributes").addObject().put("Name", "email").put("Value", "alice@example.com");
+        request.putArray("ValidationData").addObject().put("Name", "inviteCode").put("Value", "abc123");
+        request.putObject("ClientMetadata").put("source", "signup-form");
+        new CognitoJsonHandler(service, MAPPER).handle("SignUp", request, "us-east-1");
+
+        ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
+        verify(lambdaService).invoke(anyString(), eq("arn:aws:lambda:::pre-signup"),
+                payloadCaptor.capture(), eq(InvocationType.RequestResponse));
+        JsonNode event = MAPPER.readTree(payloadCaptor.getValue());
+        assertEquals("PreSignUp_SignUp", event.path("triggerSource").asText());
+        assertEquals(client.getClientId(), event.path("callerContext").path("clientId").asText());
+        assertEquals("alice@example.com", event.path("request").path("userAttributes").path("email").asText());
+        assertEquals("abc123", event.path("request").path("validationData").path("inviteCode").asText());
+        assertEquals("signup-form", event.path("request").path("clientMetadata").path("source").asText());
+        assertFalse(service.adminGetUser(pool.getId(), "alice").getAttributes().containsKey("inviteCode"),
+                "ValidationData must not be stored as a user attribute");
+    }
+
+    @Test
+    void postConfirmationFiresWithSignUpClientMetadataWhenAutoConfirmed() throws Exception {
+        UserPool pool = createPoolWithLambdaConfig(Map.of(
+                "PreSignUp", "arn:aws:lambda:::pre-signup",
+                "PostConfirmation", "arn:aws:lambda:::post-confirm"));
+        UserPoolClient client = createClient(pool);
+
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::pre-signup"),
+                any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(ok(Map.of("autoConfirmUser", true)));
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::post-confirm"),
+                any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(ok(Map.of()));
+
+        ObjectNode request = MAPPER.createObjectNode();
+        request.put("ClientId", client.getClientId());
+        request.put("Username", "alice");
+        request.put("Password", "Perm1234!");
+        request.putArray("UserAttributes").addObject().put("Name", "email").put("Value", "alice@example.com");
+        request.putObject("ClientMetadata").put("source", "signup-form");
+        new CognitoJsonHandler(service, MAPPER).handle("SignUp", request, "us-east-1");
+
+        ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
+        verify(lambdaService, times(2)).invoke(anyString(), anyString(),
+                payloadCaptor.capture(), eq(InvocationType.RequestResponse));
+        JsonNode postConfirmation = MAPPER.readTree(payloadCaptor.getAllValues().get(1));
+        assertEquals("PostConfirmation_ConfirmSignUp", postConfirmation.path("triggerSource").asText());
+        assertEquals("signup-form", postConfirmation.path("request").path("clientMetadata").path("source").asText());
     }
 
     @Test
@@ -561,7 +623,7 @@ class CognitoLambdaTriggersTest {
 
         AwsException ex = assertThrows(AwsException.class, () ->
                 service.signUp(client.getClientId(), "alice", "Perm1234!",
-                        Map.of("email", "alice@example.com")));
+                        Map.of("email", "alice@example.com"), Map.of(), Map.of()));
         assertEquals("UserLambdaValidationException", ex.getErrorCode());
         assertEquals("PreSignUp failed with error Invitations are closed.", ex.getMessage());
     }
@@ -578,7 +640,7 @@ class CognitoLambdaTriggersTest {
 
         AwsException ex = assertThrows(AwsException.class, () ->
                 service.signUp(client.getClientId(), "alice", "Perm1234!",
-                        Map.of("email", "alice@example.com")));
+                        Map.of("email", "alice@example.com"), Map.of(), Map.of()));
 
         assertEquals("UnexpectedLambdaException", ex.getErrorCode());
         assertEquals(400, ex.getHttpStatus());
@@ -600,7 +662,7 @@ class CognitoLambdaTriggersTest {
 
         AwsException ex = assertThrows(AwsException.class, () ->
                 service.signUp(client.getClientId(), "alice", "Perm1234!",
-                        Map.of("email", "alice@example.com")));
+                        Map.of("email", "alice@example.com"), Map.of(), Map.of()));
 
         assertEquals("InvalidLambdaResponseException", ex.getErrorCode());
         assertEquals(400, ex.getHttpStatus());
@@ -622,7 +684,7 @@ class CognitoLambdaTriggersTest {
                         "autoVerifyEmail", true)));
 
         var user = service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("email", "alice@example.com"));
+                Map.of("email", "alice@example.com"), Map.of(), Map.of());
 
         assertEquals("CONFIRMED", user.getUserStatus(),
                 "autoConfirmUser=true should set status to CONFIRMED at signup");
@@ -640,7 +702,7 @@ class CognitoLambdaTriggersTest {
                 .thenReturn(ok(Map.of("autoVerifyPhone", true)));
 
         var user = service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("phone_number", "+15551234567"));
+                Map.of("phone_number", "+15551234567"), Map.of(), Map.of());
 
         assertEquals("true", user.getAttributes().get("phone_number_verified"),
                 "autoVerifyPhone=true should set phone_number_verified attribute");
@@ -662,7 +724,7 @@ class CognitoLambdaTriggersTest {
                 .thenReturn(ok(Map.of()));
 
         service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("email", "alice@example.com"));
+                Map.of("email", "alice@example.com"), Map.of(), Map.of());
 
         verify(lambdaService, atLeastOnce())
                 .invoke(anyString(), eq("arn:aws:lambda:::post-confirm"),
@@ -675,7 +737,7 @@ class CognitoLambdaTriggersTest {
         UserPoolClient client = createClient(pool);
 
         service.signUp(client.getClientId(), "alice", "Perm1234!",
-                Map.of("email", "alice@example.com"));
+                Map.of("email", "alice@example.com"), Map.of(), Map.of());
 
         verify(lambdaService, never())
                 .invoke(anyString(), anyString(), any(byte[].class), any());
@@ -2163,7 +2225,7 @@ class CognitoLambdaTriggersTest {
                         "emailSubject", "TRIGGER-FIRED",
                         "emailMessage", "TRIGGER-FIRED code={####}")));
 
-        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"));
+        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), Map.of());
 
         assertVerificationEmail(ses, "spike@example.com", "TRIGGER-FIRED", "TRIGGER-FIRED code=246962");
     }
@@ -2188,13 +2250,40 @@ class CognitoLambdaTriggersTest {
                 payloadCaptor.capture(), eq(InvocationType.RequestResponse)))
                 .thenReturn(ok(Map.of()));
 
-        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"));
+        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), Map.of());
 
         Map<String, Object> event = MAPPER.readValue(payloadCaptor.getValue(), new TypeReference<>() {});
         assertEquals("CustomMessage_SignUp", event.get("triggerSource"));
         Map<String, Object> request = (Map<String, Object>) event.get("request");
         assertEquals("{####}", request.get("codeParameter"));
         assertEquals("spike", request.get("usernameParameter"));
+    }
+
+    @Test
+    void customMessageSignUpTriggerCarriesClientMetadata() throws Exception {
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.SIGNUP_CONFIRMATION), any()))
+                .thenReturn("246962");
+        CognitoService svc = createServiceWithMessaging(mock(SesService.class), mock(SnsService.class),
+                verificationCodeService);
+
+        UserPool pool = svc.createUserPool(Map.of(
+                "PoolName", "trigger-pool",
+                "AutoVerifiedAttributes", List.of("email"),
+                "LambdaConfig", Map.of("CustomMessage", "arn:aws:lambda:::custom-message")), "us-east-1");
+        UserPoolClient client = svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
+
+        ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::custom-message"),
+                payloadCaptor.capture(), eq(InvocationType.RequestResponse)))
+                .thenReturn(ok(Map.of()));
+
+        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"),
+                Map.of(), Map.of("source", "signup-form"));
+
+        JsonNode event = MAPPER.readTree(payloadCaptor.getValue());
+        assertEquals("CustomMessage_SignUp", event.path("triggerSource").asText());
+        assertEquals("signup-form", event.path("request").path("clientMetadata").path("source").asText());
     }
 
     @Test
@@ -2215,7 +2304,7 @@ class CognitoLambdaTriggersTest {
                 .thenReturn(lambdaError("Unhandled"));
 
         // SignUp must still succeed and deliver the default message when CustomMessage errors.
-        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"));
+        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), Map.of());
 
         assertVerificationEmail(ses, "spike@example.com", "Your verification code",
                 "Your verification code is 246962.");
@@ -2234,7 +2323,7 @@ class CognitoLambdaTriggersTest {
                 "AutoVerifiedAttributes", List.of("email")), "us-east-1");
         UserPoolClient client = svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
 
-        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"));
+        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), Map.of());
 
         verify(lambdaService, never()).invoke(anyString(), anyString(), any(byte[].class), any());
         assertVerificationEmail(ses, "spike@example.com", "Your verification code",
@@ -2255,7 +2344,7 @@ class CognitoLambdaTriggersTest {
                 "AutoVerifiedAttributes", List.of("email"),
                 "LambdaConfig", Map.of("CustomMessage", "arn:aws:lambda:::custom-message")), "us-east-1");
         UserPoolClient client = svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
-        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"));
+        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), Map.of());
 
         ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
         when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::custom-message"),

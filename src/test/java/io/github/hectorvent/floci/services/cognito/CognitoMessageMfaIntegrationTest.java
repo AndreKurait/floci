@@ -9,8 +9,6 @@ import org.junit.jupiter.api.Test;
 
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import static io.github.hectorvent.floci.services.cognito.CognitoRestAssuredUtils.cognitoAction;
 import static io.github.hectorvent.floci.services.cognito.CognitoRestAssuredUtils.cognitoJson;
@@ -28,7 +26,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @QuarkusTest
 class CognitoMessageMfaIntegrationTest {
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final Pattern SIX_DIGIT_CODE = Pattern.compile("\\b(\\d{6})\\b");
     private static final String PASSWORD = "Perm1234!";
     private static final String SMS_CONFIG = """
             "SmsMfaConfiguration":{"SmsAuthenticationMessage":"Your MFA code is {####}"}""";
@@ -64,7 +61,7 @@ class CognitoMessageMfaIntegrationTest {
         assertTrue(challenge.path("ChallengeParameters").path("CODE_DELIVERY_DESTINATION").asText().startsWith("+"));
         String sms = latestSms(user.phone());
         assertTrue(sms.startsWith("Your MFA code is "), sms);
-        String code = sixDigitCode(sms);
+        String code = CognitoCodes.sixDigitCode(sms);
 
         String wrongCode = code.equals("000000") ? "000001" : "000000";
         cognitoAction("RespondToAuthChallenge", respond(clientId, "SMS_MFA", challenge, user,
@@ -103,7 +100,7 @@ class CognitoMessageMfaIntegrationTest {
         assertEquals("EMAIL", challenge.path("ChallengeParameters").path("CODE_DELIVERY_DELIVERY_MEDIUM").asText());
         JsonNode email = latestEmail(user.email());
         assertEquals("Your MFA code", email.path("Subject").asText());
-        String code = sixDigitCode(email.path("Body").path("text_part").asText());
+        String code = CognitoCodes.sixDigitCode(email.path("Body").path("text_part").asText());
 
         JsonNode signedIn = cognitoJson("AdminRespondToAuthChallenge", """
                 {"UserPoolId":"%s","ClientId":"%s","ChallengeName":"EMAIL_OTP","Session":"%s",
@@ -132,7 +129,7 @@ class CognitoMessageMfaIntegrationTest {
         JsonNode emailChallenge = cognitoJson("RespondToAuthChallenge", respond(clientId, "SELECT_MFA_TYPE", select,
                 user, "ANSWER", "EMAIL_OTP"));
         assertEquals("EMAIL_OTP", emailChallenge.path("ChallengeName").asText());
-        String code = sixDigitCode(latestEmail(user.email()).path("Body").path("text_part").asText());
+        String code = CognitoCodes.sixDigitCode(latestEmail(user.email()).path("Body").path("text_part").asText());
         JsonNode signedIn = cognitoJson("RespondToAuthChallenge", respond(clientId, "EMAIL_OTP", emailChallenge,
                 user, "EMAIL_OTP_CODE", code));
         assertFalse(signedIn.path("AuthenticationResult").path("AccessToken").asText().isEmpty());
@@ -152,7 +149,7 @@ class CognitoMessageMfaIntegrationTest {
         JsonNode challenge = passwordLogin(clientId, user);
         assertEquals("SMS_MFA", challenge.path("ChallengeName").asText());
         JsonNode signedIn = cognitoJson("RespondToAuthChallenge", respond(clientId, "SMS_MFA", challenge, user,
-                "SMS_MFA_CODE", sixDigitCode(latestSms(user.phone()))));
+                "SMS_MFA_CODE", CognitoCodes.sixDigitCode(latestSms(user.phone()))));
         assertFalse(signedIn.path("AuthenticationResult").path("AccessToken").asText().isEmpty());
     }
 
@@ -171,7 +168,7 @@ class CognitoMessageMfaIntegrationTest {
         String sms = latestSms(user.phone());
         assertTrue(sms.startsWith("Sign-in code "), sms);
         JsonNode signedIn = cognitoJson("RespondToAuthChallenge", respond(clientId, "SMS_MFA", challenge, user,
-                "SMS_MFA_CODE", sixDigitCode(sms)));
+                "SMS_MFA_CODE", CognitoCodes.sixDigitCode(sms)));
         assertFalse(signedIn.path("AuthenticationResult").path("AccessToken").asText().isEmpty());
     }
 
@@ -200,7 +197,7 @@ class CognitoMessageMfaIntegrationTest {
         String body = email.path("Body").path("text_part").asText();
         assertTrue(body.startsWith("Your MFA code is "), body);
         JsonNode signedIn = cognitoJson("RespondToAuthChallenge", respond(clientId, "EMAIL_OTP", challenge, user,
-                "EMAIL_OTP_CODE", sixDigitCode(body)));
+                "EMAIL_OTP_CODE", CognitoCodes.emailSignInCode(body)));
         assertFalse(signedIn.path("AuthenticationResult").path("AccessToken").asText().isEmpty());
     }
 
@@ -328,11 +325,5 @@ class CognitoMessageMfaIntegrationTest {
         }
         assertNotNull(latest, "an email should have been sent to " + recipient);
         return latest;
-    }
-
-    private static String sixDigitCode(String message) {
-        Matcher matcher = SIX_DIGIT_CODE.matcher(message);
-        assertTrue(matcher.find(), "the message should carry a six-digit code: " + message);
-        return matcher.group(1);
     }
 }

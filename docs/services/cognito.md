@@ -390,6 +390,8 @@ factor:
   masked `CODE_DELIVERY_DESTINATION`, and fire the CustomMessage trigger with
   `CustomMessage_Authentication`. Once set, `EmailMfaConfiguration`'s `Subject` and `Message` also
   carry the `USER_AUTH` `EMAIL_OTP` sign-in code, as `SmsAuthenticationMessage` does for `SMS_OTP`.
+  That email sign-in code has eight digits, as on AWS; MFA, sign-up, forgotten-password and
+  attribute verification codes have six.
 - A wrong code fails with `CodeMismatchException` and leaves the session for another try. After a
   right one, the phone number or email address the code went to is marked verified, as on AWS.
 - Signing in again while the last code is still unused and under 30 seconds old answers the new

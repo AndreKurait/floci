@@ -8,6 +8,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -81,6 +82,71 @@ public class AssumeRolePolicyEvaluator {
                           String callerAccount, Map<String, List<String>> requestContext) {
         TrustDecision decision = decide(trustPolicyDocument, caller, callerAccount, requestContext);
         return decision == TrustDecision.ALLOW || decision == TrustDecision.ALLOW_ACCOUNT;
+    }
+
+    /**
+     * Returns true if {@code trustPolicyDocument} lets some principal of {@code account} assume the
+     * role: the account itself, through its root, or a principal of it that an Allow names, each
+     * decided by {@link #decide} with its conditions and Deny statements. It answers for a service
+     * that assumes a role on an account's behalf without a caller Floci knows, as CloudFormation does
+     * for {@code Fn::GetStackOutput}: Floci keeps no execution role or caller for a stack operation.
+     */
+    public boolean allowsAnyPrincipalOf(String trustPolicyDocument, String account, String partition) {
+        String root = AwsArnUtils.Arn.global(partition, "iam", account, "root").toString();
+        if (allows(trustPolicyDocument, IamService.CallerArns.accountRoot(root, account), account, Map.of())) {
+            return true;
+        }
+        for (String principal : allowedAwsPrincipals(trustPolicyDocument)) {
+            if (AwsArnUtils.isArn(principal) && account.equals(AwsArnUtils.parse(principal).accountId())
+                    && allows(trustPolicyDocument, callerNamed(principal), account, Map.of())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The {@code Principal.AWS} entries of the Allow statements that apply to {@code sts:AssumeRole}. */
+    private List<String> allowedAwsPrincipals(String trustPolicyDocument) {
+        List<String> principals = new ArrayList<>();
+        if (trustPolicyDocument == null || trustPolicyDocument.isBlank()) {
+            return principals;
+        }
+        JsonNode statements;
+        try {
+            statements = objectMapper.readTree(trustPolicyDocument).path("Statement");
+        } catch (Exception e) {
+            LOG.warnv("Failed to parse trust policy: {0}", e.getMessage());
+            return principals;
+        }
+        if (!isWellFormed(statements)) {
+            return principals;
+        }
+        Iterable<JsonNode> statementList = statements.isArray() ? statements : List.of(statements);
+        for (JsonNode stmt : statementList) {
+            if (effectOf(stmt) != Match.ALLOW || !actionApplies(stmt)) {
+                continue;
+            }
+            JsonNode aws = stmt.path("Principal").path("AWS");
+            Iterable<JsonNode> awsList = aws.isArray() ? aws : List.of(aws);
+            for (JsonNode entry : awsList) {
+                if (entry.isTextual()) {
+                    principals.add(entry.asText());
+                }
+            }
+        }
+        return principals;
+    }
+
+    /** The principal {@code principalArn} names, as it calls: a role through a session of it. */
+    private static IamService.CallerArns callerNamed(String principalArn) {
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(principalArn);
+        if (!arn.resource().startsWith("role/")) {
+            return new IamService.CallerArns(principalArn, principalArn);
+        }
+        String roleName = arn.resource().substring(arn.resource().lastIndexOf('/') + 1);
+        String session = AwsArnUtils.Arn.global(arn.partition(), "sts", arn.accountId(), "assumed-role/" + roleName)
+                .toString();
+        return new IamService.CallerArns(session, principalArn, IamService.CallerArns.TYPE_ASSUMED_ROLE, null, null);
     }
 
     /**

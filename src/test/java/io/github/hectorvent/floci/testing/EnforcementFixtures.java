@@ -113,13 +113,22 @@ public final class EnforcementFixtures {
      */
     public static String createRole(PartitionCleanup cleanup, int port, String account, String path,
                                     String roleName, String policy) {
+        return createRole(cleanup, port, account, path, roleName, """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                  "Principal":{"AWS":"arn:aws:iam::%s:root"},"Action":"sts:AssumeRole"}]}"""
+                .formatted(account), policy);
+    }
+
+    /**
+     * Creates a role as {@link #createRole(PartitionCleanup, int, String, String, String, String)}
+     * does, trusting whatever {@code trustPolicy} allows instead of its own account's root.
+     */
+    public static String createRole(PartitionCleanup cleanup, int port, String account, String path,
+                                    String roleName, String trustPolicy, String policy) {
         String authorization = auth(account, "iam");
         cleanup.register(() -> removeRole(port, authorization, roleName));
         iam(port, authorization, "CreateRole", "RoleName", roleName, "Path", path,
-                "AssumeRolePolicyDocument", """
-                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
-                          "Principal":{"AWS":"arn:aws:iam::%s:root"},"Action":"sts:AssumeRole"}]}"""
-                        .formatted(account)).statusCode(200);
+                "AssumeRolePolicyDocument", trustPolicy).statusCode(200);
         iam(port, authorization, "PutRolePolicy", "RoleName", roleName, "PolicyName", "p",
                 "PolicyDocument", policy).statusCode(200);
         return "arn:aws:iam::" + account + ":role" + path + roleName;

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.apigateway;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.auth.CredentialScope;
+import io.github.hectorvent.floci.core.common.auth.SessionTokenCheck;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.core.common.auth.SigV4SignedRequest;
@@ -17,8 +18,6 @@ import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
 
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Instant;
 
 /**
@@ -32,8 +31,8 @@ import java.time.Instant;
  * string, the headers named in {@code SignedHeaders}, and the SHA-256 of the body), and the derived
  * signature is compared in constant time.
  *
- * <p>A temporary credential must additionally present the session token it was issued with, which
- * is checked by {@link #checkSessionToken}.
+ * <p>A temporary credential must also present the session token it was issued with, and a long-term
+ * one must present none. {@link #checkSessionToken} checks this.
  *
  * <h2>Deliberate deviations from real AWS</h2>
  * <ul>
@@ -78,6 +77,8 @@ public class ExecuteApiSigV4Authorizer {
         MALFORMED,
         /** The credential names an access key this emulator has never issued. */
         UNKNOWN_KEY,
+        /** A session token came that was not issued with the access key. */
+        INVALID_TOKEN,
         /** The signing timestamp is outside the accepted window, or a presigned URL has expired. */
         EXPIRED,
         /** The signature does not match the one derived from the caller's secret key. */
@@ -165,7 +166,9 @@ public class ExecuteApiSigV4Authorizer {
             return Result.rejected(Failure.UNKNOWN_KEY, "access key is not registered");
         }
 
-        Result sessionToken = checkSessionToken(scope.accessKeyId(), headers, queryParameters);
+        Result sessionToken = checkSessionToken(scope.accessKeyId(), presigned
+                ? queryParameters.getFirst(SECURITY_TOKEN)
+                : headers == null ? null : headers.getHeaderString(SECURITY_TOKEN));
         if (sessionToken != null) {
             return sessionToken;
         }
@@ -243,50 +246,19 @@ public class ExecuteApiSigV4Authorizer {
     }
 
     /**
-     * Rejects a temporary credential that does not present the session token Floci issued with it,
-     * returning {@code null} when there is nothing to object to.
-     *
-     * <p>The secret alone is not the whole credential. AWS requires the session token on every
-     * request made with temporary credentials precisely because it is what confirms the credential
-     * is live and genuinely STS-issued, so accepting an {@code ASIA...} key on its secret alone
-     * lets an incomplete credential through a route that is supposed to demand a complete one.
-     *
-     * <p>The token is compared against the value recorded at mint time rather than merely required
-     * to be present, so a fabricated token fails as well as a missing one. Presence is all that can
-     * be demanded of a session stored before Floci recorded tokens: {@code findSessionToken} is
-     * empty there, and rejecting it would lock out a credential that is otherwise perfectly valid.
-     * {@code findSecretKey(accessKeyId, sessionToken)} is the stricter one-step alternative, which
-     * this deliberately does not use because it cannot tell that case apart from a real mismatch.
-     *
-     * <p>Folding the token into the canonical request is deliberately not required. Whether a
-     * service covers it by {@code SignedHeaders} or appends it after signing is service-specific in
-     * SigV4, and comparing against the issued value binds the token regardless of where it rode.
+     * Rejects a session token that does not fit the access key, returning {@code null} when there
+     * is nothing to object to. AWS reads the token from where the signature is, the header or the
+     * presigned query, and ignores it in the other place.
      */
-    private Result checkSessionToken(String accessKeyId, HttpHeaders headers,
-                                     MultivaluedMap<String, String> queryParameters) {
-        if (!IamService.isTemporaryAccessKey(accessKeyId)) {
+    private Result checkSessionToken(String accessKeyId, String presented) {
+        if (LEGACY_ACCESS_KEY_ID.equals(accessKeyId)) {
             return null;
         }
-        String presented = queryParameters.getFirst(SECURITY_TOKEN);
-        if (isBlank(presented) && headers != null) {
-            presented = headers.getHeaderString(SECURITY_TOKEN);
-        }
-        if (isBlank(presented)) {
-            LOG.debugv("execute-api request uses temporary credential accessKey={0} with no {1}",
-                    SigV4RequestValidator.sanitizeForLog(accessKeyId), SECURITY_TOKEN);
-            return Result.rejected(Failure.UNKNOWN_KEY, "temporary credential presents no session token");
-        }
-        String issued = iamService.findSessionToken(accessKeyId).orElse(null);
-        if (issued == null) {
-            return null;
-        }
-        if (!MessageDigest.isEqual(issued.getBytes(StandardCharsets.UTF_8),
-                presented.getBytes(StandardCharsets.UTF_8))) {
-            LOG.debugv("execute-api request presents a session token that does not match the one"
-                    + " issued for accessKey={0}", SigV4RequestValidator.sanitizeForLog(accessKeyId));
-            return Result.rejected(Failure.UNKNOWN_KEY, "session token does not match the issued credential");
-        }
-        return null;
+        return switch (SessionTokenCheck.of(iamService, accessKeyId, presented)) {
+            case VALID -> null;
+            case MISSING -> Result.rejected(Failure.UNKNOWN_KEY, "session token is missing or empty");
+            case INVALID -> Result.rejected(Failure.INVALID_TOKEN, "session token was not issued with the access key");
+        };
     }
 
     /**

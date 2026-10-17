@@ -98,7 +98,8 @@ public class CloudFormationService implements ResourceProvider {
                     + " to review their current state before your next update.";
     private static final String FORCE_WITH_SKIPS = "ForceRollback and ResourcesToSkip are mutually exclusive";
     private static final String CONTINUE_STACK_MISSING = "Stack: %s does not exist";
-    private static final Pattern CONTINUE_STACK_NAME =
+    /** The StackName pattern ContinueUpdateRollback and DescribeStacks validate a name against. */
+    private static final Pattern STACK_NAME =
             Pattern.compile("[a-zA-Z][-a-zA-Z0-9]*|arn:[-a-zA-Z0-9:/._+]*");
     private static final Pattern RESOURCE_TO_SKIP =
             Pattern.compile("[a-zA-Z0-9]+|[a-zA-Z][-a-zA-Z0-9]*\\.[a-zA-Z0-9]+");
@@ -119,6 +120,7 @@ public class CloudFormationService implements ResourceProvider {
     private final CfnResourceDispatcher dispatcher;
     private final S3Service s3Service;
     private final SsmService ssmService;
+    private final GetStackOutputRoleAuthorizer stackOutputRoles;
     private final CfnDynamicReferences dynamicReferences;
     private final ObjectMapper objectMapper;
     private final EmulatorConfig config;
@@ -136,13 +138,15 @@ public class CloudFormationService implements ResourceProvider {
 
     @Inject
     public CloudFormationService(CfnResourceDispatcher dispatcher, S3Service s3Service,
-                                 SsmService ssmService, CfnDynamicReferences dynamicReferences,
+                                 SsmService ssmService, GetStackOutputRoleAuthorizer stackOutputRoles,
+                                 CfnDynamicReferences dynamicReferences,
                                  ObjectMapper objectMapper, EmulatorConfig config,
                                  RegionResolver regionResolver, Clock clock,
                                  StorageFactory storageFactory) {
         this.dispatcher = dispatcher;
         this.s3Service = s3Service;
         this.ssmService = ssmService;
+        this.stackOutputRoles = stackOutputRoles;
         this.dynamicReferences = dynamicReferences;
         this.objectMapper = objectMapper;
         this.config = config;
@@ -436,6 +440,7 @@ public class CloudFormationService implements ResourceProvider {
         // template declaring the SAM transform, whether or not that transform succeeded, so
         // gating this call on samTransformFailureReason == null duplicates that check for no
         // effect.
+        validateGetStackOutputPlacement(resolvedTemplate);
         validateResourceDependencies(resolvedTemplate, parameters, preflightStackName, preflightStackId,
                 region, accountId);
 
@@ -1410,9 +1415,9 @@ public class CloudFormationService implements ResourceProvider {
                 violations.add("Value '' at 'stackName' failed to satisfy constraint:"
                         + " Member must have length greater than or equal to 1");
             }
-            if (!CONTINUE_STACK_NAME.matcher(stackNameOrArn).matches()) {
+            if (!STACK_NAME.matcher(stackNameOrArn).matches()) {
                 violations.add("Value '" + stackNameOrArn + "' at 'stackName' failed to satisfy constraint:"
-                        + " Member must satisfy regular expression pattern: " + CONTINUE_STACK_NAME.pattern());
+                        + " Member must satisfy regular expression pattern: " + STACK_NAME.pattern());
             }
         }
         if (resourcesToSkip.stream().anyMatch(skip -> !RESOURCE_TO_SKIP.matcher(skip).matches())) {
@@ -2001,7 +2006,9 @@ public class CloudFormationService implements ResourceProvider {
                             accountId, region, stack.getStackName(),
                             stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, mappings, objectMapper,
                             name -> exports.get(accountExportKey(accountId, exportKey(region, name))),
-                            value -> dynamicReferences.resolveDynamicReferences(value, region, false));
+                            value -> dynamicReferences.resolveDynamicReferences(value, region, false),
+                            (name, output, outputRegion, roleArn) ->
+                                    resolveStackOutput(accountId, name, output, outputRegion, roleArn));
 
                     StackResource resource = stack.getResources().get(logicalId);
                     StackResource previousResource = resource;
@@ -2167,7 +2174,9 @@ public class CloudFormationService implements ResourceProvider {
                     accountId, region, stack.getStackName(),
                     stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, mappings, objectMapper,
                     name -> exports.get(accountExportKey(accountId, exportKey(region, name))),
-                    value -> dynamicReferences.resolveDynamicReferences(value, region, false));
+                    value -> dynamicReferences.resolveDynamicReferences(value, region, false),
+                    (name, output, outputRegion, roleArn) ->
+                            resolveStackOutput(accountId, name, output, outputRegion, roleArn));
 
             // Resolve outputs before mutating stack/global export state, so failed updates do not
             // leave stale or partially registered exports behind.
@@ -2175,23 +2184,46 @@ public class CloudFormationService implements ResourceProvider {
             Map<String, String> newOutputs = new LinkedHashMap<>();
             Map<String, String> newExports = new LinkedHashMap<>();
             Map<String, String> newOutputExportNames = new LinkedHashMap<>();
-            JsonNode outputs = template.path("Outputs");
-            if (outputs.isObject()) {
-                outputs.fields().forEachRemaining(e -> {
-                    JsonNode outputDef = e.getValue();
-                    String value = finalEngine.resolve(outputDef.path("Value"));
-                    newOutputs.put(e.getKey(), value);
-
-                    // Register exports
-                    JsonNode exportNode = outputDef.path("Export").path("Name");
-                    if (!exportNode.isMissingNode()) {
-                        String exportName = finalEngine.resolve(exportNode);
-                        validateExportNameAvailable(region, exportName, oldExports, newExports);
-                        newExports.put(exportName, value);
-                        newOutputExportNames.put(e.getKey(), exportName);
-                    }
-                });
+            // An output whose Condition is false is left out unresolved, as on AWS: DescribeStacks
+            // does not list it, and what it reads is never read (measured, eu-west-1, 2026-10-16).
+            Map<String, JsonNode> outputs = new LinkedHashMap<>();
+            for (Map.Entry<String, JsonNode> output : template.path("Outputs").properties()) {
+                String condition = output.getValue().path("Condition").asText(null);
+                if (condition == null || conditions.getOrDefault(condition, false)) {
+                    outputs.put(output.getKey(), output.getValue());
+                }
             }
+            Map<String, String> outputValues = new LinkedHashMap<>();
+            for (Map.Entry<String, JsonNode> output : outputs.entrySet()) {
+                try {
+                    outputValues.put(output.getKey(), finalEngine.resolve(output.getValue().path("Value")));
+                } catch (AwsException e) {
+                    if (!CloudFormationTemplateEngine.containsGetStackOutput(output.getValue())) {
+                        throw e;
+                    }
+                    // An output whose Fn::GetStackOutput cannot be read fails the operation once the
+                    // resources exist, and the stack rolls back as for a resource that failed
+                    // (measured: a create deletes them and ends ROLLBACK_COMPLETE).
+                    LOG.warnv("Stack {0} output {1} failed: {2}", stack.getStackName(), output.getKey(),
+                            e.getMessage());
+                    rollbackFailedExecution(stack, region, isCreate, e.getMessage(), previousState,
+                            attemptedResourceIds);
+                    return;
+                }
+            }
+            outputs.forEach((key, outputDef) -> {
+                String value = outputValues.get(key);
+                newOutputs.put(key, value);
+
+                // Register exports
+                JsonNode exportNode = outputDef.path("Export").path("Name");
+                if (!exportNode.isMissingNode()) {
+                    String exportName = finalEngine.resolve(exportNode);
+                    validateExportNameAvailable(region, exportName, oldExports, newExports);
+                    newExports.put(exportName, value);
+                    newOutputExportNames.put(key, exportName);
+                }
+            });
 
             removeStackExports(stack, region);
             stack.replaceOutputs(newOutputs);
@@ -2329,18 +2361,30 @@ public class CloudFormationService implements ResourceProvider {
             StackResource failedResource,
             StackUpdateSnapshot previousState,
             Set<String> attemptedResourceIds) {
-        String failStatus = isCreate ? "CREATE_FAILED" : "UPDATE_FAILED";
-        stack.setStatus(failStatus);
-        stack.setStatusReason(failedResource.getStatusReason());
-        addEvent(stack, stack.getStackName(), stack.getStackId(),
-                "AWS::CloudFormation::Stack", failStatus, failedResource.getStatusReason());
         LOG.warnv("Stack {0} resource {1} failed: {2}", stack.getStackName(),
                 failedResource.getLogicalId(), failedResource.getStatusReason());
+        rollbackFailedExecution(stack, region, isCreate, failedResource.getStatusReason(), previousState,
+                attemptedResourceIds);
+    }
+
+    /** As above, for a failure that is not one resource's: the reason is the stack's. */
+    private void rollbackFailedExecution(
+            Stack stack,
+            String region,
+            boolean isCreate,
+            String reason,
+            StackUpdateSnapshot previousState,
+            Set<String> attemptedResourceIds) {
+        String failStatus = isCreate ? "CREATE_FAILED" : "UPDATE_FAILED";
+        stack.setStatus(failStatus);
+        stack.setStatusReason(reason);
+        addEvent(stack, stack.getStackName(), stack.getStackId(),
+                "AWS::CloudFormation::Stack", failStatus, reason);
 
         if (isCreate) {
             stack.setStatus("ROLLBACK_IN_PROGRESS");
             addEvent(stack, stack.getStackName(), stack.getStackId(),
-                    "AWS::CloudFormation::Stack", "ROLLBACK_IN_PROGRESS", failedResource.getStatusReason());
+                    "AWS::CloudFormation::Stack", "ROLLBACK_IN_PROGRESS", reason);
             List<String> rollbackFailures = rollbackCreatedResources(stack, region);
             stack.setLastUpdatedTime(now());
             if (rollbackFailures.isEmpty()) {
@@ -2349,18 +2393,18 @@ public class CloudFormationService implements ResourceProvider {
                         "AWS::CloudFormation::Stack", "ROLLBACK_COMPLETE", null);
                 LOG.infov("Stack {0} rolled back to a clean slate (ROLLBACK_COMPLETE)", stack.getStackName());
             } else {
-                String reason = "The following resource(s) failed to roll back: ["
+                String rollbackReason = "The following resource(s) failed to roll back: ["
                         + String.join(", ", rollbackFailures) + "].";
                 stack.setStatus("ROLLBACK_FAILED");
-                stack.setStatusReason(reason);
+                stack.setStatusReason(rollbackReason);
                 addEvent(stack, stack.getStackName(), stack.getStackId(),
-                        "AWS::CloudFormation::Stack", "ROLLBACK_FAILED", reason);
-                LOG.errorv("Stack {0} rollback failed: {1}", stack.getStackName(), reason);
+                        "AWS::CloudFormation::Stack", "ROLLBACK_FAILED", rollbackReason);
+                LOG.errorv("Stack {0} rollback failed: {1}", stack.getStackName(), rollbackReason);
             }
         } else {
             rollbackFailedUpdate(
                     stack, region, previousState, attemptedResourceIds,
-                    failedResource.getStatusReason());
+                    reason);
             return;
         }
         persistStack(stack);
@@ -3631,9 +3675,12 @@ public class CloudFormationService implements ResourceProvider {
             });
         }
         // CloudFormation creates or updates the child with these values, so the call fails as a
-        // CreateStack or UpdateStack would, before the child is created or changed.
+        // CreateStack or UpdateStack would, before the child is created or changed: a parameter
+        // without a value, or a Fn::GetStackOutput where the child's template may not hold one
+        // (measured: the Child resource fails with the template error, and the parent rolls back).
         try {
             requireParameterValues(childTemplate, childParams);
+            validateGetStackOutputPlacement(childTemplate);
         } catch (AwsException e) {
             resource.setStatus("CREATE_FAILED");
             resource.setStatusReason(e.getMessage());
@@ -3846,6 +3893,114 @@ public class CloudFormationService implements ResourceProvider {
             return null;
         }
         return changeSet;
+    }
+
+    /**
+     * Reads the output a {@code Fn::GetStackOutput} names, as DescribeStacks does in the
+     * referenced account and Region: the consuming stack's account, or the account of
+     * {@code roleArn}, a role CloudFormation has to be able to assume, which
+     * {@link GetStackOutputRoleAuthorizer} decides. The failures carry the messages AWS reports for
+     * them: STS's or DescribeStacks' AccessDenied for the role, DescribeStacks' ValidationError for a
+     * missing stack, and a template error for a missing output.
+     */
+    private String resolveStackOutput(String accountId, String stackName, String outputName,
+                                      String region, String roleArn) {
+        String partition = AwsRegions.partitionFor(region);
+        String ownerAccount = roleArn == null ? accountId : stackOutputRoles.assume(roleArn, accountId, partition);
+        // CloudFormation hands the stack name to DescribeStacks as written, a dynamic reference
+        // included (it resolves none inside Fn::GetStackOutput), and DescribeStacks validates it.
+        if (!STACK_NAME.matcher(stackName).matches()) {
+            throw new AwsException("ValidationError", CloudFormationTemplateEngine.sdkErrorMessage(
+                    "1 validation error detected: Value '" + stackName + "' at 'stackName' failed to satisfy"
+                            + " constraint: Member must satisfy regular expression pattern: "
+                            + STACK_NAME.pattern(),
+                    "AmazonCloudFormation", 400, "ValidationError"), 400);
+        }
+        Stack referenced = resolveStack(stackName, region, ownerAccount);
+        if (referenced == null) {
+            throw new AwsException("ValidationError", CloudFormationTemplateEngine.sdkErrorMessage(
+                    "Stack with id " + stackName + " does not exist", "AmazonCloudFormation", 400,
+                    "ValidationError"), 400);
+        }
+        if (roleArn != null) {
+            stackOutputRoles.requireDescribeStacks(roleArn, referenced.getStackId(), partition);
+        }
+        String value = referenced.outputsSnapshot().get(outputName);
+        if (value == null) {
+            throw new AwsException("ValidationError", "TemplateError: Fn::GetStackOutput references output "
+                    + outputName + " from stack " + stackName
+                    + ", but this output was not found. The output may have been deleted.", 400);
+        }
+        return value;
+    }
+
+    /**
+     * The places AWS refuses {@code Fn::GetStackOutput} when the stack operation is requested,
+     * before anything runs (measured, eu-west-1, 2026-10-04 and 2026-10-17): anywhere in the
+     * Conditions section, inside an {@code Fn::ImportValue}, and in an output's
+     * {@code Export.Name}, neither of which may depend on another stack. A nested stack's template
+     * is checked when the child is created, and the child's resource fails with the same message.
+     */
+    private void validateGetStackOutputPlacement(String templateBody) {
+        JsonNode parsed;
+        try {
+            parsed = parseTemplate(templateBody);
+        } catch (Exception e) {
+            // As validateResourceDependencies: a template that does not parse fails where it is
+            // processed, with the parser's error.
+            LOG.debugv("Skipping Fn::GetStackOutput placement validation; template did not parse: {0}",
+                    e.getMessage());
+            return;
+        }
+        JsonNode template;
+        try {
+            // The rules hold for the template as processed: an AWS::Include fragment can carry it.
+            template = awsIncludeProcessor.mergeIncludes(parsed);
+        } catch (AwsException e) {
+            // A fragment that cannot be read fails the operation as the transform does, where the
+            // includes are processed; the request itself is not refused for it on AWS.
+            LOG.debugv("Skipping Fn::GetStackOutput placement validation; an AWS::Include failed: {0}",
+                    e.getMessage());
+            return;
+        }
+        if (CloudFormationTemplateEngine.containsGetStackOutput(template.path("Conditions"))) {
+            throw new AwsException("ValidationError",
+                    "Template error: Cannot use Fn::GetStackOutput in Conditions.", 400);
+        }
+        if (template.findValues("Fn::ImportValue").stream()
+                .anyMatch(CloudFormationTemplateEngine::containsGetStackOutput)) {
+            throw new AwsException("ValidationError", "Template error: the attribute in Fn::ImportValue must not"
+                    + " depend on any resources, imported values, or Fn::GetAZs", 400);
+        }
+        for (Map.Entry<String, JsonNode> output : template.path("Outputs").properties()) {
+            if (CloudFormationTemplateEngine.containsGetStackOutput(output.getValue().path("Export").path("Name"))) {
+                throw new AwsException("ValidationError", "Template format error: Output " + output.getKey()
+                        + " is malformed.  The Name field of Export must not depend on any resources, imported"
+                        + " values, or Fn::GetAZs.", 400);
+            }
+        }
+        requireGetStackOutputArguments(template);
+    }
+
+    /**
+     * Refuses a {@code Fn::GetStackOutput} without the map of parameters it takes, or without its
+     * StackName or OutputName, when the stack operation is requested, with the messages AWS gives
+     * (measured, eu-west-1, 2026-10-16). A value of the wrong type is DescribeStacks' to refuse.
+     */
+    private static void requireGetStackOutputArguments(JsonNode template) {
+        for (JsonNode arguments : template.findValues("Fn::GetStackOutput")) {
+            if (!arguments.isObject()) {
+                throw new AwsException("ValidationError",
+                        "TemplateError: Fn::GetStackOutput requires a map of named parameters", 400);
+            }
+            for (String required : List.of("StackName", "OutputName")) {
+                if (!arguments.has(required)) {
+                    throw new AwsException("ValidationError", "GetStackOutput: " + required + " is required", 400);
+                }
+            }
+            // findValues does not look inside what it found; a parameter may hold another reference.
+            requireGetStackOutputArguments(arguments);
+        }
     }
 
     /**
