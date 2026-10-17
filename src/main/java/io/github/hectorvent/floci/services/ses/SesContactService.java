@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ses;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ses.model.Contact;
@@ -217,9 +218,8 @@ public class SesContactService implements SesTaggable {
     // SES V2 surfaces missing/invalid input as Smithy validation errors. Field paths and the
     // enum value order are taken verbatim from real AWS.
     private static AwsException validationError(String fieldPath, String constraint) {
-        return new AwsException("BadRequestException",
-                "1 validation error detected: Value at '" + fieldPath
-                        + "' failed to satisfy constraint: " + constraint, 400);
+        return SmithyValidationErrors.exception("BadRequestException",
+                List.of("Value at '" + fieldPath + "' failed to satisfy constraint: " + constraint));
     }
 
     private static void validateContactListName(String name) {

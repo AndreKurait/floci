@@ -92,11 +92,11 @@ run-native: ## Run the host binary from native-host on port 4566, state under ./
 	@file "$(NATIVE_BIN)" | grep -q ELF && [ "$$(uname -s)" != Linux ] && { echo "$(NATIVE_BIN) is a Linux binary from 'make native'; run 'make native-host' for this machine"; exit 1; } || true
 	$(NATIVE_BIN)
 
-native-install: ## Copy the host binary to $(PREFIX)/bin/floci (PREFIX defaults to ~/.local)
+native-install: ## Copy the host binary to $(PREFIX)/bin/floci-aws (PREFIX defaults to ~/.local); `floci` is the CLI
 	@test -n "$(NATIVE_BIN)" || { echo "no target/*-runner: run 'make native-host' first"; exit 1; }
 	mkdir -p $(PREFIX)/bin
-	cp "$(NATIVE_BIN)" $(PREFIX)/bin/floci
-	@echo "installed $(PREFIX)/bin/floci"
+	cp "$(NATIVE_BIN)" $(PREFIX)/bin/floci-aws
+	@echo "installed $(PREFIX)/bin/floci-aws"
 
 native-image: ## Package native/$(ARCH)/ as $(NATIVE_IMAGE) with docker/Dockerfile.native-package
 	@test -f native/$(ARCH)/application || { echo "native/$(ARCH)/application is missing: run 'make native' first"; exit 1; }

@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.ses.model.SentEmail;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -380,10 +381,6 @@ public class SesMetricsController {
     }
 
     private static AwsException aggregated(List<String> violations) {
-        String header = violations.size() == 1
-                ? "1 validation error detected: "
-                : violations.size() + " validation errors detected: ";
-        return new AwsException("BadRequestException",
-                header + String.join("; ", violations), 400);
+        return SmithyValidationErrors.exception("BadRequestException", violations);
     }
 }

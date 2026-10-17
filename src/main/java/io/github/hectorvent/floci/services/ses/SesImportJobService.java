@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -469,9 +470,8 @@ public class SesImportJobService implements Resettable {
     }
 
     private static AwsException validationError(String path, String constraint) {
-        return new AwsException("BadRequestException",
-                "1 validation error detected: Value at '" + path + "' failed to satisfy constraint: "
-                        + constraint, 400);
+        return SmithyValidationErrors.exception("BadRequestException",
+                List.of("Value at '" + path + "' failed to satisfy constraint: " + constraint));
     }
 
     static String key(String region, String jobId) {

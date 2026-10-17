@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.ses.address.SesAddressSyntax;
 import io.github.hectorvent.floci.services.ses.model.BulkEmailEntry;
 import io.github.hectorvent.floci.services.ses.model.BulkEmailEntryResult;
@@ -59,6 +60,8 @@ public class SesSendController {
 
     private static final Logger LOG = Logger.getLogger(SesSendController.class);
 
+    private static final List<String> TRACKING_VALUES = List.of("ENABLED", "DISABLED");
+
     private final SesService sesService;
     // The bulk send resolves a stored template's content before handing the entries to the facade.
     private final SesTemplateService templateService;
@@ -93,6 +96,7 @@ public class SesSendController {
             JsonNode request = objectMapper.readTree(body);
             requireJsonObject(request);
             SesV2RequestShapes.check("SendEmail", request);
+            validateTrackingOverrides(request);
 
             // FromEmailAddress is optional per the AWS v2 contract. Each content type below
             // enforces the sender requirement the way AWS does: Raw can take its From from the
@@ -245,6 +249,7 @@ public class SesSendController {
             JsonNode request = objectMapper.readTree(body);
             requireJsonObject(request);
             SesV2RequestShapes.check("SendBulkEmail", request);
+            validateTrackingOverrides(request);
             String fromEmailAddress = request.path("FromEmailAddress").asText(null);
             if (fromEmailAddress == null || fromEmailAddress.isBlank()) {
                 throw new AwsException("BadRequestException",
@@ -583,13 +588,40 @@ public class SesSendController {
 
     private static AwsException constraintViolation(String value, String path, String constraint) {
         String subject = value == null ? "Value" : "Value '" + value + "'";
-        return new AwsException("BadRequestException",
-                "1 validation error detected: " + subject + " at '" + path
-                        + "' failed to satisfy constraint: " + constraint, 400);
+        return SmithyValidationErrors.exception("BadRequestException",
+                List.of(subject + " at '" + path + "' failed to satisfy constraint: " + constraint));
     }
 
     private static AwsException missingHeaderMember(String location, int index, String member) {
         return constraintViolation(null, location + "." + index + ".member." + member, "Member must not be null");
+    }
+
+    /**
+     * {@code ConfigurationOverrides.Tracking}'s enum, checked the way SES checks it (probed
+     * 2026-10-06): a value outside it is a validation error, both values reported together with the
+     * click one first. The shapes check has already refused a wrong JSON type. Floci has no open or
+     * click tracking, so a valid override is accepted and has no effect.
+     */
+    private static void validateTrackingOverrides(JsonNode request) {
+        JsonNode tracking = request.path("ConfigurationOverrides").path("Tracking");
+        String open = tracking.path("OpenTrackingEnabled").asText(null);
+        String click = tracking.path("ClickTrackingEnabled").asText(null);
+        List<String> violations = new ArrayList<>();
+        if (click != null && !TRACKING_VALUES.contains(click)) {
+            violations.add(trackingViolation("clickTrackingEnabled"));
+        }
+        if (open != null && !TRACKING_VALUES.contains(open)) {
+            violations.add(trackingViolation("openTrackingEnabled"));
+        }
+        if (!violations.isEmpty()) {
+            throw SmithyValidationErrors.exception("BadRequestException", violations);
+        }
+    }
+
+    private static String trackingViolation(String member) {
+        return "Value at 'configurationOverrides.tracking." + member
+                + "' failed to satisfy constraint: Member must satisfy enum value set: ["
+                + String.join(", ", TRACKING_VALUES) + "]";
     }
 
     private static ListManagementOptions parseListManagementOptions(JsonNode node) {

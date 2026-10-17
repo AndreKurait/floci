@@ -441,6 +441,28 @@ Two deviations are worth knowing:
 `StorageType`, `MultiAZ` and `Iops` are not read on a modify yet. Floci reports every instance as
 `gp2`.
 
+### Storage autoscaling threshold changes
+
+For standalone instances with instance-owned storage, `ModifyDBInstance` checks an explicit
+`MaxAllocatedStorage` against the current allocation. The threshold must be at least 10% higher,
+except that a value equal to the current allocation retains the existing disable handling.
+For example, with 20 GiB allocated, maxima of 19 or 21 GiB are refused and 22 GiB meets this
+minimum. Explicit zero and negative maxima are also refused. Rejection occurs before any settings
+in the request change, including backup retention and allocation. An omitted maximum retains its
+stored value without rechecking historical state.
+
+The check uses the current allocation even when the request also changes storage. AWS applies
+threshold changes immediately while storage changes can wait for maintenance. Floci's existing
+immediate storage-change behavior remains; this is not a live AWS combined-growth capture or a
+complete check of all combined-update constraints.
+
+Aurora/cluster members and RDS Custom remain outside this check. Engine/class upper limits,
+IOPS ratios and create/restore/replica constraints remain separate. The chosen HTTP 400
+`InvalidParameterCombination` follows the adjacent allocated-storage refusal precedent. The
+message follows the guide's example, `Invalid max storage size for {engine_name}`; neither is
+claimed as an independently captured, universal live AWS maximum-error response.
+
+
 ## Examples
 
 ```bash

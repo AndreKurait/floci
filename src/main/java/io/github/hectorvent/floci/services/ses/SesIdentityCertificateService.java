@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.core.common.PublicKeys;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmService;
@@ -348,9 +349,7 @@ public class SesIdentityCertificateService {
         if (violations.isEmpty()) {
             return;
         }
-        String count = violations.size() == 1 ? "1 validation error detected: "
-                : violations.size() + " validation errors detected: ";
-        throw badRequest(count + String.join("; ", violations));
+        throw SmithyValidationErrors.exception("BadRequestException", violations);
     }
 
     private static AwsException badRequest(String message) {

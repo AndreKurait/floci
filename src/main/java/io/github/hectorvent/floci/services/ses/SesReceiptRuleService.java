@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
@@ -483,9 +484,7 @@ public class SesReceiptRuleService {
         if (violations.isEmpty()) {
             return;
         }
-        String label = violations.size() == 1 ? "1 validation error detected: "
-                : violations.size() + " validation errors detected: ";
-        throw new AwsException("ValidationError", label + String.join("; ", violations), 400);
+        throw SmithyValidationErrors.exception("ValidationError", violations);
     }
 
     /**
@@ -774,9 +773,7 @@ public class SesReceiptRuleService {
             }
         }
         if (!violations.isEmpty()) {
-            String label = violations.size() == 1 ? "1 validation error detected: "
-                    : violations.size() + " validation errors detected: ";
-            throw new AwsException("ValidationError", label + String.join("; ", violations), 400);
+            throw SmithyValidationErrors.exception("ValidationError", violations);
         }
     }
 

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ses;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ses.model.AccountDetails;
@@ -199,9 +200,7 @@ public class SesAccountService {
             }
         }
         if (!errors.isEmpty()) {
-            throw new AwsException("BadRequestException",
-                    errors.size() + " validation error" + (errors.size() > 1 ? "s" : "")
-                            + " detected: " + String.join("; ", errors), 400);
+            throw SmithyValidationErrors.exception("BadRequestException", errors);
         }
         if (!isValidUrl(websiteUrl)) {
             throw new AwsException("BadRequestException", "Url contains invalid format", 400);

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ses;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.ses.model.EmailInsights;
 import io.github.hectorvent.floci.services.ses.model.ExportJob;
 import io.github.hectorvent.floci.services.ses.model.SentEmail;
@@ -70,11 +71,7 @@ final class SesExportMetrics {
         }
         validateMetrics(metrics.path("Metrics"), violations);
         if (!violations.isEmpty()) {
-            String header = violations.size() == 1
-                    ? "1 validation error detected: "
-                    : violations.size() + " validation errors detected: ";
-            throw new AwsException("BadRequestException",
-                    header + String.join("; ", violations), 400);
+            throw SmithyValidationErrors.exception("BadRequestException", violations);
         }
     }
 

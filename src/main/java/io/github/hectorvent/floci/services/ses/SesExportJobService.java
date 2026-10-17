@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -540,9 +541,8 @@ public class SesExportJobService implements Resettable {
     }
 
     private static AwsException notNull(String member) {
-        return new AwsException("BadRequestException",
-                "1 validation error detected: Value at '" + member
-                        + "' failed to satisfy constraint: Member must not be null", 400);
+        return SmithyValidationErrors.exception("BadRequestException",
+                List.of("Value at '" + member + "' failed to satisfy constraint: Member must not be null"));
     }
 
     /**

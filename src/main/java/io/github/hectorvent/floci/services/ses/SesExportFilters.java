@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ses;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -92,11 +93,7 @@ final class SesExportFilters {
         requireFilterBlock(insights.path("Include"), "include", violations);
         requireFilterBlock(insights.path("Exclude"), "exclude", violations);
         if (!violations.isEmpty()) {
-            String header = violations.size() == 1
-                    ? "1 validation error detected: "
-                    : violations.size() + " validation errors detected: ";
-            throw new AwsException("BadRequestException",
-                    header + String.join("; ", violations), 400);
+            throw SmithyValidationErrors.exception("BadRequestException", violations);
         }
     }
 

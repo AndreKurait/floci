@@ -6,13 +6,16 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.sesv2.SesV2Client;
 import software.amazon.awssdk.services.sesv2.model.AlreadyExistsException;
+import software.amazon.awssdk.services.sesv2.model.BadRequestException;
 import software.amazon.awssdk.services.sesv2.model.Body;
+import software.amazon.awssdk.services.sesv2.model.ConfigurationOverrides;
 import software.amazon.awssdk.services.sesv2.model.Content;
 import software.amazon.awssdk.services.sesv2.model.CreateContactListRequest;
 import software.amazon.awssdk.services.sesv2.model.CreateEmailIdentityRequest;
 import software.amazon.awssdk.services.sesv2.model.DeleteContactListRequest;
 import software.amazon.awssdk.services.sesv2.model.Destination;
 import software.amazon.awssdk.services.sesv2.model.EmailContent;
+import software.amazon.awssdk.services.sesv2.model.FeatureStatus;
 import software.amazon.awssdk.services.sesv2.model.GetContactRequest;
 import software.amazon.awssdk.services.sesv2.model.GetContactResponse;
 import software.amazon.awssdk.services.sesv2.model.ListManagementOptions;
@@ -21,17 +24,24 @@ import software.amazon.awssdk.services.sesv2.model.SendEmailRequest;
 import software.amazon.awssdk.services.sesv2.model.SendEmailResponse;
 import software.amazon.awssdk.services.sesv2.model.SubscriptionStatus;
 import software.amazon.awssdk.services.sesv2.model.Topic;
+import software.amazon.awssdk.services.sesv2.model.TrackingConfigurationOverrides;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * SDK compatibility test for {@code SendEmail} with {@code ListManagementOptions} through the AWS
- * Java SDK v2 {@link SesV2Client}. A real SDK round-trip proves the nested {@code ListManagementOptions}
- * structure (ContactListName + optional TopicName) marshals as a real client sends it — and that Floci
- * actually processes it, since an absent recipient is auto-created as a contact on the list (matches AWS).
+ * SDK compatibility test for the {@code SendEmail} request options, through the AWS Java SDK v2
+ * {@link SesV2Client}. A real SDK round-trip proves each nested structure marshals as a real client
+ * sends it, and that Floci actually processes it:
+ * <ul>
+ *   <li>{@code ListManagementOptions} (ContactListName + optional TopicName): an absent recipient is
+ *       auto-created as a contact on the list (matches AWS).</li>
+ *   <li>{@code ConfigurationOverrides.Tracking}: Floci accepts a valid override (it has no open or
+ *       click tracking, so the override has no effect) and refuses a value outside the enum.</li>
+ * </ul>
  */
-@DisplayName("SES v2 SendEmail ListManagementOptions")
-class SesListManagementOptionsTest {
+@DisplayName("SES v2 SendEmail request options")
+class SesSendEmailOptionsTest {
 
     private static final String LIST = "compat-lmo-list";
     private static final String TOPIC = "weekly";
@@ -121,5 +131,50 @@ class SesListManagementOptionsTest {
                 .build());
 
         assertThat(response.messageId()).isNotBlank();
+    }
+
+    @Test
+    void sendWithTrackingOverrides_isAccepted() {
+        SendEmailResponse response = sesV2.sendEmail(SendEmailRequest.builder()
+                .fromEmailAddress(FROM)
+                .destination(Destination.builder()
+                        .toAddresses("tracking-" + TestFixtures.uniqueName() + "@example.com").build())
+                .content(EmailContent.builder()
+                        .simple(Message.builder()
+                                .subject(Content.builder().data("compat-tracking").build())
+                                .body(Body.builder().text(Content.builder().data("hi").build()).build())
+                                .build())
+                        .build())
+                .configurationOverrides(ConfigurationOverrides.builder()
+                        .tracking(TrackingConfigurationOverrides.builder()
+                                .openTrackingEnabled(FeatureStatus.DISABLED)
+                                .clickTrackingEnabled(FeatureStatus.ENABLED)
+                                .build())
+                        .build())
+                .build());
+
+        assertThat(response.messageId()).isNotBlank();
+    }
+
+    @Test
+    void sendWithAnInvalidTrackingValue_isRefused() {
+        assertThatThrownBy(() -> sesV2.sendEmail(SendEmailRequest.builder()
+                .fromEmailAddress(FROM)
+                .destination(Destination.builder()
+                        .toAddresses("tracking-" + TestFixtures.uniqueName() + "@example.com").build())
+                .content(EmailContent.builder()
+                        .simple(Message.builder()
+                                .subject(Content.builder().data("compat-tracking").build())
+                                .body(Body.builder().text(Content.builder().data("hi").build()).build())
+                                .build())
+                        .build())
+                .configurationOverrides(ConfigurationOverrides.builder()
+                        .tracking(TrackingConfigurationOverrides.builder().openTrackingEnabled("yes").build())
+                        .build())
+                .build()))
+                .isInstanceOf(BadRequestException.class)
+                .hasMessageContaining("1 validation error detected: Value at "
+                        + "'configurationOverrides.tracking.openTrackingEnabled' failed to satisfy constraint: "
+                        + "Member must satisfy enum value set: [ENABLED, DISABLED]");
     }
 }
