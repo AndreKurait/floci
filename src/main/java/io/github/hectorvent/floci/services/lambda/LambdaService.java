@@ -2390,8 +2390,10 @@ public class LambdaService implements ResourceProvider {
                         + "returning it rather than creating a duplicate", functionName, unchanged.getVersion());
                 return unchanged;
             }
-            int version = nextVersionNumber(versionCounterKey(region, fn),
-                    legacyVersionCounterKey(region, functionName));
+            String counterKey = versionCounterKey(region, fn);
+            String legacyCounterKey = legacyVersionCounterKey(region, functionName);
+            boolean migrateLegacyCounter = !versionCounters.containsKey(counterKey);
+            int version = nextVersionNumber(counterKey, legacyCounterKey);
             LambdaFunction snapshot = new LambdaFunction();
             snapshot.setAccountId(fn.getAccountId());
             snapshot.setFunctionName(fn.getFunctionName());
@@ -2452,8 +2454,10 @@ public class LambdaService implements ResourceProvider {
             snapshot.setDurableKmsKeyArn(fn.getDurableKmsKeyArn());
 
             functionStore.save(region, snapshot);
-            versionCounters.put(versionCounterKey(region, fn), version);
-            versionCounters.remove(legacyVersionCounterKey(region, functionName));
+            versionCounters.put(counterKey, version);
+            if (migrateLegacyCounter) {
+                versionCounters.remove(legacyCounterKey);
+            }
             LOG.infov("Published version {0} for function {1}", version, functionName);
             return snapshot;
         }
