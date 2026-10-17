@@ -2285,12 +2285,11 @@ public class CloudFormationService implements ResourceProvider {
                 return;
             }
             LOG.errorv("Stack {0} execution failed: {1}", stack.getStackName(), e.getMessage());
-            String failStatus = isCreate ? "CREATE_FAILED" : "UPDATE_FAILED";
-            stack.setStatus(failStatus);
-            stack.setStatusReason(e.getMessage());
-            addEvent(stack, stack.getStackName(), stack.getStackId(),
-                    "AWS::CloudFormation::Stack", failStatus, e.getMessage());
             if (isCreate) {
+                stack.setStatusReason(e.getMessage());
+                addEvent(stack, stack.getStackName(), stack.getStackId(),
+                        "AWS::CloudFormation::Stack", "CREATE_FAILED", e.getMessage());
+                stack.setStatus("CREATE_FAILED");
                 persistStack(stack);
             } else {
                 rollbackFailedUpdate(
@@ -2375,30 +2374,26 @@ public class CloudFormationService implements ResourceProvider {
             String reason,
             StackUpdateSnapshot previousState,
             Set<String> attemptedResourceIds) {
-        String failStatus = isCreate ? "CREATE_FAILED" : "UPDATE_FAILED";
-        stack.setStatus(failStatus);
         stack.setStatusReason(reason);
-        addEvent(stack, stack.getStackName(), stack.getStackId(),
-                "AWS::CloudFormation::Stack", failStatus, reason);
 
         if (isCreate) {
-            stack.setStatus("ROLLBACK_IN_PROGRESS");
             addEvent(stack, stack.getStackName(), stack.getStackId(),
                     "AWS::CloudFormation::Stack", "ROLLBACK_IN_PROGRESS", reason);
+            stack.setStatus("ROLLBACK_IN_PROGRESS");
             List<String> rollbackFailures = rollbackCreatedResources(stack, region);
             stack.setLastUpdatedTime(now());
             if (rollbackFailures.isEmpty()) {
-                stack.setStatus("ROLLBACK_COMPLETE");
                 addEvent(stack, stack.getStackName(), stack.getStackId(),
                         "AWS::CloudFormation::Stack", "ROLLBACK_COMPLETE", null);
+                stack.setStatus("ROLLBACK_COMPLETE");
                 LOG.infov("Stack {0} rolled back to a clean slate (ROLLBACK_COMPLETE)", stack.getStackName());
             } else {
                 String rollbackReason = "The following resource(s) failed to roll back: ["
                         + String.join(", ", rollbackFailures) + "].";
-                stack.setStatus("ROLLBACK_FAILED");
                 stack.setStatusReason(rollbackReason);
                 addEvent(stack, stack.getStackName(), stack.getStackId(),
                         "AWS::CloudFormation::Stack", "ROLLBACK_FAILED", rollbackReason);
+                stack.setStatus("ROLLBACK_FAILED");
                 LOG.errorv("Stack {0} rollback failed: {1}", stack.getStackName(), rollbackReason);
             }
         } else {
@@ -2656,10 +2651,10 @@ public class CloudFormationService implements ResourceProvider {
             StackUpdateSnapshot previousState,
             Set<String> attemptedResourceIds,
             String failureReason) {
-        stack.setStatus("UPDATE_ROLLBACK_IN_PROGRESS");
         stack.setStatusReason(failureReason);
         addEvent(stack, stack.getStackName(), stack.getStackId(),
                 "AWS::CloudFormation::Stack", "UPDATE_ROLLBACK_IN_PROGRESS", failureReason);
+        stack.setStatus("UPDATE_ROLLBACK_IN_PROGRESS");
 
         List<String> rollbackFailures = rollbackUpdatedResources(
                 stack, previousState.resources(), attemptedResourceIds, region);
@@ -3629,9 +3624,9 @@ public class CloudFormationService implements ResourceProvider {
      * {@code UPDATE_FAILED}) means the resource loop failed and rolled back before Outputs were
      * ever computed: see {@link #executeTemplate}, which only reaches its Outputs block once the
      * whole resource loop has succeeded. This is deliberately an allow-list rather than a
-     * deny-list of failure strings: a nested stack's own {@code rollbackFailedExecution} rewrites
-     * its status past {@code CREATE_FAILED}/{@code UPDATE_FAILED} into one of the ROLLBACK_*
-     * statuses before this method ever inspects it, so checking for the FAILED strings here can
+     * deny-list of failure strings: a nested stack's own {@code rollbackFailedExecution} settles
+     * it in one of the ROLLBACK_* statuses before this method ever inspects it, never in
+     * {@code CREATE_FAILED}/{@code UPDATE_FAILED}, so checking for the FAILED strings here can
      * never match on a create and silently reports a stack that rolled back to nothing as
      * CREATE_COMPLETE.
      */

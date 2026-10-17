@@ -337,6 +337,46 @@ Schemas created without a matching Glue database retain the legacy Phase 1 path 
 Its single-table query restrictions still apply. PostgreSQL materialization approximates Spectrum
 execution and does not reproduce AWS distributed planning or a cross-service transaction snapshot.
 
+### Glue-backed external table lifecycle
+
+Glue-backed schemas support these statements through the Simple Query protocol, JDBC Extended
+Query, and the Redshift Data API:
+
+```sql
+ALTER TABLE lake.events ADD IF NOT EXISTS
+PARTITION (dt='2026-10-17') LOCATION 's3://analytics/events/dt=2026-10-17/';
+
+DROP TABLE IF EXISTS lake.events;
+DROP SCHEMA IF EXISTS lake CASCADE;
+```
+
+`ADD PARTITION` registers partitions in Glue, preserves the declared partition-key order, refreshes
+`svv_external_partitions`, and invalidates cached rows. Multiple partition clauses are supported.
+The entire partition list is validated before registration. A duplicate partition fails unless
+`IF NOT EXISTS` is specified; that clause keeps the existing partition location unchanged.
+If registration or metadata refresh fails, Floci attempts to remove only the partitions created
+by that statement. A failed cleanup is logged while the original error remains the response.
+
+`DROP TABLE` removes the Glue table and its partitions, drops any materialized PostgreSQL table,
+and refreshes the external catalog views. The default `RESTRICT` preserves the Glue definition
+if a local view depends on its materialized table; `CASCADE` also drops those dependent objects.
+No S3 objects are deleted. `IF EXISTS` also removes a stale materialization if the Glue table
+has already been deleted.
+
+`DROP SCHEMA` unregisters the local external schema and clears its materializations and catalog
+view rows. It preserves the Glue database, Glue tables and partitions, and S3 objects. The default
+`RESTRICT` refuses a schema containing Glue tables, including tables that have never been queried.
+If the Glue database was already deleted, the remaining local schema can still be dropped.
+`CASCADE` removes the local schema and its dependent objects. `DROP EXTERNAL DATABASE` and
+multi-object DROP statements are outside this implementation.
+
+Run these catalog changes outside explicit transactions and Data API batches. Floci rejects them
+with SQLSTATE `25001` before changing Glue or PostgreSQL because it cannot roll back Glue changes
+with a PostgreSQL transaction. The schema transaction restriction is an emulator limitation.
+Glue and PostgreSQL updates do not form a distributed transaction: an infrastructure failure after
+one store changes can require retrying the command. The legacy Phase 1 catalog does not gain these
+lifecycle operations.
+
 ### COPY from S3
 
 `COPY <table> [(<columns>)] FROM 's3://<bucket>/<keyOrPrefix>' [options]` sent over the Simple

@@ -7281,8 +7281,8 @@ class CloudFormationIntegrationTest {
      * resource's {@code Outputs.*} attributes right after the child's (synchronous, same-thread)
      * {@code executeTemplate} call returns. When the child's own resource loop fails, {@code
      * executeTemplate} never reaches its Outputs block at all: {@code rollbackFailedExecution}
-     * rewrites the child's status straight from {@code CREATE_FAILED} into {@code
-     * ROLLBACK_COMPLETE} before returning. {@code executeNestedStack} used to detect a failed
+     * settles the child in {@code ROLLBACK_COMPLETE} before returning, and the child's status is
+     * never {@code CREATE_FAILED}. {@code executeNestedStack} used to detect a failed
      * child only by checking for the literal strings {@code CREATE_FAILED}/{@code UPDATE_FAILED},
      * which a rolled-back create can never match, so the parent kept going and reported
      * {@code CREATE_COMPLETE} with its {@code Fn::GetAtt} on the child's outputs left unresolved:

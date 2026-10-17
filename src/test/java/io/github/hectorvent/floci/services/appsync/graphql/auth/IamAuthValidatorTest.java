@@ -130,9 +130,7 @@ class IamAuthValidatorTest {
         Map<String, String> signed = AppSyncRequestSigner.signedHeaders(
                 "api-1", HOST, BODY, "AKIAUNKNOWN", "whatever-secret", REGION, Instant.now());
 
-        AppSyncTransportException ex = assertThrows(AppSyncTransportException.class,
-                () -> validator.validateRequest(authorization(signed), "api-1", infoWith(signed)));
-        assertEquals(401, ex.getHttpStatus());
+        assertRefused(signed, "The security token included in the request is invalid.");
     }
 
     @Test
@@ -191,25 +189,44 @@ class IamAuthValidatorTest {
     }
 
     @Test
-    void temporaryCredentialSignedButNoSessionTokenIs401() throws Exception {
+    void temporaryCredentialSignedButNoSessionTokenIsRefused() throws Exception {
         when(iamService.findSecretKey("ASIANOTOKEN")).thenReturn(Optional.of("session-secret"));
         Map<String, String> signed = AppSyncRequestSigner.signedHeaders(
                 "api-1", HOST, BODY, "ASIANOTOKEN", "session-secret", REGION, Instant.now());
 
-        AppSyncTransportException ex = assertThrows(AppSyncTransportException.class,
-                () -> validator.validateRequest(authorization(signed), "api-1", infoWith(signed)));
-        assertEquals(401, ex.getHttpStatus());
+        assertRefused(signed, "The security token included in the request is invalid.");
     }
 
     @Test
-    void temporaryCredentialWithMismatchedSessionTokenIs401() throws Exception {
+    void temporaryCredentialWithMismatchedSessionTokenIsRefused() throws Exception {
         when(iamService.findSecretKey("ASIAFORGED")).thenReturn(Optional.of("session-secret"));
         when(iamService.findSessionToken("ASIAFORGED")).thenReturn(Optional.of("issued-token"));
         Map<String, String> signed = signedWithSessionToken("ASIAFORGED", "session-secret", "forged-token");
 
+        assertRefused(signed, "The security token included in the request is invalid");
+    }
+
+    @Test
+    void longTermKeyWithASessionTokenIsRefused() throws Exception {
+        assertRefused(signedWithSessionToken("AKIAGOOD", "good-secret", "bogus"),
+                "The security token included in the request is invalid");
+        assertRefused(signedWithSessionToken("AKIAGOOD", "good-secret", ""),
+                "The security token included in the request is invalid.");
+    }
+
+    @Test
+    void legacyTestKeyTakesAnySessionToken() throws Exception {
+        Map<String, String> signed = signedWithSessionToken("test", "test", "bogus");
+
+        assertEquals("test", validator.validateRequest(authorization(signed), "api-1", infoWith(signed)).get("user"));
+    }
+
+    private void assertRefused(Map<String, String> signed, String message) {
         AppSyncTransportException ex = assertThrows(AppSyncTransportException.class,
                 () -> validator.validateRequest(authorization(signed), "api-1", infoWith(signed)));
-        assertEquals(401, ex.getHttpStatus());
+        assertEquals(403, ex.getHttpStatus());
+        assertEquals("UnrecognizedClientException", ex.getErrorType());
+        assertEquals(message, ex.getMessage());
     }
 
     @Test

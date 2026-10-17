@@ -14,8 +14,8 @@ public final class ThreadStates {
     private ThreadStates() {}
 
     /**
-     * Returns once {@code thread} is blocked entering a monitor, or {@code task} has finished,
-     * whichever comes first. Code that serializes correctly leaves the second request blocked
+     * Returns once {@code thread} is blocked entering a monitor or parked on a lock, or {@code task} has
+     * finished, whichever comes first. Code that serializes correctly leaves the second request blocked
      * behind the first; code that does not lets it run to the end, which the caller's assertions
      * then catch. Polls every 5 ms and gives up after five seconds rather than hang a broken test.
      */
@@ -25,9 +25,9 @@ public final class ThreadStates {
     }
 
     /**
-     * Returns once {@code thread} is blocked entering a monitor or is no longer alive. Same wait as
-     * the {@link Future} overload, for a test that owns the {@link Thread} directly; gives up after
-     * ten seconds and fails, since a thread still running unblocked by then is not overlapping the
+     * Returns once {@code thread} is blocked entering a monitor, parked on a lock, or is no longer alive.
+     * Same wait as the {@link Future} overload, for a test that owns the {@link Thread} directly; gives up
+     * after ten seconds and fails, since a thread still running unblocked by then is not overlapping the
      * way the test needs.
      */
     public static void awaitBlockedOrDone(Thread thread) throws InterruptedException {
@@ -48,6 +48,10 @@ public final class ThreadStates {
     }
 
     private static boolean isBlocked(Thread thread) {
-        return thread != null && thread.getState() == Thread.State.BLOCKED;
+        if (thread == null) {
+            return false;
+        }
+        Thread.State state = thread.getState();
+        return state == Thread.State.BLOCKED || state == Thread.State.WAITING;
     }
 }

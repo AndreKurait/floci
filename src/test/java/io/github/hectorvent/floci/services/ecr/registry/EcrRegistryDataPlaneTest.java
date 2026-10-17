@@ -131,6 +131,36 @@ class EcrRegistryDataPlaneTest {
         assertEquals("/v2/000000000000/us-east-1/platform/api/manifests/v1", request.backendUri());
     }
 
+    /**
+     * The address Floci hands the Docker daemon for the ECS and Lambda images it pulls is path
+     * style on localhost in either URI style: a daemon with the containerd image store reaches
+     * only localhost and 127.0.0.1 over plain HTTP, and takes {@code *.localhost} for HTTPS.
+     */
+    @Test
+    void pathStyleOnALoopbackHostIsClaimedInHostnameStyle() {
+        EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor("localhost:4566",
+                "/v2/000000000000/us-east-1/platform/api/manifests/v1", null, "hostname").orElseThrow();
+
+        assertEquals("000000000000", request.accountId());
+        assertEquals("us-east-1", request.region());
+        assertEquals("platform/api", request.repositoryName());
+        assertEquals("v1", request.tag());
+        assertEquals("/v2/000000000000/us-east-1/platform/api/manifests/v1", request.backendUri());
+        assertTrue(EcrRegistryDataPlane.requestFor("127.0.0.1:443",
+                "/v2/000000000000/us-east-1/platform/api/blobs/sha256:abc", null, "hostname").isPresent());
+        assertTrue(EcrRegistryDataPlane.requestFor("[::1]:4566", "/v2/", null, "hostname").isPresent());
+        assertTrue(EcrRegistryDataPlane.requestFor("localhost:4566", "/v2/", null, "hostname").isPresent());
+    }
+
+    @Test
+    void pathStyleOnAnotherHostIsNotClaimedInHostnameStyle() {
+        assertFalse(EcrRegistryDataPlane.requestFor("floci:4566",
+                "/v2/000000000000/us-east-1/platform/api/manifests/v1", null, "hostname").isPresent());
+        assertFalse(EcrRegistryDataPlane.requestFor("localhost.floci.io:4566",
+                "/v2/000000000000/us-east-1/platform/api/manifests/v1", null, "hostname").isPresent());
+        assertFalse(EcrRegistryDataPlane.requestFor("localhost:4566", "/v2/apis", null, "hostname").isPresent());
+    }
+
     @Test
     void unrelatedV2RouteDoesNotClaimTheRequest() {
         assertFalse(EcrRegistryDataPlane.requestFor("localhost:4566", "/v2/apis", null, "hostname").isPresent());

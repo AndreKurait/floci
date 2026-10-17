@@ -265,6 +265,140 @@ class SamTransformIntegrationTest {
             .body("release", equalTo("second"));
     }
 
+    @Test
+    void samAutoPublishCodeSha256DecidesWhenANewVersionPublishes() {
+        String stackName = "sam-code-sha-stack";
+        String function = "sam-code-sha-func";
+        stacksToDelete.add(stackName);
+        String template = """
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              Function:
+                Type: AWS::Serverless::Function
+                Properties:
+                  FunctionName: sam-code-sha-func
+                  Handler: index.handler
+                  Runtime: nodejs20.x
+                  AutoPublishAlias: live
+                  AutoPublishCodeSha256: "%s"
+                  InlineCode: "exports.handler = async () => ({ release: '%s' });"
+            """;
+        given().contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack").formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted("aaaaaaaaaa", "first"))
+            .formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when().post("/").then().statusCode(200);
+        waitForStackStatus(stackName, "CREATE_COMPLETE");
+
+        // As in SAM, the given hash names the version, so new code under the same value is not published.
+        given().contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack").formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted("aaaaaaaaaa", "second"))
+            .formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when().post("/").then().statusCode(200);
+        waitForStackStatus(stackName, "UPDATE_COMPLETE");
+        given().when().get("/2015-03-31/functions/" + function + "/aliases/live")
+            .then().statusCode(200).body("FunctionVersion", equalTo("1"));
+
+        given().contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack").formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted("bbbbbbbbbb", "second"))
+            .formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when().post("/").then().statusCode(200);
+        waitForStackStatus(stackName, "UPDATE_COMPLETE");
+        given().when().get("/2015-03-31/functions/" + function + "/aliases/live")
+            .then().statusCode(200).body("FunctionVersion", equalTo("2"));
+        given().when().get("/2015-03-31/functions/" + function + "/versions")
+            .then().statusCode(200).body("Versions.Version", equalTo(List.of("$LATEST", "1", "2")));
+    }
+
+    /** Under AutoPublishAliasAllProperties a property outside the default hash, here Timeout, publishes. */
+    @Test
+    void samAutoPublishAliasAllPropertiesPublishesATimeoutChange() {
+        String stackName = "sam-all-properties-stack";
+        String function = "sam-all-properties-func";
+        stacksToDelete.add(stackName);
+        String template = """
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              Function:
+                Type: AWS::Serverless::Function
+                Properties:
+                  FunctionName: sam-all-properties-func
+                  Handler: index.handler
+                  Runtime: nodejs20.x
+                  Timeout: %d
+                  AutoPublishAlias: live
+                  AutoPublishAliasAllProperties: true
+                  InlineCode: "exports.handler = async () => ({});"
+            """;
+        given().contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack").formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(3)).formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when().post("/").then().statusCode(200);
+        waitForStackStatus(stackName, "CREATE_COMPLETE");
+
+        given().contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack").formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(9)).formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when().post("/").then().statusCode(200);
+        waitForStackStatus(stackName, "UPDATE_COMPLETE");
+
+        given().when().get("/2015-03-31/functions/" + function + "/aliases/live")
+            .then().statusCode(200).body("FunctionVersion", equalTo("2"));
+        given().queryParam("Qualifier", "live")
+        .when().get("/2015-03-31/functions/" + function + "/configuration")
+            .then().statusCode(200).body("Version", equalTo("2")).body("Timeout", equalTo(9));
+    }
+
+    /** With VersionDeletionPolicy: Delete, the version a code change replaces is reported deleted. */
+    @Test
+    void samVersionDeletionPolicyDeleteAppliesToTheReplacedVersion() {
+        String stackName = "sam-version-delete-stack";
+        String function = "sam-version-delete-func";
+        stacksToDelete.add(stackName);
+        String template = """
+            Transform: AWS::Serverless-2016-10-31
+            Resources:
+              Function:
+                Type: AWS::Serverless::Function
+                Properties:
+                  FunctionName: sam-version-delete-func
+                  Handler: index.handler
+                  Runtime: nodejs20.x
+                  AutoPublishAlias: live
+                  VersionDeletionPolicy: Delete
+                  InlineCode: "exports.handler = async () => ({ release: '%s' });"
+            """;
+        given().contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack").formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted("first")).formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when().post("/").then().statusCode(200);
+        waitForStackStatus(stackName, "CREATE_COMPLETE");
+
+        given().contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack").formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted("second")).formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when().post("/").then().statusCode(200);
+        waitForStackStatus(stackName, "UPDATE_COMPLETE");
+
+        given().when().get("/2015-03-31/functions/" + function + "/aliases/live")
+            .then().statusCode(200).body("FunctionVersion", equalTo("2"));
+        String events = given().contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackEvents").formParam("StackName", stackName)
+        .when().post("/").then().statusCode(200).extract().asString();
+        // FunctionVersion6a52d0f87f is the id SAM gives the first InlineCode.
+        List<String> oldVersionStatuses = XmlParser.extractGroups(events, "member").stream()
+            .filter(event -> "FunctionVersion6a52d0f87f".equals(event.get("LogicalResourceId")))
+            .map(event -> event.get("ResourceStatus"))
+            .toList();
+        assertThat(oldVersionStatuses, hasItem("DELETE_COMPLETE"));
+        assertThat(oldVersionStatuses, not(hasItem("DELETE_SKIPPED")));
+        // floci reports the version deleted but keeps every version it publishes; AWS deletes it.
+        given().when().get("/2015-03-31/functions/" + function + "/versions")
+            .then().statusCode(200).body("Versions.Version", equalTo(List.of("$LATEST", "1", "2")));
+    }
+
     /**
      * A code change names a new version resource: the change set adds it, modifies the alias and
      * removes the old version, which, retained as SAM retains it, stays published.

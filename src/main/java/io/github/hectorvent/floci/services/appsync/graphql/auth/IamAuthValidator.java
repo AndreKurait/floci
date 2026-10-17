@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.auth.CredentialScope;
+import io.github.hectorvent.floci.core.common.auth.SessionTokenCheck;
 import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.services.appsync.graphql.AppSyncTransportException;
@@ -124,7 +125,7 @@ public class IamAuthValidator {
         if (secretKey == null) {
             LOG.debugv("AppSync SigV4 request references unregistered access key={0}",
                     SigV4RequestValidator.sanitizeForLog(accessKeyId));
-            throw AppSyncAuth.unauthorized();
+            throw AppSyncAuth.unrecognizedClient();
         }
         checkSessionToken(accessKeyId, info.requestHeaders());
         try {
@@ -166,40 +167,19 @@ public class IamAuthValidator {
         return iamService.findSecretKey(accessKeyId).orElse(null);
     }
 
-    /**
-     * Rejects a temporary ({@code ASIA...}) credential that does not present the session token
-     * Floci issued with it. Mirrors {@code ExecuteApiSigV4Authorizer.checkSessionToken}: a matching
-     * secret alone is not the whole credential, since AWS requires the session token on every
-     * request made with temporary credentials to confirm it is live and genuinely STS-issued.
-     *
-     * <p>The token is compared against the value recorded at mint time, not merely required to be
-     * present, so a fabricated token is rejected along with a missing one. A session recorded
-     * before Floci tracked tokens has no issued value to compare against ({@code findSessionToken}
-     * is empty there), so presence is all that can be demanded of it: rejecting that case would
-     * lock out an otherwise valid credential.
-     *
-     * <p>The token does not need to ride in {@code SignedHeaders}: comparing it against the issued
-     * value binds it regardless of where it rode, the same way the execute-api authorizer does.
-     */
+    /** Rejects a session token that does not fit the access key. The local {@code test} key takes any token. */
     private void checkSessionToken(String accessKeyId, Map<String, String> requestHeaders) {
-        if (!IamService.isTemporaryAccessKey(accessKeyId)) {
+        if (LEGACY_ACCESS_KEY_ID.equals(accessKeyId)) {
             return;
         }
-        String presented = header(requestHeaders, SECURITY_TOKEN);
-        if (isBlank(presented)) {
-            LOG.debugv("AppSync SigV4 request uses temporary credential accessKey={0} with no {1}",
-                    SigV4RequestValidator.sanitizeForLog(accessKeyId), SECURITY_TOKEN);
-            throw AppSyncAuth.unauthorized();
-        }
-        String issued = iamService.findSessionToken(accessKeyId).orElse(null);
-        if (issued == null) {
-            return;
-        }
-        if (!MessageDigest.isEqual(issued.getBytes(StandardCharsets.UTF_8),
-                presented.getBytes(StandardCharsets.UTF_8))) {
-            LOG.debugv("AppSync SigV4 request presents a session token that does not match the one"
-                    + " issued for accessKey={0}", SigV4RequestValidator.sanitizeForLog(accessKeyId));
-            throw AppSyncAuth.unauthorized();
+        String presented = hasHeader(requestHeaders, SECURITY_TOKEN) ? header(requestHeaders, SECURITY_TOKEN) : null;
+        AppSyncTransportException refusal = switch (SessionTokenCheck.of(iamService, accessKeyId, presented)) {
+            case VALID -> null;
+            case MISSING -> AppSyncAuth.unrecognizedClient();
+            case INVALID -> AppSyncAuth.invalidSessionToken();
+        };
+        if (refusal != null) {
+            throw refusal;
         }
     }
 
@@ -251,6 +231,10 @@ public class IamAuthValidator {
             }
         }
         return "";
+    }
+
+    private static boolean hasHeader(Map<String, String> headers, String name) {
+        return headers != null && headers.keySet().stream().anyMatch(name::equalsIgnoreCase);
     }
 
     private static boolean isBlank(String value) {

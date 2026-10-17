@@ -21,6 +21,8 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.postgresql.PGStatement;
 
 import java.nio.charset.StandardCharsets;
@@ -436,6 +438,125 @@ class RedshiftSpectrumIntegrationTest {
             }
             connection.commit();
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"simple", "extended"})
+    @Timeout(120)
+    void externalLifecycleKeepsGlueCatalogAndCachedRowsConsistent(String queryMode) throws Exception {
+        bucket = "spectrum-lifecycle-" + System.nanoTime();
+        glueDatabase = "lifecycle_" + System.nanoTime();
+        clusterId = "lifecycle-" + System.nanoTime();
+        s3Service.createBucket(bucket, "us-east-1");
+        s3Service.putObject(bucket, "events/part-1.csv", "1,10\n2,20\n".getBytes(StandardCharsets.UTF_8), "text/csv", null);
+        s3Service.putObject(bucket, "invalid/part-1.csv", "3,7\n".getBytes(StandardCharsets.UTF_8), "text/csv", null);
+        Database database = new Database();
+        database.setName(glueDatabase);
+        glueService.createDatabase(database);
+        Cluster cluster = createClusterWithRole(clusterId);
+        String url = "jdbc:postgresql://127.0.0.1:" + cluster.getEndpoint().getPort()
+                + "/dev?preferQueryMode=" + queryMode + "&socketTimeout=30";
+        String create = "CREATE EXTERNAL TABLE lake.events (id INTEGER, amount INTEGER) PARTITIONED BY (dt VARCHAR) "
+                + "ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION 's3://" + bucket + "/root/'";
+        String firstPartition = "ALTER TABLE lake.events ADD PARTITION (dt='first') LOCATION 's3://" + bucket + "/events/'";
+        try (Connection connection = DriverManager.getConnection(url, "admin", "Secret123");
+             Statement statement = connection.createStatement()) {
+            statement.execute("CREATE EXTERNAL SCHEMA lake FROM DATA CATALOG DATABASE '" + glueDatabase
+                    + "' IAM_ROLE '" + ROLE_ARN + "'");
+            statement.execute(create);
+            statement.execute(create.replace("lake.events", "lake.cold_events"));
+            statement.execute("CREATE USER lifecycle_reader PASSWORD 'Password123'");
+            statement.execute("GRANT USAGE ON SCHEMA lake TO lifecycle_reader");
+            try (Connection reader = DriverManager.getConnection(url, "lifecycle_reader", "Password123");
+                 Statement readOnly = reader.createStatement()) {
+                for (String deniedSql : List.of(firstPartition.replace("lake.events", "lake.cold_events"),
+                        "DROP TABLE lake.cold_events", "DROP SCHEMA lake RESTRICT")) {
+                    SQLException denied = assertThrows(SQLException.class, () -> readOnly.execute(deniedSql));
+                    assertEquals("42501", denied.getSQLState());
+                }
+            }
+            assertTrue(glueService.getPartitions(glueDatabase, "cold_events").isEmpty());
+            statement.execute("DROP TABLE lake.cold_events");
+            assertTotal(statement, 0);
+            statement.execute(firstPartition);
+            assertTotal(statement, 30);
+            assertEquals(List.of("first"), glueService.getPartitions(glueDatabase, "events").getFirst().getValues());
+            statement.execute(firstPartition.replace("ADD PARTITION", "ADD IF NOT EXISTS PARTITION")
+                    .replace("/events/'", "/invalid/'"));
+            assertTotal(statement, 30);
+            SQLException duplicate = assertThrows(SQLException.class, () -> statement.execute(firstPartition));
+            assertEquals("42710", duplicate.getSQLState());
+            statement.execute("CREATE VIEW saved_events AS SELECT id FROM lake.events");
+            statement.execute("GRANT SELECT ON lake.events TO lifecycle_reader");
+            lifecycleDataStatement("ALTER TABLE lake.events ADD PARTITION (dt='second') LOCATION 's3://"
+                    + bucket + "/invalid/'");
+            assertTotal(statement, 37);
+            try (Connection reader = DriverManager.getConnection(url, "lifecycle_reader", "Password123");
+                 Statement readOnly = reader.createStatement();
+                 ResultSet rows = readOnly.executeQuery("SELECT COUNT(*) FROM lake.events")) {
+                assertTrue(rows.next());
+                assertEquals(3, rows.getInt(1));
+                SQLException denied = assertThrows(SQLException.class, () -> readOnly.execute("DROP TABLE lake.events"));
+                assertEquals("42501", denied.getSQLState());
+            }
+            try (ResultSet rows = statement.executeQuery("SELECT COUNT(*) FROM svv_external_partitions WHERE schemaname='lake'")) {
+                assertTrue(rows.next());
+                assertEquals(2, rows.getInt(1));
+            }
+            connection.setAutoCommit(false);
+            SQLException transaction = assertThrows(SQLException.class, () -> statement.execute("DROP TABLE lake.events"));
+            assertEquals("25001", transaction.getSQLState());
+            connection.rollback();
+            connection.setAutoCommit(true);
+            assertEquals("events", glueService.getTable(glueDatabase, "events").getName());
+
+            SQLException dependent = assertThrows(SQLException.class, () -> statement.execute("DROP TABLE lake.events"));
+            assertEquals("2BP01", dependent.getSQLState());
+            assertEquals("events", glueService.getTable(glueDatabase, "events").getName());
+            statement.execute("DROP TABLE lake.events CASCADE");
+            assertThrows(AwsException.class, () -> glueService.getTable(glueDatabase, "events"));
+            statement.execute("DROP TABLE IF EXISTS lake.events");
+            lifecycleDataStatement(create);
+            lifecycleDataStatement(firstPartition);
+            assertTotal(statement, 30);
+
+            SQLException restrict = assertThrows(SQLException.class, () -> statement.execute("DROP SCHEMA lake RESTRICT"));
+            assertEquals("2BP01", restrict.getSQLState());
+            lifecycleDataStatement("DROP SCHEMA lake CASCADE");
+            assertTrue(externalRegistry.list("000000000000", "000000000000:" + clusterId, "dev").isEmpty());
+            assertEquals("events", glueService.getTable(glueDatabase, "events").getName());
+            assertEquals(1, glueService.getPartitions(glueDatabase, "events").size());
+            assertEquals(2, s3Service.listObjects(bucket, "", null, 100).size());
+            try (ResultSet rows = statement.executeQuery("SELECT COUNT(*) FROM svv_external_schemas WHERE schemaname='lake'")) {
+                assertTrue(rows.next());
+                assertEquals(0, rows.getInt(1));
+            }
+            statement.execute("DROP SCHEMA IF EXISTS lake");
+            statement.execute("CREATE EXTERNAL SCHEMA lake FROM DATA CATALOG DATABASE '" + glueDatabase
+                    + "' IAM_ROLE '" + ROLE_ARN + "'");
+            assertTotal(statement, 30);
+            lifecycleDataStatement("DROP TABLE lake.events");
+            glueService.deleteDatabase(glueDatabase);
+            glueDatabase = null;
+            statement.execute("DROP SCHEMA lake");
+        }
+    }
+
+    private static void assertTotal(Statement statement, long total) throws SQLException {
+        try (ResultSet rows = statement.executeQuery("SELECT COALESCE(SUM(amount),0) FROM lake.events")) {
+            assertTrue(rows.next());
+            assertEquals(total, rows.getLong(1));
+        }
+    }
+
+    private void lifecycleDataStatement(String sql) {
+        RestAssuredJsonUtils.configureAwsContentTypes();
+        String queryId = RestAssuredJsonUtils.awsAction("RedshiftData", "ExecuteStatement", """
+                {"ClusterIdentifier":"%s","Database":"dev","DbUser":"admin","Sql":"%s","WaitTimeSeconds":30}
+                """.formatted(clusterId, sql.replace("\\", "\\\\").replace("\"", "\\\"")))
+                .then().statusCode(200).extract().path("Id");
+        assertEquals("FINISHED", RestAssuredJsonUtils.awsAction("RedshiftData", "DescribeStatement",
+                "{\"Id\":\"" + queryId + "\"}").then().statusCode(200).extract().path("Status"));
     }
 
     private static Connection waitForConnection(Cluster cluster, String username, String password) throws SQLException {

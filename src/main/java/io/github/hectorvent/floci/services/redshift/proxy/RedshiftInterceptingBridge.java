@@ -216,9 +216,9 @@ public class RedshiftInterceptingBridge {
                 writeSimpleSpectrumError(new SpectrumReadException("58030", "Unable to prepare external query"));
                 return;
             }
-            if (intercepted && decision[0] instanceof SpectrumInterceptor.Decision.Handled) {
+            if (intercepted && decision[0] instanceof SpectrumInterceptor.Decision.Handled handled) {
                 coordinator.register(BackendResponseCoordinator.Operation.SIMPLE_QUERY, null);
-                write(client.getOutputStream(), commandComplete("CREATE EXTERNAL\0"));
+                write(client.getOutputStream(), commandComplete(handled.commandTag() + "\0"));
                 reportLocalReady();
                 return;
             }
@@ -270,6 +270,22 @@ public class RedshiftInterceptingBridge {
         // resolve to the stale Spectrum plan in handleBind/handleDescribe/handleExecute.
         spectrumStatements.remove(parse.statementName());
         relationalStatements.remove(parse.statementName());
+        if (spectrumInterceptor != null && parse.parameterTypeOids().isEmpty()
+                && !coordinator.isDiscardingUntilSync()) {
+            try {
+                SpectrumInterceptor.Plan plan = spectrumInterceptor.plan(parse.sql(), spectrumSession());
+                if (plan instanceof SpectrumInterceptor.Plan.Ddl || plan instanceof SpectrumInterceptor.Plan.Query
+                        || plan instanceof SpectrumInterceptor.Plan.ExternalDdl) {
+                    awaitPriorBackendResponses();
+                    spectrumStatements.put(parse.statementName(), plan);
+                    write(client.getOutputStream(), backendFrame('1', EMPTY_BODY));
+                    return;
+                }
+            } catch (RuntimeException exception) {
+                writeParseSpectrumError(exception);
+                return;
+            }
+        }
         // After a backend error the backend discards everything up to Sync, so a preparation round trip
         // would only wait out the socket timeout; forward the Parse and let the backend discard it.
         if (spectrumInterceptor != null && spectrumInterceptor.preparation() != null
@@ -287,21 +303,6 @@ public class RedshiftInterceptingBridge {
                 relationalStatements.put(parse.statementName(), parse);
             } catch (RuntimeException exception) {
                 spectrumInterceptor.preparation().finishCycle(relationalBackend);
-                writeParseSpectrumError(exception);
-                return;
-            }
-        }
-        if (spectrumInterceptor != null && parse.parameterTypeOids().isEmpty()) {
-            try {
-                SpectrumInterceptor.Plan plan = spectrumInterceptor.plan(parse.sql(), spectrumSession());
-                if (plan instanceof SpectrumInterceptor.Plan.Ddl || plan instanceof SpectrumInterceptor.Plan.Query
-                        || plan instanceof SpectrumInterceptor.Plan.ExternalDdl) {
-                    awaitPriorBackendResponses();
-                    spectrumStatements.put(parse.statementName(), plan);
-                    write(client.getOutputStream(), backendFrame('1', EMPTY_BODY));
-                    return;
-                }
-            } catch (RuntimeException exception) {
                 writeParseSpectrumError(exception);
                 return;
             }

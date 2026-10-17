@@ -294,9 +294,22 @@ public class ExternalStatementParser {
                 return List.of();
             }
             Map<String, String> values = new LinkedHashMap<>();
-            Matcher value = PARTITION_VALUE.matcher(text.substring(open + 1, close).trim() + ",");
-            while (value.find()) {
-                values.put(identifier(value.group(1)), value.group(2).replace("''", "'"));
+            String keys = text.substring(open + 1, close).trim();
+            Matcher value = PARTITION_VALUE.matcher(keys);
+            int position = 0;
+            while (position < keys.length()) {
+                if (!value.region(position, keys.length()).lookingAt()) {
+                    throw new SpectrumSqlException("42601", "Malformed partition key list");
+                }
+                String name = identifier(value.group(1));
+                if (values.keySet().stream().anyMatch(existing -> existing.equalsIgnoreCase(name))) {
+                    throw new SpectrumSqlException("42601", "Duplicate partition key: " + name);
+                }
+                values.put(name, value.group(2).replace("''", "'"));
+                position = value.end();
+                if (position == keys.length() && keys.endsWith(",")) {
+                    throw new SpectrumSqlException("42601", "Malformed partition key list");
+                }
             }
             if (values.isEmpty()) {
                 return List.of();

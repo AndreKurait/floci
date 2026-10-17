@@ -466,19 +466,52 @@ numeric `Version` attribute. CloudFormation resolves the version before creating
 alias. As in SAM, the version's logical id is `<Function>Version` followed by ten hex digits of a
 SHA-1 over the function's code, with its template parameter references resolved (pseudo
 parameters such as `${AWS::Region}` stay as written), its `Environment` and `MemorySize` as
-written, and its `SnapStart` when it sets an `ApplyOn` other than `None`. An update that changes the
-code, `Environment` or `MemorySize`, or a parameter the code uses, publishes a new version and
-moves the alias to it. A parameter used only in `Environment` or `MemorySize` does not, and neither
-does a property outside the hash, such as `Timeout`. A new id publishes only when the function's
-code or configuration changed since its last version. floci does not give the function
-`SnapStart`, so turning it on changes the id but publishes nothing: the alias stays where it is.
+written, and its `SnapStart` when it sets an `ApplyOn` other than `None`. By default, then, an
+update that changes the code, `Environment` or `MemorySize`, or a parameter the code uses, publishes
+a new version and moves the alias to it. A parameter used only in `Environment` or `MemorySize` does
+not, and neither does a property outside the hash, such as `Timeout`.
 
-The version a new id replaces stays published: like SAM, floci gives the version
-`DeletionPolicy: Retain` unless the function sets a `DeletionPolicy`, and the update reports it
-`DELETE_SKIPPED`. With `Delete` floci reports the old version `DELETE_COMPLETE` but never deletes
-it, where AWS does. Changes made to `$LATEST` outside the stack, including Lambda's reactive S3
-sync, do not reach the alias until an update publishes a new version. Event sources and API
-integrations still invoke the function rather than the alias, so they run `$LATEST`.
+Two optional function properties change the id. Under `AutoPublishAliasAllProperties: true` the
+hash covers every property floci gives the function, its code's parameter references resolved as
+above, plus its `SnapStart`; those properties differ from the ones SAM generates, so these ids are
+floci's own rather than SAM's. An `AutoPublishCodeSha256` that is a string, or a `Ref` to a
+parameter holding one, replaces the hash with its first ten characters, under
+`AutoPublishAliasAllProperties` too; an empty value leaves the hash in place. `Globals` can set
+`AutoPublishAliasAllProperties` and `VersionDeletionPolicy`, but as in SAM not
+`AutoPublishCodeSha256`, which fails the transform there. floci does not honour a resource's
+`IgnoreGlobals`, so no function can opt out of a `VersionDeletionPolicy` in `Globals` with it: one
+without `AutoPublishAlias` fails the transform with
+`'VersionDeletionPolicy' requires 'AutoPublishAlias'.`, as it does in SAM when it does not ignore
+that global.
+
+A new id publishes a version, and moves the alias to it, only when the function's code or
+configuration changed since its last version. Otherwise the new version resource takes the last
+version and the alias stays where it is, as when an update changes only one of these:
+
+- A change to `SnapStart`: floci does not give the function `SnapStart`.
+- A new `AutoPublishCodeSha256` alone: on AWS this publishes, because SAM appends it to the
+  function's `Description`, but floci's transform sets no `Description` on the function.
+- Under `AutoPublishAliasAllProperties`, a change to `Tags` or `ReservedConcurrentExecutions`
+  only: AWS fails that update with
+  `A version for this Lambda function exists ( N ). Modify the function to create a new version.`,
+  where floci completes it.
+
+A function whose code is hot-reloaded publishes a version for every new id.
+
+Like SAM, floci gives the version the function's `DeletionPolicy`, else its `VersionDeletionPolicy`
+(`Delete` or `Retain`), else `Delete` for a function with a `CapacityProviderConfig` and `Retain`
+for any other. So by default the version a new id replaces stays published, and the update reports
+it `DELETE_SKIPPED`. With `Delete` floci reports the old version `DELETE_COMPLETE` but never deletes
+it, where AWS does. A `VersionDeletionPolicy` written as an intrinsic function, such as a `Ref` to
+a parameter, is copied onto the version unresolved, as SAM copies it. CloudFormation takes
+intrinsic functions only in resource properties, outputs, metadata attributes and update policy
+attributes, unless a transform such as `AWS::LanguageExtensions` resolves them first, and floci
+implements no such transform: it reads any `DeletionPolicy` that is not a plain string as `Delete`
+(see [Deletion Policies](#deletion-policies)).
+
+Changes made to `$LATEST` outside the stack, including Lambda's reactive S3 sync, do not reach the
+alias until an update publishes a new version. Event sources and API integrations still invoke the
+function rather than the alias, so they run `$LATEST`.
 
 ## RDS Credential Dynamic References
 

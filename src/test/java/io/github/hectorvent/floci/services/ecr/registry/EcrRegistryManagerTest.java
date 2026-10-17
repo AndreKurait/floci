@@ -392,7 +392,7 @@ class EcrRegistryManagerTest {
 
         String rewritten = manager.rewriteImageUri("123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn/backend-user:1");
 
-        assertEquals("123456789012.dkr.ecr.cn-north-1.localhost:4566/backend-user:1", rewritten);
+        assertEquals("localhost:4566/123456789012/cn-north-1/backend-user:1", rewritten);
     }
 
     @Test
@@ -402,7 +402,7 @@ class EcrRegistryManagerTest {
 
         String rewritten = manager.rewriteImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1");
 
-        assertEquals("123456789012.dkr.ecr.us-east-1.localhost:4566/backend-user:1", rewritten);
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1", rewritten);
         verify(lifecycleManager).createAndStart(any());
     }
 
@@ -432,7 +432,7 @@ class EcrRegistryManagerTest {
 
     @ParameterizedTest
     @CsvSource({
-            "hostname, 123456789012.dkr.ecr.us-east-1.localhost:4566/backend-user:1",
+            "hostname, localhost:4566/123456789012/us-east-1/backend-user:1",
             "path, localhost:4566/123456789012/us-east-1/backend-user:1"
     })
     void automaticImageRewritesKeepLoopbackWhenTlsUrisAreAdvertised(String style, String expectedImage) {
@@ -494,7 +494,7 @@ class EcrRegistryManagerTest {
 
     @ParameterizedTest
     @CsvSource({
-            "hostname, 123456789012.dkr.ecr.us-east-1.localhost:54321/backend-user:1",
+            "hostname, localhost:54321/123456789012/us-east-1/backend-user:1",
             "path, localhost:54321/123456789012/us-east-1/backend-user:1"
     })
     void rewriteImageUri_flociPublishedOnAnotherHostPort_pointsTheDaemonAtThePublishedPort(String style,
@@ -517,7 +517,7 @@ class EcrRegistryManagerTest {
         assertEquals("000000000000.dkr.ecr.us-east-1.localhost:4577/app",
                 manager.getRepositoryUri("000000000000", "us-east-1", "app"));
         assertEquals("http://000000000000.dkr.ecr.us-east-1.localhost:4577", manager.getProxyEndpoint());
-        assertEquals("123456789012.dkr.ecr.us-east-1.localhost:4577/backend-user:1",
+        assertEquals("localhost:4577/123456789012/us-east-1/backend-user:1",
                 manager.rewriteImageUri(AWS_ECR_IMAGE));
         verify(currentContainerNetworkResolver, Mockito.atLeastOnce()).resolvePublishedPort(4577);
     }
@@ -576,7 +576,7 @@ class EcrRegistryManagerTest {
 
         String rewritten = manager.rewriteImageUri(AWS_ECR_IMAGE);
 
-        assertEquals("123456789012.dkr.ecr.us-east-1.localhost:4566/backend-user:1", rewritten);
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1", rewritten);
         verify(dockerClient, Mockito.never()).inspectImageCmd(anyString());
     }
 
@@ -606,7 +606,7 @@ class EcrRegistryManagerTest {
 
         String rewritten = manager.rewriteImageUri(AWS_ECR_IMAGE);
 
-        assertEquals("123456789012.dkr.ecr.us-east-1.localhost:4566/backend-user:1", rewritten);
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1", rewritten);
         verify(dockerClient).inspectImageCmd(mirrored);
         verify(lifecycleManager).createAndStart(any());
     }
@@ -619,7 +619,7 @@ class EcrRegistryManagerTest {
 
         String rewritten = manager.rewriteImageUri(AWS_ECR_IMAGE);
 
-        assertEquals("123456789012.dkr.ecr.us-east-1.localhost:4566/backend-user:1", rewritten);
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1", rewritten);
         verify(lifecycleManager).createAndStart(any());
     }
 

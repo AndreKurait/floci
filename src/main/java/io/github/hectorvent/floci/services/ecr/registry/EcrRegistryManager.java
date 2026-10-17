@@ -139,7 +139,12 @@ public class EcrRegistryManager {
         String region = m.group(2);
         String repoAndTag = m.group(3);
         ensureStarted();
-        String rewritten = repositoryUri(account, region, repoAndTag, "localhost");
+        // Path style on localhost whatever style the API advertises. A daemon with the
+        // containerd image store, the default from Docker Engine 29, reaches only localhost and
+        // 127.0.0.1 over plain HTTP and takes every other name, *.localhost included, for an
+        // HTTPS registry: Floci's plain port cannot answer that, and its TLS port cannot prove
+        // itself to a daemon that does not trust Floci's CA.
+        String rewritten = "localhost:" + advertisedPort() + "/" + internalRepoName(account, region, repoAndTag);
         LOG.infov("Rewriting ECR image URI {0} -> {1}", image, rewritten);
         return rewritten;
     }

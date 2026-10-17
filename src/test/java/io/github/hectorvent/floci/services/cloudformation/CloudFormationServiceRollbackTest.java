@@ -27,6 +27,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -115,6 +116,58 @@ class CloudFormationServiceRollbackTest {
         assertEquals("DELETE_COMPLETE", created.getStatus());
         assertNull(created.getStatusReason());
         verify(provisioner).delete(created, REGION);
+    }
+
+    /**
+     * With rollback enabled AWS moves the stack from CREATE_IN_PROGRESS straight to
+     * ROLLBACK_IN_PROGRESS; CREATE_FAILED is the failed resource's status, not the stack's. A
+     * stack status of CREATE_FAILED, even for a moment, is read as final by a DescribeStacks poll.
+     * Each status is published after its reason and event, so a poll that sees it sees them too.
+     */
+    @Test
+    void createRollback_neverReportsTheStackAsCreateFailed() {
+        StatusRecordingStack stack = new StatusRecordingStack();
+        stack.setStackName("rollback-stack-events");
+        stack.setStackId("stack-id");
+        stack.setRegion(REGION);
+        StackResource failed = resource("FailingResource", null, "AWS::Test::Failure", "CREATE_FAILED");
+        failed.setStatusReason("simulated create failure");
+        stack.getResources().put(failed.getLogicalId(), failed);
+
+        service.rollbackFailedExecution(stack, REGION, true, failed, null, Set.of());
+
+        assertEquals(List.of("ROLLBACK_IN_PROGRESS", "ROLLBACK_COMPLETE"), stack.statuses());
+        assertEquals(List.of("ROLLBACK_IN_PROGRESS", "ROLLBACK_COMPLETE"), stackEventStatuses(stack));
+        stack.assertEachStatusFollowsItsEvent();
+        assertEquals("simulated create failure", stack.writes().getFirst().reason());
+    }
+
+    /**
+     * The update counterpart: UPDATE_IN_PROGRESS goes straight to UPDATE_ROLLBACK_IN_PROGRESS, with
+     * no stack-level UPDATE_FAILED in between.
+     */
+    @Test
+    void updateRollback_neverReportsTheStackAsUpdateFailed() {
+        StatusRecordingStack stack = new StatusRecordingStack();
+        stack.setStackName("update-rollback-stack-events");
+        stack.setStackId("stack-id");
+        stack.setRegion(REGION);
+        stack.setStatus("UPDATE_IN_PROGRESS");
+        stack.writes().clear();
+        StackResource added = resource("Dup", null, "AWS::Logs::LogGroup", "CREATE_FAILED");
+        added.setStatusReason("already exists");
+        stack.getResources().put(added.getLogicalId(), added);
+        StackUpdateSnapshot previousState = new StackUpdateSnapshot(
+                "previous-template", "previous-original", Map.of(), Map.of(), Map.of(), Map.of(), Map.of(),
+                Map.of());
+
+        service.rollbackFailedExecution(stack, REGION, false, added, previousState,
+                new LinkedHashSet<>(List.of("Dup")));
+
+        assertEquals(List.of("UPDATE_ROLLBACK_IN_PROGRESS", "UPDATE_ROLLBACK_COMPLETE"), stack.statuses());
+        assertEquals(List.of("UPDATE_ROLLBACK_IN_PROGRESS", "UPDATE_ROLLBACK_COMPLETE"), stackEventStatuses(stack));
+        stack.assertEachStatusFollowsItsEvent();
+        assertEquals("already exists", stack.writes().getFirst().reason());
     }
 
     @Test
@@ -779,6 +832,47 @@ class CloudFormationServiceRollbackTest {
         stack.getChangeSets().clear();
         stack.setStatus("CREATE_COMPLETE");
         return stack;
+    }
+
+    private static List<String> stackEventStatuses(Stack stack) {
+        return stack.getEvents().stream()
+                .filter(event -> "AWS::CloudFormation::Stack".equals(event.getResourceType()))
+                .map(StackEvent::getResourceStatus)
+                .toList();
+    }
+
+    /** One status write, with the reason and the latest stack-level event it was published with. */
+    private record StatusWrite(String status, String reason, String latestStackEvent) {
+    }
+
+    /**
+     * Records every status write, so a test sees a status DescribeStacks could have served for a
+     * moment, not only the one the stack settled in.
+     */
+    private static final class StatusRecordingStack extends Stack {
+        private final List<StatusWrite> writes = new ArrayList<>();
+
+        @Override
+        public void setStatus(String status) {
+            List<String> stackEvents = stackEventStatuses(this);
+            writes.add(new StatusWrite(status, getStatusReason(),
+                    stackEvents.isEmpty() ? null : stackEvents.getLast()));
+            super.setStatus(status);
+        }
+
+        List<StatusWrite> writes() {
+            return writes;
+        }
+
+        List<String> statuses() {
+            return writes.stream().map(StatusWrite::status).toList();
+        }
+
+        void assertEachStatusFollowsItsEvent() {
+            for (StatusWrite write : writes) {
+                assertEquals(write.status(), write.latestStackEvent(), "event published after " + write.status());
+            }
+        }
     }
 
     private static StackResource resource(String logicalId, String physicalId, String resourceType, String status) {

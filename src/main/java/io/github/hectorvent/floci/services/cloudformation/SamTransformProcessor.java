@@ -44,6 +44,9 @@ class SamTransformProcessor {
     /** A {@code ${Name}} reference in an {@code Fn::Sub} string, as SAM matches one. */
     private static final Pattern SUB_REFERENCE = Pattern.compile("\\$\\{([A-Za-z0-9.]+|AWS::[A-Z][A-Za-z]*)}");
 
+    /** What SAM accepts as a logical id. */
+    private static final Pattern ALPHANUMERIC = Pattern.compile("[A-Za-z0-9]+");
+
     private final ObjectMapper objectMapper;
 
     SamTransformProcessor(ObjectMapper objectMapper) {
@@ -91,6 +94,12 @@ class SamTransformProcessor {
         // (including the early return below when Resources is absent or not an object).
         JsonNode globals = expanded.path("Globals");
         expanded.remove("Globals");
+        // SAM refuses any Globals property it does not list for a section. AutoPublishCodeSha256 is
+        // one of them: one value there would name every function's version.
+        if (globals.path("Function").has("AutoPublishCodeSha256")) {
+            throw new AwsException("ValidationError", "'Globals' section is invalid. 'AutoPublishCodeSha256' "
+                    + "is not a supported property of 'Function'.", 400);
+        }
 
         JsonNode resources = expanded.path("Resources");
         if (!resources.isObject()) {
@@ -987,11 +996,13 @@ class SamTransformProcessor {
      * dependencies, so the alias selects the immutable version published by this stack. The
      * version's logical id carries a hash of what a new version publishes (see
      * {@link #versionLogicalId}), so an update that changes the code names a new version resource,
-     * which publishes, and the alias follows it.
+     * which publishes, and the alias follows it; a given {@code AutoPublishCodeSha256} fixes the id
+     * instead.
      */
     private String expandAutoPublishAlias(String functionLogicalId, JsonNode properties, JsonNode functionProperties,
                                           ObjectNode passthrough, JsonNode template,
                                           Map<String, String> parameterValues, ObjectNode resources) {
+        validateVersionProperties(functionLogicalId, properties);
         JsonNode aliasName = properties.path("AutoPublishAlias");
         if (aliasName.isMissingNode() || aliasName.isNull()
                 || (aliasName.isTextual() && aliasName.asText().isBlank())) {
@@ -1010,7 +1021,7 @@ class SamTransformProcessor {
         // The version a new hash replaces leaves the template on that update; like SAM, keep it
         // published unless the template says otherwise, so the update reports it DELETE_SKIPPED.
         if (!versionDef.has("DeletionPolicy")) {
-            versionDef.put("DeletionPolicy", "Retain");
+            versionDef.set("DeletionPolicy", defaultVersionDeletionPolicy(properties));
         }
         resources.set(versionId, versionDef);
 
@@ -1032,34 +1043,105 @@ class SamTransformProcessor {
     }
 
     /**
-     * The logical id SAM gives the version it publishes: {@code <Function>Version} and the first ten
+     * SAM's {@code DeletionPolicy} for the version when the function declares none: the function's
+     * {@code VersionDeletionPolicy}, else {@code Delete} for a function on a capacity provider and
+     * {@code Retain} for any other.
+     */
+    private JsonNode defaultVersionDeletionPolicy(JsonNode properties) {
+        JsonNode versionDeletionPolicy = properties.path("VersionDeletionPolicy");
+        if (isPropertyPresent(versionDeletionPolicy)) {
+            return versionDeletionPolicy.deepCopy();
+        }
+        return TextNode.valueOf(isPropertyPresent(properties.path("CapacityProviderConfig")) ? "Delete" : "Retain");
+    }
+
+    /**
+     * The checks SAM makes on every function's version properties before it transforms them: the
+     * type each must have, and that {@code VersionDeletionPolicy} comes with an
+     * {@code AutoPublishAlias}. Like SAM, it takes any one-key object for an intrinsic function where
+     * the property allows one.
+     */
+    private void validateVersionProperties(String functionLogicalId, JsonNode properties) {
+        JsonNode codeSha256 = properties.path("AutoPublishCodeSha256");
+        if (isPropertyPresent(codeSha256) && !codeSha256.isTextual() && !isOneKeyObject(codeSha256)) {
+            throw invalidResource(functionLogicalId, "Type of property 'AutoPublishCodeSha256' is invalid.");
+        }
+        JsonNode allProperties = properties.path("AutoPublishAliasAllProperties");
+        if (isPropertyPresent(allProperties) && !allProperties.isBoolean()) {
+            throw invalidResource(functionLogicalId, "Type of property 'AutoPublishAliasAllProperties' is invalid.");
+        }
+        JsonNode versionDeletionPolicy = properties.path("VersionDeletionPolicy");
+        if (!isPropertyPresent(versionDeletionPolicy)) {
+            return;
+        }
+        boolean allowed = versionDeletionPolicy.isTextual()
+                && List.of("Delete", "Retain").contains(versionDeletionPolicy.asText());
+        if (!allowed && !isOneKeyObject(versionDeletionPolicy)) {
+            throw invalidResource(functionLogicalId,
+                    "Property 'VersionDeletionPolicy' should be a one of the strings: 'Delete' or 'Retain'.");
+        }
+        if (!isPropertyPresent(properties.path("AutoPublishAlias"))) {
+            throw invalidResource(functionLogicalId, "'VersionDeletionPolicy' requires 'AutoPublishAlias'.");
+        }
+    }
+
+    private static boolean isOneKeyObject(JsonNode node) {
+        return node.isObject() && node.size() == 1;
+    }
+
+    /**
+     * The logical id of the version the alias points at: {@code <Function>Version} and the first ten
      * hex digits of the SHA-1 of the function's {@code Code}, with references to template parameters
      * resolved, merged with its {@code Environment}, its {@code MemorySize} and a {@code SnapStart}
      * that applies, as sorted compact JSON with characters outside printable ASCII as lowercase hex
-     * escapes, apart from JSON's short escapes such as a newline's. A change to the hashed input is a new logical id: the update publishes a new version and the alias moves
-     * to it. Unchanged, the id and the version it published stay, since the version provisioner never
-     * republishes under the same id.
+     * escapes, apart from JSON's short escapes such as a newline's; that is the id SAM gives. Under
+     * {@code AutoPublishAliasAllProperties} the hash covers all the properties this transform gives
+     * the function, the code's parameter references still resolved, plus its {@code SnapStart},
+     * which makes the id floci's own. A string
+     * {@code AutoPublishCodeSha256} names the version itself, by its first ten characters. A change
+     * to the hashed input is a new logical id, so a new version resource, which publishes when the
+     * function's code or configuration changed since its last version. Unchanged, the id and the
+     * version it published stay, since the version provisioner never republishes under the same id.
      */
     private String versionLogicalId(String functionLogicalId, JsonNode samProperties, JsonNode functionProperties,
                                     JsonNode template, Map<String, String> parameterValues) {
+        String codeSha256 = autoPublishCodeSha256(functionLogicalId, samProperties, template, parameterValues);
+        if (codeSha256 != null && !codeSha256.isEmpty()) {
+            String given = codeSha256.substring(0, Math.min(10, codeSha256.length()));
+            if (!ALPHANUMERIC.matcher(given).matches()) {
+                throw invalidResource(functionLogicalId + "Version" + given, "Logical ids must be alphanumeric.");
+            }
+            return functionLogicalId + "Version" + given;
+        }
+        // SAM resolves the code in place, so the all-properties hash sees it resolved as well.
         JsonNode code = resolveParameterRefs(functionProperties.path("Code"), template, parameterValues);
         ObjectNode hashed = objectMapper.createObjectNode();
-        if (code.isObject()) {
-            hashed.setAll((ObjectNode) code);
-        }
-        JsonNode environment = functionProperties.path("Environment");
-        if (environment.isObject()) {
-            hashed.setAll((ObjectNode) environment.deepCopy());
-        }
-        if (functionProperties.has("MemorySize")) {
-            hashed.set("MemorySize", functionProperties.get("MemorySize").deepCopy());
-        }
-        // SAM hashes a SnapStart that applies, so the id matches the one SAM gives. A missing
-        // ApplyOn means None; a null one does not.
         JsonNode snapStart = samProperties.path("SnapStart");
-        JsonNode applyOn = snapStart.path("ApplyOn");
-        if (snapStart.isObject() && !applyOn.isMissingNode() && !"None".equals(applyOn.asText(null))) {
-            hashed.set("SnapStart", snapStart.deepCopy());
+        if (samProperties.path("AutoPublishAliasAllProperties").asBoolean(false)) {
+            hashed.setAll((ObjectNode) functionProperties.deepCopy());
+            if (code.isObject()) {
+                hashed.set("Code", code);
+            }
+            if (isPropertyPresent(snapStart)) {
+                hashed.set("SnapStart", snapStart.deepCopy());
+            }
+        } else {
+            if (code.isObject()) {
+                hashed.setAll((ObjectNode) code);
+            }
+            JsonNode environment = functionProperties.path("Environment");
+            if (environment.isObject()) {
+                hashed.setAll((ObjectNode) environment.deepCopy());
+            }
+            if (functionProperties.has("MemorySize")) {
+                hashed.set("MemorySize", functionProperties.get("MemorySize").deepCopy());
+            }
+            // SAM hashes a SnapStart that applies, so the id matches the one SAM gives. A missing
+            // ApplyOn means None; a null one does not.
+            JsonNode applyOn = snapStart.path("ApplyOn");
+            if (snapStart.isObject() && !applyOn.isMissingNode() && !"None".equals(applyOn.asText(null))) {
+                hashed.set("SnapStart", snapStart.deepCopy());
+            }
         }
         String hashInput;
         try {
@@ -1074,6 +1156,23 @@ class SamTransformProcessor {
             throw new IllegalStateException("Cannot serialize the version hash input of " + functionLogicalId, e);
         }
         return functionLogicalId + "Version" + Digests.sha1Hex(hashInput).substring(0, 10);
+    }
+
+    /**
+     * The function's {@code AutoPublishCodeSha256} with template parameters resolved, or null when it
+     * declares none. As in SAM, an intrinsic function that does not resolve to a string is refused.
+     */
+    private String autoPublishCodeSha256(String functionLogicalId, JsonNode samProperties, JsonNode template,
+                                         Map<String, String> parameterValues) {
+        JsonNode given = samProperties.path("AutoPublishCodeSha256");
+        if (!isPropertyPresent(given)) {
+            return null;
+        }
+        JsonNode resolved = resolveParameterRefs(given, template, parameterValues);
+        if (!resolved.isTextual()) {
+            throw invalidResource(functionLogicalId, "AutoPublishCodeSha256 must be a string");
+        }
+        return resolved.asText();
     }
 
     /**

@@ -32,14 +32,18 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static io.github.hectorvent.floci.testing.ThreadStates.awaitBlockedOrDone;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -452,6 +456,20 @@ class ExternalTableMaterializerTest {
         assertThat(backend.statements.getLast(), containsString("CREATE TABLE \"analytics\".\"events\""));
     }
 
+    @Test
+    void invalidatingDataKeepsTheExistingTableAndItsDependencies() {
+        when(glue.getTable("lake", "events")).thenReturn(csvTable());
+        materializer.ensureCurrent(backend, session(false), BINDING, "events");
+        materializer.invalidateTable(BINDING.clusterKey(), "dev", "analytics", "events");
+        backend.statements.clear();
+
+        assertThat(materializer.ensureCurrent(backend, session(false), BINDING, "events"),
+                equalTo(ExternalTableMaterializer.Outcome.LOADED));
+        String swap = backend.statements.getLast();
+        assertThat(swap, containsString("TRUNCATE \"analytics\".\"events\""));
+        assertThat(swap, not(containsString("DROP TABLE IF EXISTS \"analytics\".\"events\"")));
+    }
+
     private void forceReload() {
         when(s3.listObjectsWithPrefixes(eq("bucket"), eq("events/"), eq(""), eq(1000), any(), any()))
                 .thenReturn(new S3Service.ListObjectsResult(
@@ -766,9 +784,13 @@ class ExternalTableMaterializerTest {
             Future<ExternalTableMaterializer.Outcome> first = executor.submit(
                     () -> materializer.ensureCurrent(backend, session(false), BINDING, "events"));
             assertThat(loading.await(10, TimeUnit.SECONDS), equalTo(true));
-            Future<ExternalTableMaterializer.Outcome> second = executor.submit(
-                    () -> materializer.ensureCurrent(backend, session(false), BINDING, "events"));
-            assertThrows(TimeoutException.class, () -> second.get(300, TimeUnit.MILLISECONDS));
+            AtomicReference<Thread> secondThread = new AtomicReference<>();
+            Future<ExternalTableMaterializer.Outcome> second = executor.submit(() -> {
+                secondThread.set(Thread.currentThread());
+                return materializer.ensureCurrent(backend, session(false), BINDING, "events");
+            });
+            awaitBlockedOrDone(secondThread, second);
+            assertFalse(second.isDone());
 
             release.countDown();
 
@@ -777,6 +799,56 @@ class ExternalTableMaterializerTest {
         } finally {
             release.countDown();
             executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void dropWaitsForAnEarlierLoadBeforeDeletingTheMaterializedTable() throws Exception {
+        AtomicReference<Table> stored = new AtomicReference<>(csvTable());
+        AtomicInteger lookups = new AtomicInteger();
+        CountDownLatch reading = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(glue.getTable("lake", "events")).thenAnswer(invocation -> {
+            Table snapshot = stored.get();
+            if (lookups.incrementAndGet() == 1) {
+                reading.countDown();
+                assertTrue(release.await(10, TimeUnit.SECONDS));
+            }
+            if (snapshot == null) {
+                throw new AwsException("EntityNotFoundException", "gone", 400);
+            }
+            return snapshot;
+        });
+        doAnswer(invocation -> {
+            stored.set(null);
+            return null;
+        }).when(glue).deleteTable("lake", "events");
+        ExternalCatalogRegistry registry = mock(ExternalCatalogRegistry.class);
+        when(registry.list(ACCOUNT, BINDING.clusterKey(), "dev")).thenReturn(List.of(BINDING));
+        SpectrumQueryPreparation preparation = new SpectrumQueryPreparation(registry, materializer,
+                new ExternalStatementParser(), glue, mock(ExternalMetadataWriter.class), materializer.catalogLocks());
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            Future<ExternalTableMaterializer.Outcome> load = executor.submit(
+                    () -> materializer.ensureCurrent(backend, session(false), BINDING, "events"));
+            try {
+                assertTrue(reading.await(10, TimeUnit.SECONDS));
+                AtomicReference<Thread> dropThread = new AtomicReference<>();
+                Future<Boolean> drop = executor.submit(() -> {
+                    dropThread.set(Thread.currentThread());
+                    return preparation.prepare("DROP TABLE analytics.events", session(false), backend);
+                });
+                awaitBlockedOrDone(dropThread, drop);
+                assertFalse(drop.isDone());
+                release.countDown();
+                assertEquals(ExternalTableMaterializer.Outcome.LOADED, load.get(10, TimeUnit.SECONDS));
+                assertTrue(drop.get(10, TimeUnit.SECONDS));
+                assertEquals("DROP TABLE IF EXISTS \"analytics\".\"events\" RESTRICT", backend.statements.getLast());
+                assertEquals(ExternalTableMaterializer.Outcome.NOT_EXTERNAL,
+                        materializer.ensureCurrent(backend, session(false), BINDING, "events"));
+                assertTrue(materializer.loadedTables(BINDING.clusterKey(), "dev", "analytics").isEmpty());
+            } finally {
+                release.countDown();
+            }
         }
     }
 

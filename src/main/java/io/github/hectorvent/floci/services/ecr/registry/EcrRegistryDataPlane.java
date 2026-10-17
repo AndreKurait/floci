@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ecr.registry;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.NetworkExposureGuard;
 import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpClient;
@@ -10,6 +11,7 @@ import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.RequestOptions;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import io.vertx.core.net.HostAndPort;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -245,7 +247,9 @@ public class EcrRegistryDataPlane {
                     storageRepositoryName, repository, backendUri,
                     tag(path)));
         }
-        if (!"path".equalsIgnoreCase(uriStyle)) {
+        // A loopback host is the address Floci itself hands the Docker daemon for the ECS and
+        // Lambda images it pulls, path style in either URI style (see rewriteImageUri).
+        if (!"path".equalsIgnoreCase(uriStyle) && !isLoopbackHost(host)) {
             return Optional.empty();
         }
 
@@ -263,6 +267,11 @@ public class EcrRegistryDataPlane {
         return Optional.of(new RegistryRequest(segments[0], segments[1], repository,
                 storageRepositoryName, storageRepositoryName,
                 registryPath + querySuffix(query, true), tag(registryPath)));
+    }
+
+    private static boolean isLoopbackHost(String host) {
+        HostAndPort authority = host == null ? null : HostAndPort.parseAuthority(host, -1);
+        return authority != null && NetworkExposureGuard.isLoopback(authority.host());
     }
 
     private static String querySuffix(String query, boolean removeNamespace) {

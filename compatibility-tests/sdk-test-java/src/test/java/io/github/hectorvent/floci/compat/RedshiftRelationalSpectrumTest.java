@@ -90,16 +90,7 @@ class RedshiftRelationalSpectrumTest {
                         assertEquals(7L, rows.getLong(2));
                         assertFalse(rows.next());
                     }
-                    String id = data.executeStatement(r -> r.clusterIdentifier(clusterId).database("dev")
-                            .dbUser("admin").sql(sql)).id();
-                    Instant deadline = Instant.now().plusSeconds(30);
-                    DescribeStatementResponse status = data.describeStatement(r -> r.id(id));
-                    while (!status.statusAsString().equals("FINISHED") && Instant.now().isBefore(deadline)) {
-                        assertNotEquals("FAILED", status.statusAsString(), status.error());
-                        Thread.sleep(100);
-                        status = data.describeStatement(r -> r.id(id));
-                    }
-                    assertEquals("FINISHED", status.statusAsString(), status.error());
+                    String id = executeLifecycle(data, clusterId, sql);
                     GetStatementResultResponse result = data.getStatementResult(r -> r.id(id));
                     assertEquals(2L, result.totalNumRows());
                     assertEquals("VN", result.records().get(0).get(0).stringValue());
@@ -119,6 +110,24 @@ class RedshiftRelationalSpectrumTest {
                         assertTrue(rows.next());
                         assertEquals(0L, rows.getLong(1));
                     }
+                    setup.execute("CREATE EXTERNAL TABLE lake.partitioned_events (id INTEGER, amount INTEGER) "
+                            + "PARTITIONED BY (dt VARCHAR) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' "
+                            + "STORED AS TEXTFILE LOCATION 's3://" + bucket + "/partitioned/'");
+                    executeLifecycle(data, clusterId, "ALTER TABLE lake.partitioned_events ADD PARTITION (dt='first') "
+                            + "LOCATION 's3://" + bucket + "/events/'");
+                    assertEquals("first", glue.getPartitions(r -> r.databaseName(database).tableName("partitioned_events"))
+                            .partitions().get(0).values().get(0));
+                    try (ResultSet rows = setup.executeQuery("SELECT SUM(amount) FROM lake.partitioned_events")) {
+                        assertTrue(rows.next());
+                        assertEquals(22L, rows.getLong(1));
+                    }
+                    executeLifecycle(data, clusterId, "DROP TABLE lake.partitioned_events");
+                    assertTrue(glue.getTables(r -> r.databaseName(database)).tableList().stream()
+                            .noneMatch(table -> table.name().equals("partitioned_events")));
+                    executeLifecycle(data, clusterId, "DROP SCHEMA lake CASCADE");
+                    assertEquals("events", glue.getTable(r -> r.databaseName(database).name("events")).table().name());
+                    assertEquals("1,10\n1,5\n2,7\n", s3.getObjectAsBytes(r -> r.bucket(bucket).key("events/data.csv"))
+                            .asUtf8String());
                 }
             } finally {
                 if (clusterCreated) {
@@ -139,5 +148,19 @@ class RedshiftRelationalSpectrumTest {
                 }
             }
         }
+    }
+
+    private static String executeLifecycle(RedshiftDataClient data, String clusterId, String sql) throws InterruptedException {
+        String id = data.executeStatement(r -> r.clusterIdentifier(clusterId).database("dev")
+                .dbUser("admin").sql(sql)).id();
+        Instant deadline = Instant.now().plusSeconds(30);
+        DescribeStatementResponse status = data.describeStatement(r -> r.id(id));
+        while (!status.statusAsString().equals("FINISHED") && Instant.now().isBefore(deadline)) {
+            assertNotEquals("FAILED", status.statusAsString(), status.error());
+            Thread.sleep(100);
+            status = data.describeStatement(r -> r.id(id));
+        }
+        assertEquals("FINISHED", status.statusAsString(), status.error());
+        return id;
     }
 }

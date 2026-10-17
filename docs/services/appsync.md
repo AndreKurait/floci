@@ -238,6 +238,7 @@ Responses are `application/json` with AWS AppSync wire shapes (`data` / `errors[
 | API exists but no executable schema (incl. PROCESSING) | **502** | `GraphQLSchemaException` — `No schema definition exists.` + `x-amzn-errortype` |
 | Unexpected failure | 500 | `InternalFailure` |
 | Missing/invalid/expired credentials, unconfigured mode, Lambda deny | **401** | `UnauthorizedException` — GraphQL does not run; `x-amzn-errortype` is set. Missing headers use message `Missing authorization header`. |
+| `AWS_IAM` with an unknown access key, or a session token that does not fit the key | **403** | `UnrecognizedClientException`: `The security token included in the request is invalid`, ending with a period only when no token or an empty one came |
 | Field directive mismatch, Cognito group miss, Lambda `deniedFields`, IAM field DENY | **200** | Field is `null` and `errors[]` contains `Unauthorized` — `Not Authorized to access {field} on type {type}` (no `x-amzn-errortype`) |
 
 **Evidence for data-plane statuses** (empty/`[]`/`{}` → 400; missing schema → 502): AppSync team sample in [graphql/graphql-over-http#81](https://github.com/graphql/graphql-over-http/issues/81) (@robzhu). The management API Reference lists `GraphQLSchemaException` as HTTP 400 for “schema not valid” on management operations — a different surface than the GraphQL execute data plane.
@@ -248,7 +249,7 @@ Request auth runs after Content-Type and body parse and after API lookup (unknow
 
 Headers are classified by **shape** (not primary-then-fallback). If both `x-api-key` and SigV4 `Authorization` are present, **SigV4 wins**. AppSync does not fall back to the API key when IAM validation fails.
 
-Missing required auth headers return HTTP **401** `UnauthorizedException` with message `Missing authorization header`. Invalid or expired credentials that are present still return 401 with `You are not authorized to make this call.`
+Missing required auth headers return HTTP **401** `UnauthorizedException` with message `Missing authorization header`. Invalid or expired credentials that are present still return 401 with `You are not authorized to make this call.`, except the 403 `AWS_IAM` cases in the table above.
 
 | Header shape | Mode |
 |---|---|
@@ -262,7 +263,7 @@ Configured modes are the API default `authenticationType` plus `additionalAuthen
 | Mode | Emulator notes |
 |---|---|
 | API_KEY | Lookup by `ApiKey.id`, which is the key value (`da2-…`). Identity is absent (not `{}`). Default key expiry is 7 days when `expires` is omitted; stored `expires` is rounded down to the nearest hour. Create/UpdateApiKey require `expires` between 1 and 365 days from now (`ApiKeyValidityOutOfBoundsException`, 400). `deletes` is `expires` plus 60 days. |
-| AWS_IAM | Verifies a real header-signed SigV4 request (`appsync` service, fixed `/v1/apis/{apiId}/graphql` canonical path, 5-minute clock skew): the `Credential=` access key must resolve to a secret via `IamService`, and the signature must match. The legacy `test`/`test` pair is still emulator ALLOW, but it must be signed with secret `test` like any other key, and it is not a bypass. A temporary (`ASIA...`) credential must also present the `X-Amz-Security-Token` header matching the one issued for it. An unknown or unsigned key is always 401 and never becomes the account-root identity. Known keys additionally evaluate `appsync:GraphQL`. |
+| AWS_IAM | Verifies a real header-signed SigV4 request (`appsync` service, fixed `/v1/apis/{apiId}/graphql` canonical path, 5-minute clock skew): the `Credential=` access key must resolve to a secret via `IamService`, and the signature must match. The legacy `test`/`test` pair is still emulator ALLOW, but it must be signed with secret `test` like any other key, and it is not a bypass. A temporary (`ASIA...`) credential must also present the `X-Amz-Security-Token` header issued with it, and a long-term key must present none, as on AWS. The `test` key takes any token. An unknown key is 403 and an unsigned one 401, and neither becomes the account-root identity. Known keys additionally evaluate `appsync:GraphQL`. |
 | Cognito / OIDC | JWT signature is verified, not just decoded. Cognito checks the token against the issuing user pool's own RS256 signing key (`alg`, `kid`, issuer, audience/`clientId`, expiry); OIDC checks it against the configured issuer's published JWKS (via OIDC discovery), the same way the HTTP API JWT authorizer does. Both fail closed: an unreachable issuer, unsupported algorithm (including `none`), unmatched `kid`, or bad signature is 401. OIDC as the sole mode still skips the token's own `iss` claim check, but the signature is always verified against the configured issuer's keys. OIDC identity is `{sub, issuer, claims}` (no `sourceIp`). |
 | Lambda | AppSync `isAuthorized` contract via `LambdaService.invoke` (not an API Gateway policy document). |
 

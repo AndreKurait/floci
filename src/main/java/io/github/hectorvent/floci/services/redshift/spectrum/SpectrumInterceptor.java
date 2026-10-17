@@ -89,7 +89,7 @@ public final class SpectrumInterceptor {
         switch (plan) {
             case Plan.ExternalDdl(String sql, SpectrumSession session) -> {
                 if (preparation.prepare(sql, session, new PostgresBackendSession(backend))) {
-                    return new Decision.Handled();
+                    return new Decision.Handled(preparation.commandTag(sql));
                 }
                 return execute(plan(sql, accountId, databaseName), accountId, databaseName, backend);
             }
@@ -145,7 +145,10 @@ public final class SpectrumInterceptor {
     }
 
     public sealed interface Decision permits Decision.Handled, Decision.Forward, Decision.Rewritten {
-        record Handled() implements Decision {
+        record Handled(String commandTag) implements Decision {
+            public Handled() {
+                this("CREATE EXTERNAL");
+            }
         }
 
         record Forward() implements Decision {

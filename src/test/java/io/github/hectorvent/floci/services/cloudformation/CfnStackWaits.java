@@ -74,15 +74,12 @@ final class CfnStackWaits {
     }
 
     /**
-     * Waits until DescribeStacks reports {@code expectedStatus} and returns that state. Unlike
-     * {@link #awaitTerminal}, a rollback is waited out: a stack rolling back shows CREATE_FAILED or
-     * UPDATE_FAILED for a moment before ROLLBACK_IN_PROGRESS, so while a rollback status is expected
-     * only a failed rollback is final. Any other terminal status fails at once with its reason, as
-     * do a DescribeStacks that is not 200 and ten seconds without the expected status.
+     * Waits until DescribeStacks reports {@code expectedStatus} and returns that state. Any other
+     * terminal status fails at once with its reason, as do a DescribeStacks that is not 200 and ten
+     * seconds without the expected status.
      */
     static StackState awaitStatus(String stackName, String expectedStatus) {
         long deadline = System.currentTimeMillis() + 10_000;
-        boolean rollbackExpected = expectedStatus.contains("ROLLBACK");
         StackState last = new StackState(null, "");
         while (System.currentTimeMillis() < deadline) {
             Response response = given()
@@ -100,9 +97,7 @@ final class CfnStackWaits {
             if (expectedStatus.equals(last.status())) {
                 return last;
             }
-            boolean onTheWayToRollback = rollbackExpected
-                    && ("CREATE_FAILED".equals(last.status()) || "UPDATE_FAILED".equals(last.status()));
-            if (last.status() != null && TERMINAL.contains(last.status()) && !onTheWayToRollback) {
+            if (last.status() != null && TERMINAL.contains(last.status())) {
                 fail("Stack " + stackName + " reached " + last.status() + " instead of " + expectedStatus
                         + ": " + last.reason());
             }

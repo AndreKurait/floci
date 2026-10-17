@@ -48,8 +48,8 @@ final class ExtendedSpectrumExchange {
             PortalCursor cursor = cursors.get(portalName);
             if (cursor == null) {
                 SpectrumInterceptor.Decision decision = interceptor.execute(plan, accountId, database, backend);
-                if (decision instanceof SpectrumInterceptor.Decision.Handled) {
-                    forward(client, commandComplete("CREATE EXTERNAL"));
+                if (decision instanceof SpectrumInterceptor.Decision.Handled handled) {
+                    forward(client, commandComplete(handled.commandTag()));
                     failed = false;
                     return;
                 }
