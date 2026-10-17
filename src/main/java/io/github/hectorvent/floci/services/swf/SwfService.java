@@ -1912,13 +1912,6 @@ public class SwfService implements Resettable {
                 .isPresent());
     }
 
-    /**
-     * True when nothing is pending, so the decider gets another decision task rather than
-     * an execution stalled with no outstanding work and no scheduled decision.
-     */
-    private boolean hasNothingPending(SwfWorkflowExecution execution) {
-        return !hasOpenWork(execution);
-    }
 
     public int openActivityCount(SwfWorkflowExecution execution) {
         return (int) execution.getActivities().values().stream().filter(SwfActivityTask::isOpen).count();
