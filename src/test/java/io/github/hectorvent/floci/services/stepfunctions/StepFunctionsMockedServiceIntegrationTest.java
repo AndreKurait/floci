@@ -30,7 +30,7 @@ class StepFunctionsMockedServiceIntegrationTest {
     private static final String DDB_CONTENT_TYPE = "application/x-amz-json-1.0";
     private static final String ROLE_ARN = "arn:aws:iam::000000000000:role/test-role";
     private static final String TABLE_NAME = "sfn-mock-items";
-    private static final String UNSUPPORTED_RESOURCE = "arn:aws:states:::apigateway:invoke";
+    private static final String API_RESOURCE = "arn:aws:states:::apigateway:invoke";
     private static final ObjectMapper mapper = new ObjectMapper();
 
     private static String mockSmArn;
@@ -72,7 +72,7 @@ class StepFunctionsMockedServiceIntegrationTest {
                     }
                   }
                 }
-                """.formatted(UNSUPPORTED_RESOURCE));
+                """.formatted(API_RESOURCE));
 
         ddbSmArn = createStateMachine("sfn-mock-ddb-test", null, """
                 {
@@ -98,7 +98,7 @@ class StepFunctionsMockedServiceIntegrationTest {
                     }
                   }
                 }
-                """.formatted(UNSUPPORTED_RESOURCE, TABLE_NAME));
+                """.formatted(API_RESOURCE, TABLE_NAME));
 
         expressSmArn = createStateMachine("sfn-mock-express-test", "EXPRESS", """
                 {
@@ -111,7 +111,7 @@ class StepFunctionsMockedServiceIntegrationTest {
                     }
                   }
                 }
-                """.formatted(UNSUPPORTED_RESOURCE));
+                """.formatted(API_RESOURCE));
 
         skipSmArn = createStateMachine("sfn-mock-skip-test", null, """
                 {
@@ -134,7 +134,7 @@ class StepFunctionsMockedServiceIntegrationTest {
                     }
                   }
                 }
-                """.formatted(UNSUPPORTED_RESOURCE, UNSUPPORTED_RESOURCE));
+                """.formatted(API_RESOURCE, API_RESOURCE));
 
         given()
                 .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
@@ -254,7 +254,7 @@ class StepFunctionsMockedServiceIntegrationTest {
         Response describe = waitForTerminalState(execArn);
         assertEquals("FAILED", describe.jsonPath().getString("status"));
         assertEquals("States.TaskFailed", describe.jsonPath().getString("error"));
-        assertTrue(describe.jsonPath().getString("cause").contains("Unsupported resource"));
+        assertTrue(describe.jsonPath().getString("cause").contains("only REST POST with IAM_ROLE and JSON request body is supported"));
     }
 
     @Test
@@ -283,7 +283,7 @@ class StepFunctionsMockedServiceIntegrationTest {
         Response describe = waitForTerminalState(execArn);
         assertEquals("FAILED", describe.jsonPath().getString("status"));
         assertEquals("States.TaskFailed", describe.jsonPath().getString("error"));
-        assertTrue(describe.jsonPath().getString("cause").contains("Unsupported resource"));
+        assertTrue(describe.jsonPath().getString("cause").contains("only REST POST with IAM_ROLE and JSON request body is supported"));
     }
 
     @Test
