@@ -1480,6 +1480,14 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean enforcementEnabled();
 
+        /** Enables bounded metadata lookup and proof verification for current AssumeRole sessions. */
+        @WithDefault("false")
+        boolean issuedSessionVerificationEnabled();
+
+        /** Enables issuer-owned current Lambda execution identity observations and proof verification. */
+        @WithDefault("false")
+        boolean lambdaIdentityVerificationEnabled();
+
         @WithDefault("false")
         boolean seedDeployerPrincipal();
 
@@ -2907,6 +2915,15 @@ public interface EmulatorConfig {
         int containerIdleTimeoutSeconds();
 
         /**
+         * One shutdown drain budget shared by provisioned and on-demand Lambda containers.
+         * Values outside 1 through 300 seconds fail initialization.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_CONTAINER_DRAIN_TIMEOUT_SECONDS
+         */
+        @WithDefault("15")
+        int containerDrainTimeoutSeconds();
+
+        /**
          * Maximum idle (warm) containers kept per function. A container released when the
          * function already holds this many idle ones is stopped instead of pooled.
          *
@@ -2934,6 +2951,14 @@ public interface EmulatorConfig {
 
         /** Docker network to attach Lambda containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
+
+        /**
+         * Additional existing Docker networks joined before a Lambda container starts.
+         * The primary network remains selected by docker-network or docker-flags.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS (comma-separated)
+         */
+        Optional<List<String>> additionalDockerNetworks();
 
         /** Additional Docker create flags applied to every Lambda execution container. */
         Optional<String> dockerFlags();
