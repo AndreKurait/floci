@@ -63,6 +63,7 @@ class IamConditionContextResolverTest {
     private RequestContext requestContext;
     private EmulatorConfig config;
     private IamConditionContextResolver resolver;
+    private ResolvedServiceCatalog serviceCatalog;
 
     @SuppressWarnings("unchecked")
     @BeforeEach
@@ -89,9 +90,16 @@ class IamConditionContextResolverTest {
         requestContext.setRegion("us-east-1");
         config = mock(EmulatorConfig.class);
         when(config.defaultRegion()).thenReturn("us-east-1");
+        serviceCatalog = mock(ResolvedServiceCatalog.class);
+        ServiceDescriptor dynamo = new ServiceDescriptor("dynamodb", "dynamodb", true, true,
+                null, null, 0L, null, ServiceProtocol.JSON, Set.of(ServiceProtocol.JSON),
+                Set.of("DynamoDB_20111205."), Set.of("dynamodb"), Set.of(), Set.of(),
+                Set.of("DynamoDB_20111205."));
+        ServiceCatalog catalog = new ServiceCatalog(List.of(dynamo));
+        when(serviceCatalog.matchTarget(any())).thenAnswer(call -> catalog.matchTarget(call.getArgument(0)));
         resolver = new IamConditionContextResolver(
                 dynamoDbFacadeInstance, ec2ServiceInstance, s3ServiceInstance, logsServiceInstance, requestContext, config,
-                null);
+                null, serviceCatalog);
     }
 
     @Test
@@ -360,7 +368,7 @@ class IamConditionContextResolverTest {
     @SuppressWarnings("unchecked")
     private IamConditionContextResolver resolverAt(Instant now) {
         return new IamConditionContextResolver(mock(Instance.class), mock(Instance.class), mock(Instance.class),
-                mock(Instance.class), requestContext, config, null, Clock.fixed(now, ZoneOffset.UTC));
+                mock(Instance.class), requestContext, config, null, serviceCatalog, Clock.fixed(now, ZoneOffset.UTC));
     }
 
     @Test
@@ -469,6 +477,47 @@ class IamConditionContextResolverTest {
                 assertEquals(primary.get("dynamodb:Attributes"), remaining.get(i).get("dynamodb:Attributes"));
             }
         }
+    }
+
+    @Test
+    void legacyQueryConditionsRequireTheLegacyJsonTarget() {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json("""
+                {"TableName":"FgacTable","HashKeyValue":{"S":"USER_bob"},
+                 "RangeKeyCondition":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"private"}]},
+                 "Count":true,"AttributesToGet":["secret"],
+                 "KeyConditions":{"PK":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"USER_alice"}]}}}
+                """));
+        when(request.getMediaType()).thenReturn(MediaType.valueOf("application/x-amz-json-1.0"));
+        when(request.getHeaderString("X-Amz-Target")).thenReturn("DynamoDB_20111205.Query");
+        TableDefinition table = fgacTable();
+        table.setKeySchema(List.of(new KeySchemaElement("PK", "HASH"), new KeySchemaElement("SK", "RANGE")));
+        when(dynamoDbService.findTable("FgacTable", "us-east-1")).thenReturn(Optional.of(table));
+        Map<String, List<String>> legacy = resolver.resolve("dynamodb", "dynamodb:Query", request);
+        assertEquals(List.of("USER_bob"), legacy.get("dynamodb:LeadingKeys"));
+        assertEquals(Set.of("PK", "SK", "secret"), new HashSet<>(legacy.get("dynamodb:Attributes")));
+        assertEquals(List.of("COUNT"), legacy.get("dynamodb:Select"));
+        when(request.getHeaderString("X-Amz-Target")).thenReturn("DynamoDB_20120810.Query");
+        Map<String, List<String>> modern = resolver.resolve("dynamodb", "dynamodb:Query", request);
+        assertEquals(List.of("USER_alice"), modern.get("dynamodb:LeadingKeys"));
+        assertFalse(modern.containsKey("dynamodb:Select"));
+    }
+
+    @Test
+    void legacyBatchDeleteCannotHidePartitionOrAttributeNames() {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json("""
+                {"RequestItems":{"FgacTable":[{"DeleteRequest":{"Key":{
+                  "HashKeyElement":{"S":"USER_bob"},"RangeKeyElement":{"S":"private"}}}}]}}
+                """));
+        when(request.getMediaType()).thenReturn(MediaType.valueOf("application/x-amz-json-1.0"));
+        when(request.getHeaderString("X-Amz-Target")).thenReturn("DynamoDB_20111205.BatchWriteItem");
+        TableDefinition table = fgacTable();
+        table.setKeySchema(List.of(new KeySchemaElement("PK", "HASH"), new KeySchemaElement("SK", "RANGE")));
+        when(dynamoDbService.findTable("FgacTable", "us-east-1")).thenReturn(Optional.of(table));
+        Map<String, List<String>> conditions = resolver.resolve("dynamodb", "dynamodb:BatchWriteItem", request);
+        assertEquals(List.of("USER_bob"), conditions.get("dynamodb:LeadingKeys"));
+        assertEquals(Set.of("PK", "SK"), new HashSet<>(conditions.get("dynamodb:Attributes")));
     }
 
     @Test

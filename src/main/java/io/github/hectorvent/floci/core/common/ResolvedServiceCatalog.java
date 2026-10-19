@@ -88,6 +88,7 @@ import jakarta.inject.Inject;
 
 import java.util.Arrays;
 import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -135,7 +136,8 @@ public class ResolvedServiceCatalog {
                         config.storage().services().dynamodb().flushIntervalMs(), null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON, ServiceProtocol.CBOR),
                         Set.of("DynamoDB_20120810.", "DynamoDBStreams_20120810."),
-                        Set.of("dynamodb"), Set.of("DynamoDB", "DynamoDB Streams"), Set.of()),
+                        Set.of("dynamodb"), Set.of("DynamoDB", "DynamoDB Streams"), Set.of(),
+                        "DynamoDB_20111205."),
                 descriptor("sns", "sns", config.services().sns().enabled(), true,
                         "sns", storageMode(config.storage().services().sns().mode(), config.storage().mode()),
                         config.storage().services().sns().flushIntervalMs(), AwsNamespaces.SNS, ServiceProtocol.QUERY,
@@ -850,8 +852,11 @@ public class ResolvedServiceCatalog {
             Set<String> targetPrefixes,
             Set<String> credentialScopes,
             Set<String> cborSdkServiceIds,
-            Set<Class<?>> resourceClasses
+            Set<Class<?>> resourceClasses,
+            String... jsonOnlyTargetPrefixes
     ) {
+        Set<String> resolvedTargetPrefixes = new HashSet<>(targetPrefixes);
+        resolvedTargetPrefixes.addAll(Set.of(jsonOnlyTargetPrefixes));
         return new ServiceDescriptor(
                 externalKey,
                 configKey,
@@ -863,10 +868,11 @@ public class ResolvedServiceCatalog {
                 xmlNamespace,
                 defaultProtocol,
                 Set.copyOf(supportedProtocols),
-                Set.copyOf(targetPrefixes),
+                Set.copyOf(resolvedTargetPrefixes),
                 Set.copyOf(credentialScopes),
                 Set.copyOf(cborSdkServiceIds),
-                Set.copyOf(resourceClasses)
+                Set.copyOf(resourceClasses),
+                Set.of(jsonOnlyTargetPrefixes)
         );
     }
 

@@ -111,6 +111,6 @@ class AwsQueryServiceResolverTest {
 
     private static ServiceDescriptor descriptor(String service, ServiceProtocol protocol) {
         return new ServiceDescriptor(service, service, true, true, service, "memory", 0L,
-                null, protocol, Set.of(protocol), Set.of(), Set.of(service), Set.of(), Set.of());
+                null, protocol, Set.of(protocol), Set.of(), Set.of(service), Set.of(), Set.of(), Set.of());
     }
 }

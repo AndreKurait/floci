@@ -160,6 +160,9 @@ public class AwsJsonController {
                     if (targetMatch.prefix().startsWith("DynamoDBStreams_")) {
                         yield dynamoDbStreamsJsonHandler.handle(action, request, region);
                     }
+                    if (targetMatch.jsonOnly()) {
+                        yield dynamoDbJsonHandler.handleLegacy(action, request, region);
+                    }
                     DynamoDbRequestShapes.check(action, request);
                     yield dynamoDbJsonHandler.handle(action, request, region);
                 }
@@ -197,6 +200,9 @@ public class AwsJsonController {
         // boundary so other callers of DynamoDbJsonHandler (CBOR, API Gateway proxy,
         // Step Functions tasks) keep their original ObjectNode entity.
         if ("dynamodb".equals(serviceKey)) {
+            if (targetMatch.jsonOnly()) {
+                response = DynamoDbResponses.withLegacyErrorNamespace(response, objectMapper);
+            }
             return DynamoDbResponses.withCrc32(response, objectMapper);
         }
         return response;

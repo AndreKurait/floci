@@ -50,6 +50,8 @@ class ServiceCatalogRoutingIntegrationTest {
         assertEquals("sqs", catalog.byCborSdkServiceId("AmazonSQS").orElseThrow().externalKey());
         assertEquals("sns", catalog.byCborSdkServiceId("SNS_20100331").orElseThrow().externalKey());
         assertEquals("states", catalog.byCborSdkServiceId("AWSStepFunctions").orElseThrow().externalKey());
+        assertTrue(catalog.byCborSdkServiceId("DynamoDB_20111205").isEmpty());
+        assertEquals("DescribeTable", catalog.matchTarget("DynamoDB_20111205.DescribeTable").orElseThrow().action());
     }
 
     @Test

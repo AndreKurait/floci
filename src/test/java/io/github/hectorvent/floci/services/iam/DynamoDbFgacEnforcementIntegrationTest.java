@@ -36,6 +36,99 @@ class DynamoDbFgacEnforcementIntegrationTest {
         RestAssuredJsonUtils.configureAwsContentTypes();
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"Query", "BatchWriteItem"})
+    void legacyKeysCannotBypassLeadingKeyPolicyWithoutNullGuard(String action) {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String tableName = "fgac-legacy-" + suffix;
+        String roleName = "FgacLegacyRole" + suffix;
+        given().header("Authorization", auth(ROLE_ACCOUNT_ID, "dynamodb"))
+                .header("X-Amz-Target", "DynamoDB_20120810.CreateTable").contentType(DYNAMODB_CONTENT_TYPE)
+                .body("""
+                        {"TableName":"%s","KeySchema":[{"AttributeName":"PK","KeyType":"HASH"},
+                          {"AttributeName":"SK","KeyType":"RANGE"}],
+                         "AttributeDefinitions":[{"AttributeName":"PK","AttributeType":"S"},
+                          {"AttributeName":"SK","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}
+                        """.formatted(tableName)).post("/").then().statusCode(200);
+        createRole(roleName);
+        putBroadDynamoDbRolePolicy(roleName);
+        String accessKey = assumeRoleWithLeadingKeysSessionPolicy(roleName, false);
+        for (String user : new String[]{"USER_bob", "USER_alice"}) {
+            String body = "Query".equals(action)
+                    ? """
+                      {"TableName":"%s","HashKeyValue":{"S":"%s"}}
+                      """.formatted(tableName, user)
+                    : """
+                      {"RequestItems":{"%s":[{"DeleteRequest":{"Key":{
+                        "HashKeyElement":{"S":"%s"},"RangeKeyElement":{"S":"profile"}}}}]}}
+                      """.formatted(tableName, user);
+            if ("USER_bob".equals(user)) {
+                given().header("Authorization", auth(accessKey, "dynamodb"))
+                        .header("X-Amz-Target", "DynamoDB_20111205." + action)
+                        .contentType(DYNAMODB_CONTENT_TYPE).body(body).post("/").then()
+                        .statusCode(400).body(containsString("AccessDeniedException"));
+            } else {
+                given().header("Authorization", auth(accessKey, "dynamodb"))
+                        .header("X-Amz-Target", "DynamoDB_20111205." + action)
+                        .contentType(DYNAMODB_CONTENT_TYPE).body(body).post("/").then().statusCode(200);
+            }
+        }
+    }
+
+    @Test
+    void legacyQueryHonorsProjectedAttributesAndExplicitPartitionDeny() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String tableName = "fgac-legacy-attributes-" + suffix;
+        String roleName = "FgacLegacyAttributes" + suffix;
+        given().header("Authorization", auth(ROLE_ACCOUNT_ID, "dynamodb"))
+                .header("X-Amz-Target", "DynamoDB_20120810.CreateTable").contentType(DYNAMODB_CONTENT_TYPE)
+                .body("""
+                        {"TableName":"%s","KeySchema":[{"AttributeName":"PK","KeyType":"HASH"},
+                          {"AttributeName":"SK","KeyType":"RANGE"}],
+                         "AttributeDefinitions":[{"AttributeName":"PK","AttributeType":"S"},
+                          {"AttributeName":"SK","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}
+                        """.formatted(tableName)).post("/").then().statusCode(200);
+        given().header("Authorization", auth(ROLE_ACCOUNT_ID, "dynamodb"))
+                .header("X-Amz-Target", "DynamoDB_20120810.PutItem").contentType(DYNAMODB_CONTENT_TYPE)
+                .body("""
+                        {"TableName":"%s","Item":{"PK":{"S":"USER_alice"},"SK":{"S":"one"},
+                        "public":{"S":"visible"},"secret":{"S":"fixture-private"}}}
+                        """.formatted(tableName)).post("/").then().statusCode(200);
+        createRole(roleName);
+        putBroadDynamoDbRolePolicy(roleName);
+        String accessKey = assumeRoleWithSessionPolicy(roleName, """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"dynamodb:Query","Resource":"*",
+                   "Condition":{"ForAllValues:StringEquals":{"dynamodb:Attributes":["PK","SK","public"]}}},
+                  {"Effect":"Deny","Action":"dynamodb:Query","Resource":"*",
+                   "Condition":{"ForAnyValue:StringEquals":{"dynamodb:LeadingKeys":["USER_denied"]}}}]}
+                """);
+        for (String[] query : new String[][]{
+                {"USER_alice", "public", "200"}, {"USER_alice", "secret", "400"}, {"USER_denied", "public", "400"}}) {
+            if ("200".equals(query[2])) {
+                given().header("Authorization", auth(accessKey, "dynamodb"))
+                        .header("X-Amz-Target", "DynamoDB_20111205.Query").contentType(DYNAMODB_CONTENT_TYPE)
+                        .body("""
+                                {"TableName":"%s","HashKeyValue":{"S":"%s"},"AttributesToGet":["%s"]}
+                                """.formatted(tableName, query[0], query[1]))
+                        .post("/").then().statusCode(200);
+            } else {
+                given().header("Authorization", auth(accessKey, "dynamodb"))
+                        .header("X-Amz-Target", "DynamoDB_20111205.Query").contentType(DYNAMODB_CONTENT_TYPE)
+                        .body("""
+                                {"TableName":"%s","HashKeyValue":{"S":"%s"},"AttributesToGet":["%s"]}
+                                """.formatted(tableName, query[0], query[1]))
+                        .post("/").then().statusCode(400).body(containsString("AccessDeniedException"));
+            }
+        }
+        given().header("Authorization", auth(accessKey, "dynamodb"))
+                .header("X-Amz-Target", "DynamoDB_20111205.Query").contentType(DYNAMODB_CONTENT_TYPE)
+                .body("""
+                        {"TableName":"%s","HashKeyValue":{"S":"USER_alice"}}
+                        """.formatted(tableName)).post("/").then().statusCode(200)
+                .body("Items[0].secret.S", equalTo("fixture-private"));
+    }
+
     @Test
     void leadingKeysScopedSessionReadsItsOwnPartitionAndIsDeniedAnotherTenants() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
@@ -393,6 +486,10 @@ class DynamoDbFgacEnforcementIntegrationTest {
                    "Condition":{"ForAllValues:StringLike":{"dynamodb:LeadingKeys":["USER_alice*"]}%s}}
                 ]}
                 """.formatted(nullGuard ? ",\"Null\":{\"dynamodb:LeadingKeys\":\"false\"}" : "");
+        return assumeRoleWithSessionPolicy(roleName, policy);
+    }
+
+    private static String assumeRoleWithSessionPolicy(String roleName, String policy) {
         return given()
                 .formParam("Action", "AssumeRole")
                 .formParam("RoleArn", "arn:aws:iam::" + ROLE_ACCOUNT_ID + ":role/" + roleName)

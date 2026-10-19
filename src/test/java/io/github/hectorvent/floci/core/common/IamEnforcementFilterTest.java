@@ -270,7 +270,7 @@ class IamEnforcementFilterTest {
     private static ServiceDescriptor pricingDescriptor() {
         return new ServiceDescriptor("pricing", "pricing", true, true, null, null, 5000L, null,
                 ServiceProtocol.JSON, Set.of(ServiceProtocol.JSON), Set.of("AWSPriceListService."),
-                Set.of("pricing", "api.pricing"), Set.of(), Set.of());
+                Set.of("pricing", "api.pricing"), Set.of(), Set.of(), Set.of());
     }
 
     @Test
@@ -433,7 +433,7 @@ class IamEnforcementFilterTest {
     private static ServiceDescriptor dynamoDbDescriptor() {
         return new ServiceDescriptor("dynamodb", "dynamodb", true, true, "dynamodb", "memory", 0L, null,
                 ServiceProtocol.JSON, Set.of(ServiceProtocol.JSON), Set.of("DynamoDB_20120810."),
-                Set.of("dynamodb"), Set.of(), Set.of());
+                Set.of("dynamodb"), Set.of(), Set.of(), Set.of());
     }
 
     private static ResourceInfo resourceInfo(Class<?> resourceClass) {
@@ -446,7 +446,7 @@ class IamEnforcementFilterTest {
                                                 Set<String> scopes, Class<?> resourceClass) {
         Set<Class<?>> resourceClasses = resourceClass == null ? Set.of() : Set.of(resourceClass);
         return new ServiceDescriptor(service, service, true, true, service, "memory", 0L,
-                null, protocol, Set.of(protocol), Set.of(), scopes, Set.of(), resourceClasses);
+                null, protocol, Set.of(protocol), Set.of(), scopes, Set.of(), resourceClasses, Set.of());
     }
 
     @Test

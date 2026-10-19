@@ -46,7 +46,7 @@ class PersistentPathValidatorTest {
     private static ServiceDescriptor descriptor(String key, boolean enabled, String storageKey, String mode) {
         return new ServiceDescriptor(key, key, enabled, true, storageKey, mode, 0L,
                 null, ServiceProtocol.REST_XML, Set.of(ServiceProtocol.REST_XML),
-                Set.of(), Set.of(), Set.of(), Set.of());
+                Set.of(), Set.of(), Set.of(), Set.of(), Set.of());
     }
 
     @Test

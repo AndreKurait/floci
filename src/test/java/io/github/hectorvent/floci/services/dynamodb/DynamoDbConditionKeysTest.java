@@ -39,6 +39,21 @@ class DynamoDbConditionKeysTest {
     }
 
     @Test
+    void legacyPartitionValuesRemainExplicitWhenTableMetadataIsUnavailable() {
+        DynamoDbConditionKeys.Result query = DynamoDbConditionKeys.extractLegacy("dynamodb:Query",
+                json("{\"TableName\":\"missing\",\"HashKeyValue\":{\"S\":\"USER_bob\"}}"), null);
+        assertEquals(List.of("USER_bob"), query.leadingKeys());
+        assertTrue(query.attributes().isEmpty());
+        DynamoDbConditionKeys.Result deletes = DynamoDbConditionKeys.extractLegacy("dynamodb:BatchWriteItem",
+                json("""
+                        {"RequestItems":{"missing":[{"DeleteRequest":{"Key":{
+                          "HashKeyElement":{"S":"USER_bob"},"RangeKeyElement":{"S":"profile"}}}}]}}
+                        """), null);
+        assertEquals(List.of("USER_bob"), deletes.leadingKeys());
+        assertTrue(deletes.attributes().isEmpty());
+    }
+
+    @Test
     void getItemExposesTheKeyValueAndTheKeyAttributeNames() {
         DynamoDbConditionKeys.Result result = DynamoDbConditionKeys.extract(
                 "dynamodb:GetItem",

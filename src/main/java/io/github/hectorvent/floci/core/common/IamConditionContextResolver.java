@@ -90,6 +90,7 @@ public class IamConditionContextResolver {
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
+    private final ResolvedServiceCatalog serviceCatalog;
 
     /**
      * The system clock, not the CDI one: Object Lock's remaining retention days has to count from the
@@ -102,9 +103,10 @@ public class IamConditionContextResolver {
                                        Instance<CloudWatchLogsService> logsService,
                                        RequestContext requestContext,
                                        EmulatorConfig config,
-                                       CurrentVertxRequest currentVertxRequest) {
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, requestContext, config, currentVertxRequest,
-                Clock.systemUTC());
+                serviceCatalog, Clock.systemUTC());
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -114,7 +116,7 @@ public class IamConditionContextResolver {
                                 RequestContext requestContext,
                                 EmulatorConfig config,
                                 CurrentVertxRequest currentVertxRequest,
-                                Clock clock) {
+                                ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -123,6 +125,7 @@ public class IamConditionContextResolver {
         this.config = config;
         this.currentVertxRequest = currentVertxRequest;
         this.clock = clock;
+        this.serviceCatalog = serviceCatalog;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
@@ -739,7 +742,7 @@ public class IamConditionContextResolver {
             return dynamoDbBatchConditionContext(action, ctx, null);
         }
         TableDefinition table = describeTargetTable(targetTableName(body));
-        DynamoDbConditionKeys.Result keys = DynamoDbConditionKeys.extract(action, body, table);
+        DynamoDbConditionKeys.Result keys = dynamoDbKeys(action, body, table, ctx);
 
         Map<String, List<String>> conditions = new LinkedHashMap<>();
         if (!keys.leadingKeys().isEmpty()) {
@@ -850,8 +853,8 @@ public class IamConditionContextResolver {
             ObjectNode single = ((ObjectNode) body).objectNode();
             single.setAll((ObjectNode) body);
             single.putObject("RequestItems").set(entry.getKey(), entry.getValue());
-            DynamoDbConditionKeys.Result keys = DynamoDbConditionKeys.extract(
-                    action, single, describeTargetTable(reference));
+            DynamoDbConditionKeys.Result keys = dynamoDbKeys(
+                    action, single, describeTargetTable(reference), ctx);
             leadingKeys.addAll(keys.leadingKeys());
             attributes.addAll(keys.attributes());
         });
@@ -878,6 +881,21 @@ public class IamConditionContextResolver {
     private JsonNode bufferedJsonBody(ContainerRequestContext ctx) {
         Object cached = ctx.getProperty(BUFFERED_JSON_BODY);
         return cached instanceof JsonNode node ? node : null;
+    }
+
+    private DynamoDbConditionKeys.Result dynamoDbKeys(
+            String action, JsonNode body, TableDefinition table, ContainerRequestContext ctx) {
+        String target = ctx.getHeaderString("X-Amz-Target");
+        boolean legacy = action != null && action.startsWith("dynamodb:")
+                && serviceCatalog.matchTarget(target)
+                    .filter(ServiceCatalog.TargetMatch::jsonOnly)
+                    .filter(match -> "dynamodb".equals(match.descriptor().externalKey()))
+                    .filter(match -> match.action().equals(action.substring("dynamodb:".length())))
+                    .isPresent()
+                && ctx.getMediaType() != null
+                && ctx.getMediaType().isCompatible(MediaType.valueOf("application/x-amz-json-1.0"));
+        return legacy ? DynamoDbConditionKeys.extractLegacy(action, body, table)
+                : DynamoDbConditionKeys.extract(action, body, table);
     }
 
     /**

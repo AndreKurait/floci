@@ -16,7 +16,8 @@ public record ServiceDescriptor(
         Set<String> targetPrefixes,
         Set<String> credentialScopes,
         Set<String> cborSdkServiceIds,
-        Set<Class<?>> resourceClasses
+        Set<Class<?>> resourceClasses,
+        Set<String> jsonOnlyTargetPrefixes
 ) {
 
     public boolean supportsStorage() {

@@ -37,6 +37,12 @@ public class DynamoDbJsonHandler {
         return toResponse(operations.execute(new Call(scope, Api.DYNAMODB, action, request)));
     }
 
+    public Response handleLegacy(String action, JsonNode request, String region) throws Exception {
+        Scope scope = new Scope(regionResolver.getAccountId(),
+                region != null ? region : regionResolver.getDefaultRegion());
+        return toResponse(new DynamoDbLegacyProtocol(operations, scope).execute(action, request));
+    }
+
     static Response toResponse(Reply reply) {
         Response.ResponseBuilder builder = Response.status(reply.status()).entity(reply.body());
         for (Map.Entry<String, List<String>> header : reply.headers().entrySet()) {
