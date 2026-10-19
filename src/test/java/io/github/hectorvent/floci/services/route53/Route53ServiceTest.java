@@ -39,7 +39,7 @@ class Route53ServiceTest {
         StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
         Mockito.when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
                 .thenAnswer(invocation -> {
-                    AccountAwareStorageBackend<Object> store = AccountAwareStorageBackend.inMemory(ACCOUNT);
+                    AccountAwareStorageBackend<Object> store = Mockito.spy(AccountAwareStorageBackend.inMemory(ACCOUNT));
                     stores.put(invocation.getArgument(1), store);
                     return store;
                 });
@@ -62,6 +62,27 @@ class Route53ServiceTest {
         RegionResolver regionResolver = new RegionResolver("us-east-1", ACCOUNT);
 
         return new Route53Service(storageFactory, config, regionResolver, ec2Service);
+    }
+
+    @Test
+    void publicZoneIndexAvoidsStorageScansOutsideOwnedNamesAndTracksDeletion() {
+        Route53Service service = newService();
+        AccountAwareStorageBackend<?> zones = stores.get("route53-zones.json");
+        Mockito.clearInvocations(zones);
+        assertTrue(service.publicDnsZones("outside.example").isEmpty());
+        Mockito.verifyNoInteractions(zones);
+        String first = service.createHostedZone("owned.example", "first", null, null).zone().getId();
+        String second = service.createHostedZone("owned.example", "second", null, null).zone().getId();
+        Mockito.clearInvocations(zones);
+        assertTrue(service.publicDnsZones("outside.example").isEmpty());
+        Mockito.verifyNoInteractions(zones);
+        assertEquals(2, service.publicDnsZones("text.owned.example").size());
+        service.deleteHostedZone(first);
+        assertEquals(1, service.publicDnsZones("text.owned.example").size());
+        service.deleteHostedZone(second);
+        Mockito.clearInvocations(zones);
+        assertTrue(service.publicDnsZones("text.owned.example").isEmpty());
+        Mockito.verifyNoInteractions(zones);
     }
 
     private static Map<String, Object> change(String action, ResourceRecordSet rrs) {
