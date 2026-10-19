@@ -269,6 +269,13 @@ public class IamActionRegistry {
         rule("ses", "POST",  "^/v2/email/update-configuration-sets/?$",                              "ses:UpdateConfigurationSet"),
         rule("ses", "POST",  "^/v2/email/vdm/recommendations/?$",                                    "ses:ListRecommendations"),
 
+        // ── Resource Groups ─────────────────────────────────────────────────────
+        rule("resource-groups", "POST", "^/_rg/groups/?$", "resource-groups:CreateGroup"),
+        rule("resource-groups", "POST", "^/_rg/get-group/?$", "resource-groups:GetGroup"),
+        rule("resource-groups", "POST", "^/_rg/delete-group/?$", "resource-groups:DeleteGroup"),
+        rule("resource-groups", "POST", "^/_rg/group-resources/?$", "resource-groups:GroupResources"),
+        rule("resource-groups", "POST", "^/_rg/list-group-resources/?$", "resource-groups:ListGroupResources"),
+
         // ── Kinesis ────────────────────────────────────────────────────────────
         rule("kinesis", "POST", ".*", "kinesis:*")
     );

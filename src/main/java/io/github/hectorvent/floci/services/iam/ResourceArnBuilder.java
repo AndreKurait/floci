@@ -108,8 +108,25 @@ public class ResourceArnBuilder {
             case "ssm"            -> List.of(buildSsmArn(ctx, region, accountId));
             case "kms"            -> List.of(buildKmsArn(path, region, accountId));
             case "iam"            -> buildIamArns(ctx, region, accountId);
+            case "resource-groups" -> List.of(buildResourceGroupArn(ctx, region, accountId));
             default               -> List.of("*");
         };
+    }
+
+    private String buildResourceGroupArn(ContainerRequestContext ctx, String region, String accountId) {
+        JsonNode body = readJsonBody(ctx);
+        if (body == null) {
+            return "*";
+        }
+        String path = ctx.getUriInfo().getPath();
+        boolean create = path.endsWith("/groups") || path.endsWith("/groups/");
+        String group = create ? body.path("Name").asText()
+                : body.path("Group").asText(body.path("GroupName").asText());
+        if (group.isEmpty()) {
+            return "*";
+        }
+        return group.startsWith("arn:") ? group
+                : AwsArnUtils.Arn.of("resource-groups", region, accountId, "group/" + group).toString();
     }
 
     /** Uses the serving operation and the same raw names as the handler. */

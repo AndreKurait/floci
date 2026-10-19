@@ -110,6 +110,7 @@ import software.amazon.awssdk.services.redshiftdata.RedshiftDataClient;
 import software.amazon.awssdk.services.redshiftserverless.RedshiftServerlessClient;
 import software.amazon.awssdk.services.resourceexplorer2.ResourceExplorer2Client;
 import software.amazon.awssdk.services.resourceexplorer2.ResourceExplorer2ClientBuilder;
+import software.amazon.awssdk.services.resourcegroups.ResourceGroupsClient;
 import software.amazon.awssdk.services.resourcegroupstaggingapi.ResourceGroupsTaggingApiClient;
 import software.amazon.awssdk.services.route53.Route53Client;
 import software.amazon.awssdk.services.route53.model.Change;
@@ -957,6 +958,14 @@ public final class TestFixtures {
 
     public static GlueClient glueClient() {
         return GlueClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static ResourceGroupsClient resourceGroupsClient() {
+        return ResourceGroupsClient.builder()
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
                 .credentialsProvider(CREDENTIALS)

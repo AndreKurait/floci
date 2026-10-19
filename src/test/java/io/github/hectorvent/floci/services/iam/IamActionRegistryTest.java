@@ -36,6 +36,19 @@ class IamActionRegistryTest {
 
     private final IamActionRegistry registry = new IamActionRegistry();
 
+    @ParameterizedTest
+    @CsvSource({"groups,CreateGroup", "get-group,GetGroup", "delete-group,DeleteGroup",
+            "group-resources,GroupResources", "list-group-resources,ListGroupResources"})
+    void resourceGroupsManagementRoutesResolveTheirOwnActions(String path, String operation) {
+        ContainerRequestContext ctx = mockCtx("POST", "/_rg/" + path,
+                new MultivaluedHashMap<>(), MediaType.APPLICATION_JSON_TYPE, "{}");
+        assertEquals("resource-groups:" + operation, registry.resolveRoute("resource-groups", ctx));
+        assertNull(registry.resolveRoute("resource-groups", mockCtx("GET", "/_rg/" + path,
+                new MultivaluedHashMap<>(), null, "")));
+        assertNull(registry.resolveRoute("resource-groups", mockCtx("POST", "/_rg/" + path + "/extra",
+                new MultivaluedHashMap<>(), MediaType.APPLICATION_JSON_TYPE, "{}")));
+    }
+
     @Test
     void cloudWatchGetUsesQueryActionAndOperationPrecedence() {
         MultivaluedMap<String, String> query = new MultivaluedHashMap<>();

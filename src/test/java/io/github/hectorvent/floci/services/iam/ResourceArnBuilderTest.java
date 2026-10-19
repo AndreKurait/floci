@@ -683,6 +683,23 @@ class ResourceArnBuilderTest {
     }
 
     @Test
+    void resourceGroupTargetsUseNamesOrArnsInTheRequestPartition() {
+        for (String region : List.of("us-east-1", "cn-north-1", "us-gov-west-1")) {
+            String arn = "arn:" + AwsRegions.partitionFor(region) + ":resource-groups:"
+                    + region + ":" + ACCOUNT + ":group/pool";
+            for (String selector : List.of("Name", "GroupName", "Group")) {
+                when(uriInfo.getPath()).thenReturn(selector.equals("Name") ? "_rg/groups" : "_rg/get-group");
+                setJsonBody("{\"" + selector + "\":\"pool\"}");
+                assertEquals(List.of(arn), builder.buildResources("resource-groups", ctx, region, ACCOUNT));
+            }
+            setJsonBody("{\"Group\":\"" + arn + "\"}");
+            assertEquals(List.of(arn), builder.buildResources("resource-groups", ctx, region, ACCOUNT));
+        }
+        setJsonBody("{}");
+        assertEquals(List.of("*"), builder.buildResources("resource-groups", ctx, "us-east-1", ACCOUNT));
+    }
+
+    @Test
     void logStreamTargetsUseTheServingActionAndRequestPartition() {
         for (String action : List.of("logs:CreateLogStream", "logs:DeleteLogStream")) {
             for (String region : List.of("us-east-1", "cn-north-1", "us-gov-west-1")) {

@@ -58,6 +58,7 @@ import io.github.hectorvent.floci.services.opensearch.OpenSearchController;
 import io.github.hectorvent.floci.services.pipes.PipesController;
 import io.github.hectorvent.floci.services.rdsdata.RdsDataController;
 import io.github.hectorvent.floci.services.resourceexplorer2.ResourceExplorer2Controller;
+import io.github.hectorvent.floci.services.resourcegroups.ResourceGroupsController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
 import io.github.hectorvent.floci.services.rum.RumController;
 import io.github.hectorvent.floci.services.s3.S3Controller;
@@ -365,6 +366,11 @@ public class ResolvedServiceCatalog {
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("AmazonEC2ContainerRegistry_V20150921."), Set.of("ecr"), Set.of(), Set.of()),
+                descriptor("resource-groups", "resource-groups", config.services().resourceGroups().enabled(), true,
+                        "resource-groups", storageMode(config.storage().services().resourceGroups().mode(), config.storage().mode()),
+                        config.storage().services().resourceGroups().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("resource-groups"), Set.of(),
+                        Set.of(ResourceGroupsController.class)),
                 descriptor("tagging", "tagging", config.services().tagging().enabled(), true,
                         "tagging", storageMode(config.storage().services().tagging().mode(), config.storage().mode()),
                         config.storage().services().tagging().flushIntervalMs(), null, ServiceProtocol.JSON,
