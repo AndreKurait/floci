@@ -325,7 +325,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
                     () -> assertEquals("COGNITO_USER_POOLS", authorizer.path("type").asText()),
                     () -> assertEquals(AUTHORIZER_URI, authorizer.path("authorizerUri").asText()));
 
-            when(lambdaService.invoke(eq("us-east-1"), eq(AUTHORIZER_FUNCTION), any(byte[].class),
+            when(lambdaService.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + AUTHORIZER_FUNCTION), any(byte[].class),
                     eq(InvocationType.RequestResponse)))
                     .thenReturn(new InvokeResult(200, null, ALLOW_POLICY, null, "authorizer-request"));
             deploy(apiId, "mismatched-type");
@@ -539,7 +539,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
     }
 
     @Test
-    void emptySecurityAlternativeKeepsImportedMethodPublic() throws Exception {
+    void emptySecurityAlternativeDoesNotRemoveApiKeyRequirement() throws Exception {
         String optionalOperationSecurity = API_KEY_SPEC.replace(
                 "\"security\": [{\"client_key\": []}]",
                 "\"security\": [{\"client_key\": []}, {}]");
@@ -552,9 +552,9 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
                 JsonNode method = getJson(methodPath(apiId));
                 deploy(apiId, "optional-security");
                 assertAll(
-                        () -> assertFalse(method.path("apiKeyRequired").asBoolean()),
+                        () -> assertTrue(method.path("apiKeyRequired").asBoolean()),
                         () -> assertEquals("NONE", method.path("authorizationType").asText()),
-                        () -> assertEquals(200, invokeWithoutApiKey(apiId, "optional-security")));
+                        () -> assertEquals(403, invokeWithoutApiKey(apiId, "optional-security")));
             } finally {
                 given().delete("/restapis/" + apiId).then().statusCode(202);
             }
@@ -576,7 +576,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
     }
 
     @Test
-    void apiKeyAndAuthorizerAlternativesDoNotRequireAnApiKeyAndKeepAuthorizer() throws Exception {
+    void apiKeyAndAuthorizerAlternativesKeepBothRequirements() throws Exception {
         String apiKeyAndAuthorizerSpec = """
                 {
                   "openapi": "3.0.1",
@@ -602,7 +602,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
             JsonNode method = getJson(methodPath(apiId));
             deploy(apiId, "mixed-security");
             assertAll(
-                    () -> assertFalse(method.path("apiKeyRequired").asBoolean()),
+                    () -> assertTrue(method.path("apiKeyRequired").asBoolean()),
                     () -> assertEquals("CUSTOM", method.path("authorizationType").asText()),
                     () -> assertTrue(method.hasNonNull("authorizerId")),
                     () -> assertEquals(403, invoke(apiId, "mixed-security")),
@@ -878,7 +878,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
     }
 
     private void denyAuthorizerRequests(String function) {
-        when(lambdaService.invoke(eq("us-east-1"), eq(function), any(byte[].class),
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + function), any(byte[].class),
                 eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, null, DENY_POLICY, null, "authorizer-request"));
     }
@@ -888,7 +888,7 @@ class ApiGatewayPutRestApiMergeAuthorizationTest {
     }
 
     private void verifyDenyInvocations(String function, int count) {
-        verify(lambdaService, times(count)).invoke(eq("us-east-1"), eq(function),
+        verify(lambdaService, times(count)).invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + function),
                 any(byte[].class), eq(InvocationType.RequestResponse));
     }
 }

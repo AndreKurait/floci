@@ -134,7 +134,7 @@ public class WebSocketAuthorizerService {
         // Invoke the authorizer Lambda
         InvokeResult invokeResult;
         try {
-            invokeResult = lambdaService.invoke(region, functionName,
+            invokeResult = lambdaService.invokeTarget(region, functionName,
                     authorizerEventJson.getBytes(), InvocationType.RequestResponse);
         } catch (Exception e) {
             LOG.warnv("Lambda authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());
@@ -217,9 +217,9 @@ public class WebSocketAuthorizerService {
 
     /**
      * Extract the Lambda function name from an authorizer URI.
-     * Delegates to {@link LambdaArnUtils#extractFunctionNameFromUri(String)}.
+     * Delegates to {@link LambdaArnUtils#extractFunctionReferenceFromUri(String)}.
      */
     private String extractFunctionNameFromUri(String uri) {
-        return LambdaArnUtils.extractFunctionNameFromUri(uri);
+        return LambdaArnUtils.extractFunctionReferenceFromUri(uri);
     }
 }

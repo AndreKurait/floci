@@ -244,7 +244,7 @@ class ApiGatewayHttpContextMappingIntegrationTest {
             assertNotEquals(previousRequestId, requestId);
             previousRequestId = requestId;
         }
-        verify(lambdaService).invoke(eq("us-east-1"), eq(FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse));
+        verify(lambdaService).invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
     @ParameterizedTest
@@ -450,7 +450,7 @@ class ApiGatewayHttpContextMappingIntegrationTest {
                 .get("/execute-api/" + apiId + "/test/orders/42")
                 .then().statusCode(200).extract().asByteArray());
         ArgumentCaptor<byte[]> invocation = ArgumentCaptor.forClass(byte[].class);
-        verify(lambdaService).invoke(eq("us-east-1"), eq(FUNCTION), invocation.capture(), eq(InvocationType.RequestResponse));
+        verify(lambdaService).invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + FUNCTION), invocation.capture(), eq(InvocationType.RequestResponse));
         JsonNode authorizerContext = MAPPER.readTree(invocation.getValue()).path("requestContext");
         for (String field : List.of("requestId", "extendedRequestId", "requestTimeEpoch")) {
             assertEquals(authorizerContext.path(field).asText(), response.path("headers").path("x-" + field.toLowerCase(Locale.ROOT)).path(0).asText());
@@ -540,7 +540,7 @@ class ApiGatewayHttpContextMappingIntegrationTest {
         given().contentType(ContentType.JSON)
                 .body(Map.of("authorizationType", "CUSTOM", "authorizerId", authorizerId))
                 .put(methodPath + "GET").then().statusCode(201);
-        when(lambdaService.invoke(eq("us-east-1"), eq(FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq("arn:aws:lambda:us-east-1:000000000000:function:" + FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenAnswer(invocation -> {
                     JsonNode event = MAPPER.readTree((byte[]) invocation.getArgument(2));
                     String effect = "REQUEST".equals(type) || "Bearer allowed".equals(event.path("authorizationToken").asText()) ? "Allow" : "Deny";
