@@ -358,6 +358,13 @@ legacy `2009-05-15` API, which supports only `ListMetrics` and `GetMetricStatist
 An invalid version or action returns HTTP 404 `InvalidAction`; an absent action returns
 HTTP 404 `UnknownOperationException`. IAM policies use the `cloudwatch` action prefix.
 
+Query clients using `Version=2013-01-16` can use the shared `PutMetricAlarm`,
+`DescribeAlarms` and `DeleteAlarms` wire contract. This compatibility subset applies to
+both GET and POST, with the same storage, account/region scope and IAM checks as the current
+API. It does not implement the other operations of that version: `GetMetricData` and
+account-specific metric extensions remain unsupported. Explicit version/action combinations
+are validated through the same registration for both Query methods.
+
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
 
 ### Supported Actions
