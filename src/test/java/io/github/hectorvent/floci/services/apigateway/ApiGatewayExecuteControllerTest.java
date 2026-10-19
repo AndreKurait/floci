@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
@@ -452,6 +453,8 @@ class ApiGatewayExecuteControllerTest {
     @Test
     void signedV2RequestDoesNotConsultRegionFallback() {
         RegionResolver regionResolver = mock(RegionResolver.class);
+        RequestContext requestContext = new RequestContext();
+        requestContext.setAccountId("000000000000");
         ApiGatewayV2Service apiGatewayV2Service = mock(ApiGatewayV2Service.class);
         ApiGatewayService apiGatewayService = mock(ApiGatewayService.class);
         HttpHeaders headers = mock(HttpHeaders.class);
@@ -471,13 +474,14 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, requestContext, null, null, null);
 
         controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
         // A correctly-signed (or otherwise resolved) request must not pay for the v1 region
         // scan — resolveRestApiRegion is only for the "region is a guess" case.
         verify(apiGatewayService, never()).resolveRestApiRegion(anyString(), anyString());
+        verify(apiGatewayService).findRestApiOwner("abc123", "000000000000", "us-east-1");
         verify(apiGatewayV2Service, atLeastOnce()).getApi("us-east-1", "abc123");
     }
 

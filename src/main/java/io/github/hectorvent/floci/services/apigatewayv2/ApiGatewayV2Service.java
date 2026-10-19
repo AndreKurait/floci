@@ -160,6 +160,10 @@ public class ApiGatewayV2Service {
                 .orElseThrow(() -> new AwsException("NotFoundException", "Invalid API id specified", 404));
     }
 
+    public boolean hasApi(String region, String apiId) {
+        return apiStore.get(apiKey(region, apiId)).isPresent();
+    }
+
     /** Persists an Api the caller already holds — used to attach OpenAPI import diagnostics. */
     public void putApi(String region, Api api) {
         apiStore.put(apiKey(region, api.getApiId()), api);

@@ -1,11 +1,12 @@
 package io.github.hectorvent.floci.services.apigateway;
 
 import io.github.hectorvent.floci.services.apigateway.model.BasePathMapping;
-import io.github.hectorvent.floci.services.apigateway.model.CustomDomain;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.reflect.Proxy;
 import java.net.URI;
@@ -14,6 +15,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -38,7 +40,26 @@ class ApiGatewayCustomDomainFilterTest {
         assertEquals("/execute-api/" + API_ID + "/prod/iam", request.routedUri().getRawPath());
         assertEquals("tenant=alpha", request.routedUri().getRawQuery());
         assertEquals("/v1/iam", routeContext.signedRequestPath());
+        assertEquals(new ApiGatewayService.CustomDomainRoute("111122223333", "us-east-1", DOMAIN),
+                routeContext.mappedDomain());
+        assertTrue(routeContext.isRestApiRoute());
         assertEquals(Boolean.TRUE, request.property(ApiGatewayCustomDomainFilter.ROUTED_PROPERTY));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HTTP", "WEBSOCKET"})
+    void mappedV2ApisKeepTheirOwnerRegionAndType(String type) {
+        ApiGatewayService service = serviceWithMapping("(none)", "prod", type);
+        RecordingRequest request = new RecordingRequest(DOMAIN, URI.create("http://" + DOMAIN + "/orders"));
+        ApiGatewayExecuteRouteContext routeContext = new ApiGatewayExecuteRouteContext();
+
+        new ApiGatewayCustomDomainFilter(service, mock(ApiGatewayV2Service.class), routeContext)
+                .filter(request.context());
+
+        assertEquals("us-east-1", routeContext.httpApiRegion());
+        assertEquals(new ApiGatewayService.CustomDomainRoute("111122223333", "us-east-1", DOMAIN),
+                routeContext.mappedDomain());
+        assertEquals("/orders", routeContext.signedRequestPath());
     }
 
     @Test
@@ -74,8 +95,8 @@ class ApiGatewayCustomDomainFilterTest {
     @Test
     void leavesSignedPathUnsetWhenNoMappingMatches() {
         ApiGatewayService service = mock(ApiGatewayService.class);
-        CustomDomain domain = new CustomDomain();
-        domain.setDomainName(DOMAIN);
+        ApiGatewayService.CustomDomainRoute domain =
+                new ApiGatewayService.CustomDomainRoute("111122223333", "us-east-1", DOMAIN);
         when(service.findDomainByName(DOMAIN)).thenReturn(domain);
         RecordingRequest request = new RecordingRequest(
                 DOMAIN, URI.create("http://" + DOMAIN + "/unmapped"));
@@ -90,14 +111,18 @@ class ApiGatewayCustomDomainFilterTest {
     }
 
     private static ApiGatewayService serviceWithMapping(String basePath, String stage) {
+        return serviceWithMapping(basePath, stage, "REST");
+    }
+
+    private static ApiGatewayService serviceWithMapping(String basePath, String stage, String type) {
         ApiGatewayService service = mock(ApiGatewayService.class);
-        CustomDomain domain = new CustomDomain();
-        domain.setDomainName(DOMAIN);
+        ApiGatewayService.CustomDomainRoute domain =
+                new ApiGatewayService.CustomDomainRoute("111122223333", "us-east-1", DOMAIN);
         BasePathMapping mapping = new BasePathMapping(basePath, API_ID, stage);
-        mapping.setApiType("REST");
+        mapping.setApiType(type);
         when(service.findDomainByRegionalHostname(DOMAIN + ".regional.local")).thenReturn(domain);
         when(service.findDomainByName(DOMAIN)).thenReturn(domain);
-        when(service.resolveBasePathMapping(anyString(), anyString())).thenReturn(mapping);
+        when(service.resolveBasePathMapping(eq(domain), anyString())).thenReturn(mapping);
         when(service.stripBasePath(anyString(), eq(mapping)))
                 .thenAnswer(invocation -> {
                     String path = invocation.getArgument(0);

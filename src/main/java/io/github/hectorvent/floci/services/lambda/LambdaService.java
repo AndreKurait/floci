@@ -1332,6 +1332,12 @@ public class LambdaService implements ResourceProvider {
         return new InvokeResult(200, "Unhandled", DurableWire.functionErrorPayload(error), null, requestId);
     }
 
+    /** Service integrations use the target's region; direct Invoke requests must match their endpoint region. */
+    public InvokeResult invokeTarget(String defaultRegion, String functionReference, byte[] payload, InvocationType type) {
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionReference);
+        return invoke(ref.region() == null ? defaultRegion : ref.region(), functionReference, payload, type);
+    }
+
     /**
      * Invokes a Lambda target ARN using the account encoded in that ARN.
      *

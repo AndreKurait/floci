@@ -167,7 +167,8 @@ class ApiGatewayV2ApiMappingServiceTest {
         StoredMapping created = service.createApiMapping(REGION, DOMAIN, "orders/v1/items", apiId, "prod");
 
         assertEquals("REST", created.mapping().getApiType());
-        assertEquals(apiId, service.resolveBasePathMapping(DOMAIN, "/orders/v1/items/123").getRestApiId());
+        assertEquals(apiId, service.resolveBasePathMapping(
+                service.findDomainByName(DOMAIN), "/orders/v1/items/123").getRestApiId());
     }
 
     @Test

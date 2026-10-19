@@ -73,6 +73,20 @@ public class ApiGatewayExecuteRouteContext {
     private String httpApiRegion;
     private boolean restApiRoute;
     private String signedRequestPath;
+    private ApiGatewayService.CustomDomainRoute mappedDomain;
+
+    void routeToMappedApi(ApiGatewayService.CustomDomainRoute domain, boolean restApi) {
+        mappedDomain = domain;
+        if (restApi) {
+            routeToRestApi();
+        } else {
+            routeToHttpApi(domain.region());
+        }
+    }
+
+    ApiGatewayService.CustomDomainRoute mappedDomain() {
+        return mappedDomain;
+    }
 
     void routeToHttpApi(String region) {
         this.httpApiRegion = region;
