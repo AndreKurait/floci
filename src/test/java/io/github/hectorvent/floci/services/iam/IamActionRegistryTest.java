@@ -37,6 +37,15 @@ class IamActionRegistryTest {
     private final IamActionRegistry registry = new IamActionRegistry();
 
     @ParameterizedTest
+    @CsvSource({"PUT,PutProvisionedConcurrencyConfig", "GET,GetProvisionedConcurrencyConfig",
+            "DELETE,DeleteProvisionedConcurrencyConfig"})
+    void provisionedConcurrencyRoutesResolveTheirActions(String method, String operation) {
+        ContainerRequestContext ctx = mockCtx(method, "/2019-09-30/functions/example/provisioned-concurrency",
+                new MultivaluedHashMap<>(), MediaType.APPLICATION_JSON_TYPE, "{}");
+        assertEquals("lambda:" + operation, registry.resolveRoute("lambda", ctx));
+    }
+
+    @ParameterizedTest
     @CsvSource({"groups,CreateGroup", "get-group,GetGroup", "delete-group,DeleteGroup",
             "group-resources,GroupResources", "list-group-resources,ListGroupResources"})
     void resourceGroupsManagementRoutesResolveTheirOwnActions(String path, String operation) {

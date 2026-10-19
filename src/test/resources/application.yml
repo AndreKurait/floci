@@ -154,7 +154,9 @@ floci:
       enabled: true
     lambda:
       enabled: true
+      container-drain-timeout-seconds: 15
       docker-flags: ""
+      # additional-docker-networks: []
       honour-architectures: false
       zip-max-entries: 100000
       async-retry-delay-seconds: 1
@@ -173,6 +175,8 @@ floci:
     iam:
       enabled: true
       enforcement-enabled: false
+      issued-session-verification-enabled: false
+      lambda-identity-verification-enabled: false
       seed-deployer-principal: false
     msk:
       enabled: true
