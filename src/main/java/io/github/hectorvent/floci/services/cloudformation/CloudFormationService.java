@@ -2026,7 +2026,9 @@ public class CloudFormationService implements ResourceProvider {
                             value -> dynamicReferences.resolveDynamicReferences(value, region, false),
                             (name, output, outputRegion, roleArn) ->
                                     resolveStackOutput(accountId, name, output, outputRegion, roleArn),
-                            parameterTypes);
+                            parameterTypes,
+                            (id, attribute, value) -> dispatcher.attributeValue(
+                                    resources.path(id).path("Type").asText(), attribute, value));
 
                     StackResource resource = stack.getResources().get(logicalId);
                     StackResource previousResource = resource;
@@ -2197,7 +2199,9 @@ public class CloudFormationService implements ResourceProvider {
                     value -> dynamicReferences.resolveDynamicReferences(value, region, false),
                     (name, output, outputRegion, roleArn) ->
                             resolveStackOutput(accountId, name, output, outputRegion, roleArn),
-                    parameterTypes);
+                    parameterTypes,
+                    (id, attribute, value) -> dispatcher.attributeValue(
+                            resources.path(id).path("Type").asText(), attribute, value));
 
             // Resolve outputs before mutating stack/global export state, so failed updates do not
             // leave stale or partially registered exports behind.
@@ -2217,14 +2221,9 @@ public class CloudFormationService implements ResourceProvider {
             Map<String, String> outputValues = new LinkedHashMap<>();
             for (Map.Entry<String, JsonNode> output : outputs.entrySet()) {
                 try {
-                    outputValues.put(output.getKey(), finalEngine.resolve(output.getValue().path("Value")));
+                    outputValues.put(output.getKey(), finalEngine.resolveString(output.getValue().path("Value"),
+                            "Template format error: Every Value member must be a string."));
                 } catch (AwsException e) {
-                    if (!CloudFormationTemplateEngine.containsGetStackOutput(output.getValue())) {
-                        throw e;
-                    }
-                    // An output whose Fn::GetStackOutput cannot be read fails the operation once the
-                    // resources exist, and the stack rolls back as for a resource that failed
-                    // (measured: a create deletes them and ends ROLLBACK_COMPLETE).
                     LOG.warnv("Stack {0} output {1} failed: {2}", stack.getStackName(), output.getKey(),
                             e.getMessage());
                     rollbackFailedExecution(stack, region, isCreate, e.getMessage(), previousState,
