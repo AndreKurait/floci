@@ -266,6 +266,7 @@ public class AslExecutor {
     private final JsonataEvaluator jsonataEvaluator;
     private final Instance<StepFunctionsService> sfnService;
     private final WebClient webClient;
+    private final ApiGatewayTaskInvoker apiGatewayTaskInvoker;
     private final EmulatorConfig config;
     private final CustomResourceLiveness customResourceLiveness;
     private final Clock clock;
@@ -294,14 +295,15 @@ public class AslExecutor {
                        ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
                        Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
                        CustomResourceLiveness customResourceLiveness, RedshiftDataJsonHandler redshiftDataHandler,
-                       ServiceRegistry serviceRegistry, LambdaTaskAuthorizer lambdaTaskAuthorizer) {
+                       ServiceRegistry serviceRegistry, LambdaTaskAuthorizer lambdaTaskAuthorizer,
+                       ApiGatewayTaskInvoker apiGatewayTaskInvoker) {
         this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
                 sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
-                lambdaTaskAuthorizer, null, null);
+                lambdaTaskAuthorizer, null, null, apiGatewayTaskInvoker);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
@@ -318,7 +320,8 @@ public class AslExecutor {
                 Clock clock, Sleeper sleeper, Integer maxWaitSecondsOverride,
                 RedshiftDataJsonHandler redshiftDataHandler, ServiceRegistry serviceRegistry,
                 LambdaTaskAuthorizer lambdaTaskAuthorizer, Duration expressMaxExecutionTimeOverride,
-                LongSupplier nanoTimeOverride) {
+                LongSupplier nanoTimeOverride, ApiGatewayTaskInvoker apiGatewayTaskInvoker) {
+        this.apiGatewayTaskInvoker = apiGatewayTaskInvoker;
         this.serviceRegistry = serviceRegistry;
         this.lambdaTaskAuthorizer = lambdaTaskAuthorizer;
         this.customResourceLiveness = customResourceLiveness;
@@ -380,7 +383,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null, null, null);
+                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null, null, null, null);
     }
 
     // Kept for tests that do not exercise the Redshift Data API integration.
@@ -401,7 +404,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                clock, sleeper, maxWaitSecondsOverride, null, null, null, null, null);
+                clock, sleeper, maxWaitSecondsOverride, null, null, null, null, null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
@@ -1322,6 +1325,14 @@ public class AslExecutor {
 
         if (integration == null) {
             return invokeNonIntegrationResource(resource, input, taskToken);
+        }
+
+        if (integration.is("apigateway", "invoke") && integration.suffix().isEmpty()) {
+            try {
+                return apiGatewayTaskInvoker.invoke(input, sm, credentialsRoleArn);
+            } catch (AwsException error) {
+                throw new FailStateException("ApiGateway." + error.getHttpStatus(), error.getMessage());
+            }
         }
 
         // DynamoDB optimized integrations (4 actions)
