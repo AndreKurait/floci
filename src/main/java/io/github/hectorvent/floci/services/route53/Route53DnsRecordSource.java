@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.LocalStackParity;
 import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
 import io.github.hectorvent.floci.core.common.dns.DnsLookupHelper;
+import io.github.hectorvent.floci.core.common.dns.DnsRecord;
 import io.github.hectorvent.floci.core.common.dns.DnsRecordSource;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.services.route53.model.AliasTarget;
@@ -15,6 +16,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.net.InetAddress;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -25,7 +27,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Resolves Route 53 private hosted zone records for the embedded DNS server.
+ * Resolves private IPv4 records and public TXT/NS/SOA records for the embedded DNS server.
  *
  * <p>Discovered via CDI as a {@link DnsRecordSource} implementation, keeping
  * the embedded DNS server decoupled from Route 53 service classes.
@@ -63,6 +65,81 @@ public class Route53DnsRecordSource implements DnsRecordSource {
             if (config.dns() != null) {
                 LocalStackParity.withDnsSuffixes(config.dns().extraSuffixes()).ifPresent(this.flociSuffixes::addAll);
             }
+        }
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
+        if (name == null || name.isBlank()) {
+            return Optional.empty();
+        }
+        if (route53Service.isCoveredByPrivateZone(name)) {
+            return Optional.empty();
+        }
+        List<Route53Service.PublicDnsZone> zones = route53Service.publicDnsZones(name);
+        if (zones.isEmpty()) {
+            return Optional.empty();
+        }
+        if (zones.size() != 1 || (type != 2 && type != 6 && type != 16)) {
+            return Optional.of(DnsAnswer.refused());
+        }
+        Route53Service.PublicDnsZone zone = zones.getFirst();
+        String normalized = Route53Service.normalizeName(name).toLowerCase(Locale.ROOT);
+        String apex = Route53Service.normalizeName(zone.name()).toLowerCase(Locale.ROOT);
+        // A delegation ends this zone's authority. Serving the parent's negative answer below
+        // that cut, or flattening an unsupported CNAME/routing policy, would hide real records.
+        boolean delegated = zone.records().stream().anyMatch(record -> "NS".equals(record.getType())
+                && !Route53Service.normalizeName(record.getName()).equalsIgnoreCase(apex)
+                && DomainNames.isWithin(normalized, Route53Service.normalizeName(record.getName())));
+        if (delegated || zone.matchingRecords().stream().anyMatch(record -> "CNAME".equals(record.getType()))) {
+            return Optional.of(DnsAnswer.refused());
+        }
+        ResourceRecordSet soaSet = zone.records().stream()
+                .filter(record -> "SOA".equals(record.getType())
+                        && Route53Service.normalizeName(record.getName()).equalsIgnoreCase(apex))
+                .findFirst().orElse(null);
+        if (soaSet == null || soaSet.getRecords() == null || soaSet.getRecords().size() != 1) {
+            return Optional.of(DnsAnswer.refused());
+        }
+        List<DnsRecord> answers = new ArrayList<>();
+        int ttl = Integer.MAX_VALUE;
+        try {
+            for (ResourceRecordSet record : zone.matchingRecords()) {
+                if (!record.getType().equals(switch (type) {
+                    case 2 -> "NS";
+                    case 6 -> "SOA";
+                    default -> "TXT";
+                })) {
+                    continue;
+                }
+                if (record.getSetIdentifier() != null || record.getAliasTarget() != null
+                        || record.getWeight() != null || record.getRegion() != null
+                        || record.getFailover() != null || record.getHealthCheckId() != null
+                        || record.getRecords() == null) {
+                    return Optional.of(DnsAnswer.refused());
+                }
+                for (ResourceRecord value : record.getRecords()) {
+                    DnsRecord answer = switch (type) {
+                        case 2 -> new DnsRecord.Ns(value.getValue());
+                        case 6 -> new DnsRecord.Soa(value.getValue());
+                        default -> new DnsRecord.Txt(value.getValue());
+                    };
+                    answer.data();
+                    answers.add(answer);
+                }
+                ttl = Math.min(ttl, ttlOf(record));
+            }
+            boolean exists = !zone.matchingRecords().isEmpty() || zone.records().stream()
+                    .anyMatch(record -> Route53Service.normalizeName(record.getName()).toLowerCase(Locale.ROOT)
+                            .endsWith("." + normalized));
+            DnsAnswer answer = answers.isEmpty() ? (exists ? DnsAnswer.noData() : DnsAnswer.nxDomain())
+                    : DnsAnswer.typedRecords(answers, ttl);
+            DnsRecord.Soa soa = new DnsRecord.Soa(soaSet.getRecords().getFirst().getValue());
+            soa.data();
+            return Optional.of(answer.withAuthority(apex, soa, ttlOf(soaSet)));
+        } catch (IllegalArgumentException e) {
+            LOG.debugv("Cannot encode public DNS records for {0}: {1}", name, e.getMessage());
+            return Optional.of(DnsAnswer.refused());
         }
     }
 

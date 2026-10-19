@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -316,14 +317,20 @@ class EmbeddedDnsServerTest {
 
     @Test
     void planQuery_aMatchingRuleTakesPrecedenceOverAPrivateHostedZoneRecord() {
+        AtomicInteger privateLookups = new AtomicInteger();
+        DnsRecordSource privateSource = name -> {
+            privateLookups.incrementAndGet();
+            return Optional.of(DnsAnswer.records(List.of("10.0.0.7"), 60));
+        };
         EmbeddedDnsServer dns = withRules(
-                List.of(source("db.corp.internal", List.of("10.0.0.7"))),
+                List.of(privateSource),
                 rules("vpc-a", forward("corp.internal", "10.1.0.53")), clientVpc("vpc-a"));
 
         EmbeddedDnsServer.QueryPlan plan = dns.planQuery("db.corp.internal", CLIENT, MY_IP, 1);
 
         assertTrue(plan.answer().isEmpty(), "the rule decides the name, not the zone record");
         assertEquals(List.of(new DnsForwardingRule.Target("10.1.0.53", 53)), plan.ruleTargets());
+        assertEquals(0, privateLookups.get(), "a winning rule must not trigger private CNAME resolution");
     }
 
     @Test

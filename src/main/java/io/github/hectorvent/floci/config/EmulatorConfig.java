@@ -1180,16 +1180,16 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
-        @WithDefault("ns-1.awsdns-01.org")
+        @WithDefault("ns-1.route53.localhost.floci.io")
         String defaultNameserver1();
 
-        @WithDefault("ns-2.awsdns-02.net")
+        @WithDefault("ns-2.route53.localhost.floci.io")
         String defaultNameserver2();
 
-        @WithDefault("ns-3.awsdns-03.com")
+        @WithDefault("ns-3.route53.localhost.floci.io")
         String defaultNameserver3();
 
-        @WithDefault("ns-4.awsdns-04.co.uk")
+        @WithDefault("ns-4.route53.localhost.floci.io")
         String defaultNameserver4();
 
         /**

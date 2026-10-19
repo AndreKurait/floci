@@ -208,7 +208,7 @@ public class EmbeddedDnsServer {
             int questionOffset = buf.position(); // always 12 for a standard query
             String qname = readName(buf, data);
             short qtype = buf.getShort();
-            buf.getShort(); // qclass
+            short qclass = buf.getShort();
             int questionEnd = buf.position();
 
             vertx.<QueryPlan>executeBlocking(() -> planQuery(qname, senderHost, myIp, qtype), false)
@@ -223,7 +223,13 @@ public class EmbeddedDnsServer {
                             return;
                         }
                         DnsAnswer records = plan.answer().orElseThrow();
-                        byte[] response = !records.isEmpty()
+                        if (records.isPublicAuthorityAnswer()
+                                && (qdCount != 1 || qclass != 1 || (flags & 0x7800) != 0)) {
+                            records = DnsAnswer.refused();
+                        }
+                        byte[] response = records.isPublicAuthorityAnswer()
+                                ? buildPublicResponse(data, txId, questionOffset, questionEnd, records)
+                                : !records.isEmpty()
                                 ? buildAResponse(data, txId, questionOffset, questionEnd, records)
                                 : buildEmptyResponse(data, txId, questionOffset, questionEnd,
                                         records.nameExists() ? 0 : 3);
@@ -261,6 +267,10 @@ public class EmbeddedDnsServer {
     }
 
     private Optional<DnsAnswer> resolveRecordWithOwnership(String name, String myIp, int type) {
+        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true);
+        if (stored.isPresent()) {
+            return stored;
+        }
         Optional<DnsAnswer> emulatorName = resolveEmulatorName(name, myIp, type);
         return emulatorName.isPresent() ? emulatorName : resolveFromRecordSources(name, type);
     }
@@ -284,7 +294,8 @@ public class EmbeddedDnsServer {
     }
 
     /**
-     * Names the emulator itself owns come first, whatever the rules say. Route 53 Resolver does
+     * Stored public authority answers take precedence over broad emulator suffix spoofing.
+     * Other names the emulator itself owns come first, whatever the rules say. Route 53 Resolver does
      * the same for the AWS-internal domains it autodefines system rules for, so that a rule for a
      * broad domain (or for "." itself) cannot send the platform's own names off to a resolver that
      * knows nothing about them.
@@ -294,8 +305,9 @@ public class EmbeddedDnsServer {
      * hosted zone that matches the same name.
      */
     QueryPlan planQuery(String name, String clientAddress, String myIp, int type) {
+        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true);
         Optional<DnsAnswer> emulatorName = resolveEmulatorName(name, myIp, type);
-        if (emulatorName.isPresent()) {
+        if (emulatorName.isPresent() && stored.isEmpty()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
         }
         // A rule steers the name whatever the query asks about it, so this is deliberately not
@@ -304,7 +316,8 @@ public class EmbeddedDnsServer {
         if (rule.isPresent() && rule.orElseThrow().forwards()) {
             return QueryPlan.forwardingTo(rule.orElseThrow().targets());
         }
-        return resolveFromRecordSources(name, type).map(QueryPlan::answering).orElse(QueryPlan.UPSTREAM);
+        return stored.or(() -> resolveFromRecordSources(name, type))
+                .map(QueryPlan::answering).orElse(QueryPlan.UPSTREAM);
     }
 
     private Optional<DnsAnswer> resolveEmulatorName(String name, String myIp, int type) {
@@ -385,12 +398,17 @@ public class EmbeddedDnsServer {
      * through to the upstream resolvers, which is what happened before any source existed.
      */
     private Optional<DnsAnswer> resolveFromRecordSources(String name, int type) {
+        return resolveFromRecordSources(name, type, false);
+    }
+
+    private Optional<DnsAnswer> resolveFromRecordSources(String name, int type, boolean authoritative) {
         if (recordSources == null) {
             return Optional.empty();
         }
         for (DnsRecordSource source : recordSources) {
             try {
-                Optional<DnsAnswer> answer = source.resolve(name, type);
+                Optional<DnsAnswer> answer = authoritative ? source.resolveAuthoritative(name, type)
+                        : source.resolve(name, type);
                 if (answer != null && answer.isPresent()) {
                     return answer;
                 }
@@ -522,7 +540,8 @@ public class EmbeddedDnsServer {
 
         // header
         resp.putShort(txId);
-        resp.putShort((short) (0x8180 | (truncated ? 0x0200 : 0))); // QR=1, RD=1, RCODE=0
+        int flags = answer.authority() == null ? 0x8180 : 0x8400 | (query[2] & 1) << 8;
+        resp.putShort((short) (flags | (truncated ? 0x0200 : 0)));
         resp.putShort((short) 1);           // qdcount
         resp.putShort((short) answerCount); // ancount
         resp.putShort((short) 0);           // nscount
@@ -542,6 +561,34 @@ public class EmbeddedDnsServer {
         }
         appendOpt(resp, payload);
         return resp.array();
+    }
+
+    byte[] buildPublicResponse(byte[] query, short txId, int questionOffset, int questionEnd, DnsAnswer answer) {
+        if (!answer.isEmpty()) {
+            return buildAResponse(query, txId, questionOffset, questionEnd, answer);
+        }
+        int flags = 0x8000 | (query[2] & 0x79) << 8 | answer.responseCode();
+        DnsAnswer.Authority authority = answer.authority();
+        if (authority == null) {
+            return buildAnswerlessResponse(query, txId, questionOffset, questionEnd, (short) flags);
+        }
+        byte[] owner = DnsRecord.encodeName(authority.name());
+        byte[] soa = authority.soa().data();
+        UdpPayload payload = udpPayload(query, questionEnd);
+        int questionLength = questionEnd - questionOffset;
+        int length = 12 + questionLength + (payload.edns() ? 11 : 0);
+        boolean fits = length + owner.length + 10 + soa.length <= payload.size();
+        ByteBuffer response = ByteBuffer.allocate(length + (fits ? owner.length + 10 + soa.length : 0));
+        response.putShort(txId).putShort((short) (flags | 0x0400 | (fits ? 0 : 0x0200)));
+        response.putShort((short) 1).putShort((short) 0).putShort((short) (fits ? 1 : 0))
+                .putShort((short) (payload.edns() ? 1 : 0));
+        response.put(query, questionOffset, questionLength);
+        if (fits) {
+            response.put(owner).putShort((short) 6).putShort((short) 1).putInt(authority.ttlSeconds())
+                    .putShort((short) soa.length).put(soa);
+        }
+        appendOpt(response, payload);
+        return response.array();
     }
 
     private record UdpPayload(int size, boolean edns) {}
