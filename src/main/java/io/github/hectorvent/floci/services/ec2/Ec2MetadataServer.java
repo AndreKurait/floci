@@ -503,7 +503,7 @@ public class Ec2MetadataServer {
         // IMDSv2: a presented token must be valid; an invalid or expired one gets 401 so the
         // caller fetches a new token. A token is not valid on another instance, so a caller whose
         // IP maps to a different instance also gets 401; an unregistered IP defers to the token.
-        // Requests without a token fall back to IMDSv1.
+        // Requests without a token fall back to IMDSv1 only when the instance permits it.
         String token = ctx.request().getHeader("x-aws-ec2-metadata-token");
         if (token != null && !token.isBlank()) {
             SessionToken session = tokens.get(token);
@@ -529,6 +529,10 @@ public class Ec2MetadataServer {
             ctx.response().setStatusCode(404)
                     .putHeader("content-type", "text/plain")
                     .end(message);
+        } else if (inst.getMetadataOptions() != null
+                && "required".equals(inst.getMetadataOptions().getHttpTokens())) {
+            ctx.response().setStatusCode(401).end();
+            return null;
         }
         return inst;
     }
