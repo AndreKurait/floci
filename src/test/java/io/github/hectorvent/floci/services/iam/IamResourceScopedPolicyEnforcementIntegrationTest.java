@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.iam;
 import io.github.hectorvent.floci.testing.EnforcementFixtures;
 import io.github.hectorvent.floci.testing.IamEnforcementProfile;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
+import io.github.hectorvent.floci.testutil.AwsRequestSigner;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -10,6 +11,8 @@ import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URI;
 import java.util.LinkedHashMap;
@@ -55,19 +58,21 @@ class IamResourceScopedPolicyEnforcementIntegrationTest {
                 .formatted(action, resource);
     }
 
-    @Test
-    void aDenyNamingOneUserLeavesTheOthersAlone() {
+    @ParameterizedTest
+    @ValueSource(strings = {"POST", "GET", "PRESIGNED"})
+    void aDenyNamingOneUserLeavesTheOthersAlone(String protocol) throws Exception {
         String suffix = suffix();
         String denied = "deny-" + suffix;
         String allowed = "keep-" + suffix;
         createUser(denied);
         createUser(allowed);
 
-        String akid = userWith(denying("DeleteUser", arn("user/" + denied)));
+        EnforcementFixtures.UserCredentials credentials = userWithCredentials(
+                denying("DeleteUser", arn("user/" + denied)));
 
-        userIam(akid, "DeleteUser", Map.of("UserName", denied))
+        iamCall(credentials, "DeleteUser", Map.of("UserName", denied), protocol)
                 .statusCode(403).body(containsString("AccessDenied"));
-        userIam(akid, "DeleteUser", Map.of("UserName", allowed)).statusCode(200);
+        iamCall(credentials, "DeleteUser", Map.of("UserName", allowed), protocol).statusCode(200);
     }
 
     /**
@@ -378,12 +383,16 @@ class IamResourceScopedPolicyEnforcementIntegrationTest {
 
     /** An IAM user in {@link #ACCOUNT_ID} carrying {@code policy} inline. */
     private String userWith(String policy) {
+        return userWithCredentials(policy).accessKeyId();
+    }
+
+    private EnforcementFixtures.UserCredentials userWithCredentials(String policy) {
         String user = "scoped-" + suffix();
-        String accessKeyId = EnforcementFixtures.createUser(cleanup, port(),
-                adminAuth(), user).accessKeyId();
+        EnforcementFixtures.UserCredentials credentials = EnforcementFixtures.createUser(cleanup, port(),
+                adminAuth(), user);
         adminIam("PutUserPolicy", Map.of("UserName", user, "PolicyName", "p",
                 "PolicyDocument", policy)).statusCode(200);
-        return accessKeyId;
+        return credentials;
     }
 
     private static ValidatableResponse adminIam(String action, Map<String, String> params) {
@@ -396,7 +405,7 @@ class IamResourceScopedPolicyEnforcementIntegrationTest {
     }
 
     private static ValidatableResponse iamCall(String akid, String action,
-                                               Map<String, String> params) {
+                                                Map<String, String> params) {
         RequestSpecification spec = given()
                 .header("Authorization", auth(akid))
                 .contentType("application/x-www-form-urlencoded")
@@ -404,6 +413,23 @@ class IamResourceScopedPolicyEnforcementIntegrationTest {
                 .formParam("Version", "2010-05-08");
         params.forEach(spec::formParam);
         return spec.when().post("/").then();
+    }
+
+    private ValidatableResponse iamCall(EnforcementFixtures.UserCredentials credentials, String action,
+                                        Map<String, String> params, String protocol) throws Exception {
+        if ("POST".equals(protocol)) {
+            return iamCall(credentials.accessKeyId(), action, params);
+        }
+        AwsRequestSigner signer = AwsRequestSigner.signedAs(credentials.accessKeyId(),
+                credentials.secretAccessKey(), "iam");
+        Map<String, String> query = new LinkedHashMap<>(params);
+        query.put("Operation", action);
+        query.put("Version", "2010-05-08");
+        if ("PRESIGNED".equals(protocol)) {
+            return given().urlEncodingEnabled(false)
+                    .get(signer.presignedUri("GET", baseUri, query, new byte[0])).then();
+        }
+        return given().filter(signer).queryParams(query).get("/").then();
     }
 
     private static String auth(String accessKeyId) {

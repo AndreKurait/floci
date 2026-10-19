@@ -58,6 +58,18 @@ python3.9 -m venv .venv-legacy
 FLOCI_ENDPOINT=http://localhost:4566 .venv-legacy/bin/python -m pytest legacy/
 ```
 
+## Legacy Query GET
+
+`legacy/test_elb_query_get.py` checks that public Boto 2 Query GET reads and
+deletes Classic load balancers created through Boto 3 POST, including the
+missing-resource error. Boto 2.49.0 requires a separate Python 3.9 environment:
+
+```bash
+python3.9 -m venv .venv-legacy
+.venv-legacy/bin/pip install boto==2.49.0 boto3 pytest cryptography
+FLOCI_ENDPOINT=http://localhost:4566 .venv-legacy/bin/python -m pytest legacy/test_elb_query_get.py
+```
+
 ## Configuration
 
 | Variable         | Default                 | Description             |

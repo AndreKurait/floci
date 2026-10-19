@@ -55,7 +55,7 @@ import java.util.stream.Stream;
 @Path("/")
 public class AwsQueryController {
 
-    static final String CLOUDWATCH_GET_PATH = "/_cloudwatch-query";
+    static final String QUERY_GET_PATH = "/_query";
 
     private static final Logger LOG = Logger.getLogger(AwsQueryController.class);
 
@@ -379,22 +379,10 @@ public class AwsQueryController {
             "AdminAddUserToGroup", "AdminRemoveUserFromGroup", "AdminListGroupsForUser"
     );
 
-    /** Root GET requests that can use the CloudWatch Query handler without claiming S3 traffic. */
-    public static boolean isCloudWatchQueryGet(String authorization, String target, String accept,
-                                                MultivaluedMap<String, String> queryParams) {
-        String auth = IamEnforcementFilter.requestAuthorization(authorization, queryParams);
-        if (auth != null) {
-            return SigV4CredentialScope.serviceName(auth).filter("monitoring"::equals).isPresent();
-        }
-        String action = AwsQueryServiceResolver.action(queryParams);
-        return target == null && (accept == null || !accept.contains(MediaType.TEXT_HTML)) && action != null
-                && "monitoring".equals(inferServiceFromAction(action, queryParams.getFirst("Version")));
-    }
-
     @GET
-    @Path(CLOUDWATCH_GET_PATH)
+    @Path(QUERY_GET_PATH)
     @Produces({MediaType.APPLICATION_XML, MediaType.TEXT_HTML})
-    public Response dispatchCloudWatchQueryGet(@HeaderParam("Authorization") String authorization,
+    public Response dispatchQueryGet(@HeaderParam("Authorization") String authorization,
                                                @Context UriInfo uriInfo,
                                                @Context ContainerRequestContext request) {
         // Only the pre-matching Query claim may select this internal route.
@@ -404,6 +392,11 @@ public class AwsQueryController {
         }
         MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
         String action = AwsQueryServiceResolver.action(queryParams);
+        String auth = IamEnforcementFilter.requestAuthorization(authorization, queryParams);
+        String service = serviceResolver.resolve(auth, action, queryParams.getFirst("Version"));
+        if (!"monitoring".equals(service)) {
+            return dispatch(auth, queryParams);
+        }
         if (action == null) {
             return Response.status(404).type(MediaType.APPLICATION_XML)
                     .entity("<UnknownOperationException/>").build();

@@ -105,6 +105,16 @@ class ServiceEnablementIntegrationTest {
     }
 
     @Test
+    void signedQueryGetIsRejectedWhenItsServiceIsDisabled() {
+        given().header("Authorization", authorization("sqs"))
+                .queryParam("Action", "ListQueues").queryParam("Version", "2012-11-05")
+                .get("/").then().statusCode(400)
+                .contentType("application/xml")
+                .body(containsString("<Code>ServiceNotAvailableException</Code>"))
+                .body(containsString("<Message>Service sqs is not enabled.</Message>"));
+    }
+
+    @Test
     void dynamodbTargetedCborRequestsReturnCborErrors() throws Exception {
         JsonNode body = cborBody(
                 given()

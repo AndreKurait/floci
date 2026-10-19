@@ -75,7 +75,7 @@ public class AwsProtocolClaimFilter implements ContainerRequestFilter {
         ctx.setProperty(CLAIM_PROPERTY, resolved);
         if (resolved.protocol() == WireProtocol.AWS_QUERY && "GET".equalsIgnoreCase(signals.method())) {
             ctx.setRequestUri(ctx.getUriInfo().getRequestUriBuilder()
-                    .replacePath(AwsQueryController.CLOUDWATCH_GET_PATH).build());
+                    .replacePath(AwsQueryController.QUERY_GET_PATH).build());
         }
         if (resolved.protocol() == WireProtocol.REST) {
             Optional<String> scope = SigV4CredentialScope.serviceName(signals.authorization());
