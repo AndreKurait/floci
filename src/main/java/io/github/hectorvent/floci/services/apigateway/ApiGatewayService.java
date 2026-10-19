@@ -4296,19 +4296,21 @@ public class ApiGatewayService implements ResourceProvider {
         List<SecurityRequirement> secReqs = operation.getSecurity() != null
                 ? operation.getSecurity() : openAPI.getSecurity();
         boolean apiKeyRequired = secReqs != null && !secReqs.isEmpty()
-                && secReqs.stream().allMatch(requirement -> requirement.keySet().stream()
+                && secReqs.stream().anyMatch(requirement -> requirement.keySet().stream()
                         .anyMatch(apiKeySchemes::contains));
         String authType = "NONE";
         String authorizerId = null;
         List<String> authorizationScopes = List.of();
         if (secReqs != null) {
-            // An API Gateway method can reference only one authorizer, so preserve the first match.
-            resolveAuth:
             for (SecurityRequirement secReq : secReqs) {
                 for (String schemeName : secReq.keySet()) {
                     String mapped = schemeToAuthType.get(schemeName);
                     if (mapped == null || "NONE".equals(mapped)) {
                         continue;
+                    }
+                    if (!"NONE".equals(authType)) {
+                        throw new AwsException("BadRequestException",
+                                "Only one Authorizer or IAM authorization is allowed per operation", 400);
                     }
                     authType = mapped;
                     authorizerId = schemeToAuthorizerId.get(schemeName);
@@ -4316,7 +4318,6 @@ public class ApiGatewayService implements ResourceProvider {
                     if (requestedScopes != null) {
                         authorizationScopes = requestedScopes;
                     }
-                    break resolveAuth;
                 }
             }
         }

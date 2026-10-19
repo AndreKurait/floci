@@ -1713,7 +1713,7 @@ class ApiGatewayOpenApiImportTest {
 
     @Test
     @Order(93)
-    void importRestApi_firstDeclaredAuthorizerWins() throws Exception {
+    void importRestApi_rejectsMultipleAuthorizers() {
         String spec = """
                 {
                   "openapi": "3.0.1",
@@ -1752,30 +1752,12 @@ class ApiGatewayOpenApiImportTest {
                   }
                 }
                 """;
-        String apiId = mapper.readTree(given()
-                .contentType(ContentType.JSON).queryParam("mode", "import").body(spec)
-                .when().post("/restapis").then().statusCode(201)
-                .extract().body().asString()).get("id").asText();
+        given().contentType(ContentType.JSON).queryParam("mode", "import").body(spec)
+                .post("/restapis").then().statusCode(400)
+                .body("message", containsString("Only one Authorizer or IAM authorization"));
+        given().get("/restapis").then().statusCode(200)
+                .body("item.find { it.name == 'MultiAuthAPI' }", nullValue());
 
-        // The first declared scheme (AuthA) binds the method — not the last (AuthB).
-        String authAId = given()
-                .when().get("/restapis/" + apiId + "/authorizers")
-                .then().statusCode(200)
-                .body("item", hasSize(2))
-                .extract().body().jsonPath().getString("item.find { it.name == 'AuthA' }.id");
-
-        String resourceId = given()
-                .when().get("/restapis/" + apiId + "/resources")
-                .then().statusCode(200)
-                .extract().body().jsonPath().getString("item.find { it.path == '/multi' }.id");
-
-        given()
-                .when().get("/restapis/" + apiId + "/resources/" + resourceId + "/methods/GET")
-                .then().statusCode(200)
-                .body("authorizationType", equalTo("CUSTOM"))
-                .body("authorizerId", equalTo(authAId));
-
-        given().delete("/restapis/" + apiId);
     }
 
     @Test
