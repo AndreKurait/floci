@@ -3391,6 +3391,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDescribeKeyPairs(MultivaluedMap<String, String> p, String region) {
+        boolean includePublicKey = Boolean.parseBoolean(p.getFirst("IncludePublicKey"));
         List<String> keyNames = getList(p, "KeyName");
         List<String> keyPairIds = getList(p, "KeyPairId");
         List<KeyPair> kps = service.describeKeyPairs(region, keyNames, keyPairIds);
@@ -3402,9 +3403,18 @@ public class Ec2QueryHandler {
             xml.start("item")
                     .elem("keyPairId", kp.getKeyPairId())
                     .elem("keyName", kp.getKeyName())
-                    .elem("keyFingerprint", kp.getKeyFingerprint())
-                    .raw(tagSetXml(kp.getTags()))
-                    .end("item");
+                    .elem("keyFingerprint", kp.getKeyFingerprint());
+            if (includePublicKey) {
+                String publicKey = kp.getPublicKey();
+                if (publicKey != null) {
+                    String[] fields = publicKey.strip().split("\\s+", 3);
+                    if (fields.length >= 2) {
+                        publicKey = fields[0] + " " + fields[1] + " " + kp.getKeyName();
+                    }
+                }
+                xml.elem("publicKey", publicKey);
+            }
+            xml.raw(tagSetXml(kp.getTags())).end("item");
         }
         xml.end("keySet").end("DescribeKeyPairsResponse");
         return xmlResponse(xml.build());
@@ -3506,6 +3516,9 @@ public class Ec2QueryHandler {
                     .elem("hypervisor", img.getHypervisor())
                     .elem("imageOwnerAlias", img.getImageOwnerAlias())
                     .elem("creationDate", img.getCreationDate())
+                    .elem("sourceImageId", img.getCreationSourceImageId())
+                    .elem("sourceImageRegion", img.getCreationSourceImageRegion())
+                    .elem("sourceInstanceId", img.getCreationSourceInstanceId())
                     .raw(blockDeviceMappingXml(img.getBlockDeviceMappings()))
                     .raw(tagSetXml(img.getTags()))
                     .end("item");
