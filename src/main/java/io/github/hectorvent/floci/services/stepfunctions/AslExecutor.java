@@ -268,6 +268,7 @@ public class AslExecutor {
     private final WebClient webClient;
     private final ApiGatewayTaskInvoker apiGatewayTaskInvoker;
     private final EmulatorConfig config;
+    private final NestedTaskCredentials nestedTaskCredentials;
     private final CustomResourceLiveness customResourceLiveness;
     private final Clock clock;
     private final Sleeper sleeper;
@@ -295,15 +296,15 @@ public class AslExecutor {
                        ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
                        Instance<StepFunctionsService> sfnService, EmulatorConfig config, Vertx vertx,
                        CustomResourceLiveness customResourceLiveness, RedshiftDataJsonHandler redshiftDataHandler,
-                       ServiceRegistry serviceRegistry, LambdaTaskAuthorizer lambdaTaskAuthorizer,
-                       ApiGatewayTaskInvoker apiGatewayTaskInvoker) {
+                       ServiceRegistry serviceRegistry, NestedTaskCredentials nestedTaskCredentials,
+                       LambdaTaskAuthorizer lambdaTaskAuthorizer, ApiGatewayTaskInvoker apiGatewayTaskInvoker) {
         this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
                 sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
-                lambdaTaskAuthorizer, null, null, apiGatewayTaskInvoker);
+                nestedTaskCredentials, lambdaTaskAuthorizer, null, null, apiGatewayTaskInvoker);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
@@ -319,9 +320,11 @@ public class AslExecutor {
                 CustomResourceLiveness customResourceLiveness,
                 Clock clock, Sleeper sleeper, Integer maxWaitSecondsOverride,
                 RedshiftDataJsonHandler redshiftDataHandler, ServiceRegistry serviceRegistry,
-                LambdaTaskAuthorizer lambdaTaskAuthorizer, Duration expressMaxExecutionTimeOverride,
-                LongSupplier nanoTimeOverride, ApiGatewayTaskInvoker apiGatewayTaskInvoker) {
+                NestedTaskCredentials nestedTaskCredentials, LambdaTaskAuthorizer lambdaTaskAuthorizer,
+                Duration expressMaxExecutionTimeOverride, LongSupplier nanoTimeOverride,
+                ApiGatewayTaskInvoker apiGatewayTaskInvoker) {
         this.apiGatewayTaskInvoker = apiGatewayTaskInvoker;
+        this.nestedTaskCredentials = nestedTaskCredentials;
         this.serviceRegistry = serviceRegistry;
         this.lambdaTaskAuthorizer = lambdaTaskAuthorizer;
         this.customResourceLiveness = customResourceLiveness;
@@ -383,7 +386,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null, null, null, null);
+                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null, null, null, null, null);
     }
 
     // Kept for tests that do not exercise the Redshift Data API integration.
@@ -404,7 +407,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                clock, sleeper, maxWaitSecondsOverride, null, null, null, null, null, null);
+                clock, sleeper, maxWaitSecondsOverride, null, null, null, null, null, null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
@@ -908,6 +911,7 @@ public class AslExecutor {
             ((ObjectNode) context.get("Task")).put("Token", taskToken);
         }
 
+        JsonNode credentialInput = jsonata ? input : applyInputPath(stateDef, input, context);
         JsonNode effectiveInput;
         // The role a task's Credentials name is read the way its Parameters or Arguments are, and
         // only under IAM enforcement, the one place it is used.
@@ -925,7 +929,7 @@ public class AslExecutor {
                         buildStatesVar(input, null, context), variables);
             }
         } else {
-            effectiveInput = applyInputPath(stateDef, input, context);
+            effectiveInput = credentialInput;
             if (readCredentials) {
                 credentials = resolveParameters(stateDef.get("Credentials"), effectiveInput, context);
             }
@@ -936,7 +940,8 @@ public class AslExecutor {
         String credentialsRoleArn = credentials == null ? null : credentials.path("RoleArn").asText(null);
 
         // Registered after the input template resolved, so a template failure leaves no token behind.
-        CompletableFuture<JsonNode> tokenFuture = needsToken ? sfnService.get().registerPendingToken(taskToken) : null;
+        CompletableFuture<JsonNode> tokenFuture = needsToken ? sfnService.get().registerPendingToken(taskToken,
+                AwsArnUtils.parse(sm.getStateMachineArn()).accountId()) : null;
         TaskEventProfile profile = taskEventProfile(resource, isActivity);
         JsonNode taskResult;
         // Read before the scheduled event is built, so a large input or a slow history callback
@@ -946,13 +951,34 @@ public class AslExecutor {
             addTaskScheduledEvent(chain, profile, stateDef, effectiveInput, sm);
             addTaskStartedEvent(chain, profile);
             try {
+                String taskAccount = null;
+                boolean handledCredentials = iamEnforcementEnabled()
+                        && effectiveResource.contains(":lambda:") && effectiveResource.contains(":function:")
+                        || StatesIntegration.parse(effectiveResource).map(integration ->
+                            iamEnforcementEnabled() && integration.is("lambda", "invoke")
+                            || integration.is("apigateway", "invoke") && integration.suffix().isEmpty()).orElse(false);
+                if (mockedInvocation == null && stateDef.has("Credentials") && !handledCredentials) {
+                    JsonNode taskCredentials = jsonata
+                            ? jsonataEvaluator.resolveTemplate(stateDef.get("Credentials"), "Credentials",
+                                    buildStatesVar(input, null, context), variables)
+                            : resolveParameters(stateDef.get("Credentials"), credentialInput, context);
+                    taskAccount = nestedTaskCredentials.account(taskCredentials, resource, sm);
+                }
+                if (mockedInvocation == null) {
+                    NestedTaskCredentials.validateTargetAccount(resource, effectiveInput, sm, taskAccount);
+                }
+                JsonNode resourceInput = effectiveInput;
+                String resourceToken = taskToken;
                 taskResult = mockedInvocation != null
                         ? mockedTaskResult(mockedInvocation.steps(), stateName, mockedInvocation.responseIndex())
-                        : invokeResource(effectiveResource, effectiveInput, sm, taskToken,
+                        : RequestScopes.callAsChecked(taskAccount, () -> invokeResource(
+                                effectiveResource, resourceInput, sm, resourceToken,
                                 context.path("Execution").path("Id").asText(null),
                                 executionDeadlineNanos, taskDeadlineNanos,
                                 jsonata ? null : stateDef.path("Parameters"), credentialsRoleArn,
-                                jobResponse -> addTaskSubmittedEvent(chain, profile, jobResponse));
+                                jobResponse -> RequestScopes.runAs(
+                                        AwsArnUtils.parse(sm.getStateMachineArn()).accountId(),
+                                        () -> addTaskSubmittedEvent(chain, profile, jobResponse))));
                 if (tokenFuture != null) {
                     taskResult = awaitToken(tokenFuture, stateDef, taskToken, executionDeadlineNanos,
                             taskDeadlineNanos);
@@ -1699,8 +1725,10 @@ public class AslExecutor {
      */
     private JsonNode invokeAwsSdkSfnSendTaskSuccess(JsonNode input) throws Exception {
         String taskToken = input.path("TaskToken").asText(null);
-        if (!sfnService.get().sendTaskSuccess(taskToken, sdkPayload(input.path("Output")))) {
-            throw new FailStateException("Sfn.InvalidTokenException", "Invalid Token: 'Invalid token'");
+        try {
+            sfnService.get().sendTaskSuccess(taskToken, sdkPayload(input.path("Output")));
+        } catch (AwsException e) {
+            throw new FailStateException(sdkExceptionName("Sfn", e.getErrorCode()), e.getMessage());
         }
         return objectMapper.createObjectNode();
     }
@@ -1708,9 +1736,11 @@ public class AslExecutor {
     /** AWS SDK integration for {@code sfn:sendTaskFailure}, token semantics as in SendTaskSuccess. */
     private JsonNode invokeAwsSdkSfnSendTaskFailure(JsonNode input) {
         String taskToken = input.path("TaskToken").asText(null);
-        if (!sfnService.get().sendTaskFailure(taskToken, input.path("Cause").asText(null),
-                input.path("Error").asText(null))) {
-            throw new FailStateException("Sfn.InvalidTokenException", "Invalid Token: 'Invalid token'");
+        try {
+            sfnService.get().sendTaskFailure(taskToken, input.path("Cause").asText(null),
+                    input.path("Error").asText(null));
+        } catch (AwsException e) {
+            throw new FailStateException(sdkExceptionName("Sfn", e.getErrorCode()), e.getMessage());
         }
         return objectMapper.createObjectNode();
     }
@@ -5932,7 +5962,8 @@ public class AslExecutor {
             return false;
         }
         try {
-            return abortedByCaller(sfnService.get().describeExecution(executionArn));
+            return RequestScopes.callAs(AwsArnUtils.parse(executionArn).accountId(),
+                    () -> abortedByCaller(sfnService.get().describeExecution(executionArn)));
         } catch (AwsException e) {
             LOG.warnv("Execution {0} vanished while a .sync task was waiting on its job; ending the wait ({1})",
                     executionArn, e.getMessage());
