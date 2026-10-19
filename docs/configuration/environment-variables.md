@@ -252,6 +252,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | `FLOCI_SERVICES_LAMBDA_POLL_INTERVAL_MS` | `1000` | How often (ms) the SQS and Kinesis event source pollers check for new messages |
 | `FLOCI_SERVICES_LAMBDA_ASYNC_RETRY_DELAY_SECONDS` | `60` | Wait before the first retry of a failed asynchronous invocation (seconds); the second waits twice this, `0` retries back to back |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS` | `300` | Seconds of inactivity before an idle Lambda container is removed |
+| `FLOCI_SERVICES_LAMBDA_CONTAINER_DRAIN_TIMEOUT_SECONDS` | `15` | Shared shutdown drain budget for Lambda containers; 1 through 300 seconds, invalid values fail initialization |
 | `FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_PER_FUNCTION` | `max(4, cpus)` | Maximum idle (warm) containers kept per function; a container released beyond this is stopped |
 | `FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_TOTAL` | `0` | Maximum idle (warm) containers kept across all functions. Beyond it, the least-recently-used idle container of any function is stopped to make room for the one just released. `0` leaves the total unbounded; a negative value is ignored with a warning. See [Bounding warm containers](../services/lambda.md#bounding-warm-containers) |
 | `FLOCI_SERVICES_LAMBDA_REGION_CONCURRENCY_LIMIT` | `1000` | Maximum concurrent Lambda invocations across all functions in a region |
@@ -260,6 +261,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | `FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ENABLED` | `false` | Watch Lambda code directories for changes and reload without redeployment |
 | `FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ALLOWED_PATHS` | _(none)_ | Comma-separated host paths that hot-reload is allowed to watch |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | _(none)_ | Docker network for Lambda containers (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
+| `FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS` | _(none)_ | Comma-separated existing Docker network names or IDs joined before a function starts. Keeps the primary network; a failed attachment aborts and cleans up the launch. Duplicate or invalid names are rejected |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_FLAGS` | _(none)_ | Additional Docker flags applied to Lambda containers, such as `--env`, `--volume`, `--publish`, `--add-host`, `--dns`, `--label`, `--network`, `--user`, `--privileged`, and `--platform`. Explicit `--dns` entries replace automatic embedded DNS and public fallback resolvers. Published ports support `host:container` and `127.0.0.1:host:container` forms |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX` | `floci` | Base name prefix for Lambda-spawned containers and code volumes (must match `[A-Za-z0-9][A-Za-z0-9_.-]*`) |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | _(none)_ | Explicit host/IP Lambda containers use to reach the Runtime API, bypassing auto-detection (e.g. rootless Podman) |
@@ -282,6 +284,8 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_IAM_ENABLED` | `true` | Enable the IAM service |
+| `FLOCI_SERVICES_IAM_ISSUED_SESSION_VERIFICATION_ENABLED` | `false` | Enable bounded local metadata lookup and SigV4 proof verification for current normal AssumeRole sessions; does not grant permissions |
+| `FLOCI_SERVICES_IAM_LAMBDA_IDENTITY_VERIFICATION_ENABLED` | `false` | Enable local observation and proof verification of current Lambda execution-role identities; does not grant permissions |
 | `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED` | `false` | When `true`, enforce IAM policies on API calls. Leave `false` for most local development scenarios |
 | `FLOCI_SERVICES_IAM_SEED_DEPLOYER_PRINCIPAL` | `false` | Create a local `floci-deployer` IAM user with `AdministratorAccess` and static `floci`/`floci` credentials |
 
@@ -545,6 +549,19 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_EC2_IMDS_PORT` | `9169` | Port for the EC2 Instance Metadata Service (IMDS) endpoint |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START` | `2200` | First port in the SSH port range for EC2 instances |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END` | `2299` | Last port in the SSH port range |
+
+Guest environment values are explicit, never copied from the Floci host environment.
+They replace image defaults through Docker's normal environment merge. Floci's
+instance ID, region, credentials/provider selection, AWS service endpoints and IMDS
+settings remain authoritative; the corresponding `AWS_*` keys cannot be overridden.
+Other keys, such as `AWS_CA_BUNDLE`, are allowed. Invalid or duplicate entries refuse
+the guest launch before a workload or firewall namespace is created, without logging
+their values.
+
+Process limits apply only to EC2 workload containers, including image, minimal and
+systemd runtimes. They do not change helper containers or Docker daemon defaults.
+An absent setting keeps the existing defaults; CPU and memory limits remain controlled
+by the instance type and `FLOCI_SERVICES_EC2_INSTANCE_RESOURCE_LIMITS`.
 
 ### Athena
 
