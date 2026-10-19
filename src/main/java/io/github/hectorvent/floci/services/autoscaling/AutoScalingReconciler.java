@@ -441,6 +441,7 @@ public class AutoScalingReconciler {
                 LaunchPlacement placement = leastPopulatedPlacement(asg, placements);
                 List<Instance> launched = launchInstance(asg, launchSource, placement, null, null,
                         List.of(), launchedInstanceIds, false);
+
                 if (placement.subnetId() != null) {
                     placements.set(placements.indexOf(placement), new LaunchPlacement(placement.subnetId(),
                             placement.availabilityZone(), Math.max(0,
@@ -550,13 +551,13 @@ public class AutoScalingReconciler {
                 reservation = ec2Service.runInstances(
                         asg.getRegion(), launchSource.imageId(), launchSource.instanceType(), 1, 1,
                         launchSource.keyName(), launchSource.securityGroupIds(), placement.subnetId(), clientToken,
-                        propagatedInstanceTags(asg, launchSource), launchSource.userData(),
+                        AutoScalingService.propagatedInstanceTags(asg, launchSource.instanceTags()), launchSource.userData(),
                         launchSource.launchConfigurationName() == null ? launchSource.iamInstanceProfile()
                                 : asgService.resolveLaunchConfigurationProfile(launchSource.iamInstanceProfile()),
                         launchSource.associatePublicIpAddress(), null, 0, null, launchSource.metadataOptions(), null,
                         launchSource.encodedUserData() != null ? launchSource.encodedUserData()
                                 : encodeLegacyUserData(launchSource.userData()),
-                        false, null, null, launchSource.blockDeviceMappings());
+                        false, null, null, launchSource.blockDevices());
             } catch (RuntimeException launchFailure) {
                 if (!refreshLaunch) {
                     throw launchFailure;
@@ -659,23 +660,6 @@ public class AutoScalingReconciler {
 
     private record LaunchPlacement(String subnetId, String availabilityZone, int availableIpAddresses,
                                    boolean requiresIpv4Address) {}
-
-    private static List<io.github.hectorvent.floci.services.ec2.model.Tag> propagatedInstanceTags(
-            AutoScalingGroup asg,
-            LaunchSource launchSource) {
-        Map<String, String> tags = new LinkedHashMap<>();
-        for (io.github.hectorvent.floci.services.ec2.model.Tag tag : launchSource.instanceTags()) {
-            tags.put(tag.getKey(), tag.getValue());
-        }
-        asg.getTags().forEach((key, value) -> {
-            if (asg.getTagPropagateAtLaunch().getOrDefault(key, false)) {
-                tags.put(key, value);
-            }
-        });
-        return tags.entrySet().stream()
-                .map(entry -> new io.github.hectorvent.floci.services.ec2.model.Tag(entry.getKey(), entry.getValue()))
-                .toList();
-    }
 
     private void scaleIn(AutoScalingGroup asg, int count) {
         List<AsgInstance> candidates = asg.getInstances().stream()
@@ -851,8 +835,7 @@ public class AutoScalingReconciler {
                     // Forwarded as-is: an explicit false has to beat a public
                     // subnet's MapPublicIpOnLaunch, and only null means
                     // "fall back to the subnet default".
-                    lc.getAssociatePublicIpAddress(),
-                    launchConfigurationBlockDevices(lc), lc.getMetadataOptions());
+                    lc.getAssociatePublicIpAddress(), launchConfigurationBlockDevices(lc), lc.getMetadataOptions());
         }
 
         LaunchTemplate launchTemplate = resolveLaunchTemplate(asg);
@@ -880,8 +863,8 @@ public class AutoScalingReconciler {
                     asg.getLaunchTemplateId(),
                     asg.getLaunchTemplateName(),
                     resolvedVersion,
-                    version.getData().effectiveAssociatePublicIpAddress(),
-                    version.getData().getBlockDeviceMappings(), version.getData().getMetadataOptions());
+                    version.getData().effectiveAssociatePublicIpAddress(), version.getData().getBlockDeviceMappings(),
+                    version.getData().getMetadataOptions());
         }
 
         MixedInstancesPolicy.LaunchTemplateSpecification specification =
@@ -915,8 +898,8 @@ public class AutoScalingReconciler {
                                 : specification.getLaunchTemplateId(),
                         specification.getLaunchTemplateName(),
                         resolvedVersion,
-                        version.getData().effectiveAssociatePublicIpAddress(),
-                        version.getData().getBlockDeviceMappings(), version.getData().getMetadataOptions());
+                        version.getData().effectiveAssociatePublicIpAddress(), version.getData().getBlockDeviceMappings(),
+                        version.getData().getMetadataOptions());
             }
         }
 
@@ -1052,7 +1035,7 @@ public class AutoScalingReconciler {
             String launchTemplateName,
             String launchTemplateVersion,
             Boolean associatePublicIpAddress,
-            List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings,
+            List<LaunchTemplateData.BlockDeviceMapping> blockDevices,
             LaunchTemplateData.MetadataOptions metadataOptions) {}
 
     // Override for describeAutoScalingGroups with null region (all regions)
