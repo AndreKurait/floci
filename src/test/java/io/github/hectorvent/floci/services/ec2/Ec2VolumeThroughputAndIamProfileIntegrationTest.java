@@ -1,15 +1,23 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Covers EC2 read-path parity gaps that broke Terraform/OpenTofu:
@@ -42,6 +50,7 @@ class Ec2VolumeThroughputAndIamProfileIntegrationTest {
             .then()
                 .statusCode(200)
                 .body("CreateVolumeResponse.volumeId", notNullValue())
+                .body("CreateVolumeResponse.iops", equalTo("3000"))
                 .body("CreateVolumeResponse.throughput", equalTo("125"))
                 .extract().path("CreateVolumeResponse.volumeId");
 
@@ -53,6 +62,7 @@ class Ec2VolumeThroughputAndIamProfileIntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200)
+                .body("DescribeVolumesResponse.volumeSet.item.iops", equalTo("3000"))
                 .body("DescribeVolumesResponse.volumeSet.item.throughput", equalTo("125"));
     }
 
@@ -90,6 +100,48 @@ class Ec2VolumeThroughputAndIamProfileIntegrationTest {
                 // The handler omits the <throughput> element when the value is null
                 // (positively verified for gp3 in the tests above).
                 .body("CreateVolumeResponse.volumeType", equalTo("gp2"));
+    }
+
+    @Test
+    @Order(4)
+    void describeVolumesPagesFilteredResultsAndRejectsInvalidCursors() {
+        String scope = UUID.randomUUID().toString();
+        List<String> volumes = new ArrayList<>();
+        try {
+            for (int index = 0; index < 6; index++) {
+                volumes.add(given().header("Authorization", AUTH_HEADER)
+                        .formParam("Action", "CreateVolume").formParam("AvailabilityZone", "us-east-1a")
+                        .formParam("Size", "1").formParam("TagSpecification.1.ResourceType", "volume")
+                        .formParam("TagSpecification.1.Tag.1.Key", "PageScope")
+                        .formParam("TagSpecification.1.Tag.1.Value", scope)
+                        .post("/").then().statusCode(200).extract().path("CreateVolumeResponse.volumeId"));
+            }
+            Response first = given().header("Authorization", AUTH_HEADER)
+                    .formParam("Action", "DescribeVolumes").formParam("MaxResults", "5")
+                    .formParam("Filter.1.Name", "tag:PageScope").formParam("Filter.1.Value.1", scope)
+                    .post("/").then().statusCode(200).extract().response();
+            List<String> ids = new ArrayList<>(first.xmlPath().getList("DescribeVolumesResponse.volumeSet.item.volumeId"));
+            assertEquals(5, ids.size());
+            String token = first.path("DescribeVolumesResponse.nextToken");
+            assertFalse(token.isBlank());
+            Response last = given().header("Authorization", AUTH_HEADER)
+                    .formParam("Action", "DescribeVolumes").formParam("MaxResults", "5")
+                    .formParam("NextToken", token).formParam("Filter.1.Name", "tag:PageScope")
+                    .formParam("Filter.1.Value.1", scope)
+                    .post("/").then().statusCode(200).extract().response();
+            ids.addAll(last.xmlPath().getList("DescribeVolumesResponse.volumeSet.item.volumeId"));
+            assertEquals(volumes.stream().sorted().toList(), ids);
+            assertTrue(last.xmlPath().getList("DescribeVolumesResponse.nextToken").isEmpty());
+            given().header("Authorization", AUTH_HEADER).formParam("Action", "DescribeVolumes")
+                    .formParam("MaxResults", "5").formParam("NextToken", "not-a-token")
+                    .post("/").then().statusCode(400)
+                    .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
+        } finally {
+            for (String id : volumes) {
+                given().header("Authorization", AUTH_HEADER).formParam("Action", "DeleteVolume")
+                        .formParam("VolumeId", id).post("/").then().statusCode(200);
+            }
+        }
     }
 
     // ── #1090: DescribeAddressesAttribute ─────────────────────────────────────
