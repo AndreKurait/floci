@@ -456,13 +456,16 @@ without `AutoPublishAlias` fails the transform with
 `'VersionDeletionPolicy' requires 'AutoPublishAlias'.`, as it does in SAM when it does not ignore
 that global.
 
+When `AutoPublishAlias` and a nonempty `AutoPublishCodeSha256` are set, SAM appends the hash to
+the function's `Description`. Parameter references in the description are resolved first;
+other intrinsics are preserved in a `Fn::Join`. Changing the hash alone therefore publishes
+a new version and moves the alias to it.
+
 A new id publishes a version, and moves the alias to it, only when the function's code or
 configuration changed since its last version. Otherwise the new version resource takes the last
 version and the alias stays where it is, as when an update changes only one of these:
 
 - A change to `SnapStart`: floci does not give the function `SnapStart`.
-- A new `AutoPublishCodeSha256` alone: on AWS this publishes, because SAM appends it to the
-  function's `Description`, but floci's transform sets no `Description` on the function.
 - Under `AutoPublishAliasAllProperties`, a change to `Tags` or `ReservedConcurrentExecutions`
   only: AWS fails that update with
   `A version for this Lambda function exists ( N ). Modify the function to create a new version.`,
