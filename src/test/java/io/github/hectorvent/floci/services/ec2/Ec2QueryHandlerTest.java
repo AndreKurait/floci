@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ec2;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
@@ -69,6 +70,44 @@ class Ec2QueryHandlerTest {
                     ? "InvalidParameter" : "InvalidParameterValue";
             assertTrue(response.getEntity().toString().contains("<Code>" + code + "</Code>"));
             assertTrue(response.getEntity().toString().contains("reserved for internal use"));
+            verifyNoInteractions(service);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"resource-type", "missing-resource-type", "reserved-key",
+            "key-length", "value-length", "tag-count"})
+    void rejectsInvalidRegisterImageCreationTagsBeforeMutation(String invalid) {
+        for (String prefix : List.of("TagSpecification", "TagSpecifications")) {
+            Ec2Service service = mock(Ec2Service.class);
+            Image image = new Image();
+            image.setImageId("ami-1234567890abcdef0");
+            when(service.registerImage("us-east-1", "tagged-register-test", null, null, null, List.of()))
+                    .thenReturn(image);
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("Name", "tagged-register-test");
+            params.putSingle(prefix + ".1.ResourceType", "image");
+            params.putSingle(prefix + ".1.Tag.1.Key", "Build");
+            params.putSingle(prefix + ".1.Tag.1.Value", "example");
+            switch (invalid) {
+                case "resource-type" -> params.putSingle(prefix + ".2.ResourceType", "snapshot");
+                case "missing-resource-type" -> params.remove(prefix + ".1.ResourceType");
+                case "reserved-key" -> params.putSingle(prefix + ".1.Tag.1.Key", "aws:example");
+                case "key-length" -> params.putSingle(prefix + ".1.Tag.1.Key", "k".repeat(129));
+                case "value-length" -> params.putSingle(prefix + ".1.Tag.1.Value", "v".repeat(257));
+                case "tag-count" -> {
+                    for (int i = 1; i <= 51; i++) {
+                        params.putSingle(prefix + ".1.Tag." + i + ".Key", "key-" + i);
+                    }
+                }
+                default -> throw new IllegalArgumentException(invalid);
+            }
+
+            Response response = handler(service).handle("RegisterImage", params, "us-east-1");
+
+            assertEquals(400, response.getStatus());
+            String code = "tag-count".equals(invalid) ? "TagLimitExceeded" : "InvalidParameterValue";
+            assertTrue(response.getEntity().toString().contains("<Code>" + code + "</Code>"));
             verifyNoInteractions(service);
         }
     }
