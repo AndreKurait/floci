@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.services.ec2.model.Tag;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
@@ -36,6 +37,11 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.GZIPOutputStream;
@@ -736,6 +742,166 @@ class AutoScalingServiceTest {
                 () -> service.deleteAutoScalingGroup(REGION, "test-asg", false));
 
         assertEquals("ResourceInUse", error.getErrorCode());
+    }
+
+    @Test
+    void deletingGroupPreservesSameNameGroupsHooksAndPoliciesInOtherRegions() {
+        String otherRegion = "us-west-2";
+        createGroup(otherRegion, "test-asg");
+        createGroup(REGION, "test-asg::other");
+        service.putLifecycleHook(REGION, "test-asg::other", "hook", "autoscaling:EC2_INSTANCE_LAUNCHING",
+                null, null, null, 300, "CONTINUE");
+        service.putScalingPolicy(REGION, "test-asg::other", "policy", "SimpleScaling", "ChangeInCapacity",
+                1, 300, null, null);
+        for (String region : List.of(REGION, otherRegion)) {
+            service.putLifecycleHook(region, "test-asg", "hook", "autoscaling:EC2_INSTANCE_LAUNCHING",
+                    null, null, null, 300, "CONTINUE");
+            service.putScalingPolicy(region, "test-asg", "policy", "SimpleScaling", "ChangeInCapacity",
+                    1, 300, null, null);
+        }
+
+        assertEquals(1, service.describeLifecycleHooks(REGION, "test-asg", null).size());
+        assertEquals(1, service.describeLifecycleHooks(otherRegion, "test-asg", null).size());
+
+        service.deleteAutoScalingGroup(REGION, "test-asg", false);
+
+        assertEquals(1, service.describeLifecycleHooks(otherRegion, "test-asg", null).size());
+        assertEquals(1, service.describePolicies(otherRegion, "test-asg", null).size());
+        assertTrue(service.describePolicies(REGION, "test-asg", null).isEmpty());
+        assertEquals(1, service.describeLifecycleHooks(REGION, "test-asg::other", null).size());
+        assertEquals(1, service.describePolicies(REGION, "test-asg::other", null).size());
+    }
+
+    @Test
+    void deletingPolicyMatchesRegionAndRequestedGroup() {
+        createGroup("us-west-2", "test-asg");
+        createGroup(REGION, "other-asg");
+        for (String region : List.of(REGION, "us-west-2")) {
+            service.putScalingPolicy(region, "test-asg", "policy", "SimpleScaling", "ChangeInCapacity",
+                    1, 300, null, null);
+        }
+        service.putScalingPolicy(REGION, "other-asg", "policy", "SimpleScaling", "ChangeInCapacity",
+                1, 300, null, null);
+
+        service.deletePolicy(REGION, "test-asg", "policy");
+
+        assertTrue(service.describePolicies(REGION, "test-asg", null).isEmpty());
+        assertEquals(1, service.describePolicies("us-west-2", "test-asg", null).size());
+        assertEquals(1, service.describePolicies(REGION, "other-asg", null).size());
+        String policyArn = service.describePolicies("us-west-2", "test-asg", null).getFirst().getPolicyArn();
+        service.deletePolicy("us-west-2", null, policyArn);
+        assertTrue(service.describePolicies("us-west-2", "test-asg", null).isEmpty());
+        assertEquals(1, service.describePolicies(REGION, "other-asg", null).size());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("groupMutations")
+    void deletionAfterGroupLookupDoesNotResurrectGroup(String name, Consumer<AutoScalingService> mutation)
+            throws Exception {
+        AutoScalingGroupFixture.addInstance(service, REGION, "test-asg", "i-active", "InService", "lt-original", "1");
+        AtomicReference<Thread> mutator = new AtomicReference<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        CountDownLatch read = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        service.groups = new ConcurrentHashMap<>(service.groups) {
+            @Override
+            public AutoScalingGroup get(Object key) {
+                AutoScalingGroup group = super.get(key);
+                if (Thread.currentThread() == mutator.get()) {
+                    read.countDown();
+                    try {
+                        assertTrue(resume.await(5, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(e);
+                    }
+                }
+                return group;
+            }
+        };
+        Thread change = new Thread(() -> {
+            try {
+                mutation.accept(service);
+            } catch (Throwable e) {
+                failure.compareAndSet(null, e);
+            }
+        });
+        mutator.set(change);
+        Thread delete = new Thread(() -> {
+            try {
+                service.deleteAutoScalingGroup(REGION, "test-asg", true);
+            } catch (Throwable e) {
+                failure.compareAndSet(null, e);
+            }
+        });
+        try {
+            change.start();
+            assertTrue(read.await(5, TimeUnit.SECONDS));
+            delete.start();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (delete.isAlive() && delete.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+                Thread.sleep(1);
+            }
+            assertTrue(!delete.isAlive() || delete.getState() == Thread.State.BLOCKED);
+            resume.countDown();
+            change.join(5000);
+            delete.join(5000);
+            assertFalse(change.isAlive());
+            assertFalse(delete.isAlive());
+            assertNull(failure.get());
+            assertTrue(service.describeAutoScalingGroups(REGION, List.of("test-asg")).isEmpty());
+            createGroup(REGION, "test-asg");
+            assertTrue(service.describeLifecycleHooks(REGION, "test-asg", null).isEmpty());
+            assertTrue(service.describePolicies(REGION, "test-asg", null).isEmpty());
+            assertTrue(service.describeScheduledActions(REGION, "test-asg", null).isEmpty());
+            assertNull(service.describeWarmPool(REGION, "test-asg"));
+        } finally {
+            resume.countDown();
+            change.interrupt();
+            delete.interrupt();
+            change.join(5000);
+            delete.join(5000);
+        }
+    }
+
+    private static Stream<Arguments> groupMutations() {
+        return Stream.of(
+                Arguments.of("capacity", (Consumer<AutoScalingService>) s -> s.setDesiredCapacity(REGION, "test-asg", 2)),
+                Arguments.of("configuration", (Consumer<AutoScalingService>) s -> s.updateAutoScalingGroup(
+                        REGION, "test-asg", null, null, null, null, null, null, 4, null, null,
+                        null, null, null, null, null, AsgOptionalFields.none())),
+                Arguments.of("tags", (Consumer<AutoScalingService>) s -> s.createOrUpdateTags(
+                        REGION, "test-asg", "auto-scaling-group", Map.of("k", "v"), Map.of("k", true))),
+                Arguments.of("delete-tags", (Consumer<AutoScalingService>) s -> s.deleteTags(
+                        REGION, "test-asg", "auto-scaling-group", List.of("k"))),
+                Arguments.of("protection", (Consumer<AutoScalingService>) s -> s.setInstanceProtection(
+                        REGION, "test-asg", List.of("i-active"), true)),
+                Arguments.of("attach-targets", (Consumer<AutoScalingService>) s -> s.attachLoadBalancerTargetGroups(
+                        REGION, "test-asg", List.of("target"))),
+                Arguments.of("detach-targets", (Consumer<AutoScalingService>) s -> s.detachLoadBalancerTargetGroups(
+                        REGION, "test-asg", List.of("target"))),
+                Arguments.of("attach-balancers", (Consumer<AutoScalingService>) s -> s.attachLoadBalancers(
+                        REGION, "test-asg", List.of("balancer"))),
+                Arguments.of("detach-balancers", (Consumer<AutoScalingService>) s -> s.detachLoadBalancers(
+                        REGION, "test-asg", List.of("balancer"))),
+                Arguments.of("attach-traffic", (Consumer<AutoScalingService>) s -> s.attachTrafficSources(
+                        REGION, "test-asg", List.of(new AutoScalingService.TrafficSourceIdentifier("traffic", "elbv2")))),
+                Arguments.of("detach-traffic", (Consumer<AutoScalingService>) s -> s.detachTrafficSources(
+                        REGION, "test-asg", List.of(new AutoScalingService.TrafficSourceIdentifier("traffic", "elbv2")))),
+                Arguments.of("hook", (Consumer<AutoScalingService>) s -> s.putLifecycleHook(REGION, "test-asg", "hook",
+                        "autoscaling:EC2_INSTANCE_LAUNCHING", null, null, null, 300, "CONTINUE")),
+                Arguments.of("policy", (Consumer<AutoScalingService>) s -> s.putScalingPolicy(REGION, "test-asg", "policy",
+                        "SimpleScaling", "ChangeInCapacity", 1, 300, null, null)),
+                Arguments.of("schedule", (Consumer<AutoScalingService>) s -> s.putScheduledUpdateGroupAction(
+                        REGION, "test-asg", "action", null, null, null, null, 0, 3, 1)),
+                Arguments.of("warm-pool", (Consumer<AutoScalingService>) s -> s.putWarmPool(
+                        REGION, "test-asg", 3, 1, "Stopped", false)));
+    }
+
+    private void createGroup(String region, String name) {
+        service.createAutoScalingGroup(region, name, null, "lt-original", null, "1", null,
+                0, 3, 1, 300, List.of(), List.of(), List.of(), List.of(), "EC2", 0, List.of(),
+                Map.of(), Map.of(), AsgOptionalFields.none());
     }
 
     @Test
