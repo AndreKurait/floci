@@ -503,6 +503,8 @@ class SamTransformIntegrationTest {
         .when().get("/2015-03-31/functions/" + function + "/configuration")
             .then().statusCode(200).body("Version", equalTo("1"))
             .body("MemorySize", equalTo(128)).body("Environment.Variables.MARKER", equalTo("original"));
+
+
     }
 
     @Test
