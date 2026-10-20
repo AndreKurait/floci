@@ -4604,6 +4604,7 @@ public class Ec2QueryHandler {
                     .elem("zoneName", az.get("zoneName"))
                     .elem("zoneState", az.get("state"))
                     .elem("regionName", az.get("regionName"))
+                    .elem("networkBorderGroup", az.get("networkBorderGroup"))
                     .elem("zoneId", az.get("zoneId"))
                     .elem("groupName", az.get("groupName"))
                     .elem("groupLongName", az.get("groupLongName"))
