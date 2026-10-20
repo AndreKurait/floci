@@ -941,7 +941,10 @@ public class ContainerLifecycleManager {
         try {
             InspectContainerResponse.ContainerState state =
                     dockerClient.inspectContainerCmd(containerId).exec().getState();
-            boolean running = state != null && Boolean.TRUE.equals(state.getRunning());
+            Boolean running = state != null ? state.getRunning() : null;
+            if (running == null) {
+                return ContainerPresence.UNKNOWN;
+            }
             return running ? ContainerPresence.RUNNING : ContainerPresence.STOPPED;
         } catch (NotFoundException e) {
             return ContainerPresence.ABSENT;

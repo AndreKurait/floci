@@ -1463,6 +1463,64 @@ class ContainerLauncherTest {
         order.verify(executionRoleCredentials).unregister("222233334444", "ASIARETRYSESSION");
     }
 
+    @ParameterizedTest
+    @CsvSource({"STOPPED,true", "ABSENT,true", "RUNNING,false", "UNKNOWN,false"})
+    void failedRemovalRetiresOnlyTheSessionOfConfirmedStoppedExecution(
+            ContainerLifecycleManager.ContainerPresence presence, boolean retireSession) throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("role-session-confirmed-stop"));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("role-session-confirmed-stop-fn");
+        fn.setAccountId("222233334444");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        when(executionRoleCredentials.forFunction(fn)).thenReturn(Optional.of(
+                new SessionCreds("ASIACONFIRMEDSTOP", "role-secret", "role-token")));
+        ContainerHandle handle = launcher.launch(fn);
+        IllegalStateException failure = new IllegalStateException("Docker removal failed");
+        doThrow(failure).when(lifecycleManager)
+                .stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(), 1);
+        lenient().when(lifecycleManager.presenceOf(handle.getContainerId())).thenReturn(presence);
+
+        assertSame(failure, assertThrows(IllegalStateException.class, () -> launcher.stop(handle)));
+
+        verify(runtimeApiServer).quiesce();
+        verify(runtimeApiServer, never()).close();
+        verify(runtimeApiServerFactory, never()).release(runtimeApiServer);
+        if (retireSession) {
+            verify(executionRoleCredentials).unregister("222233334444", "ASIACONFIRMEDSTOP");
+        } else {
+            verify(executionRoleCredentials, never()).unregister(any(), any());
+        }
+    }
+
+    @Test
+    void failedSessionRetirementPreservesTheOriginalRemovalFailureAndRuntimeOwnership() throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("role-session-retirement-failure"));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("role-session-retirement-failure-fn");
+        fn.setAccountId("222233334444");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        when(executionRoleCredentials.forFunction(fn)).thenReturn(Optional.of(
+                new SessionCreds("ASIARETIREMENTFAIL", "role-secret", "role-token")));
+        ContainerHandle handle = launcher.launch(fn);
+        IllegalStateException removalFailure = new IllegalStateException("Docker removal failed");
+        IllegalStateException retirementFailure = new IllegalStateException("Session storage unavailable");
+        doThrow(removalFailure).when(lifecycleManager)
+                .stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(), 1);
+        when(lifecycleManager.presenceOf(handle.getContainerId()))
+                .thenReturn(ContainerLifecycleManager.ContainerPresence.STOPPED);
+        doThrow(retirementFailure).when(executionRoleCredentials)
+                .unregister("222233334444", "ASIARETIREMENTFAIL");
+
+        assertSame(removalFailure, assertThrows(IllegalStateException.class, () -> launcher.stop(handle)));
+        assertEquals(List.of(retirementFailure), Arrays.asList(removalFailure.getSuppressed()));
+        verify(runtimeApiServer, never()).close();
+        verify(runtimeApiServerFactory, never()).release(runtimeApiServer);
+    }
+
     @Test
     void launchFailureUnregistersExecutionRoleSession() throws Exception {
         Path codePath = Files.createDirectory(tempDir.resolve("role-session-failure"));
@@ -1870,10 +1928,46 @@ class ContainerLauncherTest {
             launcher.launch(fn);
             assertEquals(1, capturedRemotePaths.stream().filter("/var/task"::equals).count(),
                     "a refused removal must retain the populated cache");
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager).removeVolume(volume);
             normalDeleteService(store).deleteFunction("us-east-1", fn.getFunctionName());
             verify(lifecycleManager, times(2)).removeVolume(volume);
         } finally {
             ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @Test
+    void cachedLaunchForADeletedFunctionDoesNotCancelItsVolumeRetirementRetry() throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
+        LambdaFunction fn = codeVolumeFunction("stale-deleted-cache", "$LATEST", "stale-deleted-sha");
+        store.save("us-east-1", fn);
+        String volume = ContainerLauncher.codeVolumeName(config, fn);
+        when(lifecycleManager.volumeExists(volume)).thenReturn(true);
+        when(lifecycleManager.removeVolume(volume)).thenReturn(false, true);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        long grace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            ContainerHandle original = launcher.launch(fn);
+            launcher.stop(original);
+            normalDeleteService(store).deleteFunction("us-east-1", fn.getFunctionName());
+            assertTrue(store.get("us-east-1", fn.getFunctionName()).isEmpty());
+            verify(lifecycleManager).removeVolume(volume);
+
+            ContainerHandle stale = launcher.launch(fn);
+            assertEquals(1, capturedRemotePaths.stream().filter("/var/task"::equals).count(),
+                    "the captured old function must take the cached-volume path");
+            assertEquals(0, launcher.inFlightCount(volume));
+            launcher.stop(stale);
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+            launcher.cleanupSupersededVolumes();
+
+            verify(lifecycleManager, times(2)).removeVolume(volume);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = grace;
         }
     }
 
@@ -2172,11 +2266,10 @@ class ContainerLauncherTest {
 
     @Test
     void rollingBackToAPreviousCodeVersion_rescuesItsVolumeFromCleanup() throws Exception {
-        // Regression: v1 -> v2 -> back to v1 (e.g. a CloudFormation rollback) resolves v1's volume
-        // name again, which is already populated - a fast-path hit in ensureCodeVolume. Without
-        // reconciling functionCurrentVolume/volumesPendingCleanup on that path too, v1 would stay
-        // queued as superseded from the v1 -> v2 step and the next sweep would delete the volume
-        // this function is actively using again.
+        // A rollback resolves v1's already populated volume. Persist each live code change so the
+        // sweep must protect the rolled-back reference while retiring the now-unreferenced v2.
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
         Path codePath = Files.createDirectory(tempDir.resolve("rollback-code"));
         Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]); // 8 KiB
 
@@ -2204,8 +2297,11 @@ class ContainerLauncherTest {
         long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
         try {
             ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            store.save("us-east-1", v1);
             launcher.launch(v1);
+            store.save("us-east-1", v2);
             launcher.launch(v2);
+            store.save("us-east-1", v1);
             launcher.launch(v1); // roll back
 
             ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;

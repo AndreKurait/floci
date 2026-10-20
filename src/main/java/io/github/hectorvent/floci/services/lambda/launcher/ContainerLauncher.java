@@ -712,8 +712,26 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // extension shutdown work — only that we will not preempt PID 1 for at least
         // that long if it happens to be slow.
         int stopTimeoutSeconds = server.hasRegisteredExtensions() ? 2 : 1;
-        lifecycleManager.stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(),
-                stopTimeoutSeconds);
+        try {
+            lifecycleManager.stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(),
+                    stopTimeoutSeconds);
+        } catch (RuntimeException cleanupFailure) {
+            try {
+                ContainerLifecycleManager.ContainerPresence presence =
+                        lifecycleManager.presenceOf(handle.getContainerId());
+                if (presence == ContainerLifecycleManager.ContainerPresence.STOPPED
+                        || presence == ContainerLifecycleManager.ContainerPresence.ABSENT) {
+                    // Execution has ended, but keep the runtime/log/handle ownership for removal retry.
+                    executionRoleCredentials.unregister(
+                            handle.getExecutionRoleSessionAccountId(), handle.getExecutionRoleAccessKeyId());
+                }
+            } catch (RuntimeException retirementFailure) {
+                if (retirementFailure != cleanupFailure) {
+                    cleanupFailure.addSuppressed(retirementFailure);
+                }
+            }
+            throw cleanupFailure;
+        }
 
         // Only now close the runtime API socket. Any pollers that were still parked when
         // the container exited get terminated by their end of the connection closing;
@@ -929,11 +947,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 }
                 populatedCodeVolumes.add(volName);
             }
-            // Reconcile bookkeeping for the resolved volume even when the check above already found
-            // it populated: a redeploy rolled back to an older code version resolves a volume name
-            // that's already populated but may have been queued as superseded by the deploy this
-            // just rolled back. Without pulling it back out of volumesPendingCleanup and marking it
-            // current again, the next sweep would delete the volume this function is actively using.
+            // Reconcile bookkeeping even for an already populated volume. With the authoritative
+            // store, keep pending candidates: its live-reference guard protects a rollback, while
+            // a stale launch for a deleted function must not cancel that volume's retirement retry.
             //
             // Under the per-function lock too: this specific read-modify-write (put, then queue
             // whatever was previously current) must be atomic across different code versions of the
@@ -943,7 +959,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             Object functionLock = functionVolumeTransitionLocks.computeIfAbsent(
                     fn.getFunctionName(), k -> new Object());
             synchronized (functionLock) {
-                volumesPendingCleanup.remove(volName);
+                if (functionStore == null) {
+                    volumesPendingCleanup.remove(volName);
+                }
                 String previous = functionCurrentVolume.put(fn.getFunctionName(), volName);
                 if (previous != null && !previous.equals(volName)) {
                     volumesPendingCleanup.put(previous, System.currentTimeMillis());
