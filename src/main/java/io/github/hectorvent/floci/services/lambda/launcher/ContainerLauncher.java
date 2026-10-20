@@ -42,6 +42,7 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -206,6 +207,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // runtime-api port per failed attempt and eventually exhausts the pool, so launches keep
         // failing even after the daemon recovers.
         String containerId = null;
+        Closeable logHandle = null;
+        LambdaExitWatcher exitWatcher = null;
         // Hoisted alongside containerId, for the same reason: the resolved volume name (if any)
         // must be visible in the catch block below to release its in-flight reference on any
         // failure path, not just the one where useCodeVolume's block itself throws.
@@ -293,11 +296,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withMemoryMb(fn.getMemorySize())
                 .withDockerNetwork(config.services().lambda().dockerNetwork())
                 .withHostDockerInternalOnLinux()
-                .withLogRotation()
-                .withLabels(ContainerStorageHelper.resourceIdentityLabels(
-                        "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion));
+                .withLogRotation();
 
         applyDockerFlags(specBuilder, dockerFlags);
+        specBuilder.withLabels(ContainerStorageHelper.resourceIdentityLabels(
+                "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion));
 
         specBuilder.withEmbeddedDns();
         List<String> additionalNetworks = configuredAdditionalDockerNetworks();
@@ -449,11 +452,27 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     COPY_MAX_ATTEMPTS, COPY_RETRY_BACKOFF_MS);
         }
 
-        // Now start the container with code in place
+        LogDestination logDestination = new LogDestination(
+                lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
+        logStreamer.ensureLogGroupAndStreamForAccount(
+                lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
+        Duration readinessBudget = Duration.ofSeconds(config.docker().connectionRequestTimeoutSeconds());
+        long readinessDeadline = System.nanoTime() + readinessBudget.toNanos();
+        exitWatcher = LambdaExitWatcher.watchBeforeStart(
+                dockerClient, containerId, runtimeApiServer::handleRuntimeProcessExited, readinessBudget);
+        logHandle = logStreamer.attachBeforeStartForAccount(
+                lambdaAccountId, containerId, cwLogGroup, cwLogStream, lambdaRegion,
+                "lambda:" + fn.getFunctionName(),
+                Duration.ofNanos(Math.max(0, readinessDeadline - System.nanoTime())));
+        Objects.requireNonNull(logHandle, "Lambda output stream was not attached before start");
+        exitWatcher.requireHealthy();
+
+        // Output and NEXT_EXIT are acknowledged before a fast runtime can exit and be removed.
         if (config.services().iam().lambdaIdentityVerificationEnabled() && roleCredentials.isPresent()) {
             executionRoleCredentials.bindContainer(fn, roleCredentials.get().accessKeyId(), containerId);
         }
         lifecycleManager.startCreated(containerId, spec);
+        exitWatcher.containerStarted();
         if (config.services().iam().lambdaIdentityVerificationEnabled() && roleCredentials.isPresent()) {
             try {
                 executionRoleCredentials.bindStartedContainer(fn, roleCredentials.get().accessKeyId(), containerId,
@@ -463,16 +482,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 LOG.debug("Could not seal Lambda execution start time");
             }
         }
-        watchForUnexpectedExit(dockerClient, containerId, runtimeApiServer);
-
-        // Extensions can log as soon as they start, which is before the container's own log stream
-        // is attached below. Create the group/stream up front so those early lines are not dropped
-        // by CloudWatch; the call is idempotent, so attach() repeating it is harmless.
-        LogDestination logDestination = new LogDestination(
-                lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
-        logStreamer.ensureLogGroupAndStreamForAccount(
-                lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
-
         // Real AWS's runtime interface client discovers and launches every binary under
         // /opt/extensions/ as a sibling process to the main entrypoint before the runtime is
         // considered ready; Floci only runs the image's own ENTRYPOINT/CMD, so extensions
@@ -497,11 +506,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 roleCredentials.map(SessionCreds::accessKeyId).orElse(null),
                 LambdaExecutionRoleCredentials.sessionAccountId(fn));
 
-        // Attach log streaming
-        Closeable logHandle = logStreamer.attachForAccount(
-                lambdaAccountId, containerId, cwLogGroup, cwLogStream,
-                lambdaRegion, "lambda:" + fn.getFunctionName());
         handle.setLogStream(logHandle);
+        handle.setExitWatcher(exitWatcher);
 
         return handle;
         } catch (RuntimeException e) {
@@ -513,9 +519,13 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             // failed before the container was created (e.g. an ensureCodeVolume populate failure).
             LOG.errorv("Container launch failed for function {0}; cleaning up: {1}",
                     fn.getFunctionName(), e.getMessage());
+            runtimeApiServer.quiesce();
+            if (exitWatcher != null) {
+                exitWatcher.cancel();
+            }
             if (containerId != null) {
                 try {
-                    lifecycleManager.stopAndRemove(containerId, null);
+                    lifecycleManager.stopAndRemove(containerId, logHandle);
                 } catch (Exception cleanupError) {
                     LOG.warnv(cleanupError, "Could not remove failed Lambda container {0}", containerId);
                 }
@@ -663,6 +673,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Quiesce first: stop accepting new work, notify extensions, complete pending
         // invocations. Existing runtime pollers on /invocation/next stay parked.
         server.quiesce();
+        handle.cancelExitWatcher();
 
         // Then SIGTERM the container. The runtime library's default SIGTERM handler exits
         // the process while the runtime API socket is still up, matching real AWS Lambda's
@@ -1418,24 +1429,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      */
     /** Where a container's output is sent: the CloudWatch log group/stream and its region. */
     private record LogDestination(String accountId, String logGroup, String logStream, String region) { }
-
-    /**
-     * Arms an async watch (via Docker's own wait-for-exit API, not polling) that notices when
-     * this container's main process dies while nothing inside the runtime reported it - a
-     * stray {@code sys.exit}/{@code process.exit}/{@code System.exit} in the handler, or any
-     * other crash (see #3314). Without this, a dead runtime left every pending/in-flight
-     * invocation waiting out the full function timeout to be told {@code Function.TimedOut}
-     * instead of the {@code Runtime.ExitError} AWS reports immediately.
-     *
-     * <p>Fires once per container exit, including an intentional {@code docker stop} during
-     * normal teardown. {@link RuntimeApiServer#handleRuntimeProcessExited} itself distinguishes
-     * a genuine crash from that case (its own {@code stopped}/{@code faulted} guard). The watch
-     * survives its stream timing out on a quiet container; see {@link LambdaExitWatcher}.
-     */
-    private void watchForUnexpectedExit(DockerClient dockerClient, String containerId,
-                                        RuntimeApiServer runtimeApiServer) {
-        LambdaExitWatcher.watch(dockerClient, containerId, runtimeApiServer::handleRuntimeProcessExited);
-    }
 
     private void launchExtensions(DockerClient dockerClient, String containerId, String functionName,
                                   RuntimeApiServer runtimeApiServer, LogDestination logDestination, boolean strict) {

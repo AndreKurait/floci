@@ -1229,7 +1229,11 @@ public class ContainerLifecycleManager {
     }
 
     private HostConfig buildHostConfig(ContainerSpec spec) {
-        HostConfig hostConfig = HostConfig.newHostConfig();
+        // Lambda output and exit streams are registered before start; the daemon can therefore
+        // finish removing their captured runtime IDs even after Floci's shutdown budget expires.
+        // EC2, other services, and the unlabelled code-volume helpers keep their containers.
+        HostConfig hostConfig = HostConfig.newHostConfig().withAutoRemove(
+                "lambda".equals(ContainerStorageHelper.labelValue(spec.labels(), ContainerStorageHelper.SERVICE_LABEL)));
 
         // Privileged mode (required for e.g. k3s containers)
         if (spec.privileged()) {

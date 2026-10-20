@@ -2,18 +2,23 @@ package io.github.hectorvent.floci.services.lambda.launcher;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.AttachContainerCmd;
 import com.github.dockerjava.api.command.ConnectToNetworkCmd;
 import com.github.dockerjava.api.command.CopyArchiveFromContainerCmd;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
+import com.github.dockerjava.api.command.WaitContainerCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.AccessMode;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.StreamType;
+import com.github.dockerjava.api.model.WaitContainerCondition;
+import com.github.dockerjava.api.model.WaitResponse;
+import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -51,6 +56,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -62,6 +68,7 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -100,6 +107,7 @@ class ContainerLauncherTest {
     /** Collects remote paths passed to withRemotePath across all copy mocks. */
     final java.util.List<String> capturedRemotePaths = new java.util.ArrayList<>();
     String capturedRuntimeBootstrap;
+    Closeable exitTransport;
 
     @BeforeEach
     void setUp() {
@@ -168,6 +176,16 @@ class ContainerLauncherTest {
                 new ContainerLifecycleManager.ContainerInfo("container-123", Map.of());
         lenient().when(lifecycleManager.startCreated(eq("container-123"), any())).thenReturn(info);
         lenient().when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
+        exitTransport = mock(Closeable.class);
+        WaitContainerCmd wait = mock(WaitContainerCmd.class, RETURNS_SELF);
+        lenient().when(dockerClient.waitContainerCmd("container-123")).thenReturn(wait);
+        lenient().when(wait.exec(any())).thenAnswer(call -> {
+            WaitContainerResultCallback callback = call.getArgument(0);
+            callback.onStart(exitTransport);
+            return callback;
+        });
+        lenient().when(logStreamer.attachBeforeStartForAccount(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(mock(Closeable.class));
 
         // Stub the Docker copy chain so code and bootstrap archive copies
         // don't throw when the mock DockerClient is used. Each invocation
@@ -237,6 +255,159 @@ class ContainerLauncherTest {
         verify(lifecycleManager, atLeastOnce()).create(any(ContainerSpec.class), platformCaptor.capture());
         List<String> platforms = platformCaptor.getAllValues();
         return platforms.get(platforms.size() - 1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void fastRuntimeExitKeepsItsFinalOutputAndExitStatusBeforeDaemonRemoval(boolean exitBeforeOutput) {
+        CloudWatchLogsService logs = mock(CloudWatchLogsService.class);
+        ContainerLogStreamer actualStreamer = new ContainerLogStreamer(dockerClient, logs);
+        ContainerBuilder builder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
+        LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(
+                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, 4566));
+        launcher = new ContainerLauncher(builder, lifecycleManager, actualStreamer, imageResolver,
+                runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
+                layerService, awsEnv, executionRoleCredentials);
+        AtomicReference<ResultCallback<Frame>> output = new AtomicReference<>();
+        AtomicReference<WaitContainerResultCallback> exit = new AtomicReference<>();
+        AttachContainerCmd attach = mock(AttachContainerCmd.class, RETURNS_SELF);
+        lenient().when(dockerClient.attachContainerCmd("container-123")).thenReturn(attach);
+        lenient().when(attach.exec(any())).thenAnswer(call -> {
+            ResultCallback<Frame> callback = call.getArgument(0);
+            output.set(callback);
+            callback.onStart(mock(Closeable.class));
+            return callback;
+        });
+        WaitContainerCmd wait = mock(WaitContainerCmd.class, RETURNS_SELF);
+        lenient().when(dockerClient.waitContainerCmd("container-123")).thenReturn(wait);
+        lenient().when(wait.exec(any())).thenAnswer(call -> {
+            WaitContainerResultCallback callback = call.getArgument(0);
+            exit.set(callback);
+            callback.onStart(mock(Closeable.class));
+            return callback;
+        });
+        when(lifecycleManager.startCreated(eq("container-123"), any())).thenAnswer(call -> {
+            assertNotNull(output.get(), "Output must be attached before the process can emit and disappear");
+            assertNotNull(exit.get(), "The exit waiter must be registered before a fast process can disappear");
+            WaitResponse response = mock(WaitResponse.class);
+            when(response.getStatusCode()).thenReturn(17);
+            if (exitBeforeOutput) {
+                exit.get().onNext(response);
+                exit.get().onComplete();
+            }
+            output.get().onNext(new Frame(StreamType.STDOUT, "final-".getBytes(StandardCharsets.UTF_8)));
+            output.get().onNext(new Frame(StreamType.STDOUT, "tail".getBytes(StandardCharsets.UTF_8)));
+            output.get().onComplete();
+            if (!exitBeforeOutput) {
+                exit.get().onNext(response);
+                exit.get().onComplete();
+            }
+            return new ContainerLifecycleManager.ContainerInfo("container-123", Map.of());
+        });
+        LambdaFunction function = new LambdaFunction();
+        function.setFunctionName("fast-exit");
+        function.setPackageType("Image");
+        function.setImageUri("example-runtime:1");
+        function.setAccountId("111111111111");
+        function.setFunctionArn("arn:aws:lambda:us-east-1:111111111111:function:fast-exit");
+
+        ContainerHandle handle = launcher.launch(function);
+
+        assertNotNull(handle.getLogStream());
+        verify(attach).withLogs(false);
+        verify(wait).withCondition(WaitContainerCondition.NEXT_EXIT);
+        verify(runtimeApiServer).handleRuntimeProcessExited(17);
+        verify(logs).putLogEventsForAccount(eq("111111111111"), anyString(), anyString(),
+                argThat(events -> events.size() == 1 && "final-tail".equals(events.getFirst().get("message"))),
+                eq("us-east-1"));
+        verify(dockerClient, never()).inspectContainerCmd(any());
+    }
+
+    @Test
+    void cloudWatchDestinationExistsBeforeTheRuntimeStarts() {
+        LambdaFunction function = new LambdaFunction();
+        function.setFunctionName("early-output");
+        function.setPackageType("Image");
+        function.setImageUri("example-runtime:1");
+
+        launcher.launch(function);
+
+        InOrder order = inOrder(logStreamer, lifecycleManager);
+        order.verify(logStreamer).ensureLogGroupAndStreamForAccount(any(), anyString(), anyString(), any());
+        order.verify(lifecycleManager).startCreated(eq("container-123"), any());
+    }
+
+    @Test
+    void userDockerLabelsCannotReplaceTheLambdaRuntimeIdentity() {
+        when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
+                "--label io.floci.service=ec2 --label io.floci.account=222222222222 --label example=control"));
+        LambdaFunction function = new LambdaFunction();
+        function.setFunctionName("runtime-identity");
+        function.setPackageType("Image");
+        function.setImageUri("example-runtime:1");
+        function.setAccountId("111111111111");
+        function.setFunctionArn("arn:aws:lambda:us-east-1:111111111111:function:runtime-identity");
+
+        launcher.launch(function);
+
+        Map<String, String> labels = captureRealContainerSpec().labels();
+        assertEquals("lambda", labels.get("io.floci.service"));
+        assertEquals("111111111111", labels.get("io.floci.account"));
+        assertEquals("runtime-identity", labels.get("io.floci.resource-id"));
+        assertEquals("control", labels.get("example"));
+    }
+
+    @Test
+    void missingExitRegistrationNeverStartsTheCapturedContainer() {
+        when(dockerClient.waitContainerCmd("container-123"))
+                .thenThrow(new NotFoundException("Captured container is missing"));
+        LambdaFunction function = new LambdaFunction();
+        function.setFunctionName("missing-wait");
+        function.setPackageType("Image");
+        function.setImageUri("example-runtime:1");
+
+        assertThrows(IllegalStateException.class, () -> launcher.launch(function));
+
+        verify(lifecycleManager, never()).startCreated(any(), any());
+        verify(lifecycleManager).stopAndRemove("container-123", null);
+        verify(runtimeApiServer, never()).handleRuntimeProcessExited(anyInt());
+    }
+
+    @Test
+    void failedOutputReadinessCancelsThePrearmedWatcherWithoutStarting() throws Exception {
+        when(logStreamer.attachBeforeStartForAccount(any(), any(), any(), any(), any(), any(), any()))
+                .thenThrow(new IllegalStateException("Output attachment is not healthy"));
+        LambdaFunction function = new LambdaFunction();
+        function.setFunctionName("failed-attachment");
+        function.setPackageType("Image");
+        function.setImageUri("example-runtime:1");
+
+        assertThrows(IllegalStateException.class, () -> launcher.launch(function));
+
+        verify(lifecycleManager, never()).startCreated(any(), any());
+        verify(lifecycleManager).stopAndRemove("container-123", null);
+        verify(exitTransport).close();
+        verify(runtimeApiServer).quiesce();
+        verify(runtimeApiServer, never()).handleRuntimeProcessExited(anyInt());
+    }
+
+    @Test
+    void failedStartRetiresTheCapturedOutputAndWaitHandles() throws Exception {
+        Closeable output = mock(Closeable.class);
+        when(logStreamer.attachBeforeStartForAccount(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(output);
+        when(lifecycleManager.startCreated(eq("container-123"), any()))
+                .thenThrow(new IllegalStateException("Start refused"));
+        LambdaFunction function = new LambdaFunction();
+        function.setFunctionName("failed-start");
+        function.setPackageType("Image");
+        function.setImageUri("example-runtime:1");
+
+        assertThrows(IllegalStateException.class, () -> launcher.launch(function));
+
+        verify(lifecycleManager).stopAndRemove("container-123", output);
+        verify(exitTransport).close();
+        verify(runtimeApiServer).quiesce();
     }
 
     /** Returns the read-only {@code /var/task} volume mount on the spec, or null if absent. */
@@ -931,9 +1102,9 @@ class ContainerLauncherTest {
         assertTrue(stream.matches("\\d{4}/\\d{2}/\\d{2}/custom-logs-fn\\[\\$LATEST][0-9a-f]{8}"), stream);
         verify(logStreamer).ensureLogGroupAndStreamForAccount(
                 eq("000000000000"), eq("/shared/app-logs"), eq(stream), eq("us-east-1"));
-        verify(logStreamer).attachForAccount(
+        verify(logStreamer).attachBeforeStartForAccount(
                 eq("000000000000"), eq("container-123"), eq("/shared/app-logs"), eq(stream),
-                eq("us-east-1"), eq("lambda:custom-logs-fn"));
+                eq("us-east-1"), eq("lambda:custom-logs-fn"), any());
     }
 
     @Test
@@ -991,9 +1162,9 @@ class ContainerLauncherTest {
         List<String> env = captureRealContainerSpec().env();
         assertTrue(env.contains("AWS_DEFAULT_REGION=eu-west-2"));
         assertTrue(env.contains("AWS_REGION=eu-west-2"));
-        verify(logStreamer).attachForAccount(
+        verify(logStreamer).attachBeforeStartForAccount(
                 eq("000000000000"), eq("container-123"), any(), any(),
-                eq("eu-west-2"), eq("lambda:region-arn-fn"));
+                eq("eu-west-2"), eq("lambda:region-arn-fn"), any());
     }
 
     @Test
@@ -1208,7 +1379,7 @@ class ContainerLauncherTest {
         int timeout = extensions ? 2 : 1;
         IllegalStateException failure = new IllegalStateException("Docker removal failed");
         doThrow(failure).doNothing().when(lifecycleManager)
-                .stopAndRemoveStrict("container-123", null, timeout);
+                .stopAndRemoveStrict("container-123", handle.getLogStream(), timeout);
 
         assertSame(failure, assertThrows(IllegalStateException.class, () -> launcher.stop(handle)));
 
@@ -1222,9 +1393,9 @@ class ContainerLauncherTest {
         InOrder order = inOrder(lifecycleManager, runtimeApiServer, runtimeApiServerFactory,
                 executionRoleCredentials);
         order.verify(runtimeApiServer).quiesce();
-        order.verify(lifecycleManager).stopAndRemoveStrict("container-123", null, timeout);
+        order.verify(lifecycleManager).stopAndRemoveStrict("container-123", handle.getLogStream(), timeout);
         order.verify(runtimeApiServer).quiesce();
-        order.verify(lifecycleManager).stopAndRemoveStrict("container-123", null, timeout);
+        order.verify(lifecycleManager).stopAndRemoveStrict("container-123", handle.getLogStream(), timeout);
         order.verify(runtimeApiServer).close();
         order.verify(runtimeApiServerFactory).release(runtimeApiServer);
         order.verify(executionRoleCredentials).unregister("222233334444", "ASIARETRYSESSION");
@@ -2114,6 +2285,13 @@ class ContainerLauncherTest {
     @Test
     void launchFunction_forwardsExtensionOutputToCloudWatchLogs() throws Exception {
         CloudWatchLogsService cloudWatchLogs = mock(CloudWatchLogsService.class);
+        AttachContainerCmd attach = mock(AttachContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.attachContainerCmd("container-123")).thenReturn(attach);
+        when(attach.exec(any())).thenAnswer(call -> {
+            ResultCallback<Frame> callback = call.getArgument(0);
+            callback.onStart(mock(Closeable.class));
+            return callback;
+        });
         ContainerReachableEndpoint reachableEndpoint =
                 new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, 4566);
         ContainerLauncher launcherWithRealStreamer = new ContainerLauncher(
