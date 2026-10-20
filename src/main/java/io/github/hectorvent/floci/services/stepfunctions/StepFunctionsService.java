@@ -2378,6 +2378,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
 
         validateFieldsAllowedForType(statePath, stateDef, stateType, errors);
         validateTransitionTargets(statePath, stateDef, siblingStateNames, errors);
+        if ("Task".equals(stateType)) {
+            validateApiGatewayHeaders(statePath, stateDef, stateIsJsonata, errors);
+        }
 
         // Measured on AWS: the downgrade is the whole answer for that state, and the fields its
         // refused language forbids are not named on top of it. Only this check is skipped; every
@@ -2426,6 +2429,30 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                             topLevelJsonata, errors);
                 }
             }
+        }
+    }
+
+    private static void validateApiGatewayHeaders(String statePath, JsonNode stateDef,
+                                                  boolean jsonata, List<String> errors) {
+        if (StatesIntegration.parse(stateDef.path("Resource").asText(null))
+                .filter(integration -> integration.isAnySuffix("apigateway", "invoke")).isEmpty()) {
+            return;
+        }
+        String field = jsonata ? "Arguments" : "Parameters";
+        JsonNode headers = stateDef.path(field).path("Headers");
+        if (!headers.isObject()) {
+            return;
+        }
+        List<String> unsupported = new ArrayList<>();
+        headers.fieldNames().forEachRemaining(name -> {
+            String lower = name.toLowerCase(Locale.ROOT);
+            if (ApiGatewayTaskInvoker.isReservedDefinitionHeader(lower)) {
+                unsupported.add(lower);
+            }
+        });
+        if (!unsupported.isEmpty()) {
+            errors.add(EXPLICIT_LOCATION_MARKER + "The 'Headers' field contains unsupported values: "
+                    + unsupported + MARKER_PAYLOAD_SEPARATOR + statePath + "/" + field);
         }
     }
 

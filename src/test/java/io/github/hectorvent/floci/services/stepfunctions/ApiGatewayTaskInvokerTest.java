@@ -24,6 +24,9 @@ import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.InetSocketAddress;
 import java.net.URI;
@@ -64,6 +67,7 @@ class ApiGatewayTaskInvokerTest {
     private final AtomicReference<Throwable> serverFailure = new AtomicReference<>();
     private final AtomicInteger calls = new AtomicInteger();
     private final AtomicInteger status = new AtomicInteger(200);
+    private final AtomicReference<String> responseBody = new AtomicReference<>("{\"workflow_id\":\"owned\"}");
     private ApiGatewayTaskInvoker invoker;
     // Quarkus and the JDK test server share the HttpServer simple name.
     private final io.quarkus.vertx.http.HttpServer listener = mock(io.quarkus.vertx.http.HttpServer.class);
@@ -74,6 +78,7 @@ class ApiGatewayTaskInvokerTest {
     private final EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
     private final Instance<ScpProvider> scps = mock(Instance.class);
     private final AtomicReference<List<String>> receivedHeaders = new AtomicReference<>();
+    private final AtomicReference<String> observedHeader = new AtomicReference<>("x_test");
 
     @BeforeEach
     void setup() throws Exception {
@@ -111,7 +116,7 @@ class ApiGatewayTaskInvokerTest {
             try {
                 byte[] body = exchange.getRequestBody().readAllBytes();
                 received.set(mapper.readTree(body));
-                receivedHeaders.set(exchange.getRequestHeaders().get("x_test"));
+                receivedHeaders.set(exchange.getRequestHeaders().get(observedHeader.get()));
                 assertEquals("/restapis/owned/gamma/_user_request_/create-workflow-execution", exchange.getRequestURI().getPath());
                 assertEquals("owned-key", exchange.getRequestHeaders().getFirst("x-api-key"));
                 SigV4AuthorizationHeader auth = SigV4AuthorizationHeader.parse(exchange.getRequestHeaders().getFirst("Authorization"));
@@ -127,7 +132,7 @@ class ApiGatewayTaskInvokerTest {
             } catch (Throwable error) {
                 serverFailure.set(error);
             }
-            byte[] body = "{\"workflow_id\":\"owned\"}".getBytes(StandardCharsets.UTF_8);
+            byte[] body = responseBody.get().getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "text/plain");
             exchange.sendResponseHeaders(status.get(), body.length);
             exchange.getResponseBody().write(body);
@@ -154,6 +159,31 @@ class ApiGatewayTaskInvokerTest {
         assertEquals("OK", result.path("StatusText").asText());
         assertEquals("owned", result.path("ResponseBody").path("workflow_id").asText());
         assertEquals(request.path("RequestBody"), received.get());
+        assertEquals(null, serverFailure.get());
+        verify(iam).unregisterSession(ACCOUNT, credentials.get()[0]);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"X-AmzFoo", "X-Amznn-Test", "X-ForwardedFoo", "X-Amz", "X-Amzn", "X-Forwarded"})
+    void headersOutsideTheReservedPrefixesReachTheApi(String header) throws Exception {
+        observedHeader.set(header);
+        ((ObjectNode) request.get("Headers")).putArray(header).add("preserved");
+
+        JsonNode result = invoker.invoke(request, machine, null);
+
+        assertEquals(200, result.path("StatusCode").asInt());
+        assertEquals(List.of("preserved"), receivedHeaders.get());
+        assertEquals(null, serverFailure.get());
+        verify(iam).unregisterSession(ACCOUNT, credentials.get()[0]);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"200 OK,200", "null trailing,null"})
+    void scalarResponseUsesTheFirstJsonValueAsAwsDoes(String body, String expectedJson) throws Exception {
+        responseBody.set(body);
+        JsonNode result = invoker.invoke(request, machine, null);
+        assertEquals(200, result.path("StatusCode").asInt());
+        assertEquals(mapper.readTree(expectedJson), result.get("ResponseBody"));
         assertEquals(null, serverFailure.get());
         verify(iam).unregisterSession(ACCOUNT, credentials.get()[0]);
     }
