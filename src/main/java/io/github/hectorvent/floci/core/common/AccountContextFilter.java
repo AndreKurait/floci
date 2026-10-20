@@ -2,12 +2,15 @@ package io.github.hectorvent.floci.core.common;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.s3.PreSignedUrlFilter;
+import io.github.hectorvent.floci.services.s3.S3Controller;
 import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Priorities;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ContainerRequestFilter;
+import jakarta.ws.rs.container.ResourceInfo;
+import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.ext.Provider;
 import org.jboss.logging.Logger;
@@ -42,6 +45,9 @@ public class AccountContextFilter implements ContainerRequestFilter {
 
     /** The signing names S3 answers to; an S3 client expects S3's XML error document. */
     private static final Set<String> S3_SIGNING_NAMES = Set.of("s3", "s3express");
+
+    @Context
+    ResourceInfo resourceInfo;
 
     private final AccountResolver accountResolver;
     private final RegionResolver regionResolver;
@@ -80,7 +86,9 @@ public class AccountContextFilter implements ContainerRequestFilter {
         if (rejectAmbiguousRegion(ctx, auth)) {
             return;
         }
-        String akid = auth != null && !auth.isEmpty() ? accountResolver.extractAccessKeyId(auth) : null;
+        String akid = resourceInfo != null && resourceInfo.getResourceClass() == S3Controller.class
+                && !configProvider.get().services().iam().enforcementEnabled()
+                ? accountResolver.extractS3AccessKeyId(auth) : accountResolver.extractAccessKeyId(auth);
         if (akid != null) {
             requestContext.setAccountId(resolveAccount(akid, accountResolver.resolve(auth)));
             requestContext.setAccessKeyId(akid);
@@ -248,12 +256,13 @@ public class AccountContextFilter implements ContainerRequestFilter {
     }
 
     /**
-     * Applies the account-resolution precedence. A 12-digit AKID is already reflected in
-     * {@code resolvedDefault} (the account or default returned by {@link AccountResolver});
-     * for any other key shape, an IAM or live-session lookup takes precedence before falling back.
+     * Applies account resolution to header and presigned credentials, including legacy S3 keys.
      */
     private String resolveAccount(String akid, String resolvedDefault) {
-        if (akid != null && !akid.matches("\\d{12}")) {
+        if (akid != null) {
+            if (akid.matches("\\d{12}")) {
+                return akid;
+            }
             Optional<String> credentialAccount = sessionAccountLookup.resolveAccountId(akid);
             if (credentialAccount.isPresent()) {
                 return credentialAccount.get();

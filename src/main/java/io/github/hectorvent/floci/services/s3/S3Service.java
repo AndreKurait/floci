@@ -497,7 +497,13 @@ public class S3Service implements Resettable, ResourceProvider {
             throw new AwsException("InvalidBucketAclWithBlockPublicAccessError",
                     "Bucket cannot have public ACLs set with BlockPublicAccess enabled", 400);
         }
-        var existing = bucketStore.get(bucketName);
+        // Share deletion's name lock so checking availability and publishing an owner are atomic.
+        return withLock(multipartBucketLock(bucketName).writeLock(),
+                () -> createBucketLocked(bucketName, region, ownership, requestedAcl));
+    }
+
+    private Bucket createBucketLocked(String bucketName, String region, String ownership, String requestedAcl) {
+        Optional<Bucket> existing = bucketStore.get(bucketName);
         if (existing.isPresent()) {
             Bucket bucket = existing.get();
             if (isDefaultS3Region(bucket.getRegion()) && isDefaultS3Region(region)) {
@@ -506,6 +512,11 @@ public class S3Service implements Resettable, ResourceProvider {
             }
             throw new AwsException("BucketAlreadyOwnedByYou",
                     "Your previous request to create the named bucket succeeded and you already own it.", 409);
+        }
+        if (globalBucketNamespace && resolveBucketEntry(bucketName).isPresent()) {
+            throw new AwsException("BucketAlreadyExists",
+                    "The requested bucket name is not available. The bucket namespace is shared by all users of the system.",
+                    409);
         }
 
         Bucket bucket = new Bucket(bucketName);
@@ -2316,14 +2327,25 @@ public class S3Service implements Resettable, ResourceProvider {
 
     public ListObjectsResult listObjectsWithPrefixes(String bucketName, String prefix, String delimiter, int maxKeys,
                                                      String continuationToken, String startAfter) {
-        ensureBucketExists(bucketName);
+        String bucketOwnerAccount = resolveBucketEntry(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket",
+                        "The specified bucket does not exist.", 404))
+                .account();
 
         String keyPrefix = bucketName + "/";
         String fullPrefix = prefix != null ? keyPrefix + prefix : keyPrefix;
 
         // Filter out versioned entries (contain #v#) and delete markers
-        List<S3Object> allObjects = objectStore.scan(key ->
-                        key.startsWith(fullPrefix) && !key.contains("#v#"))
+        Predicate<String> keyFilter = key -> key.startsWith(fullPrefix) && !key.contains("#v#");
+        List<S3Object> storedObjects;
+        if (globalBucketNamespace && objectStore instanceof AccountAwareStorageBackend<?> aware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<S3Object> typed = (AccountAwareStorageBackend<S3Object>) aware;
+            storedObjects = typed.scanForAccount(bucketOwnerAccount, keyFilter);
+        } else {
+            storedObjects = objectStore.scan(keyFilter);
+        }
+        List<S3Object> allObjects = storedObjects
                 .stream()
                 .filter(obj -> !obj.isDeleteMarker())
                 .toList();

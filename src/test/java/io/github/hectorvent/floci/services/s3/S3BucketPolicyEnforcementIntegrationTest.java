@@ -24,6 +24,39 @@ class S3BucketPolicyEnforcementIntegrationTest {
     private static final String ACCOUNT_B = "222233334444";
     private static final S3RequestSigner ROOT_SIGNER = S3RequestSigner.signedAs("test", "test");
 
+    @Test
+    void crossAccountListingRequiresAndHonorsTheOwnersBucketPolicy() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        Credentials owner = createAccountAdmin("list-owner-" + suffix, ACCOUNT_A);
+        Credentials reader = createAccountAdmin("list-reader-" + suffix, ACCOUNT_B);
+        String bucket = "owner-listing-" + suffix;
+        createBucketAs(bucket, owner.signer());
+        try {
+            given().filter(owner.signer()).body("owned-data").put("/" + bucket + "/object.txt")
+                    .then().statusCode(200);
+            for (String query : new String[]{"", "?list-type=2"}) {
+                given().filter(reader.signer()).get("/" + bucket + query)
+                        .then().statusCode(403).body(containsString("AccessDenied"));
+            }
+            given().filter(owner.signer()).body("""
+                    {"Version":"2012-10-17","Statement":[{
+                      "Effect":"Allow","Principal":{"AWS":"%s"},"Action":"s3:ListBucket",
+                      "Resource":"arn:aws:s3:::%s"}]}
+                    """.formatted(reader.userArn(), bucket))
+                    .put("/" + bucket + "?policy").then().statusCode(200);
+            for (String query : new String[]{"", "?list-type=2"}) {
+                given().filter(reader.signer()).get("/" + bucket + query)
+                        .then().statusCode(200).body(containsString("<Key>object.txt</Key>"));
+            }
+            given().filter(owner.signer()).delete("/" + bucket + "?policy").then().statusCode(204);
+            given().filter(reader.signer()).get("/" + bucket + "?list-type=2")
+                    .then().statusCode(403).body(containsString("AccessDenied"));
+        } finally {
+            given().filter(owner.signer()).delete("/" + bucket + "/object.txt");
+            given().filter(owner.signer()).delete("/" + bucket);
+        }
+    }
+
     record Credentials(String accessKeyId, String secretAccessKey, String userArn) {
         S3RequestSigner signer() {
             return S3RequestSigner.signedAs(accessKeyId, secretAccessKey);
