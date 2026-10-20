@@ -497,6 +497,10 @@ creation provenance. These fields survive storage serialization.
 | CreateImage | Captures an instance as a new AMI. Reboots the source unless `NoReboot=true`. |
 | RegisterImage | Registers an AMI from supplied metadata and block device mappings. |
 
+`RegisterImage` accepts optional `image` tag specifications. Those tags appear in
+`DescribeImages` and its tag filters; unsupported tag resource types are rejected
+before the AMI is registered.
+
 Every resource EC2 creates is owned by the account the request resolves to, the same account
 [STS](sts.md) reports for those credentials, and that account is what `ownerId` and the resource ARN
 carry. So `DescribeImages` with `--owners <your account id>` matches the AMIs that account

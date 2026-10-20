@@ -9224,6 +9224,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
+    static void validateCreationTags(List<Tag> tagList) {
+        validateUserTagKeys(tagList);
+        validateTagLengths(tagList);
+        requireWithinTagLimit(List.of(), tagList);
+    }
+
     private static void validateTagLengths(List<Tag> tagList) {
         for (Tag tag : tagList) {
             if (tag.getKey().codePointCount(0, tag.getKey().length()) > MAX_TAG_KEY_LENGTH) {
@@ -9314,8 +9320,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /** At most 50 user tags on a resource after the change; tags with the aws: prefix do not count. */
     private void requireWithinTagLimit(String region, String resourceId, List<Tag> tagList) {
+        requireWithinTagLimit(tagsOf(region, resourceId).orElse(List.of()), tagList);
+    }
+
+    private static void requireWithinTagLimit(List<Tag> currentTags, List<Tag> tagList) {
         Set<String> userKeys = new HashSet<>();
-        for (Tag tag : tagsOf(region, resourceId).orElse(List.of())) {
+        for (Tag tag : currentTags) {
             if (!isAwsTagKey(tag.getKey())) {
                 userKeys.add(tag.getKey());
             }
