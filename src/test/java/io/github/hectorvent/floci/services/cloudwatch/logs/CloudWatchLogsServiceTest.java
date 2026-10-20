@@ -1229,6 +1229,86 @@ class CloudWatchLogsServiceTest {
     }
 
     @Test
+    void filterLogEventsAllowsExistingEmptyGroup() {
+        service.createLogGroup("/app/empty", null, null, REGION);
+
+        CloudWatchLogsService.FilteredLogEventsResult result = service.filterLogEvents(
+                "/app/empty", null, null, null, null, 100, null, REGION);
+
+        assertTrue(result.events().isEmpty());
+        assertNull(result.nextToken());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void filterLogEventsRejectsMissingOrDeletedGroup(boolean deleted) {
+        service.createLogGroup("/app/retained", null, null, REGION);
+        service.createLogStream("/app/retained", "stream", REGION);
+        service.putLogEvents("/app/retained", "stream",
+                List.of(Map.of("timestamp", 1L, "message", "retained")), REGION);
+        if (deleted) {
+            service.createLogGroup("/app/missing", null, null, REGION);
+            service.createLogStream("/app/missing", "stream", REGION);
+            service.putLogEvents("/app/missing", "stream",
+                    List.of(Map.of("timestamp", 2L, "message", "deleted")), REGION);
+            service.deleteLogGroup("/app/missing", REGION);
+        }
+
+        AwsException error = assertThrows(AwsException.class, () -> service.filterLogEvents(
+                "/app/missing", null, null, null, null, 100, null, REGION));
+
+        assertEquals("ResourceNotFoundException", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertEquals(List.of("/app/retained"), service.describeLogGroups(null, REGION).stream()
+                .map(LogGroup::getLogGroupName).toList());
+        assertEquals(List.of("retained"), service.filterLogEvents(
+                "/app/retained", null, null, null, null, 100, null, REGION).events().stream()
+                .map(event -> event.event().getMessage()).toList());
+    }
+
+    @Test
+    void filterLogEventsRequiresGroupInRequestedRegion() {
+        service.createLogGroup("/app/scoped", null, null, REGION);
+
+        AwsException error = assertThrows(AwsException.class, () -> service.filterLogEvents(
+                "/app/scoped", null, null, null, null, 100, null, "eu-west-1"));
+
+        assertEquals("ResourceNotFoundException", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertTrue(service.describeLogGroups(null, "eu-west-1").isEmpty());
+        assertEquals(1, service.describeLogGroups(null, REGION).size());
+        assertTrue(service.filterLogEvents(
+                "/app/scoped", null, null, null, null, 100, null, REGION).events().isEmpty());
+    }
+
+    @Test
+    void filterLogEventsRequiresGroupInCurrentAccount() {
+        String accountA = "111111111111";
+        String accountB = "222222222222";
+        InMemoryStorage<String, LogGroup> rawGroups = new InMemoryStorage<>();
+        CloudWatchLogsService scoped = new CloudWatchLogsService(
+                new AccountAwareStorageBackend<>(rawGroups, null, accountB),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, accountB),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, accountB),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, accountB),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, accountB),
+                10_000, new RegionResolver(REGION, accountB));
+        scoped.createLogGroupForAccount(accountA, "/app/scoped", null, null, REGION);
+        Set<String> before = Set.copyOf(rawGroups.keys());
+
+        AwsException error = assertThrows(AwsException.class, () -> scoped.filterLogEvents(
+                "/app/scoped", null, null, null, null, 100, null, REGION));
+
+        assertEquals("ResourceNotFoundException", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertEquals(before, Set.copyOf(rawGroups.keys()));
+        assertTrue(scoped.describeLogGroups(null, REGION).isEmpty());
+        scoped.createLogGroup("/app/scoped", null, null, REGION);
+        assertTrue(scoped.filterLogEvents(
+                "/app/scoped", null, null, null, null, 100, null, REGION).events().isEmpty());
+    }
+
+    @Test
     void filterLogEvents() {
         service.createLogGroup("/app/logs", null, null, REGION);
         service.createLogStream("/app/logs", "stream-1", REGION);

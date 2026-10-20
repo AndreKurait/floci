@@ -939,6 +939,11 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
         FilterPattern pattern = filterPattern == null || filterPattern.isBlank()
                 ? null : requireFilterPattern(filterPattern);
 
+        groupStore.get(groupKey(region, groupName))
+                .filter(stored -> groupName.equals(stored.getLogGroupName()))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "The specified log group does not exist: " + groupName, 400));
+
         String groupPrefix = groupKeyPrefix(region) + groupName + "::";
         List<String> requested = streamNames == null ? List.of() : streamNames;
 
