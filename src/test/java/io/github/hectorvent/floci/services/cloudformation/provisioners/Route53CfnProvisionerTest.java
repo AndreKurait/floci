@@ -36,6 +36,30 @@ import static org.mockito.Mockito.when;
 
 class Route53CfnProvisionerTest {
     @Test
+    void recordGroupValidatesEveryMemberBeforeChangingTheZone() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode props = mapper.readTree("""
+                {"HostedZoneId":"Z123","RecordSets":[
+                  {"Name":"valid.example.com","Type":"A","TTL":"60","ResourceRecords":["192.0.2.1"]},
+                  {"Name":"invalid.example.com"}
+                ]}
+                """);
+        Route53Service service = mock(Route53Service.class);
+        CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
+        when(engine.resolve(any())).thenAnswer(invocation -> invocation.<JsonNode>getArgument(0).asText());
+        when(engine.resolveNode(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(engine.resolveStringList(any())).thenReturn(List.of("192.0.2.1"));
+        StackResource resource = new StackResource();
+        resource.setLogicalId("Group");
+        resource.setResourceType("AWS::Route53::RecordSetGroup");
+        assertThrows(AwsException.class, () -> new Route53CfnProvisioner(service).provision(
+                resource, props, new ProvisionContext(engine, "us-east-1", "123456789012", "stack")));
+        verifyNoInteractions(service);
+        assertNull(resource.getPhysicalId());
+        assertTrue(resource.getAttributes().isEmpty());
+    }
+
+    @Test
     void createsBackingPrivateZoneAndExactAttributes() {
         Route53Service service = mock(Route53Service.class);
         VpcAssociation vpc = new VpcAssociation("vpc-123", "us-east-1");
