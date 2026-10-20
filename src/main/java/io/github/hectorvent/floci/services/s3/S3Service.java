@@ -2327,14 +2327,25 @@ public class S3Service implements Resettable, ResourceProvider {
 
     public ListObjectsResult listObjectsWithPrefixes(String bucketName, String prefix, String delimiter, int maxKeys,
                                                      String continuationToken, String startAfter) {
-        ensureBucketExists(bucketName);
+        String bucketOwnerAccount = resolveBucketEntry(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket",
+                        "The specified bucket does not exist.", 404))
+                .account();
 
         String keyPrefix = bucketName + "/";
         String fullPrefix = prefix != null ? keyPrefix + prefix : keyPrefix;
 
         // Filter out versioned entries (contain #v#) and delete markers
-        List<S3Object> allObjects = objectStore.scan(key ->
-                        key.startsWith(fullPrefix) && !key.contains("#v#"))
+        Predicate<String> keyFilter = key -> key.startsWith(fullPrefix) && !key.contains("#v#");
+        List<S3Object> storedObjects;
+        if (globalBucketNamespace && objectStore instanceof AccountAwareStorageBackend<?> aware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<S3Object> typed = (AccountAwareStorageBackend<S3Object>) aware;
+            storedObjects = typed.scanForAccount(bucketOwnerAccount, keyFilter);
+        } else {
+            storedObjects = objectStore.scan(keyFilter);
+        }
+        List<S3Object> allObjects = storedObjects
                 .stream()
                 .filter(obj -> !obj.isDeleteMarker())
                 .toList();
