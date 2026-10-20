@@ -1411,6 +1411,26 @@ container's reachable address: its own IP when Floci's clients can route to it, 
 - `fixed`: `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS` (default `127.0.0.1`, DNS name `localhost`)
   for every instance, so a tool that connects to the public address reaches a host you choose. An
   Elastic IP associated with the primary private address shows that address too.
+- `pool`: distinct model identities from the required
+  `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS_POOL` IPv4 CIDR. The CIDR must be network-aligned and
+  between `/24` and `/32`, containing at most 256 addresses. All addresses are available as
+  individual `/32` identities; these are not VPC subnet allocations. Missing or invalid pool
+  configuration fails service initialization before EC2 model writes.
+
+Pool mode is opt-in and has no default CIDR. It requires caller-owned local delivery, such as
+scoped one-to-one NAT between each identity and its emulated instance. Floci does not install
+those routes, allocate Internet addresses, establish ownership of the configured range, or
+make it publicly reachable. Do not enable it for clients that would send the identities to
+the Internet instead of the intended local network.
+
+The pool skips instance and Elastic IP identities held in any account or region, including
+persisted records after a restart. It reserves the whole launch's identities before private
+addresses, tags or volumes are written, then records them on the accepted pending instances.
+A launch that cannot fit the requested instances fails with `AddressLimitExceeded`; an
+exhausted pool never moves a newly public instance to `running` without its required identity.
+A running identity stays stable. Stop and
+termination release automatic identities, and start allocates an available replacement under
+the existing launch/primary-interface rules below. Elastic IP allocation remains unchanged.
 
 For an address that reaches the instance itself, run it with a container (`FLOCI_SERVICES_EC2_MOCK`
 `false`). Elastic IPs come from `203.0.113.0/24` in both modes (see [Elastic IPs](#elastic-ips)).
@@ -1422,7 +1442,8 @@ For an address that reaches the instance itself, run it with a container (`FLOCI
   [InstanceNetworkInterfaceSpecification reference](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_InstanceNetworkInterfaceSpecification.html)
   specifies, only an interface the launch creates gets an automatic address. An instance launched
   on an existing network interface has none.
-- The address appears when the instance reaches `running` and remains stable while it runs. A
+- Outside pool mode, the address appears when the instance reaches `running`; pool mode reserves
+  it on the accepted pending launch. It remains stable while the instance runs. A
   stop or termination releases it, and a restart assigns a new one (the same one again under
   `fixed`); the private address does not change. As the
   [EC2 User Guide](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing.html#concepts-public-addresses)

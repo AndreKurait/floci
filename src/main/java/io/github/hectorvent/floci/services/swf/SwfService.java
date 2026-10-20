@@ -1438,9 +1438,7 @@ public class SwfService implements Resettable {
     public boolean recordActivityTaskHeartbeat(String taskToken, String details) {
         return withActivityToken(taskToken, (execution, task) -> {
             task.setLastHeartbeatTimestamp(now());
-            if (details != null) {
-                task.setControl(details);
-            }
+            task.setHeartbeatDetails(details);
             storeExecution(executionKey(execution), execution);
             return task.isCancelRequested();
         });
@@ -1720,6 +1718,7 @@ public class SwfService implements Resettable {
             }
             appendEvent(execution, "ActivityTaskTimedOut")
                     .attr("timeoutType", timeoutType)
+                    .attr("details", task.getHeartbeatDetails())
                     .attr("scheduledEventId", task.getScheduledEventId())
                     .attr("startedEventId", task.getStartedEventId() != null ? task.getStartedEventId() : 0L);
             task.setState(SwfActivityTask.STATE_CLOSED);

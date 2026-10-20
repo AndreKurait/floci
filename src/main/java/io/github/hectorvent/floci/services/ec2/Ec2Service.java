@@ -180,6 +180,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private static final String SYNTHETIC_FALLBACK_CIDR = "172.31.0.0/24";
     private static final String DEFAULT_ROOT_VOLUME_TYPE = "gp3";
     private static final String DOCUMENTATION_PREFIX = "203.0.113.";
+    private static final long MAX_MOCK_PUBLIC_ADDRESS_POOL_SIZE = 256;
     private static final Set<String> VALID_VOLUME_TYPES =
             Set.of("standard", "io1", "io2", "gp2", "sc1", "st1", "gp3");
     /** The accounts behind the two non-self owner aliases DescribeImages accepts. */
@@ -311,6 +312,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final Object privateIpAllocationLock = new Object();
     /** Host part (1-254) of the last 203.0.113.0/24 address handed out; guarded by the allocation lock. */
     private int documentationHost;
+    private final Cidr4 mockPublicAddressPool;
+    /** Next configured pool offset to try; persisted holders, not this cursor, retain leases. */
+    private long mockPublicAddressOffset;
 
     /**
      * Null in the hermetic unit tests, which reach the constructors that do not take it; CDI always
@@ -796,6 +800,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                StorageBackend<String, Host> hosts,
                StorageBackend<String, TransitGatewayPeeringAttachment> transitGatewayPeeringAttachments,
                StorageBackend<String, EgressOnlyInternetGateway> egressOnlyInternetGateways) {
+        this.mockPublicAddressPool = configuredMockPublicAddressPool(config);
         this.hosts = hosts;
         this.egressOnlyInternetGateways = egressOnlyInternetGateways;
         this.transitGatewayPeeringAttachments = transitGatewayPeeringAttachments;
@@ -3617,6 +3622,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         String az = subnet != null ? subnet.getAvailabilityZone()
                 : availabilityZone != null && !availabilityZone.isBlank() ? availabilityZone : region + "a";
         String finalSubnetId = subnet != null ? subnet.getSubnetId() : null;
+        boolean automaticPublicIp = suppliedEni == null && (associatePublicIp != null
+                ? associatePublicIp : subnet != null && subnet.isMapPublicIpOnLaunch());
 
         // Resolve security groups
         List<GroupIdentifier> sgIdentifiers;
@@ -3688,6 +3695,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         // since the unlocked check above.
                         validateHostPlacement(getRequiredAvailableHost(region, hostId), az, effectiveInstanceType, tenancy);
                     }
+                    List<String> publicIps = allocateMockPublicAddresses(automaticPublicIp, count);
                     List<String> privateIps = allocateLaunchAddresses(region, finalSubnetId, suppliedEni, count);
                     for (int i = 0; i < count; i++) {
                         String instanceId = "i-" + randomHex(17);
@@ -3711,9 +3719,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         // override wins in both directions; the subnet's MapPublicIpOnLaunch
                         // attribute is only the default when the launch does not specify it. An
                         // interface the caller created never takes an automatic address.
-                        inst.setAssociatePublicIp(suppliedEni == null && (associatePublicIp != null
-                                ? associatePublicIp
-                                : subnet != null && subnet.isMapPublicIpOnLaunch()));
+                        inst.setAssociatePublicIp(automaticPublicIp);
+                        if (!publicIps.isEmpty()) {
+                            setPublicAddress(inst, publicIps.get(i));
+                        }
                         inst.setPrivateIpAddress(privateIp);
                         inst.setPrivateDnsName(AwsRegions.ec2PrivateIpDnsName(privateIp, region));
                         inst.setKeyName(keyName);
@@ -4303,7 +4312,56 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             case NONE -> null;
             case FIXED -> fixedMockPublicAddress();
             case DOCUMENTATION -> documentationPublicAddress();
+            case POOL -> pooledPublicAddress();
         };
+    }
+
+    private static Cidr4 configuredMockPublicAddressPool(EmulatorConfig config) {
+        EmulatorConfig.Ec2ServiceConfig ec2 = config.services().ec2();
+        if (ec2.mockPublicAddresses() != EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.POOL) {
+            return null;
+        }
+        String configured = ec2.mockPublicAddressPool().map(String::strip).orElse("");
+        Cidr4 pool = Cidr4.parse(configured).orElseThrow(() -> new IllegalArgumentException(
+                "floci.services.ec2.mock-public-address-pool requires a network-aligned IPv4 CIDR"));
+        if (!pool.toString().equals(configured) || pool.size() > MAX_MOCK_PUBLIC_ADDRESS_POOL_SIZE) {
+            throw new IllegalArgumentException(
+                    "floci.services.ec2.mock-public-address-pool requires a network-aligned /24 to /32 CIDR");
+        }
+        return pool;
+    }
+
+    /** Reserve the whole launch before private addresses, tags or volumes are written. */
+    private List<String> allocateMockPublicAddresses(boolean publicIpDue, int count) {
+        if (!config.services().ec2().mock() || mockPublicAddressPool == null || !publicIpDue) {
+            return List.of();
+        }
+        if (count > mockPublicAddressPool.size()) {
+            throw exhaustedMockPublicAddressPool();
+        }
+        Set<String> taken = publicAddressesInUse();
+        List<String> allocated = new ArrayList<>(count);
+        for (long step = 0; step < mockPublicAddressPool.size() && allocated.size() < count; step++) {
+            long offset = mockPublicAddressOffset;
+            mockPublicAddressOffset = (offset + 1) % mockPublicAddressPool.size();
+            String candidate = mockPublicAddressPool.addressAt(offset).orElseThrow();
+            if (taken.add(candidate)) {
+                allocated.add(candidate);
+            }
+        }
+        if (allocated.size() < count) {
+            throw exhaustedMockPublicAddressPool();
+        }
+        return allocated;
+    }
+
+    /** Callers hold the allocation lock until the chosen identity is stored on its instance. */
+    private String pooledPublicAddress() {
+        return allocateMockPublicAddresses(true, 1).get(0);
+    }
+
+    private static AwsException exhaustedMockPublicAddressPool() {
+        return new AwsException("AddressLimitExceeded", "The configured mock public address pool is exhausted.", 400);
     }
 
     /**
@@ -4328,6 +4386,18 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * @return the address, or null once all 254 are taken
      */
     private String documentationPublicAddress() {
+        Set<String> taken = publicAddressesInUse();
+        for (int i = 0; i < 254; i++) {
+            documentationHost = documentationHost % 254 + 1;
+            String candidate = DOCUMENTATION_PREFIX + documentationHost;
+            if (!taken.contains(candidate)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private Set<String> publicAddressesInUse() {
         Set<String> taken = new HashSet<>();
         for (Instance other : instances instanceof AccountAwareStorageBackend<Instance> aware
                 ? aware.scanAllAccounts() : instances.scan(k -> true)) {
@@ -4338,14 +4408,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             taken.add(other.getPublicIp());
             taken.add(other.getAllocatedPublicIp());
         }
-        for (int i = 0; i < 254; i++) {
-            documentationHost = documentationHost % 254 + 1;
-            String candidate = DOCUMENTATION_PREFIX + documentationHost;
-            if (!taken.contains(candidate)) {
-                return candidate;
-            }
-        }
-        return null;
+        return taken;
     }
 
     private static String primaryInterfaceId(Instance instance) {
@@ -4412,8 +4475,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * the primary interface it was associated through, or null.
      */
     private Address primaryElasticAddress(String region, Instance instance) {
+        return primaryElasticAddress(region, instance, null);
+    }
+
+    private Address primaryElasticAddress(String region, Instance instance, String excludedAllocationId) {
         String primaryInterfaceId = primaryInterfaceId(instance);
         for (Address address : addresses.scan(k -> k.startsWith(region + "::"))) {
+            if (excludedAllocationId != null && excludedAllocationId.equals(address.getAllocationId())) {
+                continue;
+            }
             boolean onInstance = instance.getInstanceId().equals(address.getInstanceId())
                     || primaryInterfaceId != null && primaryInterfaceId.equals(address.getNetworkInterfaceId());
             if (onInstance && address.getAssociationId() != null
@@ -11158,8 +11228,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         + " is not assigned to the primary network interface of instance " + instanceId + ".", 400);
             }
 
+            boolean replaceOldPublicAddress = mockPublicAddressPool == null || !config.services().ec2().mock()
+                    || target == null || secondary != null
+                    || !instanceId.equals(addressHolder(region, addr));
+            String oldReplacement = addr.getAssociationId() != null && replaceOldPublicAddress
+                    ? pooledReplacementAddress(region, addr) : null;
             if (addr.getAssociationId() != null) {
-                disassociateAddress(region, addr.getAssociationId());
+                disassociateAddress(region, addr.getAssociationId(), replaceOldPublicAddress, oldReplacement);
             }
             // An Elastic IP already on the same private address of the instance is disassociated and
             // stays allocated, as on AWS. That includes one a retained interface carried onto this
@@ -11172,7 +11247,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     if (onInstance && existing.getAssociationId() != null
                             && !allocationId.equals(existing.getAllocationId())
                             && Objects.equals(secondary, secondaryPrivateIpOf(region, target, existing.getPrivateIpAddress()))) {
-                        disassociateAddress(region, existing.getAssociationId());
+                        // The incoming EIP replaces this exact private-address association.
+                        boolean replaceTemporary = mockPublicAddressPool == null || !config.services().ec2().mock();
+                        disassociateAddress(region, existing.getAssociationId(), replaceTemporary, null);
                     }
                 }
             }
@@ -11309,6 +11386,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public void disassociateAddress(String region, String associationId) {
+        disassociateAddress(region, associationId, true, null);
+    }
+
+    private void disassociateAddress(String region, String associationId, boolean replacePublicAddress,
+                                    String reservedPublicAddress) {
         ensureDefaultResources(region);
         // Under the lock NAT create and delete take, so the gateway check and the clear see the
         // same association.
@@ -11334,6 +11416,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             && (addr.getInstanceId() != null
                                     || Objects.equals(addr.getNetworkInterfaceId(), primaryInterfaceId(holder)))
                             && secondaryPrivateIpOf(region, holder, addr.getPrivateIpAddress()) == null;
+                    String replacement = reservedPublicAddress != null ? reservedPublicAddress
+                            : onPrimary && replacePublicAddress ? pooledReplacementAddress(region, addr) : null;
                     addr.setInstanceId(null);
                     addr.setAssociationId(null);
                     updateStoredAddressAssociation(addr);
@@ -11345,8 +11429,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         addr.setPublicIp(addr.getAllocatedPublicIp());
                     }
                     addresses.put(key(region, addr.getAllocationId()), addr);
-                    if (onPrimary) {
-                        releaseElasticAddress(region, holder);
+                    if (onPrimary && replacePublicAddress) {
+                        releaseElasticAddress(region, holder, replacement);
                     }
                     return;
                 }
@@ -11360,7 +11444,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * {@link AutomaticPublicAddress} says it is due, as on AWS; otherwise none. A terminated
      * instance is left as it is.
      */
-    private void releaseElasticAddress(String region, Instance inst) {
+    private String pooledReplacementAddress(String region, Address releasing) {
+        if (!config.services().ec2().mock() || mockPublicAddressPool == null) {
+            return null;
+        }
+        String instanceId = addressHolder(region, releasing);
+        Instance holder = instanceId == null ? null : instances.get(key(region, instanceId)).orElse(null);
+        if (holder == null || holder.getState() == null || !"running".equals(holder.getState().getName())
+                || secondaryPrivateIpOf(region, holder, releasing.getPrivateIpAddress()) != null
+                || !AutomaticPublicAddress.isDue(holder, true)
+                || primaryElasticAddress(region, holder, releasing.getAllocationId()) != null) {
+            return null;
+        }
+        return pooledPublicAddress();
+    }
+
+    private void releaseElasticAddress(String region, Instance inst, String reservedPublicAddress) {
         writePublicAddress(inst, () -> {
             String state = inst.getState() == null ? null : inst.getState().getName();
             if ("terminated".equals(state) || "shutting-down".equals(state)) {
@@ -11373,7 +11472,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             clearPublicAddress(inst);
             if ("running".equals(state)) {
-                assignAutomaticAddress(inst, true);
+                if (reservedPublicAddress != null) {
+                    setPublicAddress(inst, reservedPublicAddress);
+                } else {
+                    assignAutomaticAddress(inst, true);
+                }
             }
         });
         instances.put(key(region, inst.getInstanceId()), inst);
