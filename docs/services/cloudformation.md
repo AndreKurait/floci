@@ -753,9 +753,11 @@ always lists both stages, matching AWS.
 adds the corresponding security schemes and operation requirements. API Gateway imports
 these as `authorizationType: AWS_IAM` and `apiKeyRequired: true`: invocation requires both
 a valid SigV4 signature and an enabled API key associated with the invoked stage when both
-controls are selected. Existing inline requirements and their scheme definitions are
+controls are selected. Existing method-level requirements and their scheme definitions are
 preserved. Defaults are selected by the SAM names `AWS_IAM` and `api_key`; an existing
 scheme with another name does not suppress either default.
+Root-level OpenAPI security remains in the document and is not copied into operations
+when applying these defaults, matching AWS SAM.
 
 Other `Auth` properties, custom default authorizers, external definitions, unresolved or
 malformed security requirements, and method override markers are rejected. Existing
