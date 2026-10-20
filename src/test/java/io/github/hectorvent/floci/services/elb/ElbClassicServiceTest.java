@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.elb;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
@@ -31,7 +33,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -311,11 +316,11 @@ class ElbClassicServiceTest {
 
     @Test
     void registerAndDeregisterInstancesAreIdempotent() {
-        create("my-elb");
+        ClassicLoadBalancer lb = create("my-elb");
         service.registerInstances(REGION, "my-elb", List.of("i-1"));
         assertEquals(List.of("i-1"), service.registerInstances(REGION, "my-elb", List.of("i-1")));
         assertEquals(List.of(), service.deregisterInstances(REGION, "my-elb", List.of("i-1")));
-        verify(healthChecker).deregisterInstances(REGION, "my-elb", List.of("i-1"));
+        verify(healthChecker).deregisterInstances(lb, List.of("i-1"));
     }
 
     @Test
@@ -365,6 +370,31 @@ class ElbClassicServiceTest {
         ClassicLoadBalancer lb = create("my-elb");
         service.createLoadBalancerListeners(REGION, "my-elb", List.of(httpListener()));
         assertEquals(1, lb.getListeners().size());
+    }
+
+    @Test
+    void restoresHealthAndHostedZonesWithoutMovingAnotherAccountsBalancer() {
+        AccountAwareStorageBackend<Map<String, ClassicLoadBalancer>> storage =
+                AccountAwareStorageBackend.inMemory("111111111111");
+        StorageFactory factory = mock(StorageFactory.class);
+        doReturn(storage).when(factory).create(eq("elb"), eq("elb-load-balancers.json"), any());
+        ClassicLoadBalancer own = new ClassicLoadBalancer();
+        ClassicLoadBalancer foreign = new ClassicLoadBalancer();
+        foreign.setInstanceIds(List.of("i-foreign"));
+        storage.putForAccount("111111111111", REGION, Map.of("same-name", own));
+        storage.putForAccount("222222222222", REGION, Map.of("same-name", foreign));
+        service = new ElbClassicService(ec2Service, healthChecker, factory, null);
+        service.initializeStorage();
+
+        service.restorePersistedRuntime();
+
+        assertEquals(AwsRegionFacts.classicElbHostedZoneId(REGION).orElseThrow(),
+                foreign.getCanonicalHostedZoneNameId());
+        assertEquals(Map.of("same-name", own), storage.getForAccount("111111111111", REGION).orElseThrow());
+        assertEquals(Map.of("same-name", foreign), storage.getForAccount("222222222222", REGION).orElseThrow());
+        verify(healthChecker).startMonitoring(own);
+        verify(healthChecker).startMonitoring(foreign);
+        verify(healthChecker).registerInstances(foreign, List.of("i-foreign"));
     }
 
     /** A balancer stored before the zone was looked up per region carries the old fixed zone. */
