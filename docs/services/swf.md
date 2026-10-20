@@ -256,9 +256,9 @@ Faults use the AWS codes and messages, so SDK error handling works unchanged:
 
 ## Limitations
 
-- **Long polling.** `PollForDecisionTask` and `PollForActivityTask` return immediately
-  instead of holding the connection for up to 60 seconds. Workers that loop on an empty
-  poll behave the same; workers that rely on the call blocking will spin.
+- **Long polling.** `PollForDecisionTask` and `PollForActivityTask` hold an empty
+  poll for up to 60 seconds and wake when a matching task becomes available. Decision
+  history continuation requests return the next page without starting another poll.
 - **Task tokens are in-memory.** Tokens do not survive a restart even under persistent
   storage modes, matching the fact that SWF tokens are not durable handles.
 - **Retention.** `workflowExecutionRetentionPeriodInDays` is stored and returned but

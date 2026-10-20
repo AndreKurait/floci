@@ -1518,6 +1518,32 @@ class Ec2ServiceTest {
     }
 
     @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void primaryInterfaceMacIsPresentAndStableAcrossDescriptions(boolean suppliedInterface) {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnetId = service.describeSubnets(region, List.of(), Map.of()).getFirst().getSubnetId();
+        NetworkInterface supplied = suppliedInterface
+                ? service.createNetworkInterface(region, subnetId, null, null, List.of(), List.of(), List.of()) : null;
+        Instance instance = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnetId, null, List.of(), null, null,
+                null, supplied != null ? supplied.getNetworkInterfaceId() : null, 0).getInstances().getFirst();
+        String interfaceId = instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        String mac = instance.getNetworkInterfaces().getFirst().getMacAddress();
+        assertNotNull(mac);
+        assertTrue(mac.matches("(?:[0-9a-f]{2}:){5}[0-9a-f]{2}"));
+        if (supplied != null) {
+            assertEquals(supplied.getMacAddress(), mac);
+        }
+        assertEquals(mac, service.describeInstances(region, List.of(instance.getInstanceId()), Map.of()).getFirst()
+                .getInstances().getFirst().getNetworkInterfaces().getFirst().getMacAddress());
+        assertEquals(mac, service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of(), 0, null)
+                .networkInterfaces().getFirst().getMacAddress());
+    }
+
+    @ParameterizedTest
     @CsvSource({"false,false,true", "false,true,true", "true,false,true",
             "true,true,true", "true,false,false", "true,true,false"})
     void terminationKeepsAddressesOnlyOnRetainedInterfaces(boolean suppliedInterface, boolean defaultVpc,

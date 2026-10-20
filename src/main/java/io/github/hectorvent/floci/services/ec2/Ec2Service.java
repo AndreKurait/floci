@@ -3757,7 +3757,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         eni.setVpcId(vpcId);
                         eni.setOwnerId(callerAccountId());
                         eni.setDescription(suppliedEni != null ? suppliedEni.getDescription() : null);
-                        eni.setMacAddress(suppliedEni != null ? suppliedEni.getMacAddress() : null);
+                        eni.setMacAddress(suppliedEni != null ? suppliedEni.getMacAddress() : randomMac());
                         eni.setPrivateIpAddress(privateIp);
                         eni.setPrivateDnsName(inst.getPrivateDnsName());
                         eni.setGroups(new ArrayList<>(sgIdentifiers));
