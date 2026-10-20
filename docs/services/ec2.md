@@ -202,11 +202,11 @@ forms, encrypted shared copies and KMS are unsupported.
 Container mode refuses foreign sources with unbound runtime ancestry. Captured Docker layers are
 refused in both modes, including captures in source ancestry. Direct shared-image container launches
 require a caller-owned copy. Same-account captured
-copies retain their existing behavior. `CopyImageTags`, tag specifications,
-encryption and placement options
-are refused. AWS's special `ec2:SharedTag/` visibility and copy behavior is not
-implemented; foreign AMIs with those tags are explicitly refused instead of
-silently dropping or exposing them.
+copies retain their existing behavior. Explicit `CopyImageTags=true`, tag
+specifications, encryption and placement options are refused.
+Owned and cross-account copies automatically retain `ec2:SharedTag/` image tags
+in the destination account's tag store. Private and system tags are not copied,
+and source tags and permission sets remain unchanged.
 
 ### Cloud-image-derived AMI guests
 
