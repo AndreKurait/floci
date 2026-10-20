@@ -931,6 +931,11 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
                                                     Long startTime, Long endTime,
                                                     String filterPattern, int limit,
                                                     String nextToken, String region) {
+        groupStore.get(groupKey(region, groupName))
+                .filter(stored -> groupName.equals(stored.getLogGroupName()))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "The specified log group does not exist.", 400));
+
         int maxEvents = Math.min(limit > 0 ? limit : Integer.MAX_VALUE,
                 maxEventsPerQuery);
         // The filter pattern syntax metric and subscription filters use: terms, quoted phrases,
