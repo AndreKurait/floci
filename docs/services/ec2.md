@@ -1089,6 +1089,9 @@ When `floci.services.ec2.volume-block-devices` is enabled (the default), attache
 Validation matches AWS behavior:
 - Unknown volumes are rejected with `InvalidVolume.NotFound`.
 - Decreasing volume size is rejected with `InvalidParameterValue`.
+- Modification validates the target type's size, IOPS, throughput, and performance ratios before resizing backing storage or updating volume metadata. It uses the same limits as `CreateVolume`.
+- Omitted performance values retain their existing provisioning when the volume type stays the same. Type changes use the target defaults; a gp2-to-gp3 change with both performance fields omitted preserves source performance when it exceeds gp3's baseline.
+- Increasing gp2 size recomputes its size-based IOPS metadata. Provisioned gp3, io1, and io2 IOPS remain unchanged during a size increase unless explicitly updated.
 - Unsupported parameters (such as `Throughput` on non-gp3 volumes or `Iops` on non-provisioned IOPS volume types) are rejected with `InvalidParameterCombination`.
 - When querying `DescribeVolumesModifications` with an explicit volume ID for an unmodified volume, the request fails with `InvalidVolumeModification.NotFound`. Listing or filtering without explicit IDs returns only modified volumes.
 

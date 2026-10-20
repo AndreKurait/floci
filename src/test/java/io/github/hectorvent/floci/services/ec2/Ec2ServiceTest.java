@@ -52,6 +52,7 @@ import io.github.hectorvent.floci.services.ec2.model.TransitGatewayVpcAttachment
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
+import io.github.hectorvent.floci.services.ec2.model.VolumeModification;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.ec2.model.VpcCidrBlockAssociation;
 import io.github.hectorvent.floci.services.ec2.model.VpcEndpoint;
@@ -818,6 +819,101 @@ class Ec2ServiceTest {
                         false, iops, throughput, null, List.of())).getHttpStatus());
         assertTrue(volumeStore.keys().isEmpty());
         assertTrue(vpcStore.keys().isEmpty());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"1,65537,gp3,,", "1,1,gp3,0,", "1,1,gp3,-1,", "1,1,gp3,2999,", "1,1,gp3,3500,",
+            "160,160,gp3,80001,", "1,1,gp3,3000,124", "160,160,gp3,8000,2001",
+            "10,20,gp3,3000,751", "1,3,io1,100,", "1,4,io1,201,",
+            "1,4,io2,4001,", "256,256,io2,256001,", "1,16385,gp2,,",
+            "1,1025,standard,,", "1,124,sc1,,"})
+    void invalidVolumeModificationIsRefusedBeforeResizeOrMetadataMutation(int originalSize, int targetSize,
+                                                                         String targetType, Integer iops,
+                                                                         Integer throughput) throws Exception {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp3", originalSize,
+                false, 3000, 125, null, List.of(new Tag("Owner", "unchanged")));
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Field field = Ec2Service.class.getDeclaredField("volumeBlockDeviceManager");
+        field.setAccessible(true);
+        field.set(service, devices);
+
+        AwsException error = assertThrows(AwsException.class, () -> service.modifyVolume("us-east-1",
+                volume.getVolumeId(), targetSize, targetType, iops, throughput, null, false));
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+        Volume described = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
+        assertEquals(originalSize, described.getSize());
+        assertEquals("gp3", described.getVolumeType());
+        assertEquals(3000, described.getIops());
+        assertEquals(125, described.getThroughput());
+        assertEquals("unchanged", described.getTags().getFirst().getValue());
+        assertTrue(service.describeVolumesModifications("us-east-1", List.of(), Map.of()).isEmpty());
+        verifyNoInteractions(devices);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"1,3000,128", "500,3000,250", "2000,6000,250"})
+    void gp2ToGp3MigrationPreservesSourcePerformanceAboveTheBaseline(int size, int expectedIops,
+                                                                   int expectedThroughput) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp2", size,
+                false, 0, null, null, List.of());
+        VolumeModification modification = service.modifyVolume("us-east-1", volume.getVolumeId(),
+                null, "gp3", null, null, null, false);
+        assertEquals(expectedIops, modification.getTargetIops());
+        assertEquals(expectedThroughput, modification.getTargetThroughput());
+        Volume described = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
+        assertEquals(expectedIops, described.getIops());
+        assertEquals(expectedThroughput, described.getThroughput());
+    }
+
+    @Test
+    void gp2SizeIncreaseRecomputesPerformanceAndGp3SizeIncreaseRetainsProvisioning() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume gp2 = service.createVolume("us-east-1", "us-east-1a", "gp2", 32,
+                false, 0, null, null, List.of());
+        service.modifyVolume("us-east-1", gp2.getVolumeId(), 100, null, null, null, null, false);
+        assertEquals(300, gp2.getIops());
+        Volume gp3 = service.createVolume("us-east-1", "us-east-1a", "gp3", 160,
+                false, 80000, 2000, null, List.of());
+        service.modifyVolume("us-east-1", gp3.getVolumeId(), 200, null, null, null, null, false);
+        assertEquals(80000, gp3.getIops());
+        assertEquals(2000, gp3.getThroughput());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"gp3,160,80000,2000,io2,3000,", "io2,256,256000,,gp3,3000,125"})
+    void changingProvisionedVolumeTypeUsesTheTargetsDefaults(String sourceType, int size, int iops,
+                                                            Integer throughput, String targetType,
+                                                            int expectedIops, Integer expectedThroughput) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", sourceType, size,
+                false, iops, throughput, null, List.of());
+        service.modifyVolume("us-east-1", volume.getVolumeId(), null, targetType, null, null, null, false);
+        assertEquals(expectedIops, volume.getIops());
+        assertEquals(expectedThroughput, volume.getThroughput());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"gp3,160,80000,2000", "gp3,65536,3000,125", "io1,1280,64000,",
+            "io2,256,256000,", "io2,65536,256000,"})
+    void validVolumeModificationsReportTheNewPerformanceLimits(String type, int size, int iops,
+                                                              Integer throughput) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp3", 1,
+                false, 0, null, null, List.of());
+        VolumeModification changed = service.modifyVolume("us-east-1", volume.getVolumeId(),
+                size, type, iops, throughput, null, false);
+        assertEquals("completed", changed.getModificationState());
+        assertEquals(size, changed.getTargetSize());
+        assertEquals(iops, changed.getTargetIops());
+        assertEquals(throughput, changed.getTargetThroughput());
+        VolumeModification retained = service.modifyVolume("us-east-1", volume.getVolumeId(),
+                null, null, null, null, null, false);
+        assertEquals(iops, retained.getTargetIops());
+        assertEquals(throughput, retained.getTargetThroughput());
+        assertEquals(size, volume.getSize());
+        assertEquals(type, volume.getVolumeType());
     }
 
     @Test

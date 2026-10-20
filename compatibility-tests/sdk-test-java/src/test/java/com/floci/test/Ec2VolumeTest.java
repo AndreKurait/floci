@@ -9,6 +9,7 @@ import software.amazon.awssdk.services.ec2.model.CreateVolumeResponse;
 import software.amazon.awssdk.services.ec2.model.DescribeVolumesResponse;
 import software.amazon.awssdk.services.ec2.model.Ec2Exception;
 import software.amazon.awssdk.services.ec2.model.Filter;
+import software.amazon.awssdk.services.ec2.model.ModifyVolumeResponse;
 import software.amazon.awssdk.services.ec2.model.ResourceType;
 import software.amazon.awssdk.services.ec2.model.Tag;
 import software.amazon.awssdk.services.ec2.model.TagSpecification;
@@ -22,6 +23,62 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class Ec2VolumeTest {
+
+    @Test
+    void modifyVolumeMigratesGp2AndRetainsUpdatedGp3Performance() {
+        String scope = TestFixtures.uniqueName("volume-modify");
+        try (Ec2Client ec2 = TestFixtures.ec2Client()) {
+            String id = ec2.createVolume(request -> request
+                    .availabilityZone(TestFixtures.region().id() + "a")
+                    .volumeType(VolumeType.GP2).size(500).tagSpecifications(tags(scope))).volumeId();
+            try {
+                ModifyVolumeResponse migrated = ec2.modifyVolume(request -> request
+                        .volumeId(id).volumeType(VolumeType.GP3));
+                assertThat(migrated.volumeModification().targetIops()).isEqualTo(3000);
+                assertThat(migrated.volumeModification().targetThroughput()).isEqualTo(250);
+                ec2.modifyVolume(request -> request.volumeId(id).size(600).iops(80000).throughput(2000));
+                ec2.modifyVolume(request -> request.volumeId(id).size(700));
+                Volume described = ec2.describeVolumes(request -> request.volumeIds(id)).volumes().get(0);
+                assertThat(described.volumeType()).isEqualTo(VolumeType.GP3);
+                assertThat(described.size()).isEqualTo(700);
+                assertThat(described.iops()).isEqualTo(80000);
+                assertThat(described.throughput()).isEqualTo(2000);
+            } finally {
+                ec2.deleteVolume(request -> request.volumeId(id));
+            }
+        }
+    }
+
+    @Test
+    void invalidVolumeModificationsPreserveTheExistingVolume() {
+        String scope = TestFixtures.uniqueName("volume-invalid-modify");
+        try (Ec2Client ec2 = TestFixtures.ec2Client()) {
+            String id = ec2.createVolume(request -> request
+                    .availabilityZone(TestFixtures.region().id() + "a")
+                    .volumeType(VolumeType.GP3).size(10).tagSpecifications(tags(scope))).volumeId();
+            try {
+                assertThatThrownBy(() -> ec2.modifyVolume(request -> request.volumeId(id).iops(0)))
+                        .isInstanceOfSatisfying(Ec2Exception.class, error ->
+                                assertThat(error.awsErrorDetails().errorCode()).isEqualTo("InvalidParameterValue"));
+                assertThatThrownBy(() -> ec2.modifyVolume(request -> request.volumeId(id).size(20)
+                        .iops(3000).throughput(751)))
+                        .isInstanceOfSatisfying(Ec2Exception.class, error ->
+                                assertThat(error.awsErrorDetails().errorCode()).isEqualTo("InvalidParameterValue"));
+                assertThatThrownBy(() -> ec2.modifyVolume(request -> request.volumeId(id)
+                        .volumeType(VolumeType.IO2).size(20).iops(20001)))
+                        .isInstanceOfSatisfying(Ec2Exception.class, error ->
+                                assertThat(error.awsErrorDetails().errorCode()).isEqualTo("InvalidParameterValue"));
+                Volume described = ec2.describeVolumes(request -> request.volumeIds(id)).volumes().get(0);
+                assertThat(described.volumeType()).isEqualTo(VolumeType.GP3);
+                assertThat(described.size()).isEqualTo(10);
+                assertThat(described.iops()).isEqualTo(3000);
+                assertThat(described.throughput()).isEqualTo(125);
+                assertThat(described.tags()).contains(Tag.builder().key("VolumeScope").value(scope).build());
+            } finally {
+                ec2.deleteVolume(request -> request.volumeId(id));
+            }
+        }
+    }
 
     @Test
     void volumeDefaultsAndInvalidPerformanceHaveCorrectReadbackAndNoExtraVolumes() {

@@ -12443,13 +12443,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         "The parameter iops is not supported for " + targetVolumeType + " volumes", 400);
             }
 
+            if (iops != null && iops <= 0) {
+                throw new AwsException("InvalidParameterValue",
+                        "Iops is outside the supported range for " + targetVolumeType, 400);
+            }
+
             if (multiAttachEnabled != null && multiAttachEnabled && !"io1".equals(targetVolumeType) && !"io2".equals(targetVolumeType)) {
                 throw new AwsException("InvalidParameterCombination",
                         "The parameter MultiAttachEnabled is not supported for " + targetVolumeType + " volumes", 400);
-            }
-
-            if (dryRun) {
-                throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
             }
 
             Integer originalSize = volume.getSize();
@@ -12459,26 +12460,26 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             Boolean originalMultiAttachEnabled = volume.getMultiAttachEnabled();
 
             int targetSize = size != null ? size : volume.getSize();
-            Integer targetIops = iops != null ? iops : (volume.getIops() > 0 ? volume.getIops() : null);
-            Integer targetThroughput = throughput != null ? throughput : volume.getThroughput();
+            boolean sameVolumeType = targetVolumeType.equals(originalVolumeType);
+            int targetIops = iops != null ? iops : (sameVolumeType ? volume.getIops() : 3000);
+            Integer targetThroughput = null;
             Boolean targetMultiAttach = multiAttachEnabled != null ? multiAttachEnabled : volume.getMultiAttachEnabled();
 
             if ("gp3".equals(targetVolumeType)) {
-                if (targetIops == null) {
-                    targetIops = 3000;
+                targetThroughput = throughput != null ? throughput
+                        : (sameVolumeType && originalThroughput != null ? originalThroughput : 125);
+                if ("gp2".equals(originalVolumeType) && iops == null && throughput == null) {
+                    targetIops = Math.max(3000, Math.min(16000, Math.max(100, 3 * originalSize)));
+                    targetThroughput = originalSize <= 170 ? 128 : 250;
                 }
-                if (targetThroughput == null) {
-                    targetThroughput = 125;
-                }
-            } else if ("io1".equals(targetVolumeType) || "io2".equals(targetVolumeType)) {
-                if (targetIops == null) {
-                    targetIops = 3000;
-                }
-                targetThroughput = null;
-            } else {
-                targetIops = null;
-                targetThroughput = null;
+            } else if (!"io1".equals(targetVolumeType) && !"io2".equals(targetVolumeType)) {
+                targetIops = 0;
                 targetMultiAttach = false;
+            }
+            targetIops = validatedVolumeIops(targetVolumeType, targetSize, targetIops, targetThroughput);
+
+            if (dryRun) {
+                throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
             }
 
             boolean resizeSuccess = true;
@@ -12492,7 +12493,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             mod.setVolumeId(volumeId);
             mod.setTargetSize(targetSize);
             mod.setTargetVolumeType(targetVolumeType);
-            mod.setTargetIops(targetIops);
+            mod.setTargetIops(targetIops > 0 ? targetIops : null);
             mod.setTargetThroughput(targetThroughput);
             mod.setTargetMultiAttachEnabled(targetMultiAttach);
             mod.setOriginalSize(originalSize);
@@ -12514,7 +12515,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
             volume.setSize(targetSize);
             volume.setVolumeType(targetVolumeType);
-            volume.setIops(targetIops != null ? targetIops : 0);
+            volume.setIops(targetIops);
             volume.setThroughput(targetThroughput);
             volume.setMultiAttachEnabled(targetMultiAttach);
             volumes.put(key(region, volumeId), volume);
