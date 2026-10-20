@@ -4,7 +4,7 @@
 
 ## Instance Execution Model
 
-`RunInstances` launches a **real Docker container** for each instance. By default, the container is kept alive with `tail -f /dev/null` so any base image works regardless of its default CMD. Catalog entries that opt into the `systemd` guest runtime start `/sbin/init` instead, with the Docker mounts needed for a systemd-based cloud-image guest.
+`RunInstances` launches a **real Docker container** for each instance. By default, the `minimal` guest runtime overrides the image's CMD with `tail -f /dev/null`. Catalog entries can instead select `systemd`, which starts `/sbin/init` with the mounts needed for a systemd-based cloud-image guest, or `image`, which preserves the image's own ENTRYPOINT and CMD.
 
 | EC2 state | Docker operation |
 |---|---|
@@ -76,6 +76,166 @@ metadata.
 | `ami-0abcdef1234567893` | | `public.ecr.aws/amazonlinux/amazonlinux:2023` |
 
 Any unrecognized AMI ID (including real AWS AMI IDs like `ami-0abc12345678`) falls back to the catalog `defaultDockerImage` (`public.ecr.aws/amazonlinux/amazonlinux:2023` by default).
+
+### Images with their own startup command
+
+Set `guestRuntime: image` on an AMI entry in an external catalog selected with
+`FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH` to run the Docker image's declared
+ENTRYPOINT and CMD without either override:
+
+```yaml
+defaultDockerImage: example/base:1
+images:
+  - imageId: ami-local-worker
+    dockerImage: example/worker:1
+    name: local-worker
+    description: Worker with its own startup command
+    architecture: arm64
+    creationDate: '2026-10-08T00:00:00.000Z'
+    guestRuntime: image
+```
+
+The image must provide a working startup command. This mode does not add the
+systemd mounts, install an init system, or establish application readiness.
+The normal EC2 networking, resource limits, metadata, SSH and UserData behavior
+still applies. Omitted `guestRuntime` and unknown AMI IDs retain the `minimal`
+runtime; selecting `image` on one entry does not change other entries.
+
+### Binding registered AMIs to local images
+
+An external catalog entry can declare `registrationNames`, an optional list of
+exact `RegisterImage` names:
+
+```yaml
+    guestRuntime: image
+    registrationNames:
+      - local-worker-release
+```
+
+Registering `Name=local-worker-release` then binds the generated AMI ID to that
+catalog entry. RunInstances uses its Docker image, guest runtime and Docker
+platform. An omitted architecture inherits the catalog architecture; an
+explicit mismatch returns `InvalidParameterValue` before registration.
+Duplicate or blank registration names make the catalog invalid. Names are
+case-sensitive, with no wildcard or prefix matching.
+
+CopyImage retains this binding across regions through its source ancestry.
+CreateImage and CopyImage use their explicit source, even when the output name
+matches another registration binding. Names without a declared binding retain
+the existing metadata registration and default-image fallback behavior.
+The mapping does not import snapshot bytes or prove that a guest boots.
+
+### Image creation provenance
+
+`DescribeImages` reports `SourceImageId` and `SourceImageRegion` for images
+created with `CreateImage` or `CopyImage`. These identify the immediate source:
+copying a copy reports that copy's ID and region, not its original ancestor.
+`CreateImage` also reports `SourceInstanceId`; `CopyImage` does not inherit it.
+
+Catalog and `RegisterImage` results omit these fields, including registrations
+bound to a local catalog entry. Older persisted images without recorded creation
+provenance also omit them. Runtime ancestry and captured Docker images are stored
+separately and retain their existing launch behavior. This does not add
+`CreateRestoreImageTask` support.
+
+### Volume snapshot metadata
+
+`CreateSnapshot` records a snapshot of an existing volume's metadata in the
+caller's account and region. The volume must be `available` or `in-use`.
+The response includes its volume ID, size, encryption flag, owner, creation
+time, description and requested snapshot tags. Source volume tags are not
+inherited. Metadata completes immediately with `status=completed` and
+`progress=100%`; this does not copy EBS block data or provide data restoration.
+
+`DescribeSnapshots` returns the stored metadata and supports `tag:<key>` and
+`tag-key` filters alongside its existing ID, owner and metadata filters.
+Deleting the source volume leaves its snapshots intact. Registering an AMI
+with an existing snapshot retains that snapshot's original metadata.
+Configured persistent storage retains snapshots across restarts.
+
+`DryRun=true` validates the source without storing a snapshot. Only regional
+placement is supported; Local Zone and Outpost placement are refused.
+`DeleteSnapshot` removes caller-owned regional metadata while preserving its
+source volume. A registered AMI's root snapshot cannot be deleted until every
+referencing AMI is deregistered. Dry-run and invalid requests preserve the
+snapshot. Standalone `CopySnapshot` remains unsupported.
+
+### Public addresses in metadata mode
+
+With `FLOCI_SERVICES_EC2_MOCK=true`, a running instance receives a synthetic public
+IPv4 address when its launch settings request one. Explicit true or false takes
+precedence over the subnet default. Direct launches and Auto Scaling use the
+selected launch-template version's primary-interface setting.
+
+Repeated reads retain the address; stopping releases an automatic address and
+starting assigns a new one without changing the private address. These are API
+identities, not host routes or published ports. An external executor must supply
+networking. Public DNS is represented by the address itself; AWS public-hostname
+synthesis and Elastic IP lifecycle parity are not qualified by these checks.
+
+### EBS launch mappings
+
+`RunInstances` inherits the AMI's EBS mappings. Launch-template settings override
+those mappings by device name, and explicit request fields override the template.
+Auto Scaling launch templates and launch configurations use the same EC2 volume
+allocation path. Volume size, type, snapshot, IOPS, gp3 throughput and
+`DeleteOnTermination` are retained; `DescribeInstances` reports every attached
+launch volume. Termination deletes volumes whose attachment requests deletion
+and detaches retained volumes.
+
+The complete mapping is validated before allocating launch resources. Duplicate
+devices, conflicting `NoDevice`/EBS settings, missing root devices, unavailable
+snapshots, and volumes smaller than their snapshots are refused. `NoDevice`
+suppresses an inherited non-root device. Instance-store mappings and explicit
+launch-time KMS key selection are unsupported and fail explicitly.
+
+A shared AMI's launch permission permits snapshot IDs already present in that
+AMI's unencrypted backing mappings in this launch path only, including when an
+override places the same backing snapshot on another device. It does not grant direct `CreateVolume` or `CopyImage`
+access to those snapshots. These are metadata volumes; launching does not copy
+snapshot block data. Container-backed shared-image launch retains its existing
+caller-owned-copy requirement.
+
+### Account permissions and shared AMI copies
+
+An owner can read and modify an AMI's `launchPermission` and a snapshot's
+`createVolumePermission`. Mutations support nested `Add.N.UserId` or
+`Remove.N.UserId` entries containing 12-digit account IDs. `Attribute` may
+be omitted on mutations, or must match the nested permission field.
+Attribute reads require the exact attribute name. Permission sets persist
+with their resources, and dry runs validate without changing permissions.
+Snapshot requests cannot combine additions and removals and are limited to
+500 entries per call. Invalid later entries refuse the whole request.
+
+Cross-account `CopyImage` resolves an exact stored source ID, region and
+owner. It requires the recipient's AMI launch permission and read permission
+for every backing snapshot before creating any destination records.
+The source must have completed, unencrypted EBS snapshot metadata.
+Container mode additionally requires explicit runtime ancestry ending at an existing local catalog entry;
+metadata mode (`mock=true`) does not invent a runtime ancestor for an unbound image.
+The copy has a distinct AMI ID and distinct destination-owned snapshots,
+retains the source size and catalog runtime ancestry, and does not inherit
+permission sets or ordinary owner tags. The source remains independent.
+This is metadata and local catalog behavior, not EBS block-data copying.
+
+`DescribeImages` includes explicitly shared images in the selected region, preserving the source owner.
+Owner and tag filters apply to that view; only `ec2:SharedTag/` tags cross the account boundary.
+Reads neither create recipient-owned aliases nor change source tags or mappings. Revocation removes visibility.
+Direct `CreateVolume` from a shared snapshot requires its create-volume grant and uses the snapshot size
+when size is omitted. Smaller sizes, missing grants, wrong regions and encrypted shared snapshots are refused.
+No snapshot bytes are copied by metadata mode.
+Permission reads and mutations remain owner-scoped. IAM policy evaluation,
+public/group/organization grants, legacy `OperationType`/`UserId.N` mutation
+forms, encrypted shared copies and KMS are unsupported.
+
+Container mode refuses foreign sources with unbound runtime ancestry. Captured Docker layers are
+refused in both modes, including captures in source ancestry. Direct shared-image container launches
+require a caller-owned copy. Same-account captured
+copies retain their existing behavior. `CopyImageTags`, tag specifications,
+encryption and placement options
+are refused. AWS's special `ec2:SharedTag/` visibility and copy behavior is not
+implemented; foreign AMIs with those tags are explicitly refused instead of
+silently dropping or exposing them.
 
 ### Cloud-image-derived AMI guests
 
@@ -159,6 +319,14 @@ instance ID. The check bypasses any HTTP proxy the image configures, a failed or
 response does not fall back to a tokenless request, and the check passes on an instance that
 requires tokens.
 
+EC2 link-local routing uses a host route and an OUTPUT DNAT rule inside the
+guest network namespace. The host route selects the same existing interface
+and source address as a direct request to the metadata server. This preserves
+instance identity when the guest's default route uses a different Docker
+bridge. Conflicting metadata host routes and Floci-owned DNAT rules are refused.
+No listener or local address is installed on port 80, so applications may
+continue to use that port.
+
 `iam/info` returns the ARN and ID that IAM holds for the attached profile, and 404 when that
 profile is missing, has no role or does not match the attached ARN. An EKS cluster node, whose
 profile Floci synthesizes, reports the synthesized ARN and a stable ID instead while IAM holds no
@@ -206,6 +374,11 @@ User data is returned as the original base64-decoded bytes, without decompressin
 
 IAM credentials are served when the instance has an `IamInstanceProfile.Arn` that resolves to an existing instance profile with one role in the profile's account. The role list uses the role name, which can differ from the profile name. Missing profiles, missing roles, and requests for another role return `404`.
 
+The `/latest/meta-data/iam/info` response uses that same validated attachment.
+Its `InstanceProfileArn` and `InstanceProfileId` are the actual IAM profile
+values; an EC2 instance ID is not a profile ID. Missing, deleted or mismatched
+attachments return `404`.
+
 Instance identity credentials are served for every instance, with or without an instance profile, under `identity-credentials/ec2/`, with directory listings at each level. They are a session of the instance identity role, `arn:<partition>:sts::<account>:assumed-role/aws:ec2-instance/<instance-id>` to `GetCallerIdentity`, where `<account>` is the account that launched the instance. As on AWS, no identity policy applies to that role, so with IAM enforcement on they are granted nothing beyond what needs no permission, such as `sts:GetCallerIdentity`. They follow the same lifetime, refresh and revocation rules as role credentials. The SSM Agent requests them first when it registers.
 
 Each registered instance receives its own temporary IAM session. Credentials last one hour and refresh on retrieval during the final five minutes; the previous generation remains valid until expiration. Floci revokes tracked sessions when the instance is unregistered or IMDS shuts down, and discards persisted EC2 sessions when Floci restarts. Restored guests obtain fresh credentials after metadata registration is rebuilt.
@@ -215,6 +388,19 @@ Guests with an instance profile receive endpoint and region settings without Flo
 ### IMDS and SSM managed instances
 
 IMDS only knows about containers that Floci itself launched through `RunInstances`. That launch is what installs the link-local `169.254.169.254` proxy inside the container and maps the container's IP to its instance record.
+
+The EC2 IMDS helper routes guest-originated TCP requests for `169.254.169.254:80` with one
+comment-owned `nat OUTPUT` DNAT rule in the guest's network namespace. It does not
+bind port 80 or add a loopback address, so an application can keep its wildcard
+port 80 listener. The helper requires `NET_ADMIN` as before and installs the
+distribution's iptables package with its other tools. The parent target must
+resolve to a remote unicast IPv4 address inside the guest. Repeated setup reuses
+the exact rule and repeats bounded IMDSv2 token readiness; a different or duplicate
+owned rule is refused. A legacy local `169.254.169.254` address is also refused,
+requiring a fresh guest rather than changing its source routing silently. Other
+network rules and the separate pod-identity relay are unchanged. EKS keeps its
+existing node-local IMDS listener, which its forwarded pod-network routing needs.
+The EKS and pod-identity installer requirements and package lists are also unchanged.
 
 Registering a container with SSM is independent of this: an SSM agent that calls `UpdateInstanceInformation` becomes a managed instance, but that does not create an EC2 instance record, does not install the IMDS proxy, and does not register the container with IMDS. From such a container, `curl http://169.254.169.254/...` fails outright (no proxy), and a request sent straight to the host IMDS port returns `404` with a message explaining that no EC2 instance is registered for the source IP. Floci also logs a warning when an SSM agent registers from a container that is not backed by a Floci EC2 instance.
 
@@ -890,6 +1076,7 @@ EC2 stores and returns IAM's profile ID, including for launch-template, EC2 Flee
 Auto Scaling instances. Persisted instances from older versions omit the unknown ID until the
 profile is reassociated; looking up the ARN could misidentify a deleted and recreated
 profile.
+The `client-token` instance filter selects only matching launches.
 
 ### Network Interfaces
 
@@ -935,7 +1122,12 @@ Validation matches AWS behavior:
 
 | Action | Description |
 |--------|-------------|
-| DescribeSnapshots | Lists or returns stored snapshots, filterable by id and owner. |
+| CreateSnapshot | Creates completed, volume-derived snapshot metadata with requested tags in the caller's account and region. |
+| DescribeSnapshots | Lists or returns stored snapshots, filterable by id, owner, metadata and tags. |
+| DescribeImageAttribute | Returns an owned image's launch permission account IDs. |
+| ModifyImageAttribute | Adds or removes nested launch permission account IDs on an owned image. |
+| DescribeSnapshotAttribute | Returns an owned snapshot's create-volume permission account IDs. |
+| ModifySnapshotAttribute | Adds or removes nested create-volume permission account IDs on an owned snapshot. |
 
 ### Flow Logs
 
@@ -1267,3 +1459,6 @@ Under `none` the rule still runs, but a mock instance has only the Elastic IP, i
 Otherwise a mock instance's address appears whether DescribeInstances or DescribeInstanceStatus
 observes the launch first. A terminated mock instance has no public address, and stopping it does not bring it
 back.
+
+A launch template with network interfaces cannot be combined with an instance-level
+`SubnetId`; place the subnet on the primary network interface instead.
