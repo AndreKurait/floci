@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.services.stepfunctions.model.Activity;
 import io.github.hectorvent.floci.services.stepfunctions.model.ActivityTask;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
@@ -20,10 +21,14 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -466,7 +471,17 @@ public class StepFunctionsJsonHandler {
 
     private Response handleGetExecutionHistory(JsonNode request) {
         String arn = request.path("executionArn").asText();
-        boolean includeExecutionData = request.path("includeExecutionData").asBoolean(true);
+        boolean includeExecutionData = parseOptionalBoolean(request, "includeExecutionData", true);
+        boolean reverseOrder = parseOptionalBoolean(request, "reverseOrder", false);
+        Integer maxResults = parseOptionalInt(request, "maxResults");
+        if (maxResults != null && (!request.path("maxResults").canConvertToInt()
+                || maxResults < 0 || maxResults > 1000)) {
+            throw new AwsException("ValidationException", "maxResults must be between 0 and 1000.", 400);
+        }
+        int pageSize = maxResults == null || maxResults == 0 ? 100 : maxResults;
+        String nextToken = optionalText(request, "nextToken");
+        String tokenNamespace = historyTokenNamespace(
+                arn, reverseOrder, includeExecutionData, pageSize, nextToken);
 
         List<HistoryEvent> live = service.getExecutionHistory(arn);
         List<HistoryEvent> events;
@@ -474,9 +489,13 @@ public class StepFunctionsJsonHandler {
         synchronized (live) {
             events = new ArrayList<>(live);
         }
+        PaginatedResult<HistoryEvent> page = Pagination.paginate(
+                events, event -> historyPaginationCursor(event, reverseOrder),
+                pageSize, nextToken, tokenNamespace,
+                token -> new AwsException("InvalidToken", "The provided token is not valid.", 400));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("events");
-        for (HistoryEvent e : events) {
+        for (HistoryEvent e : page.items()) {
             ObjectNode item = array.addObject();
             item.put("id", e.getId());
             item.put("timestamp", e.getTimestamp());
@@ -492,7 +511,42 @@ public class StepFunctionsJsonHandler {
                 item.set(historyEventDetailsField(e.getType()), objectMapper.valueToTree(details));
             }
         }
+        if (page.nextToken() != null) {
+            response.put("nextToken", page.nextToken());
+        }
         return Response.ok(response).build();
+    }
+
+    private static String historyPaginationCursor(HistoryEvent event, boolean reverseOrder) {
+        long timestampMillis = Math.round(event.getTimestamp() * 1000);
+        return String.format(Locale.ROOT, "%020d:%020d",
+                reverseOrder ? Long.MAX_VALUE - timestampMillis : timestampMillis,
+                reverseOrder ? Long.MAX_VALUE - event.getId() : event.getId());
+    }
+
+    private static String historyTokenNamespace(
+            String arn, boolean reverseOrder, boolean includeExecutionData, int pageSize, String nextToken) {
+        String namespace = "sfn-history:" + arn + ":" + reverseOrder + ":" + includeExecutionData + ":" + pageSize;
+        long now = System.currentTimeMillis();
+        long issuedAt = now;
+        if (nextToken != null) {
+            try {
+                String decoded = new String(Base64.getUrlDecoder().decode(nextToken), StandardCharsets.UTF_8);
+                String prefix = namespace + ":";
+                int separator = decoded.indexOf(':', prefix.length());
+                if (!decoded.startsWith(prefix) || separator < 0
+                        || !decoded.substring(separator + 1).matches("[0-9]{20}:[0-9]{20}")) {
+                    throw new IllegalArgumentException("Invalid history token");
+                }
+                issuedAt = Long.parseLong(decoded.substring(prefix.length(), separator));
+                if (issuedAt > now || issuedAt < now - Duration.ofHours(24).toMillis()) {
+                    throw new IllegalArgumentException("Expired history token");
+                }
+            } catch (IllegalArgumentException e) {
+                throw new AwsException("InvalidToken", "The provided token is not valid.", 400);
+            }
+        }
+        return namespace + ":" + issuedAt;
     }
 
     private static final Set<String> EXECUTION_DATA_FIELDS =
