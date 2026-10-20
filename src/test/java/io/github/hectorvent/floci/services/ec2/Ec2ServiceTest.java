@@ -1914,20 +1914,89 @@ class Ec2ServiceTest {
         }
     }
 
-    @Test
-    void allocationFailsOnceEveryDocumentationAddressIsTaken() {
-        Ec2Service service = mockModeService();
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void allocationFailsOnceEveryDocumentationAddressIsTaken(boolean anotherAccount) {
+        @SuppressWarnings("unchecked")
+        jakarta.enterprise.inject.Instance<RequestContext> contextInstance = mock(jakarta.enterprise.inject.Instance.class);
+        RequestContext context = new RequestContext();
+        when(contextInstance.isResolvable()).thenReturn(true);
+        when(contextInstance.get()).thenReturn(context);
+        context.setAccountId("111111111111");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(contextInstance), contextInstance);
         String region = "us-east-1";
         List<Address> allocated = new ArrayList<>();
         for (int i = 0; i < 254; i++) {
-            allocated.add(service.allocateAddress(region));
+            allocated.add(service.allocateAddress(i % 2 == 0 ? region : "us-west-2"));
         }
         assertEquals(254, allocated.stream().map(Address::getPublicIp).distinct().count());
+        if (anotherAccount) {
+            context.setAccountId("222222222222");
+            assertTrue(service.describeAddresses(region, List.of(), Map.of()).isEmpty());
+        }
         AwsException full = assertThrows(AwsException.class, () -> service.allocateAddress(region));
         assertEquals("AddressLimitExceeded", full.getErrorCode());
 
+        context.setAccountId("111111111111");
         service.releaseAddress(region, allocated.getFirst().getAllocationId());
-        assertEquals(allocated.getFirst().getPublicIp(), service.allocateAddress(region).getPublicIp());
+        context.setAccountId(anotherAccount ? "222222222222" : "111111111111");
+        Address replacement = service.allocateAddress("us-west-2");
+        assertEquals(allocated.getFirst().getPublicIp(), replacement.getPublicIp());
+        assertTrue(service.describeAddresses(region, List.of(replacement.getAllocationId()), Map.of()).isEmpty());
+        if (anotherAccount) {
+            context.setAccountId("111111111111");
+            assertTrue(service.describeAddresses("us-west-2",
+                    List.of(replacement.getAllocationId()), Map.of()).isEmpty());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void documentationAddressesKeepOtherAccountsReservationsAfterCursorWrapOrServiceRestart(boolean restart) {
+        @SuppressWarnings("unchecked")
+        jakarta.enterprise.inject.Instance<RequestContext> contextInstance = mock(jakarta.enterprise.inject.Instance.class);
+        RequestContext context = new RequestContext();
+        when(contextInstance.isResolvable()).thenReturn(true);
+        when(contextInstance.get()).thenReturn(context);
+        AccountAwareStorageBackend<Instance> instanceStore = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), contextInstance, "000000000000");
+        AccountAwareStorageBackend<Address> addressStore = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), contextInstance, "000000000000");
+        InMemoryStorageFactory storage = new InMemoryStorageFactory(
+                Map.of("ec2-instances.json", instanceStore, "ec2-addresses.json", addressStore), contextInstance);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), storage, contextInstance);
+        context.setAccountId("111111111111");
+        String subnet = publicSubnet(service, "us-east-1", "10.236.0.0/24");
+        Instance held = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null, null).getInstances().getFirst();
+        service.describeInstances("us-east-1", List.of(held.getInstanceId()), Map.of());
+        Address elastic = service.allocateAddress("us-west-2");
+        Set<String> reserved = Set.of(held.getPublicIpAddress(), elastic.getPublicIp());
+        assertEquals(2, reserved.size());
+        context.setAccountId("222222222222");
+        if (restart) {
+            service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                    mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                    new Ec2InstanceTypeCatalog(), storage, contextInstance);
+        } else {
+            for (int i = 0; i < 252; i++) {
+                Address transientAddress = service.allocateAddress("us-east-1");
+                service.releaseAddress("us-east-1", transientAddress.getAllocationId());
+            }
+        }
+        assertTrue(service.describeInstances("us-east-1", List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeAddresses("us-west-2", List.of(), Map.of()).isEmpty());
+        Address allocated = service.allocateAddress("us-east-1");
+        assertFalse(reserved.contains(allocated.getPublicIp()), allocated.getPublicIp());
+        context.setAccountId("111111111111");
+        assertEquals(held.getPublicIpAddress(), service.describeInstances("us-east-1",
+                List.of(held.getInstanceId()), Map.of()).getFirst().getInstances().getFirst().getPublicIpAddress());
+        assertEquals(elastic.getPublicIp(), service.describeAddresses("us-west-2",
+                List.of(elastic.getAllocationId()), Map.of()).getFirst().getPublicIp());
     }
 
     @Test
@@ -3636,11 +3705,80 @@ class Ec2ServiceTest {
         assertEquals("vpc-default", created.getVpcId(),
                 "a new security group with no explicit VpcId must attach to the real default VPC on file");
 
+        Instance launched = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        assertEquals(List.of("sg-default"), launched.getSecurityGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+
         // A genuinely fresh region has neither format on file, so both resolvers fall back to the
         // scoped form ensureDefaultResources would seed.
         assertEquals(Ec2Service.defaultVpcId("eu-west-1"), service.resolveDefaultVpcId("eu-west-1"));
         assertEquals(Ec2Service.defaultSecurityGroupId("eu-west-1"),
                 service.resolveDefaultSecurityGroupId("eu-west-1"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"us-east-1", "eu-west-1"})
+    void runInstancesUsesTheSelectedVpcDefaultSecurityGroup(String region) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String vpcId = service.createVpc(region, "10.82.0.0/16", false).getVpcId();
+        Subnet subnet = service.createSubnet(region, vpcId, "10.82.1.0/24", region + "a");
+        String expectedGroupId = service.describeSecurityGroups(region, List.of(), List.of(), Map.of()).stream()
+                .filter(group -> vpcId.equals(group.getVpcId()) && "default".equals(group.getGroupName()))
+                .findFirst().orElseThrow().getGroupId();
+
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro",
+                1, 1, null, List.of(), subnet.getSubnetId(), null, List.of(), null, null)
+                .getInstances().getFirst();
+
+        assertEquals(vpcId, instance.getVpcId());
+        assertEquals(List.of(expectedGroupId), instance.getSecurityGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+        assertEquals(List.of(expectedGroupId), instance.getNetworkInterfaces().getFirst().getGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"us-east-1", "eu-west-1"})
+    void runInstancesRejectsAnotherVpcGroupBeforeAllocatingResources(String region) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String selectedVpc = service.createVpc(region, "10.83.0.0/16", false).getVpcId();
+        String otherVpc = service.createVpc(region, "10.84.0.0/16", false).getVpcId();
+        Subnet subnet = service.createSubnet(region, selectedVpc, "10.83.1.0/28", region + "a");
+        String otherGroup = service.createSecurityGroup(region, "foreign-vpc", "foreign-vpc", otherVpc).getGroupId();
+        int available = subnet.getAvailableIpAddressCount();
+
+        AwsException error = assertThrows(AwsException.class, () -> service.runInstances(region, "ami-test", "t3.micro",
+                1, 1, null, List.of(otherGroup), subnet.getSubnetId(), null,
+                List.of(new Tag("RejectedLaunch", "probe")), null, null));
+
+        assertEquals("InvalidGroup.NotFound", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeNetworkInterfaces(region, List.of(), Map.of(), 0, null).networkInterfaces().isEmpty());
+        assertTrue(service.describeVolumes(region, List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeTags(region, Map.of("key", List.of("RejectedLaunch"))).isEmpty());
+        assertEquals(available, service.describeSubnets(region, List.of(subnet.getSubnetId()), Map.of())
+                .getFirst().getAvailableIpAddressCount());
+    }
+
+    @Test
+    void suppliedPrimaryInterfaceKeepsItsOwnVpcSecurityGroups() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.85.0.0/16", false).getVpcId();
+        Subnet subnet = service.createSubnet(region, vpcId, "10.85.1.0/24", region + "a");
+        String groupId = service.createSecurityGroup(region, "interface-group", "interface-group", vpcId).getGroupId();
+        NetworkInterface eni = service.createNetworkInterface(region, subnet.getSubnetId(), "primary",
+                null, List.of(), List.of(groupId), List.of());
+
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(service.resolveDefaultSecurityGroupId(region)), null, null, List.of(),
+                null, null, null, eni.getNetworkInterfaceId(), 0).getInstances().getFirst();
+
+        assertEquals(vpcId, instance.getVpcId());
+        assertEquals(List.of(groupId), instance.getSecurityGroups().stream().map(GroupIdentifier::getGroupId).toList());
+        assertEquals(eni.getNetworkInterfaceId(), instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
     }
 
     @SuppressWarnings("unchecked")

@@ -884,8 +884,10 @@ after termination; release still follows that interface's VPC rules.
 
 AllocateAddress draws Elastic IPs from `203.0.113.0/24`, a range reserved for documentation that
 no host answers on, in every mode, so a client never reaches someone else's host through one. An
-allocation never takes an address the account's other Elastic IPs or instances already hold; once
-all 254 are taken, AllocateAddress fails with `AddressLimitExceeded`. Elastic IPs allocated by an
+allocation never takes an address another Elastic IP or instance holds in any account or region.
+All accounts and regions share the 254-address pool, including records restored after a service
+restart; resource visibility remains scoped to the caller. Once all are taken, AllocateAddress
+fails with `AddressLimitExceeded`. Elastic IPs allocated by an
 earlier Floci version keep their `54.x.x.x` address until released. Associating an Elastic IP with an
 instance that has a container re-points it at the address the instance is actually reachable on
 (the same value DescribeInstances reports), and so does associating one with a mock instance's
@@ -1403,9 +1405,9 @@ container's reachable address: its own IP when Floci's clients can route to it, 
   unless an Elastic IP is associated. The launch still records whether it asked for one, so
   switching the setting takes effect at the instance's next start.
 - `documentation`: an address from `203.0.113.0/24`, a range reserved for documentation that no
-  host answers on, as Lightsail and EMR use. Instances get addresses distinct from each other and
-  from the account's Elastic IPs while any are free (none once all are taken), and a restart gets
-  a different one.
+  host answers on, as Lightsail and EMR use. Instances get addresses distinct from other instances
+  and Elastic IPs across all accounts and regions while any of the shared 254 are free (none once
+  all are taken), and an instance restart gets a different one.
 - `fixed`: `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS` (default `127.0.0.1`, DNS name `localhost`)
   for every instance, so a tool that connects to the public address reaches a host you choose. An
   Elastic IP associated with the primary private address shows that address too.

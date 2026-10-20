@@ -237,6 +237,9 @@ encoding for instance attributes and metadata, including compressed and binary
 payloads. Execution still uses decoded text. Older templates that store only
 execution text retain that text through a UTF-8 fallback.
 
+For direct and mixed launch templates, omitting the version selects `$Default`.
+Explicit `$Default`, `$Latest`, and numeric versions keep their requested selection.
+
 Auto Scaling groups preserve either a launch configuration, a top-level launch template, or a `MixedInstancesPolicy`. These launch sources are mutually exclusive in create/update requests. When a mixed instances policy is supplied, Floci stores and returns:
 
 - `LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateId`

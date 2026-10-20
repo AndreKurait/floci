@@ -3619,23 +3619,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         String finalSubnetId = subnet != null ? subnet.getSubnetId() : null;
 
         // Resolve security groups
-        List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
+        List<GroupIdentifier> sgIdentifiers;
         if (suppliedEni != null) {
             // AWS ignores instance-level SecurityGroupId when a network interface is supplied;
             // the interface's own groups win (module main.tf sets vpc_security_group_ids = null
             // in this case, so there is nothing to conflict with in practice).
-            sgIdentifiers.addAll(suppliedEni.getGroups());
-        } else if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
-            for (String sgId : securityGroupIds) {
-                SecurityGroup sg = getRequiredSecurityGroup(region, sgId);
-                sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
-            }
+            sgIdentifiers = new ArrayList<>(suppliedEni.getGroups());
         } else {
-            // Use default SG
-            SecurityGroup defaultSg = securityGroups.get(key(region, resolveDefaultSecurityGroupId(region))).orElse(null);
-            if (defaultSg != null) {
-                sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
-            }
+            sgIdentifiers = resolveSecurityGroups(region, vpcId, securityGroupIds);
         }
 
         String reservationId = "r-" + randomHex(17);
@@ -4330,18 +4321,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * The next address from 203.0.113.0/24 (TEST-NET-3, reserved for documentation and routed
-     * nowhere) after the last one handed out, skipping any the caller's account already holds as an
-     * instance's public address or an Elastic IP, so a restarted instance gets a different address
-     * as on AWS. Callers hold the allocation lock, so two requests do not pick the same one.
+     * nowhere) after the last one handed out, skipping instance public addresses and Elastic IPs
+     * held in any account or region, including restored records after a service restart.
+     * Callers hold the allocation lock, so two requests do not pick the same one.
      *
      * @return the address, or null once all 254 are taken
      */
     private String documentationPublicAddress() {
         Set<String> taken = new HashSet<>();
-        for (Instance other : instances.scan(k -> true)) {
+        for (Instance other : instances instanceof AccountAwareStorageBackend<Instance> aware
+                ? aware.scanAllAccounts() : instances.scan(k -> true)) {
             taken.add(other.getPublicIpAddress());
         }
-        for (Address other : addresses.scan(k -> true)) {
+        for (Address other : addresses instanceof AccountAwareStorageBackend<Address> aware
+                ? aware.scanAllAccounts() : addresses.scan(k -> true)) {
             taken.add(other.getPublicIp());
             taken.add(other.getAllocatedPublicIp());
         }
@@ -12919,6 +12912,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return new NetworkInterfaceListResult(result, null);
     }
 
+    private List<GroupIdentifier> resolveSecurityGroups(String region, String vpcId, List<String> securityGroupIds) {
+        List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
+        if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
+            for (String sgId : securityGroupIds) {
+                SecurityGroup sg = getRequiredSecurityGroup(region, sgId);
+                if (!vpcId.equals(sg.getVpcId())) {
+                    throw new AwsException("InvalidGroup.NotFound",
+                            "Security group " + sgId + " does not belong to the subnet VPC", 400);
+                }
+                sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
+            }
+        } else {
+            SecurityGroup defaultSg = securityGroups.scan(k -> k.startsWith(region + "::")).stream()
+                    .filter(group -> vpcId.equals(group.getVpcId())
+                            && "default".equals(group.getGroupName()))
+                    .findFirst().orElse(null);
+            if (defaultSg != null) {
+                sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
+            }
+        }
+        return sgIdentifiers;
+    }
+
     /**
      * Creates a standalone (not-yet-attached) elastic network interface, floci-kt9. Covers the
      * {@code aws_network_interface} resource: an ENI created independently of an instance and
@@ -12934,26 +12950,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         ensureDefaultResources(region);
         Subnet subnet = requireSubnet(region, subnetId);
-
-        List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
-        if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
-            for (String sgId : securityGroupIds) {
-                SecurityGroup sg = getRequiredSecurityGroup(region, sgId);
-                if (!subnet.getVpcId().equals(sg.getVpcId())) {
-                    throw new AwsException("InvalidGroup.NotFound",
-                            "Security group " + sgId + " does not belong to the subnet VPC", 400);
-                }
-                sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
-            }
-        } else {
-            SecurityGroup defaultSg = securityGroups.scan(k -> k.startsWith(region + "::")).stream()
-                    .filter(group -> subnet.getVpcId().equals(group.getVpcId())
-                            && "default".equals(group.getGroupName()))
-                    .findFirst().orElse(null);
-            if (defaultSg != null) {
-                sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
-            }
-        }
+        List<GroupIdentifier> sgIdentifiers = resolveSecurityGroups(region, subnet.getVpcId(), securityGroupIds);
 
         synchronized (privateIpAllocationLock) {
             String eniId = "eni-" + randomHex(17);
