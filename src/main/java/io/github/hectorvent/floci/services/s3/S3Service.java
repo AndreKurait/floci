@@ -497,6 +497,12 @@ public class S3Service implements Resettable, ResourceProvider {
             throw new AwsException("InvalidBucketAclWithBlockPublicAccessError",
                     "Bucket cannot have public ACLs set with BlockPublicAccess enabled", 400);
         }
+        // Share deletion's name lock so checking availability and publishing an owner are atomic.
+        return withLock(multipartBucketLock(bucketName).writeLock(),
+                () -> createBucketLocked(bucketName, region, ownership, requestedAcl));
+    }
+
+    private Bucket createBucketLocked(String bucketName, String region, String ownership, String requestedAcl) {
         var existing = bucketStore.get(bucketName);
         if (existing.isPresent()) {
             Bucket bucket = existing.get();
@@ -506,6 +512,11 @@ public class S3Service implements Resettable, ResourceProvider {
             }
             throw new AwsException("BucketAlreadyOwnedByYou",
                     "Your previous request to create the named bucket succeeded and you already own it.", 409);
+        }
+        if (globalBucketNamespace && resolveBucketEntry(bucketName).isPresent()) {
+            throw new AwsException("BucketAlreadyExists",
+                    "The requested bucket name is not available. The bucket namespace is shared by all users of the system.",
+                    409);
         }
 
         Bucket bucket = new Bucket(bucketName);
