@@ -1388,6 +1388,7 @@ public class Ec2ContainerManager {
                         containerGone = true;
                     } catch (Exception e) {
                         LOG.warnv("Error removing EC2 container {0}: {1}", containerId, e.getMessage());
+                        return;
                     }
                     try {
                         // iptables/veth teardown lags behind container removal; prevents port-reuse conflicts.

@@ -39,6 +39,23 @@ import static org.mockito.Mockito.when;
 class Ec2QueryHandlerTest {
 
     @ParameterizedTest
+    @ValueSource(strings = {"LaunchTemplateVersion", "Versions"})
+    void describeLaunchTemplateVersionsReadsIndexedSelectors(String prefix) {
+        Ec2Service service = mock(Ec2Service.class);
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("LaunchTemplateId", "lt-test");
+        params.putSingle(prefix + ".1", "$Default");
+        params.putSingle(prefix + ".2", "1");
+        params.putSingle(prefix + ".3", "$Latest");
+
+        Response response = handler(service).handle("DescribeLaunchTemplateVersions", params, "eu-west-1");
+
+        assertEquals(200, response.getStatus());
+        verify(service).describeLaunchTemplateVersions(
+                "eu-west-1", "lt-test", null, List.of("$Default", "1", "$Latest"));
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"0", "-1", "invalid"})
     void explicitlyInvalidVolumeIopsIsRefusedBeforeServiceMutation(String iops) {
         Ec2Service service = mock(Ec2Service.class);

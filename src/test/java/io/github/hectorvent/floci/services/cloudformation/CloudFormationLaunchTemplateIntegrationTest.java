@@ -14,6 +14,7 @@ import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
@@ -365,11 +366,58 @@ class CloudFormationLaunchTemplateIntegrationTest {
 
             applyNetworkTemplate(stackName, networkTemplate(templateName, true, false, false), true);
             assertNetworkTemplate(templateName, "2", Boolean.TRUE);
+            given()
+                .header("Authorization", EC2_AUTH)
+                .formParam("Action", "DescribeLaunchTemplates")
+                .formParam("LaunchTemplateName.1", templateName)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeLaunchTemplatesResponse.launchTemplates.item.defaultVersionNumber", equalTo("1"))
+                .body("DescribeLaunchTemplatesResponse.launchTemplates.item.latestVersionNumber", equalTo("2"));
+            assertNetworkTemplate(templateName, "$Default", "1", Boolean.FALSE);
+            assertNetworkTemplate(templateName, "1", "1", Boolean.FALSE);
+            assertNetworkTemplate(templateName, "2", "2", Boolean.TRUE);
+            given()
+                .header("Authorization", EC2_AUTH)
+                .formParam("Action", "DescribeLaunchTemplateVersions")
+                .formParam("LaunchTemplateName", templateName)
+                .formParam("LaunchTemplateVersion.1", "1")
+                .formParam("LaunchTemplateVersion.2", "$Latest")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeLaunchTemplateVersionsResponse.launchTemplateVersionSet.item.versionNumber",
+                        contains("1", "2"));
+            given()
+                .header("Authorization", EC2_AUTH)
+                .formParam("Action", "DescribeLaunchTemplateVersions")
+                .formParam("LaunchTemplateName", templateName)
+                .formParam("LaunchTemplateVersion.1", "invalid")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body(containsString("<Code>InvalidLaunchTemplateVersion.Malformed</Code>"));
+            given()
+                .header("Authorization", EC2_AUTH)
+                .formParam("Action", "DescribeLaunchTemplateVersions")
+                .formParam("LaunchTemplateName", templateName)
+                .formParam("LaunchTemplateVersion.1", "1")
+                .formParam("LaunchTemplateVersion.2", "999")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body(containsString("<Code>InvalidLaunchTemplateVersion.NotFound</Code>"));
             assertTemplateLaunchPublicIp(templateName, true);
 
             applyNetworkTemplate(stackName, networkTemplate(templateName, false, false, true), true);
             assertEquals("UPDATE_ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stackName).status());
             assertNetworkTemplate(templateName, "2", Boolean.TRUE);
+            assertNetworkTemplate(templateName, "$Default", "1", Boolean.FALSE);
 
             applyNetworkTemplate(stackName, networkTemplate(templateName, null, true, false), true);
             assertNetworkTemplate(templateName, "3", null);
@@ -447,12 +495,16 @@ class CloudFormationLaunchTemplateIntegrationTest {
     }
 
     private void assertNetworkTemplate(String templateName, String version, Boolean associatePublicIp) {
+        assertNetworkTemplate(templateName, "$Latest", version, associatePublicIp);
+    }
+
+    private void assertNetworkTemplate(String templateName, String selector, String version, Boolean associatePublicIp) {
         String response = given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", EC2_AUTH)
             .formParam("Action", "DescribeLaunchTemplateVersions")
             .formParam("LaunchTemplateName", templateName)
-            .formParam("Versions.1", "$Latest")
+            .formParam("LaunchTemplateVersion.1", selector)
         .when()
             .post("/")
         .then()
@@ -461,7 +513,7 @@ class CloudFormationLaunchTemplateIntegrationTest {
             .body(containsString("<deviceIndex>0</deviceIndex>"))
             .body(containsString("<subnetId>subnet-"))
             .extract().asString();
-        LaunchTemplateData data = ec2Service.resolveLaunchTemplateData("us-east-1", null, templateName, "$Latest");
+        LaunchTemplateData data = ec2Service.resolveLaunchTemplateData("us-east-1", null, templateName, selector);
         assertEquals(associatePublicIp, data.effectiveAssociatePublicIpAddress());
         if (associatePublicIp == null) {
             assertNull(data.primaryNetworkInterface().getAssociatePublicIpAddress());
