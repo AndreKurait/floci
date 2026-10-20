@@ -347,6 +347,10 @@ JSON requests also accept the legacy `CloudWatchVersion20130116.` target prefix 
 same metrics handler. The public AWS target remains `GraniteServiceVersion20100801.`; the
 legacy prefix does not register a Smithy RPC v2 service.
 
+AWS JSON requests with `Content-Encoding: gzip` use the shared decoder's 10 MiB decompressed
+body limit. AWS documents gzip payloads for
+[`PutMetricData`](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_PutMetricData.html).
+
 CloudWatch Query operations accept form-encoded POST requests and root GET requests with
 URL query parameters. GET uses the existing handlers, signature validation and IAM policy checks. A `monitoring`
 credential in the Authorization header or presigned URL selects CloudWatch, including
