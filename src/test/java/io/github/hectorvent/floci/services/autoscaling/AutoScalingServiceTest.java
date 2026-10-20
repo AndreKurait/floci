@@ -51,6 +51,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -939,6 +940,49 @@ class AutoScalingServiceTest {
         service.deleteAutoScalingGroup(REGION, "test-asg", true);
 
         verify(ec2Service).terminateInstances(REGION, List.of("i-stale"));
+        assertTrue(service.describeAutoScalingGroups(REGION, List.of("test-asg")).isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"OperationNotPermitted", "InternalError"})
+    void forceDeleteAutoScalingGroupPreservesOwnershipOnTerminationFailure(String errorCode) {
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        service.ec2Service = ec2Service;
+        AutoScalingGroupFixture.addInstance(service, REGION, "test-asg", "i-active", "InService", "lt-original", "1");
+        AutoScalingGroup group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
+        service.putLifecycleHook(REGION, "test-asg", "hook", "autoscaling:EC2_INSTANCE_LAUNCHING",
+                null, null, null, 300, "CONTINUE");
+        AwsException failure = new AwsException(errorCode, "Termination refused", 400);
+        when(ec2Service.terminateInstances(REGION, List.of("i-active"))).thenThrow(failure);
+
+        assertSame(failure, assertThrows(AwsException.class,
+                () -> service.deleteAutoScalingGroup(REGION, "test-asg", true)));
+
+        assertSame(group, service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst());
+        assertEquals(List.of("i-active"), group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals(1, service.describeLifecycleHooks(REGION, "test-asg", null).size());
+    }
+
+    @Test
+    void forceDeleteAutoScalingGroupCanRetryAfterPartialTermination() {
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        service.ec2Service = ec2Service;
+        AutoScalingGroupFixture.addInstance(service, REGION, "test-asg", "i-first", "InService", "lt-original", "1");
+        AutoScalingGroupFixture.addInstance(service, REGION, "test-asg", "i-second", "InService", "lt-original", "1");
+        when(ec2Service.terminateInstances(REGION, List.of("i-first"))).thenReturn(List.of())
+                .thenThrow(new AwsException("InvalidInstanceID.NotFound", "Already removed", 400));
+        AwsException failure = new AwsException("InternalError", "Termination failed", 500);
+        when(ec2Service.terminateInstances(REGION, List.of("i-second"))).thenThrow(failure).thenReturn(List.of());
+
+        assertSame(failure, assertThrows(AwsException.class,
+                () -> service.deleteAutoScalingGroup(REGION, "test-asg", true)));
+        assertEquals(List.of("i-first", "i-second"), service.describeAutoScalingGroups(
+                REGION, List.of("test-asg")).getFirst().getInstances().stream().map(AsgInstance::getInstanceId).toList());
+
+        service.deleteAutoScalingGroup(REGION, "test-asg", true);
+
+        verify(ec2Service, times(2)).terminateInstances(REGION, List.of("i-first"));
+        verify(ec2Service, times(2)).terminateInstances(REGION, List.of("i-second"));
         assertTrue(service.describeAutoScalingGroups(REGION, List.of("test-asg")).isEmpty());
     }
 

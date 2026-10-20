@@ -539,7 +539,10 @@ public class AutoScalingService {
                             try {
                                 ec2Service.terminateInstances(region, List.of(instanceId));
                             }
-                            catch (AwsException ignored) {
+                            catch (AwsException e) {
+                                if (!"InvalidInstanceID.NotFound".equals(e.getErrorCode())) {
+                                    throw e;
+                                }
                                 // ForceDelete should remove stale ASG membership even if EC2 no longer has the instance.
                             }
                         });

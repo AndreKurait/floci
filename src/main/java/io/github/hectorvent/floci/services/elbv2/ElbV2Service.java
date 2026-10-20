@@ -933,7 +933,8 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         List<TargetDescription> existing = tg.getTargets();
         for (TargetDescription t : targets) {
             // replace if same id+port already registered
-            existing.removeIf(e -> e.getId().equals(t.getId()) && Objects.equals(e.getPort(), t.getPort()));
+            existing.removeIf(e -> e.getId().equals(t.getId())
+                    && ElbV2HealthChecker.effectivePort(e, tg) == ElbV2HealthChecker.effectivePort(t, tg));
             existing.add(t);
         }
         persistRegion(targetGroups, region);
@@ -955,7 +956,8 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     public void deregisterTargets(String region, String tgArn, List<TargetDescription> targets) {
         TargetGroup tg = requireTargetGroup(region, tgArn);
         for (TargetDescription t : targets) {
-            tg.getTargets().removeIf(e -> e.getId().equals(t.getId()) && Objects.equals(e.getPort(), t.getPort()));
+            tg.getTargets().removeIf(e -> e.getId().equals(t.getId())
+                    && ElbV2HealthChecker.effectivePort(e, tg) == ElbV2HealthChecker.effectivePort(t, tg));
         }
         persistRegion(targetGroups, region);
         healthChecker.removeTargets(tgArn, targets, tg);
