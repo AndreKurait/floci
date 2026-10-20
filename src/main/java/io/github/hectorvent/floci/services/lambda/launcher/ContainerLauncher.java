@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
+import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
 import io.github.hectorvent.floci.services.lambda.LambdaLogDestinations;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
@@ -40,6 +41,7 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
@@ -48,6 +50,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -117,6 +120,23 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LambdaLayerService layerService;
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
+    private final LambdaFunctionStore functionStore;
+
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             EcrRegistryManager ecrRegistryManager,
+                             LambdaLayerService layerService,
+                             LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials executionRoleCredentials) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, null);
+    }
 
     @Inject
     public ContainerLauncher(ContainerBuilder containerBuilder,
@@ -129,7 +149,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              EcrRegistryManager ecrRegistryManager,
                              LambdaLayerService layerService,
                              LaunchedContainerAwsEnv awsEnv,
-                             LambdaExecutionRoleCredentials executionRoleCredentials) {
+                             LambdaExecutionRoleCredentials executionRoleCredentials,
+                             LambdaFunctionStore functionStore) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -141,6 +162,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.layerService = layerService;
         this.awsEnv = awsEnv;
         this.executionRoleCredentials = executionRoleCredentials;
+        this.functionStore = functionStore;
         this.populateSemaphore = new java.util.concurrent.Semaphore(resolvePopulateConcurrency(config));
     }
 
@@ -950,17 +972,50 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         volumesInFlight.computeIfPresent(volName, (k, count) -> count.decrementAndGet() > 0 ? count : null);
     }
 
-    /**
-     * Whether a code volume carries this process's {@code floci_namespace} label (none when no
-     * namespace is set). The superseded sweep works from this process's own map of names, so it
-     * checks the label before deleting rather than trusting that a name it tracked is still its
-     * own. A volume whose labels cannot be read is left to {@code removeVolume}'s own checks.
-     */
-    private boolean inThisResourceNamespace(String volName) {
-        return lifecycleManager.tryVolumeLabels(volName)
-                .map(labels -> Objects.equals(labels.get(NAMESPACE_LABEL),
-                        ContainerStorageHelper.defaultLabels(config).get(NAMESPACE_LABEL)))
-                .orElse(true);
+    @Override
+    public void retireFunctionCode(List<LambdaFunction> deletedFunctions) {
+        if (functionStore == null) {
+            return;
+        }
+        for (LambdaFunction fn : deletedFunctions) {
+            String volName = codeVolumeName(config, fn);
+            Object lock = codeVolumeLocks.computeIfAbsent(volName, ignored -> new Object());
+            synchronized (lock) {
+                try {
+                    if (!populatedCodeVolumes.contains(volName)
+                            && !Files.isRegularFile(codeVolumeMarkerPath(volName), LinkOption.NOFOLLOW_LINKS)
+                            && lifecycleManager.tryVolumeLabels(volName).isEmpty()
+                            && codeVolumeKnownAbsent(volName)) {
+                        continue;
+                    }
+                } catch (RuntimeException e) {
+                    // Retain the captured candidate; a later sweep must verify ownership before removal.
+                    LOG.warnv("Could not inspect deleted function's code volume {0}: {1}", volName, e.getMessage());
+                }
+                Object functionLock = functionVolumeTransitionLocks.computeIfAbsent(
+                        fn.getFunctionName(), ignored -> new Object());
+                synchronized (functionLock) {
+                    functionCurrentVolume.remove(fn.getFunctionName(), volName);
+                    volumesPendingCleanup.put(volName, System.currentTimeMillis() - VOLUME_CLEANUP_GRACE_MS);
+                }
+            }
+        }
+        cleanupSupersededVolumes();
+    }
+
+    private boolean codeVolumeStillReferenced(String volName) {
+        try {
+            return functionStore.listAll().stream()
+                    .anyMatch(fn -> volName.equals(codeVolumeName(config, fn)));
+        } catch (RuntimeException e) {
+            LOG.warnv("Could not verify live references for code volume {0}: {1}", volName, e.getMessage());
+            return true;
+        }
+    }
+
+    private boolean codeVolumeKnownAbsent(String volName) {
+        // An empty label result also covers failed reads; only a successful inventory proves absence.
+        return lifecycleManager.tryListVolumeNames().map(names -> !names.contains(volName)).orElse(false);
     }
 
     /**
@@ -971,6 +1026,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * `docker volume prune --filter label=floci` same as before this existed).
      */
     void cleanupSupersededVolumes() {
+        // Legacy callers without the authoritative store cannot rule out an uninvoked live function.
+        if (functionStore == null) {
+            return;
+        }
         long cutoff = System.currentTimeMillis() - VOLUME_CLEANUP_GRACE_MS;
         for (String volName : new java.util.ArrayList<>(volumesPendingCleanup.keySet())) {
             Long queuedAt = volumesPendingCleanup.get(volName);
@@ -988,6 +1047,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 if (stillQueuedAt == null || stillQueuedAt > cutoff) {
                     continue;
                 }
+                if (codeVolumeStillReferenced(volName)) {
+                    continue;
+                }
                 java.util.concurrent.atomic.AtomicInteger inFlight = volumesInFlight.get(volName);
                 if (inFlight != null && inFlight.get() > 0) {
                     // A launch has resolved this volume but hasn't handed it to Docker yet, so no
@@ -998,23 +1060,33 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     volumesPendingCleanup.put(volName, System.currentTimeMillis());
                     continue;
                 }
-                volumesPendingCleanup.remove(volName, stillQueuedAt);
-                if (!inThisResourceNamespace(volName)) {
-                    LOG.debugv("Left superseded code volume {0} alone: it belongs to another resource namespace",
-                            volName);
-                    continue;
-                }
-                if (lifecycleManager.removeVolume(volName)) {
-                    populatedCodeVolumes.remove(volName);
-                    LOG.debugv("Removed superseded code volume {0}", volName);
-                } else {
-                    // Not confirmed gone: still in use (e.g. a slow-draining in-flight container
-                    // outlived the grace period), or the removal attempt itself failed for some
-                    // other reason (e.g. a transient daemon error). Either way, without this the
-                    // entry would be lost with no later sweep ever retrying it. Leave
-                    // populatedCodeVolumes alone too, since for all we know it's still there and
-                    // still valid.
-                    volumesPendingCleanup.put(volName, System.currentTimeMillis());
+                try {
+                    Optional<Map<String, String>> labels = lifecycleManager.tryVolumeLabels(volName);
+                    if (labels.isEmpty()) {
+                        if (codeVolumeKnownAbsent(volName)) {
+                            volumesPendingCleanup.remove(volName, stillQueuedAt);
+                            populatedCodeVolumes.remove(volName);
+                        }
+                        continue;
+                    }
+                    if (!Objects.equals(labels.get().get(NAMESPACE_LABEL),
+                            ContainerStorageHelper.defaultLabels(config).get(NAMESPACE_LABEL))) {
+                        volumesPendingCleanup.remove(volName, stillQueuedAt);
+                        LOG.debugv("Left superseded code volume {0} alone: it belongs to another resource namespace",
+                                volName);
+                        continue;
+                    }
+                    if (lifecycleManager.removeVolume(volName)) {
+                        volumesPendingCleanup.remove(volName, stillQueuedAt);
+                        populatedCodeVolumes.remove(volName);
+                        LOG.debugv("Removed superseded code volume {0}", volName);
+                    } else {
+                        // Still in use or unconfirmed: retain the populated cache and retry later.
+                        volumesPendingCleanup.put(volName, System.currentTimeMillis());
+                    }
+                } catch (RuntimeException e) {
+                    // One transport failure must neither forget this candidate nor cancel periodic cleanup.
+                    LOG.warnv("Deferred code volume cleanup for {0}: {1}", volName, e.getMessage());
                 }
             }
         }

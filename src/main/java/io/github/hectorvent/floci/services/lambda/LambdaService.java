@@ -1092,6 +1092,7 @@ public class LambdaService implements ResourceProvider {
             warmPool.deleteProvisionedQualifier(fn, qualifier);
             warmPool.drainEnvironment(version.get());
             functionStore.deleteVersion(region, name, qualifier);
+            warmPool.retireFunctionCode(List.of(version.get()));
             reclaimVersionCodeDirectory(region, fn, qualifier, version.get());
             // The snapshot may still share $LATEST's code directory, so this only reclaims once no
             // remaining version references it.
@@ -1118,12 +1119,14 @@ public class LambdaService implements ResourceProvider {
         // object, letting a follow-up request allocate a fresh lock and run
         // in parallel — the very serialization this map exists to prevent.
         synchronized (lockForConcurrencyOp(arn)) {
+            List<LambdaFunction> deletedVersions = functionStore.listVersions(region, functionName);
             warmPool.deleteProvisionedFunction(fn);
             if (concurrencyLimiter != null) {
                 concurrencyLimiter.reset(arn);
             }
             codeStore.delete(ownerAccount(fn), region, functionName);
             functionStore.delete(region, functionName);
+            warmPool.retireFunctionCode(deletedVersions);
             // Again now the function is gone, for an Event invoke that read the count after the first call.
             if (executorService != null) {
                 executorService.dropPending(fn);
@@ -2996,8 +2999,10 @@ public class LambdaService implements ResourceProvider {
                     "Version must be a published version number, got: " + version, 400);
         }
         LambdaFunction fn = getFunction(region, functionName); // throws 404 if not found
+        Optional<LambdaFunction> deletedVersion = functionStore.get(region, fn.getFunctionName(), version);
         warmPool.deleteProvisionedQualifier(fn, version);
         functionStore.deleteVersion(region, fn.getFunctionName(), version);
+        deletedVersion.ifPresent(snapshot -> warmPool.retireFunctionCode(List.of(snapshot)));
         LOG.infov("Deleted version {0} of function {1}", version, fn.getFunctionName());
     }
 

@@ -567,14 +567,18 @@ public class ContainerLifecycleManager {
         } catch (NotFoundException e) {
             // Already gone, so cleanup succeeded.
         } catch (Exception e) {
-            IllegalStateException cleanupFailure = new IllegalStateException(
-                    "Failed to remove container " + containerId, e);
-            if (stopFailure != null) {
-                cleanupFailure.addSuppressed(stopFailure);
+            // Daemon AutoRemove may finish despite an explicit remove error. Only an
+            // authoritative absence permits the caller to retire runtime credentials.
+            if (presenceOf(containerId) != ContainerPresence.ABSENT) {
+                IllegalStateException cleanupFailure = new IllegalStateException(
+                        "Failed to remove container " + containerId, e);
+                if (stopFailure != null) {
+                    cleanupFailure.addSuppressed(stopFailure);
+                }
+                // Retain the stream and original failure for the caller's retry.
+                throw cleanupFailure;
             }
-            // The container still exists and may still be logging, so the stream stays open for
-            // the caller's retry.
-            throw cleanupFailure;
+            LOG.debugv("Container {0} is absent after its removal response failed", containerId);
         }
         // Closed only once the container is stopped and gone, as in stopAndRemove, so the follower
         // can drain the final tail.

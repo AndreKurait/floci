@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda.launcher;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.AttachContainerCmd;
@@ -9,7 +10,11 @@ import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.RemoveContainerCmd;
+import com.github.dockerjava.api.command.StopContainerCmd;
 import com.github.dockerjava.api.command.WaitContainerCmd;
+import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.AccessMode;
 import com.github.dockerjava.api.model.Frame;
@@ -20,26 +25,41 @@ import com.github.dockerjava.api.model.WaitContainerCondition;
 import com.github.dockerjava.api.model.WaitResponse;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
+import io.github.hectorvent.floci.services.lambda.LambdaConcurrencyLimiter;
+import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
+import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.lambda.LambdaTargetResolver;
+import io.github.hectorvent.floci.services.lambda.WarmPool;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFileSystemConfig;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.LambdaLayerVersion;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
+import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
+import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
 import io.smallrye.config.EnvConfigSource;
 import io.smallrye.config.SmallRyeConfig;
 import io.smallrye.config.SmallRyeConfigBuilder;
+import jakarta.enterprise.inject.Instance;
+import jakarta.inject.Inject;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
@@ -48,6 +68,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
@@ -58,19 +79,24 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -108,6 +134,7 @@ class ContainerLauncherTest {
     final java.util.List<String> capturedRemotePaths = new java.util.ArrayList<>();
     String capturedRuntimeBootstrap;
     Closeable exitTransport;
+    RequestContext codeVolumeCaller;
 
     @BeforeEach
     void setUp() {
@@ -158,7 +185,8 @@ class ContainerLauncherTest {
         launcher = new ContainerLauncher(containerBuilder, lifecycleManager, logStreamer, imageResolver,
                 runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
                 layerService, awsEnv,
-                executionRoleCredentials);
+                executionRoleCredentials, codeVolumeFunctionStore());
+        lenient().when(lifecycleManager.tryVolumeLabels(anyString())).thenReturn(Optional.of(Map.of()));
 
         when(runtimeApiServerFactory.create()).thenReturn(runtimeApiServer);
         when(runtimeApiServer.getPort()).thenReturn(9000);
@@ -1362,6 +1390,40 @@ class ContainerLauncherTest {
         verify(executionRoleCredentials).unregister("222233334444", "ASIASTOPSESSION");
     }
 
+    @Test
+    void stopUnregistersExecutionRoleSessionWhenDaemonAlreadyRemovedTheRuntime() throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("role-session-daemon-removal"));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("role-session-daemon-removal-fn");
+        fn.setAccountId("222233334444");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        when(executionRoleCredentials.forFunction(fn)).thenReturn(Optional.of(
+                new SessionCreds("ASIADAEMONREMOVAL", "role-secret", "role-token")));
+        ContainerHandle handle = launcher.launch(fn);
+        ContainerLifecycleManager actualLifecycle = new ContainerLifecycleManager(
+                dockerClient, mock(ImageCacheService.class), mock(ContainerDetector.class), config);
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(dockerClient.stopContainerCmd(handle.getContainerId())).thenReturn(stop);
+        when(dockerClient.removeContainerCmd(handle.getContainerId())).thenReturn(remove);
+        doThrow(new ConflictException("removal already in progress")).when(remove).exec();
+        lenient().when(dockerClient.inspectContainerCmd(handle.getContainerId())).thenReturn(inspect);
+        lenient().when(inspect.exec()).thenThrow(new NotFoundException("daemon removed runtime"));
+        doAnswer(call -> {
+            actualLifecycle.stopAndRemoveStrict(call.getArgument(0), call.getArgument(1), call.getArgument(2));
+            return null;
+        }).when(lifecycleManager).stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(), 1);
+
+        assertDoesNotThrow(() -> launcher.stop(handle));
+
+        verify(runtimeApiServer).close();
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+        verify(executionRoleCredentials).unregister("222233334444", "ASIADAEMONREMOVAL");
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void stopRetainsRuntimeAndCredentialsUntilRemovalSucceeds(boolean extensions) throws Exception {
@@ -1677,6 +1739,388 @@ class ContainerLauncherTest {
         // Populated twice, once per launch, because the bookkeeping alone is never trusted.
         assertEquals(2, capturedRemotePaths.stream().filter("/var/task"::equals).count(),
                 "each launch should repopulate since Docker never confirms the volume exists");
+    }
+
+    @Test
+    void ordinaryFunctionDeletionRetiresItsUnusedCurrentCodeVolume() throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
+        LambdaFunction fn = codeVolumeFunction("deleted-code-cache", "$LATEST", "deleted-cache-sha");
+        store.save("us-east-1", fn);
+        lenient().when(lifecycleManager.tryVolumeLabels(anyString())).thenReturn(Optional.of(Map.of()));
+        lenient().when(lifecycleManager.removeVolume(anyString())).thenReturn(true);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(fn);
+            normalDeleteService(store).deleteFunction("us-east-1", fn.getFunctionName());
+            verify(lifecycleManager).removeVolume(ContainerLauncher.codeVolumeName(config, fn));
+            assertTrue(store.get("us-east-1", fn.getFunctionName()).isEmpty());
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @Test
+    void ordinaryVersionDeletionRetiresOnlyItsUnusedCodeVolume() throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
+        LambdaFunction latest = codeVolumeFunction("deleted-version-cache", "$LATEST", "latest-cache-sha");
+        LambdaFunction version = codeVolumeFunction("deleted-version-cache", "1", "version-cache-sha");
+        store.save("us-east-1", latest);
+        store.save("us-east-1", version);
+        lenient().when(lifecycleManager.tryVolumeLabels(anyString())).thenReturn(Optional.of(Map.of()));
+        lenient().when(lifecycleManager.removeVolume(anyString())).thenReturn(true);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(version);
+            normalDeleteService(store).deleteFunction("us-east-1", version.getFunctionName(), "1");
+            verify(lifecycleManager).removeVolume(ContainerLauncher.codeVolumeName(config, version));
+            verify(lifecycleManager, never()).removeVolume(ContainerLauncher.codeVolumeName(config, latest));
+            assertTrue(store.get("us-east-1", latest.getFunctionName()).isPresent());
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"111111111111,us-east-1", "000000000000,eu-west-1"})
+    void deletionPreservesUninvokedSharedCodeInAnotherAccountOrRegion(String account, String region) throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
+        LambdaFunction deleted = codeVolumeFunction("shared-code-cache", "$LATEST", "shared-cache-sha");
+        LambdaFunction remaining = codeVolumeFunction("shared-code-cache", "$LATEST", "shared-cache-sha");
+        remaining.setAccountId(account);
+        remaining.setFunctionArn("arn:aws:lambda:" + region + ":" + account + ":function:shared-code-cache");
+        store.save("us-east-1", deleted);
+        store.saveForAccount(account, region, remaining);
+        String volume = ContainerLauncher.codeVolumeName(config, deleted);
+        assertEquals(volume, ContainerLauncher.codeVolumeName(config, remaining));
+        when(lifecycleManager.volumeExists(volume)).thenReturn(true);
+        when(lifecycleManager.removeVolume(volume)).thenReturn(true);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(deleted);
+            normalDeleteService(store).deleteFunction("us-east-1", deleted.getFunctionName());
+            verify(lifecycleManager, never()).removeVolume(volume);
+            assertTrue(store.getForAccount(account, region, remaining.getFunctionName()).isPresent());
+
+            codeVolumeCaller.setAccountId(account);
+            launcher.launch(remaining);
+            assertEquals(1, capturedRemotePaths.stream().filter("/var/task"::equals).count(),
+                    "the uninvoked function's shared code remains populated");
+            normalDeleteService(store).deleteFunction(region, remaining.getFunctionName());
+            verify(lifecycleManager).removeVolume(volume);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @Test
+    void versionDeletionPreservesSharedCodeUntilTheRemainingLatestFunctionIsDeleted() throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
+        LambdaFunction latest = codeVolumeFunction("shared-version-cache", "$LATEST", "shared-version-sha");
+        LambdaFunction version = codeVolumeFunction("shared-version-cache", "1", "shared-version-sha");
+        store.save("us-east-1", latest);
+        store.save("us-east-1", version);
+        String volume = ContainerLauncher.codeVolumeName(config, version);
+        when(lifecycleManager.removeVolume(volume)).thenReturn(true);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(version);
+            normalDeleteService(store).deleteFunction("us-east-1", version.getFunctionName(), "1");
+            verify(lifecycleManager, never()).removeVolume(volume);
+            assertTrue(store.get("us-east-1", latest.getFunctionName()).isPresent());
+            normalDeleteService(store).deleteFunction("us-east-1", latest.getFunctionName());
+            verify(lifecycleManager).removeVolume(volume);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failedVolumeRetirementKeepsPopulatedCodeForARecreatedFunctionAndRetriesDeletion(
+            boolean transportFailure) throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
+        LambdaFunction fn = codeVolumeFunction("retry-deleted-cache", "$LATEST", "retry-deleted-sha");
+        store.save("us-east-1", fn);
+        String volume = ContainerLauncher.codeVolumeName(config, fn);
+        when(lifecycleManager.volumeExists(volume)).thenReturn(true);
+        if (transportFailure) {
+            when(lifecycleManager.removeVolume(volume))
+                    .thenThrow(new RuntimeException(new IOException("volume transport unavailable")))
+                    .thenReturn(true);
+        } else {
+            when(lifecycleManager.removeVolume(volume)).thenReturn(false, true);
+        }
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(fn);
+            assertDoesNotThrow(() -> normalDeleteService(store).deleteFunction("us-east-1", fn.getFunctionName()));
+            verify(lifecycleManager).removeVolume(volume);
+
+            store.save("us-east-1", fn);
+            launcher.launch(fn);
+            assertEquals(1, capturedRemotePaths.stream().filter("/var/task"::equals).count(),
+                    "a refused removal must retain the populated cache");
+            normalDeleteService(store).deleteFunction("us-east-1", fn.getFunctionName());
+            verify(lifecycleManager, times(2)).removeVolume(volume);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @Test
+    void volumeRetirementWaitsForReadableNamespaceOwnershipAndRetriesLater() throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
+        LambdaFunction fn = codeVolumeFunction("unreadable-deleted-cache", "$LATEST", "unreadable-cache-sha");
+        store.save("us-east-1", fn);
+        String volume = ContainerLauncher.codeVolumeName(config, fn);
+        when(lifecycleManager.tryVolumeLabels(volume)).thenReturn(Optional.empty(), Optional.of(Map.of()));
+        when(lifecycleManager.removeVolume(volume)).thenReturn(true);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(fn);
+            normalDeleteService(store).deleteFunction("us-east-1", fn.getFunctionName());
+            verify(lifecycleManager, never()).removeVolume(volume);
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager).removeVolume(volume);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @Test
+    void transientLabelFailureDoesNotAbortLogicalDeletionOrOtherQueuedCleanup() throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
+        LambdaFunction first = codeVolumeFunction("failed-label-cache", "$LATEST", "failed-label-sha");
+        LambdaFunction second = codeVolumeFunction("healthy-label-cache", "$LATEST", "healthy-label-sha");
+        store.save("us-east-1", first);
+        store.save("us-east-1", second);
+        String firstVolume = ContainerLauncher.codeVolumeName(config, first);
+        String secondVolume = ContainerLauncher.codeVolumeName(config, second);
+        when(lifecycleManager.tryVolumeLabels(firstVolume))
+                .thenThrow(new RuntimeException(new IOException("label transport unavailable")));
+        when(lifecycleManager.removeVolume(anyString())).thenReturn(true);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(first);
+            launcher.launch(second);
+            LambdaService service = normalDeleteService(store);
+            assertDoesNotThrow(() -> service.deleteFunction("us-east-1", first.getFunctionName()));
+            assertTrue(store.get("us-east-1", first.getFunctionName()).isEmpty());
+            verify(lifecycleManager, never()).removeVolume(firstVolume);
+
+            assertDoesNotThrow(() -> service.deleteFunction("us-east-1", second.getFunctionName()));
+            verify(lifecycleManager).removeVolume(secondVolume);
+            doReturn(Optional.of(Map.of())).when(lifecycleManager).tryVolumeLabels(firstVolume);
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager).removeVolume(firstVolume);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"transport", "unknown", "existing"})
+    void failedInitialVolumeDiscoveryRetainsTheCapturedDeletionCandidateForRetry(String outcome) throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
+        LambdaFunction fn = codeVolumeFunction("failed-discovery-cache", "$LATEST", "failed-discovery-sha");
+        store.save("us-east-1", fn);
+        String volume = ContainerLauncher.codeVolumeName(config, fn);
+        when(lifecycleManager.removeVolume(volume)).thenReturn(true);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(fn);
+            useInjectedLauncher(store);
+            Files.delete(tempDir.resolve("lambda-codevol-markers").resolve(volume));
+            if ("transport".equals(outcome)) {
+                when(lifecycleManager.tryVolumeLabels(volume))
+                        .thenThrow(new RuntimeException(new IOException("initial volume inspection unavailable")));
+            } else {
+                when(lifecycleManager.tryVolumeLabels(volume)).thenReturn(Optional.empty());
+                when(lifecycleManager.tryListVolumeNames())
+                        .thenReturn("existing".equals(outcome) ? Optional.of(Set.of(volume)) : Optional.empty());
+            }
+            assertDoesNotThrow(() -> normalDeleteService(store).deleteFunction("us-east-1", fn.getFunctionName()));
+            assertTrue(store.get("us-east-1", fn.getFunctionName()).isEmpty());
+            verify(lifecycleManager, never()).removeVolume(volume);
+            doReturn(Optional.of(Map.of())).when(lifecycleManager).tryVolumeLabels(volume);
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager).removeVolume(volume);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void confirmedAbsenceRetiresOnlyThePendingRecordForAnUninvokedFunction(boolean initiallyUnknown) throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
+        LambdaFunction warm = codeVolumeFunction("warm-cache-fixture", "$LATEST", "warm-cache-sha");
+        LambdaFunction fn = codeVolumeFunction("uninvoked-absent-cache", "$LATEST", "uninvoked-cache-sha");
+        store.save("us-east-1", fn);
+        String volume = ContainerLauncher.codeVolumeName(config, fn);
+        String warmVolume = ContainerLauncher.codeVolumeName(config, warm);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(warm);
+            when(lifecycleManager.tryVolumeLabels(volume)).thenReturn(Optional.empty());
+            when(lifecycleManager.tryListVolumeNames()).thenReturn(initiallyUnknown
+                    ? Optional.empty() : Optional.of(Set.of(warmVolume)));
+            normalDeleteService(store).deleteFunction("us-east-1", fn.getFunctionName());
+            lenient().doReturn(Optional.of(Set.of(warmVolume)))
+                    .when(lifecycleManager).tryListVolumeNames();
+            launcher.cleanupSupersededVolumes();
+            lenient().doReturn(Optional.of(Map.of())).when(lifecycleManager).tryVolumeLabels(volume);
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, never()).removeVolume(volume);
+            assertTrue(store.get("us-east-1", fn.getFunctionName()).isEmpty());
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @Test
+    void legacyLauncherWithoutAFunctionStoreConservativelyRetainsDeletedCode() throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        ContainerBuilder builder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
+        LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(
+                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, 4566));
+        launcher = new ContainerLauncher(builder, lifecycleManager, logStreamer, imageResolver,
+                runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
+                layerService, awsEnv, executionRoleCredentials);
+        LambdaFunction fn = codeVolumeFunction("legacy-deleted-cache", "$LATEST", "legacy-cache-sha");
+        store.save("us-east-1", fn);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(fn);
+            normalDeleteService(store).deleteFunction("us-east-1", fn.getFunctionName());
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, never()).removeVolume(anyString());
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @Test
+    void retirementRetainsRetryOwnershipWhenTheLiveFunctionViewIsUnavailable() throws Exception {
+        LambdaFunctionStore store = mock(LambdaFunctionStore.class);
+        useInjectedLauncher(store);
+        LambdaFunction fn = codeVolumeFunction("unreadable-reference-cache", "$LATEST", "reference-cache-sha");
+        String volume = ContainerLauncher.codeVolumeName(config, fn);
+        when(store.listAll()).thenThrow(new IllegalStateException("metadata unavailable")).thenReturn(List.of());
+        when(lifecycleManager.removeVolume(volume)).thenReturn(true);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(fn);
+            launcher.retireFunctionCode(List.of(fn));
+            verify(lifecycleManager, never()).removeVolume(volume);
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager).removeVolume(volume);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @Test
+    void ordinaryDeletionAfterLauncherRestartRetiresThePersistedCodeVolume() throws Exception {
+        LambdaFunctionStore store = codeVolumeFunctionStore();
+        useInjectedLauncher(store);
+        LambdaFunction fn = codeVolumeFunction("restart-deleted-cache", "$LATEST", "restart-cache-sha");
+        store.save("us-east-1", fn);
+        String volume = ContainerLauncher.codeVolumeName(config, fn);
+        when(lifecycleManager.removeVolume(volume)).thenReturn(true);
+        long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(fn);
+            assertTrue(Files.isRegularFile(tempDir.resolve("lambda-codevol-markers").resolve(volume)));
+            useInjectedLauncher(store);
+            normalDeleteService(store).deleteFunction("us-east-1", fn.getFunctionName());
+            verify(lifecycleManager).removeVolume(volume);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private LambdaFunctionStore codeVolumeFunctionStore() {
+        codeVolumeCaller = new RequestContext();
+        codeVolumeCaller.setAccountId("000000000000");
+        Instance<RequestContext> context = mock(Instance.class);
+        lenient().when(context.get()).thenReturn(codeVolumeCaller);
+        StorageFactory factory = mock(StorageFactory.class);
+        when(factory.create(anyString(), anyString(), any()))
+                .thenReturn(new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, "000000000000"));
+        return new LambdaFunctionStore(factory);
+    }
+
+    private LambdaFunction codeVolumeFunction(String name, String version, String sha) throws IOException {
+        Path code = Files.createDirectories(tempDir.resolve(name + "-" + version));
+        Files.write(code.resolve("bundle.bin"), new byte[8 * 1024]);
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName(name);
+        fn.setAccountId("000000000000");
+        fn.setFunctionArn("arn:aws:lambda:us-east-1:000000000000:function:" + name
+                + ("$LATEST".equals(version) ? "" : ":" + version));
+        fn.setVersion(version);
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(code.toString());
+        fn.setCodeSha256(sha);
+        return fn;
+    }
+
+    private void useInjectedLauncher(LambdaFunctionStore store) throws ReflectiveOperationException {
+        ContainerBuilder builder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
+        LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(
+                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, 4566));
+        Map<Class<?>, Object> dependencies = Map.ofEntries(
+                Map.entry(ContainerBuilder.class, builder),
+                Map.entry(ContainerLifecycleManager.class, lifecycleManager),
+                Map.entry(ContainerLogStreamer.class, logStreamer),
+                Map.entry(ImageResolver.class, imageResolver),
+                Map.entry(RuntimeApiServerFactory.class, runtimeApiServerFactory),
+                Map.entry(DockerHostResolver.class, dockerHostResolver),
+                Map.entry(EmulatorConfig.class, config),
+                Map.entry(EcrRegistryManager.class, ecrRegistryManager),
+                Map.entry(LambdaLayerService.class, layerService),
+                Map.entry(LaunchedContainerAwsEnv.class, awsEnv),
+                Map.entry(LambdaExecutionRoleCredentials.class, executionRoleCredentials),
+                Map.entry(LambdaFunctionStore.class, store));
+        Constructor<?> injected = Arrays.stream(ContainerLauncher.class.getConstructors())
+                .filter(constructor -> constructor.isAnnotationPresent(Inject.class))
+                .findFirst().orElseThrow();
+        Object[] arguments = Arrays.stream(injected.getParameterTypes()).map(dependencies::get).toArray();
+        launcher = (ContainerLauncher) injected.newInstance(arguments);
+    }
+
+    private LambdaService normalDeleteService(LambdaFunctionStore store) {
+        lenient().when(config.services().lambda().containerDrainTimeoutSeconds()).thenReturn(15);
+        WarmPool pool = new WarmPool(launcher, config, Clock.systemUTC());
+        return new LambdaService(store, null, new LambdaConcurrencyLimiter(config), pool,
+                new CodeStore(tempDir.resolve("code-store")), new ZipExtractor(), null,
+                new RegionResolver("us-east-1", "000000000000"), null, null,
+                new LambdaTargetResolver(store, null), null, null, null, null, null,
+                null, null, null, null, null, new ObjectMapper());
     }
 
     @Test
