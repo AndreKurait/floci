@@ -68,8 +68,6 @@ class S3DeleteObjectsSignedIamEnforcementIntegrationTest {
         assertPresent(bucket, "batch.txt", ROOT_SIGNER);
     }
 
-    // Only the denial is asserted: S3Service.deleteObject looks the bucket up in the caller's own
-    // account, so a cross-account object delete answers NoSuchBucket here, single-key or batch.
     @Test
     void aCrossAccountBucketPolicyGrantWithoutAnIdentityGrantIsDenied() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
@@ -90,6 +88,45 @@ class S3DeleteObjectsSignedIamEnforcementIntegrationTest {
         assertEquals(List.of(), result.getList("DeleteResult.Deleted.Key"));
         assertDenied(result, "shared.txt");
         assertPresent(bucket, "shared.txt", signer(ownerCredentials));
+    }
+
+    @Test
+    void crossAccountDeletesRequireBothGrantsAndMutateOnlyTheBucketOwner() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String bucket = "delobj-owner-" + suffix;
+        String owner = "delobj-owner-" + suffix;
+        UserCredentials ownerCredentials = createUser(owner, ACCOUNT_A);
+        userPolicy(owner, ACCOUNT_A, "{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"*\"}");
+        S3RequestSigner ownerSigner = signer(ownerCredentials);
+        cleanup.register(() -> EnforcementFixtures.removeBucket(baseUri.getPort(), ownerSigner, bucket));
+        createBucket(bucket, ownerSigner);
+        put(bucket, "single.txt", ownerSigner);
+        put(bucket, "batch.txt", ownerSigner);
+        put(bucket, "retained.txt", ownerSigner);
+        String user = "delobj-caller-" + suffix;
+        UserCredentials caller = createUser(user, ACCOUNT_B);
+        userPolicy(user, ACCOUNT_B, "{\"Effect\":\"Allow\",\"Action\":\"s3:DeleteObject\",\"Resource\":\"*\"}");
+        S3RequestSigner callerSigner = signer(caller);
+
+        given().filter(callerSigner).delete("/" + bucket + "/single.txt").then().statusCode(403);
+        assertDenied(deleteObjects(callerSigner, bucket, "batch.txt"), "batch.txt");
+        assertPresent(bucket, "single.txt", ownerSigner);
+        assertPresent(bucket, "batch.txt", ownerSigner);
+
+        bucketPolicy(bucket, ownerSigner, """
+                {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::%s:user/%s"},
+                 "Action":"s3:DeleteObject","Resource":"arn:aws:s3:::%s/*"}""".formatted(ACCOUNT_B, user, bucket));
+        given().filter(callerSigner).delete("/" + bucket + "/single.txt").then().statusCode(204);
+        XmlPath deleted = deleteObjects(callerSigner, bucket, "batch.txt");
+        assertEquals(List.of("batch.txt"), deleted.getList("DeleteResult.Deleted.Key"));
+        assertEquals(List.of(), deleted.getList("DeleteResult.Error.Key"));
+        given().filter(ownerSigner).head("/" + bucket + "/single.txt").then().statusCode(404);
+        given().filter(ownerSigner).head("/" + bucket + "/batch.txt").then().statusCode(404);
+        given().filter(callerSigner).delete("/" + bucket + "/single.txt").then().statusCode(204);
+
+        given().filter(ownerSigner).delete("/" + bucket + "?policy").then().statusCode(204);
+        given().filter(callerSigner).delete("/" + bucket + "/retained.txt").then().statusCode(403);
+        assertPresent(bucket, "retained.txt", ownerSigner);
     }
 
     // The IAM layer skips an access key it does not know, as it skips an unsigned request, so with S3
