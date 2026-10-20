@@ -222,6 +222,9 @@ row_notes:
     Creates backing resources with ID Ref/GetAtt values and removes them on stack deletion.
     Property-changing updates and unsupported properties are rejected; environment monitors
     are retained as metadata, without alarm evaluation.
+  AWS::CloudWatch: >-
+    Composite alarms have backing definitions with name Ref and Arn GetAtt, rollback, and
+    replacement cleanup. Composite actions are stored only; suppression properties are rejected.
   AWS::AppSync: >-
     `Ref` on `GraphQLApi` and `ApiKey` returns the id where AWS returns the ARN. See
     [AppSync](appsync.md#cloudformation) for `Ref` and `Fn::GetAtt` compared with AWS.
