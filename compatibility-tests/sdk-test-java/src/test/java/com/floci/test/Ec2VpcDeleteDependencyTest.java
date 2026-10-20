@@ -22,6 +22,7 @@ import software.amazon.awssdk.services.ec2.model.Tag;
 import software.amazon.awssdk.services.ec2.model.TagSpecification;
 import software.amazon.awssdk.services.ec2.model.Vpc;
 
+import java.net.InetAddress;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -50,7 +51,7 @@ class Ec2VpcDeleteDependencyTest {
     }
 
     @Test
-    void createIpv6OnlySubnetDryRunDoesNotStoreSubnet() {
+    void createIpv6OnlySubnetDryRunDoesNotStoreSubnet() throws Exception {
         try (Ec2Client ec2 = TestFixtures.ec2Client("123456789012")) {
             Vpc vpc = ec2.createVpc(r -> r.cidrBlock("10.87.0.0/16")
                     .amazonProvidedIpv6CidrBlock(true)).vpc();
@@ -60,8 +61,12 @@ class Ec2VpcDeleteDependencyTest {
             try {
                 assertDryRun(() -> ec2.createSubnet(request.toBuilder().dryRun(true).build()));
                 assertThat(ec2.describeSubnets(r -> r.filters(vpcFilter(vpc.vpcId()))).subnets()).isEmpty();
-                assertThat(ec2.createSubnet(request).subnet().ipv6CidrBlockAssociationSet())
-                        .extracting(association -> association.ipv6CidrBlock()).containsExactly(ipv6Cidr);
+                var associations = ec2.createSubnet(request).subnet().ipv6CidrBlockAssociationSet();
+                assertThat(associations).hasSize(1);
+                String createdCidr = associations.get(0).ipv6CidrBlock();
+                assertThat(createdCidr.split("/")[1]).isEqualTo("64");
+                assertThat(InetAddress.getByName(createdCidr.split("/")[0]))
+                        .isEqualTo(InetAddress.getByName(ipv6Cidr.split("/")[0]));
             } finally {
                 ec2.describeSubnets(r -> r.filters(vpcFilter(vpc.vpcId()))).subnets()
                         .forEach(subnet -> ec2.deleteSubnet(r -> r.subnetId(subnet.subnetId())));
