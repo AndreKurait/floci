@@ -854,6 +854,10 @@ floci:
       enabled: true
     route53:
       enabled: true
+      default-nameserver1: ns-1.route53.localhost.floci.io
+      default-nameserver2: ns-2.route53.localhost.floci.io
+      default-nameserver3: ns-3.route53.localhost.floci.io
+      default-nameserver4: ns-4.route53.localhost.floci.io
       vpc-association-control-plane-delay-ms: 0
     transfer:
       enabled: true
