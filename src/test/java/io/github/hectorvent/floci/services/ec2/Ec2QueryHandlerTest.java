@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -26,6 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
@@ -35,6 +37,24 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class Ec2QueryHandlerTest {
+
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "-1", "invalid"})
+    void explicitlyInvalidVolumeIopsIsRefusedBeforeServiceMutation(String iops) {
+        Ec2Service service = mock(Ec2Service.class);
+        Volume volume = new Volume();
+        volume.setVolumeId("vol-test");
+        when(service.createVolume(any(), any(), any(), anyInt(), anyBoolean(), anyInt(), any(), any(), anyList()))
+                .thenReturn(volume);
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("AvailabilityZone", "us-east-1a");
+        params.putSingle("Size", "10");
+        params.putSingle("VolumeType", "gp3");
+        params.putSingle("Iops", iops);
+        Response response = handler(service).handle("CreateVolume", params, "us-east-1");
+        assertInvalidParameterValue(response, "Iops");
+        verifyNoInteractions(service);
+    }
 
     @ParameterizedTest
     @CsvSource({

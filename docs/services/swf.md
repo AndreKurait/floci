@@ -88,6 +88,9 @@ A decision that cannot be applied appends its `*Failed` event with the AWS cause
 fresh decision task. A closing decision must be last in the batch: a batch with anything
 after it is rejected with `ValidationException` ("Close must be last decision in list") and
 no decision is applied.
+A closing decision is deferred with `UNHANDLED_DECISION` when a new event arrived after
+its decision task started. Known pending activities, timers and children do not prevent
+closure; normal activity cleanup and the configured child policy still apply.
 
 An empty decision response leaves the execution open and waits for a new event.
 It does not schedule another task merely because no activity, timer, or child is

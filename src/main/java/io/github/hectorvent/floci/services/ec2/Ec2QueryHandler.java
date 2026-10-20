@@ -6231,21 +6231,19 @@ public class Ec2QueryHandler {
     private Response handleCreateVolume(MultivaluedMap<String, String> p, String region) {
         String availabilityZone = p.getFirst("AvailabilityZone");
         String volumeType = p.getFirst("VolumeType");
-        String sizeStr = p.getFirst("Size");
-        int size = sizeStr != null ? Integer.parseInt(sizeStr) : 0;
+        Integer suppliedSize = parseOptionalInt(p.getFirst("Size"), "Size");
+        int size = suppliedSize != null ? suppliedSize : 0;
+        if (suppliedSize != null && suppliedSize <= 0) {
+            throw new AwsException("InvalidParameterValue", "Size must be greater than zero.", 400);
+        }
         String encryptedStr = p.getFirst("Encrypted");
         boolean encrypted = "true".equalsIgnoreCase(encryptedStr);
-        String iopsStr = p.getFirst("Iops");
-        int iops = iopsStr != null ? Integer.parseInt(iopsStr) : 0;
-        String throughputStr = p.getFirst("Throughput");
-        Integer throughput = null;
-        if (throughputStr != null) {
-            try {
-                throughput = Integer.parseInt(throughputStr);
-            } catch (NumberFormatException e) {
-                throw new AwsException("ValidationException", "Invalid Throughput value: " + throughputStr, 400);
-            }
+        Integer suppliedIops = parseOptionalInt(p.getFirst("Iops"), "Iops");
+        int iops = suppliedIops != null ? suppliedIops : 0;
+        if (suppliedIops != null && suppliedIops <= 0) {
+            throw new AwsException("InvalidParameterValue", "Iops must be greater than zero.", 400);
         }
+        Integer throughput = parseOptionalInt(p.getFirst("Throughput"), "Throughput");
 
         String snapshotId = p.getFirst("SnapshotId");
 
@@ -6264,17 +6262,20 @@ public class Ec2QueryHandler {
     private Response handleDescribeVolumes(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "VolumeId");
         Map<String, List<String>> filters = getFilters(p);
-        List<Volume> volList = service.describeVolumes(region, ids, filters);
+        Integer maxResults = parseOptionalInt(p.getFirst("MaxResults"), "MaxResults");
+        VolumeListResult result = service.describeVolumes(region, ids, filters, maxResults, p.getFirst("NextToken"));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeVolumesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
                 .start("volumeSet");
-        for (Volume vol : volList) {
+        for (Volume vol : result.volumes()) {
             xml.start("item").raw(volumeXml(vol)).end("item");
         }
-        xml.end("volumeSet")
-                .elem("nextToken", "")
-                .end("DescribeVolumesResponse");
+        xml.end("volumeSet");
+        if (result.nextToken() != null) {
+            xml.elem("nextToken", result.nextToken());
+        }
+        xml.end("DescribeVolumesResponse");
         return xmlResponse(xml.build());
     }
 

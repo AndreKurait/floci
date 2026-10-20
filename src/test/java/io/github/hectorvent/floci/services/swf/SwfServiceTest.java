@@ -301,19 +301,90 @@ class SwfServiceTest {
         assertEquals("COMPLETED", execution.getCloseStatus());
     }
 
-    @Test
-    void closingDecisionWithAnOpenActivity_recordsUnhandledDecisionAndKeepsTheExecutionOpen() {
-        String runId = start("wf-unhandled");
-        scheduleActivity("wf-unhandled", "act-1");
+    @ParameterizedTest
+    @CsvSource({"CompleteWorkflowExecution,COMPLETED", "FailWorkflowExecution,FAILED",
+            "CancelWorkflowExecution,CANCELED", "ContinueAsNewWorkflowExecution,CONTINUED_AS_NEW"})
+    void closingDecisionClosesKnownActivitiesAndTimers(String closing, String status) {
+        String runId = start("wf-known-work");
+        SwfDecisionTask first = pollFor("wf-known-work");
+        service.respondDecisionTaskCompleted(first.getTaskToken(), List.of(
+                new Decision("ScheduleActivityTask", Map.of("activityId", "known",
+                        "activityType", Map.of("name", "A", "version", "1"))),
+                new Decision("StartTimer", Map.of("timerId", "known", "startToFireTimeout", "300"))), null);
+        SwfActivityTask activity = service.pollForActivityTask(REGION, DOMAIN, "act-tl", "worker").orElseThrow();
+        SwfDecisionTask task = pokeForDecision("wf-known-work");
+        service.respondDecisionTaskCompleted(task.getTaskToken(), List.of(
+                new Decision("RecordMarker", Map.of("markerName", "before-close")),
+                new Decision(closing, Map.of())), null);
 
-        SwfDecisionTask task = pokeForDecision("wf-unhandled");
-        service.respondDecisionTaskCompleted(task.getTaskToken(),
+        SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-known-work", runId);
+        assertEquals(status, execution.getCloseStatus());
+        assertEquals("before-close", lastAttribute(execution, "MarkerRecorded", "markerName"));
+        assertEquals(0, service.openActivityCount(execution));
+        assertEquals(0, service.openTimerCount(execution));
+        assertEquals("UnknownResourceFault", assertThrows(AwsException.class,
+                () -> service.respondActivityTaskCompleted(activity.getTaskToken(), "late")).getErrorCode());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"CompleteWorkflowExecution,signal", "FailWorkflowExecution,signal",
+            "CancelWorkflowExecution,signal", "ContinueAsNewWorkflowExecution,signal",
+            "CompleteWorkflowExecution,activity", "FailWorkflowExecution,activity",
+            "CancelWorkflowExecution,activity", "ContinueAsNewWorkflowExecution,activity",
+            "CompleteWorkflowExecution,timer", "FailWorkflowExecution,timer",
+            "CancelWorkflowExecution,timer", "ContinueAsNewWorkflowExecution,timer"})
+    void closingDecisionDefersEventsThatArrivedAfterTheTaskStarted(String closing, String event) {
+        String runId = start("wf-new-event");
+        SwfDecisionTask first = pollFor("wf-new-event");
+        List<Decision> setup = switch (event) {
+            case "activity" -> List.of(new Decision("ScheduleActivityTask", Map.of("activityId", "act",
+                    "activityType", Map.of("name", "A", "version", "1"))));
+            case "timer" -> List.of(new Decision("StartTimer",
+                    Map.of("timerId", "timer", "startToFireTimeout", "1")));
+            default -> List.of();
+        };
+        service.respondDecisionTaskCompleted(first.getTaskToken(), setup, null);
+        SwfActivityTask activity = "activity".equals(event)
+                ? service.pollForActivityTask(REGION, DOMAIN, "act-tl", "worker").orElseThrow() : null;
+        SwfDecisionTask task = pokeForDecision("wf-new-event");
+        switch (event) {
+            case "activity" -> service.respondActivityTaskCompleted(activity.getTaskToken(), "done");
+            case "timer" -> {
+                clock.advance(Duration.ofSeconds(2));
+                service.sweep();
+            }
+            default -> service.signalWorkflowExecution(REGION, DOMAIN, "wf-new-event", runId, "new", null);
+        }
+        service.respondDecisionTaskCompleted(task.getTaskToken(), List.of(new Decision(closing, Map.of())), null);
+
+        SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-new-event", runId);
+        assertEquals("OPEN", execution.getExecutionStatus());
+        assertEquals("UNHANDLED_DECISION", lastAttribute(execution, closing + "Failed", "cause"));
+        SwfDecisionTask next = pollFor("wf-new-event");
+        assertEquals(task.getStartedEventId(), next.getPreviousStartedEventId());
+        service.respondDecisionTaskCompleted(next.getTaskToken(), List.of(new Decision(closing, Map.of())), null);
+        assertFalse(service.describeWorkflowExecution(REGION, DOMAIN, "wf-new-event", runId).isOpen());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"TERMINATE,TERMINATED", "REQUEST_CANCEL,", "ABANDON,"})
+    void completingParentAppliesChildPolicyToKnownOpenChildren(String policy, String childStatus) {
+        String runId = service.startWorkflowExecution(new StartWorkflowExecutionRequest(
+                REGION, DOMAIN, "wf-parent-close", "W", "1", null, null, null, null, null, policy, null, null));
+        SwfDecisionTask first = pollFor("wf-parent-close");
+        service.respondDecisionTaskCompleted(first.getTaskToken(), List.of(
+                new Decision("StartChildWorkflowExecution", Map.of("workflowId", "wf-child-close",
+                        "workflowType", Map.of("name", "W", "version", "1")))), null);
+        SwfWorkflowExecution child = service.describeWorkflowExecution(REGION, DOMAIN, "wf-child-close", null);
+        SwfDecisionTask closing = pokeForDecision("wf-parent-close");
+        service.respondDecisionTaskCompleted(closing.getTaskToken(),
                 List.of(new Decision("CompleteWorkflowExecution", Map.of())), null);
 
-        SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-unhandled", runId);
-        assertEquals("OPEN", execution.getExecutionStatus());
-        assertEquals("UNHANDLED_DECISION",
-                lastAttribute(execution, "CompleteWorkflowExecutionFailed", "cause"));
+        assertEquals("COMPLETED",
+                service.describeWorkflowExecution(REGION, DOMAIN, "wf-parent-close", runId).getCloseStatus());
+        child = service.describeWorkflowExecution(REGION, DOMAIN, "wf-child-close", child.getRunId());
+        assertEquals(childStatus, child.getCloseStatus());
+        assertEquals("REQUEST_CANCEL".equals(policy), child.isCancelRequested());
     }
 
     @Test

@@ -84,6 +84,7 @@ import io.github.hectorvent.floci.services.ec2.model.TransitGatewayVpcAttachment
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
+import io.github.hectorvent.floci.services.ec2.model.VolumeListResult;
 import io.github.hectorvent.floci.services.ec2.model.VolumeModification;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.ec2.model.VpcCidrBlockAssociation;
@@ -12179,6 +12180,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public Volume createVolume(String region, String availabilityZone, String volumeType,
                                int size, boolean encrypted, int iops, Integer throughput,
                                String snapshotId, List<Tag> volumeTags) {
+        String effectiveType = volumeType != null ? volumeType : "gp2";
+        requireValidVolumeType(effectiveType);
         if (snapshotId != null && !snapshotId.isBlank()) {
             Snapshot snapshot = volumeSnapshot(region, snapshotId);
             if (snapshot.getVolumeSize() == null || snapshot.getVolumeSize() <= 0) {
@@ -12190,21 +12193,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             size = size > 0 ? size : snapshot.getVolumeSize();
             encrypted |= snapshot.isEncrypted();
         }
+        int effectiveIops = validatedVolumeIops(effectiveType, size, iops, throughput);
         ensureDefaultResources(region);
         String volumeId = "vol-" + randomHex(17);
-        String effectiveType = volumeType != null ? volumeType : "gp2";
         Volume vol = new Volume();
         vol.setVolumeId(volumeId);
         vol.setAvailabilityZone(availabilityZone != null ? availabilityZone : region + "a");
         vol.setVolumeType(effectiveType);
-        vol.setSize(size > 0 ? size : 8);
+        vol.setSize(size);
         // With encryption by default on, AWS encrypts every new volume and the Encrypted parameter
         // cannot opt out of it.
         vol.setEncrypted(encrypted || ebsEncryptionByDefault(region));
-        vol.setIops(iops > 0 ? iops : (volumeType != null && volumeType.startsWith("io") ? iops : 0));
+        vol.setIops(effectiveIops);
         // Throughput is a gp3-only attribute; AWS reports 125 MiB/s by default for gp3.
         if ("gp3".equals(effectiveType)) {
-            vol.setThroughput(throughput != null && throughput > 0 ? throughput : 125);
+            vol.setThroughput(throughput != null ? throughput : 125);
         } else {
             vol.setThroughput(throughput);
         }
@@ -12224,8 +12227,59 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return vol;
     }
 
+    private static int validatedVolumeIops(String type, int size, int iops, Integer throughput) {
+        int minimumSize = switch (type) {
+            case "io1", "io2" -> 4;
+            case "st1", "sc1" -> 125;
+            default -> 1;
+        };
+        int maximumSize = switch (type) {
+            case "gp3", "io2" -> 65536;
+            case "standard" -> 1024;
+            default -> 16384;
+        };
+        if (size < minimumSize || size > maximumSize) {
+            throw new AwsException("InvalidParameterValue", "Size is outside the supported range for " + type, 400);
+        }
+        if (throughput != null && !"gp3".equals(type)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "The parameter Throughput is not supported for " + type + " volumes", 400);
+        }
+        if (!Set.of("gp3", "io1", "io2").contains(type)) {
+            if (iops != 0) {
+                throw new AwsException("InvalidParameterCombination",
+                        "The parameter Iops is not supported for " + type + " volumes", 400);
+            }
+            return "gp2".equals(type) ? Math.min(16000, Math.max(100, 3 * size)) : 0;
+        }
+        int effectiveIops = "gp3".equals(type) && iops == 0 ? 3000 : iops;
+        int minimumIops = "gp3".equals(type) ? 3000 : 100;
+        long maximumIops = switch (type) {
+            case "gp3" -> Math.min(80000, Math.max(3000L, 500L * size));
+            case "io1" -> Math.min(64000, 50L * size);
+            default -> Math.min(256000, 1000L * size);
+        };
+        if (effectiveIops < minimumIops || effectiveIops > maximumIops) {
+            throw new AwsException("InvalidParameterValue", "Iops is outside the supported range for " + type, 400);
+        }
+        if (throughput != null && (throughput < 125 || throughput > 2000 || 4L * throughput > effectiveIops)) {
+            throw new AwsException("InvalidParameterValue", "Throughput exceeds the supported gp3 performance", 400);
+        }
+        return effectiveIops;
+    }
+
     public List<Volume> describeVolumes(String region, List<String> volumeIds,
                                         Map<String, List<String>> filters) {
+        return describeVolumes(region, volumeIds, filters, null, null).volumes();
+    }
+
+    public VolumeListResult describeVolumes(String region, List<String> volumeIds,
+                                            Map<String, List<String>> filters, Integer maxResults,
+                                            String nextToken) {
+        if (maxResults != null && maxResults <= 0) {
+            throw new AwsException("InvalidParameterValue", "MaxResults must be greater than zero.", 400);
+        }
+        int offset = decodeToken(nextToken);
         if (volumeIds != null && !volumeIds.isEmpty()) {
             for (String id : volumeIds) {
                 if (volumes.get(key(region, id)).orElse(null) == null) {
@@ -12234,11 +12288,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
         }
-        return volumes.scan(k -> true).stream()
+        List<Volume> matching = volumes.scan(k -> k.startsWith(region + "::")).stream()
                 .filter(v -> v.getRegion().equals(region))
                 .filter(v -> volumeIds == null || volumeIds.isEmpty() || volumeIds.contains(v.getVolumeId()))
                 .filter(v -> matchesFilters(v, filters, region))
+                .sorted(Comparator.comparing(Volume::getVolumeId))
                 .collect(Collectors.toList());
+        int pageSize = maxResults != null ? maxResults : matching.size();
+        int end = (int) Math.min((long) offset + pageSize, matching.size());
+        List<Volume> page = offset < matching.size() ? matching.subList(offset, end) : List.of();
+        return new VolumeListResult(new ArrayList<>(page), end < matching.size() ? encodeToken(end) : null);
     }
 
     public void deleteVolume(String region, String volumeId) {

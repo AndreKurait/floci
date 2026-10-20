@@ -195,6 +195,12 @@ Reads neither create recipient-owned aliases nor change source tags or mappings.
 Direct `CreateVolume` from a shared snapshot requires its create-volume grant and uses the snapshot size
 when size is omitted. Smaller sizes, missing grants, wrong regions and encrypted shared snapshots are refused.
 No snapshot bytes are copied by metadata mode.
+`CreateVolume` validates volume size and provisioned performance before allocating a resource.
+It reports the gp2 baseline IOPS and the gp3 defaults of 3,000 IOPS and 125 MiB/s;
+gp3 provisioning supports the current size, IOPS, throughput and performance ratios.
+`DescribeVolumes` applies account, region and filters before `MaxResults`/`NextToken` pagination.
+IOPS and throughput describe validated API metadata; local backing storage does not enforce
+the provisioned physical performance.
 Permission reads and mutations remain owner-scoped. IAM policy evaluation,
 public/group/organization grants, legacy `OperationType`/`UserId.N` mutation
 forms, encrypted shared copies and KMS are unsupported.

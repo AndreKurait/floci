@@ -787,6 +787,39 @@ class Ec2ServiceTest {
         assertTrue(service.describeTags("eu-west-1", Map.of("resource-id", List.of(volume.getVolumeId()))).isEmpty());
     }
 
+    @ParameterizedTest
+    @CsvSource({"gp2,1,0,,100,", "gp2,100,0,,300,", "gp2,16384,0,,16000,",
+            "gp3,1,0,,3000,125", "gp3,160,80000,2000,80000,2000",
+            "io1,1280,64000,,64000,", "io2,256,256000,,256000,"})
+    void volumesReportDefaultAndProvisionedPerformance(String type, int size, int iops,
+                                                       Integer throughput, int expectedIops,
+                                                       Integer expectedThroughput) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", type, size,
+                false, iops, throughput, null, List.of());
+        Volume described = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
+        assertEquals(expectedIops, described.getIops());
+        assertEquals(expectedThroughput, described.getThroughput());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"invalid,10,0,", "gp2,0,0,", "gp2,16385,0,", "gp3,65537,0,",
+            "io1,3,100,", "io1,10,0,", "io2,10,0,", "gp2,10,100,", "gp2,10,0,250",
+            "gp3,10,2999,", "gp3,160,80001,", "gp3,1,3500,", "gp3,10,3000,124",
+            "gp3,160,80000,2001", "gp3,10,3000,751", "io1,4,201,", "io2,4,4001,"})
+    void invalidVolumePerformanceIsRefusedBeforeAllocatingResources(String type, int size, int iops,
+                                                                   Integer throughput) {
+        AccountAwareStorageBackend<Volume> volumeStore = AccountAwareStorageBackend.inMemory("000000000000");
+        AccountAwareStorageBackend<Vpc> vpcStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2Service service = tagTestService(new InMemoryStorageFactory(
+                Map.of("ec2-volumes.json", volumeStore, "ec2-vpcs.json", vpcStore)));
+        assertEquals(400, assertThrows(AwsException.class,
+                () -> service.createVolume("us-east-1", "us-east-1a", type, size,
+                        false, iops, throughput, null, List.of())).getHttpStatus());
+        assertTrue(volumeStore.keys().isEmpty());
+        assertTrue(vpcStore.keys().isEmpty());
+    }
+
     @Test
     void tagsStoredByBareIdMoveUnderTheirResourcesRegionAndOrphansAreDropped() {
         AccountAwareStorageBackend<List<Tag>> tagStore = AccountAwareStorageBackend.inMemory("000000000000");

@@ -600,6 +600,7 @@ public class SwfService implements Resettable {
             // Rejected before anything is mutated: the live service answers 400 and leaves
             // the task outstanding, so the decider can retry with a corrected batch.
             requireValidBatch(decisions);
+            boolean unhandledEvents = execution.getEvents().getLast().getEventId() > task.getStartedEventId();
 
             SwfHistoryEvent completed = appendEvent(execution, "DecisionTaskCompleted");
             completed.attr("executionContext", executionContext)
@@ -614,7 +615,7 @@ public class SwfService implements Resettable {
                 execution.setLatestExecutionContext(executionContext);
             }
 
-            applyDecisions(execution, decisions, queued, decisionEventId);
+            applyDecisions(execution, decisions, queued, decisionEventId, unhandledEvents);
 
             if (execution.isOpen() && execution.isDecisionNeeded()) {
                 execution.setDecisionNeeded(false);
@@ -674,7 +675,7 @@ public class SwfService implements Resettable {
     }
 
     private void applyDecisions(SwfWorkflowExecution execution, List<Decision> decisions,
-                                List<PendingLambda> queued, long decisionEventId) {
+                                List<PendingLambda> queued, long decisionEventId, boolean unhandledEvents) {
         if (decisions == null) {
             return;
         }
@@ -682,6 +683,13 @@ public class SwfService implements Resettable {
             if (!execution.isOpen()) {
                 LOG.debugv("Dropping {0} decision: execution {1} already closed",
                         decision.type(), execution.getRunId());
+                return;
+            }
+            if (unhandledEvents && SwfConstants.CLOSING_DECISIONS.contains(decision.type())) {
+                appendEvent(execution, decision.type() + "Failed")
+                        .attr("cause", "UNHANDLED_DECISION")
+                        .attr("decisionTaskCompletedEventId", decisionEventId);
+                execution.setDecisionNeeded(true);
                 return;
             }
             applyDecision(execution, decision, queued, decisionEventId);
@@ -831,13 +839,6 @@ public class SwfService implements Resettable {
     }
 
     private void completeWorkflowExecution(SwfWorkflowExecution execution, Decision decision, long decisionEventId) {
-        if (hasOpenWork(execution)) {
-            appendEvent(execution, "CompleteWorkflowExecutionFailed")
-                    .attr("cause", "UNHANDLED_DECISION")
-                    .attr("decisionTaskCompletedEventId", decisionEventId);
-            execution.setDecisionNeeded(true);
-            return;
-        }
         appendEvent(execution, "WorkflowExecutionCompleted")
                 .attr("result", decision.string("result"))
                 .attr("decisionTaskCompletedEventId", decisionEventId);
@@ -845,13 +846,6 @@ public class SwfService implements Resettable {
     }
 
     private void failWorkflowExecution(SwfWorkflowExecution execution, Decision decision, long decisionEventId) {
-        if (hasOpenWork(execution)) {
-            appendEvent(execution, "FailWorkflowExecutionFailed")
-                    .attr("cause", "UNHANDLED_DECISION")
-                    .attr("decisionTaskCompletedEventId", decisionEventId);
-            execution.setDecisionNeeded(true);
-            return;
-        }
         appendEvent(execution, "WorkflowExecutionFailed")
                 .attr("reason", decision.string("reason"))
                 .attr("details", decision.string("details"))
@@ -860,13 +854,6 @@ public class SwfService implements Resettable {
     }
 
     private void cancelWorkflowExecution(SwfWorkflowExecution execution, Decision decision, long decisionEventId) {
-        if (hasOpenWork(execution)) {
-            appendEvent(execution, "CancelWorkflowExecutionFailed")
-                    .attr("cause", "UNHANDLED_DECISION")
-                    .attr("decisionTaskCompletedEventId", decisionEventId);
-            execution.setDecisionNeeded(true);
-            return;
-        }
         appendEvent(execution, "WorkflowExecutionCanceled")
                 .attr("details", decision.string("details"))
                 .attr("decisionTaskCompletedEventId", decisionEventId);
@@ -1893,25 +1880,6 @@ public class SwfService implements Resettable {
             }
         }
     }
-
-    /**
-     * True when the execution still has activities, timers, or children the decider must
-     * resolve before it may close the execution. SWF rejects a closing decision in that
-     * state with UNHANDLED_DECISION.
-     */
-    private boolean hasOpenWork(SwfWorkflowExecution execution) {
-        if (execution.getActivities().values().stream().anyMatch(SwfActivityTask::isOpen)) {
-            return true;
-        }
-        if (!execution.getTimers().isEmpty()) {
-            return true;
-        }
-        return execution.getChildExecutions().entrySet().stream().anyMatch(entry -> executionStore
-                .get(executionKey(execution.getRegion(), execution.getDomain(), entry.getKey(), entry.getValue()))
-                .filter(SwfWorkflowExecution::isOpen)
-                .isPresent());
-    }
-
 
     public int openActivityCount(SwfWorkflowExecution execution) {
         return (int) execution.getActivities().values().stream().filter(SwfActivityTask::isOpen).count();

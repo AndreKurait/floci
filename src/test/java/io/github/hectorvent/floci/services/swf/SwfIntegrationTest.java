@@ -7,6 +7,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 
@@ -591,8 +593,9 @@ class SwfIntegrationTest {
                 .body("executionInfo.closeStatus", equalTo("COMPLETED"));
     }
 
-    @Test
-    void closingDecisionWithOpenActivity_failsWithUnhandledDecision() {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void closingDecisionDistinguishesKnownWorkFromNewEvents(boolean newSignal) {
         String domain = uniqueName("unhandled");
         registerDomain(domain);
         registerWorkflowType(domain, "TestWf", "1.0");
@@ -616,8 +619,12 @@ class SwfIntegrationTest {
                 {"domain": "%s", "workflowId": "wf-unhandled", "signalName": "poke"}
                 """.formatted(domain)).then().statusCode(200);
 
-        // The scheduled activity is still open, so completing the execution is rejected.
         String second = pollDecisionToken(domain);
+        if (newSignal) {
+            call("SignalWorkflowExecution", """
+                    {"domain": "%s", "workflowId": "wf-unhandled", "signalName": "new"}
+                    """.formatted(domain)).then().statusCode(200);
+        }
         call("RespondDecisionTaskCompleted", """
                 {"taskToken": "%s", "decisions": [{
                    "decisionType": "CompleteWorkflowExecution",
@@ -629,16 +636,18 @@ class SwfIntegrationTest {
                 {"domain": "%s", "execution": {"workflowId": "wf-unhandled", "runId": "%s"}}
                 """.formatted(domain, runId))
                 .then()
-                .body("executionInfo.executionStatus", equalTo("OPEN"));
+                .body("executionInfo.executionStatus", equalTo(newSignal ? "OPEN" : "CLOSED"));
 
-        call("GetWorkflowExecutionHistory", """
+        Response history = call("GetWorkflowExecutionHistory", """
                 {"domain": "%s", "execution": {"workflowId": "wf-unhandled", "runId": "%s"}}
                 """.formatted(domain, runId))
-                .then()
-                .body("events.eventType", hasItem("CompleteWorkflowExecutionFailed"))
-                .body("events.find { it.eventType == 'CompleteWorkflowExecutionFailed' }"
-                        + ".completeWorkflowExecutionFailedEventAttributes.cause",
-                        equalTo("UNHANDLED_DECISION"));
+                .then().statusCode(200).extract().response();
+        history.then().body("events.eventType",
+                hasItem(newSignal ? "CompleteWorkflowExecutionFailed" : "WorkflowExecutionCompleted"));
+        if (newSignal) {
+            history.then().body("events.find { it.eventType == 'CompleteWorkflowExecutionFailed' }"
+                    + ".completeWorkflowExecutionFailedEventAttributes.cause", equalTo("UNHANDLED_DECISION"));
+        }
     }
 
     @Test
