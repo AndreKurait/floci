@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.services.stepfunctions.model.Activity;
 import io.github.hectorvent.floci.services.stepfunctions.model.ActivityTask;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
@@ -20,10 +21,20 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -32,11 +43,19 @@ public class StepFunctionsJsonHandler {
 
     private final StepFunctionsService service;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
+    private final SecretKeySpec historyTokenKey = new SecretKeySpec(
+            new SecureRandom().generateSeed(32), "HmacSHA256");
 
     @Inject
     public StepFunctionsJsonHandler(StepFunctionsService service, ObjectMapper objectMapper) {
+        this(service, objectMapper, Clock.systemUTC());
+    }
+
+    StepFunctionsJsonHandler(StepFunctionsService service, ObjectMapper objectMapper, Clock clock) {
         this.service = service;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     public Response handle(String action, JsonNode request, String region) {
@@ -466,7 +485,21 @@ public class StepFunctionsJsonHandler {
 
     private Response handleGetExecutionHistory(JsonNode request) {
         String arn = request.path("executionArn").asText();
-        boolean includeExecutionData = request.path("includeExecutionData").asBoolean(true);
+        boolean includeExecutionData = parseOptionalBoolean(request, "includeExecutionData", true);
+        boolean reverseOrder = parseOptionalBoolean(request, "reverseOrder", false);
+        Integer maxResults = parseOptionalInt(request, "maxResults");
+        if (maxResults != null && (!request.path("maxResults").canConvertToInt()
+                || maxResults < 0 || maxResults > 1000)) {
+            throw new AwsException("ValidationException", "maxResults must be between 0 and 1000.", 400);
+        }
+        int pageSize = maxResults == null || maxResults == 0 ? 100 : maxResults;
+        String nextToken = optionalText(request, "nextToken");
+        if (nextToken != null && nextToken.isEmpty()) {
+            throw new AwsException("ValidationException", "nextToken must not be empty.", 400);
+        }
+        nextToken = verifyHistoryToken(nextToken);
+        String tokenNamespace = historyTokenNamespace(
+                arn, reverseOrder, nextToken);
 
         List<HistoryEvent> live = service.getExecutionHistory(arn);
         List<HistoryEvent> events;
@@ -474,9 +507,13 @@ public class StepFunctionsJsonHandler {
         synchronized (live) {
             events = new ArrayList<>(live);
         }
+        PaginatedResult<HistoryEvent> page = Pagination.paginate(
+                events, event -> historyPaginationCursor(event, reverseOrder),
+                pageSize, nextToken, tokenNamespace,
+                token -> new AwsException("InvalidToken", "The provided token is not valid.", 400));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("events");
-        for (HistoryEvent e : events) {
+        for (HistoryEvent e : page.items()) {
             ObjectNode item = array.addObject();
             item.put("id", e.getId());
             item.put("timestamp", e.getTimestamp());
@@ -492,7 +529,77 @@ public class StepFunctionsJsonHandler {
                 item.set(historyEventDetailsField(e.getType()), objectMapper.valueToTree(details));
             }
         }
+        if (page.nextToken() != null) {
+            response.put("nextToken", signHistoryToken(page.nextToken()));
+        }
         return Response.ok(response).build();
+    }
+
+    private static String historyPaginationCursor(HistoryEvent event, boolean reverseOrder) {
+        long timestampMillis = Math.round(event.getTimestamp() * 1000);
+        return String.format(Locale.ROOT, "%020d:%020d",
+                reverseOrder ? Long.MAX_VALUE - timestampMillis : timestampMillis,
+                reverseOrder ? Long.MAX_VALUE - event.getId() : event.getId());
+    }
+
+    private String historyTokenNamespace(
+            String arn, boolean reverseOrder, String nextToken) {
+        String namespace = "sfn-history:" + arn + ":" + reverseOrder;
+        long now = clock.millis();
+        long issuedAt = now;
+        if (nextToken != null) {
+            try {
+                String decoded = new String(Base64.getUrlDecoder().decode(nextToken), StandardCharsets.UTF_8);
+                String prefix = namespace + ":";
+                int separator = decoded.indexOf(':', prefix.length());
+                if (!decoded.startsWith(prefix) || separator < 0
+                        || !decoded.substring(separator + 1).matches("[0-9]{20}:[0-9]{20}")) {
+                    throw new IllegalArgumentException("Invalid history token");
+                }
+                issuedAt = Long.parseLong(decoded.substring(prefix.length(), separator));
+                if (issuedAt > now || issuedAt < now - Duration.ofHours(24).toMillis()) {
+                    throw new IllegalArgumentException("Expired history token");
+                }
+            } catch (IllegalArgumentException e) {
+                throw new AwsException("InvalidToken", "The provided token is not valid.", 400);
+            }
+        }
+        return namespace + ":" + issuedAt;
+    }
+
+    private String signHistoryToken(String payload) {
+        return payload + "." + Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(historyTokenSignature(payload));
+    }
+
+    private String verifyHistoryToken(String token) {
+        if (token == null) {
+            return null;
+        }
+        try {
+            int separator = token.lastIndexOf('.');
+            if (separator < 1) {
+                throw new IllegalArgumentException("Unsigned history token");
+            }
+            String payload = token.substring(0, separator);
+            byte[] signature = Base64.getUrlDecoder().decode(token.substring(separator + 1));
+            if (!MessageDigest.isEqual(signature, historyTokenSignature(payload))) {
+                throw new IllegalArgumentException("Invalid history token signature");
+            }
+            return payload;
+        } catch (IllegalArgumentException failure) {
+            throw new AwsException("InvalidToken", "The provided token is not valid.", 400);
+        }
+    }
+
+    private byte[] historyTokenSignature(String payload) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(historyTokenKey);
+            return mac.doFinal(payload.getBytes(StandardCharsets.UTF_8));
+        } catch (GeneralSecurityException failure) {
+            throw new IllegalStateException("Could not authenticate history token", failure);
+        }
     }
 
     private static final Set<String> EXECUTION_DATA_FIELDS =
