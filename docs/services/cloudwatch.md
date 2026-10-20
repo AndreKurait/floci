@@ -343,6 +343,10 @@ aws logs put-retention-policy \
 
 **Protocol:** Query (XML) and JSON 1.0 (both supported)
 
+JSON requests also accept the legacy `CloudWatchVersion20130116.` target prefix through the
+same metrics handler. Current clients use `GraniteServiceVersion20100801.`. The legacy
+prefix does not register a Smithy RPC v2 service or a CBOR target.
+
 CloudWatch Query operations accept form-encoded POST requests and root GET requests with
 URL query parameters. GET uses the existing handlers, signature validation and IAM policy checks. A `monitoring`
 credential in the Authorization header or presigned URL selects CloudWatch, including
