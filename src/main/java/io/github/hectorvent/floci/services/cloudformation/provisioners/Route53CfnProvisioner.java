@@ -1,10 +1,14 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.route53.Route53Service;
 import io.github.hectorvent.floci.services.route53.model.AliasTarget;
+import io.github.hectorvent.floci.services.route53.model.ChangeInfo;
 import io.github.hectorvent.floci.services.route53.model.HostedZone;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecord;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecordSet;
@@ -21,7 +25,7 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * Provisions {@code AWS::Route53::HostedZone} and {@code AWS::Route53::RecordSet}.
+ * Provisions hosted zones, individual records and record groups through Route 53.
  *
  * <p>A record set is written into its hosted zone through {@code ChangeResourceRecordSets}. On stack
  * create, and on an update that changes the record's identity (zone, Name, Type or SetIdentifier), the
@@ -33,17 +37,25 @@ import java.util.Set;
  * written without one. No {@code Fn::GetAtt} attribute is published: the registry lists {@code Id} as
  * read-only, but the type has no registry handlers and the resource specification gives it no
  * attributes, so {@code Ref} is its only reference.
+ *
+ * <p>Groups use one atomic change batch within a zone. Moving a group keeps its old records until
+ * the stack commits; the existing update hooks handle rollback and displaced-record cleanup.
  */
 @ApplicationScoped
 public class Route53CfnProvisioner implements CfnResourceProvisioner {
     static final String HOSTED_ZONE = "AWS::Route53::HostedZone";
     static final String RECORD_SET = "AWS::Route53::RecordSet";
+    static final String RECORD_SET_GROUP = "AWS::Route53::RecordSetGroup";
 
     // Create-time values a record's delete needs to build a matching DELETE change; kept off the
     // published attributes by the __Floci prefix, as the other provisioners do.
     private static final String RECORD_ZONE_ATTR = "__FlociRoute53RecordZoneId";
     private static final String RECORD_TYPE_ATTR = "__FlociRoute53RecordType";
     private static final String RECORD_SET_ID_ATTR = "__FlociRoute53RecordSetIdentifier";
+    private static final String GROUP_RECORDS_ATTR = "__FlociRoute53GroupRecords";
+    private static final String GROUP_UPDATE_ATTR = "__FlociRoute53GroupUpdate";
+    private static final String GROUP_CLEANUP_ATTEMPTS_ATTR = "__FlociRoute53GroupCleanupAttempts";
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final Logger LOG = Logger.getLogger(Route53CfnProvisioner.class);
 
@@ -56,7 +68,7 @@ public class Route53CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public Set<String> resourceTypes() {
-        return Set.of(HOSTED_ZONE, RECORD_SET);
+        return Set.of(HOSTED_ZONE, RECORD_SET, RECORD_SET_GROUP);
     }
 
     @Override
@@ -64,6 +76,7 @@ public class Route53CfnProvisioner implements CfnResourceProvisioner {
         switch (resource.getResourceType()) {
             case "AWS::Route53::HostedZone" -> provisionHostedZone(resource, props, ctx);
             case "AWS::Route53::RecordSet" -> provisionRecordSet(resource, props, ctx);
+            case "AWS::Route53::RecordSetGroup" -> provisionRecordSetGroup(resource, props, ctx);
             default -> throw new IllegalStateException(
                     "Route53CfnProvisioner received an unsupported type: " + resource.getResourceType());
         }
@@ -71,6 +84,32 @@ public class Route53CfnProvisioner implements CfnResourceProvisioner {
 
     private void provisionRecordSet(StackResource resource, JsonNode props, ProvisionContext ctx) {
         Map<String, String> priorAttributes = new HashMap<>(resource.getAttributes());
+        ResourceRecordSet rrs = recordSet(props, ctx);
+        String name = ctx.resolveOptional(props, "Name");
+        String type = rrs.getType();
+        String setIdentifier = rrs.getSetIdentifier();
+        String zoneId = resolveZoneId(props, ctx);
+
+        boolean sameIdentity = isPriorIdentity(ctx, priorAttributes, zoneId, name, type, setIdentifier);
+        Map<String, Object> change = new HashMap<>();
+        change.put("action", sameIdentity ? "UPSERT" : "CREATE");
+        change.put("rrs", rrs);
+        route53Service.changeResourceRecordSets(zoneId, List.of(change),
+                "CloudFormation " + ctx.stackName() + "/" + resource.getLogicalId());
+        if (!sameIdentity) {
+            removeSupersededRecord(ctx, priorAttributes);
+        }
+        resource.setPhysicalId(name);
+        resource.getAttributes().put(RECORD_ZONE_ATTR, zoneId);
+        resource.getAttributes().put(RECORD_TYPE_ATTR, type);
+        if (setIdentifier != null && !setIdentifier.isBlank()) {
+            resource.getAttributes().put(RECORD_SET_ID_ATTR, setIdentifier);
+        } else {
+            resource.getAttributes().remove(RECORD_SET_ID_ATTR);
+        }
+    }
+
+    private ResourceRecordSet recordSet(JsonNode props, ProvisionContext ctx) {
         String name = ctx.resolveOptional(props, "Name");
         String type = ctx.resolveOptional(props, "Type");
         // Type and Name are the schema's required properties; reject rather than write a nameless
@@ -81,8 +120,6 @@ public class Route53CfnProvisioner implements CfnResourceProvisioner {
         if (type == null || type.isBlank()) {
             throw new AwsException("ValidationError", "AWS::Route53::RecordSet requires Type.", 400);
         }
-        String zoneId = resolveZoneId(props, ctx);
-
         ResourceRecordSet rrs = new ResourceRecordSet();
         rrs.setName(Route53Service.normalizeName(name));
         rrs.setType(type);
@@ -104,32 +141,183 @@ public class Route53CfnProvisioner implements CfnResourceProvisioner {
         rrs.setRecords(parseResourceRecords(props, ctx));
         rrs.setAliasTarget(parseAliasTarget(props, ctx));
 
-        // The record's identity is Name + Type + SetIdentifier within a zone. Re-applying the identity
-        // this resource wrote last time is an UPSERT, which replaces whatever record holds that
-        // identity. Any other identity, on stack create or on an update that changes it, is a record
-        // the stack does not own yet, so it is a CREATE: a record another owner already holds under
-        // that identity fails the stack instead of being taken over.
-        boolean sameIdentity = isPriorIdentity(ctx, priorAttributes, zoneId, name, type, setIdentifier);
-        Map<String, Object> change = new HashMap<>();
-        change.put("action", sameIdentity ? "UPSERT" : "CREATE");
-        change.put("rrs", rrs);
-        route53Service.changeResourceRecordSets(zoneId, List.of(change),
-                "CloudFormation " + ctx.stackName() + "/" + resource.getLogicalId());
+        return rrs;
+    }
 
-        // An update that changes the identity leaves the prior record orphaned, so remove it,
-        // otherwise it lingers in the zone and later blocks the zone's own delete.
-        if (!sameIdentity) {
-            removeSupersededRecord(ctx, priorAttributes);
+    private void provisionRecordSetGroup(StackResource resource, JsonNode props, ProvisionContext ctx) {
+        String zoneId = resolveZoneId(props, ctx);
+        JsonNode members = ctx.engine().resolveNode(props.get("RecordSets"));
+        if (members == null || !members.isArray() || members.isEmpty()) {
+            throw new AwsException("ValidationError", "RecordSetGroup requires a nonempty RecordSets array.", 400);
         }
-
-        resource.setPhysicalId(name);
+        List<ResourceRecordSet> desired = new ArrayList<>();
+        for (JsonNode member : members) {
+            desired.add(recordSet(member, ctx));
+        }
+        String serialized;
+        try {
+            serialized = MAPPER.writeValueAsString(desired);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Cannot retain Route53 record group ownership.", e);
+        }
+        if (resource.getAttributes().containsKey(GROUP_UPDATE_ATTR)) {
+            UpdateCleanupResult cleanup = completeUpdate(resource);
+            if (!cleanup.complete()) {
+                throw new AwsException("InvalidChangeBatch", cleanup.failureReason(), 400);
+            }
+            clearUpdate(resource);
+        }
+        String priorZone = resource.getAttributes().get(RECORD_ZONE_ATTR);
+        String snapshot = null;
+        if (ctx.isUpdate()) {
+            try {
+                snapshot = MAPPER.writeValueAsString(resource.getAttributes());
+            } catch (JsonProcessingException e) {
+                throw new IllegalStateException("Cannot retain Route53 record group update.", e);
+            }
+        }
+        List<Map<String, Object>> changes = new ArrayList<>();
+        if (ctx.isUpdate() && zoneId.equals(priorZone)) {
+            for (ResourceRecordSet prior : groupRecords(resource)) {
+                changes.add(Map.of("action", "DELETE", "rrs", prior));
+            }
+        }
+        for (ResourceRecordSet record : desired) {
+            changes.add(Map.of("action", "CREATE", "rrs", record));
+        }
+        // One service batch validates the entire replacement before committing any record.
+        ChangeInfo change = route53Service.changeResourceRecordSets(zoneId, changes,
+                ctx.resolveOrDefault(props, "Comment", "CloudFormation " + ctx.stackName()));
+        resource.setPhysicalId(resource.getLogicalId());
+        resource.getAttributes().put("Id", change.getId());
         resource.getAttributes().put(RECORD_ZONE_ATTR, zoneId);
-        resource.getAttributes().put(RECORD_TYPE_ATTR, type);
-        if (setIdentifier != null && !setIdentifier.isBlank()) {
-            resource.getAttributes().put(RECORD_SET_ID_ATTR, setIdentifier);
-        } else {
-            resource.getAttributes().remove(RECORD_SET_ID_ATTR);
+        resource.getAttributes().put(GROUP_RECORDS_ATTR, serialized);
+        if (snapshot != null) {
+            resource.getAttributes().put(GROUP_UPDATE_ATTR, snapshot);
         }
+    }
+
+    private List<ResourceRecordSet> groupRecords(StackResource resource) {
+        return groupRecords(resource.getAttributes());
+    }
+
+    private List<ResourceRecordSet> groupRecords(Map<String, String> attributes) {
+        String value = attributes.get(GROUP_RECORDS_ATTR);
+        if (value == null) {
+            return List.of();
+        }
+        try {
+            return MAPPER.readValue(value, new TypeReference<List<ResourceRecordSet>>() {});
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Invalid retained Route53 record group ownership.", e);
+        }
+    }
+
+    private void deleteRecordSetGroup(StackResource resource) {
+        deleteRecordSetGroup(resource.getAttributes(), resource.getLogicalId());
+    }
+
+    private void deleteRecordSetGroup(Map<String, String> attributes, String logicalId) {
+        String zoneId = attributes.get(RECORD_ZONE_ATTR);
+        if (zoneId == null) {
+            return;
+        }
+        CfnDeletes.safeDelete("Route53 record set group", logicalId, () -> {
+            List<ResourceRecordSet> current = route53Service.listResourceRecordSets(zoneId, null, null, 0);
+            List<Map<String, Object>> changes = new ArrayList<>();
+            for (ResourceRecordSet prior : groupRecords(attributes)) {
+                if (current.stream().anyMatch(record -> Route53Service.sameRecord(record, prior))) {
+                    changes.add(Map.of("action", "DELETE", "rrs", prior));
+                }
+            }
+            if (!changes.isEmpty()) {
+                route53Service.changeResourceRecordSets(zoneId, changes,
+                        "CloudFormation delete " + logicalId);
+            }
+        }, "NoSuchHostedZone");
+    }
+
+    private Map<String, String> groupUpdate(StackResource resource) {
+        String snapshot = resource.getAttributes().get(GROUP_UPDATE_ATTR);
+        if (snapshot == null) {
+            return null;
+        }
+        try {
+            return MAPPER.readValue(snapshot, new TypeReference<Map<String, String>>() {});
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Invalid retained Route53 record group update.", e);
+        }
+    }
+
+    @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        Map<String, String> prior = groupUpdate(resource);
+        return prior != null && !Objects.equals(prior.get(RECORD_ZONE_ATTR),
+                resource.getAttributes().get(RECORD_ZONE_ATTR));
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return hasReplacementUpdate(resource) && !"Retain".equals(resource.getUpdateReplacePolicy())
+                ? resource.getPhysicalId() : null;
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        Map<String, String> prior = groupUpdate(resource);
+        if (prior == null) {
+            return UpdateCleanupResult.notApplicable();
+        }
+        if (!hasReplacementUpdate(resource) || "Retain".equals(resource.getUpdateReplacePolicy())) {
+            resource.getAttributes().remove(GROUP_UPDATE_ATTR);
+            return new UpdateCleanupResult(true, true, null, 0, null);
+        }
+        try {
+            deleteRecordSetGroup(prior, resource.getLogicalId());
+            resource.getAttributes().remove(GROUP_UPDATE_ATTR);
+            return new UpdateCleanupResult(true, true, resource.getPhysicalId(), 0, null);
+        } catch (RuntimeException failure) {
+            int attempts = Integer.parseInt(resource.getAttributes()
+                    .getOrDefault(GROUP_CLEANUP_ATTEMPTS_ATTR, "0")) + 1;
+            resource.getAttributes().put(GROUP_CLEANUP_ATTEMPTS_ATTR, Integer.toString(attempts));
+            return new UpdateCleanupResult(true, false, resource.getPhysicalId(), attempts, failure.getMessage());
+        }
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        // Failed displaced-group cleanup stays addressable for a retry or DeleteStack.
+        if (!hasReplacementUpdate(resource)) {
+            resource.getAttributes().remove(GROUP_UPDATE_ATTR);
+            resource.getAttributes().remove(GROUP_CLEANUP_ATTEMPTS_ATTR);
+        }
+    }
+
+    @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        if (!RECORD_SET_GROUP.equals(resource.getResourceType())) {
+            return false;
+        }
+        Map<String, String> prior = groupUpdate(resource);
+        if (prior == null) {
+            return true;
+        }
+        if (hasReplacementUpdate(resource)) {
+            deleteRecordSetGroup(resource);
+        } else {
+            List<Map<String, Object>> changes = new ArrayList<>();
+            for (ResourceRecordSet current : groupRecords(resource)) {
+                changes.add(Map.of("action", "DELETE", "rrs", current));
+            }
+            for (ResourceRecordSet record : groupRecords(prior)) {
+                changes.add(Map.of("action", "CREATE", "rrs", record));
+            }
+            route53Service.changeResourceRecordSets(prior.get(RECORD_ZONE_ATTR), changes,
+                    "CloudFormation rollback " + resource.getLogicalId());
+        }
+        resource.getAttributes().clear();
+        resource.getAttributes().putAll(prior);
+        return true;
     }
 
     /**
@@ -335,6 +523,8 @@ public class Route53CfnProvisioner implements CfnResourceProvisioner {
     public void delete(StackResource resource, String region) {
         if (RECORD_SET.equals(resource.getResourceType())) {
             deleteRecordSet(resource);
+        } else if (RECORD_SET_GROUP.equals(resource.getResourceType())) {
+            deleteRecordSetGroup(resource);
         } else {
             delete(resource.getResourceType(), resource.getPhysicalId(), region);
         }
@@ -347,7 +537,7 @@ public class Route53CfnProvisioner implements CfnResourceProvisioner {
             // The record's zone and type live on the StackResource, not the physical id, so the
             // id-only path has nothing to match a DELETE change against; delete(resource, region)
             // is the real removal.
-            case "AWS::Route53::RecordSet" -> LOG.warnv(
+            case "AWS::Route53::RecordSet", "AWS::Route53::RecordSetGroup" -> LOG.warnv(
                     "No delete from the physical id alone for resource type {0}: {1} is removed via "
                             + "delete(resource, region).", resourceType, physicalId);
             default -> throw new IllegalStateException(
