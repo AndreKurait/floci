@@ -208,6 +208,48 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void systemTagDeletionOnlyRemovesTheExpectedGroup() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Tag membership = new Tag("aws:autoscaling:groupName", "group-a");
+        Tag userTag = new Tag("env", "test");
+        Instance instance = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(membership, userTag), null, null)
+                .getInstances().getFirst();
+        List<String> ids = List.of(instance.getInstanceId());
+
+        service.deleteSystemTag("us-east-1", ids, membership.getKey(), "group-b");
+        assertEquals(List.of(membership, userTag), instance.getTags());
+        service.deleteSystemTag("us-east-1", ids, membership.getKey(), "group-a");
+        assertEquals(List.of(userTag), instance.getTags());
+    }
+
+    @Test
+    void pruningTerminatedInstancesDeletesTheirTagsAfterTheRetentionPeriod() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        List<Tag> instanceTags = List.of(new Tag("aws:autoscaling:groupName", "group"), new Tag("env", "test"));
+        List<Instance> launched = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                2, 2, null, List.of(), null, null, instanceTags, null, null).getInstances();
+        Instance expired = launched.getFirst();
+        Instance retained = launched.getLast();
+        service.terminateInstances("us-east-1", List.of(expired.getInstanceId(), retained.getInstanceId()));
+        assertEquals(instanceTags, expired.getTags());
+        assertEquals(2, service.describeTags("us-east-1",
+                Map.of("resource-id", List.of(expired.getInstanceId()))).size());
+        expired.setTerminatedAt(System.currentTimeMillis() - 3_600_001L);
+
+        service.pruneTerminatedInstances();
+
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(expired.getInstanceId()))).isEmpty());
+        assertEquals(2, service.describeTags("us-east-1",
+                Map.of("resource-id", List.of(retained.getInstanceId()))).size());
+    }
+
+
+    @Test
     void createAndDescribeVpcsDoNotContactDockerEvenOnFirstUse() {
         EmulatorConfig config = mockConfig(false);
         EmulatorConfig.VpcNetworksConfig networks = mock(EmulatorConfig.VpcNetworksConfig.class);

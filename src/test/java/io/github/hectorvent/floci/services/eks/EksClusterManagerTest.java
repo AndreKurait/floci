@@ -1610,6 +1610,7 @@ class EksClusterManagerTest {
             assertEquals(2, capturedCmds.size());
             // First command: install probe
             assertTrue(capturedCmds.get(0)[2].contains("command -v socat"));
+            assertFalse(capturedCmds.get(0)[2].contains("iptables"));
             // Second command: start command with 169.254.169.254
             assertTrue(capturedCmds.get(1)[2].contains("169.254.169.254"));
             assertTrue(capturedCmds.get(1)[2].contains("TCP:floci-host:9169"));
@@ -1630,6 +1631,7 @@ class EksClusterManagerTest {
             assertEquals(3, capturedCmds.size());
             // First command: install probe
             assertTrue(capturedCmds.get(0)[2].contains("command -v socat"));
+            assertFalse(capturedCmds.get(0)[2].contains("iptables"));
             // Second command: start command with 169.254.169.254
             assertTrue(capturedCmds.get(1)[2].contains("169.254.169.254"));
             assertTrue(capturedCmds.get(1)[2].contains("TCP:floci-host:9169"));
