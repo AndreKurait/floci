@@ -5341,10 +5341,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
                          boolean amazonProvidedIpv6CidrBlock, String instanceTenancy) {
+        return createVpc(region, requestedCidrBlock, isDefault, amazonProvidedIpv6CidrBlock, instanceTenancy, false);
+    }
+
+    public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
+                         boolean amazonProvidedIpv6CidrBlock, String instanceTenancy, boolean dryRun) {
         // AWS stores the CIDR in canonical form: "100.68.0.18/18" becomes "100.68.0.0/18".
         String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
         rejectOutOfRangePrefix(cidrBlock, "InvalidVpc.Range");
         rejectReservedVpcRange(cidrBlock);
+        String tenancy = requireVpcTenancy(instanceTenancy);
+        requireNotDryRun(dryRun);
         ensureDefaultResources(region);
         String vpcId = "vpc-" + randomHex(8);
         Vpc vpc = new Vpc();
@@ -5352,7 +5359,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         vpc.setCidrBlock(cidrBlock);
         vpc.setState("available");
         vpc.setDefault(isDefault);
-        vpc.setInstanceTenancy(requireVpcTenancy(instanceTenancy));
+        vpc.setInstanceTenancy(tenancy);
         vpc.setOwnerId(callerAccountId());
         vpc.setRegion(region);
         vpc.getCidrBlockAssociationSet().add(
@@ -6562,12 +6569,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Subnet createSubnet(String region, String vpcId, String requestedCidrBlock, String availabilityZone,
                                String availabilityZoneId, String ipv6CidrBlock) {
+        return createSubnet(region, vpcId, requestedCidrBlock, availabilityZone, availabilityZoneId, ipv6CidrBlock, false);
+    }
+
+    public Subnet createSubnet(String region, String vpcId, String requestedCidrBlock, String availabilityZone,
+                               String availabilityZoneId, String ipv6CidrBlock, boolean dryRun) {
         // Canonical form, as AWS stores it; null (an IPv6-only subnet) stays null.
         String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
         if (vpcId == null || vpcId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter VpcId", 400);
         }
-        ensureDefaultResources(region);
+        if (!dryRun) {
+            ensureDefaultResources(region);
+        }
         Vpc vpc = getRequiredVpc(region, vpcId);
         if (ipv6CidrBlock != null && !ipv6CidrBlock.isBlank() && !vpcHasAssociatedIpv6CidrBlock(vpc)) {
             throw new AwsException("InvalidParameterValue",
@@ -6606,6 +6620,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             synchronized (lockFor(key(region, vpcId))) {
                 rejectSubnetCidrOutsideVpc(currentVpc, cidrBlock);
                 rejectConflictingSubnetCidr(region, vpcId, cidrBlock);
+                requireNotDryRun(dryRun);
                 subnets.put(key(region, subnetId), subnet);
             }
         }
@@ -6800,7 +6815,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // ─── Security Groups ───────────────────────────────────────────────────────
 
     public SecurityGroup createSecurityGroup(String region, String groupName, String description, String vpcId) {
-        ensureDefaultResources(region);
+        return createSecurityGroup(region, groupName, description, vpcId, false);
+    }
+
+    public SecurityGroup createSecurityGroup(String region, String groupName, String description, String vpcId,
+                                             boolean dryRun) {
+        // An implicit default VPC is lazily seeded on a normal call; DryRun must not seed it.
+        if (dryRun && (vpcId == null || vpcId.isEmpty())
+                && !seededAccountRegions.contains(callerAccountId() + "::" + region)
+                && vpcs.scan(k -> k.startsWith(region + "::")).isEmpty()) {
+            if ("default".equals(groupName)) {
+                throw new AwsException("InvalidGroup.Duplicate",
+                        "The security group '" + groupName + "' already exists", 400);
+            }
+            requireNotDryRun(true);
+        }
+        if (!dryRun) {
+            ensureDefaultResources(region);
+        }
         if (vpcId != null && !vpcId.isEmpty()) {
             getRequiredVpc(region, vpcId);
         } else {
@@ -6829,6 +6861,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         sg.getIpPermissionsEgress().add(egressAll);
         synchronized (attachmentTopologyLock(region)) {
             getRequiredVpc(region, sg.getVpcId());
+            requireNotDryRun(dryRun);
             securityGroups.put(key(region, sgId), sg);
         }
         // Persist the default egress rule as a SecurityGroupRule so that
