@@ -156,6 +156,80 @@ class StepFunctionsValidateStateMachineDefinitionIntegrationTest {
                 .when().post("/");
     }
 
+    @ParameterizedTest
+    @MethodSource("unsupportedApiHeaders")
+    void apiGatewayReservedHeadersFailBeforeCreation(String header, boolean jsonata) {
+        String definition = apiHeaderDefinition(header, jsonata);
+        String field = jsonata ? "Arguments" : "Parameters";
+        String message = "The 'Headers' field contains unsupported values: ["
+                + header.toLowerCase(java.util.Locale.ROOT) + "]";
+        validateDefinition(definition).then().statusCode(200)
+                .body("result", equalTo("FAIL"))
+                .body("diagnostics[0].code", equalTo("SCHEMA_VALIDATION_FAILED"))
+                .body("diagnostics[0].message", equalTo(message))
+                .body("diagnostics[0].location", equalTo("/States/Call/" + field));
+        createStateMachine("invalid-header-" + System.nanoTime(), definition).then().statusCode(400)
+                .body("__type", equalTo("InvalidDefinition"))
+                .body("message", containsString(message));
+    }
+
+    static Stream<Arguments> unsupportedApiHeaders() {
+        return Stream.of("Expect", "expect", "eXpEcT", "Upgrade", "upgrade", "UPGRADE")
+                .flatMap(header -> Stream.of(Arguments.of(header, false), Arguments.of(header, true)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("supportedApiHeaders")
+    void apiGatewayOrdinaryHeadersRemainValid(String header) {
+        validateDefinition(apiHeaderDefinition(header, false)).then().statusCode(200)
+                .body("result", equalTo("OK")).body("diagnostics", hasSize(0));
+    }
+
+    static Stream<String> supportedApiHeaders() {
+        return Stream.of("X_Custom", "X-Expect", "Content-Type");
+    }
+
+    @Test
+    void apiGatewayHeaderValidationRecursesIntoParallelBranches() throws Exception {
+        String definition = OBJECT_MAPPER.writeValueAsString(Map.of("StartAt", "P", "States", Map.of("P",
+                Map.of("Type", "Parallel", "End", true,
+                        "Branches", List.of(OBJECT_MAPPER.readTree(apiHeaderDefinition("Expect", false)))))));
+        validateDefinition(definition).then().statusCode(200).body("result", equalTo("FAIL"))
+                .body("diagnostics[0].location", equalTo("/States/P/Branches[0]/States/Call/Parameters"));
+    }
+
+    @Test
+    void invalidApiHeaderUpdatePreservesTheStoredDefinition() {
+        String original = apiHeaderDefinition("X_Custom", false);
+        String arn = createStateMachine("header-update-" + System.nanoTime(), original)
+                .then().statusCode(200).extract().path("stateMachineArn");
+        try {
+            given().contentType(CT).header("X-Amz-Target", "AWSStepFunctions.UpdateStateMachine")
+                    .body(Map.of("stateMachineArn", arn, "definition", apiHeaderDefinition("Upgrade", false)))
+                    .post("/").then().statusCode(400).body("__type", equalTo("InvalidDefinition"));
+            given().contentType(CT).header("X-Amz-Target", "AWSStepFunctions.DescribeStateMachine")
+                    .body(Map.of("stateMachineArn", arn)).post("/").then().statusCode(200)
+                    .body("definition", equalTo(original));
+        } finally {
+            given().contentType(CT).header("X-Amz-Target", "AWSStepFunctions.DeleteStateMachine")
+                    .body(Map.of("stateMachineArn", arn)).post("/").then().statusCode(200);
+        }
+    }
+
+    private static String apiHeaderDefinition(String header, boolean jsonata) {
+        ObjectNode root = OBJECT_MAPPER.createObjectNode().put("StartAt", "Call");
+        if (jsonata) {
+            root.put("QueryLanguage", "JSONata");
+        }
+        ObjectNode task = root.putObject("States").putObject("Call");
+        task.put("Type", "Task").put("Resource", "arn:aws:states:::apigateway:invoke").put("End", true);
+        ObjectNode input = task.putObject(jsonata ? "Arguments" : "Parameters");
+        input.put("ApiEndpoint", "example.execute-api.us-east-2.amazonaws.com").put("Method", "POST")
+                .put("AuthType", "NO_AUTH");
+        input.putObject("Headers").putArray(header).add("test");
+        return root.toString();
+    }
+
     private static String distributedMapWithResultWriter(String resultWriter) {
         return """
                 {
