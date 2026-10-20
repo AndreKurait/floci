@@ -343,6 +343,16 @@ aws logs put-retention-policy \
 
 **Protocol:** Query (XML) and JSON 1.0 (both supported)
 
+JSON requests also accept the legacy `CloudWatchVersion20130116.` target prefix through the
+same metrics handler. Current clients use `GraniteServiceVersion20100801.`. The legacy
+prefix does not register a Smithy RPC v2 service or a CBOR target.
+
+JSON 1.0 `PutMetricData` accepts `Content-Encoding: gzip`, as documented in the
+[AWS API reference](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_PutMetricData.html).
+The decoded body is limited to 5 MiB, matching live AWS responses. Signature and IAM checks
+still run before decoding. Malformed gzip receives a controlled client error; AWS may instead
+return an empty server error. Other JSON operations retain their existing body handling.
+
 CloudWatch Query operations accept form-encoded POST requests and root GET requests with
 URL query parameters. GET uses the existing handlers, signature validation and IAM policy checks. A `monitoring`
 credential in the Authorization header or presigned URL selects CloudWatch, including
@@ -358,12 +368,20 @@ legacy `2009-05-15` API, which supports only `ListMetrics` and `GetMetricStatist
 An invalid version or action returns HTTP 404 `InvalidAction`; an absent action returns
 HTTP 404 `UnknownOperationException`. IAM policies use the `cloudwatch` action prefix.
 
-Query clients using `Version=2013-01-16` can use the shared `PutMetricAlarm`,
-`DescribeAlarms` and `DeleteAlarms` wire contract. This compatibility subset applies to
-both GET and POST, with the same storage, account/region scope and IAM checks as the current
-API. It does not implement the other operations of that version: `GetMetricData` and
-account-specific metric extensions remain unsupported. Explicit version/action combinations
-are validated through the same registration for both Query methods.
+Query clients using `Version=2013-01-16` route the common modeled operations through the
+same handlers as the current API, for both GET and POST. Implemented common operations
+include `ListMetrics`, `GetMetricStatistics`, `PutMetricAlarm`, `DescribeAlarms` and
+`DeleteAlarms`, with the same storage, account/region scope and IAM checks.
+Successful responses use the requested 2013 XML namespace.
+
+This is not complete legacy-version compatibility. Its `GetMetricData` input uses
+`Defaults` and `Metrics` instead of the current `MetricDataQueries` shape, so legacy
+JSON and Query requests return `UnsupportedOperation` rather than running the modern
+operation. Other unimplemented modeled operations, including `DescribeAlarmHistory`,
+also return `UnsupportedOperation`. The legacy target rejects modern metric streams,
+anomaly detection, dataset and resource-metrics APIs, alarm mute rules and contributors,
+OTel enrichment, managed insight rules, resource tags, `DescribeInsightRules` and
+`PutLogAlarm`. Unknown versions or operation names remain invalid.
 
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
 

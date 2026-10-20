@@ -29,6 +29,7 @@ class LambdaWebErrorPagesTest {
         assertEquals(237, length(LambdaWebErrorPages.ENDPOINT_MAX_ENV_THROTTLE));
         assertEquals(237, length(LambdaWebErrorPages.ENDPOINT_REQUEST_THROTTLE));
         assertEquals(180, LambdaWebErrorPages.MALFORMED_REQUEST_HTML.getBytes(StandardCharsets.UTF_8).length);
+        assertEquals(196, LambdaWebErrorPages.HEADER_TOO_LARGE_HTML.getBytes(StandardCharsets.UTF_8).length);
     }
 
     @Test

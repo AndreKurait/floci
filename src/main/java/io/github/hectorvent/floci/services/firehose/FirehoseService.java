@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescript
 import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.KinesisStreamSource;
 import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.S3Destination;
 import io.github.hectorvent.floci.services.firehose.model.Record;
+import io.github.hectorvent.floci.services.firehose.model.RedshiftDestination;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisRecord;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisShard;
@@ -111,6 +112,8 @@ public class FirehoseService implements ResourceProvider {
     private final Map<String, Map<String, String>> pendingSourceIterators = new ConcurrentHashMap<>();
     private final FirehoseParquetConverter parquetConverter;
     private final FirehoseLambdaTransformer lambdaTransformer;
+    // Serialises the read, version check, merge and write of a Redshift UpdateDestination per stream.
+    private final Map<String, Object> redshiftUpdateLocks = new ConcurrentHashMap<>();
     private final Clock clock;
     private final long tickIntervalSeconds;
     private final int flushRecordCount;
@@ -314,6 +317,19 @@ public class FirehoseService implements ResourceProvider {
     public String createDeliveryStream(String region, String accountId, String name, S3Destination s3Config,
                                        List<DeliveryStreamDescription.Tag> tags, String deliveryStreamType,
                                        KinesisStreamSource source) {
+        return createDeliveryStream(region, accountId, name, s3Config, null, tags, deliveryStreamType, source);
+    }
+
+    public String createDeliveryStream(String region, String name, S3Destination s3Config,
+                                       RedshiftDestination redshift, List<DeliveryStreamDescription.Tag> tags,
+                                       String deliveryStreamType, KinesisStreamSource source) {
+        return createDeliveryStream(region, regionResolver.getAccountId(), name, s3Config, redshift, tags,
+                deliveryStreamType, source);
+    }
+
+    public String createDeliveryStream(String region, String accountId, String name, S3Destination s3Config,
+                                       RedshiftDestination redshift, List<DeliveryStreamDescription.Tag> tags,
+                                       String deliveryStreamType, KinesisStreamSource source) {
         String streamKey = scopedKey(accountId, region, name);
         if (name == null || name.isEmpty() || name.length() > 64 || !name.matches("[a-zA-Z0-9_.-]+")) {
             throw new AwsException("InvalidArgumentException",
@@ -326,6 +342,10 @@ public class FirehoseService implements ResourceProvider {
         }
 
         validateBufferingHints(s3Config);
+        if (redshift != null) {
+            validateBufferingHints(redshift.getS3());
+            validateBufferingHints(redshift.getS3Backup());
+        }
         DataFormatConversionValidator.validateEffective(s3Config);
         ProcessingConfigurationValidator.validateEffective(s3Config);
         if (s3Config != null) {
@@ -342,7 +362,7 @@ public class FirehoseService implements ResourceProvider {
         if (source != null && source.getDeliveryStartTimestamp() == null) {
             source.setDeliveryStartTimestamp(Instant.now());
         }
-        DeliveryStreamDescription description = new DeliveryStreamDescription(name, arn, s3Config, source);
+        DeliveryStreamDescription description = new DeliveryStreamDescription(name, arn, s3Config, redshift, source);
         description.setAccountId(accountId);
         description.setTags(tags);
         if (deliveryStreamType != null && !deliveryStreamType.isBlank()) {
@@ -363,7 +383,15 @@ public class FirehoseService implements ResourceProvider {
         updateDestination(scopedKey(accountId, region, name), name, currentVersionId, destinationId, update);
     }
 
-    private void updateDestination(String streamKey, String name, String currentVersionId, String destinationId, S3Destination update) {
+    /** The stream an UpdateDestination call targets, with the destination it addresses. */
+    private record UpdateTarget(DeliveryStreamDescription stream, DeliveryStreamDescription.Destination destination) {}
+
+    /**
+     * The checks every UpdateDestination variant starts with, in the order AWS applies them: the stream exists, the
+     * caller holds its current version, and the destination id is the stream's destination.
+     */
+    private UpdateTarget resolveUpdateTarget(String streamKey, String name, String currentVersionId,
+                                             String destinationId) {
         DeliveryStreamDescription stream = streamGet(streamKey)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Delivery stream not found: " + name, 400));
         if (!stream.getVersionId().equals(currentVersionId)) {
@@ -378,9 +406,20 @@ public class FirehoseService implements ResourceProvider {
             throw new AwsException("InvalidArgumentException",
                     "Destination Id " + destinationId + " not found", 400);
         }
+        return new UpdateTarget(stream, destination);
+    }
+
+    private void updateDestination(String streamKey, String name, String currentVersionId, String destinationId, S3Destination update) {
+        UpdateTarget target = resolveUpdateTarget(streamKey, name, currentVersionId, destinationId);
+        DeliveryStreamDescription stream = target.stream();
+        DeliveryStreamDescription.Destination destination = target.destination();
         if (update == null) {
             throw new AwsException("InvalidArgumentException",
                     "A destination update is required for UpdateDestination.", 400);
+        }
+        if (destination.getRedshiftDestinationDescription() != null) {
+            throw new AwsException("InvalidArgumentException",
+                    "The delivery stream " + name + " has a Redshift destination; use RedshiftDestinationUpdate.", 400);
         }
         validateBufferingHints(update);
         S3Destination current = destination.getExtendedS3DestinationDescription();
@@ -409,6 +448,87 @@ public class FirehoseService implements ResourceProvider {
         stream.setLastUpdateTimestamp(java.time.Instant.now());
         streamPut(streamKey, stream);
         LOG.infov("Updated destination {0} of Firehose delivery stream {1}", destinationId, name);
+    }
+
+    public void updateRedshiftDestination(String name, String currentVersionId, String destinationId,
+                                          RedshiftDestination update) {
+        String streamKey = scopedKey(name);
+        synchronized (redshiftUpdateLocks.computeIfAbsent(streamKey, k -> new Object())) {
+            UpdateTarget target = resolveUpdateTarget(streamKey, name, currentVersionId, destinationId);
+            DeliveryStreamDescription stream = target.stream();
+            RedshiftDestination current = target.destination().getRedshiftDestinationDescription();
+            if (current == null) {
+                throw new AwsException("InvalidArgumentException",
+                        "The delivery stream " + name + " does not have a Redshift destination.", 400);
+            }
+            RedshiftDestinationValidator.validateBackupTransition(current.getS3BackupMode(), update.getS3BackupMode());
+            String effectiveBackupMode = update.getS3BackupMode() != null
+                    ? update.getS3BackupMode() : current.getS3BackupMode();
+            if ("Enabled".equals(effectiveBackupMode) && update.getS3Backup() == null && current.getS3Backup() == null) {
+                throw new AwsException("InvalidArgumentException",
+                        "S3BackupMode is Enabled but no S3 backup configuration is set.", 400);
+            }
+            validateBufferingHints(update.getS3());
+            validateBufferingHints(update.getS3Backup());
+            if (update.getS3Backup() != null && current.getS3Backup() == null) {
+                RedshiftDestinationValidator.validateNewBackup(update.getS3Backup(), "redshiftDestinationUpdate");
+            }
+            mergeRedshiftDestination(current, update);
+            stream.setVersionId(String.valueOf(parseVersionId(stream.getVersionId()) + 1));
+            stream.setLastUpdateTimestamp(Instant.now());
+            streamPut(streamKey, stream);
+            LOG.infov("Updated Redshift destination {0} of Firehose delivery stream {1}", destinationId, name);
+        }
+    }
+
+    /** Members present in the update replace the stored ones; absent members are kept. */
+    private static void mergeRedshiftDestination(RedshiftDestination current, RedshiftDestination update) {
+        if (update.getRoleArn() != null) {
+            current.setRoleArn(update.getRoleArn());
+        }
+        if (update.getClusterJdbcUrl() != null) {
+            current.setClusterJdbcUrl(update.getClusterJdbcUrl());
+        }
+        if (update.getUsername() != null) {
+            current.setUsername(update.getUsername());
+        }
+        if (update.getPassword() != null) {
+            current.setPassword(update.getPassword());
+        }
+        if (update.getCopyCommand() != null) {
+            current.setCopyCommand(update.getCopyCommand());
+        }
+        if (update.getRetryOptions() != null) {
+            current.setRetryOptions(update.getRetryOptions());
+        }
+        if (update.getS3BackupMode() != null) {
+            current.setS3BackupMode(update.getS3BackupMode());
+        }
+        if (update.getSecretsManagerConfiguration() != null) {
+            current.setSecretsManagerConfiguration(update.getSecretsManagerConfiguration());
+        }
+        if (update.getProcessingConfiguration() != null) {
+            current.setProcessingConfiguration(update.getProcessingConfiguration());
+        }
+        if (update.getCloudWatchLoggingOptions() != null) {
+            current.setCloudWatchLoggingOptions(update.getCloudWatchLoggingOptions());
+        }
+        if (update.getS3() != null) {
+            if (current.getS3() == null) {
+                update.getS3().applyDefaults();
+                current.setS3(update.getS3());
+            } else {
+                mergeDestination(current.getS3(), update.getS3());
+            }
+        }
+        if (update.getS3Backup() != null) {
+            if (current.getS3Backup() == null) {
+                update.getS3Backup().applyDefaults();
+                current.setS3Backup(update.getS3Backup());
+            } else {
+                mergeDestination(current.getS3Backup(), update.getS3Backup());
+            }
+        }
     }
 
     public void startDeliveryStreamEncryption(String name, String keyType, String keyArn) {
@@ -654,8 +774,13 @@ public class FirehoseService implements ResourceProvider {
 
     public void deleteDeliveryStream(String accountId, String region, String name) {
         String streamKey = scopedKey(accountId, region, name);
-        describeDeliveryStream(streamKey, name);
-        streamDelete(streamKey);
+        // Under the lock a Redshift update holds across its read and write: an update that read the stream just before
+        // this delete would otherwise write it back afterwards. The lock entry is kept, because removing it while an
+        // update waits on it would let a later caller take a second lock for the same stream.
+        synchronized (redshiftUpdateLocks.computeIfAbsent(streamKey, k -> new Object())) {
+            describeDeliveryStream(streamKey, name);
+            streamDelete(streamKey);
+        }
         // Pending records are discarded, not flushed: verified against real AWS
         // (2026-07-13, eu-west-1) — 3 records buffered under a 300s/5MB hint never
         // reached the bucket after DeleteDeliveryStream completed.

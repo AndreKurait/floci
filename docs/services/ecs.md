@@ -196,6 +196,11 @@ other case, the injected `FLUENT_HOST` (the router's container IP) must be reach
 config is written to `/fluent-bit/etc/fluent-bit.conf`. Fluentd config is
 written to `/fluentd/etc/fluent.conf` and uses `@type` (not `Name`) for output plugins; Floci
 does not inject an `endpoint` into Fluentd outputs.
+FireLens configuration archive uploads retry transient Docker connection failures up to six
+attempts, with exponential backoff starting at 500 ms. Each attempt sends the complete prebuilt
+archive through a fresh byte-backed stream, without a streaming pipe or writer thread.
+The router and application containers start only after the upload succeeds;
+permanent errors or exhausted retries follow the existing task-launch cleanup path.
 `config-file-type=s3` follows where ECS itself draws the line. `RegisterTaskDefinition` rejects
 it for a Fargate-compatible task definition, with `Fargate launch type does not support
 FirelensConfiguration config file from 's3'`, and rejects a `config-file-value` that is not an S3

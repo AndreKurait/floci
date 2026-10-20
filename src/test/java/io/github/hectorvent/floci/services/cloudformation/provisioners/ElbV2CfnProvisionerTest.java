@@ -62,6 +62,8 @@ class ElbV2CfnProvisionerTest {
             "arn:aws:elasticloadbalancing:us-east-1:000000000000:listener/app/web/50dc6c495c0c9188/f2f7dc8efc522ab2";
     private static final String RULE_ARN = LISTENER_ARN.replace(":listener/", ":listener-rule/") + "/9683b2d02a6cabee";
 
+    private static final List<String> TWO_SUBNETS = List.of("subnet-1", "subnet-2");
+
     private final ElbV2Service elb = mock(ElbV2Service.class);
     private final ElbV2CfnProvisioner provisioner = new ElbV2CfnProvisioner(elb);
     private final ObjectMapper mapper = new ObjectMapper();
@@ -82,6 +84,13 @@ class ElbV2CfnProvisionerTest {
         // tests use it just walks the array and calls resolve(...) per element, stubbed above.
         when(engine.resolveStringList(any())).thenCallRealMethod();
         return new ProvisionContext(engine, REGION, "000000000000", "my-stack", priorPhysicalId);
+    }
+
+    /** Load balancer properties given Subnets, which CreateLoadBalancer requires of every type. */
+    private static ObjectNode onTwoSubnets(ObjectNode props) {
+        ArrayNode subnets = props.putArray("Subnets");
+        TWO_SUBNETS.forEach(subnets::add);
+        return props;
     }
 
     private StackResource resource(String type, String logicalId) {
@@ -157,10 +166,10 @@ class ElbV2CfnProvisionerTest {
 
     @Test
     void anUnnamedLoadBalancerGetsAnElbSafeNameAndKeepsItOnUpdate() {
-        when(elb.createLoadBalancer(eq(REGION), anyString(), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
+        when(elb.createLoadBalancer(eq(REGION), anyString(), isNull(), isNull(), isNull(), eq(TWO_SUBNETS), anyList(), any()))
                 .thenAnswer(inv -> loadBalancer(inv.getArgument(1)));
         StackResource created = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Alb_With_Underscores");
-        provisioner.provision(created, mapper.createObjectNode(), ctx());
+        provisioner.provision(created, onTwoSubnets(mapper.createObjectNode()), ctx());
         String generated = created.getAttributes().get("LoadBalancerName");
         // 32 characters at most, [A-Za-z0-9-] only, so the underscores are stripped and the
         // descriptive part is cut to make room for the 8-character suffix.
@@ -169,10 +178,10 @@ class ElbV2CfnProvisionerTest {
 
         StackResource updated = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Alb_With_Underscores");
         updated.getAttributes().put("LoadBalancerName", generated);
-        provisioner.provision(updated, mapper.createObjectNode(), ctx(LB_ARN));
+        provisioner.provision(updated, onTwoSubnets(mapper.createObjectNode()), ctx(LB_ARN));
 
         verify(elb, org.mockito.Mockito.times(2)).createLoadBalancer(eq(REGION), eq(generated), isNull(), isNull(),
-                isNull(), anyList(), anyList(), any());
+                isNull(), eq(TWO_SUBNETS), anyList(), any());
     }
 
     @Test
@@ -342,12 +351,12 @@ class ElbV2CfnProvisionerTest {
     void aRenamedLoadBalancerIsReplacedAndTheOldOneCleanedUpUnlessRetained() {
         LoadBalancer renamed = loadBalancer("web-v2");
         renamed.setLoadBalancerArn(LB_ARN.replace("/web/", "/web-v2/"));
-        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
+        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), eq(TWO_SUBNETS), anyList(), any()))
                 .thenReturn(renamed);
 
         StackResource r = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Alb");
         r.getAttributes().put("LoadBalancerName", "web");
-        provisioner.provision(r, mapper.createObjectNode().put("Name", "web-v2"), ctx(LB_ARN));
+        provisioner.provision(r, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v2")), ctx(LB_ARN));
         assertEquals(renamed.getLoadBalancerArn(), r.getPhysicalId());
         assertEquals(LB_ARN, provisioner.updateCleanupPhysicalId(r));
         assertEquals(new UpdateCleanupResult(true, true, LB_ARN, 0, null), provisioner.completeUpdate(r));
@@ -356,7 +365,7 @@ class ElbV2CfnProvisionerTest {
         StackResource retained = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Alb");
         retained.setUpdateReplacePolicy("Retain");
         retained.getAttributes().put("LoadBalancerName", "web");
-        provisioner.provision(retained, mapper.createObjectNode().put("Name", "web-v2"), ctx(LB_ARN));
+        provisioner.provision(retained, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v2")), ctx(LB_ARN));
         assertNull(provisioner.updateCleanupPhysicalId(retained));
         assertEquals(new UpdateCleanupResult(true, true, LB_ARN, 0, null), provisioner.completeUpdate(retained));
         verify(elb, org.mockito.Mockito.times(1)).deleteLoadBalancer(REGION, LB_ARN);
@@ -711,14 +720,14 @@ class ElbV2CfnProvisionerTest {
     void aRollbackWhoseDeleteFailsStillPointsTheResourceAtThePriorAndPropagates() {
         LoadBalancer renamed = loadBalancer("web-v2");
         renamed.setLoadBalancerArn(LB_ARN.replace("/web/", "/web-v2/"));
-        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
+        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), eq(TWO_SUBNETS), anyList(), any()))
                 .thenReturn(renamed);
         doThrow(new AwsException("ResourceInUse", "listeners attached", 400))
                 .when(elb).deleteLoadBalancer(REGION, renamed.getLoadBalancerArn());
         StackResource r = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Alb");
         r.getAttributes().put("LoadBalancerName", "web");
         r.getAttributes().put("DNSName", "web-123.us-east-1.elb.amazonaws.com");
-        provisioner.provision(r, mapper.createObjectNode().put("Name", "web-v2"), ctx(LB_ARN));
+        provisioner.provision(r, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v2")), ctx(LB_ARN));
 
         AwsException e = assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
         assertEquals("ResourceInUse", e.getErrorCode());
@@ -743,12 +752,12 @@ class ElbV2CfnProvisionerTest {
         String orphanArn = LB_ARN.replace("/web/", "/web-v2/");
         LoadBalancer renamed = loadBalancer("web-v2");
         renamed.setLoadBalancerArn(orphanArn);
-        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
+        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), eq(TWO_SUBNETS), anyList(), any()))
                 .thenReturn(renamed);
         doThrow(new AwsException("ResourceInUse", "listeners attached", 400)).when(elb).deleteLoadBalancer(REGION, orphanArn);
         StackResource r = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Alb");
         r.getAttributes().put("LoadBalancerName", "web");
-        provisioner.provision(r, mapper.createObjectNode().put("Name", "web-v2"), ctx(LB_ARN));
+        provisioner.provision(r, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v2")), ctx(LB_ARN));
         assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
         assertEquals(LB_ARN, r.getPhysicalId());
 
@@ -766,9 +775,9 @@ class ElbV2CfnProvisionerTest {
         // A later replacement adds the prior to the same list; the committed cleanup deletes both.
         LoadBalancer third = loadBalancer("web-v3");
         third.setLoadBalancerArn(LB_ARN.replace("/web/", "/web-v3/"));
-        when(elb.createLoadBalancer(eq(REGION), eq("web-v3"), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
+        when(elb.createLoadBalancer(eq(REGION), eq("web-v3"), isNull(), isNull(), isNull(), eq(TWO_SUBNETS), anyList(), any()))
                 .thenReturn(third);
-        provisioner.provision(r, mapper.createObjectNode().put("Name", "web-v3"), ctx(LB_ARN));
+        provisioner.provision(r, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v3")), ctx(LB_ARN));
         org.mockito.Mockito.reset(elb);
         UpdateCleanupResult cleanup = provisioner.completeUpdate(r);
         assertTrue(cleanup.complete(), cleanup.toString());
@@ -783,18 +792,18 @@ class ElbV2CfnProvisionerTest {
         String orphanArn = LB_ARN.replace("/web/", "/web-v2/");
         LoadBalancer renamed = loadBalancer("web-v2");
         renamed.setLoadBalancerArn(orphanArn);
-        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
+        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), eq(TWO_SUBNETS), anyList(), any()))
                 .thenReturn(renamed);
         doThrow(new AwsException("ResourceInUse", "listeners attached", 400)).when(elb).deleteLoadBalancer(REGION, orphanArn);
         StackResource r = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Alb");
         r.getAttributes().put("LoadBalancerName", "web");
-        provisioner.provision(r, mapper.createObjectNode().put("Name", "web-v2"), ctx(LB_ARN));
+        provisioner.provision(r, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v2")), ctx(LB_ARN));
         assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
         LoadBalancer third = loadBalancer("web-v3");
         third.setLoadBalancerArn(LB_ARN.replace("/web/", "/web-v3/"));
-        when(elb.createLoadBalancer(eq(REGION), eq("web-v3"), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
+        when(elb.createLoadBalancer(eq(REGION), eq("web-v3"), isNull(), isNull(), isNull(), eq(TWO_SUBNETS), anyList(), any()))
                 .thenReturn(third);
-        provisioner.provision(r, mapper.createObjectNode().put("Name", "web-v3"), ctx(LB_ARN));
+        provisioner.provision(r, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v3")), ctx(LB_ARN));
 
         // The orphan keeps failing; the prior is deleted on the first pass all the same, and the
         // failing entry is reported with its own attempt count until the engine gives up.
@@ -816,12 +825,12 @@ class ElbV2CfnProvisionerTest {
         String orphanArn = LB_ARN.replace("/web/", "/web-v2/");
         LoadBalancer renamed = loadBalancer("web-v2");
         renamed.setLoadBalancerArn(orphanArn);
-        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
+        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), eq(TWO_SUBNETS), anyList(), any()))
                 .thenReturn(renamed);
         doThrow(new AwsException("ResourceInUse", "listeners attached", 400)).when(elb).deleteLoadBalancer(REGION, orphanArn);
         StackResource r = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Alb");
         r.getAttributes().put("LoadBalancerName", "web");
-        provisioner.provision(r, mapper.createObjectNode().put("Name", "web-v2"), ctx(LB_ARN));
+        provisioner.provision(r, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v2")), ctx(LB_ARN));
         assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
         // The orphan uses up its three attempts in a cleanup where it is the only entry.
         for (int i = 0; i < 3; i++) {
@@ -832,9 +841,9 @@ class ElbV2CfnProvisionerTest {
         // A later replacement lists the prior beside the exhausted orphan; its delete fails once.
         LoadBalancer third = loadBalancer("web-v3");
         third.setLoadBalancerArn(LB_ARN.replace("/web/", "/web-v3/"));
-        when(elb.createLoadBalancer(eq(REGION), eq("web-v3"), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
+        when(elb.createLoadBalancer(eq(REGION), eq("web-v3"), isNull(), isNull(), isNull(), eq(TWO_SUBNETS), anyList(), any()))
                 .thenReturn(third);
-        provisioner.provision(r, mapper.createObjectNode().put("Name", "web-v3"), ctx(LB_ARN));
+        provisioner.provision(r, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v3")), ctx(LB_ARN));
         doThrow(new AwsException("ResourceInUse", "listeners attached", 400)).when(elb).deleteLoadBalancer(REGION, LB_ARN);
         UpdateCleanupResult first = provisioner.completeUpdate(r);
         assertFalse(first.complete());
@@ -857,12 +866,12 @@ class ElbV2CfnProvisionerTest {
         String orphanArn = LB_ARN.replace("/web/", "/web-v2/");
         LoadBalancer renamed = loadBalancer("web-v2");
         renamed.setLoadBalancerArn(orphanArn);
-        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
+        when(elb.createLoadBalancer(eq(REGION), eq("web-v2"), isNull(), isNull(), isNull(), eq(TWO_SUBNETS), anyList(), any()))
                 .thenReturn(renamed);
         doThrow(new AwsException("ResourceInUse", "listeners attached", 400)).when(elb).deleteLoadBalancer(REGION, orphanArn);
         StackResource r = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Alb");
         r.getAttributes().put("LoadBalancerName", "web");
-        provisioner.provision(r, mapper.createObjectNode().put("Name", "web-v2"), ctx(LB_ARN));
+        provisioner.provision(r, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v2")), ctx(LB_ARN));
         assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
         provisioner.completeUpdate(r);
 

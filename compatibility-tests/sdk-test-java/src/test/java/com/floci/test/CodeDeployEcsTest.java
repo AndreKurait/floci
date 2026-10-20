@@ -112,7 +112,8 @@ class CodeDeployEcsTest {
         CreateLoadBalancerResponse resp = elb.createLoadBalancer(r -> r
                 .name(LB_NAME)
                 .type(LoadBalancerTypeEnum.APPLICATION)
-                .ipAddressType(IpAddressType.IPV4));
+                .ipAddressType(IpAddressType.IPV4)
+                .subnets(TestFixtures.defaultVpcSubnets()));
 
         assertThat(resp.loadBalancers()).hasSize(1);
         lbArn = resp.loadBalancers().get(0).loadBalancerArn();

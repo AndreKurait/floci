@@ -8096,12 +8096,14 @@ class CloudFormationIntegrationTest {
     @Test
     void updateStack_elbV2Listener_modifiesPort() {
         String stackName = "cfn-elbv2-update-stack";
+        String subnetA = Ec2Service.defaultSubnetId("us-east-1", "a");
+        String subnetB = Ec2Service.defaultSubnetId("us-east-1", "b");
         String template = """
             {
               "Resources": {
                 "Alb": {
                   "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
-                  "Properties": { "Name": "cfn-upd-alb", "Type": "application" }
+                  "Properties": { "Name": "cfn-upd-alb", "Type": "application", "Subnets": ["%s", "%s"] }
                 },
                 "Listener": {
                   "Type": "AWS::ElasticLoadBalancingV2::Listener",
@@ -8132,7 +8134,7 @@ class CloudFormationIntegrationTest {
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "CreateStack")
             .formParam("StackName", stackName)
-            .formParam("TemplateBody", template.formatted(80))
+            .formParam("TemplateBody", template.formatted(subnetA, subnetB, 80))
         .when()
             .post("/")
         .then()
@@ -8164,7 +8166,7 @@ class CloudFormationIntegrationTest {
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "UpdateStack")
             .formParam("StackName", stackName)
-            .formParam("TemplateBody", template.formatted(8080))
+            .formParam("TemplateBody", template.formatted(subnetA, subnetB, 8080))
         .when()
             .post("/")
         .then()
@@ -8192,7 +8194,7 @@ class CloudFormationIntegrationTest {
               "Resources": {
                 "Alb": {
                   "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
-                  "Properties": { "Name": "cfn-del-alb", "Type": "application" }
+                  "Properties": { "Name": "cfn-del-alb", "Type": "application", "Subnets": ["%s", "%s"] }
                 },
                 "Tg": {
                   "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
@@ -8217,7 +8219,7 @@ class CloudFormationIntegrationTest {
                 }
               }
             }
-            """;
+            """.formatted(Ec2Service.defaultSubnetId("us-east-1", "a"), Ec2Service.defaultSubnetId("us-east-1", "b"));
 
         given()
             .contentType("application/x-www-form-urlencoded")

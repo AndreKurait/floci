@@ -29,6 +29,9 @@ The tagging operations work on application ARNs, as `CreateApplication` returns 
 stores, so `GetApplication` always reports the current set. Following the EMR Serverless user guide, a
 resource holds at most 50 tags, and `aws:` in any case is reserved as the prefix of a tag key or value.
 
+Applications, creation client tokens, and application tags are scoped to the request's AWS Region.
+An application created in one Region is not returned by list, get, or tag requests signed for another.
+
 ## Limitations and Differences from AWS
 
 * **Jobs not implemented**: Floci supports the provisioning of the `Application` management plane (which satisfies tools like Terraform's `aws_emrserverless_application` resource). Executing actual Spark or Hive jobs against these applications via `StartJobRun` is not currently implemented.

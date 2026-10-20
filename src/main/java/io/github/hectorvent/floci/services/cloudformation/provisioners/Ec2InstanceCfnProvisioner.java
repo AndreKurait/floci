@@ -1,6 +1,9 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
@@ -19,6 +22,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -39,6 +43,19 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
     // The instance profile the template declared last time, so an update that drops the property
     // can be told from one that never declared it (a launch template may have set the profile).
     private static final String DECLARED_IAM_PROFILE_ATTR = "__FlociDeclaredIamInstanceProfile";
+    // The MetadataOptions members declared last time, the instance's own or its launch template's, so
+    // an update can return the ones it no longer declares to their launch defaults.
+    private static final String DECLARED_METADATA_OPTIONS_ATTR = "__FlociDeclaredMetadataOptions";
+    // The __FlociDeclared records as they stood before a replacing update, for rollbackUpdate to put
+    // back with the instance it restores; ReplacementCleanup leaves __Floci attributes alone.
+    private static final String PRIOR_DECLARATIONS_ATTR = "__FlociPriorDeclarations";
+    // What an update that kept the instance changed it from: its region, its MetadataOptions if the
+    // update changed them, its __FlociDeclared records, and whether the update also changed
+    // something with no rollback here (type, groups, user data, profile, tags), for rollbackUpdate
+    // to put back.
+    private static final String PRIOR_IN_PLACE_ATTR = "__FlociPriorInPlaceUpdate";
+    private static final String DECLARED_PREFIX = "__FlociDeclared";
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final Ec2Service ec2Service;
     /** How long {@link #delete} waits for a terminated instance; package-visible so tests can shorten it. */
@@ -74,6 +91,7 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
         // Only look one up when the property actually names a template. An Fn::If that selects
         // AWS::NoValue resolves to an empty node here, which on AWS means the property is absent
         // (launch without a template), so it must not turn into an InvalidLaunchTemplateId.NotFound.
+        LaunchTemplateData.MetadataOptions templateMetadataOptions = null;
         if (ltRef != null && ltRef.isObject() && (ltId != null || ltName != null)) {
             // A LaunchTemplate the stack references but that does not resolve is a real error, as on
             // AWS: let it fail the resource rather than silently launching with default config.
@@ -88,7 +106,17 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
             if (keyName == null || keyName.isBlank()) {
                 keyName = ltData.getKeyName();
             }
+            templateMetadataOptions = ltData.getMetadataOptions();
         }
+        // The instance's own MetadataOptions win member by member over its template's, as
+        // RunInstances merges a request over the launch template it names.
+        LaunchTemplateData.MetadataOptions metadataOptions = Ec2CfnMetadataOptions.over(templateMetadataOptions,
+                props != null ? Ec2CfnMetadataOptions.read("MetadataOptions", props.get("MetadataOptions"),
+                        Ec2CfnMetadataOptions.INSTANCE_SHAPE, engine) : null);
+        // Checked before anything changes: a reused instance gets its options last, after its
+        // type, groups, user data, profile and tags, so a bad value found there would leave it half
+        // updated.
+        Ec2Service.validateMetadataOptions(metadataOptions);
         if (instanceType == null || instanceType.isBlank()) {
             instanceType = "t3.micro";
         }
@@ -106,21 +134,41 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
         // them), as does a changed PrivateIpAddress or AvailabilityZone (compared against the value
         // declared last time, since the launch does not apply those to the instance). A mutable-only
         // change (tags, and the like) reuses it. Launching unconditionally would leak the prior
-        // instance every update.
+        // instance every update. A changed LaunchTemplate reuses it too, where AWS replaces the
+        // instance: the change-set preview and the template's own versioning would have to agree on
+        // that property first. What the template declares is reconciled in place instead, unless
+        // the ImageId or KeyName it supplies changed, which replaces the instance as above.
         Instance prior = ctx.isUpdate() ? findInstance(region, ctx.priorPhysicalId()) : null;
         if (prior != null && !createOnlyChanged(prior, imageId, subnetId, keyName)
                 && !declaredCreateOnlyChanged(attributesBefore, privateIpAddress, availabilityZone)) {
             // A reused instance still has its mutable properties reconciled to the template rather
             // than left at their prior values; re-read it so the published attributes reflect them.
-            reconcileMutableProperties(region, prior, instanceType, securityGroupIds, userData,
-                    iamInstanceProfileArn, attributesBefore.get(DECLARED_IAM_PROFILE_ATTR));
+            LaunchTemplateData.MetadataOptions metadataOptionsToApply = Ec2CfnMetadataOptions.toApply(
+                    Ec2CfnMetadataOptions.parseDeclaredMembers(attributesBefore.get(DECLARED_METADATA_OPTIONS_ATTR)),
+                    metadataOptions);
+            LaunchTemplateData.MetadataOptions optionsBefore = prior.effectiveMetadataOptions();
+            boolean metadataOptionsChange = metadataOptionsToApply != null
+                    && Ec2CfnMetadataOptions.changes(optionsBefore, metadataOptionsToApply);
+            boolean otherChange = reconcileMutableProperties(region, prior, instanceType, securityGroupIds,
+                    userData, iamInstanceProfileArn, attributesBefore.get(DECLARED_IAM_PROFILE_ATTR));
+            boolean tagsChanged = Ec2Tags.reconcile(ec2Service, region, prior.getInstanceId(), desiredTags);
+            // Saved on every update that keeps the instance, also one that changes no EC2 setting but
+            // only what is declared, so a rollback can always put the declarations back.
+            r.getAttributes().put(PRIOR_IN_PLACE_ATTR, priorInPlaceUpdate(region,
+                    metadataOptionsChange ? optionsBefore : null, attributesBefore, otherChange || tagsChanged));
+            if (metadataOptionsChange) {
+                // The last change the step makes: when an earlier one fails, the engine restores the
+                // resource as it was, without the record saved above, so the options must not have
+                // changed yet.
+                ec2Service.modifyInstanceMetadataOptions(region, prior.getInstanceId(), metadataOptionsToApply);
+            }
             Instance reconciled = findInstance(region, prior.getInstanceId());
             Instance current = reconciled != null ? reconciled : prior;
             r.setPhysicalId(current.getInstanceId());
             publishInstanceAttributes(r, current);
             storeDeclaredCreateOnly(r, privateIpAddress, availabilityZone);
             putOrRemove(r, DECLARED_IAM_PROFILE_ATTR, iamInstanceProfileArn);
-            Ec2Tags.reconcile(ec2Service, region, current.getInstanceId(), desiredTags);
+            putOrRemove(r, DECLARED_METADATA_OPTIONS_ATTR, Ec2CfnMetadataOptions.declaredMembers(metadataOptions));
             ReplacementCleanup.record(r, ctx, attributesBefore);
             return;
         }
@@ -138,9 +186,13 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
             }
         }
 
+        r.getAttributes().remove(PRIOR_IN_PLACE_ATTR);
+        if (ctx.isUpdate()) {
+            r.getAttributes().put(PRIOR_DECLARATIONS_ATTR, declarations(attributesBefore));
+        }
         Reservation reservation = ec2Service.runInstances(region, imageId, instanceType, 1, 1, keyName,
                 securityGroupIds, subnetId, null, tags, userData, iamInstanceProfileArn,
-                associatePublicIp);
+                associatePublicIp, null, 0, null, metadataOptions);
         Instance instance = reservation.getInstances().get(0);
         r.setPhysicalId(instance.getInstanceId());
         r.getAttributes().put("InstanceId", instance.getInstanceId());
@@ -153,6 +205,7 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
         publishInstanceAttributes(r, launched != null ? launched : instance);
         storeDeclaredCreateOnly(r, privateIpAddress, availabilityZone);
         putOrRemove(r, DECLARED_IAM_PROFILE_ATTR, iamInstanceProfileArn);
+        putOrRemove(r, DECLARED_METADATA_OPTIONS_ATTR, Ec2CfnMetadataOptions.declaredMembers(metadataOptions));
         // A createOnly change that landed a new instance id replaced the prior one: record it so
         // the stack cleans the displaced instance up after the update commits.
         ReplacementCleanup.record(r, ctx, attributesBefore);
@@ -216,22 +269,29 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
      * "some interruptions" the property is documented with), and a changed IamInstanceProfile is
      * associated or replaced, or disassociated when the template declared one last time and drops it
      * now. Only a declared SecurityGroupIds or UserData is reconciled, so a template that omits them
-     * does not strip what the instance already has (a launch template may have set it).
+     * does not strip what the instance already has (a launch template may have set it). Returns
+     * whether it changed anything, which a stack rollback has no way to put back here. MetadataOptions
+     * is applied after it, as the property's "No interruption" update allows, by the caller, which
+     * keeps what it replaces for {@link #rollbackUpdate}.
      */
-    private void reconcileMutableProperties(String region, Instance prior, String instanceType,
-                                            List<String> securityGroupIds, String userData,
-                                            String iamInstanceProfileArn, String priorDeclaredProfileArn) {
+    private boolean reconcileMutableProperties(String region, Instance prior, String instanceType,
+                                               List<String> securityGroupIds, String userData,
+                                               String iamInstanceProfileArn, String priorDeclaredProfileArn) {
+        boolean changed = false;
         if (instanceType != null && !instanceType.isBlank()
                 && !instanceType.equals(prior.getInstanceType())) {
             ec2Service.modifyInstanceAttribute(region, prior.getInstanceId(), "instanceType", instanceType);
+            changed = true;
         }
         if (!securityGroupIds.isEmpty() && !sameSecurityGroups(prior, securityGroupIds)) {
             ec2Service.modifyInstanceGroups(region, prior.getInstanceId(), securityGroupIds);
+            changed = true;
         }
         if (userData != null && !userData.equals(prior.getUserData())) {
             rewriteUserData(region, prior, userData);
+            changed = true;
         }
-        reconcileIamInstanceProfile(region, prior, iamInstanceProfileArn, priorDeclaredProfileArn);
+        return reconcileIamInstanceProfile(region, prior, iamInstanceProfileArn, priorDeclaredProfileArn) || changed;
     }
 
     /**
@@ -253,19 +313,24 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
         }
     }
 
-    private void reconcileIamInstanceProfile(String region, Instance prior, String desiredArn,
-                                             String priorDeclaredArn) {
+    /** Returns whether it changed the instance's profile. */
+    private boolean reconcileIamInstanceProfile(String region, Instance prior, String desiredArn,
+                                                String priorDeclaredArn) {
         String currentArn = prior.getIamInstanceProfileArn();
         String associationId = Ec2Service.iamInstanceProfileAssociationId(prior.getInstanceId());
         if (desiredArn != null) {
             if (currentArn == null) {
                 ec2Service.associateIamInstanceProfile(region, prior.getInstanceId(), desiredArn);
+                return true;
             } else if (!desiredArn.equals(currentArn)) {
                 ec2Service.replaceIamInstanceProfileAssociation(region, associationId, desiredArn);
+                return true;
             }
         } else if (priorDeclaredArn != null && currentArn != null) {
             ec2Service.disassociateIamInstanceProfile(region, associationId);
+            return true;
         }
+        return false;
     }
 
     private String resolveIamInstanceProfileArn(String nameOrArn) {
@@ -383,17 +448,138 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
+        resource.getAttributes().remove(PRIOR_DECLARATIONS_ATTR);
+        resource.getAttributes().remove(PRIOR_IN_PLACE_ATTR);
         return ReplacementCleanup.complete(resource, this::delete);
     }
 
     @Override
     public void clearUpdate(StackResource resource) {
+        resource.getAttributes().remove(PRIOR_DECLARATIONS_ATTR);
+        resource.getAttributes().remove(PRIOR_IN_PLACE_ATTR);
         ReplacementCleanup.clear(resource);
     }
 
+    /**
+     * Undoes a replacement through the cleanup record, and puts back the {@code __FlociDeclared}
+     * records of the instance it restores, so a retried update compares against what that instance
+     * was declared with. The cleanup names the prior instance again before it deletes the
+     * replacement, so when that delete throws the records go back too: a rollback that then skips
+     * this resource, or is forced, never calls here again.
+     */
     @Override
     public boolean rollbackUpdate(StackResource resource) {
-        return ReplacementCleanup.rollback(resource, this::delete);
+        String physicalIdBefore = resource.getPhysicalId();
+        boolean replaced;
+        try {
+            replaced = ReplacementCleanup.rollback(resource, this::delete);
+        } catch (RuntimeException e) {
+            if (!Objects.equals(physicalIdBefore, resource.getPhysicalId())) {
+                try {
+                    restoreSavedDeclarations(resource);
+                } catch (RuntimeException restoreFailure) {
+                    e.addSuppressed(restoreFailure);
+                }
+            }
+            throw e;
+        }
+        if (replaced) {
+            restoreSavedDeclarations(resource);
+            resource.getAttributes().remove(PRIOR_IN_PLACE_ATTR);
+        }
+        resource.getAttributes().remove(PRIOR_DECLARATIONS_ATTR);
+        return replaced || restoreInPlaceUpdate(resource);
+    }
+
+    /**
+     * Undoes an update that kept the instance: puts back the MetadataOptions it changed, if it
+     * changed any, and the instance's {@code __FlociDeclared} records, so a stack rollback leaves
+     * neither options nor declarations the stack no longer has. The rollback counts as done only
+     * when nothing else changed in that update: the instance type, groups, user data, profile and
+     * tags have no rollback here, and the stack says so for them. An update that changed no EC2
+     * setting at all, only what is declared, is undone in full.
+     */
+    private boolean restoreInPlaceUpdate(StackResource resource) {
+        String saved = resource.getAttributes().get(PRIOR_IN_PLACE_ATTR);
+        if (saved == null) {
+            return false;
+        }
+        JsonNode prior;
+        try {
+            prior = MAPPER.readTree(saved);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Could not read the saved in-place update of " + resource.getLogicalId(), e);
+        }
+        JsonNode options = prior.path("options");
+        if (options.isObject()) {
+            LaunchTemplateData.MetadataOptions restored = new LaunchTemplateData.MetadataOptions();
+            restored.setHttpTokens(options.path("HttpTokens").asText(null));
+            restored.setHttpEndpoint(options.path("HttpEndpoint").asText(null));
+            restored.setHttpProtocolIpv6(options.path("HttpProtocolIpv6").asText(null));
+            restored.setInstanceMetadataTags(options.path("InstanceMetadataTags").asText(null));
+            if (options.path("HttpPutResponseHopLimit").isInt()) {
+                restored.setHttpPutResponseHopLimit(options.path("HttpPutResponseHopLimit").intValue());
+            }
+            ec2Service.modifyInstanceMetadataOptions(prior.path("region").asText(), resource.getPhysicalId(), restored);
+        }
+        resource.getAttributes().keySet().removeIf(key -> key.startsWith(DECLARED_PREFIX));
+        prior.path("declarations").fields()
+                .forEachRemaining(e -> resource.getAttributes().put(e.getKey(), e.getValue().asText()));
+        resource.getAttributes().remove(PRIOR_IN_PLACE_ATTR);
+        return !prior.path("otherChanges").asBoolean(true);
+    }
+
+    /**
+     * What {@link #restoreInPlaceUpdate} needs, as a JSON object: {@code options} is the instance's
+     * MetadataOptions before the update, or null when the update left them as they were.
+     */
+    private static String priorInPlaceUpdate(String region, LaunchTemplateData.MetadataOptions options,
+                                             Map<String, String> attributesBefore, boolean otherChanges) {
+        ObjectNode saved = MAPPER.createObjectNode();
+        saved.put("region", region);
+        if (options != null) {
+            ObjectNode members = saved.putObject("options");
+            members.put("HttpTokens", options.getHttpTokens());
+            members.put("HttpPutResponseHopLimit", options.getHttpPutResponseHopLimit());
+            members.put("HttpEndpoint", options.getHttpEndpoint());
+            members.put("HttpProtocolIpv6", options.getHttpProtocolIpv6());
+            members.put("InstanceMetadataTags", options.getInstanceMetadataTags());
+        }
+        ObjectNode declared = saved.putObject("declarations");
+        attributesBefore.forEach((key, value) -> {
+            if (key.startsWith(DECLARED_PREFIX) && value != null) {
+                declared.put(key, value);
+            }
+        });
+        saved.put("otherChanges", otherChanges);
+        return saved.toString();
+    }
+
+    /** The {@code __FlociDeclared} attributes of {@code attributes}, as a JSON object. */
+    private static String declarations(Map<String, String> attributes) {
+        ObjectNode declared = MAPPER.createObjectNode();
+        attributes.forEach((key, value) -> {
+            if (key.startsWith(DECLARED_PREFIX) && value != null) {
+                declared.put(key, value);
+            }
+        });
+        return declared.toString();
+    }
+
+    /** Puts back the records {@link #declarations} saved, if any, and drops the saved copy. */
+    private static void restoreSavedDeclarations(StackResource resource) {
+        String saved = resource.getAttributes().remove(PRIOR_DECLARATIONS_ATTR);
+        if (saved == null) {
+            return;
+        }
+        JsonNode prior;
+        try {
+            prior = MAPPER.readTree(saved);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Could not read the saved declarations of " + resource.getLogicalId(), e);
+        }
+        resource.getAttributes().keySet().removeIf(key -> key.startsWith(DECLARED_PREFIX));
+        prior.fields().forEachRemaining(e -> resource.getAttributes().put(e.getKey(), e.getValue().asText()));
     }
 
     /**

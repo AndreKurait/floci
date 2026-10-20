@@ -1608,7 +1608,8 @@ public class Ec2QueryHandler {
         String cidrBlock = p.getFirst("CidrBlock");
         boolean amazonProvidedIpv6 = "true".equalsIgnoreCase(p.getFirst("AmazonProvidedIpv6CidrBlock"));
         List<Tag> vpcTags = parseTagsForResource(p, "vpc");
-        Vpc vpc = service.createVpc(region, cidrBlock, false, amazonProvidedIpv6, p.getFirst("InstanceTenancy"));
+        Vpc vpc = service.createVpc(region, cidrBlock, false, amazonProvidedIpv6,
+                p.getFirst("InstanceTenancy"), Boolean.parseBoolean(p.getFirst("DryRun")));
         applyResourceTags(vpcTags, region, vpc.getVpcId());
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateVpcResponse", AwsNamespaces.EC2)
@@ -3127,7 +3128,8 @@ public class Ec2QueryHandler {
         String azId = p.getFirst("AvailabilityZoneId");
         String ipv6CidrBlock = p.getFirst("Ipv6CidrBlock");
         List<Tag> tags = parseTagsForResource(p, "subnet", true);
-        Subnet subnet = service.createSubnet(region, vpcId, cidrBlock, az, azId, ipv6CidrBlock);
+        Subnet subnet = service.createSubnet(region, vpcId, cidrBlock, az, azId, ipv6CidrBlock,
+                Boolean.parseBoolean(p.getFirst("DryRun")));
         try {
             if (!tags.isEmpty()) {
                 service.createTags(region, List.of(subnet.getSubnetId()), tags);
@@ -3205,7 +3207,8 @@ public class Ec2QueryHandler {
         String groupName = requireParameter(p, "GroupName");
         String description = requireParameter(p, "GroupDescription");
         String vpcId = p.getFirst("VpcId");
-        SecurityGroup sg = service.createSecurityGroup(region, groupName, description, vpcId);
+        SecurityGroup sg = service.createSecurityGroup(region, groupName, description, vpcId,
+                Boolean.parseBoolean(p.getFirst("DryRun")));
         applyResourceTags(resourceTags, region, sg.getGroupId());
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateSecurityGroupResponse", AwsNamespaces.EC2)
@@ -3665,6 +3668,8 @@ public class Ec2QueryHandler {
     }
 
     private Response handleRegisterImage(MultivaluedMap<String, String> p, String region) {
+        List<Tag> imageTags = parseTagsForResource(p, "image", true);
+        Ec2Service.validateCreationTags(imageTags);
         Image image = service.registerImage(
                 region,
                 p.getFirst("Name"),
@@ -3672,6 +3677,7 @@ public class Ec2QueryHandler {
                 p.getFirst("Architecture"),
                 p.getFirst("RootDeviceName"),
                 parseBlockDeviceMappings(p));
+        applyResourceTags(imageTags, region, image.getImageId());
         XmlBuilder xml = new XmlBuilder()
                 .start("RegisterImageResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -3718,11 +3724,10 @@ public class Ec2QueryHandler {
      */
     private Response handleCopyImage(MultivaluedMap<String, String> p, String region) {
         if (p.containsKey("KmsKeyId") || Boolean.parseBoolean(p.getFirst("Encrypted"))
-                || Boolean.parseBoolean(p.getFirst("CopyImageTags"))
                 || p.keySet().stream().anyMatch(name -> name.startsWith("Destination")
                         || name.startsWith("TagSpecification") || name.equals("SnapshotCopyCompletionDurationMinutes"))) {
             throw new AwsException("UnsupportedOperation",
-                    "CopyImage supports regional copies without encryption, copy tags or placement options.", 400);
+                    "CopyImage supports regional copies without encryption, tag specifications or placement options.", 400);
         }
         Image image = service.copyImage(
                 region,
@@ -3730,7 +3735,8 @@ public class Ec2QueryHandler {
                 p.getFirst("SourceImageId"),
                 p.getFirst("Name"),
                 p.getFirst("Description"),
-                Boolean.parseBoolean(p.getFirst("DryRun")));
+                Boolean.parseBoolean(p.getFirst("DryRun")),
+                Boolean.parseBoolean(p.getFirst("CopyImageTags")));
         XmlBuilder xml = new XmlBuilder()
                 .start("CopyImageResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -4817,11 +4823,15 @@ public class Ec2QueryHandler {
     private Response handleDescribeLaunchTemplateVersions(MultivaluedMap<String, String> p, String region) {
         String id = p.getFirst("LaunchTemplateId");
         String name = p.getFirst("LaunchTemplateName");
+        List<String> versions = getList(p, "LaunchTemplateVersion");
+        if (versions.isEmpty()) {
+            versions = getList(p, "Versions");
+        }
         List<LaunchTemplate> launchTemplates = service.describeLaunchTemplateVersions(
                 region,
                 id,
                 name,
-                getList(p, "Versions"));
+                versions);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeLaunchTemplateVersionsResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -6259,21 +6269,19 @@ public class Ec2QueryHandler {
     private Response handleCreateVolume(MultivaluedMap<String, String> p, String region) {
         String availabilityZone = p.getFirst("AvailabilityZone");
         String volumeType = p.getFirst("VolumeType");
-        String sizeStr = p.getFirst("Size");
-        int size = sizeStr != null ? Integer.parseInt(sizeStr) : 0;
+        Integer suppliedSize = parseOptionalInt(p.getFirst("Size"), "Size");
+        int size = suppliedSize != null ? suppliedSize : 0;
+        if (suppliedSize != null && suppliedSize <= 0) {
+            throw new AwsException("InvalidParameterValue", "Size must be greater than zero.", 400);
+        }
         String encryptedStr = p.getFirst("Encrypted");
         boolean encrypted = "true".equalsIgnoreCase(encryptedStr);
-        String iopsStr = p.getFirst("Iops");
-        int iops = iopsStr != null ? Integer.parseInt(iopsStr) : 0;
-        String throughputStr = p.getFirst("Throughput");
-        Integer throughput = null;
-        if (throughputStr != null) {
-            try {
-                throughput = Integer.parseInt(throughputStr);
-            } catch (NumberFormatException e) {
-                throw new AwsException("ValidationException", "Invalid Throughput value: " + throughputStr, 400);
-            }
+        Integer suppliedIops = parseOptionalInt(p.getFirst("Iops"), "Iops");
+        int iops = suppliedIops != null ? suppliedIops : 0;
+        if (suppliedIops != null && suppliedIops <= 0) {
+            throw new AwsException("InvalidParameterValue", "Iops must be greater than zero.", 400);
         }
+        Integer throughput = parseOptionalInt(p.getFirst("Throughput"), "Throughput");
 
         String snapshotId = p.getFirst("SnapshotId");
 
@@ -6292,17 +6300,20 @@ public class Ec2QueryHandler {
     private Response handleDescribeVolumes(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "VolumeId");
         Map<String, List<String>> filters = getFilters(p);
-        List<Volume> volList = service.describeVolumes(region, ids, filters);
+        Integer maxResults = parseOptionalInt(p.getFirst("MaxResults"), "MaxResults");
+        VolumeListResult result = service.describeVolumes(region, ids, filters, maxResults, p.getFirst("NextToken"));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeVolumesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
                 .start("volumeSet");
-        for (Volume vol : volList) {
+        for (Volume vol : result.volumes()) {
             xml.start("item").raw(volumeXml(vol)).end("item");
         }
-        xml.end("volumeSet")
-                .elem("nextToken", "")
-                .end("DescribeVolumesResponse");
+        xml.end("volumeSet");
+        if (result.nextToken() != null) {
+            xml.elem("nextToken", result.nextToken());
+        }
+        xml.end("DescribeVolumesResponse");
         return xmlResponse(xml.build());
     }
 

@@ -360,9 +360,13 @@ first factor returns `MFA_SETUP` instead of tokens for a user without a verified
 Call `AssociateSoftwareToken` with that session, then `VerifySoftwareToken` with the
 returned session and a six-digit TOTP code. Finish with `RespondToAuthChallenge`
 (`MFA_SETUP`) to receive tokens. Later sign-ins return `SOFTWARE_TOKEN_MFA`, which
-requires a fresh code in `SOFTWARE_TOKEN_MFA_CODE`. Both token-management actions
-also accept an access token for an already authenticated user. Sessions expire with
-the app client's `AuthSessionValidity` and cannot be replayed after completion.
+requires a fresh code in `SOFTWARE_TOKEN_MFA_CODE`. Its `ChallengeParameters` carry
+`USER_ID_FOR_SRP`, the user's actual username rather than an alias (the `sub` in a pool
+with `UsernameAttributes`), to send back as `USERNAME` and to compute `SECRET_HASH` from,
+plus `FRIENDLY_DEVICE_NAME` when `VerifySoftwareToken` was given a `FriendlyDeviceName`.
+Both token-management actions also accept an access token for an already authenticated
+user. Sessions expire with the app client's `AuthSessionValidity` and cannot be replayed
+after completion.
 
 Completing `MFA_SETUP` turns software-token MFA on for the user and, when no other factor is
 preferred, makes it the preferred one, so `GetUser` and `AdminGetUser` report it.
@@ -713,7 +717,8 @@ the callback in `CallbackURLs`. No domain is needed; on a custom domain the same
 
 1. `GET /cognito-idp/oauth2/authorize` redirects to `/cognito-idp/login` with the request's
    parameters, `login_hint` included. If the browser already has a managed login session in the
-   pool, it skips the form and redirects straight to the callback with a code, as AWS does. A
+   pool, it skips the form and redirects straight to the callback with a code, as AWS does; the
+   code's tokens carry the `auth_time` of the session's sign-in, not of this request. A
    `scope` the client's `AllowedOAuthScopes` does not include is refused first, as on AWS, with a
    redirect to the callback carrying `error=invalid_request`, `error_description=invalid_scope`
    and the `state`.
@@ -878,9 +883,16 @@ Floci mirrors AWS's access-token / ID-token split:
 - **ID token:** `sub`, `cognito:username`, `aud`, and readable user attributes (`email`,
   `email_verified`, `phone_number`, `custom:*`, ...). Attribute claims are filtered by the app client's
   `ReadAttributes` (an unset/empty list means all attributes are readable).
+- **Both tokens:** `auth_time` is when the user signed in, as on AWS. Tokens from an authorization
+  code carry the time the user signed in at the login page or the identity provider, also when a
+  managed login session skipped the form, and tokens from `REFRESH_TOKEN_AUTH`,
+  `GetTokensFromRefreshToken` or the token endpoint's `refresh_token` grant keep the `auth_time` of
+  the sign-in that issued the refresh token. A
+  refresh token issued by an older Floci does not carry its sign-in time, so its tokens get the time
+  it was issued.
 
-As on AWS, a pre token generation trigger cannot suppress or override `sub`, the access token's
-`username` or the ID token's `cognito:username`; Floci ignores those entries in its response.
+As on AWS, a pre token generation trigger cannot suppress or override `sub`, `auth_time`, the access
+token's `username` or the ID token's `cognito:username`; Floci ignores those entries in its response.
 
 Not-found errors (`ResourceNotFoundException`, `UserNotFoundException`) return HTTP `400`, matching the
 Cognito JSON protocol.

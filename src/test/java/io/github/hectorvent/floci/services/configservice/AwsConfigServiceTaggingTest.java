@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.core.storage.WriteProfile;
@@ -20,6 +21,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.github.hectorvent.floci.testing.ThreadStates.awaitBlockedOrDone;
@@ -117,6 +119,33 @@ class AwsConfigServiceTaggingTest {
     }
 
     @Test
+    void putConfigRuleAppliesRequestTagsAtCreationOnly() {
+        AwsConfigService service = service();
+        String arn = service.putConfigRule(REGION, rule("tagged"), ENV_PROD).configRuleArn();
+        assertEquals(ENV_PROD, service.listTagsForResource(REGION, arn));
+
+        ConfigRule updated = service.putConfigRule(REGION, rule("tagged"),
+                List.of(Map.of("Key", "env", "Value", "dev"), Map.of("Key", "team", "Value", "sec")));
+
+        assertEquals(arn, updated.configRuleArn());
+        assertEquals(ENV_PROD, service.listTagsForResource(REGION, arn));
+    }
+
+    @Test
+    void deletingAConfigRuleDropsItsTagsAndARecreatedRuleStartsFresh() {
+        AwsConfigService service = service();
+        String oldArn = service.putConfigRule(REGION, rule("tagged"), ENV_PROD).configRuleArn();
+        service.tagResource(REGION, oldArn, List.of(Map.of("Key", "team", "Value", "sec")));
+
+        service.deleteConfigRule(REGION, "tagged");
+
+        assertTrue(service.storedTags(oldArn).isEmpty(), "delete must drop the rule's tags");
+        List<Map<String, String>> fresh = List.of(Map.of("Key", "env", "Value", "dev"));
+        String newArn = service.putConfigRule(REGION, rule("tagged"), fresh).configRuleArn();
+        assertEquals(fresh, service.listTagsForResource(REGION, newArn));
+    }
+
+    @Test
     void aDeletedAggregationAuthorizationIsNotFound() {
         AwsConfigService service = service();
         String arn = service.putAggregationAuthorization(REGION, "111122223333", "eu-west-1", ENV_PROD)
@@ -147,19 +176,7 @@ class AwsConfigServiceTaggingTest {
     @Test
     void aPackDeleteWaitsForATagWriteAlreadyInProgress() throws Exception {
         ParkingStore<Map<String, String>> tagStore = new ParkingStore<>();
-        AwsConfigService service = new AwsConfigService(new RegionResolver(REGION, ACCOUNT),
-                new StorageFactory(null, null) {
-                    @Override
-                    @SuppressWarnings("unchecked")
-                    public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
-                            TypeReference<Map<String, V>> typeReference, WriteProfile profile) {
-                        return fileName.equals("config-tags.json")
-                                ? new AccountAwareStorageBackend<>((StorageBackend<String, V>) (Object) tagStore,
-                                        null, ACCOUNT)
-                                : AccountAwareStorageBackend.inMemory(ACCOUNT);
-                    }
-                });
-        service.initializeStorage();
+        AwsConfigService service = serviceWithTagStore(tagStore);
         String arn = service.putConformancePack(REGION, "pack", "s3://bucket/t.yaml", null).conformancePackArn();
 
         tagStore.parkNextWrite();
@@ -186,6 +203,46 @@ class AwsConfigServiceTaggingTest {
         }
 
         assertTrue(service.storedTags(arn).isEmpty(), "a tag entry outlived the pack it was written for");
+    }
+
+    /**
+     * Creation tags are skipped once the rule exists, so a tag write that fails after the rule
+     * was stored would leave a retry nothing to restore them with. The retry must end tagged.
+     */
+    @Test
+    void aRetryAfterAFailedCreationTagWriteEndsWithTheTags() {
+        AtomicBoolean failNextWrite = new AtomicBoolean(true);
+        AwsConfigService service = serviceWithTagStore(new InMemoryStorage<String, Map<String, String>>() {
+            @Override
+            public void put(String key, Map<String, String> value) {
+                if (failNextWrite.getAndSet(false)) {
+                    throw new IllegalStateException("tag store unavailable");
+                }
+                super.put(key, value);
+            }
+        });
+
+        assertThrows(IllegalStateException.class, () -> service.putConfigRule(REGION, rule("retried"), ENV_PROD));
+        String arn = service.putConfigRule(REGION, rule("retried"), ENV_PROD).configRuleArn();
+
+        assertEquals(ENV_PROD, service.listTagsForResource(REGION, arn));
+    }
+
+    private static AwsConfigService serviceWithTagStore(StorageBackend<String, Map<String, String>> tagStore) {
+        AwsConfigService service = new AwsConfigService(new RegionResolver(REGION, ACCOUNT),
+                new StorageFactory(null, null) {
+                    @Override
+                    @SuppressWarnings("unchecked")
+                    public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
+                            TypeReference<Map<String, V>> typeReference, WriteProfile profile) {
+                        return fileName.equals("config-tags.json")
+                                ? new AccountAwareStorageBackend<>((StorageBackend<String, V>) (Object) tagStore,
+                                        null, ACCOUNT)
+                                : AccountAwareStorageBackend.inMemory(ACCOUNT);
+                    }
+                });
+        service.initializeStorage();
+        return service;
     }
 
     private static ConfigRule rule(String name) {

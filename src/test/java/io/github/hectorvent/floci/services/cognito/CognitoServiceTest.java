@@ -43,6 +43,7 @@ import java.lang.management.ThreadMXBean;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
@@ -629,6 +630,13 @@ class CognitoServiceTest {
         return service.createUserPoolClient(pool.getId(), "flows-client", false, false, List.of(), List.of(),
                 null, List.of(), null, List.of(explicitAuthFlows), null, null, List.of(), null, List.of(), null,
                 null, null, List.of(), null, null);
+    }
+
+    /** A client of the authorization code grant, with the default explicit auth flows. */
+    private UserPoolClient codeGrantClient(UserPool pool) {
+        return service.createUserPoolClient(pool.getId(), "c", false, true, List.of("code"),
+                List.of("openid", "email", "aws.cognito.signin.user.admin"), null, List.of("https://app.example.test/cb"),
+                null, List.of(), null, null, List.of(), null, List.of(), null, null, null, List.of(), null, null);
     }
 
     @ParameterizedTest
@@ -4410,18 +4418,19 @@ class CognitoServiceTest {
     }
 
     @Test
-    void preTokenGenerationOverrideCannotSuppressOrReplaceIdentityClaims() {
+    void preTokenGenerationOverrideCannotSuppressOrReplaceProtectedClaims() {
         UserPool pool = createPoolAndUser();
         UserPoolClient client = service.createUserPoolClient(
                 pool.getId(), "c", false, false, List.of(), List.of());
         CognitoUser user = service.adminGetUser(pool.getId(), "alice");
         String sub = user.getAttributes().get("sub");
         CognitoService.ClaimsOverride suppress = new CognitoService.ClaimsOverride(
-                null, List.of("sub", "cognito:username"), null, List.of("sub", "username"),
+                null, List.of("sub", "cognito:username", "auth_time"),
+                null, List.of("sub", "username", "auth_time"),
                 null, null, null, null, null);
         CognitoService.ClaimsOverride replace = new CognitoService.ClaimsOverride(
-                Map.<String, Object>of("sub", "other", "cognito:username", "bob"), null,
-                Map.<String, Object>of("sub", "other", "username", "bob"), null,
+                Map.<String, Object>of("sub", "other", "cognito:username", "bob", "auth_time", 1L), null,
+                Map.<String, Object>of("sub", "other", "username", "bob", "auth_time", 1L), null,
                 null, null, null, null, null);
 
         for (CognitoService.ClaimsOverride override : List.of(suppress, replace)) {
@@ -4434,6 +4443,8 @@ class CognitoServiceTest {
             assertEquals("alice", access.get("username"));
             assertEquals(sub, id.get("sub"));
             assertEquals("alice", id.get("cognito:username"));
+            assertEquals(access.get("iat"), access.get("auth_time"));
+            assertEquals(id.get("iat"), id.get("auth_time"));
         }
     }
 
@@ -4724,15 +4735,17 @@ class CognitoServiceTest {
         String refreshToken = (String) auth.get("RefreshToken");
 
         assertNotNull(refreshToken);
-        // Should be parseable as base64 structured token: 5 payload fields + trailing HMAC signature
+        // Should be parseable as base64 structured token: 6 payload fields + trailing HMAC signature
         String decoded = new String(Base64.getDecoder().decode(refreshToken), StandardCharsets.UTF_8);
-        String[] parts = decoded.split("\\|", 6);
-        assertEquals(6, parts.length, "Refresh token should encode 5 pipe-separated fields plus a signature");
+        String[] parts = decoded.split("\\|", 7);
+        assertEquals(7, parts.length, "Refresh token should encode 6 pipe-separated fields plus a signature");
         assertEquals(pool.getId(), parts[0]);
         assertEquals("alice", parts[1]);
         assertEquals(client.getClientId(), parts[2]);
         assertFalse(parts[3].isBlank(), "Refresh token should encode its issued-at timestamp");
-        assertFalse(parts[5].isBlank(), "Refresh token should encode a signature");
+        assertEquals("auth_time=" + Long.parseLong(parts[3]) / 1000L, parts[5],
+                "Refresh token should encode the user's auth_time, the issued-at second of an API sign-in");
+        assertFalse(parts[6].isBlank(), "Refresh token should encode a signature");
     }
 
     @Test
@@ -4761,6 +4774,84 @@ class CognitoServiceTest {
 
         assertThrows(AwsException.class, () ->
                 service.getTokensFromRefreshToken(client.getClientId(), "not-a-valid-refresh-token"));
+    }
+
+    // =========================================================================
+    // Issue #5146: refreshed tokens keep the auth_time of the sign-in
+    // =========================================================================
+
+    /**
+     * The tokens of an authorization code carry the time its user signed in, and AWS: "Refreshing a
+     * token doesn't reset the auth_time claim." Neither refresh operation does.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void refreshedTokensKeepTheAuthTimeOfTheSignIn() throws Exception {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = codeGrantClient(pool);
+        Instant signedIn = Instant.parse("2026-01-01T00:00:00Z");
+        Map<String, Object> redeemed = service.generateAuthResultForHostedAuth(service.adminGetUser(pool.getId(), "alice"),
+                pool, client, null, List.of("openid"), signedIn);
+        String refreshToken = (String) redeemed.get("RefreshToken");
+
+        Map<String, Object> viaInitiateAuth = (Map<String, Object>) service.initiateAuth(client.getClientId(),
+                "REFRESH_TOKEN_AUTH", Map.of("REFRESH_TOKEN", refreshToken)).get("AuthenticationResult");
+        Map<String, Object> viaGetTokens = (Map<String, Object>) service.getTokensFromRefreshToken(
+                client.getClientId(), refreshToken).get("AuthenticationResult");
+
+        for (Map<String, Object> tokens : List.of(redeemed, viaInitiateAuth, viaGetTokens)) {
+            assertEquals(signedIn.getEpochSecond(), authTime(tokens.get("IdToken")));
+            assertEquals(signedIn.getEpochSecond(), authTime(tokens.get("AccessToken")));
+        }
+    }
+
+    /**
+     * A code grant's refresh token minted before refresh tokens kept auth_time has the scope field
+     * alone, and refreshes with the time it was issued, as one of an API sign-in does.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void aCodeGrantRefreshTokenWithoutAuthTimeRefreshesWithTheTimeItWasIssued() throws Exception {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = codeGrantClient(pool);
+        long issuedAtMillis = System.currentTimeMillis() - 120_000L;
+        String scopeField = "scope=" + Base64.getUrlEncoder().withoutPadding()
+                .encodeToString("openid".getBytes(StandardCharsets.UTF_8));
+        String refreshToken = signRawRefreshToken(pool, pool.getId() + "|alice|" + client.getClientId() + "|"
+                + issuedAtMillis + "|" + UUID.randomUUID() + "|" + scopeField);
+
+        for (Map<String, Object> response : List.of(
+                service.getTokensFromRefreshToken(client.getClientId(), refreshToken),
+                service.initiateAuth(client.getClientId(), "REFRESH_TOKEN_AUTH",
+                        Map.of("REFRESH_TOKEN", refreshToken)))) {
+            Map<String, Object> refreshed = (Map<String, Object>) response.get("AuthenticationResult");
+            assertEquals(issuedAtMillis / 1000L, authTime(refreshed.get("IdToken")));
+            assertEquals(issuedAtMillis / 1000L, authTime(refreshed.get("AccessToken")));
+        }
+    }
+
+    /**
+     * Only the fields after the family id are tagged, so a username holding the auth_time tag stays a
+     * username, in a token with the field and in one minted before it.
+     */
+    @Test
+    void aUsernameHoldingTheAuthTimeTagIsReadAsTheUsername() {
+        UserPool pool = createPoolAndUser();
+        String username = "alice|auth_time=1";
+
+        String[] withField = service.parseRefreshToken(service.buildRefreshToken(pool, username, "client-id",
+                1_790_000_000_123L, "family-id", null, 1_789_999_400L));
+        String[] withoutField = service.parseRefreshToken(signRawRefreshToken(pool,
+                pool.getId() + "|" + username + "|client-id|1790000000123|family-id"));
+
+        assertEquals(List.of(pool.getId(), username, "client-id", "1790000000123", "family-id", "1789999400"),
+                List.of(withField));
+        assertEquals(List.of(pool.getId(), username, "client-id", "1790000000123", "family-id", ""),
+                List.of(withoutField));
+    }
+
+    private static long authTime(Object token) throws Exception {
+        return MAPPER.readTree(jwtPayload((String) token)).path("auth_time").asLong();
     }
 
     // =========================================================================
@@ -4990,9 +5081,9 @@ class CognitoServiceTest {
         UserPool pool = createPoolAndUser();
 
         String[] parts = service.parseRefreshToken(service.buildRefreshToken(pool, "alice", "client-id",
-                1_790_000_000_123L, "family-id", List.of("openid", "notes/read|write")));
+                1_790_000_000_123L, "family-id", List.of("openid", "notes/read|write"), 1_789_999_400L));
 
-        assertEquals(List.of(pool.getId(), "alice", "client-id", "1790000000123", "family-id",
+        assertEquals(List.of(pool.getId(), "alice", "client-id", "1790000000123", "family-id", "1789999400",
                 "openid notes/read|write"), List.of(parts));
     }
 
@@ -5000,21 +5091,22 @@ class CognitoServiceTest {
     void refreshTokenOfACodeGrantWithoutScopesHasAnEmptyScopeField() {
         UserPool pool = createPoolAndUser();
 
-        String[] parts = service.parseRefreshToken(
-                service.buildRefreshToken(pool, "alice", "client-id", 1_790_000_000_123L, "family-id", List.of()));
+        String[] parts = service.parseRefreshToken(service.buildRefreshToken(pool, "alice", "client-id",
+                1_790_000_000_123L, "family-id", List.of(), 1_789_999_400L));
 
-        assertEquals(6, parts.length);
-        assertEquals("", parts[5]);
+        assertEquals(7, parts.length);
+        assertEquals("", parts[6]);
     }
 
     @Test
     void refreshTokenOfAnApiSignInHasNoScopeField() {
         UserPool pool = createPoolAndUser();
 
-        String[] parts = service.parseRefreshToken(
-                service.buildRefreshToken(pool, "alice", "client-id", 1_790_000_000_123L, "family-id", null));
+        String[] parts = service.parseRefreshToken(service.buildRefreshToken(pool, "alice", "client-id",
+                1_790_000_000_123L, "family-id", null, 1_790_000_000L));
 
-        assertEquals(List.of(pool.getId(), "alice", "client-id", "1790000000123", "family-id"), List.of(parts));
+        assertEquals(List.of(pool.getId(), "alice", "client-id", "1790000000123", "family-id", "1790000000"),
+                List.of(parts));
     }
 
     /**
@@ -5036,23 +5128,21 @@ class CognitoServiceTest {
         assertNotNull(service.getTokensFromRefreshToken(client.getClientId(), refreshToken).get("AuthenticationResult"));
         assertNotNull(service.initiateAuth(client.getClientId(), "REFRESH_TOKEN_AUTH",
                 Map.of("REFRESH_TOKEN", refreshToken)).get("AuthenticationResult"));
-        assertEquals(List.of(pool.getId(), "pipe|user", "client-id", "1790000000123", "family-id", "openid"),
-                List.of(service.parseRefreshToken(service.buildRefreshToken(pool, "pipe|user", "client-id",
-                        1_790_000_000_123L, "family-id", List.of("openid")))));
+        assertEquals(List.of(pool.getId(), "pipe|user", "client-id", "1790000000123", "family-id", "1789999400",
+                "openid"), List.of(service.parseRefreshToken(service.buildRefreshToken(pool, "pipe|user", "client-id",
+                        1_790_000_000_123L, "family-id", List.of("openid"), 1_789_999_400L))));
     }
 
     @Test
     @SuppressWarnings("unchecked")
     void getTokensFromRefreshTokenOfACodeGrantKeepsItsScopesAndIssuesAnIdTokenOnlyWithOpenid() throws Exception {
         UserPool pool = createPoolAndUser();
-        UserPoolClient client = service.createUserPoolClient(pool.getId(), "c", false, true, List.of("code"),
-                List.of("openid", "email", "aws.cognito.signin.user.admin"), null, List.of("https://app.example.test/cb"),
-                null, List.of(), null, null, List.of(), null, List.of(), null, null, null, List.of(), null, null);
+        UserPoolClient client = codeGrantClient(pool);
         CognitoUser user = service.adminGetUser(pool.getId(), "alice");
 
         for (List<String> granted : List.of(List.of("openid", "email"), List.of("email"))) {
-            String refreshToken = (String) service.generateAuthResultForHostedAuth(user, pool, client, null, granted)
-                    .get("RefreshToken");
+            String refreshToken = (String) service.generateAuthResultForHostedAuth(user, pool, client, null, granted,
+                    Instant.now()).get("RefreshToken");
 
             Map<String, Object> refreshed = (Map<String, Object>) service
                     .getTokensFromRefreshToken(client.getClientId(), refreshToken).get("AuthenticationResult");
@@ -5071,8 +5161,8 @@ class CognitoServiceTest {
         UserPool pool = createPoolAndUser();
         UserPoolClient client = service.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
         CognitoUser user = service.adminGetUser(pool.getId(), "alice");
-        String refreshToken = (String) service.generateAuthResultForHostedAuth(user, pool, client, null, List.of())
-                .get("RefreshToken");
+        String refreshToken = (String) service.generateAuthResultForHostedAuth(user, pool, client, null, List.of(),
+                Instant.now()).get("RefreshToken");
 
         Map<String, Object> refreshed = (Map<String, Object>) service
                 .getTokensFromRefreshToken(client.getClientId(), refreshToken).get("AuthenticationResult");

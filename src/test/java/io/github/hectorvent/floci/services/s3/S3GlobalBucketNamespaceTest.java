@@ -54,6 +54,39 @@ class S3GlobalBucketNamespaceTest {
         return inst;
     }
 
+    @Test
+    void crossAccountListingsReadTheOwnersObjectsAndPreservePrefixPagination() {
+        Instance<RequestContext> context = mutableContext();
+        AccountAwareStorageBackend<Bucket> buckets =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        AccountAwareStorageBackend<S3Object> objects =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        S3Service service = new S3Service(buckets, objects, Path.of("s3-gns-listing-test"), true, true);
+        caller.set(ACCOUNT_A);
+        service.createBucket("owner-listing-bucket", "us-east-1");
+        service.putObject("owner-listing-bucket", "one.txt", "one".getBytes(UTF_8), "text/plain", Map.of());
+        service.putObject("owner-listing-bucket", "nested/two.txt", "two".getBytes(UTF_8),
+                "text/plain", Map.of());
+        caller.set(ACCOUNT_B);
+        service.putObject("owner-listing-bucket", "three.txt", "three".getBytes(UTF_8), "text/plain", Map.of());
+        assertEquals(List.of("nested/two.txt", "one.txt", "three.txt"),
+                service.listObjects("owner-listing-bucket", null, null, 100).stream()
+                        .map(S3Object::getKey).toList());
+        S3Service.ListObjectsResult first =
+                service.listObjectsWithPrefixes("owner-listing-bucket", null, "/", 1, null, null);
+        assertEquals(List.of("nested/"), first.commonPrefixes());
+        assertTrue(first.isTruncated());
+        S3Service.ListObjectsResult next =
+                service.listObjectsWithPrefixes("owner-listing-bucket", null, "/", 100,
+                        first.nextContinuationToken(), null);
+        assertEquals(List.of("one.txt", "three.txt"), next.objects().stream().map(S3Object::getKey).toList());
+        assertEquals(List.of("nested/two.txt"),
+                service.listObjects("owner-listing-bucket", "nested/", null, 100).stream()
+                        .map(S3Object::getKey).toList());
+        assertTrue(service.listBuckets().isEmpty());
+        assertTrue(objects.scanForAccount(ACCOUNT_B, key -> true).isEmpty());
+    }
+
     /**
      * CreateBucket only sees the caller's own buckets, so a caller that wants to know whether it
      * just created one asks ownsBucket, which stays owner-scoped where bucketExists spans accounts.

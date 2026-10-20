@@ -53,6 +53,8 @@ import software.amazon.awssdk.services.dlm.DlmClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsClient;
 import software.amazon.awssdk.services.ec2.Ec2Client;
+import software.amazon.awssdk.services.ec2.model.Subnet;
+import software.amazon.awssdk.services.ec2.model.Vpc;
 import software.amazon.awssdk.services.ecr.EcrClient;
 import software.amazon.awssdk.services.ecs.EcsClient;
 import software.amazon.awssdk.services.efs.EfsClient;
@@ -178,6 +180,8 @@ import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
@@ -275,6 +279,33 @@ public final class TestFixtures {
      */
     public static String availabilityZone() {
         return REGION.id() + "a";
+    }
+
+    /**
+     * A default subnet in each of the first two availability zones of {@link #region()}'s default VPC,
+     * for tests that create a load balancer: CreateLoadBalancer needs subnets for every type, and an
+     * Application Load Balancer needs them in two zones.
+     */
+    public static List<String> defaultVpcSubnets() {
+        try (Ec2Client ec2 = ec2Client()) {
+            List<Vpc> defaults = ec2.describeVpcs(r -> r.filters(f -> f.name("is-default").values("true"))).vpcs();
+            if (defaults.isEmpty()) {
+                throw new IllegalStateException("no default VPC in " + REGION.id() + " to put a load balancer in");
+            }
+            String vpcId = defaults.get(0).vpcId();
+            Map<String, String> byZone = new TreeMap<>();
+            for (Subnet subnet : ec2.describeSubnets(r -> r.filters(f -> f.name("vpc-id").values(vpcId)))
+                    .subnets()) {
+                if (Boolean.TRUE.equals(subnet.defaultForAz())) {
+                    byZone.putIfAbsent(subnet.availabilityZone(), subnet.subnetId());
+                }
+            }
+            if (byZone.size() < 2) {
+                throw new IllegalStateException("default VPC " + vpcId + " has default subnets in "
+                        + byZone.keySet() + ", and an Application Load Balancer needs two availability zones");
+            }
+            return byZone.values().stream().limit(2).toList();
+        }
     }
 
     /**

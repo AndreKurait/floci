@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.elbv2;
 
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.testing.RealElbV2DataPlaneProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -40,6 +41,8 @@ class ElbV2SamePortHostDispatchIntegrationTest {
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", "same-port-first")
                 .formParam("Type", "application")
+                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a"))
+                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b"))
                 .formParam("Scheme", "internet-facing")
                 .header("Authorization", AUTH)
             .when()
@@ -76,6 +79,8 @@ class ElbV2SamePortHostDispatchIntegrationTest {
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", "same-port-second")
                 .formParam("Type", "application")
+                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a"))
+                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b"))
                 .formParam("Scheme", "internet-facing")
                 .header("Authorization", AUTH)
             .when()

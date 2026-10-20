@@ -62,8 +62,19 @@ public final class RetryingTarCopier {
     public static void copyBytes(DockerClient docker, String containerId, String remotePath,
                                  String entryName, byte[] content, int mode,
                                  int maxAttempts, long backoffMillis) {
-        byte[] tar = singleFileTar(entryName, content, mode);
-        retry(entryName, containerId, maxAttempts, backoffMillis, () ->
+        copyArchive(docker, containerId, remotePath, entryName, singleFileTar(entryName, content, mode),
+                maxAttempts, backoffMillis);
+    }
+
+    /** Copies an already-built tar through fresh byte-backed streams; do not modify it during the copy. */
+    public static void copyArchive(DockerClient docker, String containerId, String remotePath,
+                                   String label, byte[] tar) {
+        copyArchive(docker, containerId, remotePath, label, tar, DEFAULT_MAX_ATTEMPTS, DEFAULT_BACKOFF_MS);
+    }
+
+    public static void copyArchive(DockerClient docker, String containerId, String remotePath,
+                                   String label, byte[] tar, int maxAttempts, long backoffMillis) {
+        retry(label, containerId, maxAttempts, backoffMillis, () ->
                 docker.copyArchiveToContainerCmd(containerId)
                         .withRemotePath(remotePath)
                         .withTarInputStream(new ByteArrayInputStream(tar))

@@ -90,7 +90,8 @@ class ElbV2HttpsDataPlaneTest {
     void officialClientsConfigureAcmBackedHttpsListenerThatTerminatesTls() throws Exception {
         LoadBalancer loadBalancer = elb.createLoadBalancer(request -> request
                         .name(TestFixtures.uniqueName("tls"))
-                        .type(LoadBalancerTypeEnum.APPLICATION))
+                        .type(LoadBalancerTypeEnum.APPLICATION)
+                        .subnets(TestFixtures.defaultVpcSubnets()))
                 .loadBalancers().get(0);
         loadBalancerArn = loadBalancer.loadBalancerArn();
         String dnsName = loadBalancer.dnsName();

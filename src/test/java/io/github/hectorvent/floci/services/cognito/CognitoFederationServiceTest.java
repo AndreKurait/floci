@@ -151,7 +151,7 @@ class CognitoFederationServiceTest {
     }
 
     @Test
-    void completeAuthorizationCarriesTheNonceAndCodeChallengeIntoTheCode() {
+    void completeAuthorizationCarriesTheNonceCodeChallengeAndSignInTimeIntoTheCode() {
         createDefaultProvider();
         String challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
         String redirect = federationService.beginAuthorization(
@@ -163,6 +163,7 @@ class CognitoFederationServiceTest {
         CognitoAuthorizationCode storedCode = stateStore.consumeAuthorizationCode(authorizationCode).orElseThrow();
         assertEquals("nonce-value", storedCode.nonce());
         assertEquals(challenge, storedCode.codeChallenge());
+        assertEquals(CLOCK.instant(), storedCode.authTime(), "the user signed in when the provider sent them back");
         assertFalse(redirect.contains(challenge), "the challenge stays with Cognito: " + redirect);
     }
 

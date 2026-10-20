@@ -4,6 +4,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.cognitoidentityprovider.CognitoIdentityProviderClient;
 import software.amazon.awssdk.services.cognitoidentityprovider.model.AdminGetUserResponse;
+import software.amazon.awssdk.services.cognitoidentityprovider.model.AdminInitiateAuthResponse;
+import software.amazon.awssdk.services.cognitoidentityprovider.model.AdminRespondToAuthChallengeResponse;
 import software.amazon.awssdk.services.cognitoidentityprovider.model.AuthFlowType;
 import software.amazon.awssdk.services.cognitoidentityprovider.model.ChallengeNameType;
 import software.amazon.awssdk.services.cognitoidentityprovider.model.ExplicitAuthFlowsType;
@@ -12,12 +14,16 @@ import software.amazon.awssdk.services.cognitoidentityprovider.model.InitiateAut
 import software.amazon.awssdk.services.cognitoidentityprovider.model.InvalidParameterException;
 import software.amazon.awssdk.services.cognitoidentityprovider.model.MessageActionType;
 import software.amazon.awssdk.services.cognitoidentityprovider.model.RespondToAuthChallengeResponse;
+import software.amazon.awssdk.services.cognitoidentityprovider.model.UserPoolClientType;
 import software.amazon.awssdk.services.cognitoidentityprovider.model.UserPoolMfaType;
+import software.amazon.awssdk.services.cognitoidentityprovider.model.UsernameAttributeType;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.Base64;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
@@ -87,6 +93,76 @@ class CognitoOptionalTotpMfaTest {
                 cognito.deleteUserPool(b -> b.userPoolId(poolId));
             }
         }
+    }
+
+    @Test
+    @DisplayName("SOFTWARE_TOKEN_MFA names the sub and the device, and accepts the sub with its SECRET_HASH")
+    void sdkAnswersTheSoftwareTokenChallengeWithUserIdForSrp() throws Exception {
+        try (CognitoIdentityProviderClient cognito = TestFixtures.cognitoClient()) {
+            String poolId = cognito.createUserPool(b -> b.poolName("email-totp-sdk-" + UUID.randomUUID())
+                    .usernameAttributes(UsernameAttributeType.EMAIL)).userPool().id();
+            try {
+                cognito.setUserPoolMfaConfig(b -> b.userPoolId(poolId)
+                        .mfaConfiguration(UserPoolMfaType.OPTIONAL)
+                        .softwareTokenMfaConfiguration(m -> m.enabled(true)));
+                UserPoolClientType client = cognito.createUserPoolClient(b -> b.userPoolId(poolId)
+                        .clientName("email-totp-sdk-client").generateSecret(true)
+                        .explicitAuthFlows(ExplicitAuthFlowsType.ALLOW_ADMIN_USER_PASSWORD_AUTH,
+                                ExplicitAuthFlowsType.ALLOW_REFRESH_TOKEN_AUTH))
+                        .userPoolClient();
+                String email = "totp-" + UUID.randomUUID() + "@example.com";
+                String sub = cognito.adminCreateUser(b -> b.userPoolId(poolId).username(email)
+                        .userAttributes(a -> a.name("email").value(email),
+                                a -> a.name("email_verified").value("true"))
+                        .messageAction(MessageActionType.SUPPRESS)).user().username();
+                cognito.adminSetUserPassword(b -> b.userPoolId(poolId).username(email)
+                        .password(PASSWORD).permanent(true));
+
+                String accessToken = adminPasswordLogin(cognito, poolId, client, email)
+                        .authenticationResult().accessToken();
+                String secret = cognito.associateSoftwareToken(b -> b.accessToken(accessToken)).secretCode();
+                String setupCode = totp(secret, Instant.now());
+                cognito.verifySoftwareToken(b -> b.accessToken(accessToken).userCode(setupCode)
+                        .friendlyDeviceName("sdk-device"));
+                cognito.adminSetUserMFAPreference(b -> b.userPoolId(poolId).username(email)
+                        .softwareTokenMfaSettings(s -> s.enabled(true).preferredMfa(true)));
+
+                AdminInitiateAuthResponse challenged = adminPasswordLogin(cognito, poolId, client, email);
+                assertThat(challenged.challengeName()).isEqualTo(ChallengeNameType.SOFTWARE_TOKEN_MFA);
+                assertThat(challenged.challengeParameters()).containsOnly(
+                        Map.entry("USER_ID_FOR_SRP", sub), Map.entry("FRIENDLY_DEVICE_NAME", "sdk-device"));
+
+                String userIdForSrp = challenged.challengeParameters().get("USER_ID_FOR_SRP");
+                String signInCode = totp(secret, Instant.now());
+                String challengeSecretHash = secretHash(client, userIdForSrp);
+                AdminRespondToAuthChallengeResponse signedIn = cognito.adminRespondToAuthChallenge(b -> b
+                        .userPoolId(poolId).clientId(client.clientId())
+                        .challengeName(ChallengeNameType.SOFTWARE_TOKEN_MFA)
+                        .session(challenged.session())
+                        .challengeResponses(Map.of("USERNAME", userIdForSrp,
+                                "SECRET_HASH", challengeSecretHash,
+                                "SOFTWARE_TOKEN_MFA_CODE", signInCode)));
+                assertThat(signedIn.authenticationResult().accessToken()).isNotBlank();
+            } finally {
+                cognito.deleteUserPool(b -> b.userPoolId(poolId));
+            }
+        }
+    }
+
+    private static AdminInitiateAuthResponse adminPasswordLogin(CognitoIdentityProviderClient cognito,
+                                                                String poolId, UserPoolClientType client,
+                                                                String username) throws Exception {
+        String secretHash = secretHash(client, username);
+        return cognito.adminInitiateAuth(b -> b.userPoolId(poolId).clientId(client.clientId())
+                .authFlow(AuthFlowType.ADMIN_USER_PASSWORD_AUTH)
+                .authParameters(Map.of("USERNAME", username, "PASSWORD", PASSWORD, "SECRET_HASH", secretHash)));
+    }
+
+    private static String secretHash(UserPoolClientType client, String username) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(client.clientSecret().getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        return Base64.getEncoder().encodeToString(
+                mac.doFinal((username + client.clientId()).getBytes(StandardCharsets.UTF_8)));
     }
 
     private static InitiateAuthResponse passwordLogin(CognitoIdentityProviderClient cognito, String clientId) {

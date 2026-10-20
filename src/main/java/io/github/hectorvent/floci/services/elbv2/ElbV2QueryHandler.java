@@ -123,18 +123,12 @@ public class ElbV2QueryHandler {
         String scheme = p.getFirst("Scheme");
         String type = p.getFirst("Type");
         String ipAddressType = p.getFirst("IpAddressType");
-        List<String> subnets = memberList(p, "Subnets");
-        List<String> subnetMappings = subnetMappingSubnetIds(p);
-        if (!subnets.isEmpty() && !subnetMappings.isEmpty()) {
-            throw new AwsException("ValidationError",
-                    "You can specify either subnets or subnet mappings, not both", 400);
-        }
-        List<String> effectiveSubnets = subnetMappings.isEmpty() ? subnets : subnetMappings;
+        List<String> subnets = ElbV2Service.requestedSubnets(memberList(p, "Subnets"), subnetMappingSubnetIds(p));
         List<String> securityGroups = memberList(p, "SecurityGroups");
         Map<String, String> tags = parseTags(p);
 
         LoadBalancer lb = service.createLoadBalancer(region, name, scheme, type, ipAddressType,
-                effectiveSubnets, securityGroups, tags);
+                subnets, securityGroups, tags);
 
         // return provisioning state in create response only
         LoadBalancer provisioning = shallowCopy(lb);
@@ -261,13 +255,8 @@ public class ElbV2QueryHandler {
 
     private Response handleSetSubnets(MultivaluedMap<String, String> p, String region) {
         String arn = p.getFirst("LoadBalancerArn");
-        List<String> subnets = memberList(p, "Subnets");
-        List<String> subnetMappings = subnetMappingSubnetIds(p);
-        if (!subnets.isEmpty() && !subnetMappings.isEmpty()) {
-            throw new AwsException("ValidationError",
-                    "You can specify either subnets or subnet mappings, not both", 400);
-        }
-        service.setSubnets(region, arn, subnetMappings.isEmpty() ? subnets : subnetMappings);
+        List<String> subnets = ElbV2Service.requestedSubnets(memberList(p, "Subnets"), subnetMappingSubnetIds(p));
+        service.setSubnets(region, arn, subnets);
         return voidResponse("SetSubnetsResponse");
     }
 

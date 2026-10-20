@@ -129,12 +129,14 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         if (loadBalancerStore instanceof AccountAwareStorageBackend<Map<String, ClassicLoadBalancer>> aware) {
             for (AccountAwareStorageBackend.AccountEntry<Map<String, ClassicLoadBalancer>> entry
                     : aware.scanAllAccountEntries(key -> true)) {
-                for (ClassicLoadBalancer lb : entry.value().values()) {
+                Map<String, ClassicLoadBalancer> regionLbs = entry.value() instanceof ConcurrentHashMap
+                        ? entry.value() : new ConcurrentHashMap<>(entry.value());
+                for (ClassicLoadBalancer lb : regionLbs.values()) {
                     lb.setCanonicalHostedZoneNameId(
                             AwsRegionFacts.classicElbHostedZoneId(entry.key()).orElse(null));
                 }
-                aware.putForAccount(entry.accountId(), entry.key(), entry.value());
-                for (ClassicLoadBalancer lb : entry.value().values()) {
+                aware.putForAccount(entry.accountId(), entry.key(), regionLbs);
+                for (ClassicLoadBalancer lb : regionLbs.values()) {
                     healthChecker.startMonitoring(lb);
                     healthChecker.registerInstances(lb, lb.getInstanceIds());
                 }

@@ -94,6 +94,7 @@ class CognitoTotpMfaTest {
         Map<String, Object> later = passwordLogin();
         assertEquals("SOFTWARE_TOKEN_MFA", later.get("ChallengeName"));
         assertFalse(later.containsKey("AuthenticationResult"));
+        assertEquals(Map.of("USER_ID_FOR_SRP", USERNAME), later.get("ChallengeParameters"));
         String laterSession = (String) later.get("Session");
         String wrongCode = code.equals("000000") ? "000001" : "000000";
         AwsException mismatch = assertThrows(AwsException.class, () -> service.respondToAuthChallenge(

@@ -47,7 +47,7 @@ def test_launched_instances_include_group_name(ec2_client, aws_config, group_tag
         while True:
             group = autoscaling.describe_auto_scaling_groups(
                 AutoScalingGroupNames=[name])["AutoScalingGroups"][0]
-            if group["Instances"]:
+            if group["Instances"] and group["Instances"][0]["LifecycleState"] == "InService":
                 break
             assert time.monotonic() < deadline, group
             time.sleep(1)

@@ -349,7 +349,6 @@ disabled fails with Lambda's error as the resource status reason.
 - The `S3Key` path is interpreted by the **Docker daemon**, not by Floci. When Floci itself runs inside Docker, the path must exist on the Docker host machine, not inside the Floci container.
 - Hot-reload containers are always ephemeral, so there is no warm-container reuse. Each invocation pays a cold-start penalty.
 - `UpdateFunctionCode` on a hot-reload function converts it back to a standard Zip function (the hot-reload bind-mount is removed).
-
 - S3 reactive sync is skipped for hot-reload functions because edits are picked up directly from disk.
 
 ### Difference from Reactive S3 Sync
@@ -366,15 +365,15 @@ disabled fails with Lambda's error as the resource status reason.
     Reserved concurrency is enforced function-wide: invocations of every
     version and alias count against the function's reservation, and
     invocations beyond the reserved value return `TooManyRequestsException`
-    (HTTP 429). Functions without a reserved value share a **per-region**
+    (HTTP 429). Functions without a reserved value share a **per-account-per-region**
     pool. AWS Lambda's "account-level" limit is in fact a
     per-account-per-region quota, and Floci mirrors that by partitioning
-    counters on the ARN's region segment. The pool size (default 1000) is
+    counters on the ARN's account and region segments. The pool size (default 1000) is
     configurable via `floci.services.lambda.region-concurrency-limit` and
-    applies independently to each region. `PutFunctionConcurrency` validates
+    applies independently to each account and region. `PutFunctionConcurrency` validates
     that the requested value leaves at least
     `floci.services.lambda.unreserved-concurrency-min` (default 100) available
-    for unreserved functions in that region.
+    for unreserved functions in that account and region.
 
     Reducing or clearing a function's reserved value does not kill
     invocations that are already in flight. This matches AWS, which
@@ -550,7 +549,7 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ENABLED` | `false` | Enable bind-mount hot-reload via `S3Bucket=hot-reload` |
 | `FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ALLOWED_PATHS` | *(unset)* | Comma-separated allowlist of host paths that may be bind-mounted |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | *(unset)* | Docker network to attach Lambda containers to (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
-| `FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS` | *(unset)* | Comma-separated existing Docker network names or IDs joined before a function starts. Keeps the primary network; a failed attachment aborts and cleans up the launch. Duplicate or invalid names are rejected |
+| `FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS` | *(unset)* | Comma-separated existing Docker network names or IDs joined before a function starts. Name/ID aliases attach once. Additional endpoints use a lower gateway priority where Docker supports it, preserving the primary route. A failed attachment aborts and cleans up the launch; duplicate or invalid names are rejected |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_FLAGS` | *(unset)* | Additional Docker flags applied to Lambda containers, including `--env`, `--volume`, `--publish`, `--add-host`, `--dns`, `--label`, `--network`, `--user`, `--privileged`, and `--platform`. Explicit `--dns` entries replace automatic embedded DNS and public fallback resolvers. Published ports support `host:container` and `127.0.0.1:host:container` forms |
 | `FLOCI_SERVICES_LAMBDA_EXTRA_HOSTS` | *(unset)* | Comma-separated `hostname:ip` entries added to each Lambda container's `/etc/hosts`; `ip` may be `host-gateway`, mirroring `docker run --add-host` |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | *(unset)* | Explicit host/IP that spawned Lambda containers use to reach Floci's Runtime API, bypassing auto-detection |
@@ -616,9 +615,9 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
     ```
 
     This bounds idle containers only, emulator-wide. Busy containers do not count toward it;
-    their ceiling is `region-concurrency-limit`, which applies independently in each region, so
+    their ceiling is `region-concurrency-limit`, which applies independently in each account and region, so
     peak container count is `warm-pool-max-total` plus the in-flight invocations across every
-    active region. A cap that is smaller than the number of functions invoked in a tight loop
+    active account and region. A cap that is smaller than the number of functions invoked in a tight loop
     trades some warm hits for the memory bound. A negative value is ignored with a warning and
     leaves the total unbounded, like `0`.
 

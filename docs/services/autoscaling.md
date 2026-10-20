@@ -86,6 +86,17 @@ EC2 instance can use a default subnet in a different zone.
 | `SuspendProcesses` | Records suspended scaling processes (empty list suspends all); reported back by `DescribeAutoScalingGroups` |
 | `ResumeProcesses` | Clears suspended processes (empty list resumes all) |
 
+Attachment checks EC2 existence, running state and the group's effective Availability
+Zones before changing tags or membership. A different subnet or VPC in a matching
+zone is accepted. Repeated IDs count once toward desired capacity. Suspended Launch
+or capacity above the maximum rejects the attachment.
+
+Detach validates the whole batch before deleting membership tags or refresh ownership.
+Missing members, Pending or Detaching members, and a decremented desired capacity below
+the minimum are rejected. Selected refresh originals remain detachable while their EC2
+instances are still running. Floci completes attachment and detachment synchronously;
+it does not reproduce AWS's asynchronous Pending and Detaching transitions.
+
 ### Instance Refresh
 
 | Operation | Notes |
@@ -236,6 +247,9 @@ Direct and mixed launch templates retain the selected version's original user-da
 encoding for instance attributes and metadata, including compressed and binary
 payloads. Execution still uses decoded text. Older templates that store only
 execution text retain that text through a UTF-8 fallback.
+
+For direct and mixed launch templates, omitting the version selects `$Default`.
+Explicit `$Default`, `$Latest`, and numeric versions keep their requested selection.
 
 Auto Scaling groups preserve either a launch configuration, a top-level launch template, or a `MixedInstancesPolicy`. These launch sources are mutually exclusive in create/update requests. When a mixed instances policy is supplied, Floci stores and returns:
 

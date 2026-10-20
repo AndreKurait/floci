@@ -189,7 +189,8 @@ public class S3Controller {
             } catch (Exception e) {
                 LOG.tracev(e, "CloudTrail: could not extract request context for S3 event {0}/{1}", bucket, key);
             }
-            String akid = accountResolver.extractAccessKeyId(authHeader);
+            String akid = config.services().iam().enforcementEnabled()
+                    ? accountResolver.extractAccessKeyId(authHeader) : accountResolver.extractS3AccessKeyId(authHeader);
             String region = requestContext.getRegion() != null
                     ? requestContext.getRegion() : regionResolver.getDefaultRegion();
             cloudTrailService.emitS3DataEvent(CloudTrailService.S3EventInput.builder()

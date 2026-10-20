@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.services.lambdaweb.LambdaWebEnvironmentManager
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebEnvironmentManager.Throttled;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService.WebFunctionTarget;
 import io.github.hectorvent.floci.services.lambdaweb.model.WebFunctionRevision;
+import io.quarkus.vertx.http.runtime.RouteConstants;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.MultiMap;
@@ -69,6 +70,13 @@ public class LambdaWebDataPlane {
     private static final DateTimeFormatter HTTP_DATE = DateTimeFormatter.RFC_1123_DATE_TIME.withZone(ZoneOffset.UTC);
     /** Floci sees an exit some tens of milliseconds after it. A process that keeps running is not waited for longer. */
     private static final Duration EXIT_WAIT = Duration.ofSeconds(1);
+    /** The edge counts the request line, the header lines and the blank line, as the client sent them. */
+    private static final int MAX_HEAD_LENGTH = 128 * 1024;
+    /** The layer behind the edge refuses a URI this long. */
+    private static final int URI_TOO_LONG = 65_535;
+    /** The Quarkus defaults, which every other host keeps. */
+    private static final int MAX_INITIAL_LINE_LENGTH = 4096;
+    private static final int MAX_HEADER_SIZE = 20 * 1024;
 
     private final LambdaWebService service;
     private final LambdaWebEnvironmentManager environments;
@@ -96,7 +104,49 @@ public class LambdaWebDataPlane {
     }
 
     void register(@Observes Router router) {
+        // A head is refused before its body is, as on AWS.
+        router.route().order(RouteConstants.ROUTE_ORDER_UPLOAD_LIMIT - 1).handler(this::limitHead);
         router.route().handler(this::handle);
+    }
+
+    /**
+     * The server reads heads past every limit, so the limits are kept here. Lambda Web hosts get the
+     * AWS ones and every other host the Quarkus defaults. A head within the defaults is within both,
+     * so only a longer one has its host looked up.
+     */
+    void limitHead(RoutingContext context) {
+        HttpServerRequest request = context.request();
+        if (request.version() == HttpVersion.HTTP_2) {
+            context.next();
+            return;
+        }
+        int initialLine = request.method().name().length() + 1 + request.uri().length() + 1 + "HTTP/1.1".length();
+        int headerBytes = 0;
+        int headerLines = 0;
+        for (Map.Entry<String, String> header : request.headers()) {
+            headerBytes += header.getKey().length() + ": ".length() + header.getValue().length();
+            headerLines++;
+        }
+        if (initialLine <= MAX_INITIAL_LINE_LENGTH && headerBytes <= MAX_HEADER_SIZE) {
+            context.next();
+            return;
+        }
+        String host = RequestHost.of(request);
+        if (host != null && isLambdaWebHost(host) && serviceConfigAccess.isEnabled("lambda")) {
+            int head = initialLine + headerBytes + 2 * (1 + headerLines + 1);
+            if (head > MAX_HEAD_LENGTH) {
+                edge(request, 431, "Request Header Fields Too Large", LambdaWebErrorPages.HEADER_TOO_LARGE_TYPE,
+                        LambdaWebErrorPages.HEADER_TOO_LARGE_HTML);
+            } else if (request.uri().length() >= URI_TOO_LONG) {
+                uriTooLong(request);
+            } else {
+                context.next();
+            }
+            return;
+        }
+        HttpServerResponse response = request.response();
+        response.setStatusCode(initialLine > MAX_INITIAL_LINE_LENGTH ? 414 : 431).end();
+        response.close();
     }
 
     void handle(RoutingContext context) {
@@ -589,15 +639,30 @@ public class LambdaWebDataPlane {
 
     /** The edge refuses a method before the platform sees the request, with its own header casing. */
     static void malformed(HttpServerRequest request) {
+        edge(request, 400, "Bad Request", LambdaWebErrorPages.MALFORMED_REQUEST_TYPE,
+                LambdaWebErrorPages.MALFORMED_REQUEST_HTML);
+    }
+
+    private static void edge(HttpServerRequest request, int status, String reason, String errorType, String html) {
         HttpServerResponse response = request.response();
-        response.setStatusCode(400).setStatusMessage("Bad Request");
+        response.setStatusCode(status).setStatusMessage(reason);
         response.headers().set("Date", LambdaWebErrorPages.edgeDate(Instant.now()));
         response.headers().set("Connection", "close");
         response.headers().set("x-amz-request-id", Long.toHexString(ThreadLocalRandom.current().nextLong())
                 .toUpperCase(Locale.ROOT));
         response.headers().set("Content-Type", "text/html; charset=utf-8");
-        response.headers().set("Lambda-Web-Error-Type", LambdaWebErrorPages.MALFORMED_REQUEST_TYPE);
-        response.end(LambdaWebErrorPages.MALFORMED_REQUEST_HTML).onComplete(ignored -> response.close());
+        response.headers().set("Lambda-Web-Error-Type", errorType);
+        response.headers().set("Content-Length", String.valueOf(html.getBytes(StandardCharsets.UTF_8).length));
+        response.end(html).onComplete(ignored -> response.close());
+    }
+
+    private static void uriTooLong(HttpServerRequest request) {
+        HttpServerResponse response = request.response();
+        response.setStatusCode(414).setStatusMessage("URI Too Long");
+        response.headers().set("connection", "close");
+        response.headers().set("content-length", "0");
+        response.headers().set("date", HTTP_DATE.format(Instant.now()));
+        response.end().onComplete(ignored -> response.close());
     }
 
     /** AWS answers its own failures with 502 and no error type, so nothing is revealed. */

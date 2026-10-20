@@ -22,10 +22,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -134,7 +136,7 @@ class Ec2InstanceCfnProvisionerTest {
                 """), ctx());
 
         verify(ec2).runInstances(eq("us-east-1"), eq("ami-from-template"), eq("m5.large"), eq(1), eq(1),
-                eq("template-key"), anyList(), any(), any(), anyList(), any(), any(), any());
+                eq("template-key"), anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
     }
 
     @Test
@@ -165,7 +167,7 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-nolt", r.getPhysicalId());
         verify(ec2).runInstances(eq("us-east-1"), any(), eq("t3.micro"), eq(1), eq(1), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
     }
 
     @Test
@@ -269,7 +271,7 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-1", r.getPhysicalId());
         verify(ec2, times(1)).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
     }
 
     @Test
@@ -378,7 +380,7 @@ class Ec2InstanceCfnProvisionerTest {
 
         ArgumentCaptor<String> profile = ArgumentCaptor.forClass(String.class);
         verify(ec2).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), profile.capture(), any());
+                any(), any(), anyList(), any(), profile.capture(), any(), any(), anyInt(), any(), any());
         assertEquals(PROFILE_A, profile.getValue());
         assertEquals(PROFILE_A, r.getAttributes().get("__FlociDeclaredIamInstanceProfile"));
     }
@@ -402,7 +404,7 @@ class Ec2InstanceCfnProvisionerTest {
         i2.setInstanceId("i-2");
         i2.setImageId("ami-2");
         when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any()))
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any()))
                 .thenReturn(reservationOf(i1), reservationOf(i2));
         StackResource r = resource("Server");
         provisioner.provision(r, props("{\"ImageId\": \"ami-1\"}"), ctx(null));
@@ -426,7 +428,7 @@ class Ec2InstanceCfnProvisionerTest {
         i2.setInstanceId("i-2");
         i2.setImageId("ami-1");
         when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any()))
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any()))
                 .thenReturn(reservationOf(i1), reservationOf(i2));
         StackResource r = resource("Server");
         provisioner.provision(r, props("{\"ImageId\": \"ami-1\", \"PrivateIpAddress\": \"10.0.0.5\"}"), ctx(null));
@@ -450,7 +452,7 @@ class Ec2InstanceCfnProvisionerTest {
         i2.setInstanceId("i-2");
         i2.setImageId("ami-1");
         when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any()))
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any()))
                 .thenReturn(reservationOf(i1), reservationOf(i2));
         StackResource r = resource("Server");
         provisioner.provision(r, props("{\"ImageId\": \"ami-1\", \"AvailabilityZone\": \"us-east-1a\"}"), ctx(null));
@@ -480,7 +482,7 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-1", r.getPhysicalId());
         verify(ec2, times(1)).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
     }
 
     @Test
@@ -500,7 +502,7 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-1", r.getPhysicalId());
         verify(ec2, times(1)).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
     }
 
     @Test
@@ -529,6 +531,513 @@ class Ec2InstanceCfnProvisionerTest {
         verify(ec2).deleteTags(eq("us-east-1"), eq(List.of("i-1")), removed.capture());
         assertEquals(1, removed.getValue().size());
         assertEquals("old", removed.getValue().get(0).getKey());
+    }
+
+    @Test
+    void reusedInstanceModifiesOnlyAChangedMetadataOptions() throws Exception {
+        Instance i1 = new Instance();
+        i1.setInstanceId("i-1");
+        i1.setImageId("ami-1");
+        stubLaunch(i1);
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required"}}
+                """), ctx(null));
+        ArgumentCaptor<LaunchTemplateData.MetadataOptions> launched =
+                ArgumentCaptor.forClass(LaunchTemplateData.MetadataOptions.class);
+        verify(ec2).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), launched.capture());
+        assertEquals("required", launched.getValue().getHttpTokens());
+
+        LaunchTemplateData.MetadataOptions applied = LaunchTemplateData.MetadataOptions.launchDefaults();
+        applied.setHttpTokens("required");
+        i1.setMetadataOptions(applied);
+        when(ec2.describeInstances("us-east-1", List.of("i-1"), null))
+                .thenReturn(List.of(reservationOf(i1)));
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required"}}
+                """), ctx("i-1"));
+        verify(ec2, never()).modifyInstanceMetadataOptions(any(), any(), any());
+
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "optional"}}
+                """), ctx("i-1"));
+        ArgumentCaptor<LaunchTemplateData.MetadataOptions> modified =
+                ArgumentCaptor.forClass(LaunchTemplateData.MetadataOptions.class);
+        verify(ec2).modifyInstanceMetadataOptions(eq("us-east-1"), eq("i-1"), modified.capture());
+        assertEquals("optional", modified.getValue().getHttpTokens());
+        verify(ec2, times(1)).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+    }
+
+    @Test
+    void reusedInstanceResetsMetadataOptionsTheTemplateNoLongerDeclares() throws Exception {
+        Instance i1 = new Instance();
+        i1.setInstanceId("i-1");
+        i1.setImageId("ami-1");
+        stubLaunch(i1);
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 2}}
+                """), ctx(null));
+        LaunchTemplateData.MetadataOptions applied = LaunchTemplateData.MetadataOptions.launchDefaults();
+        applied.setHttpTokens("required");
+        applied.setHttpPutResponseHopLimit(2);
+        i1.setMetadataOptions(applied);
+        when(ec2.describeInstances("us-east-1", List.of("i-1"), null))
+                .thenReturn(List.of(reservationOf(i1)));
+
+        // The instance dropped its MetadataOptions, so what it set last time goes back to the launch
+        // default, and what it never set is left alone.
+        provisioner.provision(r, props("{\"ImageId\": \"ami-1\"}"), ctx("i-1"));
+
+        ArgumentCaptor<LaunchTemplateData.MetadataOptions> reset =
+                ArgumentCaptor.forClass(LaunchTemplateData.MetadataOptions.class);
+        verify(ec2).modifyInstanceMetadataOptions(eq("us-east-1"), eq("i-1"), reset.capture());
+        assertEquals("optional", reset.getValue().getHttpTokens());
+        assertEquals(1, reset.getValue().getHttpPutResponseHopLimit());
+        assertNull(reset.getValue().getHttpEndpoint());
+    }
+
+    /**
+     * A changed LaunchTemplate keeps the instance, where AWS replaces it: what the new version
+     * declares is reconciled in place, here an HttpTokens the new version no longer sets.
+     */
+    @Test
+    void changingTheInstancesLaunchTemplateKeepsItAndReconcilesWhatItDeclares() throws Exception {
+        LaunchTemplateData withTokens = new LaunchTemplateData();
+        withTokens.setImageId("ami-1");
+        LaunchTemplateData.MetadataOptions required = new LaunchTemplateData.MetadataOptions();
+        required.setHttpTokens("required");
+        withTokens.setMetadataOptions(required);
+        LaunchTemplateData withoutTokens = new LaunchTemplateData();
+        withoutTokens.setImageId("ami-1");
+        when(ec2.resolveLaunchTemplateData("us-east-1", "lt-1", null, "1", false)).thenReturn(withTokens);
+        when(ec2.resolveLaunchTemplateData("us-east-1", "lt-2", null, "2", false)).thenReturn(withoutTokens);
+        Instance i1 = stubLaunches("i-1", "i-2").get(0);
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"LaunchTemplate": {"LaunchTemplateId": "lt-1", "Version": "1"}}
+                """), ctx(null));
+        LaunchTemplateData.MetadataOptions applied = LaunchTemplateData.MetadataOptions.launchDefaults();
+        applied.setHttpTokens("required");
+        i1.setMetadataOptions(applied);
+
+        provisioner.provision(r, props("""
+                {"LaunchTemplate": {"LaunchTemplateId": "lt-2", "Version": "2"}}
+                """), ctx("i-1"));
+
+        assertEquals("i-1", r.getPhysicalId());
+        assertFalse(provisioner.hasReplacementUpdate(r));
+        ArgumentCaptor<LaunchTemplateData.MetadataOptions> reset =
+                ArgumentCaptor.forClass(LaunchTemplateData.MetadataOptions.class);
+        verify(ec2).modifyInstanceMetadataOptions(eq("us-east-1"), eq("i-1"), reset.capture());
+        assertEquals("optional", reset.getValue().getHttpTokens());
+        verify(ec2, times(1)).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+    }
+
+    /**
+     * The engine restores the prior instance when a later resource fails a replacing update; its
+     * records go back with it, so retrying the update decides from what that instance was declared
+     * with rather than from the attempt that was rolled back: the HttpTokens it declared and the
+     * retry drops returns to the launch default.
+     */
+    @Test
+    void aRolledBackReplacementPutsBackTheRecordsOfTheInstanceItRestores() throws Exception {
+        List<Instance> instances = stubLaunches("i-1", "i-2");
+        StackResource r = launchRequiringTokensThenReplace(instances.get(0));
+        instances.get(1).setState(InstanceState.terminated());
+        provisioner.terminateTimeoutMillis = 20L;
+
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        assertEquals("i-1", r.getPhysicalId());
+        assertEquals(Map.of("__FlociDeclaredMetadataOptions", "HttpTokens"), declarations(r));
+        assertFalse(r.getAttributes().containsKey("__FlociPriorDeclarations"));
+        provisioner.provision(r, props("{\"ImageId\": \"ami-1\"}"), ctx("i-1"));
+        assertEquals("i-1", r.getPhysicalId());
+        ArgumentCaptor<LaunchTemplateData.MetadataOptions> reset =
+                ArgumentCaptor.forClass(LaunchTemplateData.MetadataOptions.class);
+        verify(ec2).modifyInstanceMetadataOptions(eq("us-east-1"), eq("i-1"), reset.capture());
+        assertEquals("optional", reset.getValue().getHttpTokens());
+    }
+
+    /**
+     * A rollback whose delete of the replacement fails has already named the prior instance again,
+     * and a rollback that then skips the resource never calls back, so the records go back first.
+     */
+    @Test
+    void aRollbackThatFailsToDeleteTheReplacementStillPutsBackTheRecords() throws Exception {
+        List<Instance> instances = stubLaunches("i-1", "i-2");
+        StackResource r = launchRequiringTokensThenReplace(instances.get(0));
+        doThrow(new AwsException("InternalError", "terminate failed", 500))
+                .when(ec2).terminateInstances("us-east-1", List.of("i-2"));
+
+        assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
+
+        assertEquals("i-1", r.getPhysicalId());
+        assertEquals(Map.of("__FlociDeclaredMetadataOptions", "HttpTokens"), declarations(r));
+        assertFalse(r.getAttributes().containsKey("__FlociPriorDeclarations"));
+    }
+
+    /**
+     * A retried rollback goes through the delete it still owes: whether that delete fails again or
+     * succeeds, the prior instance keeps the records the first attempt put back.
+     */
+    @Test
+    void aRetriedRollbackKeepsThePriorRecordsWhicheverWayTheDeleteGoes() throws Exception {
+        List<Instance> instances = stubLaunches("i-1", "i-2");
+        StackResource r = launchRequiringTokensThenReplace(instances.get(0));
+        when(ec2.terminateInstances("us-east-1", List.of("i-2")))
+                .thenThrow(new AwsException("InternalError", "terminate failed", 500))
+                .thenThrow(new AwsException("InternalError", "terminate failed", 500))
+                .thenReturn(List.of());
+        Map<String, String> declared = Map.of("__FlociDeclaredMetadataOptions", "HttpTokens");
+        assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
+
+        assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
+        assertEquals("i-1", r.getPhysicalId());
+        assertEquals(declared, declarations(r));
+
+        instances.get(1).setState(InstanceState.terminated());
+        provisioner.terminateTimeoutMillis = 20L;
+        assertTrue(provisioner.rollbackUpdate(r));
+        assertEquals("i-1", r.getPhysicalId());
+        assertEquals(declared, declarations(r));
+        assertFalse(r.getAttributes().containsKey("__FlociPriorDeclarations"));
+    }
+
+    /** A saved copy that cannot be read does not hide the delete failure the rollback reports. */
+    @Test
+    void anUnreadableSavedCopyDoesNotHideTheDeleteFailure() throws Exception {
+        List<Instance> instances = stubLaunches("i-1", "i-2");
+        StackResource r = launchRequiringTokensThenReplace(instances.get(0));
+        r.getAttributes().put("__FlociPriorDeclarations", "{not json");
+        AwsException deleteFailure = new AwsException("InternalError", "terminate failed", 500);
+        doThrow(deleteFailure).when(ec2).terminateInstances("us-east-1", List.of("i-2"));
+
+        AwsException thrown = assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
+
+        assertEquals(deleteFailure, thrown);
+        assertEquals(1, thrown.getSuppressed().length);
+        assertTrue(thrown.getSuppressed()[0] instanceof IllegalStateException);
+    }
+
+    /**
+     * A launch template change keeps the instance only while what the template supplies to the
+     * createOnly ImageId stays the same; a new image replaces it, as a changed ImageId does.
+     */
+    @Test
+    void aNewTemplateVersionWithAnotherImageStillReplacesTheInstance() throws Exception {
+        LaunchTemplateData first = new LaunchTemplateData();
+        first.setImageId("ami-1");
+        LaunchTemplateData second = new LaunchTemplateData();
+        second.setImageId("ami-2");
+        when(ec2.resolveLaunchTemplateData("us-east-1", "lt-1", null, "1", false)).thenReturn(first);
+        when(ec2.resolveLaunchTemplateData("us-east-1", "lt-1", null, "2", false)).thenReturn(second);
+        stubLaunches("i-1", "i-2");
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"LaunchTemplate": {"LaunchTemplateId": "lt-1", "Version": "1"}}
+                """), ctx(null));
+
+        provisioner.provision(r, props("""
+                {"LaunchTemplate": {"LaunchTemplateId": "lt-1", "Version": "2"}}
+                """), ctx("i-1"));
+
+        assertEquals("i-2", r.getPhysicalId());
+        assertTrue(provisioner.hasReplacementUpdate(r));
+    }
+
+    /**
+     * A stack update that changes only the instance's MetadataOptions in place, and then rolls back
+     * because a later resource failed, puts the options and their record back and reports the
+     * rollback done: otherwise the instance would keep options the stack no longer declares.
+     */
+    @Test
+    void aRolledBackInPlaceUpdatePutsTheMetadataOptionsBack() throws Exception {
+        Instance i1 = launchRequiringTokens();
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required"}}
+                """), ctx(null));
+        Map<String, String> declared = declarations(r);
+
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "optional", "HttpPutResponseHopLimit": 3}}
+                """), ctx("i-1"));
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        ArgumentCaptor<LaunchTemplateData.MetadataOptions> applied =
+                ArgumentCaptor.forClass(LaunchTemplateData.MetadataOptions.class);
+        verify(ec2, times(2)).modifyInstanceMetadataOptions(eq("us-east-1"), eq("i-1"), applied.capture());
+        assertEquals("optional", applied.getAllValues().get(0).getHttpTokens());
+        LaunchTemplateData.MetadataOptions restored = applied.getAllValues().get(1);
+        assertEquals("required", restored.getHttpTokens());
+        assertEquals(1, restored.getHttpPutResponseHopLimit());
+        assertEquals(i1.effectiveMetadataOptions().getHttpEndpoint(), restored.getHttpEndpoint());
+        assertEquals(declared, declarations(r));
+        assertFalse(r.getAttributes().containsKey("__FlociPriorInPlaceUpdate"));
+    }
+
+    /**
+     * When the same update also changed something CloudFormation cannot put back in place here
+     * (the instance type), the options still go back, and the rollback still reports that it could
+     * not undo the update.
+     */
+    @Test
+    void aRolledBackUpdateWithOtherInPlaceChangesStillPutsTheMetadataOptionsBack() throws Exception {
+        Instance i1 = launchRequiringTokens();
+        i1.setInstanceType("t3.micro");
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "InstanceType": "t3.micro", "MetadataOptions": {"HttpTokens": "required"}}
+                """), ctx(null));
+
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "InstanceType": "t3.large", "MetadataOptions": {"HttpTokens": "optional"}}
+                """), ctx("i-1"));
+        assertFalse(provisioner.rollbackUpdate(r));
+
+        ArgumentCaptor<LaunchTemplateData.MetadataOptions> applied =
+                ArgumentCaptor.forClass(LaunchTemplateData.MetadataOptions.class);
+        verify(ec2, times(2)).modifyInstanceMetadataOptions(eq("us-east-1"), eq("i-1"), applied.capture());
+        assertEquals("required", applied.getAllValues().get(1).getHttpTokens());
+        assertFalse(r.getAttributes().containsKey("__FlociPriorInPlaceUpdate"));
+    }
+
+    /** A tag change in the same update has no rollback either, so the options go back and the rollback reports it. */
+    @Test
+    void aRolledBackUpdateThatAlsoChangedTagsPutsTheOptionsBackButReportsItUndone() throws Exception {
+        launchRequiringTokens();
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required"}}
+                """), ctx(null));
+
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "optional"},
+                 "Tags": [{"Key": "env", "Value": "prod"}]}
+                """), ctx("i-1"));
+        assertFalse(provisioner.rollbackUpdate(r));
+
+        ArgumentCaptor<LaunchTemplateData.MetadataOptions> applied =
+                ArgumentCaptor.forClass(LaunchTemplateData.MetadataOptions.class);
+        verify(ec2, times(2)).modifyInstanceMetadataOptions(eq("us-east-1"), eq("i-1"), applied.capture());
+        assertEquals("required", applied.getAllValues().get(1).getHttpTokens());
+    }
+
+    /**
+     * An update that changes only the tags, which have no rollback here, still has its declarations
+     * put back, and the rollback reports that it could not undo the update; the options are untouched.
+     */
+    @Test
+    void aRolledBackTagOnlyUpdatePutsTheRecordBackAndReportsItCouldNotUndoIt() throws Exception {
+        launchRequiringTokens();
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required"}}
+                """), ctx(null));
+        Map<String, String> declared = declarations(r);
+
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 1},
+                 "Tags": [{"Key": "env", "Value": "prod"}]}
+                """), ctx("i-1"));
+        assertFalse(provisioner.rollbackUpdate(r));
+
+        assertEquals(declared, declarations(r));
+        assertFalse(r.getAttributes().containsKey("__FlociPriorInPlaceUpdate"));
+        verify(ec2, never()).modifyInstanceMetadataOptions(any(), any(), any());
+    }
+
+    /**
+     * The options are the update's last change: when the tags fail first, the engine restores the
+     * resource without a saved copy, so the options must not have changed.
+     */
+    @Test
+    void aTagFailureInAnInPlaceUpdateLeavesTheMetadataOptionsAlone() throws Exception {
+        launchRequiringTokens();
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required"}}
+                """), ctx(null));
+        doThrow(new AwsException("InternalError", "tags failed", 500))
+                .when(ec2).createTags(eq("us-east-1"), eq(List.of("i-1")), anyList());
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "optional"},
+                 "Tags": [{"Key": "env", "Value": "prod"}]}
+                """), ctx("i-1")));
+
+        verify(ec2, never()).modifyInstanceMetadataOptions(any(), any(), any());
+    }
+
+    /**
+     * An update that declares an option the instance already has changes no EC2 setting, only the
+     * declaration record. A rollback puts the record back and reports the update undone, without
+     * touching the instance.
+     */
+    @Test
+    void aRolledBackUpdateThatOnlyDeclaresTheCurrentOptionsPutsTheRecordBack() throws Exception {
+        launchRequiringTokens();
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required"}}
+                """), ctx(null));
+        Map<String, String> declared = declarations(r);
+
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 1}}
+                """), ctx("i-1"));
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        assertEquals(declared, declarations(r));
+        assertFalse(r.getAttributes().containsKey("__FlociPriorInPlaceUpdate"));
+        verify(ec2, never()).modifyInstanceMetadataOptions(any(), any(), any());
+    }
+
+    /**
+     * A MetadataOptions member given as an empty string is a value, not an omission, and EC2 refuses
+     * it, as it refuses any value outside the allowed set.
+     */
+    @Test
+    void aBlankMetadataOptionFailsBeforeTheInstanceLaunches() throws Exception {
+        StackResource r = resource("Server");
+
+        AwsException failure = assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": ""}}
+                """), ctx(null)));
+
+        assertEquals("InvalidParameterValue", failure.getErrorCode());
+        verify(ec2, never()).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+    }
+
+    @Test
+    void aCommittedOrClearedInPlaceUpdateDropsTheSavedRecord() throws Exception {
+        Instance i1 = launchRequiringTokens();
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required"}}
+                """), ctx(null));
+        String optional = """
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "optional"}}
+                """;
+
+        provisioner.provision(r, props(optional), ctx("i-1"));
+        assertTrue(r.getAttributes().containsKey("__FlociPriorInPlaceUpdate"));
+        provisioner.completeUpdate(r);
+        assertFalse(r.getAttributes().containsKey("__FlociPriorInPlaceUpdate"));
+        i1.getMetadataOptions().setHttpTokens("optional");
+
+        provisioner.provision(r, props(optional.replace("optional", "required")), ctx("i-1"));
+        assertTrue(r.getAttributes().containsKey("__FlociPriorInPlaceUpdate"));
+        provisioner.clearUpdate(r);
+        assertFalse(r.getAttributes().containsKey("__FlociPriorInPlaceUpdate"));
+    }
+
+    /**
+     * One stubbed instance, i-1, of the default type, whose applied options require tokens, as a
+     * launch declaring them gives.
+     */
+    private Instance launchRequiringTokens() {
+        Instance i1 = stubLaunches("i-1").get(0);
+        i1.setInstanceType("t3.micro");
+        LaunchTemplateData.MetadataOptions applied = LaunchTemplateData.MetadataOptions.launchDefaults();
+        applied.setHttpTokens("required");
+        i1.setMetadataOptions(applied);
+        return i1;
+    }
+
+    @Test
+    void aCommittedOrClearedReplacementDropsTheSavedRecords() throws Exception {
+        List<Instance> instances = stubLaunches("i-1", "i-2", "i-3", "i-4");
+        StackResource committed = launchRequiringTokensThenReplace(instances.get(0));
+        assertTrue(committed.getAttributes().containsKey("__FlociPriorDeclarations"));
+        instances.get(0).setState(InstanceState.terminated());
+        provisioner.terminateTimeoutMillis = 20L;
+        provisioner.completeUpdate(committed);
+        assertFalse(committed.getAttributes().containsKey("__FlociPriorDeclarations"));
+
+        StackResource cleared = launchRequiringTokensThenReplace(instances.get(2));
+        assertTrue(cleared.getAttributes().containsKey("__FlociPriorDeclarations"));
+        provisioner.clearUpdate(cleared);
+        assertFalse(cleared.getAttributes().containsKey("__FlociPriorDeclarations"));
+    }
+
+    /**
+     * Launches {@code first} declaring HttpTokens required, then replaces it with the next stubbed
+     * launch through an ImageId change that drops the MetadataOptions.
+     */
+    private StackResource launchRequiringTokensThenReplace(Instance first) throws Exception {
+        StackResource r = resource("Server");
+        provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "MetadataOptions": {"HttpTokens": "required"}}
+                """), ctx(null));
+        assertEquals(first.getInstanceId(), r.getPhysicalId());
+        LaunchTemplateData.MetadataOptions applied = LaunchTemplateData.MetadataOptions.launchDefaults();
+        applied.setHttpTokens("required");
+        first.setMetadataOptions(applied);
+        provisioner.provision(r, props("{\"ImageId\": \"ami-2\"}"), ctx(first.getInstanceId()));
+        assertTrue(provisioner.hasReplacementUpdate(r));
+        assertEquals(Map.of(), declarations(r));
+        return r;
+    }
+
+    /**
+     * With the same template and version (here {@code $Latest}) the instance is kept, and options
+     * its template stopped declaring go back to their launch defaults.
+     */
+    @Test
+    void reusedInstanceResetsOptionsItsTemplateStopsDeclaring() throws Exception {
+        LaunchTemplateData withTokens = new LaunchTemplateData();
+        withTokens.setImageId("ami-1");
+        LaunchTemplateData.MetadataOptions required = new LaunchTemplateData.MetadataOptions();
+        required.setHttpTokens("required");
+        withTokens.setMetadataOptions(required);
+        LaunchTemplateData withoutTokens = new LaunchTemplateData();
+        withoutTokens.setImageId("ami-1");
+        when(ec2.resolveLaunchTemplateData("us-east-1", "lt-1", null, "$Latest", false))
+                .thenReturn(withTokens, withoutTokens);
+        Instance i1 = stubLaunches("i-1").get(0);
+        StackResource r = resource("Server");
+        String template = """
+                {"LaunchTemplate": {"LaunchTemplateId": "lt-1", "Version": "$Latest"}}
+                """;
+        provisioner.provision(r, props(template), ctx(null));
+        LaunchTemplateData.MetadataOptions applied = LaunchTemplateData.MetadataOptions.launchDefaults();
+        applied.setHttpTokens("required");
+        i1.setMetadataOptions(applied);
+
+        provisioner.provision(r, props(template), ctx("i-1"));
+
+        assertEquals("i-1", r.getPhysicalId());
+        ArgumentCaptor<LaunchTemplateData.MetadataOptions> reset =
+                ArgumentCaptor.forClass(LaunchTemplateData.MetadataOptions.class);
+        verify(ec2).modifyInstanceMetadataOptions(eq("us-east-1"), eq("i-1"), reset.capture());
+        assertEquals("optional", reset.getValue().getHttpTokens());
+    }
+
+    @Test
+    void invalidMetadataOptionsFailBeforeAReusedInstanceChanges() throws Exception {
+        StackResource r = resource("Server");
+        r.setPhysicalId("i-1");
+        r.getAttributes().put("InstanceId", "i-1");
+        Instance prior = new Instance();
+        prior.setInstanceId("i-1");
+        prior.setImageId("ami-1");
+        prior.setInstanceType("t3.micro");
+        when(ec2.describeInstances("us-east-1", List.of("i-1"), null))
+                .thenReturn(List.of(reservationOf(prior)));
+
+        AwsException failure = assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"ImageId": "ami-1", "InstanceType": "t3.large", "MetadataOptions": {"HttpTokens": "Required"}}
+                """), ctx("i-1")));
+
+        assertEquals("InvalidParameterValue", failure.getErrorCode());
+        verifyNoInteractions(ec2);
     }
 
     @Test
@@ -636,7 +1145,7 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-9", r.getPhysicalId());
         verify(ec2).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
     }
 
     @Test
@@ -657,7 +1166,7 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-9", r.getPhysicalId());
         verify(ec2).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
     }
 
     @Test
@@ -670,7 +1179,7 @@ class Ec2InstanceCfnProvisionerTest {
         withoutPublicIp.setInstanceId("i-2");
         withoutPublicIp.setImageId("ami-2");
         when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any()))
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any()))
                 .thenReturn(reservationOf(withPublicIp), reservationOf(withoutPublicIp));
         StackResource r = resource("Server");
         provisioner.provision(r, props("{\"ImageId\": \"ami-1\"}"), ctx(null));
@@ -690,6 +1199,31 @@ class Ec2InstanceCfnProvisionerTest {
         return reservation;
     }
 
+    /** The provisioner's records of what the template declared, by attribute name. */
+    private static Map<String, String> declarations(StackResource r) {
+        return r.getAttributes().entrySet().stream().filter(e -> e.getKey().startsWith("__FlociDeclared"))
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+    }
+
+    /** One launch per id, in order, each instance then found by DescribeInstances. */
+    private List<Instance> stubLaunches(String... instanceIds) {
+        List<Instance> instances = new ArrayList<>();
+        List<Reservation> reservations = new ArrayList<>();
+        for (String instanceId : instanceIds) {
+            Instance instance = new Instance();
+            instance.setInstanceId(instanceId);
+            instance.setImageId("ami-1");
+            instances.add(instance);
+            reservations.add(reservationOf(instance));
+            when(ec2.describeInstances("us-east-1", List.of(instanceId), null))
+                    .thenReturn(List.of(reservationOf(instance)));
+        }
+        when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any()))
+                .thenReturn(reservations.get(0), reservations.subList(1, reservations.size()).toArray(Reservation[]::new));
+        return instances;
+    }
+
     private static Map<String, String> tagEntry(String resourceId, String key, String value) {
         Map<String, String> entry = new HashMap<>();
         entry.put("resourceId", resourceId);
@@ -702,7 +1236,7 @@ class Ec2InstanceCfnProvisionerTest {
         Reservation reservation = new Reservation();
         reservation.getInstances().add(instance);
         when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any())).thenReturn(reservation);
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any())).thenReturn(reservation);
     }
 
     private ProvisionContext ctx() {
@@ -716,6 +1250,7 @@ class Ec2InstanceCfnProvisionerTest {
             return node == null ? null : node.asText();
         });
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(engine.omitNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
         return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", priorPhysicalId);
     }
 

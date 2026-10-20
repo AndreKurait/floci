@@ -53,6 +53,15 @@ Floci emulates the Amazon EMR (Elastic MapReduce) management API. Clusters (job 
 | `PutBlockPublicAccessConfiguration` | Sets the account's block public access configuration for the Region |
 <!-- floci:actions:end -->
 
+## Cluster lifecycle
+
+Steps complete immediately in this metadata-only emulator. A cluster created with
+`Instances.KeepJobFlowAliveWhenNoSteps` set to `false` terminates after its initial steps or
+steps added later complete, reporting `ALL_STEPS_COMPLETED`. A cluster with no steps remains
+`WAITING` until steps are added. Set `KeepJobFlowAliveWhenNoSteps` to `true` to keep the cluster
+`WAITING` after its steps complete. Automatic step-completion termination also applies when
+termination protection is enabled.
+
 ## Release catalogue
 
 `ListReleaseLabels`, `DescribeReleaseLabel` and `ListSupportedInstanceTypes` read a curated catalogue,
@@ -80,7 +89,7 @@ export AWS_ENDPOINT_URL=http://localhost:4566
 CLUSTER_ID=$(aws emr run-job-flow \
   --name "demo-cluster" \
   --release-label emr-7.0.0 \
-  --instances InstanceGroups='[{InstanceCount=1,InstanceGroupType=MASTER,InstanceType=m5.xlarge}]' \
+  --instances KeepJobFlowAliveWhenNoSteps=true,InstanceGroups='[{InstanceCount=1,InstanceGroupType=MASTER,InstanceType=m5.xlarge}]' \
   --query 'JobFlowId' --output text)
 
 # Inspect it

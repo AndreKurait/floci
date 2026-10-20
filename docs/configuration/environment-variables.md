@@ -261,7 +261,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | `FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ENABLED` | `false` | Watch Lambda code directories for changes and reload without redeployment |
 | `FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ALLOWED_PATHS` | _(none)_ | Comma-separated host paths that hot-reload is allowed to watch |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | _(none)_ | Docker network for Lambda containers (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
-| `FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS` | _(none)_ | Comma-separated existing Docker network names or IDs joined before a function starts. Keeps the primary network; a failed attachment aborts and cleans up the launch. Duplicate or invalid names are rejected |
+| `FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS` | _(none)_ | Comma-separated existing Docker network names or IDs joined before a function starts. Name/ID aliases attach once. Additional endpoints use a lower gateway priority where Docker supports it, preserving the primary route. A failed attachment aborts and cleans up the launch; duplicate or invalid names are rejected |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_FLAGS` | _(none)_ | Additional Docker flags applied to Lambda containers, such as `--env`, `--volume`, `--publish`, `--add-host`, `--dns`, `--label`, `--network`, `--user`, `--privileged`, and `--platform`. Explicit `--dns` entries replace automatic embedded DNS and public fallback resolvers. Published ports support `host:container` and `127.0.0.1:host:container` forms |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX` | `floci` | Base name prefix for Lambda-spawned containers and code volumes (must match `[A-Za-z0-9][A-Za-z0-9_.-]*`) |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | _(none)_ | Explicit host/IP Lambda containers use to reach the Runtime API, bypassing auto-detection (e.g. rootless Podman) |
@@ -551,19 +551,6 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_EC2_IMDS_PORT` | `9169` | Port for the EC2 Instance Metadata Service (IMDS) endpoint |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START` | `2200` | First port in the SSH port range for EC2 instances |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END` | `2299` | Last port in the SSH port range |
-
-Guest environment values are explicit, never copied from the Floci host environment.
-They replace image defaults through Docker's normal environment merge. Floci's
-instance ID, region, credentials/provider selection, AWS service endpoints and IMDS
-settings remain authoritative; the corresponding `AWS_*` keys cannot be overridden.
-Other keys, such as `AWS_CA_BUNDLE`, are allowed. Invalid or duplicate entries refuse
-the guest launch before a workload or firewall namespace is created, without logging
-their values.
-
-Process limits apply only to EC2 workload containers, including image, minimal and
-systemd runtimes. They do not change helper containers or Docker daemon defaults.
-An absent setting keeps the existing defaults; CPU and memory limits remain controlled
-by the instance type and `FLOCI_SERVICES_EC2_INSTANCE_RESOURCE_LIMITS`.
 
 ### Athena
 

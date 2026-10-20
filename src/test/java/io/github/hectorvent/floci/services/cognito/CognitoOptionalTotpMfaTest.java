@@ -155,6 +155,92 @@ class CognitoOptionalTotpMfaTest {
                         "TIMESTAMP", timestamp));
         assertEquals("SOFTWARE_TOKEN_MFA", verified.get("ChallengeName"));
         assertFalse(verified.containsKey("AuthenticationResult"));
+        assertEquals(Map.of("USER_ID_FOR_SRP", USERNAME), verified.get("ChallengeParameters"));
+    }
+
+    @Test
+    void softwareTokenChallengeNamesTheVerifiedDeviceUntilItIsReplaced() throws Exception {
+        String accessToken = accessToken();
+        String secret = (String) service.associateSoftwareToken(accessToken, null).get("SecretCode");
+        service.verifySoftwareToken(accessToken, null, CognitoTotp.code(secret, clock.instant()), "work-phone");
+        service.adminSetUserMFAPreference(pool.getId(), USERNAME, MfaSettingsUpdate.NONE, TOTP_PREFERRED);
+
+        Map<String, Object> challenged = service.adminInitiateAuth(pool.getId(), client.getClientId(),
+                "ADMIN_USER_PASSWORD_AUTH", Map.of("USERNAME", USERNAME, "PASSWORD", PASSWORD));
+        assertEquals("SOFTWARE_TOKEN_MFA", challenged.get("ChallengeName"));
+        assertEquals(Map.of("USER_ID_FOR_SRP", USERNAME, "FRIENDLY_DEVICE_NAME", "work-phone"),
+                challenged.get("ChallengeParameters"));
+        ObjectMapper mapper = new ObjectMapper();
+        CognitoUser restored = mapper.readValue(
+                mapper.writeValueAsBytes(service.adminGetUser(pool.getId(), USERNAME)), CognitoUser.class);
+        assertEquals("work-phone", restored.getSoftwareTokenMfaDeviceName());
+
+        String replacement = (String) service.associateSoftwareToken(accessToken, null).get("SecretCode");
+        service.verifySoftwareToken(accessToken, null, CognitoTotp.code(replacement, clock.instant()));
+        assertEquals(Map.of("USER_ID_FOR_SRP", USERNAME), passwordLogin().get("ChallengeParameters"));
+    }
+
+    @Test
+    void friendlyDeviceNameAtTheLengthLimitIsKept() {
+        String accessToken = accessToken();
+        String secret = (String) service.associateSoftwareToken(accessToken, null).get("SecretCode");
+        String longestName = "d".repeat(CognitoAuthFlowHandler.MAX_FRIENDLY_DEVICE_NAME_LENGTH);
+        assertEquals("SUCCESS", service.verifySoftwareToken(accessToken, null,
+                CognitoTotp.code(secret, clock.instant()), longestName).get("Status"));
+        service.adminSetUserMFAPreference(pool.getId(), USERNAME, MfaSettingsUpdate.NONE, TOTP_PREFERRED);
+
+        assertEquals(Map.of("USER_ID_FOR_SRP", USERNAME, "FRIENDLY_DEVICE_NAME", longestName),
+                passwordLogin().get("ChallengeParameters"));
+    }
+
+    @Test
+    void friendlyDeviceNameLengthCountsCharactersNotUtf16Units() {
+        String accessToken = accessToken();
+        int limit = CognitoAuthFlowHandler.MAX_FRIENDLY_DEVICE_NAME_LENGTH;
+        for (int characters : List.of(limit / 2 + 1, limit)) {
+            String name = "\uD83D\uDE00".repeat(characters);
+            String secret = (String) service.associateSoftwareToken(accessToken, null).get("SecretCode");
+            assertEquals("SUCCESS", service.verifySoftwareToken(accessToken, null,
+                    CognitoTotp.code(secret, clock.instant()), name).get("Status"));
+            assertEquals(name, service.adminGetUser(pool.getId(), USERNAME).getSoftwareTokenMfaDeviceName());
+        }
+
+        String tooLong = "\uD83D\uDE00".repeat(limit + 1);
+        String secret = (String) service.associateSoftwareToken(accessToken, null).get("SecretCode");
+        AwsException rejected = assertThrows(AwsException.class, () -> service.verifySoftwareToken(
+                accessToken, null, CognitoTotp.code(secret, clock.instant()), tooLong));
+        assertEquals("InvalidParameterException", rejected.getErrorCode());
+        assertEquals("1 validation error detected: Value '" + tooLong + "' at 'friendlyDeviceName' failed to "
+                + "satisfy constraint: Member must have length less than or equal to 131072", rejected.getMessage());
+        assertEquals(secret, service.adminGetUser(pool.getId(), USERNAME).getPendingSoftwareTokenMfaSecret());
+    }
+
+    @Test
+    void friendlyDeviceNameOverTheLengthLimitChangesNothing() {
+        String accessToken = accessToken();
+        String secret = (String) service.associateSoftwareToken(accessToken, null).get("SecretCode");
+        service.verifySoftwareToken(accessToken, null, CognitoTotp.code(secret, clock.instant()), "work-phone");
+        String replacement = (String) service.associateSoftwareToken(accessToken, null).get("SecretCode");
+        String code = CognitoTotp.code(replacement, clock.instant());
+        String wrongCode = code.equals("000000") ? "000001" : "000000";
+        String tooLong = "d".repeat(CognitoAuthFlowHandler.MAX_FRIENDLY_DEVICE_NAME_LENGTH + 1);
+
+        for (String userCode : List.of(code, wrongCode)) {
+            AwsException rejected = assertThrows(AwsException.class,
+                    () -> service.verifySoftwareToken(accessToken, null, userCode, tooLong));
+            assertEquals("InvalidParameterException", rejected.getErrorCode());
+            assertEquals("1 validation error detected: Value '" + tooLong + "' at 'friendlyDeviceName' failed to "
+                    + "satisfy constraint: Member must have length less than or equal to 131072",
+                    rejected.getMessage());
+        }
+
+        CognitoUser user = service.adminGetUser(pool.getId(), USERNAME);
+        assertEquals(secret, user.getSoftwareTokenMfaSecret());
+        assertEquals("work-phone", user.getSoftwareTokenMfaDeviceName());
+        assertEquals(replacement, user.getPendingSoftwareTokenMfaSecret());
+        assertEquals(CognitoTotp.MAX_FAILED_ATTEMPTS, user.getPendingSoftwareTokenMfaAttemptsRemaining());
+        assertEquals("SUCCESS", service.verifySoftwareToken(accessToken, null, code, "new-phone").get("Status"));
+        assertEquals("new-phone", service.adminGetUser(pool.getId(), USERNAME).getSoftwareTokenMfaDeviceName());
     }
 
     @Test

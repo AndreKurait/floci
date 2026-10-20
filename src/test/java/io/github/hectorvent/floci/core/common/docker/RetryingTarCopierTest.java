@@ -8,6 +8,7 @@ import com.github.dockerjava.core.DefaultDockerClientConfig;
 import com.github.dockerjava.core.DockerClientImpl;
 import com.github.dockerjava.core.util.CompressArchiveUtil;
 import com.github.dockerjava.transport.DockerHttpClient;
+import io.github.hectorvent.floci.testing.DockerArchiveUploadFixture;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.junit.jupiter.api.Test;
@@ -33,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -123,6 +125,60 @@ class RetryingTarCopierTest {
         assertSame(noSuchContainer, thrown.getCause(),
                 "a genuine daemon rejection must surface after a single attempt");
         assertEquals(1, calls.get());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 73, 8192})
+    void copyArchiveReplaysTheExactBytesWithoutAStreamingPipe(int consumedBytes) {
+        DockerClient docker = mock(DockerClient.class);
+        DockerArchiveUploadFixture uploads = new DockerArchiveUploadFixture(docker, "c-1");
+        uploads.failures = 1;
+        uploads.consumedBytes = consumedBytes;
+        uploads.failure = brokenPipe();
+        byte[] archive = RetryingTarCopier.singleFileTar("config", new byte[16384], 0644);
+
+        RetryingTarCopier.copyArchive(docker, "c-1", "/etc", "config-archive", archive, MAX_ATTEMPTS, 0L);
+
+        assertEquals(2, uploads.commands.size());
+        assertEquals(1, uploads.completed.size());
+        assertArrayEquals(archive, uploads.completed.getFirst(), "an existing tar must not be wrapped in another tar");
+        assertNotSame(uploads.streams.getFirst(), uploads.streams.get(1));
+        for (int attempt = 0; attempt < uploads.commands.size(); attempt++) {
+            assertInstanceOf(ByteArrayInputStream.class, uploads.streams.get(attempt));
+            verify(uploads.commands.get(attempt)).withRemotePath("/etc");
+        }
+    }
+
+    @Test
+    void copyArchiveStopsAtTheRetryBudget() {
+        DockerClient docker = mock(DockerClient.class);
+        DockerArchiveUploadFixture uploads = new DockerArchiveUploadFixture(docker, "c-1");
+        uploads.failures = Integer.MAX_VALUE;
+        uploads.failure = brokenPipe();
+
+        RuntimeException thrown = assertThrows(RuntimeException.class,
+                () -> RetryingTarCopier.copyArchive(docker, "c-1", "/etc", "config-archive",
+                        new byte[1024], MAX_ATTEMPTS, 0L));
+
+        assertSame(uploads.failure, thrown.getCause());
+        assertTrue(thrown.getMessage().contains("config-archive"), thrown.getMessage());
+        assertEquals(MAX_ATTEMPTS, uploads.commands.size());
+        assertTrue(uploads.completed.isEmpty());
+    }
+
+    @Test
+    void copyArchiveDoesNotRetryDaemonRejection() {
+        DockerClient docker = mock(DockerClient.class);
+        DockerArchiveUploadFixture uploads = new DockerArchiveUploadFixture(docker, "c-1");
+        uploads.failures = Integer.MAX_VALUE;
+        uploads.failure = new NotFoundException("container missing");
+
+        RuntimeException thrown = assertThrows(RuntimeException.class,
+                () -> RetryingTarCopier.copyArchive(docker, "c-1", "/etc", "config-archive",
+                        new byte[1024], MAX_ATTEMPTS, 0L));
+
+        assertSame(uploads.failure, thrown.getCause());
+        assertEquals(1, uploads.commands.size());
     }
 
     // copyFile streams tarWriter through a pipe on its own thread; if the writer fails before

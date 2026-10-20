@@ -701,6 +701,20 @@ public class Route53Service implements Resettable {
         return false;
     }
 
+    record PublicDnsZone(String name, List<ResourceRecordSet> matchingRecords, List<ResourceRecordSet> records) {}
+
+    List<PublicDnsZone> publicDnsZones(String qname) {
+        String normalized = normalizeName(qname).toLowerCase();
+        return mostSpecificZones(normalized, false).stream()
+                .map(owned -> {
+                    List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(
+                            owned.accountId(), owned.zone().getId());
+                    return new PublicDnsZone(owned.zone().getName(),
+                            findRecordsForName(normalized, List.of(records)), records);
+                })
+                .toList();
+    }
+
     public record PublicAlias(String dnsName, String hostedZoneId) {}
 
     /**
@@ -764,20 +778,6 @@ public class Route53Service implements Resettable {
             current = normalizeName(next).toLowerCase(Locale.ROOT);
         }
         return null;
-    }
-
-    record PublicDnsZone(String name, List<ResourceRecordSet> matchingRecords, List<ResourceRecordSet> records) {}
-
-    List<PublicDnsZone> publicDnsZones(String qname) {
-        String normalized = normalizeName(qname).toLowerCase();
-        return mostSpecificZones(normalized, false).stream()
-                .map(owned -> {
-                    List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(
-                            owned.accountId(), owned.zone().getId());
-                    return new PublicDnsZone(owned.zone().getName(),
-                            findRecordsForName(normalized, List.of(records)), records);
-                })
-                .toList();
     }
 
     private Map<String, Integer> zoneNameCounts(boolean privateZone) {

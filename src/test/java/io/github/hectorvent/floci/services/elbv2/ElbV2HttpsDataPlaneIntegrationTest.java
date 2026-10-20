@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.acm.model.CertificateOptions;
 import io.github.hectorvent.floci.services.acm.model.CertificateStatus;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import io.github.hectorvent.floci.services.acm.model.ValidationMethod;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.arc.ClientProxy;
 import io.quarkus.test.junit.QuarkusTest;
@@ -1192,7 +1193,10 @@ class ElbV2HttpsDataPlaneIntegrationTest {
         try {
             Response created = given().header("Authorization", accountAuthorization(owner, "elasticloadbalancing"))
                     .formParam("Action", "CreateLoadBalancer").formParam("Name", "https-scoped-iam")
-                    .formParam("Type", "application").when().post("/").then().statusCode(200).extract().response();
+                    .formParam("Type", "application")
+                    .formParam("Subnets.member.1", Ec2Service.defaultSubnetId(REGION, "a"))
+                    .formParam("Subnets.member.2", Ec2Service.defaultSubnetId(REGION, "b"))
+                    .when().post("/").then().statusCode(200).extract().response();
             loadBalancer = new LoadBalancerRef(
                     created.xmlPath().getString("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn"),
                     created.xmlPath().getString("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.DNSName"));
@@ -1533,6 +1537,8 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", name)
                 .formParam("Type", "application")
+                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId(REGION, "a"))
+                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId(REGION, "b"))
                 .header("Authorization", AUTH)
             .when()
                 .post("/")

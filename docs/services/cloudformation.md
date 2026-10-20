@@ -243,6 +243,9 @@ cross-resource references.
 the name, capacity, entries, and tags in place, and stack rollback restores their prior
 values. Changing `AddressFamily` on an existing list is rejected. Capacity and entry
 changes require separate updates; reducing capacity below the current entry count fails.
+`Version` remains numeric when used as another resource's property. AWS rejects it as a
+direct string output or an operand of `Fn::Join`, `Fn::Sub`, or `Fn::Base64`; Floci does
+the same, including references selected through `Fn::If` and `Fn::Select`.
 
 All other resource types are accepted without error and assigned a synthetic physical ID (with an
 `arn:aws:stub:::<logicalId>` ARN attribute), so templates with unsupported types still reach
@@ -477,13 +480,16 @@ without `AutoPublishAlias` fails the transform with
 `'VersionDeletionPolicy' requires 'AutoPublishAlias'.`, as it does in SAM when it does not ignore
 that global.
 
+When `AutoPublishAlias` and a nonempty `AutoPublishCodeSha256` are set, SAM appends the hash to
+the function's `Description`. Parameter references in the description are resolved first;
+other intrinsics are preserved in a `Fn::Join`. Changing the hash alone therefore publishes
+a new version and moves the alias to it.
+
 A new id publishes a version, and moves the alias to it, only when the function's code or
 configuration changed since its last version. Otherwise the new version resource takes the last
 version and the alias stays where it is, as when an update changes only one of these:
 
 - A change to `SnapStart`: floci does not give the function `SnapStart`.
-- A new `AutoPublishCodeSha256` alone: on AWS this publishes, because SAM appends it to the
-  function's `Description`, but floci's transform sets no `Description` on the function.
 - Under `AutoPublishAliasAllProperties`, a change to `Tags` or `ReservedConcurrentExecutions`
   only: AWS fails that update with
   `A version for this Lambda function exists ( N ). Modify the function to create a new version.`,
@@ -747,9 +753,11 @@ always lists both stages, matching AWS.
 adds the corresponding security schemes and operation requirements. API Gateway imports
 these as `authorizationType: AWS_IAM` and `apiKeyRequired: true`: invocation requires both
 a valid SigV4 signature and an enabled API key associated with the invoked stage when both
-controls are selected. Existing inline requirements and their scheme definitions are
+controls are selected. Existing method-level requirements and their scheme definitions are
 preserved. Defaults are selected by the SAM names `AWS_IAM` and `api_key`; an existing
 scheme with another name does not suppress either default.
+Root-level OpenAPI security remains in the document and is not copied into operations
+when applying these defaults, matching AWS SAM.
 
 Other `Auth` properties, custom default authorizers, external definitions, unresolved or
 malformed security requirements, and method override markers are rejected. Existing

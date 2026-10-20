@@ -99,7 +99,7 @@ class CloudWatchQueryGetIntegrationTest {
             "GET, ListMetrics, 2000-01-01, 404", "GET, ListMetricStreams, OMITTED, 404",
             "GET, ListMetricStreams, 2009-05-15, 404", "GET, ListMetricStreams, 2010-08-01, 200",
             "GET, DescribeAlarms, 2013-01-16, 200", "POST, DescribeAlarms, 2013-01-16, 200",
-            "GET, GetMetricData, 2013-01-16, 404", "POST, GetMetricData, 2013-01-16, 404",
+            "GET, ListMetrics, 2013-01-16, 200", "POST, ListMetrics, 2013-01-16, 200",
             "GET, LegacyMetricExtension, 2013-01-16, 404",
             "POST, LegacyMetricExtension, 2013-01-16, 404",
             "POST, ListMetrics, 2000-01-01, 404", "POST, ListMetrics, '', 404",

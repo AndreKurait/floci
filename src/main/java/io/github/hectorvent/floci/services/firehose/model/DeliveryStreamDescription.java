@@ -57,6 +57,11 @@ public class DeliveryStreamDescription {
     }
 
     public DeliveryStreamDescription(String name, String arn, S3Destination s3, KinesisStreamSource kinesisStreamSource) {
+        this(name, arn, s3, null, kinesisStreamSource);
+    }
+
+    public DeliveryStreamDescription(String name, String arn, S3Destination s3, RedshiftDestination redshift,
+                                     KinesisStreamSource kinesisStreamSource) {
         this.deliveryStreamName = name;
         this.deliveryStreamARN = arn;
         this.deliveryStreamStatus = DeliveryStreamStatus.ACTIVE;
@@ -64,7 +69,10 @@ public class DeliveryStreamDescription {
         if (s3 != null) {
             s3.applyDefaults();
         }
-        this.destinations = List.of(new Destination(s3));
+        if (redshift != null && redshift.getS3() != null) {
+            redshift.getS3().applyDefaults();
+        }
+        this.destinations = List.of(redshift != null ? new Destination(redshift) : new Destination(s3));
         this.deliveryStreamEncryptionConfiguration = DeliveryStreamEncryptionConfiguration.disabled();
         if (kinesisStreamSource != null) {
             this.source = new Source(kinesisStreamSource);
@@ -155,7 +163,11 @@ public class DeliveryStreamDescription {
      */
     public S3Destination s3Destination() {
         if (destinations == null || destinations.isEmpty()) return null;
-        return destinations.get(0).getExtendedS3DestinationDescription();
+        Destination first = destinations.get(0);
+        if (first.getRedshiftDestinationDescription() != null) {
+            return first.getRedshiftDestinationDescription().getS3();
+        }
+        return first.getExtendedS3DestinationDescription();
     }
 
     @RegisterForReflection
@@ -171,8 +183,16 @@ public class DeliveryStreamDescription {
         // extended-only fields like S3BackupMode aren't part of the plain shape.
         private S3Destination s3;
 
+        private RedshiftDestination redshift;
+
         public Destination() {}
         public Destination(S3Destination s3) { this.s3 = s3; }
+        public Destination(RedshiftDestination redshift) { this.redshift = redshift; }
+
+        @JsonProperty("RedshiftDestinationDescription")
+        public RedshiftDestination getRedshiftDestinationDescription() { return redshift; }
+        @JsonProperty("RedshiftDestinationDescription")
+        public void setRedshiftDestinationDescription(RedshiftDestination redshift) { this.redshift = redshift; }
 
         public String getDestinationId() { return destinationId; }
         public void setDestinationId(String destinationId) { this.destinationId = destinationId; }

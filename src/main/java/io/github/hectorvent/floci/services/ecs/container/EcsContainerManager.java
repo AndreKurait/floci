@@ -26,6 +26,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
+import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
@@ -70,7 +71,6 @@ import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.jboss.logging.Logger;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
@@ -243,6 +243,11 @@ public class EcsContainerManager {
      */
     public EcsTaskHandle startTask(EcsTask task, TaskDefinition taskDef,
                                    List<ContainerOverride> containerOverrides, String region) {
+        return startTask(task, taskDef, containerOverrides, region, RetryingTarCopier.DEFAULT_BACKOFF_MS);
+    }
+
+    EcsTaskHandle startTask(EcsTask task, TaskDefinition taskDef,
+                            List<ContainerOverride> containerOverrides, String region, long firelensBackoffMillis) {
         String taskId = extractTaskId(task.getTaskArn());
 
         Map<String, String> containerIds = new LinkedHashMap<>();
@@ -543,7 +548,7 @@ public class EcsContainerManager {
                     dockerId = lifecycleManager.create(spec);
                     try {
                         copyFirelensConfig(dockerId, firelensConfig, isFluentdRouter(firelensRouter),
-                                firelensExternalConfig);
+                                firelensExternalConfig, firelensBackoffMillis);
                         lifecycleManager.startCreated(dockerId, spec);
                     } catch (RuntimeException e) {
                         lifecycleManager.removeIfExists(dockerId);
@@ -1784,7 +1789,7 @@ public class EcsContainerManager {
     }
 
     private void copyFirelensConfig(
-            String containerId, String configText, boolean fluentd, String externalConfig) {
+            String containerId, String configText, boolean fluentd, String externalConfig, long backoffMillis) {
         byte[] content = configText.getBytes(StandardCharsets.UTF_8);
         String fileName = fluentd ? "fluent.conf" : "fluent-bit.conf";
         String remotePath = fluentd ? "/fluentd/etc" : "/fluent-bit/etc";
@@ -1798,10 +1803,9 @@ public class EcsContainerManager {
             throw new AwsException("ClientException",
                     "unable to write FireLens config: " + e.getMessage(), 500);
         }
-        lifecycleManager.getDockerClient().copyArchiveToContainerCmd(containerId)
-                .withRemotePath(remotePath)
-                .withTarInputStream(new ByteArrayInputStream(archive.toByteArray()))
-                .exec();
+        byte[] tarBytes = archive.toByteArray();
+        RetryingTarCopier.copyArchive(lifecycleManager.getDockerClient(), containerId,
+                remotePath, "firelens-config", tarBytes, RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, backoffMillis);
     }
 
     private static void putTarEntry(TarArchiveOutputStream tar, String name, byte[] content) throws IOException {

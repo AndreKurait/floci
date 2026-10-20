@@ -34,8 +34,9 @@ import java.util.function.Function;
 
 /**
  * EMR management-plane business logic. Cluster and step lifecycles are simulated
- * through immediate state transitions (no Hadoop runs): clusters land in WAITING and
- * initial steps in COMPLETED. The {@code clusterStartupDelaySeconds} config exists for
+ * through immediate state transitions (no Hadoop runs): steps complete immediately,
+ * leaving persistent clusters WAITING and transient clusters with steps TERMINATED.
+ * The {@code clusterStartupDelaySeconds} config exists for
  * future deferred transitions; Phase 1 advances synchronously for deterministic tests.
  */
 @ApplicationScoped
@@ -111,6 +112,7 @@ public class EmrService {
             completeStep(step);
         }
         advanceToWaiting(cluster);
+        terminateAfterCompletedSteps(cluster);
         clusterStore.put(id, cluster);
         return cluster;
     }
@@ -147,11 +149,11 @@ public class EmrService {
             if (cluster == null) {
                 continue;
             }
-            if (cluster.isTerminationProtected()) {
-                anyProtected = true;
+            if ("TERMINATED".equals(cluster.getState())) {
                 continue;
             }
-            if ("TERMINATED".equals(cluster.getState())) {
+            if (cluster.isTerminationProtected()) {
+                anyProtected = true;
                 continue;
             }
             cluster.setState("TERMINATED");
@@ -204,6 +206,9 @@ public class EmrService {
             completeStep(step);
             cluster.getSteps().add(step);
             ids.add(step.getId());
+        }
+        if (!steps.isEmpty()) {
+            terminateAfterCompletedSteps(cluster);
         }
         clusterStore.put(clusterId, cluster);
         return ids;
@@ -778,6 +783,17 @@ public class EmrService {
         cluster.setStateChangeReasonCode(cluster.getSteps().isEmpty() ? null : "ALL_STEPS_COMPLETED");
         cluster.setStateChangeMessage("Cluster ready to run steps.");
         cluster.setReadyDateTime(Instant.now());
+    }
+
+    private void terminateAfterCompletedSteps(EmrCluster cluster) {
+        if (cluster.getSteps().isEmpty() || !cluster.isAutoTerminate()
+                || "TERMINATED".equals(cluster.getState())) {
+            return;
+        }
+        cluster.setState("TERMINATED");
+        cluster.setStateChangeReasonCode("ALL_STEPS_COMPLETED");
+        cluster.setStateChangeMessage("All steps completed.");
+        cluster.setEndDateTime(Instant.now());
     }
 
     private void initStep(EmrStep step) {

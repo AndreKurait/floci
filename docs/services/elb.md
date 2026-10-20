@@ -92,7 +92,8 @@ HTTPS listeners require a default certificate. Supply one when creating a listen
 - Listeners sharing a local port must use the same protocol. Requests select a load balancer by its DNS name, a hostname declared by its rules, or a certificate hostname; ambiguous hostnames return 502.
 - Load balancer, target group, listener, rule, and tag state is persisted through Floci storage and rebuilt on service startup.
 - Load balancers are created in `active` state.
-- EC2 refuses deletion of subnets and VPCs still referenced by load balancers with `DependencyViolation`. These account- and region-scoped dependencies follow persisted load balancer state; changing subnets or deleting the load balancer releases its old references. A CloudFormation update that changes `Subnets` or `SubnetMappings` moves the load balancer the way `SetSubnets` does, and a rolled-back update moves it back. An independent target group does not prevent subnet or VPC deletion.
+- `CreateLoadBalancer` takes `Subnets` or `SubnetMappings` for every load balancer type, and both together are refused with `ValidationError`. With neither it returns `ValidationError` and creates nothing: `At least two subnets in two different Availability Zones must be specified` for an Application Load Balancer, `At least one subnet must be specified` for a Network or Gateway Load Balancer. CloudFormation refuses an `AWS::ElasticLoadBalancingV2::LoadBalancer` with neither the same way when it creates or replaces the balancer; an update that keeps the balancer leaves it on its subnets.
+- EC2 refuses deletion of subnets and VPCs still referenced by load balancers with `DependencyViolation`. These account- and region-scoped dependencies follow persisted load balancer state; changing subnets or deleting the load balancer releases its old references. A CloudFormation update that names other subnets in `Subnets` or `SubnetMappings` moves the load balancer the way `SetSubnets` does, and a rolled-back update moves it back. An independent target group does not prevent subnet or VPC deletion.
 - HTTP listener sockets are preserved when listener actions change and are restarted only when socket-level settings such as port change.
 - Instance targets are resolved through EC2 instance private addresses so local load balancer traffic can reach containers.
 - Target health starts in `initial` state with reason `Elb.RegistrationInProgress` and is updated by Floci's health checker when monitoring is active.
@@ -137,11 +138,12 @@ arn:aws:elasticloadbalancing:{region}:{account-id}:listener-rule/app/{lb-name}/{
 ```bash
 export AWS_ENDPOINT_URL=http://localhost:4566
 
-# Create a load balancer
+# Create a load balancer on two of the default VPC's subnets
 aws elbv2 create-load-balancer \
   --name my-alb \
   --type application \
-  --scheme internet-facing
+  --scheme internet-facing \
+  --subnets subnet-default-us-east-1-a subnet-default-us-east-1-b
 
 # Create a target group
 aws elbv2 create-target-group \

@@ -29,6 +29,7 @@ public class CognitoUser {
     private SoftwareTokenMfaSettings softwareTokenMfaSettings;
     private SmsMfaSettings smsMfaSettings;
     private String softwareTokenMfaSecret;
+    private String softwareTokenMfaDeviceName;
     private String pendingSoftwareTokenMfaSecret;
     private Integer pendingSoftwareTokenMfaAttemptsRemaining;
     private List<WebAuthnCredential> webAuthnCredentials = new ArrayList<>();
@@ -109,6 +110,10 @@ public class CognitoUser {
 
     public String getSoftwareTokenMfaSecret() { return softwareTokenMfaSecret; }
     public void setSoftwareTokenMfaSecret(String secret) { this.softwareTokenMfaSecret = secret; }
+
+    /** VerifySoftwareToken's {@code FriendlyDeviceName} for the active authenticator, or null when none was given. */
+    public String getSoftwareTokenMfaDeviceName() { return softwareTokenMfaDeviceName; }
+    public void setSoftwareTokenMfaDeviceName(String deviceName) { this.softwareTokenMfaDeviceName = deviceName; }
 
     public String getPendingSoftwareTokenMfaSecret() { return pendingSoftwareTokenMfaSecret; }
     public void setPendingSoftwareTokenMfaSecret(String secret) { this.pendingSoftwareTokenMfaSecret = secret; }

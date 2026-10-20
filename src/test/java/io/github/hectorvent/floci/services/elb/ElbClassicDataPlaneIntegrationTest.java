@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -232,6 +233,33 @@ class ElbClassicDataPlaneIntegrationTest {
     }
 
     @Test
+    @Order(3)
+    void publicAliasesCannotForwardEmulatorApiCredentialsToAnInstance() {
+        String protectedZone = route53(ACCOUNT).body("<CreateHostedZoneRequest><Name>localhost.floci.io</Name>"
+                        + "<CallerReference>" + UUID.randomUUID()
+                        + "</CallerReference></CreateHostedZoneRequest>")
+                .post("/2013-04-01/hostedzone").then().statusCode(201).extract()
+                .path("CreateHostedZoneResponse.HostedZone.Id").toString().replace("/hostedzone/", "");
+        List<String> ownedRecords = new ArrayList<>();
+        int before = backendRequests.get();
+        try {
+            for (String authority : List.of("localhost.floci.io", "ec2.us-east-1.localhost.floci.io")) {
+                String record = alias(authority, dnsName, elbZone, null, 0);
+                changeRecord(ACCOUNT, protectedZone, "CREATE", record);
+                ownedRecords.add(record);
+                ec2Request("DescribeVpcs", FOREIGN).header("Host", authority)
+                        .post("/").then().statusCode(200).body(containsString("DescribeVpcsResponse"));
+            }
+            assertEquals(before, backendRequests.get());
+        } finally {
+            for (String record : ownedRecords) {
+                changeRecord(ACCOUNT, protectedZone, "DELETE", record);
+            }
+            route53(ACCOUNT).delete("/2013-04-01/hostedzone/" + protectedZone).then().statusCode(200);
+        }
+    }
+
+    @Test
     @Order(4)
     void malformedAliasTargetsLoopsAndAmbiguousWeightedRecordsAreRefused() {
         int before = backendRequests.get();
@@ -369,9 +397,13 @@ class ElbClassicDataPlaneIntegrationTest {
     }
 
     private void changeRecord(String action, String record) {
-        route53(ACCOUNT).body("<ChangeResourceRecordSetsRequest><ChangeBatch><Changes><Change><Action>"
+        changeRecord(ACCOUNT, zoneId, action, record);
+    }
+
+    private void changeRecord(String account, String hostedZoneId, String action, String record) {
+        route53(account).body("<ChangeResourceRecordSetsRequest><ChangeBatch><Changes><Change><Action>"
                 + action + "</Action>" + record + "</Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>")
-                .post("/2013-04-01/hostedzone/" + zoneId + "/rrset").then().statusCode(200);
+                .post("/2013-04-01/hostedzone/" + hostedZoneId + "/rrset").then().statusCode(200);
     }
 
     private static String alias(String hostname, String target, String targetZone, String setId, int weight) {

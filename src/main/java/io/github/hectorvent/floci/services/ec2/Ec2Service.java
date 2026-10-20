@@ -84,6 +84,7 @@ import io.github.hectorvent.floci.services.ec2.model.TransitGatewayVpcAttachment
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
+import io.github.hectorvent.floci.services.ec2.model.VolumeListResult;
 import io.github.hectorvent.floci.services.ec2.model.VolumeModification;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.ec2.model.VpcCidrBlockAssociation;
@@ -179,6 +180,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private static final String SYNTHETIC_FALLBACK_CIDR = "172.31.0.0/24";
     private static final String DEFAULT_ROOT_VOLUME_TYPE = "gp3";
     private static final String DOCUMENTATION_PREFIX = "203.0.113.";
+    private static final long MAX_MOCK_PUBLIC_ADDRESS_POOL_SIZE = 256;
     private static final Set<String> VALID_VOLUME_TYPES =
             Set.of("standard", "io1", "io2", "gp2", "sc1", "st1", "gp3");
     /** The accounts behind the two non-self owner aliases DescribeImages accepts. */
@@ -310,6 +312,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final Object privateIpAllocationLock = new Object();
     /** Host part (1-254) of the last 203.0.113.0/24 address handed out; guarded by the allocation lock. */
     private int documentationHost;
+    private final Cidr4 mockPublicAddressPool;
+    /** Next configured pool offset to try; persisted holders, not this cursor, retain leases. */
+    private long mockPublicAddressOffset;
 
     /**
      * Null in the hermetic unit tests, which reach the constructors that do not take it; CDI always
@@ -795,6 +800,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                StorageBackend<String, Host> hosts,
                StorageBackend<String, TransitGatewayPeeringAttachment> transitGatewayPeeringAttachments,
                StorageBackend<String, EgressOnlyInternetGateway> egressOnlyInternetGateways) {
+        this.mockPublicAddressPool = configuredMockPublicAddressPool(config);
         this.hosts = hosts;
         this.egressOnlyInternetGateways = egressOnlyInternetGateways;
         this.transitGatewayPeeringAttachments = transitGatewayPeeringAttachments;
@@ -3633,25 +3639,18 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         String az = subnet != null ? subnet.getAvailabilityZone()
                 : availabilityZone != null && !availabilityZone.isBlank() ? availabilityZone : region + "a";
         String finalSubnetId = subnet != null ? subnet.getSubnetId() : null;
+        boolean automaticPublicIp = suppliedEni == null && (associatePublicIp != null
+                ? associatePublicIp : subnet != null && subnet.isMapPublicIpOnLaunch());
 
         // Resolve security groups
-        List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
+        List<GroupIdentifier> sgIdentifiers;
         if (suppliedEni != null) {
             // AWS ignores instance-level SecurityGroupId when a network interface is supplied;
             // the interface's own groups win (module main.tf sets vpc_security_group_ids = null
             // in this case, so there is nothing to conflict with in practice).
-            sgIdentifiers.addAll(suppliedEni.getGroups());
-        } else if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
-            for (String sgId : securityGroupIds) {
-                SecurityGroup sg = getRequiredSecurityGroup(region, sgId);
-                sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
-            }
+            sgIdentifiers = new ArrayList<>(suppliedEni.getGroups());
         } else {
-            // Use default SG
-            SecurityGroup defaultSg = securityGroups.get(key(region, resolveDefaultSecurityGroupId(region))).orElse(null);
-            if (defaultSg != null) {
-                sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
-            }
+            sgIdentifiers = resolveSecurityGroups(region, vpcId, securityGroupIds);
         }
 
         String reservationId = "r-" + randomHex(17);
@@ -3715,6 +3714,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         // since the unlocked check above.
                         validateHostPlacement(getRequiredAvailableHost(region, hostId), az, effectiveInstanceType, tenancy);
                     }
+                    List<String> publicIps = allocateMockPublicAddresses(automaticPublicIp, admitted);
                     List<String> privateIps = allocateLaunchAddresses(region, finalSubnetId, suppliedEni, admitted);
                     for (int i = 0; i < admitted; i++) {
                         String instanceId = "i-" + randomHex(17);
@@ -3739,9 +3739,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         // override wins in both directions; the subnet's MapPublicIpOnLaunch
                         // attribute is only the default when the launch does not specify it. An
                         // interface the caller created never takes an automatic address.
-                        inst.setAssociatePublicIp(suppliedEni == null && (associatePublicIp != null
-                                ? associatePublicIp
-                                : subnet != null && subnet.isMapPublicIpOnLaunch()));
+                        inst.setAssociatePublicIp(automaticPublicIp);
+                        if (!publicIps.isEmpty()) {
+                            setPublicAddress(inst, publicIps.get(i));
+                        }
                         inst.setPrivateIpAddress(privateIp);
                         inst.setPrivateDnsName(AwsRegions.ec2PrivateIpDnsName(privateIp, region));
                         inst.setKeyName(keyName);
@@ -3776,7 +3777,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         eni.setVpcId(vpcId);
                         eni.setOwnerId(callerAccountId());
                         eni.setDescription(suppliedEni != null ? suppliedEni.getDescription() : null);
-                        eni.setMacAddress(suppliedEni != null ? suppliedEni.getMacAddress() : null);
+                        eni.setMacAddress(suppliedEni != null ? suppliedEni.getMacAddress() : randomMac());
                         eni.setPrivateIpAddress(privateIp);
                         eni.setPrivateDnsName(inst.getPrivateDnsName());
                         eni.setGroups(new ArrayList<>(sgIdentifiers));
@@ -4331,7 +4332,56 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             case NONE -> null;
             case FIXED -> fixedMockPublicAddress();
             case DOCUMENTATION -> documentationPublicAddress();
+            case POOL -> pooledPublicAddress();
         };
+    }
+
+    private static Cidr4 configuredMockPublicAddressPool(EmulatorConfig config) {
+        EmulatorConfig.Ec2ServiceConfig ec2 = config.services().ec2();
+        if (ec2.mockPublicAddresses() != EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.POOL) {
+            return null;
+        }
+        String configured = ec2.mockPublicAddressPool().map(String::strip).orElse("");
+        Cidr4 pool = Cidr4.parse(configured).orElseThrow(() -> new IllegalArgumentException(
+                "floci.services.ec2.mock-public-address-pool requires a network-aligned IPv4 CIDR"));
+        if (!pool.toString().equals(configured) || pool.size() > MAX_MOCK_PUBLIC_ADDRESS_POOL_SIZE) {
+            throw new IllegalArgumentException(
+                    "floci.services.ec2.mock-public-address-pool requires a network-aligned /24 to /32 CIDR");
+        }
+        return pool;
+    }
+
+    /** Reserve the whole launch before private addresses, tags or volumes are written. */
+    private List<String> allocateMockPublicAddresses(boolean publicIpDue, int count) {
+        if (!config.services().ec2().mock() || mockPublicAddressPool == null || !publicIpDue) {
+            return List.of();
+        }
+        if (count > mockPublicAddressPool.size()) {
+            throw exhaustedMockPublicAddressPool();
+        }
+        Set<String> taken = publicAddressesInUse();
+        List<String> allocated = new ArrayList<>(count);
+        for (long step = 0; step < mockPublicAddressPool.size() && allocated.size() < count; step++) {
+            long offset = mockPublicAddressOffset;
+            mockPublicAddressOffset = (offset + 1) % mockPublicAddressPool.size();
+            String candidate = mockPublicAddressPool.addressAt(offset).orElseThrow();
+            if (taken.add(candidate)) {
+                allocated.add(candidate);
+            }
+        }
+        if (allocated.size() < count) {
+            throw exhaustedMockPublicAddressPool();
+        }
+        return allocated;
+    }
+
+    /** Callers hold the allocation lock until the chosen identity is stored on its instance. */
+    private String pooledPublicAddress() {
+        return allocateMockPublicAddresses(true, 1).get(0);
+    }
+
+    private static AwsException exhaustedMockPublicAddressPool() {
+        return new AwsException("AddressLimitExceeded", "The configured mock public address pool is exhausted.", 400);
     }
 
     /**
@@ -4349,21 +4399,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * The next address from 203.0.113.0/24 (TEST-NET-3, reserved for documentation and routed
-     * nowhere) after the last one handed out, skipping any the caller's account already holds as an
-     * instance's public address or an Elastic IP, so a restarted instance gets a different address
-     * as on AWS. Callers hold the allocation lock, so two requests do not pick the same one.
+     * nowhere) after the last one handed out, skipping instance public addresses and Elastic IPs
+     * held in any account or region, including restored records after a service restart.
+     * Callers hold the allocation lock, so two requests do not pick the same one.
      *
      * @return the address, or null once all 254 are taken
      */
     private String documentationPublicAddress() {
-        Set<String> taken = new HashSet<>();
-        for (Instance other : instances.scan(k -> true)) {
-            taken.add(other.getPublicIpAddress());
-        }
-        for (Address other : addresses.scan(k -> true)) {
-            taken.add(other.getPublicIp());
-            taken.add(other.getAllocatedPublicIp());
-        }
+        Set<String> taken = publicAddressesInUse();
         for (int i = 0; i < 254; i++) {
             documentationHost = documentationHost % 254 + 1;
             String candidate = DOCUMENTATION_PREFIX + documentationHost;
@@ -4372,6 +4415,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
         }
         return null;
+    }
+
+    private Set<String> publicAddressesInUse() {
+        Set<String> taken = new HashSet<>();
+        for (Instance other : instances instanceof AccountAwareStorageBackend<Instance> aware
+                ? aware.scanAllAccounts() : instances.scan(k -> true)) {
+            taken.add(other.getPublicIpAddress());
+        }
+        for (Address other : addresses instanceof AccountAwareStorageBackend<Address> aware
+                ? aware.scanAllAccounts() : addresses.scan(k -> true)) {
+            taken.add(other.getPublicIp());
+            taken.add(other.getAllocatedPublicIp());
+        }
+        return taken;
     }
 
     private static String primaryInterfaceId(Instance instance) {
@@ -4438,8 +4495,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * the primary interface it was associated through, or null.
      */
     private Address primaryElasticAddress(String region, Instance instance) {
+        return primaryElasticAddress(region, instance, null);
+    }
+
+    private Address primaryElasticAddress(String region, Instance instance, String excludedAllocationId) {
         String primaryInterfaceId = primaryInterfaceId(instance);
         for (Address address : addresses.scan(k -> k.startsWith(region + "::"))) {
+            if (excludedAllocationId != null && excludedAllocationId.equals(address.getAllocationId())) {
+                continue;
+            }
             boolean onInstance = instance.getInstanceId().equals(address.getInstanceId())
                     || primaryInterfaceId != null && primaryInterfaceId.equals(address.getNetworkInterfaceId());
             if (onInstance && address.getAssociationId() != null
@@ -5431,6 +5495,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return createVpc(region, cidrBlock, isDefault, false);
     }
 
+
     public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
                          boolean amazonProvidedIpv6CidrBlock) {
         return createVpc(region, requestedCidrBlock, isDefault, amazonProvidedIpv6CidrBlock, null);
@@ -5453,10 +5518,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
                          boolean amazonProvidedIpv6CidrBlock, String instanceTenancy) {
+        return createVpc(region, requestedCidrBlock, isDefault, amazonProvidedIpv6CidrBlock, instanceTenancy, false);
+    }
+
+    public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
+                         boolean amazonProvidedIpv6CidrBlock, String instanceTenancy, boolean dryRun) {
+        requireNotDryRun(dryRun);
         // AWS stores the CIDR in canonical form: "100.68.0.18/18" becomes "100.68.0.0/18".
         String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
         rejectOutOfRangePrefix(cidrBlock, "InvalidVpc.Range");
         rejectReservedVpcRange(cidrBlock);
+        String tenancy = requireVpcTenancy(instanceTenancy);
         ensureDefaultResources(region);
         String vpcId = "vpc-" + randomHex(8);
         Vpc vpc = new Vpc();
@@ -5464,7 +5536,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         vpc.setCidrBlock(cidrBlock);
         vpc.setState("available");
         vpc.setDefault(isDefault);
-        vpc.setInstanceTenancy(requireVpcTenancy(instanceTenancy));
+        vpc.setInstanceTenancy(tenancy);
         vpc.setOwnerId(callerAccountId());
         vpc.setRegion(region);
         vpc.getCidrBlockAssociationSet().add(
@@ -6674,6 +6746,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Subnet createSubnet(String region, String vpcId, String requestedCidrBlock, String availabilityZone,
                                String availabilityZoneId, String ipv6CidrBlock) {
+        return createSubnet(region, vpcId, requestedCidrBlock, availabilityZone, availabilityZoneId, ipv6CidrBlock, false);
+    }
+
+    public Subnet createSubnet(String region, String vpcId, String requestedCidrBlock, String availabilityZone,
+                               String availabilityZoneId, String ipv6CidrBlock, boolean dryRun) {
+        requireNotDryRun(dryRun);
         // Canonical form, as AWS stores it; null (an IPv6-only subnet) stays null.
         String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
         if (vpcId == null || vpcId.isBlank()) {
@@ -6912,6 +6990,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // ─── Security Groups ───────────────────────────────────────────────────────
 
     public SecurityGroup createSecurityGroup(String region, String groupName, String description, String vpcId) {
+        return createSecurityGroup(region, groupName, description, vpcId, false);
+    }
+
+    public SecurityGroup createSecurityGroup(String region, String groupName, String description, String vpcId,
+                                             boolean dryRun) {
+        requireNotDryRun(dryRun);
         ensureDefaultResources(region);
         if (vpcId != null && !vpcId.isEmpty()) {
             getRequiredVpc(region, vpcId);
@@ -8124,6 +8208,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Image copyImage(String destinationRegion, String sourceRegion, String sourceImageId,
                            String name, String description, boolean dryRun) {
+        return copyImage(destinationRegion, sourceRegion, sourceImageId, name, description, dryRun, false);
+    }
+
+    public Image copyImage(String destinationRegion, String sourceRegion, String sourceImageId,
+                           String name, String description, boolean dryRun, boolean copyImageTags) {
         if (sourceImageId == null || sourceImageId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter SourceImageId", 400);
         }
@@ -8168,6 +8257,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // Fresh snapshot ids: two AMIs sharing one snapshot would make deleting either appear
             // to take the other's backing with it, and the copy's snapshots live in the
             // destination region anyway.
+            List<Tag> copiedTags = copyImageTags
+                    ? (foreign ? sharedImageView(source).getTags()
+                    : getTagsForAccount(callerAccountId(), sourceRegion, sourceImageId, source.getTags()))
+                            .stream().filter(tag -> !isAwsTagKey(tag.getKey()))
+                            .map(tag -> new Tag(tag.getKey(), tag.getValue())).toList()
+                    : List.of();
+            validateCreationTags(copiedTags);
             List<BlockDeviceMapping> mappings = foreign
                     ? sharedCopyMappings(sourceRegion, source) : sourceImageMappings(source);
             String ancestor = foreign ? sharedCopyAncestor(sourceRegion, source)
@@ -8191,7 +8287,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // emptiness CreateImage itself used to produce. The layer is shared rather than
             // duplicated; reclamation accounts for that.
             copy.setDockerImage(foreign ? null : capturedImageFor(sourceRegion, sourceImageId));
+            copy.setTags(new ArrayList<>(copiedTags));
             registeredImages.put(key(destinationRegion, copy.getImageId()), copy);
+            if (!copiedTags.isEmpty()) {
+                createTags(destinationRegion, List.of(copy.getImageId()), copiedTags);
+            }
             return copy;
         }
     }
@@ -8340,11 +8440,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private Image sharedImageView(Image source) {
         Image view = new Image(source);
-        view.setTags(getTagsForAccount(source.getOwnerId(), source.getRegion(), source.getImageId(), source.getTags()).stream()
-                .filter(tag -> tag.getKey() != null && tag.getKey().startsWith("ec2:SharedTag/"))
-                .map(tag -> new Tag(tag.getKey(), tag.getValue())).collect(Collectors.toCollection(ArrayList::new)));
+        List<Tag> visibleTags = sharedImageTags(source.getRegion(), source);
+        getTagsForAccount(callerAccountId(), source.getRegion(), source.getImageId(), List.of()).stream()
+                .filter(tag -> tag.getKey() != null && !tag.getKey().startsWith("ec2:SharedTag/"))
+                .map(tag -> new Tag(tag.getKey(), tag.getValue())).forEach(visibleTags::add);
+        view.setTags(visibleTags);
         view.setLaunchPermissionUserIds(Set.of());
         return view;
+    }
+
+    private List<Tag> sharedImageTags(String region, Image source) {
+        return getTagsForAccount(source.getOwnerId(), region, source.getImageId(), source.getTags()).stream()
+                .filter(tag -> tag.getKey() != null && tag.getKey().startsWith("ec2:SharedTag/"))
+                .map(tag -> new Tag(tag.getKey(), tag.getValue())).collect(Collectors.toCollection(ArrayList::new));
     }
 
     private Image sharedCopySource(String region, String imageId) {
@@ -8362,11 +8470,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         if (!"available".equals(source.getState())) {
             throw new AwsException("InvalidAMIID.Unavailable", "The source image is not available.", 400);
-        }
-        List<Tag> sourceTags = getTagsForAccount(entry.accountId(), region, imageId, source.getTags());
-        if (sourceTags != null && sourceTags.stream().anyMatch(tag -> tag.getKey() != null
-                && tag.getKey().startsWith("ec2:SharedTag/"))) {
-            throw new AwsException("UnsupportedOperation", "Copying shared AMI tags is not supported.", 400);
         }
         return source;
     }
@@ -9259,6 +9362,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         for (String resourceId : resourceIds) {
             requireTaggableResource(region, resourceId);
         }
+        validateSharedImageTagChanges(region, resourceIds, tagList, "create");
         // The limit is checked under the same locks as the write, so two requests cannot both pass
         // it and then together exceed it, and a rejected request writes nothing.
         withTagWriteLocks(region, resourceIds, () -> {
@@ -9326,6 +9430,27 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
+    static void validateCreationTags(List<Tag> tagList) {
+        validateUserTagKeys(tagList);
+        validateTagLengths(tagList);
+        requireWithinTagLimit(List.of(), tagList);
+    }
+
+    private void validateSharedImageTagChanges(String region, List<String> resourceIds,
+                                              List<Tag> tagList, String operation) {
+        if (tagList.stream().noneMatch(tag -> tag.getKey() != null
+                && tag.getKey().startsWith("ec2:SharedTag/"))) {
+            return;
+        }
+        for (String resourceId : resourceIds) {
+            if (resourceId.startsWith("ami-") && imageForCaller(region, resourceId).isEmpty()
+                    && sharedImageForCaller(region, resourceId).isPresent()) {
+                throw new AwsException("AccessDenied", "Only the resource owner can " + operation
+                        + " shared tags on resource '" + resourceId + "'.", 403);
+            }
+        }
+    }
+
     private static void validateTagLengths(List<Tag> tagList) {
         for (Tag tag : tagList) {
             if (tag.getKey().codePointCount(0, tag.getKey().length()) > MAX_TAG_KEY_LENGTH) {
@@ -9380,7 +9505,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // Not describeImages: it answers an unknown ami- id with a launchable fallback image.
             case "ami" -> requireFound(imageCatalog.findByIdOrAlias(resourceId).isPresent()
                             || registeredImages.get(key(region, resourceId))
-                                    .filter(image -> !DEREGISTERED_STATE.equals(image.getState())).isPresent(),
+                                    .filter(image -> !DEREGISTERED_STATE.equals(image.getState())).isPresent()
+                            || sharedImageForCaller(region, resourceId).isPresent(),
                     "InvalidAMIID.NotFound", "The image id '[" + resourceId + "]' does not exist");
             case "snap" -> requireFound(!describeSnapshots(region, List.of(resourceId), List.of(), Map.of()).isEmpty(),
                     "InvalidSnapshot.NotFound", "The snapshot '" + resourceId + "' does not exist.");
@@ -9416,8 +9542,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /** At most 50 user tags on a resource after the change; tags with the aws: prefix do not count. */
     private void requireWithinTagLimit(String region, String resourceId, List<Tag> tagList) {
+        requireWithinTagLimit(tagsOf(region, resourceId).orElse(List.of()), tagList);
+    }
+
+    private static void requireWithinTagLimit(List<Tag> currentTags, List<Tag> tagList) {
         Set<String> userKeys = new HashSet<>();
-        for (Tag tag : tagsOf(region, resourceId).orElse(List.of())) {
+        for (Tag tag : currentTags) {
             if (!isAwsTagKey(tag.getKey())) {
                 userKeys.add(tag.getKey());
             }
@@ -9474,6 +9604,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public void deleteTags(String region, List<String> resourceIds, List<Tag> tagList) {
         validateTagTargets(region, resourceIds);
         validateUserTagKeys(tagList);
+        validateSharedImageTagChanges(region, resourceIds, tagList, "delete");
         deleteResourceTags(region, resourceIds, tagList);
     }
 
@@ -11251,8 +11382,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         + " is not assigned to the primary network interface of instance " + instanceId + ".", 400);
             }
 
+            boolean replaceOldPublicAddress = mockPublicAddressPool == null || !config.services().ec2().mock()
+                    || target == null || secondary != null
+                    || !instanceId.equals(addressHolder(region, addr));
+            String oldReplacement = addr.getAssociationId() != null && replaceOldPublicAddress
+                    ? pooledReplacementAddress(region, addr) : null;
             if (addr.getAssociationId() != null) {
-                disassociateAddress(region, addr.getAssociationId());
+                disassociateAddress(region, addr.getAssociationId(), replaceOldPublicAddress, oldReplacement);
             }
             // An Elastic IP already on the same private address of the instance is disassociated and
             // stays allocated, as on AWS. That includes one a retained interface carried onto this
@@ -11265,7 +11401,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     if (onInstance && existing.getAssociationId() != null
                             && !allocationId.equals(existing.getAllocationId())
                             && Objects.equals(secondary, secondaryPrivateIpOf(region, target, existing.getPrivateIpAddress()))) {
-                        disassociateAddress(region, existing.getAssociationId());
+                        // The incoming EIP replaces this exact private-address association.
+                        boolean replaceTemporary = mockPublicAddressPool == null || !config.services().ec2().mock();
+                        disassociateAddress(region, existing.getAssociationId(), replaceTemporary, null);
                     }
                 }
             }
@@ -11402,6 +11540,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public void disassociateAddress(String region, String associationId) {
+        disassociateAddress(region, associationId, true, null);
+    }
+
+    private void disassociateAddress(String region, String associationId, boolean replacePublicAddress,
+                                    String reservedPublicAddress) {
         ensureDefaultResources(region);
         // Under the lock NAT create and delete take, so the gateway check and the clear see the
         // same association.
@@ -11427,6 +11570,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             && (addr.getInstanceId() != null
                                     || Objects.equals(addr.getNetworkInterfaceId(), primaryInterfaceId(holder)))
                             && secondaryPrivateIpOf(region, holder, addr.getPrivateIpAddress()) == null;
+                    String replacement = reservedPublicAddress != null ? reservedPublicAddress
+                            : onPrimary && replacePublicAddress ? pooledReplacementAddress(region, addr) : null;
                     addr.setInstanceId(null);
                     addr.setAssociationId(null);
                     updateStoredAddressAssociation(addr);
@@ -11438,8 +11583,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         addr.setPublicIp(addr.getAllocatedPublicIp());
                     }
                     addresses.put(key(region, addr.getAllocationId()), addr);
-                    if (onPrimary) {
-                        releaseElasticAddress(region, holder);
+                    if (onPrimary && replacePublicAddress) {
+                        releaseElasticAddress(region, holder, replacement);
                     }
                     return;
                 }
@@ -11453,7 +11598,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * {@link AutomaticPublicAddress} says it is due, as on AWS; otherwise none. A terminated
      * instance is left as it is.
      */
-    private void releaseElasticAddress(String region, Instance inst) {
+    private String pooledReplacementAddress(String region, Address releasing) {
+        if (!config.services().ec2().mock() || mockPublicAddressPool == null) {
+            return null;
+        }
+        String instanceId = addressHolder(region, releasing);
+        Instance holder = instanceId == null ? null : instances.get(key(region, instanceId)).orElse(null);
+        if (holder == null || holder.getState() == null || !"running".equals(holder.getState().getName())
+                || secondaryPrivateIpOf(region, holder, releasing.getPrivateIpAddress()) != null
+                || !AutomaticPublicAddress.isDue(holder, true)
+                || primaryElasticAddress(region, holder, releasing.getAllocationId()) != null) {
+            return null;
+        }
+        return pooledPublicAddress();
+    }
+
+    private void releaseElasticAddress(String region, Instance inst, String reservedPublicAddress) {
         writePublicAddress(inst, () -> {
             String state = inst.getState() == null ? null : inst.getState().getName();
             if ("terminated".equals(state) || "shutting-down".equals(state)) {
@@ -11466,7 +11626,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             clearPublicAddress(inst);
             if ("running".equals(state)) {
-                assignAutomaticAddress(inst, true);
+                if (reservedPublicAddress != null) {
+                    setPublicAddress(inst, reservedPublicAddress);
+                } else {
+                    assignAutomaticAddress(inst, true);
+                }
             }
         });
         instances.put(key(region, inst.getInstanceId()), inst);
@@ -12266,6 +12430,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public Volume createVolume(String region, String availabilityZone, String volumeType,
                                int size, boolean encrypted, int iops, Integer throughput,
                                String snapshotId, List<Tag> volumeTags) {
+        String effectiveType = volumeType != null ? volumeType : "gp2";
+        requireValidVolumeType(effectiveType);
         if (snapshotId != null && !snapshotId.isBlank()) {
             Snapshot snapshot = volumeSnapshot(region, snapshotId);
             if (snapshot.getVolumeSize() == null || snapshot.getVolumeSize() <= 0) {
@@ -12277,21 +12443,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             size = size > 0 ? size : snapshot.getVolumeSize();
             encrypted |= snapshot.isEncrypted();
         }
+        int effectiveIops = validatedVolumeIops(effectiveType, size, iops, throughput);
         ensureDefaultResources(region);
         String volumeId = "vol-" + randomHex(17);
-        String effectiveType = volumeType != null ? volumeType : "gp2";
         Volume vol = new Volume();
         vol.setVolumeId(volumeId);
         vol.setAvailabilityZone(availabilityZone != null ? availabilityZone : region + "a");
         vol.setVolumeType(effectiveType);
-        vol.setSize(size > 0 ? size : 8);
+        vol.setSize(size);
         // With encryption by default on, AWS encrypts every new volume and the Encrypted parameter
         // cannot opt out of it.
         vol.setEncrypted(encrypted || ebsEncryptionByDefault(region));
-        vol.setIops(iops > 0 ? iops : (volumeType != null && volumeType.startsWith("io") ? iops : 0));
+        vol.setIops(effectiveIops);
         // Throughput is a gp3-only attribute; AWS reports 125 MiB/s by default for gp3.
         if ("gp3".equals(effectiveType)) {
-            vol.setThroughput(throughput != null && throughput > 0 ? throughput : 125);
+            vol.setThroughput(throughput != null ? Math.max(125, throughput) : 125);
         } else {
             vol.setThroughput(throughput);
         }
@@ -12311,8 +12477,64 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return vol;
     }
 
+    private static int validatedVolumeIops(String type, int size, int iops, Integer throughput) {
+        int minimumSize = switch (type) {
+            case "io1", "io2" -> 4;
+            case "st1", "sc1" -> 125;
+            default -> 1;
+        };
+        int maximumSize = switch (type) {
+            case "gp3", "io2" -> 65536;
+            case "standard" -> 1024;
+            default -> 16384;
+        };
+        if (size < minimumSize || size > maximumSize) {
+            throw new AwsException("InvalidParameterValue", "Size is outside the supported range for " + type, 400);
+        }
+        if (throughput != null && !"gp3".equals(type)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "The parameter Throughput is not supported for " + type + " volumes", 400);
+        }
+        if (!Set.of("gp3", "io1", "io2").contains(type)) {
+            if (iops != 0) {
+                throw new AwsException("InvalidParameterCombination",
+                        "The parameter Iops is not supported for " + type + " volumes", 400);
+            }
+            return "gp2".equals(type) ? Math.min(16000, Math.max(100, 3 * size)) : 0;
+        }
+        int effectiveIops = "gp3".equals(type) && iops == 0 ? 3000 : iops;
+        int minimumIops = 100;
+        long maximumIops = switch (type) {
+            case "gp3" -> Math.min(80000, effectiveIops == 3000 ? Math.max(3000L, 500L * size) : 500L * size);
+            case "io1" -> Math.min(64000, 50L * size);
+            default -> Math.min(256000, 1000L * size);
+        };
+        if (effectiveIops < minimumIops || effectiveIops > maximumIops) {
+            throw new AwsException("InvalidParameterValue", "Iops is outside the supported range for " + type, 400);
+        }
+        if ("gp3".equals(type)) {
+            effectiveIops = Math.max(3000, effectiveIops);
+        }
+        if (throughput != null && (throughput < 0 || throughput > 2000
+                || 4L * Math.max(125, throughput) > effectiveIops)) {
+            throw new AwsException("InvalidParameterValue", "Throughput exceeds the supported gp3 performance", 400);
+        }
+        return effectiveIops;
+    }
+
     public List<Volume> describeVolumes(String region, List<String> volumeIds,
                                         Map<String, List<String>> filters) {
+        return describeVolumes(region, volumeIds, filters, null, null).volumes();
+    }
+
+    public VolumeListResult describeVolumes(String region, List<String> volumeIds,
+                                            Map<String, List<String>> filters, Integer maxResults,
+                                            String nextToken) {
+        if (maxResults != null && maxResults < 5) {
+            throw new AwsException("InvalidParameterValue", "Value ( " + maxResults
+                    + " ) for parameter maxResults is invalid. Expecting a value greater than 5.", 400);
+        }
+        int offset = decodeToken(nextToken);
         if (volumeIds != null && !volumeIds.isEmpty()) {
             for (String id : volumeIds) {
                 if (volumes.get(key(region, id)).orElse(null) == null) {
@@ -12321,11 +12543,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
         }
-        return volumes.scan(k -> true).stream()
+        List<Volume> matching = volumes.scan(k -> k.startsWith(region + "::")).stream()
                 .filter(v -> v.getRegion().equals(region))
                 .filter(v -> volumeIds == null || volumeIds.isEmpty() || volumeIds.contains(v.getVolumeId()))
                 .filter(v -> matchesFilters(v, filters, region))
+                .sorted(Comparator.comparing(Volume::getVolumeId))
                 .collect(Collectors.toList());
+        int pageSize = maxResults != null ? maxResults : matching.size();
+        int end = (int) Math.min((long) offset + pageSize, matching.size());
+        List<Volume> page = offset < matching.size() ? matching.subList(offset, end) : List.of();
+        return new VolumeListResult(new ArrayList<>(page), end < matching.size() ? encodeToken(end) : null);
     }
 
     public void deleteVolume(String region, String volumeId) {
@@ -12443,6 +12670,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (volumeId == null || volumeId.isBlank()) {
             throw new AwsException("MissingParameter", "The parameter VolumeId is missing", 400);
         }
+        if (dryRun) {
+            throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
+        }
+        Integer requestedIops = iops != null && iops == 0 ? null : iops;
+        Integer requestedThroughput = throughput != null && throughput == 0 ? null : throughput;
         return withVolumeLock(volumeId, () -> {
             ensureDefaultResources(region);
             Volume volume = getRequiredVolume(region, volumeId);
@@ -12461,23 +12693,25 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 requireValidVolumeType(volumeType);
             }
 
-            if (throughput != null && !"gp3".equals(targetVolumeType)) {
+            if (requestedThroughput != null && !"gp3".equals(targetVolumeType)) {
                 throw new AwsException("InvalidParameterCombination",
                         "The parameter Throughput is not supported for " + targetVolumeType + " volumes", 400);
             }
 
-            if (iops != null && !"gp3".equals(targetVolumeType) && !"io1".equals(targetVolumeType) && !"io2".equals(targetVolumeType)) {
+            if (requestedIops != null && !"gp3".equals(targetVolumeType)
+                    && !"io1".equals(targetVolumeType) && !"io2".equals(targetVolumeType)) {
                 throw new AwsException("InvalidParameterCombination",
                         "The parameter iops is not supported for " + targetVolumeType + " volumes", 400);
+            }
+
+            if (requestedIops != null && requestedIops < 0) {
+                throw new AwsException("InvalidParameterValue",
+                        "Iops is outside the supported range for " + targetVolumeType, 400);
             }
 
             if (multiAttachEnabled != null && multiAttachEnabled && !"io1".equals(targetVolumeType) && !"io2".equals(targetVolumeType)) {
                 throw new AwsException("InvalidParameterCombination",
                         "The parameter MultiAttachEnabled is not supported for " + targetVolumeType + " volumes", 400);
-            }
-
-            if (dryRun) {
-                throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
             }
 
             Integer originalSize = volume.getSize();
@@ -12487,26 +12721,25 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             Boolean originalMultiAttachEnabled = volume.getMultiAttachEnabled();
 
             int targetSize = size != null ? size : volume.getSize();
-            Integer targetIops = iops != null ? iops : (volume.getIops() > 0 ? volume.getIops() : null);
-            Integer targetThroughput = throughput != null ? throughput : volume.getThroughput();
+            boolean sameVolumeType = targetVolumeType.equals(originalVolumeType);
+            int targetIops = requestedIops != null ? requestedIops : (sameVolumeType ? volume.getIops() : 3000);
+            Integer targetThroughput = null;
             Boolean targetMultiAttach = multiAttachEnabled != null ? multiAttachEnabled : volume.getMultiAttachEnabled();
 
             if ("gp3".equals(targetVolumeType)) {
-                if (targetIops == null) {
-                    targetIops = 3000;
+                targetThroughput = requestedThroughput != null ? requestedThroughput
+                        : (sameVolumeType && originalThroughput != null ? originalThroughput : 125);
+                if ("gp2".equals(originalVolumeType) && requestedIops == null && requestedThroughput == null) {
+                    targetIops = Math.max(3000, Math.min(16000, Math.max(100, 3 * originalSize)));
+                    targetThroughput = originalSize <= 170 ? 128 : 250;
                 }
-                if (targetThroughput == null) {
-                    targetThroughput = 125;
-                }
-            } else if ("io1".equals(targetVolumeType) || "io2".equals(targetVolumeType)) {
-                if (targetIops == null) {
-                    targetIops = 3000;
-                }
-                targetThroughput = null;
-            } else {
-                targetIops = null;
-                targetThroughput = null;
+            } else if (!"io1".equals(targetVolumeType) && !"io2".equals(targetVolumeType)) {
+                targetIops = 0;
                 targetMultiAttach = false;
+            }
+            targetIops = validatedVolumeIops(targetVolumeType, targetSize, targetIops, targetThroughput);
+            if (targetThroughput != null) {
+                targetThroughput = Math.max(125, targetThroughput);
             }
 
             boolean resizeSuccess = true;
@@ -12520,7 +12753,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             mod.setVolumeId(volumeId);
             mod.setTargetSize(targetSize);
             mod.setTargetVolumeType(targetVolumeType);
-            mod.setTargetIops(targetIops);
+            mod.setTargetIops(targetIops > 0 ? targetIops : null);
             mod.setTargetThroughput(targetThroughput);
             mod.setTargetMultiAttachEnabled(targetMultiAttach);
             mod.setOriginalSize(originalSize);
@@ -12542,7 +12775,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
             volume.setSize(targetSize);
             volume.setVolumeType(targetVolumeType);
-            volume.setIops(targetIops != null ? targetIops : 0);
+            volume.setIops(targetIops);
             volume.setThroughput(targetThroughput);
             volume.setMultiAttachEnabled(targetMultiAttach);
             volumes.put(key(region, volumeId), volume);
@@ -12946,6 +13179,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return new NetworkInterfaceListResult(result, null);
     }
 
+    private List<GroupIdentifier> resolveSecurityGroups(String region, String vpcId, List<String> securityGroupIds) {
+        List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
+        if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
+            for (String sgId : securityGroupIds) {
+                SecurityGroup sg = getRequiredSecurityGroup(region, sgId);
+                if (!vpcId.equals(sg.getVpcId())) {
+                    throw new AwsException("InvalidGroup.NotFound",
+                            "Security group " + sgId + " does not belong to the subnet VPC", 400);
+                }
+                sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
+            }
+        } else {
+            SecurityGroup defaultSg = securityGroups.scan(k -> k.startsWith(region + "::")).stream()
+                    .filter(group -> vpcId.equals(group.getVpcId())
+                            && "default".equals(group.getGroupName()))
+                    .findFirst().orElse(null);
+            if (defaultSg != null) {
+                sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
+            }
+        }
+        return sgIdentifiers;
+    }
+
     /**
      * Creates a standalone (not-yet-attached) elastic network interface, floci-kt9. Covers the
      * {@code aws_network_interface} resource: an ENI created independently of an instance and
@@ -12961,26 +13217,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         ensureDefaultResources(region);
         Subnet subnet = requireSubnet(region, subnetId);
-
-        List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
-        if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
-            for (String sgId : securityGroupIds) {
-                SecurityGroup sg = getRequiredSecurityGroup(region, sgId);
-                if (!subnet.getVpcId().equals(sg.getVpcId())) {
-                    throw new AwsException("InvalidGroup.NotFound",
-                            "Security group " + sgId + " does not belong to the subnet VPC", 400);
-                }
-                sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
-            }
-        } else {
-            SecurityGroup defaultSg = securityGroups.scan(k -> k.startsWith(region + "::")).stream()
-                    .filter(group -> subnet.getVpcId().equals(group.getVpcId())
-                            && "default".equals(group.getGroupName()))
-                    .findFirst().orElse(null);
-            if (defaultSg != null) {
-                sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
-            }
-        }
+        List<GroupIdentifier> sgIdentifiers = resolveSecurityGroups(region, subnet.getVpcId(), securityGroupIds);
 
         synchronized (privateIpAllocationLock) {
             String eniId = "eni-" + randomHex(17);

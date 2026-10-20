@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.elbv2;
 
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.testing.RealElbV2DataPlaneProfile;
 import io.github.hectorvent.floci.testutil.FreePorts;
 import io.quarkus.test.junit.QuarkusTest;
@@ -47,7 +48,9 @@ class ElbV2StickinessIntegrationTest {
         first = backend("first");
         second = backend("second");
         listenerPort = FreePorts.anyInterfacePort();
-        loadBalancerArn = query("CreateLoadBalancer", "Name", "sticky-lb", "Type", "application")
+        loadBalancerArn = query("CreateLoadBalancer", "Name", "sticky-lb", "Type", "application",
+                "Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a"),
+                "Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b"))
                 .xmlPath().getString("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn");
         targetGroupArn = query("CreateTargetGroup", "Name", "sticky-tg", "Protocol", "HTTP",
                 "Port", first.actualPort(), "TargetType", "ip", "HealthCheckPath", "/health",

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.apigatewayv2;
 
 import com.sun.net.httpserver.HttpServer;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.testing.RealElbV2DataPlaneProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -81,6 +82,8 @@ class ApiGatewayV2AlbIntegrationTest {
                 .formParam("Name", "apigw-alb-test")
                 .formParam("Type", "application")
                 .formParam("Scheme", "internet-facing")
+                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a"))
+                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b"))
                 .header("Authorization", AUTH)
             .when()
                 .post("/")

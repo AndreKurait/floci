@@ -2,11 +2,13 @@
   "_source": {
     "generator": "tools/aws/regen_cfn_property_types.py",
     "schemas": "https://schema.cloudformation.us-east-1.amazonaws.com/CloudformationSchema.zip",
-    "retrieved": "2026-10-19",
+    "retrieved": "2026-10-20",
     "note": "make cfn-property-types-verify checks the file against AWS."
   },
   "operations": {
     "AWS::AutoScaling::LaunchConfiguration": "AWS::AutoScaling::LaunchConfiguration",
+    "AWS::EC2::Instance": "AWS::EC2::Instance",
+    "AWS::EC2::LaunchTemplate": "AWS::EC2::LaunchTemplate",
     "AWS::ECS::TaskDefinition": "AWS::ECS::TaskDefinition",
     "AWS::Events::Rule": "AWS::Events::Rule",
     "AWS::Lambda::Function": "AWS::Lambda::Function",
@@ -83,6 +85,828 @@
         "HttpPutResponseHopLimit": "Integer",
         "HttpTokens": "String",
         "HttpEndpoint": "String"
+      }
+    },
+    "AWS::EC2::Instance": {
+      "type": "structure",
+      "members": {
+        "PrivateDnsName": "String",
+        "Volumes": "AWS::EC2::Instance.Volumes",
+        "PrivateIp": "String",
+        "EnclaveOptions": "AWS::EC2::Instance.EnclaveOptions",
+        "ImageId": "String",
+        "Tags": "AWS::EC2::Instance.Tags",
+        "AdditionalInfo": "String",
+        "HibernationOptions": "AWS::EC2::Instance.HibernationOptions",
+        "LicenseSpecifications": "AWS::EC2::Instance.LicenseSpecifications",
+        "MetadataOptions": "AWS::EC2::Instance/MetadataOptions",
+        "InstanceId": "String",
+        "CpuOptions": "AWS::EC2::Instance.CpuOptions",
+        "AvailabilityZone": "String",
+        "PrivateDnsNameOptions": "AWS::EC2::Instance/PrivateDnsNameOptions",
+        "HostId": "String",
+        "PublicDnsName": "String",
+        "SecurityGroupIds": "AWS::EC2::Instance.SecurityGroupIds",
+        "PlacementGroupName": "String",
+        "SsmAssociations": "AWS::EC2::Instance.SsmAssociations",
+        "VpcId": "String",
+        "State": "AWS::EC2::Instance/State",
+        "Affinity": "String",
+        "Tenancy": "String",
+        "SecurityGroups": "AWS::EC2::Instance.SecurityGroups",
+        "PrivateIpAddress": "String",
+        "UserData": "String",
+        "BlockDeviceMappings": "AWS::EC2::Instance.BlockDeviceMappings",
+        "IamInstanceProfile": "String",
+        "Ipv6Addresses": "AWS::EC2::Instance.Ipv6Addresses",
+        "KernelId": "String",
+        "SubnetId": "String",
+        "EbsOptimized": "Boolean",
+        "PropagateTagsToVolumeOnCreation": "Boolean",
+        "ElasticGpuSpecifications": "AWS::EC2::Instance.ElasticGpuSpecifications",
+        "ElasticInferenceAccelerators": "AWS::EC2::Instance.ElasticInferenceAccelerators",
+        "Ipv6AddressCount": "Integer",
+        "LaunchTemplate": "AWS::EC2::Instance/LaunchTemplateSpecification",
+        "NetworkInterfaces": "AWS::EC2::Instance.NetworkInterfaces",
+        "InstanceType": "String",
+        "Monitoring": "Boolean",
+        "PublicIp": "String",
+        "InstanceInitiatedShutdownBehavior": "String",
+        "HostResourceGroupArn": "String",
+        "DisableApiTermination": "Boolean",
+        "KeyName": "String",
+        "RamdiskId": "String",
+        "SourceDestCheck": "Boolean",
+        "CreditSpecification": "AWS::EC2::Instance.CreditSpecification"
+      }
+    },
+    "AWS::EC2::Instance.BlockDeviceMappings": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/BlockDeviceMapping"
+    },
+    "AWS::EC2::Instance.CpuOptions": {
+      "type": "structure",
+      "members": {
+        "ThreadsPerCore": "Integer",
+        "CoreCount": "Integer"
+      }
+    },
+    "AWS::EC2::Instance.CreditSpecification": {
+      "type": "structure",
+      "members": {
+        "CPUCredits": "String"
+      }
+    },
+    "AWS::EC2::Instance.ElasticGpuSpecifications": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/ElasticGpuSpecification"
+    },
+    "AWS::EC2::Instance.ElasticInferenceAccelerators": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/ElasticInferenceAccelerator"
+    },
+    "AWS::EC2::Instance.EnclaveOptions": {
+      "type": "structure",
+      "members": {
+        "Enabled": "Boolean"
+      }
+    },
+    "AWS::EC2::Instance.HibernationOptions": {
+      "type": "structure",
+      "members": {
+        "Configured": "Boolean"
+      }
+    },
+    "AWS::EC2::Instance.Ipv6Addresses": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/InstanceIpv6Address"
+    },
+    "AWS::EC2::Instance.LicenseSpecifications": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/LicenseSpecification"
+    },
+    "AWS::EC2::Instance.NetworkInterfaces": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/NetworkInterface"
+    },
+    "AWS::EC2::Instance.SecurityGroupIds": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::Instance.SecurityGroups": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::Instance.SsmAssociations": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/SsmAssociation"
+    },
+    "AWS::EC2::Instance.Tags": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/Tag"
+    },
+    "AWS::EC2::Instance.Volumes": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/Volume"
+    },
+    "AWS::EC2::Instance/AssociationParameter": {
+      "type": "structure",
+      "members": {
+        "Value": "AWS::EC2::Instance/AssociationParameter.Value",
+        "Key": "String"
+      },
+      "required": [
+        "Value",
+        "Key"
+      ]
+    },
+    "AWS::EC2::Instance/AssociationParameter.Value": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::Instance/BlockDeviceMapping": {
+      "type": "structure",
+      "members": {
+        "Ebs": "AWS::EC2::Instance/Ebs",
+        "NoDevice": "Json",
+        "VirtualName": "String",
+        "DeviceName": "String"
+      },
+      "required": [
+        "DeviceName"
+      ]
+    },
+    "AWS::EC2::Instance/Ebs": {
+      "type": "structure",
+      "members": {
+        "SnapshotId": "String",
+        "VolumeType": "String",
+        "KmsKeyId": "String",
+        "Encrypted": "Boolean",
+        "Iops": "Integer",
+        "VolumeSize": "Integer",
+        "DeleteOnTermination": "Boolean"
+      }
+    },
+    "AWS::EC2::Instance/ElasticGpuSpecification": {
+      "type": "structure",
+      "members": {
+        "Type": "String"
+      },
+      "required": [
+        "Type"
+      ]
+    },
+    "AWS::EC2::Instance/ElasticInferenceAccelerator": {
+      "type": "structure",
+      "members": {
+        "Type": "String",
+        "Count": "Integer"
+      },
+      "required": [
+        "Type"
+      ]
+    },
+    "AWS::EC2::Instance/EnaSrdSpecification": {
+      "type": "structure",
+      "members": {
+        "EnaSrdEnabled": "Boolean",
+        "EnaSrdUdpSpecification": "AWS::EC2::Instance/EnaSrdUdpSpecification"
+      }
+    },
+    "AWS::EC2::Instance/EnaSrdUdpSpecification": {
+      "type": "structure",
+      "members": {
+        "EnaSrdUdpEnabled": "Boolean"
+      }
+    },
+    "AWS::EC2::Instance/InstanceIpv6Address": {
+      "type": "structure",
+      "members": {
+        "Ipv6Address": "String"
+      },
+      "required": [
+        "Ipv6Address"
+      ]
+    },
+    "AWS::EC2::Instance/LaunchTemplateSpecification": {
+      "type": "structure",
+      "members": {
+        "LaunchTemplateName": "String",
+        "Version": "String",
+        "LaunchTemplateId": "String"
+      }
+    },
+    "AWS::EC2::Instance/LicenseSpecification": {
+      "type": "structure",
+      "members": {
+        "LicenseConfigurationArn": "String"
+      },
+      "required": [
+        "LicenseConfigurationArn"
+      ]
+    },
+    "AWS::EC2::Instance/MetadataOptions": {
+      "type": "structure",
+      "members": {
+        "HttpPutResponseHopLimit": "Integer",
+        "HttpProtocolIpv6": "String",
+        "HttpTokens": "String",
+        "InstanceMetadataTags": "String",
+        "HttpEndpoint": "String"
+      }
+    },
+    "AWS::EC2::Instance/NetworkInterface": {
+      "type": "structure",
+      "members": {
+        "Description": "String",
+        "PrivateIpAddress": "String",
+        "PrivateIpAddresses": "AWS::EC2::Instance/NetworkInterface.PrivateIpAddresses",
+        "SecondaryPrivateIpAddressCount": "Integer",
+        "DeviceIndex": "String",
+        "GroupSet": "AWS::EC2::Instance/NetworkInterface.GroupSet",
+        "Ipv6Addresses": "AWS::EC2::Instance/NetworkInterface.Ipv6Addresses",
+        "SubnetId": "String",
+        "AssociatePublicIpAddress": "Boolean",
+        "NetworkInterfaceId": "String",
+        "AssociateCarrierIpAddress": "Boolean",
+        "EnaSrdSpecification": "AWS::EC2::Instance/EnaSrdSpecification",
+        "Ipv6AddressCount": "Integer",
+        "DeleteOnTermination": "Boolean"
+      },
+      "required": [
+        "DeviceIndex"
+      ]
+    },
+    "AWS::EC2::Instance/NetworkInterface.GroupSet": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::Instance/NetworkInterface.Ipv6Addresses": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/InstanceIpv6Address"
+    },
+    "AWS::EC2::Instance/NetworkInterface.PrivateIpAddresses": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/PrivateIpAddressSpecification"
+    },
+    "AWS::EC2::Instance/PrivateDnsNameOptions": {
+      "type": "structure",
+      "members": {
+        "EnableResourceNameDnsARecord": "Boolean",
+        "HostnameType": "String",
+        "EnableResourceNameDnsAAAARecord": "Boolean"
+      }
+    },
+    "AWS::EC2::Instance/PrivateIpAddressSpecification": {
+      "type": "structure",
+      "members": {
+        "PrivateIpAddress": "String",
+        "Primary": "Boolean"
+      },
+      "required": [
+        "PrivateIpAddress",
+        "Primary"
+      ]
+    },
+    "AWS::EC2::Instance/SsmAssociation": {
+      "type": "structure",
+      "members": {
+        "AssociationParameters": "AWS::EC2::Instance/SsmAssociation.AssociationParameters",
+        "DocumentName": "String"
+      },
+      "required": [
+        "DocumentName"
+      ]
+    },
+    "AWS::EC2::Instance/SsmAssociation.AssociationParameters": {
+      "type": "list",
+      "member": "AWS::EC2::Instance/AssociationParameter"
+    },
+    "AWS::EC2::Instance/State": {
+      "type": "structure",
+      "members": {
+        "Code": "String",
+        "Name": "String"
+      }
+    },
+    "AWS::EC2::Instance/Tag": {
+      "type": "structure",
+      "members": {
+        "Value": "String",
+        "Key": "String"
+      },
+      "required": [
+        "Value",
+        "Key"
+      ]
+    },
+    "AWS::EC2::Instance/Volume": {
+      "type": "structure",
+      "members": {
+        "VolumeId": "String",
+        "Device": "String"
+      },
+      "required": [
+        "VolumeId",
+        "Device"
+      ]
+    },
+    "AWS::EC2::LaunchTemplate": {
+      "type": "structure",
+      "members": {
+        "LaunchTemplateName": "String",
+        "LaunchTemplateData": "AWS::EC2::LaunchTemplate/LaunchTemplateData",
+        "VersionDescription": "String",
+        "TagSpecifications": "AWS::EC2::LaunchTemplate.TagSpecifications",
+        "LatestVersionNumber": "String",
+        "LaunchTemplateId": "String",
+        "DefaultVersionNumber": "String"
+      },
+      "required": [
+        "LaunchTemplateData"
+      ]
+    },
+    "AWS::EC2::LaunchTemplate.TagSpecifications": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/LaunchTemplateTagSpecification"
+    },
+    "AWS::EC2::LaunchTemplate/AcceleratorCount": {
+      "type": "structure",
+      "members": {
+        "Min": "Integer",
+        "Max": "Integer"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/AcceleratorTotalMemoryMiB": {
+      "type": "structure",
+      "members": {
+        "Min": "Integer",
+        "Max": "Integer"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/BaselineEbsBandwidthMbps": {
+      "type": "structure",
+      "members": {
+        "Min": "Integer",
+        "Max": "Integer"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/BaselinePerformanceFactors": {
+      "type": "structure",
+      "members": {
+        "Cpu": "AWS::EC2::LaunchTemplate/Cpu"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/BlockDeviceMapping": {
+      "type": "structure",
+      "members": {
+        "Ebs": "AWS::EC2::LaunchTemplate/Ebs",
+        "NoDevice": "String",
+        "VirtualName": "String",
+        "DeviceName": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/CapacityReservationSpecification": {
+      "type": "structure",
+      "members": {
+        "CapacityReservationPreference": "String",
+        "CapacityReservationTarget": "AWS::EC2::LaunchTemplate/CapacityReservationTarget"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/CapacityReservationTarget": {
+      "type": "structure",
+      "members": {
+        "CapacityReservationResourceGroupArn": "String",
+        "CapacityReservationId": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/ConnectionTrackingSpecification": {
+      "type": "structure",
+      "members": {
+        "UdpTimeout": "Integer",
+        "TcpEstablishedTimeout": "Integer",
+        "UdpStreamTimeout": "Integer"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/Cpu": {
+      "type": "structure",
+      "members": {
+        "References": "AWS::EC2::LaunchTemplate/References"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/CpuOptions": {
+      "type": "structure",
+      "members": {
+        "ThreadsPerCore": "Integer",
+        "AmdSevSnp": "String",
+        "NestedVirtualization": "String",
+        "CoreCount": "Integer"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/CreditSpecification": {
+      "type": "structure",
+      "members": {
+        "CpuCredits": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/Ebs": {
+      "type": "structure",
+      "members": {
+        "SnapshotId": "String",
+        "VolumeType": "String",
+        "KmsKeyId": "String",
+        "Encrypted": "Boolean",
+        "EbsCardIndex": "Integer",
+        "Throughput": "Integer",
+        "Iops": "Integer",
+        "VolumeInitializationRate": "Integer",
+        "VolumeSize": "Integer",
+        "DeleteOnTermination": "Boolean"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/EnaSrdSpecification": {
+      "type": "structure",
+      "members": {
+        "EnaSrdEnabled": "Boolean",
+        "EnaSrdUdpSpecification": "AWS::EC2::LaunchTemplate/EnaSrdUdpSpecification"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/EnaSrdUdpSpecification": {
+      "type": "structure",
+      "members": {
+        "EnaSrdUdpEnabled": "Boolean"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/EnclaveOptions": {
+      "type": "structure",
+      "members": {
+        "Enabled": "Boolean"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/HibernationOptions": {
+      "type": "structure",
+      "members": {
+        "Configured": "Boolean"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/IamInstanceProfile": {
+      "type": "structure",
+      "members": {
+        "Arn": "String",
+        "Name": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/InstanceMarketOptions": {
+      "type": "structure",
+      "members": {
+        "SpotOptions": "AWS::EC2::LaunchTemplate/SpotOptions",
+        "MarketType": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/InstanceRequirements": {
+      "type": "structure",
+      "members": {
+        "InstanceGenerations": "AWS::EC2::LaunchTemplate/InstanceRequirements.InstanceGenerations",
+        "MemoryGiBPerVCpu": "AWS::EC2::LaunchTemplate/MemoryGiBPerVCpu",
+        "AcceleratorTypes": "AWS::EC2::LaunchTemplate/InstanceRequirements.AcceleratorTypes",
+        "VCpuCount": "AWS::EC2::LaunchTemplate/VCpuCount",
+        "AcceleratorManufacturers": "AWS::EC2::LaunchTemplate/InstanceRequirements.AcceleratorManufacturers",
+        "LocalStorage": "String",
+        "CpuManufacturers": "AWS::EC2::LaunchTemplate/InstanceRequirements.CpuManufacturers",
+        "BareMetal": "String",
+        "RequireHibernateSupport": "Boolean",
+        "MaxSpotPriceAsPercentageOfOptimalOnDemandPrice": "Integer",
+        "OnDemandMaxPricePercentageOverLowestPrice": "Integer",
+        "MemoryMiB": "AWS::EC2::LaunchTemplate/MemoryMiB",
+        "LocalStorageTypes": "AWS::EC2::LaunchTemplate/InstanceRequirements.LocalStorageTypes",
+        "NetworkInterfaceCount": "AWS::EC2::LaunchTemplate/NetworkInterfaceCount",
+        "ExcludedInstanceTypes": "AWS::EC2::LaunchTemplate/InstanceRequirements.ExcludedInstanceTypes",
+        "AllowedInstanceTypes": "AWS::EC2::LaunchTemplate/InstanceRequirements.AllowedInstanceTypes",
+        "AcceleratorCount": "AWS::EC2::LaunchTemplate/AcceleratorCount",
+        "NetworkBandwidthGbps": "AWS::EC2::LaunchTemplate/NetworkBandwidthGbps",
+        "BaselinePerformanceFactors": "AWS::EC2::LaunchTemplate/BaselinePerformanceFactors",
+        "SpotMaxPricePercentageOverLowestPrice": "Integer",
+        "BaselineEbsBandwidthMbps": "AWS::EC2::LaunchTemplate/BaselineEbsBandwidthMbps",
+        "AcceleratorNames": "AWS::EC2::LaunchTemplate/InstanceRequirements.AcceleratorNames",
+        "AcceleratorTotalMemoryMiB": "AWS::EC2::LaunchTemplate/AcceleratorTotalMemoryMiB",
+        "BurstablePerformance": "String",
+        "TotalLocalStorageGB": "AWS::EC2::LaunchTemplate/TotalLocalStorageGB"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/InstanceRequirements.AcceleratorManufacturers": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::LaunchTemplate/InstanceRequirements.AcceleratorNames": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::LaunchTemplate/InstanceRequirements.AcceleratorTypes": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::LaunchTemplate/InstanceRequirements.AllowedInstanceTypes": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::LaunchTemplate/InstanceRequirements.CpuManufacturers": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::LaunchTemplate/InstanceRequirements.ExcludedInstanceTypes": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::LaunchTemplate/InstanceRequirements.InstanceGenerations": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::LaunchTemplate/InstanceRequirements.LocalStorageTypes": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::LaunchTemplate/Ipv4PrefixSpecification": {
+      "type": "structure",
+      "members": {
+        "Ipv4Prefix": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/Ipv6Add": {
+      "type": "structure",
+      "members": {
+        "Ipv6Address": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/Ipv6PrefixSpecification": {
+      "type": "structure",
+      "members": {
+        "Ipv6Prefix": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/LaunchTemplateData": {
+      "type": "structure",
+      "members": {
+        "SecurityGroups": "AWS::EC2::LaunchTemplate/LaunchTemplateData.SecurityGroups",
+        "TagSpecifications": "AWS::EC2::LaunchTemplate/LaunchTemplateData.TagSpecifications",
+        "NetworkPerformanceOptions": "AWS::EC2::LaunchTemplate/NetworkPerformanceOptions",
+        "UserData": "String",
+        "BlockDeviceMappings": "AWS::EC2::LaunchTemplate/LaunchTemplateData.BlockDeviceMappings",
+        "MaintenanceOptions": "AWS::EC2::LaunchTemplate/MaintenanceOptions",
+        "IamInstanceProfile": "AWS::EC2::LaunchTemplate/IamInstanceProfile",
+        "KernelId": "String",
+        "EbsOptimized": "Boolean",
+        "Placement": "AWS::EC2::LaunchTemplate/Placement",
+        "NetworkInterfaces": "AWS::EC2::LaunchTemplate/LaunchTemplateData.NetworkInterfaces",
+        "EnclaveOptions": "AWS::EC2::LaunchTemplate/EnclaveOptions",
+        "ImageId": "String",
+        "InstanceType": "String",
+        "Monitoring": "AWS::EC2::LaunchTemplate/Monitoring",
+        "HibernationOptions": "AWS::EC2::LaunchTemplate/HibernationOptions",
+        "MetadataOptions": "AWS::EC2::LaunchTemplate/MetadataOptions",
+        "LicenseSpecifications": "AWS::EC2::LaunchTemplate/LaunchTemplateData.LicenseSpecifications",
+        "InstanceInitiatedShutdownBehavior": "String",
+        "DisableApiStop": "Boolean",
+        "CpuOptions": "AWS::EC2::LaunchTemplate/CpuOptions",
+        "PrivateDnsNameOptions": "AWS::EC2::LaunchTemplate/PrivateDnsNameOptions",
+        "SecurityGroupIds": "AWS::EC2::LaunchTemplate/LaunchTemplateData.SecurityGroupIds",
+        "KeyName": "String",
+        "DisableApiTermination": "Boolean",
+        "InstanceMarketOptions": "AWS::EC2::LaunchTemplate/InstanceMarketOptions",
+        "InstanceRequirements": "AWS::EC2::LaunchTemplate/InstanceRequirements",
+        "RamDiskId": "String",
+        "CapacityReservationSpecification": "AWS::EC2::LaunchTemplate/CapacityReservationSpecification",
+        "CreditSpecification": "AWS::EC2::LaunchTemplate/CreditSpecification"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/LaunchTemplateData.BlockDeviceMappings": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/BlockDeviceMapping"
+    },
+    "AWS::EC2::LaunchTemplate/LaunchTemplateData.LicenseSpecifications": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/LicenseSpecification"
+    },
+    "AWS::EC2::LaunchTemplate/LaunchTemplateData.NetworkInterfaces": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/NetworkInterface"
+    },
+    "AWS::EC2::LaunchTemplate/LaunchTemplateData.SecurityGroupIds": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::LaunchTemplate/LaunchTemplateData.SecurityGroups": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::LaunchTemplate/LaunchTemplateData.TagSpecifications": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/TagSpecification"
+    },
+    "AWS::EC2::LaunchTemplate/LaunchTemplateTagSpecification": {
+      "type": "structure",
+      "members": {
+        "ResourceType": "String",
+        "Tags": "AWS::EC2::LaunchTemplate/LaunchTemplateTagSpecification.Tags"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/LaunchTemplateTagSpecification.Tags": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/Tag"
+    },
+    "AWS::EC2::LaunchTemplate/LicenseSpecification": {
+      "type": "structure",
+      "members": {
+        "LicenseConfigurationArn": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/MaintenanceOptions": {
+      "type": "structure",
+      "members": {
+        "AutoRecovery": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/MemoryGiBPerVCpu": {
+      "type": "structure",
+      "members": {
+        "Min": "Double",
+        "Max": "Double"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/MemoryMiB": {
+      "type": "structure",
+      "members": {
+        "Min": "Integer",
+        "Max": "Integer"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/MetadataOptions": {
+      "type": "structure",
+      "members": {
+        "HttpPutResponseHopLimit": "Integer",
+        "HttpTokens": "String",
+        "HttpProtocolIpv6": "String",
+        "InstanceMetadataTags": "String",
+        "HttpEndpoint": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/Monitoring": {
+      "type": "structure",
+      "members": {
+        "Enabled": "Boolean"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/NetworkBandwidthGbps": {
+      "type": "structure",
+      "members": {
+        "Min": "Double",
+        "Max": "Double"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/NetworkInterface": {
+      "type": "structure",
+      "members": {
+        "Description": "String",
+        "PrivateIpAddress": "String",
+        "PrivateIpAddresses": "AWS::EC2::LaunchTemplate/NetworkInterface.PrivateIpAddresses",
+        "SecondaryPrivateIpAddressCount": "Integer",
+        "Ipv6PrefixCount": "Integer",
+        "Ipv4Prefixes": "AWS::EC2::LaunchTemplate/NetworkInterface.Ipv4Prefixes",
+        "DeviceIndex": "Integer",
+        "PrimaryIpv6": "Boolean",
+        "Ipv4PrefixCount": "Integer",
+        "EnaQueueCount": "Integer",
+        "Ipv6Prefixes": "AWS::EC2::LaunchTemplate/NetworkInterface.Ipv6Prefixes",
+        "SubnetId": "String",
+        "Ipv6Addresses": "AWS::EC2::LaunchTemplate/NetworkInterface.Ipv6Addresses",
+        "AssociatePublicIpAddress": "Boolean",
+        "NetworkInterfaceId": "String",
+        "NetworkCardIndex": "Integer",
+        "InterfaceType": "String",
+        "AssociateCarrierIpAddress": "Boolean",
+        "EnaSrdSpecification": "AWS::EC2::LaunchTemplate/EnaSrdSpecification",
+        "Ipv6AddressCount": "Integer",
+        "Groups": "AWS::EC2::LaunchTemplate/NetworkInterface.Groups",
+        "DeleteOnTermination": "Boolean",
+        "ConnectionTrackingSpecification": "AWS::EC2::LaunchTemplate/ConnectionTrackingSpecification"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/NetworkInterface.Groups": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::EC2::LaunchTemplate/NetworkInterface.Ipv4Prefixes": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/Ipv4PrefixSpecification"
+    },
+    "AWS::EC2::LaunchTemplate/NetworkInterface.Ipv6Addresses": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/Ipv6Add"
+    },
+    "AWS::EC2::LaunchTemplate/NetworkInterface.Ipv6Prefixes": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/Ipv6PrefixSpecification"
+    },
+    "AWS::EC2::LaunchTemplate/NetworkInterface.PrivateIpAddresses": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/PrivateIpAdd"
+    },
+    "AWS::EC2::LaunchTemplate/NetworkInterfaceCount": {
+      "type": "structure",
+      "members": {
+        "Min": "Integer",
+        "Max": "Integer"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/NetworkPerformanceOptions": {
+      "type": "structure",
+      "members": {
+        "BandwidthWeighting": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/Placement": {
+      "type": "structure",
+      "members": {
+        "GroupName": "String",
+        "Tenancy": "String",
+        "SpreadDomain": "String",
+        "PartitionNumber": "Integer",
+        "AvailabilityZone": "String",
+        "Affinity": "String",
+        "HostId": "String",
+        "HostResourceGroupArn": "String",
+        "GroupId": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/PrivateDnsNameOptions": {
+      "type": "structure",
+      "members": {
+        "EnableResourceNameDnsARecord": "Boolean",
+        "HostnameType": "String",
+        "EnableResourceNameDnsAAAARecord": "Boolean"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/PrivateIpAdd": {
+      "type": "structure",
+      "members": {
+        "PrivateIpAddress": "String",
+        "Primary": "Boolean"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/Reference": {
+      "type": "structure",
+      "members": {
+        "InstanceFamily": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/References": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/Reference"
+    },
+    "AWS::EC2::LaunchTemplate/SpotOptions": {
+      "type": "structure",
+      "members": {
+        "SpotInstanceType": "String",
+        "InstanceInterruptionBehavior": "String",
+        "MaxPrice": "String",
+        "BlockDurationMinutes": "Integer",
+        "ValidUntil": "String"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/Tag": {
+      "type": "structure",
+      "members": {
+        "Value": "String",
+        "Key": "String"
+      },
+      "required": [
+        "Value",
+        "Key"
+      ]
+    },
+    "AWS::EC2::LaunchTemplate/TagSpecification": {
+      "type": "structure",
+      "members": {
+        "ResourceType": "String",
+        "Tags": "AWS::EC2::LaunchTemplate/TagSpecification.Tags"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/TagSpecification.Tags": {
+      "type": "list",
+      "member": "AWS::EC2::LaunchTemplate/Tag"
+    },
+    "AWS::EC2::LaunchTemplate/TotalLocalStorageGB": {
+      "type": "structure",
+      "members": {
+        "Min": "Double",
+        "Max": "Double"
+      }
+    },
+    "AWS::EC2::LaunchTemplate/VCpuCount": {
+      "type": "structure",
+      "members": {
+        "Min": "Integer",
+        "Max": "Integer"
       }
     },
     "AWS::ECS::TaskDefinition": {
@@ -467,6 +1291,16 @@
         "ContainerPath": "String"
       }
     },
+    "AWS::ECS::TaskDefinition/NvidiaMpsAllocation": {
+      "type": "structure",
+      "members": {
+        "Memory": "Integer",
+        "MaxComputePercent": "Integer"
+      },
+      "required": [
+        "Memory"
+      ]
+    },
     "AWS::ECS::TaskDefinition/PortMapping": {
       "type": "structure",
       "members": {
@@ -503,6 +1337,7 @@
       "type": "structure",
       "members": {
         "Type": "String",
+        "SharingStrategy": "AWS::ECS::TaskDefinition/SharingStrategy",
         "Value": "String"
       },
       "required": [
@@ -549,6 +1384,15 @@
       "required": [
         "Name",
         "ValueFrom"
+      ]
+    },
+    "AWS::ECS::TaskDefinition/SharingStrategy": {
+      "type": "structure",
+      "members": {
+        "NvidiaMps": "AWS::ECS::TaskDefinition/NvidiaMpsAllocation"
+      },
+      "required": [
+        "NvidiaMps"
       ]
     },
     "AWS::ECS::TaskDefinition/SystemControl": {

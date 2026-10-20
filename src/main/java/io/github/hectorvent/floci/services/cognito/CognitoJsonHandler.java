@@ -992,7 +992,7 @@ public class CognitoJsonHandler {
     private Response handleVerifySoftwareToken(JsonNode request) {
         Map<String, Object> result = service.verifySoftwareToken(
                 request.path("AccessToken").asText(null), request.path("Session").asText(null),
-                request.path("UserCode").asText(null));
+                request.path("UserCode").asText(null), request.path("FriendlyDeviceName").asText(null));
         return Response.ok(objectMapper.valueToTree(result)).build();
     }
 

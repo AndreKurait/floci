@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Tag reconciliation shared by the EC2 provisioners ({@code Ec2InstanceCfnProvisioner},
@@ -42,12 +43,17 @@ final class Ec2Tags {
 
     /**
      * Brings a resource's tags to {@code desired}: removes the keys AWS currently has that the
-     * template no longer declares, then creates or overwrites the declared ones.
+     * template no longer declares, then creates or overwrites the declared ones. Returns whether the
+     * tags were anything other than {@code desired} before.
      */
-    static void reconcile(Ec2Service ec2Service, String region, String resourceId, Map<String, String> desired) {
+    static boolean reconcile(Ec2Service ec2Service, String region, String resourceId, Map<String, String> desired) {
         List<Tag> add = validatedTags(desired);
         Map<String, String> current = current(ec2Service, region, resourceId);
         List<String> stale = ProvisionContext.staleTagKeys(current, desired);
+        boolean changed = !stale.isEmpty();
+        for (Tag tag : add) {
+            changed |= !current.containsKey(tag.getKey()) || !Objects.equals(tag.getValue(), current.get(tag.getKey()));
+        }
         if (!stale.isEmpty()) {
             List<Tag> remove = new ArrayList<>();
             for (String key : stale) {
@@ -58,5 +64,6 @@ final class Ec2Tags {
         if (!add.isEmpty()) {
             ec2Service.createTags(region, List.of(resourceId), add);
         }
+        return changed;
     }
 }

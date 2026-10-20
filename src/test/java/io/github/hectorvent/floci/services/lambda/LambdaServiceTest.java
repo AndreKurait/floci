@@ -872,10 +872,10 @@ class LambdaServiceTest {
                 new ZipExtractor(), new RegionResolver(REGION, "000000000000"));
 
         // Starts empty…
-        assertEquals(0, rebooted.concurrencyLimiter().totalReserved(REGION));
+        assertEquals(0, rebooted.concurrencyLimiter().totalReserved("000000000000", REGION));
         // …until rehydrate walks the store and re-registers the reserved values.
         rebooted.rehydrateConcurrency();
-        assertEquals(500, rebooted.concurrencyLimiter().totalReserved(REGION));
+        assertEquals(500, rebooted.concurrencyLimiter().totalReserved("000000000000", REGION));
     }
 
     @Test
@@ -919,7 +919,7 @@ class LambdaServiceTest {
                             && "LimitExceededException".equals(((AwsException) rejected).getErrorCode()),
                     "other Put must be rejected, got " + rejected);
             assertEquals(500,
-                    service.concurrencyLimiter().totalReserved(REGION),
+                    service.concurrencyLimiter().totalReserved("000000000000", REGION),
                     "limiter total must reflect only the winning Put");
         } finally {
             pool.shutdownNow();
@@ -938,7 +938,7 @@ class LambdaServiceTest {
         svc.createFunction(REGION, baseRequest("rb-fn"));
         // Baseline: Put of 300 succeeds
         svc.putFunctionConcurrency(REGION, "rb-fn", 300);
-        assertEquals(300, svc.concurrencyLimiter().totalReserved(REGION));
+        assertEquals(300, svc.concurrencyLimiter().totalReserved("000000000000", REGION));
 
         // Now make the next save() explode and try to Put 500
         failing.shouldFail = true;
@@ -946,7 +946,7 @@ class LambdaServiceTest {
                 () -> svc.putFunctionConcurrency(REGION, "rb-fn", 500));
 
         // Limiter must have rolled back to the previous 300
-        assertEquals(300, svc.concurrencyLimiter().totalReserved(REGION),
+        assertEquals(300, svc.concurrencyLimiter().totalReserved("000000000000", REGION),
                 "limiter must unwind on save failure");
     }
 
@@ -968,7 +968,7 @@ class LambdaServiceTest {
 
         // Reserved is cleared from the limiter, but the inflight counter
         // must still be live for the held permit to decrement into.
-        assertEquals(0, service.concurrencyLimiter().totalReserved(REGION));
+        assertEquals(0, service.concurrencyLimiter().totalReserved("000000000000", REGION));
         assertEquals(1, service.concurrencyLimiter().inflightCount(arn),
                 "inflight must survive delete until the permit closes");
 
@@ -1370,7 +1370,7 @@ class LambdaServiceTest {
                 // both read the same LambdaFunction field — so assert
                 // against the limiter's independently-maintained total.
                 assertEquals(stored.intValue(),
-                        service.concurrencyLimiter().totalReserved(REGION),
+                        service.concurrencyLimiter().totalReserved("000000000000", REGION),
                         "limiter totalReserved must match persisted reserved value");
             }
         } finally {

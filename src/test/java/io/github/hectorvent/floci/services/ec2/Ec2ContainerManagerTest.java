@@ -14,8 +14,10 @@ import com.github.dockerjava.api.command.InspectExecCmd;
 import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.command.PingCmd;
+import com.github.dockerjava.api.command.RemoveContainerCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
 import com.github.dockerjava.api.exception.DockerException;
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerConfig;
 import com.github.dockerjava.api.model.ContainerNetwork;
@@ -52,6 +54,7 @@ import org.mockito.ArgumentCaptor;
 
 import java.io.Closeable;
 import java.io.InputStream;
+import java.nio.channels.ClosedByInterruptException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -2080,14 +2083,20 @@ class Ec2ContainerManagerTest {
         awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
     }
 
-    @Test
-    void theTeardownHookRunsOnceTheContainerIsGone() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void theTeardownHookRunsOnceTheContainerIsGone(boolean alreadyAbsent) throws Exception {
         // The hook exists so callers can do work that is only valid after the container has
         // released its Docker resources, so it must actually fire on the ordinary path.
         LaunchHarness harness = launchHarness();
         stubDockerPing(harness.dockerClient(), false);
         Instance instance = instance("i-teardown-hook");
         harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
+        if (alreadyAbsent) {
+            instance.setDockerContainerId(TEST_CONTAINER_ID);
+            when(harness.dockerClient().removeContainerCmd(TEST_CONTAINER_ID))
+                    .thenThrow(new NotFoundException("already absent"));
+        }
         AtomicBoolean ran = new AtomicBoolean(false);
 
         harness.manager().terminate(instance, () -> ran.set(true));
@@ -2095,24 +2104,54 @@ class Ec2ContainerManagerTest {
         awaitUntil(ran::get, Duration.ofSeconds(2));
     }
 
-    @Test
-    void theTeardownHookIsSkippedWhenTheContainerCouldNotBeRemoved() throws Exception {
-        // Running it anyway would start work that depends on the container being gone while it
-        // demonstrably is not, and nothing retries behind it. Skipping and logging is the
-        // honest outcome.
-        LaunchHarness harness = launchHarness();
-        stubDockerPing(harness.dockerClient(), false);
-        Instance instance = instance("i-teardown-hook-refused");
-        harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
-        instance.setDockerContainerId("c-stuck");
-        when(harness.dockerClient().removeContainerCmd("c-stuck"))
-                .thenThrow(new RuntimeException("daemon refused"));
-        AtomicBoolean ran = new AtomicBoolean(false);
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failedRemovalRetainsInstanceLeasesAndTheSameContainerCanBeRetried(boolean interrupted) throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+            stubDockerPing(harness.dockerClient(), false);
+            Instance instance = leasedInstance("i-teardown-hook-refused");
+            harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
+            instance.setDockerContainerId(TEST_CONTAINER_ID);
+            instance.setContainerBridgeIp("172.18.0.2");
+            instance.setImdsSourceIp("192.168.215.7");
+            instance.setSshHostPort(2201);
+            RemoveContainerCmd remove = mock(RemoveContainerCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
+            when(harness.dockerClient().removeContainerCmd(TEST_CONTAINER_ID)).thenReturn(remove);
+            RuntimeException failure = interrupted
+                    ? new RuntimeException(new ClosedByInterruptException()) : new RuntimeException("daemon refused");
+            doThrow(failure).doNothing().when(remove).exec();
+            AtomicInteger callbacks = new AtomicInteger();
 
-        harness.manager().terminate(instance, () -> ran.set(true));
+            harness.manager().terminate(instance, callbacks::incrementAndGet);
+            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
 
-        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
-        assertFalse(ran.get(), "the hook must not run when the container is still present");
+            assertEquals("shutting-down", instance.getState().getName());
+            assertEquals(TEST_CONTAINER_ID, instance.getDockerContainerId());
+            assertEquals(0, instance.getTerminatedAt());
+            assertEquals(0, callbacks.get());
+            verify(harness.portAllocator(), never()).release(2201);
+            verify(harness.vpcNetworkManager(), never()).releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+            verify(harness.metadataServer(), never()).unregisterContainer(anyString(), eq(instance));
+            verify(harness.metadataServer(), never()).unregisterInstance(instance);
+
+            harness.manager().terminate(instance, callbacks::incrementAndGet);
+            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+
+            assertEquals("terminated", instance.getState().getName());
+            assertTrue(instance.getTerminatedAt() > 0);
+            assertEquals(1, callbacks.get());
+            verify(harness.dockerClient(), times(2)).removeContainerCmd(TEST_CONTAINER_ID);
+            verify(remove, times(2)).exec();
+            verify(harness.portAllocator()).release(2201);
+            verify(harness.vpcNetworkManager()).releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+            verify(harness.metadataServer()).unregisterContainer("172.18.0.2", instance);
+            verify(harness.metadataServer()).unregisterContainer("192.168.215.7", instance);
+            verify(harness.metadataServer()).unregisterInstance(instance);
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
     @Test

@@ -219,11 +219,20 @@ permission sets or ordinary owner tags. The source remains independent.
 This is metadata and local catalog behavior, not EBS block-data copying.
 
 `DescribeImages` includes explicitly shared images in the selected region, preserving the source owner.
-Owner and tag filters apply to that view; only `ec2:SharedTag/` tags cross the account boundary.
+Owner and tag filters apply to that view; recipients see their own private tags and the owner's
+`ec2:SharedTag/` tags. Recipients can change their private tags but cannot change the owner's shared tags.
 Reads neither create recipient-owned aliases nor change source tags or mappings. Revocation removes visibility.
 Direct `CreateVolume` from a shared snapshot requires its create-volume grant and uses the snapshot size
 when size is omitted. Smaller sizes, missing grants, wrong regions and encrypted shared snapshots are refused.
 No snapshot bytes are copied by metadata mode.
+`CreateVolume` validates volume size and provisioned performance before allocating a resource.
+It reports the gp2 baseline IOPS and the gp3 defaults of 3,000 IOPS and 125 MiB/s;
+gp3 provisioning supports the current size, IOPS, throughput and performance ratios.
+`DescribeVolumes` applies account, region and filters before `MaxResults`/`NextToken` pagination.
+Explicit page sizes below five are rejected. gp3 accepts below-baseline performance values
+within the size ratio and reports at least 3,000 IOPS and 125 MiB/s.
+IOPS and throughput describe validated API metadata; local backing storage does not enforce
+the provisioned physical performance.
 Permission reads and mutations remain owner-scoped. IAM policy evaluation,
 public/group/organization grants, legacy `OperationType`/`UserId.N` mutation
 forms, encrypted shared copies and KMS are unsupported.
@@ -231,11 +240,10 @@ forms, encrypted shared copies and KMS are unsupported.
 Container mode refuses foreign sources with unbound runtime ancestry. Captured Docker layers are
 refused in both modes, including captures in source ancestry. Direct shared-image container launches
 require a caller-owned copy. Same-account captured
-copies retain their existing behavior. `CopyImageTags`, tag specifications,
-encryption and placement options
-are refused. AWS's special `ec2:SharedTag/` visibility and copy behavior is not
-implemented; foreign AMIs with those tags are explicitly refused instead of
-silently dropping or exposing them.
+copies retain their existing behavior. Tag specifications, encryption and placement options are refused.
+Image tags are not copied by default. `CopyImageTags=true` copies the caller's private tags and visible
+`ec2:SharedTag/` tags into the destination account's tag store. Other owners' private tags and system
+tags are excluded, and source tags and permission sets remain unchanged.
 
 ### Cloud-image-derived AMI guests
 
@@ -304,6 +312,8 @@ Notes and limitations:
 EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT` for IMDS and `AWS_ENDPOINT_URL` for AWS service API calls back to Floci.
 
 CloudFormation `AWS::EC2::VPCEndpoint` resolves `IpAddressType` on create and update, including parameter references. Omission, a selected `AWS::NoValue` branch, or `not-specified` uses the default `ipv4`; an explicitly empty value is rejected. Updates retain the existing replacement behavior; synthetic interfaces remain IPv4-only.
+
+CloudFormation `AWS::EC2::LaunchTemplate` stores `LaunchTemplateData.MetadataOptions`, and `AWS::EC2::Instance` launches with its own `MetadataOptions` over those of the launch template it names, as `RunInstances` merges them, so CDK's `requireImdsv2` sets `HttpTokens=required`. A block or member of the wrong type, such as `HttpTokens: [required]`, fails the resource with CloudFormation's type error, a member given as an empty or padded string fails an instance with `InvalidParameterValue` (a launch template stores it unchecked, as `CreateLaunchTemplate` does, and the instances launched from it fail), and `AWS::NoValue` leaves a member or the whole block out. A stack update checks the options before it changes anything, applies changed ones in place, returns options it no longer declares to their defaults, and puts them back if the stack update rolls back. An update that kept the instance and changed no EC2 setting, such as one that only declares the options the instance already has, rolls back in full. When the same update also changed the instance's type, security groups, user data, profile or tags, which have no in-place rollback, the options still go back but the stack ends `UPDATE_ROLLBACK_FAILED` for the instance ("Rollback is not implemented"). The options handling includes an update that changes or drops the instance's `LaunchTemplate` (another template or version, as `Fn::GetAtt LatestVersionNumber` gives after the template changes): AWS replaces the instance then, as `LaunchTemplate` is a replacement property, but Floci keeps it and applies what the new template declares, unless the `ImageId` or `KeyName` the template supplies changed, which replaces it. A change set still previews a literal `LaunchTemplate` change as a replacement.
 
 ## Instance Metadata Service (IMDS)
 
@@ -525,6 +535,10 @@ key of any type but `ssh-rsa`, `ssh-ed25519`, `ecdsa-sha2-nistp256`, `ecdsa-sha2
 | RegisterImage | Registers an AMI from supplied metadata and block device mappings. |
 | CopyImage | Copies an AMI from `SourceRegion` into the request's region as a new AMI the caller owns. |
 | DeregisterImage | Deregisters an AMI. Its snapshots are kept unless `DeleteAssociatedSnapshots=true`, and a snapshot another AMI still uses is kept either way. |
+
+`RegisterImage` accepts optional `image` tag specifications. Those tags appear in
+`DescribeImages` and its tag filters; unsupported tag resource types are rejected
+before the AMI is registered.
 
 Every resource EC2 creates is owned by the account the request resolves to, the same account
 [STS](sts.md) reports for those credentials, and that account is what `ownerId` and the resource ARN
@@ -913,8 +927,10 @@ after termination; release still follows that interface's VPC rules.
 
 AllocateAddress draws Elastic IPs from `203.0.113.0/24`, a range reserved for documentation that
 no host answers on, in every mode, so a client never reaches someone else's host through one. An
-allocation never takes an address the account's other Elastic IPs or instances already hold; once
-all 254 are taken, AllocateAddress fails with `AddressLimitExceeded`. Elastic IPs allocated by an
+allocation never takes an address another Elastic IP or instance holds in any account or region.
+All accounts and regions share the 254-address pool, including records restored after a service
+restart; resource visibility remains scoped to the caller. Once all are taken, AllocateAddress
+fails with `AddressLimitExceeded`. Elastic IPs allocated by an
 earlier Floci version keep their `54.x.x.x` address until released. Associating an Elastic IP with an
 instance that has a container re-points it at the address the instance is actually reachable on
 (the same value DescribeInstances reports), and so does associating one with a mock instance's
@@ -1118,6 +1134,9 @@ When `floci.services.ec2.volume-block-devices` is enabled (the default), attache
 Validation matches AWS behavior:
 - Unknown volumes are rejected with `InvalidVolume.NotFound`.
 - Decreasing volume size is rejected with `InvalidParameterValue`.
+- Modification validates the target type's size, IOPS, throughput, and performance ratios before resizing backing storage or updating volume metadata. It uses the same limits as `CreateVolume`.
+- Omitted or zero performance values retain their existing provisioning when the volume type stays the same. Type changes use the target defaults; a gp2-to-gp3 change with both performance fields omitted preserves source performance when it exceeds gp3's baseline.
+- Increasing gp2 size recomputes its size-based IOPS metadata. Provisioned gp3, io1, and io2 IOPS remain unchanged during a size increase unless explicitly updated.
 - Unsupported parameters (such as `Throughput` on non-gp3 volumes or `Iops` on non-provisioned IOPS volume types) are rejected with `InvalidParameterCombination`.
 - When querying `DescribeVolumesModifications` with an explicit volume ID for an unmodified volume, the request fails with `InvalidVolumeModification.NotFound`. Listing or filtering without explicit IDs returns only modified volumes.
 
@@ -1429,12 +1448,32 @@ container's reachable address: its own IP when Floci's clients can route to it, 
   unless an Elastic IP is associated. The launch still records whether it asked for one, so
   switching the setting takes effect at the instance's next start.
 - `documentation`: an address from `203.0.113.0/24`, a range reserved for documentation that no
-  host answers on, as Lightsail and EMR use. Instances get addresses distinct from each other and
-  from the account's Elastic IPs while any are free (none once all are taken), and a restart gets
-  a different one.
+  host answers on, as Lightsail and EMR use. Instances get addresses distinct from other instances
+  and Elastic IPs across all accounts and regions while any of the shared 254 are free (none once
+  all are taken), and an instance restart gets a different one.
 - `fixed`: `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS` (default `127.0.0.1`, DNS name `localhost`)
   for every instance, so a tool that connects to the public address reaches a host you choose. An
   Elastic IP associated with the primary private address shows that address too.
+- `pool`: distinct model identities from the required
+  `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS_POOL` IPv4 CIDR. The CIDR must be network-aligned and
+  between `/24` and `/32`, containing at most 256 addresses. All addresses are available as
+  individual `/32` identities; these are not VPC subnet allocations. Missing or invalid pool
+  configuration fails service initialization before EC2 model writes.
+
+Pool mode is opt-in and has no default CIDR. It requires caller-owned local delivery, such as
+scoped one-to-one NAT between each identity and its emulated instance. Floci does not install
+those routes, allocate Internet addresses, establish ownership of the configured range, or
+make it publicly reachable. Do not enable it for clients that would send the identities to
+the Internet instead of the intended local network.
+
+The pool skips instance and Elastic IP identities held in any account or region, including
+persisted records after a restart. It reserves the whole launch's identities before private
+addresses, tags or volumes are written, then records them on the accepted pending instances.
+A launch that cannot fit the requested instances fails with `AddressLimitExceeded`; an
+exhausted pool never moves a newly public instance to `running` without its required identity.
+A running identity stays stable. Stop and
+termination release automatic identities, and start allocates an available replacement under
+the existing launch/primary-interface rules below. Elastic IP allocation remains unchanged.
 
 For an address that reaches the instance itself, run it with a container (`FLOCI_SERVICES_EC2_MOCK`
 `false`). Elastic IPs come from `203.0.113.0/24` in both modes (see [Elastic IPs](#elastic-ips)).
@@ -1446,7 +1485,8 @@ For an address that reaches the instance itself, run it with a container (`FLOCI
   [InstanceNetworkInterfaceSpecification reference](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_InstanceNetworkInterfaceSpecification.html)
   specifies, only an interface the launch creates gets an automatic address. An instance launched
   on an existing network interface has none.
-- The address appears when the instance reaches `running` and remains stable while it runs. A
+- Outside pool mode, the address appears when the instance reaches `running`; pool mode reserves
+  it on the accepted pending launch. It remains stable while the instance runs. A
   stop or termination releases it, and a restart assigns a new one (the same one again under
   `fixed`); the private address does not change. As the
   [EC2 User Guide](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing.html#concepts-public-addresses)

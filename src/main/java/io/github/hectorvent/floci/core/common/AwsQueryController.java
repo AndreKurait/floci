@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.redshift.RedshiftQueryHandler;
 import io.github.hectorvent.floci.services.ses.SesQueryHandler;
 import io.github.hectorvent.floci.services.sns.SnsQueryHandler;
 import io.github.hectorvent.floci.services.sqs.SqsQueryHandler;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.GET;
@@ -135,6 +136,7 @@ public class AwsQueryController {
     @POST
     @Consumes(MediaType.APPLICATION_FORM_URLENCODED)
     @Produces(MediaType.APPLICATION_XML)
+    @RunOnVirtualThread
     public Response dispatch(
             @HeaderParam("Authorization") String authorization,
             @Context UriInfo uriInfo,
@@ -396,6 +398,7 @@ public class AwsQueryController {
     @GET
     @Path(QUERY_GET_PATH)
     @Produces({MediaType.APPLICATION_XML, MediaType.TEXT_HTML})
+    @RunOnVirtualThread
     public Response dispatchQueryGet(@HeaderParam("Authorization") String authorization,
                                                @Context UriInfo uriInfo,
                                                @Context ContainerRequestContext request) {
@@ -420,7 +423,7 @@ public class AwsQueryController {
         Set<String> actions = switch (version) {
             case "2009-05-15" -> Set.of("ListMetrics", "GetMetricStatistics");
             case CLOUDWATCH_API_VERSION -> QueryServiceModels.of("monitoring").operations();
-            case "2013-01-16" -> Set.of("PutMetricAlarm", "DescribeAlarms", "DeleteAlarms");
+            case "2013-01-16" -> QueryServiceModels.legacyCloudWatchOperations();
             default -> Set.of();
         };
         if (!actions.contains(action)) {
@@ -469,7 +472,7 @@ public class AwsQueryController {
             QueryService.modeled("rds"),
             QueryService.modeled("monitoring"),
             new QueryService("monitoring", Set.of("2013-01-16"),
-                    Set.of("PutMetricAlarm", "DescribeAlarms", "DeleteAlarms")),
+                    QueryServiceModels.legacyCloudWatchOperations()),
             QueryService.modeled("cloudformation"),
             QueryService.modeled("email"),
             new QueryService("cognito-idp", Set.of(), COGNITO_ACTIONS),

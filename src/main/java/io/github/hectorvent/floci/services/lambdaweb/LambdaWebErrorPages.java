@@ -37,11 +37,18 @@ final class LambdaWebErrorPages {
     static final Page ENDPOINT_REQUEST_THROTTLE = new Page(429, "Too Many Requests",
             "Platform.EndpointRequestThrottle", RATE_EXCEEDED);
 
-    /** The edge in front of the platform refuses a method itself, with its own page and header casing. */
+    /**
+     * The edge in front of the platform refuses a method or a large head itself, with its own pages
+     * and header casing.
+     */
     static final String MALFORMED_REQUEST_TYPE = "Platform.MalformedRequest";
     static final String MALFORMED_REQUEST_HTML = "<!DOCTYPE html>\n<html>\n<head>\n<title>HTTP Error 400</title>\n"
             + "</head>\n<body>\n<h1>400 Bad Request</h1>\n"
             + "<p>The request could not be parsed as a valid HTTP request.</p>\n</body>\n</html>\n";
+    static final String HEADER_TOO_LARGE_TYPE = "Platform.HeaderTooLarge";
+    static final String HEADER_TOO_LARGE_HTML = "<!DOCTYPE html>\n<html>\n<head>\n<title>HTTP Error 431</title>\n"
+            + "</head>\n<body>\n<h1>431 Request Header Fields Too Large</h1>\n"
+            + "<p>The request headers exceed the maximum allowed size.</p>\n</body>\n</html>\n";
     /** The edge writes a two-digit year in its Date header. */
     private static final DateTimeFormatter EDGE_DATE =
             DateTimeFormatter.ofPattern("EEE, dd MMM yy HH:mm:ss 'GMT'", Locale.ROOT).withZone(ZoneOffset.UTC);

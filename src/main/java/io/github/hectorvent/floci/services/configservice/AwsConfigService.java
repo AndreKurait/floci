@@ -187,6 +187,14 @@ public class AwsConfigService {
     // --- Config Rules ---
 
     public ConfigRule putConfigRule(String region, ConfigRule requested) {
+        return putConfigRule(region, requested, null);
+    }
+
+    /** Put is an upsert, and request tags are applied at creation only: the PutConfigRule model
+     *  (config/2014-11-12) says a later Put with different Tags is treated as idempotent and leaves
+     *  the tags alone, which TagResource/UntagResource change instead. The get-then-put runs under
+     *  the lock delete takes, so a delete cannot land between them and orphan the creation tags. */
+    public ConfigRule putConfigRule(String region, ConfigRule requested, List<Map<String, String>> tagList) {
         if (requested == null || isBlank(requested.configRuleName())) {
             throw new AwsException("InvalidParameterValueException",
                     "ConfigRuleName must be specified.", 400);
@@ -225,6 +233,13 @@ public class AwsConfigService {
             }
         }
         String ruleName = requested.configRuleName();
+        synchronized (lockFor(ruleKey(region, ruleName))) {
+            return storeConfigRule(region, requested, ruleName, tagList);
+        }
+    }
+
+    private ConfigRule storeConfigRule(String region, ConfigRule requested, String ruleName,
+                                       List<Map<String, String>> tagList) {
         Map<String, ConfigRule> store = rulesFor(region);
         ConfigRule existing = store.get(ruleName);
         String ruleId;
@@ -248,6 +263,12 @@ public class AwsConfigService {
         ConfigRule rule = new ConfigRule(ruleName, ruleArn, ruleId, requested.description(),
                 requested.scope(), requested.source(), requested.inputParameters(),
                 requested.maximumExecutionFrequency(), state, requested.createdBy(), evaluationModes);
+        // Tags first: a later Put finds the rule and skips them, so a rule stored before its tags
+        // and then a failed tag write could never get them back. This way a failed tag write leaves
+        // no rule and the retry creates both.
+        if (existing == null && tagList != null && !tagList.isEmpty()) {
+            applyTags(ruleArn, tagList);
+        }
         store.put(ruleName, rule);
         persistRegion(configRules, region);
         return rule;
@@ -259,10 +280,12 @@ public class AwsConfigService {
         }
         synchronized (lockFor(ruleKey(region, ruleName))) {
             Map<String, ConfigRule> store = rulesFor(region);
-            if (store.remove(ruleName) == null) {
+            ConfigRule removed = store.remove(ruleName);
+            if (removed == null) {
                 throw new AwsException("NoSuchConfigRuleException", NO_SUCH_CONFIG_RULE_MESSAGE, 400);
             }
             persistRegion(configRules, region);
+            tags.remove(removed.configRuleArn());
             Map<String, Map<String, ConfigEvaluation>> regionEvaluations = evaluations.get(region);
             if (regionEvaluations != null && regionEvaluations.remove(ruleName) != null) {
                 persistRegion(evaluations, region);

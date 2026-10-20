@@ -13,6 +13,7 @@ import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
@@ -20,6 +21,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.matchesPattern;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** The platform answers that need no execution environment, so no Docker. */
@@ -181,7 +183,57 @@ class LambdaWebDataPlaneIntegrationTest {
         assertTrue(response.contains("\r\nLambda-Web-Error-Type: Platform.MalformedRequest\r\n"), response);
         assertTrue(response.contains("\r\nContent-Type: text/html; charset=utf-8\r\n"), response);
         assertTrue(response.contains("\r\nConnection: close\r\n"), response);
+        assertTrue(response.contains("\r\nContent-Length: 180\r\n"), response);
         assertTrue(response.endsWith(LambdaWebErrorPages.MALFORMED_REQUEST_HTML), response);
+    }
+
+    @Test
+    void aHeadPastTheLimitIsRefusedByTheEdgeBeforeAnyOtherCheck() throws IOException {
+        String host = "Host: " + UNKNOWN_HOST + "\r\n";
+        String closing = host + "Connection: close\r\n";
+        assertTrue(raw(head("GET / HTTP/1.1", closing, 1, 131_072)).startsWith("HTTP/1.1 404 Not Found\r\n"));
+        assertTrue(raw(head("GET / HTTP/1.1", closing, 120, 131_072)).startsWith("HTTP/1.1 404 Not Found\r\n"));
+
+        for (String line : List.of("GET / HTTP/1.1", "TRACE / HTTP/1.1", "GET / HTTP/1.0")) {
+            for (int headers : List.of(1, 120)) {
+                String response = raw(head(line, host, headers, 131_073));
+                String message = line + " " + headers + "\n" + response;
+                assertTrue(response.contains(" 431 Request Header Fields Too Large\r\n"), message);
+                assertTrue(response.contains("\r\nLambda-Web-Error-Type: Platform.HeaderTooLarge\r\n"), message);
+                assertTrue(response.contains("\r\nContent-Type: text/html; charset=utf-8\r\n"), message);
+                assertTrue(response.contains("\r\nConnection: close\r\n"), message);
+                assertTrue(response.contains("\r\nContent-Length: 196\r\n"), message);
+                assertTrue(response.endsWith(LambdaWebErrorPages.HEADER_TOO_LARGE_HTML), message);
+            }
+        }
+    }
+
+    @Test
+    void aUriOf64KiBIsTooLong() throws IOException {
+        String fits = raw("GET /" + "a".repeat(65_533) + " HTTP/1.1\r\nHost: " + UNKNOWN_HOST
+                + "\r\nConnection: close\r\n\r\n");
+        assertTrue(fits.startsWith("HTTP/1.1 404 Not Found\r\n"), fits);
+
+        String response = raw("GET /" + "a".repeat(65_534) + " HTTP/1.1\r\nHost: " + UNKNOWN_HOST
+                + "\r\nConnection: close\r\n\r\n");
+        assertTrue(response.startsWith("HTTP/1.1 414 URI Too Long\r\n"), response);
+        assertTrue(response.contains("\r\nconnection: close\r\n"), response);
+        assertTrue(response.contains("\r\ncontent-length: 0\r\n"), response);
+        assertTrue(response.endsWith("\r\n\r\n"), response);
+    }
+
+    @Test
+    void otherHostsKeepTheQuarkusLimits() throws IOException {
+        String path = "/" + "a".repeat(4096 - "GET / HTTP/1.1".length());
+        assertFalse(raw("GET " + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .startsWith("HTTP/1.1 414 "));
+        assertTrue(raw("GET " + path + "a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .startsWith("HTTP/1.1 414 "));
+
+        String headers = "Host: localhost\r\nConnection: close\r\nX-Pad: ";
+        String pad = "a".repeat(20 * 1024 - "Host: localhost".length() - "Connection: close".length() - "X-Pad: ".length());
+        assertFalse(raw("GET / HTTP/1.1\r\n" + headers + pad + "\r\n\r\n").startsWith("HTTP/1.1 431 "));
+        assertTrue(raw("GET / HTTP/1.1\r\n" + headers + pad + "a\r\n\r\n").startsWith("HTTP/1.1 431 "));
     }
 
     @Test
@@ -209,6 +261,21 @@ class LambdaWebDataPlaneIntegrationTest {
                 .when().put(BASE + "/web-functions")
                 .then().statusCode(202)
                 .extract().path("endpoint.domainName");
+    }
+
+    /** A head of exactly {@code length} bytes, padded over {@code headers} headers after the fixed ones. */
+    private static String head(String requestLine, String fixedHeaders, int headers, int length) {
+        StringBuilder head = new StringBuilder(requestLine + "\r\n" + fixedHeaders);
+        int padding = length - head.length() - 2;
+        int share = padding / headers;
+        for (int i = 0; i < headers; i++) {
+            String name = "X-Pad-%03d: ".formatted(i);
+            int line = i < headers - 1 ? share : padding - (headers - 1) * share;
+            head.append(name).append("a".repeat(line - name.length() - 2)).append("\r\n");
+        }
+        String result = head.append("\r\n").toString();
+        assertEquals(length, result.length());
+        return result;
     }
 
     private static String raw(String request) throws IOException {

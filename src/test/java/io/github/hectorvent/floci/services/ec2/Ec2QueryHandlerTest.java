@@ -3,9 +3,11 @@ package io.github.hectorvent.floci.services.ec2;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -27,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
@@ -36,6 +39,41 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class Ec2QueryHandlerTest {
+
+    @ParameterizedTest
+    @ValueSource(strings = {"LaunchTemplateVersion", "Versions"})
+    void describeLaunchTemplateVersionsReadsIndexedSelectors(String prefix) {
+        Ec2Service service = mock(Ec2Service.class);
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("LaunchTemplateId", "lt-test");
+        params.putSingle(prefix + ".1", "$Default");
+        params.putSingle(prefix + ".2", "1");
+        params.putSingle(prefix + ".3", "$Latest");
+
+        Response response = handler(service).handle("DescribeLaunchTemplateVersions", params, "eu-west-1");
+
+        assertEquals(200, response.getStatus());
+        verify(service).describeLaunchTemplateVersions(
+                "eu-west-1", "lt-test", null, List.of("$Default", "1", "$Latest"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "-1", "invalid"})
+    void explicitlyInvalidVolumeIopsIsRefusedBeforeServiceMutation(String iops) {
+        Ec2Service service = mock(Ec2Service.class);
+        Volume volume = new Volume();
+        volume.setVolumeId("vol-test");
+        when(service.createVolume(any(), any(), any(), anyInt(), anyBoolean(), anyInt(), any(), any(), anyList()))
+                .thenReturn(volume);
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("AvailabilityZone", "us-east-1a");
+        params.putSingle("Size", "10");
+        params.putSingle("VolumeType", "gp3");
+        params.putSingle("Iops", iops);
+        Response response = handler(service).handle("CreateVolume", params, "us-east-1");
+        assertInvalidParameterValue(response, "Iops");
+        verifyNoInteractions(service);
+    }
 
     @ParameterizedTest
     @CsvSource({
@@ -74,6 +112,44 @@ class Ec2QueryHandlerTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"resource-type", "missing-resource-type", "reserved-key",
+            "key-length", "value-length", "tag-count"})
+    void rejectsInvalidRegisterImageCreationTagsBeforeMutation(String invalid) {
+        for (String prefix : List.of("TagSpecification", "TagSpecifications")) {
+            Ec2Service service = mock(Ec2Service.class);
+            Image image = new Image();
+            image.setImageId("ami-1234567890abcdef0");
+            when(service.registerImage("us-east-1", "tagged-register-test", null, null, null, List.of()))
+                    .thenReturn(image);
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("Name", "tagged-register-test");
+            params.putSingle(prefix + ".1.ResourceType", "image");
+            params.putSingle(prefix + ".1.Tag.1.Key", "Build");
+            params.putSingle(prefix + ".1.Tag.1.Value", "example");
+            switch (invalid) {
+                case "resource-type" -> params.putSingle(prefix + ".2.ResourceType", "snapshot");
+                case "missing-resource-type" -> params.remove(prefix + ".1.ResourceType");
+                case "reserved-key" -> params.putSingle(prefix + ".1.Tag.1.Key", "aws:example");
+                case "key-length" -> params.putSingle(prefix + ".1.Tag.1.Key", "k".repeat(129));
+                case "value-length" -> params.putSingle(prefix + ".1.Tag.1.Value", "v".repeat(257));
+                case "tag-count" -> {
+                    for (int i = 1; i <= 51; i++) {
+                        params.putSingle(prefix + ".1.Tag." + i + ".Key", "key-" + i);
+                    }
+                }
+                default -> throw new IllegalArgumentException(invalid);
+            }
+
+            Response response = handler(service).handle("RegisterImage", params, "us-east-1");
+
+            assertEquals(400, response.getStatus());
+            String code = "tag-count".equals(invalid) ? "TagLimitExceeded" : "InvalidParameterValue";
+            assertTrue(response.getEntity().toString().contains("<Code>" + code + "</Code>"));
+            verifyNoInteractions(service);
+        }
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"CreateLaunchTemplate", "CreateLaunchTemplateVersion"})
     void rejectsReservedNestedTemplateTagsBeforeCreatingATemplateOrVersion(String action) {
         Ec2Service service = mock(Ec2Service.class);
@@ -96,7 +172,7 @@ class Ec2QueryHandlerTest {
         Ec2Service service = mock(Ec2Service.class);
         Subnet subnet = new Subnet();
         subnet.setSubnetId("subnet-test");
-        when(service.createSubnet("us-east-1", "vpc-test", "10.38.1.0/24", null, null, null))
+        when(service.createSubnet("us-east-1", "vpc-test", "10.38.1.0/24", null, null, null, false))
                 .thenReturn(subnet);
         MultivaluedMap<String, String> params = createSubnetParams("10.38.1.0/24");
         params.putSingle(prefix + ".1.ResourceType", "subnet");
@@ -158,7 +234,7 @@ class Ec2QueryHandlerTest {
         Ec2Service service = mock(Ec2Service.class);
         Vpc vpc = new Vpc();
         vpc.setVpcId("vpc-test");
-        when(service.createVpc("us-east-1", "10.38.0.0/16", false, false, null)).thenReturn(vpc);
+        when(service.createVpc("us-east-1", "10.38.0.0/16", false, false, null, false)).thenReturn(vpc);
         MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
         params.putSingle("CidrBlock", "10.38.0.0/16");
         params.putSingle("TagSpecification.1.ResourceType", "vpc");
@@ -224,7 +300,7 @@ class Ec2QueryHandlerTest {
         Ec2Service service = mock(Ec2Service.class);
         Subnet subnet = new Subnet();
         subnet.setSubnetId("subnet-test");
-        when(service.createSubnet("us-east-1", "vpc-test", "10.42.1.0/24", null, null, null))
+        when(service.createSubnet("us-east-1", "vpc-test", "10.42.1.0/24", null, null, null, false))
                 .thenReturn(subnet);
         IllegalStateException taggingFailure = new IllegalStateException("tag storage failed");
         doThrow(taggingFailure).when(service).createTags(eq("us-east-1"), eq(List.of("subnet-test")),

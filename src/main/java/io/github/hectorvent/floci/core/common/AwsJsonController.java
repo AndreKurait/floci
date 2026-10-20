@@ -20,6 +20,7 @@ import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsJsonHandle
 import io.github.hectorvent.floci.services.swf.SwfJsonHandler;
 import io.github.hectorvent.floci.services.timestreaminfluxdb.TimestreamInfluxDbJsonHandler;
 import io.github.hectorvent.floci.services.verifiedpermissions.VerifiedPermissionsJsonHandler;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
@@ -100,6 +101,7 @@ public class AwsJsonController {
     @POST
     @Consumes("application/json")
     @Produces("application/json")
+    @RunOnVirtualThread
     public Response handlePlainJsonRequest(
             @HeaderParam("X-Amz-Target") String target,
             @Context HttpHeaders httpHeaders,
@@ -118,6 +120,7 @@ public class AwsJsonController {
     @POST
     @Consumes(CONTENT_TYPE_AWS_JSON_1_0)
     @Produces(CONTENT_TYPE_AWS_JSON_1_0)
+    @RunOnVirtualThread
     public Response handleJsonRequest(
             @HeaderParam("X-Amz-Target") String target,
             @Context HttpHeaders httpHeaders,
@@ -134,6 +137,10 @@ public class AwsJsonController {
 
         String serviceKey = targetMatch.descriptor().externalKey();
         String action = targetMatch.action();
+        if ("CloudWatchVersion20130116.".equals(targetMatch.prefix())
+                && !QueryServiceModels.legacyCloudWatchOperations().contains(action)) {
+            return JsonErrorResponseUtils.createUnknownOperationErrorResponse(target);
+        }
         LOG.debugv("{0} JSON action: {1}", serviceKey, action);
 
         JsonNode request;
@@ -170,7 +177,9 @@ public class AwsJsonController {
                 case "sns" -> snsJsonHandler.handle(action, request, region);
                 case "states" -> sfnJsonHandler.handle(action, request, region);
                 case "swf" -> swfJsonHandler.handle(action, request, region);
-                case "monitoring" -> cloudWatchMetricsJsonHandler.handle(action, request, region);
+                case "monitoring" -> "CloudWatchVersion20130116.".equals(targetMatch.prefix())
+                        ? cloudWatchMetricsJsonHandler.handleLegacy(action, request, region)
+                        : cloudWatchMetricsJsonHandler.handle(action, request, region);
                 case "cloudcontrol" -> cloudControlJsonHandler.handle(
                                         action, request, region, regionResolver.getAccountId());
                 case "network-firewall" -> networkFirewallJsonHandler.handle(

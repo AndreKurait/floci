@@ -2485,7 +2485,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         List<String> unsupported = new ArrayList<>();
         headers.fieldNames().forEachRemaining(name -> {
             String lower = name.toLowerCase(Locale.ROOT);
-            if ("expect".equals(lower) || "upgrade".equals(lower)) {
+            if (ApiGatewayTaskInvoker.isReservedDefinitionHeader(lower)) {
                 unsupported.add(lower);
             }
         });

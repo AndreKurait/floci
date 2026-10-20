@@ -36,6 +36,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
@@ -1148,7 +1149,7 @@ class CognitoLambdaTriggersTest {
         }
         assertEquals("gold", claims.get("tier"), "claimsToAddOrOverride should add 'tier'");
         assertEquals("override@example.com", claims.get("email"), "claimsToAddOrOverride should override 'email'");
-        assertNull(claims.get("auth_time"), "claimsToSuppress should drop 'auth_time'");
+        assertNotNull(claims.get("auth_time"), "a trigger cannot suppress 'auth_time'");
         assertEquals(List.of("admins", "managers"), claims.get("cognito:groups"),
                 "groupOverrideDetails.groupsToOverride should replace cognito:groups");
     }
@@ -1196,7 +1197,7 @@ class CognitoLambdaTriggersTest {
                 "claimsAndScopeOverrideDetails", Map.of(
                         "idTokenGeneration", Map.of(
                                 "claimsToAddOrOverride", Map.of("id_only", "yes", "tier", "id-gold"),
-                                "claimsToSuppress", List.of("auth_time")),
+                                "claimsToSuppress", List.of("email")),
                         "accessTokenGeneration", Map.of(
                                 "claimsToAddOrOverride", Map.of("access_only", "yes", "tier", "access-gold"))));
         when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::pre-token"), any(byte[].class), any()))
@@ -1218,12 +1219,11 @@ class CognitoLambdaTriggersTest {
         assertEquals("yes", idClaims.get("id_only"));
         assertEquals("id-gold", idClaims.get("tier"));
         assertNull(idClaims.get("access_only"), "access-only override must not leak into id token");
-        assertNull(idClaims.get("auth_time"), "id-side claimsToSuppress should drop auth_time");
+        assertNull(idClaims.get("email"), "id-side claimsToSuppress should drop email");
 
         assertEquals("yes", accessClaims.get("access_only"));
         assertEquals("access-gold", accessClaims.get("tier"));
         assertNull(accessClaims.get("id_only"), "id-only override must not leak into access token");
-        assertNotNull(accessClaims.get("auth_time"), "access-side did not suppress auth_time");
     }
 
     @Test
@@ -1384,7 +1384,7 @@ class CognitoLambdaTriggersTest {
                         "groupOverrideDetails", Map.of("groupsToOverride", List.of("admins"))))));
 
         Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client, null,
-                List.of("openid", "email"));
+                List.of("openid", "email"), Instant.now());
 
         Map<String, Object> event;
         Map<String, Object> idClaims;
@@ -1423,7 +1423,7 @@ class CognitoLambdaTriggersTest {
                 .thenReturn(ok(Map.of()));
 
         service.generateAuthResultForHostedAuth(user, pool, client, null,
-                List.of("openid", "admin/superuser", "email"));
+                List.of("openid", "admin/superuser", "email"), Instant.now());
 
         Map<String, Object> event;
         try {
@@ -1445,7 +1445,7 @@ class CognitoLambdaTriggersTest {
         when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::pre-token"), payloadCap.capture(), any()))
                 .thenReturn(ok(Map.of()));
 
-        service.generateAuthResultForHostedAuth(user, pool, client, null, List.of("openid"));
+        service.generateAuthResultForHostedAuth(user, pool, client, null, List.of("openid"), Instant.now());
 
         Map<String, Object> event;
         try {
@@ -1470,7 +1470,7 @@ class CognitoLambdaTriggersTest {
         when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::pre-token"), payloadCap.capture(), any()))
                 .thenReturn(ok(Map.of()));
         String refreshToken = (String) service.generateAuthResultForHostedAuth(user, pool, client, null,
-                List.of("openid", "email")).get("RefreshToken");
+                List.of("openid", "email"), Instant.now()).get("RefreshToken");
 
         service.getTokensFromRefreshToken(client.getClientId(), refreshToken);
         service.initiateAuth(client.getClientId(), "REFRESH_TOKEN_AUTH", Map.of("REFRESH_TOKEN", refreshToken));
@@ -1502,7 +1502,7 @@ class CognitoLambdaTriggersTest {
 
         Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client,
                 new CognitoService.ClaimsOverride(Map.of("nonce", "request-nonce"), null, null, null,
-                        null, null, null, null, null), List.of("openid"));
+                        null, null, null, null, null), List.of("openid"), Instant.now());
 
         Map<String, Object> idClaims;
         try {
@@ -1524,7 +1524,7 @@ class CognitoLambdaTriggersTest {
 
         Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client,
                 new CognitoService.ClaimsOverride(Map.of("nonce", "request-nonce"), null, null, null,
-                        null, null, null, null, null), List.of("openid"));
+                        null, null, null, null, null), List.of("openid"), Instant.now());
 
         assertNotNull(auth.get("IdToken"));
         assertNotNull(auth.get("AccessToken"));
@@ -1555,7 +1555,8 @@ class CognitoLambdaTriggersTest {
                 .thenReturn(ok(Map.of()));
 
         List<String> granted = CognitoService.grantedScopes(client, List.of());
-        Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client, null, granted);
+        Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client, null, granted,
+                Instant.now());
 
         assertEquals(List.of("openid", "email", "aws.cognito.signin.user.admin"), granted);
         Map<String, Object> event;
@@ -1579,7 +1580,8 @@ class CognitoLambdaTriggersTest {
         UserPoolClient client = createOAuthClient(pool, List.of("openid", "email"));
         CognitoUser user = service.adminGetUser(pool.getId(), "alice");
 
-        Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client, null, List.of());
+        Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client, null, List.of(),
+                Instant.now());
 
         Map<String, Object> accessClaims;
         try {
@@ -1602,7 +1604,8 @@ class CognitoLambdaTriggersTest {
                 .thenReturn(ok(Map.of("claimsAndScopeOverrideDetails", Map.of(
                         "accessTokenGeneration", Map.of("scopesToSuppress", List.of("email"))))));
 
-        Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client, null, List.of("email"));
+        Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client, null, List.of("email"),
+                Instant.now());
 
         Map<String, Object> accessClaims;
         try {
@@ -1621,7 +1624,8 @@ class CognitoLambdaTriggersTest {
         UserPoolClient client = createOAuthClient(pool, List.of("openid", "email"));
         CognitoUser user = service.adminGetUser(pool.getId(), "alice");
 
-        Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client, null, List.of("email"));
+        Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client, null, List.of("email"),
+                Instant.now());
 
         Map<String, Object> accessClaims;
         try {
@@ -1648,7 +1652,7 @@ class CognitoLambdaTriggersTest {
                                 "scopesToAdd", List.of("aws.cognito.signin.user.admin"))))));
 
         Map<String, Object> auth = service.generateAuthResultForHostedAuth(user, pool, client, null,
-                List.of("openid", "email"));
+                List.of("openid", "email"), Instant.now());
 
         Map<String, Object> accessClaims;
         try {

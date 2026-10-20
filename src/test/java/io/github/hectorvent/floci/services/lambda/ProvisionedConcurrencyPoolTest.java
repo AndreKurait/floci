@@ -267,6 +267,58 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     @Test
+    void replacingCapacityReportsFailedRetirementAndWaitsForCleanupBeforeInitializing() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        launcher.stopFailures.set(2);
+
+        AwsException failure = assertThrows(AwsException.class, () -> put(2));
+        assertEquals(500, failure.getHttpStatus());
+        assertTrue(first.alive);
+        assertEquals(1, launcher.starts.get());
+        assertEquals("IN_PROGRESS", get().status());
+        assertEquals(0, get().allocated());
+        assertEquals(2, get().requested());
+        assertEquals("ResourceConflictException", assertThrows(AwsException.class, () -> put(2)).getErrorCode());
+
+        pool.reconcileSafely();
+        assertTrue(first.alive);
+        assertEquals(1, launcher.starts.get());
+
+        pool.reconcileSafely();
+        assertFalse(first.alive);
+        Environment second = launched();
+        Environment third = launched();
+        second.initialized.complete(null);
+        third.initialized.complete(null);
+        ready();
+        assertEquals(3, first.stops.get());
+        assertEquals(3, launcher.starts.get());
+    }
+
+    @Test
+    void failedReleaseRetainsOwnedCleanupWithoutChangingCompletedInvocationDispatch() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        assertSame(first.handle, pool.acquire(version, "live"));
+        pool.delete(REGION, "example", "live", ACCOUNT);
+        launcher.stopFailures.set(1);
+
+        assertTrue(pool.release(first.handle, false));
+        assertTrue(first.alive);
+        assertEquals(1, first.stops.get());
+        assertThrows(AwsException.class, this::get);
+
+        pool.reconcileSafely();
+        assertFalse(first.alive);
+        assertEquals(2, first.stops.get());
+    }
+
+    @Test
     void initializationFailureIsFailedAndExplicitPutCanRetry() throws Exception {
         put(1);
         Environment first = launched();
@@ -289,8 +341,8 @@ class ProvisionedConcurrencyPoolTest {
         ready();
         first.alive = false;
         pool.reconcile();
-        Environment replacement = launched();
         assertEquals("IN_PROGRESS", get().status());
+        Environment replacement = launched();
         replacement.initialized.complete(null);
         ready();
         assertEquals(1, first.stops.get());
@@ -309,12 +361,37 @@ class ProvisionedConcurrencyPoolTest {
         first.faulted.set(true);
 
         pool.reconcile();
+        assertEquals("IN_PROGRESS", get().status());
         Environment replacement = launched();
         replacement.initialized.complete(null);
         ready();
         assertSame(replacement.handle, pool.acquire(version, "live"));
         assertTrue(pool.release(replacement.handle, false));
         assertEquals(1, first.stops.get());
+    }
+
+    @Test
+    void faultReplacementWaitsUntilTheOldEnvironmentCanBeRemoved() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        first.faulted.set(true);
+        launcher.stopFailures.set(1);
+
+        pool.reconcile();
+        assertTrue(first.alive);
+        assertEquals(1, launcher.starts.get());
+        assertEquals("IN_PROGRESS", get().status());
+        assertEquals(1, launcher.starts.get());
+
+        pool.reconcileSafely();
+        assertFalse(first.alive);
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        ready();
+        assertEquals(2, first.stops.get());
+        assertEquals(2, launcher.starts.get());
     }
 
     @Test
@@ -409,7 +486,7 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     @Test
-    void pendingLaunchCannotRenewTheShutdownDeadline() throws Exception {
+    void pendingLaunchPreservesShutdownDeadlineAndCleansUpWhenItReturns() throws Exception {
         launcher.launchGate = new CompletableFuture<>();
         put(1);
         Environment first = launched();
@@ -424,11 +501,12 @@ class ProvisionedConcurrencyPoolTest {
         } finally {
             launcher.launchGate.complete(null);
         }
+        await().atMost(Duration.ofSeconds(5)).until(() -> !first.alive);
+        assertEquals(1, first.stops.get());
+        pool.stopManagedContainers();
+        assertEquals(1, first.stops.get());
         pool.clear();
-        await().atMost(Duration.ofSeconds(5)).until(() -> {
-            pool.reconcileSafely();
-            return !first.alive;
-        });
+        assertEquals(1, first.stops.get());
         assertTrue(storage.scan(ignored -> true).isEmpty());
     }
 

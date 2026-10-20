@@ -619,7 +619,7 @@ public class CognitoOAuthController {
             UserPool pool = cognitoService.describeUserPool(consumedCode.userPoolId());
             CognitoUser user = cognitoService.adminGetUser(consumedCode.userPoolId(), consumedCode.userId());
             Map<String, Object> authentication = cognitoService.generateAuthResultForHostedAuth(user, pool, client,
-                    nonceClaim(consumedCode.nonce()), consumedCode.scopes());
+                    nonceClaim(consumedCode.nonce()), consumedCode.scopes(), consumedCode.authTime());
             return tokenResponse(authentication);
         } catch (AwsException e) {
             LOG.error("Failed to redeem Cognito authorization code", e);

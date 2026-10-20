@@ -123,6 +123,40 @@ Delivered objects are named `<evaluated prefix><streamName>-<versionId>-<yyyy-MM
 
 Known deviations from AWS: timestamps are evaluated at flush time instead of the oldest buffered record's arrival time; expressions AWS would reject at create time (unknown namespaces, `!{partitionKeyFromQuery:...}`/`!{partitionKeyFromLambda:...}` dynamic partitioning keys, invalid patterns) are kept literally in the key; `FileExtension` is accepted on the legacy `S3DestinationConfiguration` shape too, where AWS only defines it on the extended one.
 
+## Redshift destination
+
+`CreateDeliveryStream` accepts `RedshiftDestinationConfiguration` and `UpdateDestination` accepts
+`RedshiftDestinationUpdate`. A stream has either an S3 destination or a Redshift destination, never both.
+`DescribeDeliveryStream` returns `RedshiftDestinationDescription`, which never includes `Password`.
+
+Supported members: `RoleARN`, `ClusterJDBCURL`, `Username`, `Password`, `CopyCommand`
+(`DataTableName`, `CopyOptions`, `DataTableColumns`), `S3Configuration` (the intermediate S3 location),
+`RetryOptions`, `S3BackupMode` with `S3BackupConfiguration`, `SecretsManagerConfiguration`,
+`ProcessingConfiguration` and `CloudWatchLoggingOptions`. Members are validated against the Firehose API
+model: required members, length and pattern limits, and the rule that `SNAPPY` and `ZIP` are refused on the
+intermediate S3 location. `S3BackupMode` can be switched on after creation but not off again.
+
+`DataTableName` and `DataTableColumns` must be identifiers Redshift would read as such: a table name with an optional
+schema, and a comma-separated list of column names. `CopyOptions` must not carry a second statement, so outside a
+quoted value a `;`, a `$` (dollar quoting is never needed) and the comment markers `--` and `/*` are refused, as is an
+unterminated quote. One closing `;` at the very end is the exception (the API reference's own example,
+`delimiter '\t' lzop;`, is accepted). Create and update reject anything else.
+
+This release accepts and stores the destination and stages each batch in the intermediate S3 location, like an
+S3 destination. It does not run the `COPY` into the cluster yet, and `S3BackupMode` has no effect on what is written.
+
+### Known deviations from AWS
+
+- `ClusterJDBCURL` must match the AWS pattern, so it needs a host such as
+  `mycluster.abc123.us-east-1.redshift.amazonaws.com`. Floci treats the URL as a logical address: the first
+  host label is the cluster identifier, and the host suffix and port are ignored. The database name is ignored
+  too, because the emulated database is always `dev`. The cluster is not looked up when the stream is created, so a stream
+  can be created before its cluster.
+- `ProcessingConfiguration` on a Redshift destination is accepted and returned but not executed.
+- The intermediate `Prefix` must not contain whitespace or quotes, because the `COPY` emulation cannot read such
+  object keys. `DataFormatConversionConfiguration` is ignored on the Redshift `S3Configuration`, which AWS does not
+  define.
+
 ## Configuration
 
 | Variable | Default | Description |

@@ -152,8 +152,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             if (stopped) {
                 throw new AwsException("ResourceConflictException", "Lambda executor is stopping", 409);
             }
-            if (pendingTeardown.stream().anyMatch(handle ->
-                    target.key().equals(owned.get(handle).key()))) {
+            if (hasPendingTeardown(target)) {
                 throw new AwsException("ResourceConflictException",
                         "The previous provisioned allocation is still being removed", 409);
             }
@@ -192,6 +191,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             result = status(next);
         }
         stop(retired);
+        requireCleanupComplete(retired);
         reconcile();
         return result;
     }
@@ -241,6 +241,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                     break;
                 }
                 allocation.handles.remove(candidate);
+                pendingTeardown.add(candidate);
                 discarded.add(candidate);
             }
         }
@@ -258,6 +259,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             retire = failed || !current(allocation) || !healthy(handle);
             if (retire) {
                 allocation.handles.remove(handle);
+                pendingTeardown.add(handle);
             } else {
                 handle.setState(ContainerState.WARM);
                 allocation.idle.addLast(handle);
@@ -312,12 +314,21 @@ public class ProvisionedConcurrencyPool implements Resettable {
             }
         }
         stop(retired);
+        requireCleanupComplete(retired);
+    }
+
+    private void requireCleanupComplete(List<ContainerHandle> retired) {
         synchronized (lock) {
             if (retired.stream().anyMatch(owned::containsKey)) {
                 throw new AwsException("ServiceException",
                         "Provisioned environment cleanup is incomplete; retry the operation", 500);
             }
         }
+    }
+
+    private boolean hasPendingTeardown(Configuration configuration) {
+        return pendingTeardown.stream().anyMatch(handle ->
+                configuration.key().equals(owned.get(handle).key()));
     }
 
     void reconcileSafely() {
@@ -359,8 +370,12 @@ public class ProvisionedConcurrencyPool implements Resettable {
                     if (!healthy(handle)) {
                         allocation.idle.remove(handle);
                         allocation.handles.remove(handle);
+                        pendingTeardown.add(handle);
                         retired.add(handle);
                     }
+                }
+                if (hasPendingTeardown(allocation.configuration)) {
+                    continue;
                 }
                 int missing = allocation.configuration.requested()
                         - allocation.handles.size() - allocation.launching;
@@ -439,7 +454,9 @@ public class ProvisionedConcurrencyPool implements Resettable {
             long deadline;
             synchronized (lock) {
                 shutdownDrain = stopped;
-                deadline = stopped ? shutdownDeadlineNanos : System.nanoTime() + drainTimeoutNanos;
+                long now = System.nanoTime();
+                deadline = stopped && shutdownDeadlineNanos > now
+                        ? shutdownDeadlineNanos : now + drainTimeoutNanos;
             }
             try {
                 stop(new ArrayList<>(toStop), shutdownDrain, deadline);
@@ -478,6 +495,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 .filter(handle -> !leases.containsKey(handle)).toList();
         allocation.handles.clear();
         allocation.idle.clear();
+        pendingTeardown.addAll(result);
         return result;
     }
 
@@ -490,6 +508,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
     }
 
     private void stop(List<ContainerHandle> handles, boolean shutdownDrain, long deadlineNanos) {
+        handles = handles.stream().distinct().toList();
         synchronized (lock) {
             for (ContainerHandle handle : handles) {
                 if (owned.containsKey(handle)) {

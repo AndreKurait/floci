@@ -13,6 +13,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Stream;
 
@@ -162,7 +163,7 @@ class StepFunctionsValidateStateMachineDefinitionIntegrationTest {
         String definition = apiHeaderDefinition(header, jsonata);
         String field = jsonata ? "Arguments" : "Parameters";
         String message = "The 'Headers' field contains unsupported values: ["
-                + header.toLowerCase(java.util.Locale.ROOT) + "]";
+                + header.toLowerCase(Locale.ROOT) + "]";
         validateDefinition(definition).then().statusCode(200)
                 .body("result", equalTo("FAIL"))
                 .body("diagnostics[0].code", equalTo("SCHEMA_VALIDATION_FAILED"))
@@ -174,19 +175,27 @@ class StepFunctionsValidateStateMachineDefinitionIntegrationTest {
     }
 
     static Stream<Arguments> unsupportedApiHeaders() {
-        return Stream.of("Expect", "expect", "eXpEcT", "Upgrade", "upgrade", "UPGRADE")
+        return Stream.of("Expect", "expect", "eXpEcT", "Upgrade", "upgrade", "UPGRADE",
+                        "Authorization", "authorization", "AUTHORIZATION", "Host", "host", "HOST",
+                        "X-Amz-Test", "x-amz-test", "X-AMZ-TEST", "X-Amzn-Test", "x-amzn-test", "X-AMZN-TEST",
+                        "X-Amz-", "X-Amzn-", "Connection", "Content-MD5", "Max-Forwards", "Proxy-Authenticate",
+                        "Server", "TE", "Transfer-Encoding", "Trailer", "Via", "WWW-Authenticate",
+                        "X-Forwarded-Test", "x-forwarded-test", "X-FORWARDED-TEST")
                 .flatMap(header -> Stream.of(Arguments.of(header, false), Arguments.of(header, true)));
     }
 
     @ParameterizedTest
     @MethodSource("supportedApiHeaders")
-    void apiGatewayOrdinaryHeadersRemainValid(String header) {
-        validateDefinition(apiHeaderDefinition(header, false)).then().statusCode(200)
+    void apiGatewayOrdinaryHeadersRemainValid(String header, boolean jsonata) {
+        validateDefinition(apiHeaderDefinition(header, jsonata)).then().statusCode(200)
                 .body("result", equalTo("OK")).body("diagnostics", hasSize(0));
     }
 
-    static Stream<String> supportedApiHeaders() {
-        return Stream.of("X_Custom", "X-Expect", "Content-Type");
+    static Stream<Arguments> supportedApiHeaders() {
+        return Stream.of("X_Custom", "X-Expect", "Content-Type", "X-Amz", "X-Amzn", "X-AmzFoo", "X-AmznFoo",
+                        "X-Amznn-Test", "Authorization-Extra", "Hostname", "Expect-Extra", "Upgrade-Extra",
+                        "X-Am-Example", "X-Am", "XX-Amz-Test", "X-Forwarded", "X-ForwardedFoo", "XX-Forwarded-Test")
+                .flatMap(header -> Stream.of(Arguments.of(header, false), Arguments.of(header, true)));
     }
 
     @Test

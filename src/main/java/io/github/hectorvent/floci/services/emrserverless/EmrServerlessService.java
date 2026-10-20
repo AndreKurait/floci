@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -40,13 +41,16 @@ public class EmrServerlessService {
 
     private final EmulatorConfig config;
     private final AccountAwareStorageBackend<Application> storage;
+    private final RegionResolver regionResolver;
     
     @Inject
     RequestContext requestContext;
 
     @Inject
-    public EmrServerlessService(EmulatorConfig config, StorageFactory storageFactory) {
+    public EmrServerlessService(EmulatorConfig config, StorageFactory storageFactory,
+                                RegionResolver regionResolver) {
         this.config = config;
+        this.regionResolver = regionResolver;
         this.storage = storageFactory.create("emrserverless", "emr-serverless-applications.json",
                 new TypeReference<Map<String, Application>>() {});
     }
@@ -62,9 +66,10 @@ public class EmrServerlessService {
             throw new AwsException("ValidationException", "clientToken is required", 400);
         }
 
+        String region = regionResolver.getRegion();
         if (request.getClientToken() != null) {
             for (Application existing : storage.scan(k -> true)) {
-                if (request.getClientToken().equals(existing.getClientToken())) {
+                if (inRegion(existing, region) && request.getClientToken().equals(existing.getClientToken())) {
                     return existing;
                 }
             }
@@ -104,11 +109,14 @@ public class EmrServerlessService {
 
     public Application getApplication(String applicationId) {
         return storage.get(applicationId)
+                .filter(app -> inRegion(app, regionResolver.getRegion()))
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Application " + applicationId + " not found", 404));
     }
 
     public PaginatedResult<ApplicationSummary> listApplications(ListApplicationsRequest request) {
-        List<Application> all = storage.scan(k -> true);
+        String region = regionResolver.getRegion();
+        List<Application> all = storage.scan(k -> true).stream()
+                .filter(app -> inRegion(app, region)).collect(Collectors.toList());
         if (request.getStates() != null && !request.getStates().isEmpty()) {
             all = all.stream().filter(app -> request.getStates().contains(app.getState())).collect(Collectors.toList());
         }
@@ -272,6 +280,9 @@ public class EmrServerlessService {
         if (!"emr-serverless".equals(parsed.service()) || !matcher.matches()) {
             throw new AwsException("ValidationException", "Invalid resourceArn: " + arn, 400);
         }
+        if (!parsed.region().equals(regionResolver.getRegion())) {
+            throw new AwsException("ResourceNotFoundException", "Resource " + arn + " not found", 404);
+        }
         if (matcher.group(2) != null) {
             throw new AwsException("ResourceNotFoundException", "Job run " + matcher.group(2) + " not found", 404);
         }
@@ -317,9 +328,21 @@ public class EmrServerlessService {
     }
 
     private String buildArn(String id) {
-        String region = requestContext != null && requestContext.getRegion() != null ? requestContext.getRegion() : config.defaultRegion();
+        String region = regionResolver.getRegion();
         String accountId = requestContext != null && requestContext.getAccountId() != null ? requestContext.getAccountId() : config.defaultAccountId();
         return AwsArnUtils.Arn.of("emr-serverless", region, accountId, "/applications/" + id).toString();
+    }
+
+    private static boolean inRegion(Application app, String region) {
+        if (app.getArn() == null) {
+            return false;
+        }
+        try {
+            return region.equals(AwsArnUtils.parse(app.getArn()).region());
+        } catch (IllegalArgumentException ignored) {
+            // A malformed stored ARN cannot establish Region ownership.
+            return false;
+        }
     }
 
     private ApplicationSummary toSummary(Application app) {

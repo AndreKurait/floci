@@ -211,12 +211,12 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     /**
      * The template's subnets: {@code Subnets}, or else the {@code SubnetId} of each
      * {@code SubnetMappings} entry, the form a Network Load Balancer uses to give a zone an Elastic IP.
-     * Both non-empty fails the resource with the error CreateLoadBalancer gives, as the resource allows
-     * one or the other; an empty side, such as one an Fn::If drops, does not count. {@code SubnetId} is
-     * required in a mapping, so one without it fails the resource before anything is created or moved,
-     * with the error the resource schema gives. A blank one counts as a mapping and, with no
-     * {@code Subnets}, is passed on as given for ELBv2 to refuse as an unknown subnet; dropping it would
-     * create or move the balancer without it.
+     * Both non-empty fails the resource with the error CreateLoadBalancer gives, through
+     * {@link ElbV2Service#requestedSubnets}, as the resource allows one or the other; an empty side, such
+     * as one an Fn::If drops, does not count. {@code SubnetId} is required in a mapping, so one without it
+     * fails the resource before anything is created or moved, with the error the resource schema gives.
+     * A blank one counts as a mapping and, with no {@code Subnets}, is passed on as given for ELBv2 to
+     * refuse as an unknown subnet; dropping it would create or move the balancer without it.
      */
     private static List<String> templateSubnets(JsonNode props, ProvisionContext ctx) {
         List<String> subnets = ctx.resolveStringList(props, "Subnets");
@@ -236,11 +236,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
                 mapped.add(subnetId);
             }
         }
-        if (!subnets.isEmpty() && !mapped.isEmpty()) {
-            throw new AwsException("ValidationError",
-                    "You can specify either subnets or subnet mappings, not both", 400);
-        }
-        return subnets.isEmpty() ? mapped : subnets;
+        return ElbV2Service.requestedSubnets(subnets, mapped);
     }
 
     /**

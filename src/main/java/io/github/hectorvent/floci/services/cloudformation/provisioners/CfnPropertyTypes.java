@@ -72,6 +72,16 @@ final class CfnPropertyTypes {
         return shape;
     }
 
+    /** The shape the vendored shape {@code shapeName} declares for its member {@code member}. */
+    static String memberShape(String shapeName, String member) {
+        Shape owner = Holder.MODEL.shapes().get(shapeName);
+        String shape = owner == null || owner.members() == null ? null : owner.members().get(member);
+        if (shape == null) {
+            throw notVendored(shapeName + "." + member);
+        }
+        return shape;
+    }
+
     private static IllegalStateException notVendored(String what) {
         return new IllegalStateException(what + " is not in " + RESOURCE_NAME
                 + "; add the type to tools/aws/regen_cfn_property_types.py");

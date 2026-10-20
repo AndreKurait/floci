@@ -1,8 +1,12 @@
 package io.github.hectorvent.floci.services.elb;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.LocalStackParity;
+import io.github.hectorvent.floci.config.TlsConfigSource;
+import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.RequestHost;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
+import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.elb.model.ClassicListener;
@@ -95,6 +99,10 @@ public class ElbClassicDataPlane {
         name = name.endsWith(".") ? name : name + ".";
         List<ClassicLoadBalancer> balancers = service.findByDnsName(name);
         if (balancers.isEmpty()) {
+            if (isEmulatorHost(name, config)) {
+                context.next();
+                return;
+            }
             Route53Service.PublicAlias alias = route53.lookupPublicAlias(name);
             if (alias == null) {
                 context.next();
@@ -140,6 +148,36 @@ public class ElbClassicDataPlane {
                     .onFailure(error -> fail(context, 502));
         })
                 .onFailure(error -> fail(context, 502));
+    }
+
+    static boolean isEmulatorHost(String name, EmulatorConfig config) {
+        String host = normalizedHost(name);
+        if (host.indexOf(':') >= 0 || host.chars().allMatch(c -> c == '.' || c >= '0' && c <= '9')) {
+            try {
+                InetAddress.ofLiteral(host);
+                return true;
+            } catch (IllegalArgumentException ignored) {
+                // A malformed IP spelling remains subject to the ordinary HTTP route validation.
+            }
+        }
+        List<String> domains = new ArrayList<>(List.of("localhost",
+                EmbeddedDnsServer.DEFAULT_SUFFIX, EmbeddedDnsServer.LOCALSTACK_SUFFIX));
+        config.hostname().ifPresent(domains::add);
+        String baseHost = URI.create(config.baseUrl()).getHost();
+        if (baseHost != null) {
+            domains.add(baseHost);
+        }
+        LocalStackParity.withDnsSuffixes(config.dns().extraSuffixes()).ifPresent(domains::addAll);
+        if (config.dns().spoofAwsEndpoints()) {
+            domains.addAll(TlsConfigSource.awsEndpointSuffixes());
+        }
+        return domains.stream().map(ElbClassicDataPlane::normalizedHost)
+                .anyMatch(domain -> DomainNames.isWithin(host, domain));
+    }
+
+    private static String normalizedHost(String name) {
+        String host = name.toLowerCase(Locale.ROOT);
+        return host.endsWith(".") ? host.substring(0, host.length() - 1) : host;
     }
 
     private List<String> healthyTargets(ClassicLoadBalancer lb) {

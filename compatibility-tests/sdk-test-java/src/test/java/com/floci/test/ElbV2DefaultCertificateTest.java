@@ -31,7 +31,8 @@ class ElbV2DefaultCertificateTest {
             String loadBalancer = null;
             try {
                 loadBalancer = elb.createLoadBalancer(b -> b.name(TestFixtures.uniqueName("sdk-https-default"))
-                        .type("application")).loadBalancers().get(0).loadBalancerArn();
+                        .type("application").subnets(TestFixtures.defaultVpcSubnets()))
+                        .loadBalancers().get(0).loadBalancerArn();
                 String lbArn = loadBalancer;
                 InvalidConfigurationRequestException creation = assertThrows(InvalidConfigurationRequestException.class,
                         () -> createListener(elb, lbArn, "HTTPS", 443, null));
@@ -88,7 +89,8 @@ class ElbV2DefaultCertificateTest {
                 String firstArn = first;
                 String additionalArn = additional;
                 loadBalancer = elb.createLoadBalancer(b -> b.name(TestFixtures.uniqueName("sdk-default-cert"))
-                        .type("application")).loadBalancers().get(0).loadBalancerArn();
+                        .type("application").subnets(TestFixtures.defaultVpcSubnets()))
+                        .loadBalancers().get(0).loadBalancerArn();
                 String lbArn = loadBalancer;
                 String listener = elb.createListener(b -> b.loadBalancerArn(lbArn).port(443).protocol("HTTPS")
                         .certificates(Certificate.builder().certificateArn(firstArn).build())

@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescript
 import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.KinesisStreamSource;
 import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.S3Destination;
 import io.github.hectorvent.floci.services.firehose.model.Record;
+import io.github.hectorvent.floci.services.firehose.model.RedshiftDestination;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
@@ -53,6 +54,18 @@ public class FirehoseJsonHandler {
                     s3 = mapper.treeToValue(request.get("ExtendedS3DestinationConfiguration"), S3Destination.class);
                     S3DestinationValidator.validateWireShape(s3, "extendedS3DestinationConfiguration");
                 }
+                RedshiftDestination redshift = null;
+                if (request.hasNonNull("RedshiftDestinationConfiguration")) {
+                    if (s3 != null) {
+                        throw new AwsException("InvalidArgumentException",
+                                "Only one destination configuration may be specified.", 400);
+                    }
+                    redshift = mapper.treeToValue(request.get("RedshiftDestinationConfiguration"),
+                            RedshiftDestination.class);
+                    dropExtendedOnlyMembersFromLegacyShape(redshift.getS3());
+                    dropExtendedOnlyMembersFromLegacyShape(redshift.getS3Backup());
+                    RedshiftDestinationValidator.validateConfiguration(redshift, "redshiftDestinationConfiguration");
+                }
                 List<io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.Tag> tags = new ArrayList<>();
                 if (request.has("Tags")) {
                     requireListSize(request.get("Tags"), "Tags", 1, 50);
@@ -70,7 +83,7 @@ public class FirehoseJsonHandler {
                         ? mapper.treeToValue(request.get("KinesisStreamSourceConfiguration"), KinesisStreamSource.class)
                         : null;
                 String arn = firehoseService.createDeliveryStream(
-                        region, name, s3, tags, deliveryStreamType, source);
+                        region, name, s3, redshift, tags, deliveryStreamType, source);
                 yield Response.ok(Map.of("DeliveryStreamARN", arn)).build();
             }
             case "UpdateDestination" -> {
@@ -86,7 +99,20 @@ public class FirehoseJsonHandler {
                     dropExtendedOnlyMembersFromLegacyShape(update);
                     S3DestinationValidator.validateWireShape(update, "s3DestinationUpdate");
                 }
-                firehoseService.updateDestination(name, currentVersionId, destinationId, update);
+                if (request.hasNonNull("RedshiftDestinationUpdate")) {
+                    if (update != null) {
+                        throw new AwsException("InvalidArgumentException",
+                                "Only one destination update may be specified.", 400);
+                    }
+                    RedshiftDestination redshiftUpdate = mapper.treeToValue(request.get("RedshiftDestinationUpdate"),
+                            RedshiftDestination.class);
+                    dropExtendedOnlyMembersFromLegacyShape(redshiftUpdate.getS3());
+                    dropExtendedOnlyMembersFromLegacyShape(redshiftUpdate.getS3Backup());
+                    RedshiftDestinationValidator.validateUpdate(redshiftUpdate, "redshiftDestinationUpdate");
+                    firehoseService.updateRedshiftDestination(name, currentVersionId, destinationId, redshiftUpdate);
+                } else {
+                    firehoseService.updateDestination(name, currentVersionId, destinationId, update);
+                }
                 yield Response.ok(Map.of()).build();
             }
             case "StartDeliveryStreamEncryption" -> {
@@ -117,7 +143,7 @@ public class FirehoseJsonHandler {
             case "DescribeDeliveryStream" -> {
                 String name = getDeliveryStreamName(request);
                 DeliveryStreamDescription desc = firehoseService.describeDeliveryStream(name);
-                yield Response.ok(Map.of("DeliveryStreamDescription", desc)).build();
+                yield Response.ok(Map.of("DeliveryStreamDescription", withoutSecrets(desc))).build();
             }
             case "ListDeliveryStreams" -> {
                 yield Response.ok(Map.of(
@@ -196,6 +222,26 @@ public class FirehoseJsonHandler {
             }
             default -> throw new AwsException("InvalidAction", "Action " + action + " is not supported", 400);
         };
+    }
+
+    /**
+     * Returns the description with every Redshift password removed. The stored object is never
+     * touched: in memory mode it is the live instance the delivery path reads the password from.
+     */
+    private DeliveryStreamDescription withoutSecrets(DeliveryStreamDescription desc) {
+        boolean hasRedshift = desc.getDestinations() != null && desc.getDestinations().stream()
+                .anyMatch(d -> d.getRedshiftDestinationDescription() != null);
+        if (!hasRedshift) {
+            return desc;
+        }
+        DeliveryStreamDescription copy = mapper.convertValue(desc, DeliveryStreamDescription.class);
+        for (DeliveryStreamDescription.Destination destination : copy.getDestinations()) {
+            if (destination.getRedshiftDestinationDescription() != null) {
+                destination.setRedshiftDestinationDescription(
+                        destination.getRedshiftDestinationDescription().copyWithoutPassword());
+            }
+        }
+        return copy;
     }
 
     /**
