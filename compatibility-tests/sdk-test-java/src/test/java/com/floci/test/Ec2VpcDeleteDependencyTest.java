@@ -18,6 +18,7 @@ import software.amazon.awssdk.services.ec2.model.DetachInternetGatewayRequest;
 import software.amazon.awssdk.services.ec2.model.Ec2Exception;
 import software.amazon.awssdk.services.ec2.model.Filter;
 import software.amazon.awssdk.services.ec2.model.ResourceType;
+import software.amazon.awssdk.services.ec2.model.SubnetIpv6CidrBlockAssociation;
 import software.amazon.awssdk.services.ec2.model.Tag;
 import software.amazon.awssdk.services.ec2.model.TagSpecification;
 import software.amazon.awssdk.services.ec2.model.Vpc;
@@ -61,7 +62,8 @@ class Ec2VpcDeleteDependencyTest {
             try {
                 assertDryRun(() -> ec2.createSubnet(request.toBuilder().dryRun(true).build()));
                 assertThat(ec2.describeSubnets(r -> r.filters(vpcFilter(vpc.vpcId()))).subnets()).isEmpty();
-                var associations = ec2.createSubnet(request).subnet().ipv6CidrBlockAssociationSet();
+                List<SubnetIpv6CidrBlockAssociation> associations =
+                        ec2.createSubnet(request).subnet().ipv6CidrBlockAssociationSet();
                 assertThat(associations).hasSize(1);
                 String createdCidr = associations.get(0).ipv6CidrBlock();
                 assertThat(createdCidr.split("/")[1]).isEqualTo("64");
