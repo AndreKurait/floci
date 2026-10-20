@@ -175,6 +175,15 @@ public class AwsQueryController {
     private Response dispatchToHandler(String service, String action,
                                        MultivaluedMap<String, String> formParams,
                                        String authorization, String region) {
+        String version = formParams.getFirst("Version");
+        if ("monitoring".equals(service) && version != null
+                && !("2009-05-15".equals(version)
+                    ? Set.of("ListMetrics", "GetMetricStatistics").contains(action)
+                    : QUERY_SERVICES.stream().anyMatch(candidate -> candidate.name().equals(service)
+                        && candidate.apiVersions().contains(version) && candidate.actions().contains(action)))) {
+            return xmlErrorResponse("InvalidAction", "Could not find operation " + action + " for version "
+                    + version, 404);
+        }
         return switch (service) {
             case "sqs" -> sqsQueryHandler.handle(action, formParams, region);
             case "sns" -> snsQueryHandler.handle(action, formParams, region);
@@ -411,6 +420,7 @@ public class AwsQueryController {
         Set<String> actions = switch (version) {
             case "2009-05-15" -> Set.of("ListMetrics", "GetMetricStatistics");
             case CLOUDWATCH_API_VERSION -> QueryServiceModels.of("monitoring").operations();
+            case "2013-01-16" -> Set.of("PutMetricAlarm", "DescribeAlarms", "DeleteAlarms");
             default -> Set.of();
         };
         if (!actions.contains(action)) {
@@ -458,6 +468,8 @@ public class AwsQueryController {
             QueryService.modeled("elasticache", "ValidateIamAuthToken"),
             QueryService.modeled("rds"),
             QueryService.modeled("monitoring"),
+            new QueryService("monitoring", Set.of("2013-01-16"),
+                    Set.of("PutMetricAlarm", "DescribeAlarms", "DeleteAlarms")),
             QueryService.modeled("cloudformation"),
             QueryService.modeled("email"),
             new QueryService("cognito-idp", Set.of(), COGNITO_ACTIONS),
