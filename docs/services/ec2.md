@@ -283,6 +283,10 @@ private gateway lifecycles are not modelled.
 
 ### Key Pairs
 
+`DescribeKeyPairs` omits the public key unless `IncludePublicKey=true`. When requested,
+it returns the OpenSSH public key with the key-pair name as its comment, including
+for imported keys. It never returns private key material.
+
 | Action | Description |
 |--------|-------------|
 | CreateKeyPair | Creates and stores a local key pair. |
@@ -291,6 +295,12 @@ private gateway lifecycles are not modelled.
 | ImportKeyPair | Imports a public key as a local key pair. |
 
 ### AMIs
+
+`DescribeImages` reports immediate creation provenance separately from Floci's
+runtime image ancestry. Captured images identify the source instance and its launch
+image; copied images identify the requested source image and region without
+inheriting the source instance ID. Registered and catalog images do not invent
+creation provenance. These fields survive storage serialization.
 
 | Action | Description |
 |--------|-------------|

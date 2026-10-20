@@ -2451,12 +2451,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     /**
-     * One region-wide monitor for every operation that creates an attachment, removes one, or
+     * Shared with services that attach resources to EC2 subnets. One region-wide monitor
+     * for every operation that creates an attachment, removes one, or
      * removes something an attachment depends on. Held outermost wherever a gateway lock is also
      * taken, so the two never interleave in opposite orders. Per-resource striped locks cannot
      * serve here: the dependency spans a gateway, a VPC and its subnets, which stripe separately.
      */
-    private Object attachmentTopologyLock(String region) {
+    public Object attachmentTopologyLock(String region) {
         return lockFor(key(region, "transit-gateway-attachments"));
     }
 
@@ -7393,6 +7394,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // of falling through to the catalog default. This is also the fallback when the file
         // system cannot be captured below.
         image.setSourceImageId(resolveLaunchableImageId(region, source.getImageId()));
+        image.setCreationSourceImageId(source.getImageId());
+        image.setCreationSourceImageRegion(region);
+        image.setCreationSourceInstanceId(source.getInstanceId());
 
         // Capture the instance's file system. Without this the AMI is a metadata record that
         // launches the *base* image, so everything provisioned on the source instance is
@@ -7912,6 +7916,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // chain of CreateImage parents lives; it bottoms out at a catalog id, which is
             // region-agnostic.
             copy.setSourceImageId(resolveLaunchableImageId(sourceRegion, sourceImageId));
+            copy.setCreationSourceImageId(sourceImageId);
+            copy.setCreationSourceImageRegion(sourceRegion);
             // The captured file system is the point of a CreateImage AMI, and the ancestry the
             // copy inherits does not carry it: sourceImageId is flattened to a launchable catalog
             // id, and the chain in between lives in the source region where the copy cannot see
