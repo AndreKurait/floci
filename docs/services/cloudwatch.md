@@ -362,6 +362,21 @@ legacy `2009-05-15` API, which supports only `ListMetrics` and `GetMetricStatist
 An invalid version or action returns HTTP 404 `InvalidAction`; an absent action returns
 HTTP 404 `UnknownOperationException`. IAM policies use the `cloudwatch` action prefix.
 
+Query clients using `Version=2013-01-16` route the common modeled operations through the
+same handlers as the current API, for both GET and POST. Implemented common operations
+include `ListMetrics`, `GetMetricStatistics`, `PutMetricAlarm`, `DescribeAlarms` and
+`DeleteAlarms`, with the same storage, account/region scope and IAM checks.
+Successful responses use the requested 2013 XML namespace.
+
+This is not complete legacy-version compatibility. Its `GetMetricData` input uses
+`Defaults` and `Metrics` instead of the current `MetricDataQueries` shape, so legacy
+JSON and Query requests return `UnsupportedOperation` rather than running the modern
+operation. Other unimplemented modeled operations, including `DescribeAlarmHistory`,
+also return `UnsupportedOperation`. The legacy target rejects modern metric streams,
+anomaly detection, dataset and resource-metrics APIs, alarm mute rules and contributors,
+OTel enrichment, managed insight rules, resource tags, `DescribeInsightRules` and
+`PutLogAlarm`. Unknown versions or operation names remain invalid.
+
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
 
 ### Supported Actions
