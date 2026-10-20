@@ -2107,18 +2107,21 @@ public class S3Service implements Resettable, ResourceProvider {
      */
     public S3Object deleteObject(String bucketName, String key, String versionId, boolean bypassGovernance,
                                  String ifMatch) {
-        Bucket bucket = bucketStore.get(bucketName)
+        AccountAwareStorageBackend.OwnedEntry<Bucket> ownedBucket = resolveBucketEntry(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
                         "The specified bucket does not exist.", 404));
+        Bucket bucket = ownedBucket.value();
 
         // The bucket monitor serializes this against PutObject's annotation cleanup and the
         // annotation subresource writes, which hold the same monitor (storeObjectInternal
         // already runs under it via storeObject). The precondition is checked under it too,
         // so a concurrent overwrite cannot land between the check and the delete.
-        synchronized (bucket) {
-            checkDeletePrecondition(bucketName, key, ifMatch);
-            return deleteObjectLocked(bucket, bucketName, key, versionId, bypassGovernance, OBJECT_REMOVED_EVENT);
-        }
+        return RequestScopes.callAs(ownedBucket.account(), () -> {
+            synchronized (bucket) {
+                checkDeletePrecondition(bucketName, key, ifMatch);
+                return deleteObjectLocked(bucket, bucketName, key, versionId, bypassGovernance, OBJECT_REMOVED_EVENT);
+            }
+        });
     }
 
     /**
@@ -2293,8 +2296,8 @@ public class S3Service implements Resettable, ResourceProvider {
      * entry must not make that entry require {@code s3:BypassGovernanceRetention}.
      */
     public boolean isGovernanceRetentionActive(String bucketName, String key, String versionId) {
-        ensureBucketExists(bucketName);
-        S3Object object = objectStore.get(versionStoreKey(bucketName, key, versionId))
+        String bucketOwnerAccount = getBucketOwnerAccountId(bucketName);
+        S3Object object = resolveObjectForAccount(bucketOwnerAccount, versionStoreKey(bucketName, key, versionId))
                 .filter(existing -> isNamedVersion(existing, versionId))
                 .orElse(null);
         return object != null
@@ -6828,7 +6831,7 @@ public class S3Service implements Resettable, ResourceProvider {
      * Resolves a bucket for existence/access. With {@code globalBucketNamespace} enabled, the
      * lookup spans every account's partition (AWS bucket names are globally unique and reachable
      * cross-account); otherwise it stays scoped to the calling account. Write-side ownership
-     * checks (CreateBucket, delete) intentionally do not use this — they remain account-scoped.
+     * checks (CreateBucket, DeleteBucket) intentionally do not use this; they remain account-scoped.
      */
     private Optional<Bucket> resolveBucket(String bucketName) {
         return resolveBucketEntry(bucketName).map(AccountAwareStorageBackend.OwnedEntry::value);
