@@ -12,6 +12,8 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
 import io.github.hectorvent.floci.services.eventbridge.model.ApiDestination;
 import io.github.hectorvent.floci.services.eventbridge.model.BatchParameters;
+import io.github.hectorvent.floci.services.eventbridge.model.Connection;
+import io.github.hectorvent.floci.services.eventbridge.model.ConnectionState;
 import io.github.hectorvent.floci.services.eventbridge.model.EcsParameters;
 import io.github.hectorvent.floci.services.eventbridge.model.EventBus;
 import io.github.hectorvent.floci.services.eventbridge.model.HttpParameters;
@@ -24,6 +26,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -75,7 +78,7 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
     @Override
     public Set<String> resourceTypes() {
         return Set.of("AWS::Events::Rule", "AWS::Events::EventBus", "AWS::Events::EventBusPolicy",
-                "AWS::Events::ApiDestination");
+                "AWS::Events::Connection", "AWS::Events::ApiDestination");
     }
 
     @Override
@@ -84,7 +87,18 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
             case "AWS::Events::Rule" -> provisionRule(r, props, ctx);
             case "AWS::Events::EventBus" -> provisionEventBus(r, props, ctx);
             case "AWS::Events::EventBusPolicy" -> provisionEventBusPolicy(r, props, ctx);
-            case "AWS::Events::ApiDestination" -> provisionApiDestination(r, props, ctx);
+            case "AWS::Events::Connection" -> {
+                ReplacementCleanup.endRollbackRetry(r);
+                Map<String, String> attributesBefore = Map.copyOf(r.getAttributes());
+                provisionConnection(r, props, ctx);
+                ReplacementCleanup.record(r, ctx, attributesBefore);
+            }
+            case "AWS::Events::ApiDestination" -> {
+                ReplacementCleanup.endRollbackRetry(r);
+                Map<String, String> attributesBefore = Map.copyOf(r.getAttributes());
+                provisionApiDestination(r, props, ctx);
+                ReplacementCleanup.record(r, ctx, attributesBefore);
+            }
             default -> throw new IllegalStateException(
                     "EventsCfnProvisioner cannot handle " + r.getResourceType());
         }
@@ -115,6 +129,8 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
             case "AWS::Events::Rule" -> deleteEventBridgeRuleSafe(physicalId, null, region);
             case "AWS::Events::EventBus" -> deleteEventBusSafe(physicalId, region);
             case "AWS::Events::EventBusPolicy" -> removeEventBusPolicySafe(physicalId, region);
+            case "AWS::Events::Connection" -> CfnDeletes.safeDelete("EventBridge connection", physicalId,
+                    () -> eventBridgeService.deleteConnection(physicalId, region), "ResourceNotFoundException");
             case "AWS::Events::ApiDestination" -> deleteApiDestinationSafe(physicalId, region);
             default -> {
                 // no other type reaches this provisioner
@@ -316,6 +332,12 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
      */
     @Override
     public boolean rollbackUpdate(StackResource resource) {
+        if (ReplacementCleanup.rollback(resource, this::delete)) {
+            return true;
+        }
+        if ("AWS::Events::Connection".equals(resource.getResourceType())) {
+            return rollbackConnectionUpdate(resource);
+        }
         if ("AWS::Events::ApiDestination".equals(resource.getResourceType())) {
             return rollbackApiDestinationUpdate(resource);
         }
@@ -781,14 +803,125 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
                 "ResourceNotFoundException");
     }
 
+    @Override
+    public boolean retainsFailedUpdateState(StackResource resource) {
+        return resource.getAttributes().containsKey(CfnRollback.CONNECTION_UPDATE_SNAPSHOT_ATTR)
+                || resource.getAttributes().containsKey(CfnRollback.API_DESTINATION_UPDATE_SNAPSHOT_ATTR);
+    }
+
+    @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        return ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return ReplacementCleanup.cleanupPhysicalId(resource);
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        clearSnapshots(resource);
+        return ReplacementCleanup.complete(resource, this::delete);
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        clearSnapshots(resource);
+        ReplacementCleanup.clear(resource);
+    }
+
+    private static void clearSnapshots(StackResource resource) {
+        resource.getAttributes().remove(CfnRollback.CONNECTION_UPDATE_SNAPSHOT_ATTR);
+        resource.getAttributes().remove(CfnRollback.API_DESTINATION_UPDATE_SNAPSHOT_ATTR);
+    }
+
+    private void provisionConnection(StackResource r, JsonNode props, ProvisionContext ctx) {
+        CfnPropertyTypes.Reader types = new CfnPropertyTypes.Reader(ctx.engine());
+        ObjectNode resolved = MAPPER.createObjectNode();
+        if (props != null) {
+            props.properties().forEach(property -> resolved.set(property.getKey(), types.read(property.getKey(),
+                    property.getValue(), CfnPropertyTypes.propertyShape("AWS::Events::Connection", property.getKey()))));
+        }
+        types.finish();
+        String name = ctx.stablePhysicalName(resolved.path("Name").asText(null), r.getLogicalId(), 64, false);
+        String description = resolved.path("Description").asText("");
+        String authorizationType = resolved.path("AuthorizationType").asText(null);
+        String authParameters = jsonProperty(resolved, "AuthParameters");
+        if (authorizationType == null || authParameters == null) {
+            throw new AwsException("ValidationError", "Connection requires AuthorizationType and AuthParameters.", 400);
+        }
+        String connectivity = jsonProperty(resolved, "InvocationConnectivityParameters");
+        String kmsKey = resolved.path("KmsKeyIdentifier").asText(null);
+        r.getAttributes().remove(CfnRollback.CONNECTION_UPDATE_SNAPSHOT_ATTR);
+        Connection connection;
+        if (ctx.reusesPriorEntity(name)) {
+            Connection current = eventBridgeService.describeConnection(name, ctx.region());
+            ObjectNode snapshot = MAPPER.createObjectNode();
+            snapshot.put("region", ctx.region());
+            snapshot.put("name", current.getName());
+            snapshot.put("description", current.getDescription());
+            snapshot.put("authorizationType", current.getAuthorizationType());
+            snapshot.put("authParameters", current.getAuthParameters());
+            snapshot.put("invocationConnectivityParameters", current.getInvocationConnectivityParameters());
+            snapshot.put("kmsKeyIdentifier", current.getKmsKeyIdentifier());
+            snapshot.put("connectionState", current.getConnectionState() == null
+                    ? null : current.getConnectionState().name());
+            snapshot.put("stateReason", current.getStateReason());
+            snapshot.put("lastModifiedTime", current.getLastModifiedTime() == null
+                    ? null : current.getLastModifiedTime().toString());
+            snapshot.put("lastAuthorizedTime", current.getLastAuthorizedTime() == null
+                    ? null : current.getLastAuthorizedTime().toString());
+            r.getAttributes().put(CfnRollback.CONNECTION_UPDATE_SNAPSHOT_ATTR, snapshot.toString());
+            connection = eventBridgeService.updateConnection(name, description, authorizationType,
+                    authParameters, connectivity, kmsKey, ctx.region());
+        } else {
+            connection = eventBridgeService.createConnection(name, description, authorizationType,
+                    authParameters, connectivity, kmsKey, ctx.region());
+        }
+        r.setPhysicalId(name);
+        r.getAttributes().put("Arn", connection.getConnectionArn());
+        String arn = connection.getConnectionArn();
+        r.getAttributes().put("ArnForPolicy", arn.substring(0, arn.lastIndexOf('/')));
+        r.getAttributes().put("SecretArn", connection.getSecretArn());
+    }
+
+    private static String jsonProperty(JsonNode props, String property) {
+        return props.hasNonNull(property) ? props.get(property).toString() : null;
+    }
+
+    private boolean rollbackConnectionUpdate(StackResource resource) {
+        String raw = resource.getAttributes().get(CfnRollback.CONNECTION_UPDATE_SNAPSHOT_ATTR);
+        if (raw == null) {
+            return false;
+        }
+        JsonNode snapshot;
+        try {
+            snapshot = MAPPER.readTree(raw);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Could not read the connection update snapshot for "
+                    + resource.getLogicalId(), e);
+        }
+        String state = snapshotText(snapshot, "connectionState");
+        eventBridgeService.restoreConnection(snapshot.path("name").asText(),
+                snapshotText(snapshot, "description"), snapshotText(snapshot, "authorizationType"),
+                snapshotText(snapshot, "authParameters"), snapshotText(snapshot, "invocationConnectivityParameters"),
+                snapshotText(snapshot, "kmsKeyIdentifier"),
+                state == null ? null : ConnectionState.valueOf(state),
+                snapshotText(snapshot, "stateReason"), snapshotInstant(snapshot, "lastModifiedTime"),
+                snapshotInstant(snapshot, "lastAuthorizedTime"), snapshot.path("region").asText());
+        resource.getAttributes().remove(CfnRollback.CONNECTION_UPDATE_SNAPSHOT_ATTR);
+        return true;
+    }
+
+    private static Instant snapshotInstant(JsonNode snapshot, String property) {
+        String value = snapshotText(snapshot, property);
+        return value == null ? null : Instant.parse(value);
+    }
+
     private void provisionApiDestination(StackResource r, JsonNode props, ProvisionContext ctx) {
         String name = ctx.stablePhysicalName(
                 ctx.resolveOptional(props, "Name"), r.getLogicalId(), 64, false);
-        if (ctx.isUpdate() && ctx.priorPhysicalId() != null && !ctx.priorPhysicalId().equals(name)) {
-            throw new AwsException("ValidationError",
-                    "Updating ApiDestination Name requires resource replacement, which is not supported.", 400);
-        }
-
         String connectionArn = ctx.resolveOptional(props, "ConnectionArn");
         String invocationEndpoint = ctx.resolveOptional(props, "InvocationEndpoint");
         String httpMethod = ctx.resolveOptional(props, "HttpMethod");

@@ -62,3 +62,5 @@ AWS::IAM::ManagedPolicy	PermissionsBoundaryUsageCount	not modeled: Floci does no
 AWS::IAM::ManagedPolicy	UpdateDate	not published: Floci does not surface the policy update date as an Fn::GetAtt value
 AWS::Lambda::Function	SnapStartResponse	not modeled: Floci does not emulate Lambda SnapStart, so it exposes no ApplyOn/OptimizationStatus response
 AWS::CloudFormation::CustomResource	Id	not published: Id is the primary identifier returned by Ref (the physical resource id); Floci does not expose it as a separate Fn::GetAtt attribute
+AWS::Events::Connection	AuthParameters.ConnectivityParameters.ResourceParameters.ResourceAssociationArn	private API resource associations through VPC Lattice are not emulated
+AWS::Events::Connection	InvocationConnectivityParameters.ResourceParameters.ResourceAssociationArn	private API resource associations through VPC Lattice are not emulated

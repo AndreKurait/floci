@@ -278,6 +278,9 @@ public final class CfnRollback {
      */
     public static final String NETWORK_CONNECTOR_UPDATE_SNAPSHOT_ATTR = "__FlociNetworkConnectorUpdateSnapshot";
 
+    /** Prior Connection configuration, including credentials, retained only while an update can roll back. */
+    public static final String CONNECTION_UPDATE_SNAPSHOT_ATTR = "__FlociConnectionUpdateSnapshot";
+
     private CfnRollback() {
     }
 

@@ -803,19 +803,25 @@ class EventsCfnProvisionerTest {
     }
 
     @Test
-    void provisionApiDestinationRejectsNameChangeOnUpdate() {
+    void provisionApiDestinationReplacesNameAndDeletesOnlyAfterCommit() {
         StackResource r = resource("AWS::Events::ApiDestination", "MyDestination");
+        r.setPhysicalId("old-name");
+        r.getAttributes().put("Arn", "old-arn");
         ObjectNode props = mapper.createObjectNode()
                 .put("Name", "new-name")
                 .put("ConnectionArn", "arn:aws:events:us-east-1:000000000000:connection/conn/111")
                 .put("InvocationEndpoint", "https://api.example.com/orders")
                 .put("HttpMethod", "POST");
+        when(events.createApiDestination(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(priorApiDestination());
 
-        AwsException thrown = assertThrows(AwsException.class,
-                () -> provisioner.provision(r, props, ctx("old-name")));
+        provisioner.provision(r, props, ctx("old-name"));
 
-        assertEquals("ValidationError", thrown.getErrorCode());
-        assertTrue(thrown.getMessage().contains("requires resource replacement"));
+        assertEquals("new-name", r.getPhysicalId());
+        assertTrue(provisioner.hasReplacementUpdate(r));
+        verify(events, never()).deleteApiDestination(any(), any());
+        provisioner.completeUpdate(r);
+        verify(events).deleteApiDestination("old-name", REGION);
     }
 
     @Test

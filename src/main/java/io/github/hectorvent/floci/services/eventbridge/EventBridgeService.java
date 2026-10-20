@@ -1495,6 +1495,25 @@ public class EventBridgeService implements ResourceProvider {
         return connection;
     }
 
+    /** Restores complete configuration after a failed CloudFormation update, including absent optional values. */
+    public Connection restoreConnection(String name, String description, String authorizationType,
+                                         String authParameters, String invocationConnectivityParameters,
+                                         String kmsKeyIdentifier, ConnectionState state, String stateReason,
+                                         Instant lastModifiedTime, Instant lastAuthorizedTime, String region) {
+        Connection connection = describeConnection(name, region);
+        connection.setDescription(description);
+        connection.setAuthorizationType(authorizationType);
+        connection.setAuthParameters(authParameters);
+        connection.setInvocationConnectivityParameters(invocationConnectivityParameters);
+        connection.setKmsKeyIdentifier(kmsKeyIdentifier);
+        connection.setConnectionState(state);
+        connection.setStateReason(stateReason);
+        connection.setLastModifiedTime(lastModifiedTime);
+        connection.setLastAuthorizedTime(lastAuthorizedTime);
+        connectionStore.put(connectionKey(region, name), connection);
+        return connection;
+    }
+
     public Connection deleteConnection(String name, String region) {
         String key = connectionKey(region, name);
         Connection connection = connectionStore.get(key)

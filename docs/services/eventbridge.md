@@ -192,6 +192,24 @@ aws events put-targets \
 - A destination or connection ARN taken before the resource was deleted and recreated under the same name no longer resolves.
 - `ListApiDestinations` supports `Limit` (1 to 100) and `NextToken`.
 
+## CloudFormation API Destinations
+
+`AWS::Events::Connection` and `AWS::Events::ApiDestination` use the existing EventBridge APIs.
+`Ref` returns the resource name. Both expose `Arn` and `ArnForPolicy`, with the generated ID
+removed from the policy ARN. Connections also expose `SecretArn` from `DescribeConnection`.
+Connection credentials support CloudFormation dynamic references to Secrets Manager and SSM.
+
+Unnamed resources keep their generated names across updates. Mutable properties update the
+existing resource; changing `Name` creates a replacement and removes the displaced resource
+once the stack update commits, honoring `UpdateReplacePolicy: Retain`. A failed update restores
+prior Connection credentials, destination settings and rule targets, or removes newly created
+replacements. Stack deletion removes managed connections and destinations unless retained.
+
+Connection properties follow their CloudFormation schema types, including nested authentication
+and HTTP parameter values. `SecretArn` is existing EventBridge metadata: this resource does not
+create a managed Secrets Manager secret or apply KMS encryption. Private connectivity and its
+resource association attributes are not emulated.
+
 ## Target Retry and Dead-Letter Queues
 
 A target's `RetryPolicy` and `DeadLetterConfig` are validated by `PutTargets`, stored with the target, returned by `ListTargetsByRule`, and applied to delivery from `PutEvents` and scheduled rules.
