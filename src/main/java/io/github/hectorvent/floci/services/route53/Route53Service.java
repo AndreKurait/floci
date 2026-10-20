@@ -920,7 +920,7 @@ public class Route53Service implements Resettable {
         soa.setType("SOA");
         soa.setTtl(900L);
         soa.setRecords(List.of(new ResourceRecord(
-                nameServers.get(0) + " awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400")));
+                normalizeName(nameServers.get(0)) + " awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400")));
         records.add(soa);
 
         ResourceRecordSet ns = new ResourceRecordSet();
@@ -928,7 +928,7 @@ public class Route53Service implements Resettable {
         ns.setType("NS");
         ns.setTtl(172800L);
         ns.setRecords(nameServers.stream()
-                .map(n -> new ResourceRecord(n + "."))
+                .map(n -> new ResourceRecord(normalizeName(n)))
                 .toList());
         records.add(ns);
 

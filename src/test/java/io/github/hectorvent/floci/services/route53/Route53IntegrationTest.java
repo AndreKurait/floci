@@ -52,7 +52,7 @@ class Route53IntegrationTest {
                 .body("CreateHostedZoneResponse.ChangeInfo.Status", equalTo("INSYNC"))
                 .body("CreateHostedZoneResponse.ChangeInfo.Id", startsWith("/change/C"))
                 .body(not(containsString("<VPC>")))
-                .body(containsString("ns-1.awsdns-01.org"))
+                .body(containsString("ns-1.route53.localhost.floci.io"))
                 .extract().header("Location");
 
         // Location is an absolute URL: http://localhost:PORT/2013-04-01/hostedzone/ZXXX
@@ -71,7 +71,7 @@ class Route53IntegrationTest {
                 .body("GetHostedZoneResponse.HostedZone.Name", equalTo("example.com."))
                 .body("GetHostedZoneResponse.HostedZone.Config.PrivateZone", equalTo("false"))
                 .body(not(containsString("<VPCs>")))
-                .body(containsString("ns-1.awsdns-01.org"));
+                .body(containsString("ns-1.route53.localhost.floci.io"));
     }
 
     @Test
@@ -246,7 +246,7 @@ class Route53IntegrationTest {
                           <Type>SOA</Type>
                           <TTL>900</TTL>
                           <ResourceRecords>
-                            <ResourceRecord><Value>ns-1.awsdns-01.org. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400</Value></ResourceRecord>
+                            <ResourceRecord><Value>ns-1.route53.localhost.floci.io. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400</Value></ResourceRecord>
                           </ResourceRecords>
                         </ResourceRecordSet>
                       </Change>
