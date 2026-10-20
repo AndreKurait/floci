@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.lambda.launcher;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.ConnectToNetworkCmd;
 import com.github.dockerjava.api.command.CopyArchiveFromContainerCmd;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.ExecCreateCmd;
@@ -25,10 +26,15 @@ import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
+import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFileSystemConfig;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.lambda.model.LambdaLayerVersion;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
+import io.smallrye.config.EnvConfigSource;
+import io.smallrye.config.SmallRyeConfig;
+import io.smallrye.config.SmallRyeConfigBuilder;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
@@ -85,6 +91,7 @@ class ContainerLauncherTest {
     @Mock RuntimeApiServer runtimeApiServer;
     @Mock DockerClient dockerClient;
     @Mock LambdaExecutionRoleCredentials executionRoleCredentials;
+    @Mock LambdaLayerService layerService;
 
     @TempDir
     Path tempDir;
@@ -98,12 +105,15 @@ class ContainerLauncherTest {
     void setUp() {
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.LambdaServiceConfig lambda = mock(EmulatorConfig.LambdaServiceConfig.class);
+        EmulatorConfig.IamServiceConfig iam = mock(EmulatorConfig.IamServiceConfig.class);
         EmulatorConfig.DockerConfig docker = mock(EmulatorConfig.DockerConfig.class);
         EmulatorConfig.StorageConfig storage = mock(EmulatorConfig.StorageConfig.class);
         EmulatorConfig.EfsSharingConfig efs = mock(EmulatorConfig.EfsSharingConfig.class);
 
         when(config.services()).thenReturn(services);
         when(services.lambda()).thenReturn(lambda);
+        lenient().when(services.iam()).thenReturn(iam);
+        lenient().when(iam.lambdaIdentityVerificationEnabled()).thenReturn(false);
         when(lambda.dockerNetwork()).thenReturn(Optional.empty());
         lenient().when(lambda.extraHosts()).thenReturn(Optional.empty());
         lenient().when(lambda.awsConfigPath()).thenReturn(Optional.empty());
@@ -139,7 +149,7 @@ class ContainerLauncherTest {
         LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(reachableEndpoint);
         launcher = new ContainerLauncher(containerBuilder, lifecycleManager, logStreamer, imageResolver,
                 runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
-                mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class), awsEnv,
+                layerService, awsEnv,
                 executionRoleCredentials);
 
         when(runtimeApiServerFactory.create()).thenReturn(runtimeApiServer);
@@ -601,6 +611,105 @@ class ContainerLauncherTest {
 
         // createAndStart must NOT be called — Lambda uses the split path
         verify(lifecycleManager, never()).createAndStart(any());
+        verify(dockerClient, never()).connectToNetworkCmd();
+    }
+
+    @Test
+    void additionalNetworksAreConnectedBeforeTheFunctionStarts() {
+        LambdaFunction fn = networkFunction();
+        SmallRyeConfig mapped = new SmallRyeConfigBuilder()
+                .withSources(new EnvConfigSource(Map.of(
+                        "FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS",
+                        "primary-net,metadata-net,peer-net"), 300))
+                .withMapping(EmulatorConfig.class)
+                .build();
+        when(config.services().lambda().dockerNetwork()).thenReturn(Optional.of("primary-net"));
+        when(config.services().lambda().additionalDockerNetworks())
+                .thenReturn(mapped.getConfigMapping(EmulatorConfig.class).services().lambda().additionalDockerNetworks());
+        ConnectToNetworkCmd metadata = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        ConnectToNetworkCmd peer = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.connectToNetworkCmd()).thenReturn(metadata, peer);
+
+        launcher.launch(fn);
+
+        assertEquals("primary-net", captureRealContainerSpec().networkMode());
+        InOrder order = inOrder(lifecycleManager, metadata, peer);
+        order.verify(lifecycleManager).create(any());
+        order.verify(metadata).withNetworkId("metadata-net");
+        order.verify(metadata).withContainerId("container-123");
+        order.verify(metadata).exec();
+        order.verify(peer).withNetworkId("peer-net");
+        order.verify(peer).withContainerId("container-123");
+        order.verify(peer).exec();
+        order.verify(lifecycleManager).startCreated(eq("container-123"), any());
+        verify(dockerClient, times(2)).connectToNetworkCmd();
+    }
+
+    @Test
+    void absentAdditionalNetworksPreserveTheDefaultLaunch() {
+        SmallRyeConfig mapped = new SmallRyeConfigBuilder()
+                .withSources(new EnvConfigSource(Map.of(), 300))
+                .withMapping(EmulatorConfig.class)
+                .build();
+        Optional<List<String>> networks = mapped.getConfigMapping(EmulatorConfig.class)
+                .services().lambda().additionalDockerNetworks();
+        assertTrue(networks.isEmpty());
+        when(config.services().lambda().additionalDockerNetworks()).thenReturn(networks);
+
+        launcher.launch(networkFunction());
+
+        verify(lifecycleManager).create(any());
+        verify(lifecycleManager).startCreated(eq("container-123"), any());
+        verify(dockerClient, never()).connectToNetworkCmd();
+    }
+
+    @Test
+    void failedAdditionalNetworkAttachmentReleasesTheContainerAndRoleSession() {
+        LambdaFunction fn = networkFunction();
+        when(config.services().lambda().additionalDockerNetworks())
+                .thenReturn(Optional.of(List.of("metadata-net", "missing-net")));
+        when(executionRoleCredentials.forFunction(fn)).thenReturn(Optional.of(
+                new SessionCreds("ASIANETWORKFAIL", "role-secret", "role-token")));
+        ConnectToNetworkCmd metadata = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        ConnectToNetworkCmd missing = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.connectToNetworkCmd()).thenReturn(metadata, missing);
+        doThrow(new IllegalStateException("network disappeared")).when(missing).exec();
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> launcher.launch(fn));
+
+        assertEquals("network disappeared", failure.getMessage());
+        verify(metadata).exec();
+        verify(lifecycleManager, never()).startCreated(any(), any());
+        verify(lifecycleManager).stopAndRemove("container-123", null);
+        verify(executionRoleCredentials).unregister("222233334444", "ASIANETWORKFAIL");
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidAdditionalNetworks")
+    void invalidAdditionalNetworksFailBeforeContainerCreation(List<String> networks) {
+        when(config.services().lambda().additionalDockerNetworks()).thenReturn(Optional.of(networks));
+
+        assertThrows(IllegalArgumentException.class, () -> launcher.launch(networkFunction()));
+
+        verify(lifecycleManager, never()).create(any());
+        verify(lifecycleManager, never()).startCreated(any(), any());
+        verify(dockerClient, never()).connectToNetworkCmd();
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    private static Stream<List<String>> invalidAdditionalNetworks() {
+        return Stream.of(List.of(""), List.of("same", "same"), List.of("../outside"), List.of("two names"));
+    }
+
+    private static LambdaFunction networkFunction() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("network-function");
+        fn.setAccountId("222233334444");
+        fn.setFunctionArn("arn:aws:lambda:us-east-1:222233334444:function:network-function");
+        fn.setPackageType("Image");
+        fn.setImageUri("unit-lambda:latest");
+        return fn;
     }
 
     @Test
@@ -622,6 +731,120 @@ class ContainerLauncherTest {
                 "AWS_SECRET_ACCESS_KEY should be injected when awsConfigPath is absent");
         assertTrue(env.stream().anyMatch(e -> e.startsWith("AWS_SESSION_TOKEN=")),
                 "AWS_SESSION_TOKEN should be injected when awsConfigPath is absent");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"$LATEST", "1", "7"})
+    void onDemandLaunchUsesTheSelectedVersion(String version) {
+        LambdaFunction fn = networkFunction();
+        fn.setVersion(version);
+        fn.setEnvironment(Map.of("AWS_LAMBDA_FUNCTION_VERSION", "user-override"));
+
+        launcher.launch(fn);
+
+        assertEquals(List.of("AWS_LAMBDA_FUNCTION_VERSION=" + version),
+                captureRealContainerSpec().env().stream()
+                        .filter(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION=")).toList());
+    }
+
+    @Test
+    void provisionedLaunchUsesTheImmutableVersionAndPlatformInitializationType() throws Exception {
+        stubExtensionDiscovery("example-extension");
+        when(logStreamer.execLogCallbackForAccount(anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(new ResultCallback.Adapter<>());
+        LambdaFunction fn = networkFunction();
+        fn.setVersion("7");
+        fn.setEnvironment(Map.of("AWS_LAMBDA_INITIALIZATION_TYPE", "on-demand",
+                "AWS_LAMBDA_FUNCTION_VERSION", "$LATEST"));
+        launcher.launchProvisioned(fn);
+        List<String> env = captureRealContainerSpec().env();
+        assertEquals(List.of("AWS_LAMBDA_FUNCTION_VERSION=7"),
+                env.stream().filter(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION=")).toList());
+        assertEquals(List.of("AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency"),
+                env.stream().filter(value -> value.startsWith("AWS_LAMBDA_INITIALIZATION_TYPE=")).toList());
+        verify(runtimeApiServer).expectExtensions(1);
+        verify(runtimeApiServer, never()).awaitExtensionsReady(anyLong());
+        verify(runtimeApiServer, never()).enqueue(any());
+    }
+
+    @Test
+    void provisionedLaunchRefusesFailedExtensionDiscoveryAndCleansTheCreatedRuntime() {
+        LambdaFunction fn = networkFunction();
+        fn.setVersion("1");
+        CopyArchiveFromContainerCmd archive = mock(CopyArchiveFromContainerCmd.class);
+        when(dockerClient.copyArchiveFromContainerCmd("container-123", "/opt/extensions")).thenReturn(archive);
+        when(archive.exec()).thenThrow(new IllegalStateException("controlled archive failure"));
+        assertThrows(RuntimeException.class, () -> launcher.launchProvisioned(fn));
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+        verify(runtimeApiServer, never()).expectExtensions(0);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void provisionedLaunchCopiesTheStoredAccountsLayerWithoutAmbientLookup(boolean legacyAccount) throws Exception {
+        LambdaFunction fn = networkFunction();
+        fn.setAccountId(legacyAccount ? null : "123456789012");
+        fn.setFunctionArn("arn:aws:lambda:eu-west-1:123456789012:function:layer-function");
+        fn.setVersion("1");
+        String arn = "arn:aws:lambda:eu-west-1:123456789012:layer:owned:1";
+        fn.setLayers(List.of(arn));
+        Path layerPath = Files.createDirectory(tempDir.resolve("owned-layer"));
+        Files.writeString(layerPath.resolve("dependency.txt"), "owned");
+        LambdaLayerVersion layer = new LambdaLayerVersion();
+        layer.setCodeLocalPath(layerPath.toString());
+        when(layerService.resolveLayerByArnForAccount(arn, "123456789012", "eu-west-1")).thenReturn(layer);
+        stubExtensionDiscovery();
+
+        launcher.launchProvisioned(fn);
+
+        assertTrue(capturedRemotePaths.contains("/opt"));
+        verify(layerService, never()).resolveLayerByArn(anyString());
+        verify(lifecycleManager).startCreated(eq("container-123"), any());
+        verify(runtimeApiServer).expectExtensions(0);
+    }
+
+    @ParameterizedTest
+    @MethodSource("unavailableLayerPaths")
+    void provisionedLaunchRefusesMissingLayerInputsAndCleansBeforeStart(String pathKind) throws Exception {
+        LambdaFunction fn = networkFunction();
+        fn.setAccountId("123456789012");
+        fn.setFunctionArn("arn:aws:lambda:us-east-1:123456789012:function:missing-layer");
+        fn.setVersion("1");
+        String arn = "arn:aws:lambda:us-east-1:123456789012:layer:missing:1";
+        fn.setLayers(List.of(arn));
+        if (!"unresolved".equals(pathKind)) {
+            LambdaLayerVersion layer = new LambdaLayerVersion();
+            if ("absent".equals(pathKind)) {
+                layer.setCodeLocalPath(tempDir.resolve("absent").toString());
+            } else if ("regular-file".equals(pathKind)) {
+                layer.setCodeLocalPath(Files.writeString(tempDir.resolve("not-a-directory"), "data").toString());
+            }
+            when(layerService.resolveLayerByArnForAccount(eq(arn), eq("123456789012"), anyString()))
+                    .thenReturn(layer);
+        }
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> launcher.launchProvisioned(fn));
+        assertTrue(error.getMessage().startsWith("Configured layer is unavailable for provisioned initialization:"));
+        verify(lifecycleManager, never()).startCreated(anyString(), any());
+        verify(lifecycleManager).stopAndRemove("container-123", null);
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+        verify(runtimeApiServer, never()).expectExtensions(anyInt());
+        verify(runtimeApiServer, never()).enqueue(any());
+    }
+
+    private static Stream<String> unavailableLayerPaths() {
+        return Stream.of("unresolved", "null-path", "absent", "regular-file");
+    }
+
+    @Test
+    void ordinaryLaunchRetainsItsUnresolvedLayerBehavior() {
+        LambdaFunction fn = networkFunction();
+        String arn = "arn:aws:lambda:us-east-1:123456789012:layer:missing:1";
+        fn.setLayers(List.of(arn));
+        launcher.launch(fn);
+        verify(layerService).resolveLayerByArn(arn);
+        verify(layerService, never()).resolveLayerByArnForAccount(anyString(), anyString(), anyString());
+        verify(lifecycleManager).startCreated(eq("container-123"), any());
     }
 
     @Test
@@ -966,6 +1189,45 @@ class ContainerLauncherTest {
         launcher.stop(handle);
 
         verify(executionRoleCredentials).unregister("222233334444", "ASIASTOPSESSION");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void stopRetainsRuntimeAndCredentialsUntilRemovalSucceeds(boolean extensions) throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("role-session-stop-retry"));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("role-session-stop-retry-fn");
+        fn.setAccountId("222233334444");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        when(executionRoleCredentials.forFunction(fn)).thenReturn(Optional.of(
+                new SessionCreds("ASIARETRYSESSION", "role-secret", "role-token")));
+        when(runtimeApiServer.hasRegisteredExtensions()).thenReturn(extensions);
+        ContainerHandle handle = launcher.launch(fn);
+        int timeout = extensions ? 2 : 1;
+        IllegalStateException failure = new IllegalStateException("Docker removal failed");
+        doThrow(failure).doNothing().when(lifecycleManager)
+                .stopAndRemoveStrict("container-123", null, timeout);
+
+        assertSame(failure, assertThrows(IllegalStateException.class, () -> launcher.stop(handle)));
+
+        verify(runtimeApiServer).quiesce();
+        verify(runtimeApiServer, never()).close();
+        verify(runtimeApiServerFactory, never()).release(runtimeApiServer);
+        verify(executionRoleCredentials, never()).unregister(any(), any());
+
+        launcher.stop(handle);
+
+        InOrder order = inOrder(lifecycleManager, runtimeApiServer, runtimeApiServerFactory,
+                executionRoleCredentials);
+        order.verify(runtimeApiServer).quiesce();
+        order.verify(lifecycleManager).stopAndRemoveStrict("container-123", null, timeout);
+        order.verify(runtimeApiServer).quiesce();
+        order.verify(lifecycleManager).stopAndRemoveStrict("container-123", null, timeout);
+        order.verify(runtimeApiServer).close();
+        order.verify(runtimeApiServerFactory).release(runtimeApiServer);
+        order.verify(executionRoleCredentials).unregister("222233334444", "ASIARETRYSESSION");
     }
 
     @Test
