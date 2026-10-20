@@ -7625,6 +7625,7 @@ class Ec2ServiceTest {
         when(config.defaultAccountId()).thenReturn("000000000000");
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
+        when(ec2.enabled()).thenReturn(true);
         when(ec2.mock()).thenReturn(ec2Mock);
         when(ec2.mockPublicAddresses()).thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.DOCUMENTATION);
         when(ec2.mockPublicAddress()).thenReturn(Optional.empty());
