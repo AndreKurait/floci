@@ -7,7 +7,9 @@ import io.github.hectorvent.floci.core.common.AwsRegionFacts;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -65,6 +67,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
 
     // region → load balancer name → record
     private Map<String, Map<String, ClassicLoadBalancer>> loadBalancers = new ConcurrentHashMap<>();
+    private StorageBackend<String, Map<String, ClassicLoadBalancer>> loadBalancerStore;
 
     /** Serializes listener writes against each other; see {@link #createLoadBalancerListeners}. */
     private final Object listenerLock = new Object();
@@ -106,8 +109,9 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         if (storageFactory == null) {
             return;
         }
-        this.loadBalancers = new StorageBackedMap<>(storageFactory.create("elb", "elb-load-balancers.json",
-                new TypeReference<Map<String, Map<String, ClassicLoadBalancer>>>() {}));
+        this.loadBalancerStore = storageFactory.create("elb", "elb-load-balancers.json",
+                new TypeReference<Map<String, Map<String, ClassicLoadBalancer>>>() {});
+        this.loadBalancers = new StorageBackedMap<>(loadBalancerStore);
         for (Map.Entry<String, Map<String, ClassicLoadBalancer>> entry
                 : new ArrayList<>(loadBalancers.entrySet())) {
             if (!(entry.getValue() instanceof ConcurrentHashMap)) {
@@ -122,6 +126,23 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
      * nothing reachable from {@link #initializeStorage()} may touch an injected collaborator.
      */
     public void restorePersistedRuntime() {
+        if (loadBalancerStore instanceof AccountAwareStorageBackend<Map<String, ClassicLoadBalancer>> aware) {
+            for (AccountAwareStorageBackend.AccountEntry<Map<String, ClassicLoadBalancer>> entry
+                    : aware.scanAllAccountEntries(key -> true)) {
+                Map<String, ClassicLoadBalancer> regionLbs = entry.value() instanceof ConcurrentHashMap
+                        ? entry.value() : new ConcurrentHashMap<>(entry.value());
+                for (ClassicLoadBalancer lb : regionLbs.values()) {
+                    lb.setCanonicalHostedZoneNameId(
+                            AwsRegionFacts.classicElbHostedZoneId(entry.key()).orElse(null));
+                }
+                aware.putForAccount(entry.accountId(), entry.key(), regionLbs);
+                for (ClassicLoadBalancer lb : regionLbs.values()) {
+                    healthChecker.startMonitoring(lb);
+                    healthChecker.registerInstances(lb, lb.getInstanceIds());
+                }
+            }
+            return;
+        }
         // A balancer stored before the zone was looked up per region still carries the one fixed
         // zone every balancer used to report; take the region's zone again and store it back.
         for (String region : List.copyOf(loadBalancers.keySet())) {
@@ -236,6 +257,16 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         return result;
     }
 
+    /** Public load-balancer names select the owner independently of an API caller's credentials. */
+    List<ClassicLoadBalancer> findByDnsName(String dnsName) {
+        Collection<Map<String, ClassicLoadBalancer>> regions =
+                loadBalancerStore instanceof AccountAwareStorageBackend<Map<String, ClassicLoadBalancer>> aware
+                        ? aware.scanAllAccounts() : loadBalancers.values();
+        return regions.stream().flatMap(region -> region.values().stream())
+                .filter(lb -> (lb.getDnsName() + ".").equalsIgnoreCase(dnsName))
+                .toList();
+    }
+
     private void populateSourceSecurityGroup(String region, ClassicLoadBalancer lb) {
         if (lb.getSecurityGroups() == null || lb.getSecurityGroups().isEmpty()) {
             lb.setSourceSecurityGroupOwnerAlias(null);
@@ -264,8 +295,9 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         if (regionLbs == null) {
             return;
         }
-        if (regionLbs.remove(name) != null) {
-            healthChecker.stopMonitoring(region, name);
+        ClassicLoadBalancer removed = regionLbs.remove(name);
+        if (removed != null) {
+            healthChecker.stopMonitoring(removed);
             loadBalancers.put(region, regionLbs);
         }
     }
@@ -360,7 +392,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         ClassicLoadBalancer lb = requireLoadBalancer(region, name);
         lb.getInstanceIds().removeAll(instanceIds);
         persist(region);
-        healthChecker.deregisterInstances(region, name, instanceIds);
+        healthChecker.deregisterInstances(lb, instanceIds);
         return List.copyOf(lb.getInstanceIds());
     }
 
@@ -377,7 +409,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
                 throw new AwsException("InvalidInstance",
                         "Could not find EC2 instance " + id + ".", 400);
             }
-            result.put(id, healthChecker.getHealth(region, name, id));
+            result.put(id, healthChecker.getHealth(lb, id));
         }
         return result;
     }
