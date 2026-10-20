@@ -7,12 +7,17 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.ArchitectureValues;
 import software.amazon.awssdk.services.ec2.model.BlockDeviceMapping;
+import software.amazon.awssdk.services.ec2.model.CopyImageRequest;
+import software.amazon.awssdk.services.ec2.model.CreateVolumePermission;
+import software.amazon.awssdk.services.ec2.model.CreateVolumePermissionModifications;
 import software.amazon.awssdk.services.ec2.model.DescribeSnapshotsRequest;
 import software.amazon.awssdk.services.ec2.model.DescribeVolumesRequest;
 import software.amazon.awssdk.services.ec2.model.EbsBlockDevice;
 import software.amazon.awssdk.services.ec2.model.Ec2Exception;
 import software.amazon.awssdk.services.ec2.model.Filter;
 import software.amazon.awssdk.services.ec2.model.Image;
+import software.amazon.awssdk.services.ec2.model.LaunchPermission;
+import software.amazon.awssdk.services.ec2.model.LaunchPermissionModifications;
 import software.amazon.awssdk.services.ec2.model.RegisterImageRequest;
 import software.amazon.awssdk.services.ec2.model.ResourceType;
 import software.amazon.awssdk.services.ec2.model.Tag;
@@ -68,6 +73,72 @@ class Ec2RegisterImageTagTest {
             assertThat(error.awsErrorDetails().errorCode()).isEqualTo("InvalidParameterValue");
             assertThat(ec2.describeImages(request -> request.filters(
                     Filter.builder().name("name").values(name).build())).images()).isEmpty();
+        }
+    }
+
+    @Test
+    void sharedImageCopyPreservesSharedTagsWithoutCopyingPrivateTags() {
+        String name = TestFixtures.uniqueName("shared-image-copy");
+        Region home = TestFixtures.region();
+        Region destination = Region.regions().stream()
+                .filter(region -> !region.equals(home) && !region.isGlobalRegion() && region.metadata() != null)
+                .filter(region -> TestFixtures.partition().equals(region.metadata().partition().id()))
+                .findFirst().orElseThrow();
+        Tag shared = Tag.builder().key("ec2:SharedTag/SdkImageProbe").value(name).build();
+        Tag privateTag = Tag.builder().key("Purpose").value("private-image-note").build();
+        try (Ec2Client owner = client("111111111111", home);
+                Ec2Client ownerDestination = client("111111111111", destination);
+                Ec2Client recipient = client("222222222222", destination);
+                Ec2Client recipientHome = client("222222222222", home);
+                ImageSource source = new ImageSource(owner, name)) {
+            String sourceId = owner.registerImage(source.registration(name).tagSpecifications(
+                    TagSpecification.builder().resourceType(ResourceType.IMAGE).tags(privateTag).build()).build())
+                    .imageId();
+            CopyImageRequest request = CopyImageRequest.builder().sourceImageId(sourceId)
+                    .sourceRegion(home.id()).name(name + "-copy").build();
+            Ec2Exception denied = assertThrows(Ec2Exception.class, () -> recipient.copyImage(request));
+            assertThat(denied.awsErrorDetails().errorCode()).isEqualTo("AuthFailure");
+            owner.modifyImageAttribute(change -> change.imageId(sourceId).launchPermission(
+                    LaunchPermissionModifications.builder().add(
+                            LaunchPermission.builder().userId("222222222222").build()).build()));
+            denied = assertThrows(Ec2Exception.class, () -> recipient.copyImage(request));
+            assertThat(denied.awsErrorDetails().errorCode()).isEqualTo("AuthFailure");
+            owner.modifySnapshotAttribute(change -> change.snapshotId(source.snapshotId).createVolumePermission(
+                    CreateVolumePermissionModifications.builder().add(
+                            CreateVolumePermission.builder().userId("222222222222").build()).build()));
+            owner.createTags(change -> change.resources(sourceId).tags(shared));
+            assertThat(owner.describeImages(read -> read.imageIds(sourceId)).images().get(0).tags())
+                    .containsExactlyInAnyOrder(privateTag, shared);
+            assertThat(recipientHome.describeImages(read -> read.imageIds(sourceId)).images().get(0).tags())
+                    .containsExactly(shared);
+            String copyId = null;
+            try {
+                copyId = recipient.copyImage(request).imageId();
+                String ownedCopyId = copyId;
+                Image copy = recipient.describeImages(read -> read.imageIds(ownedCopyId)).images().get(0);
+                assertThat(copy.ownerId()).isEqualTo("222222222222");
+                assertThat(copy.publicLaunchPermissions()).isFalse();
+                assertThat(copy.tags()).containsExactly(shared);
+                assertThat(copy.blockDeviceMappings().get(0).ebs().snapshotId()).isNotEqualTo(source.snapshotId);
+                assertThat(recipient.describeSnapshots(read -> read.snapshotIds(
+                        copy.blockDeviceMappings().get(0).ebs().snapshotId())).snapshots().get(0).ownerId())
+                        .isEqualTo("222222222222");
+                assertThat(recipientHome.describeImages(read -> read.filters(
+                        Filter.builder().name("name").values(name + "-copy").build())).images()).isEmpty();
+                assertThat(ownerDestination.describeImages(read -> read.filters(
+                        Filter.builder().name("name").values(name + "-copy").build())).images()).isEmpty();
+            } finally {
+                if (copyId != null) {
+                    String ownedCopyId = copyId;
+                    Image copy = recipient.describeImages(read -> read.imageIds(ownedCopyId)).images().get(0);
+                    recipient.deregisterImage(change -> change.imageId(ownedCopyId));
+                    for (BlockDeviceMapping mapping : copy.blockDeviceMappings()) {
+                        if (mapping.ebs() != null) {
+                            recipient.deleteSnapshot(change -> change.snapshotId(mapping.ebs().snapshotId()));
+                        }
+                    }
+                }
+            }
         }
     }
 

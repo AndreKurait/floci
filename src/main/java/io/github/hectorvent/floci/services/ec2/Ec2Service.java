@@ -8168,6 +8168,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // Fresh snapshot ids: two AMIs sharing one snapshot would make deleting either appear
             // to take the other's backing with it, and the copy's snapshots live in the
             // destination region anyway.
+            List<Tag> sharedTags = sharedImageTags(sourceRegion, source);
+            validateCreationTags(sharedTags);
             List<BlockDeviceMapping> mappings = foreign
                     ? sharedCopyMappings(sourceRegion, source) : sourceImageMappings(source);
             String ancestor = foreign ? sharedCopyAncestor(sourceRegion, source)
@@ -8191,7 +8193,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // emptiness CreateImage itself used to produce. The layer is shared rather than
             // duplicated; reclamation accounts for that.
             copy.setDockerImage(foreign ? null : capturedImageFor(sourceRegion, sourceImageId));
+            copy.setTags(sharedTags);
             registeredImages.put(key(destinationRegion, copy.getImageId()), copy);
+            if (!sharedTags.isEmpty()) {
+                createTags(destinationRegion, List.of(copy.getImageId()), sharedTags);
+            }
             return copy;
         }
     }
@@ -8340,11 +8346,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private Image sharedImageView(Image source) {
         Image view = new Image(source);
-        view.setTags(getTagsForAccount(source.getOwnerId(), source.getRegion(), source.getImageId(), source.getTags()).stream()
-                .filter(tag -> tag.getKey() != null && tag.getKey().startsWith("ec2:SharedTag/"))
-                .map(tag -> new Tag(tag.getKey(), tag.getValue())).collect(Collectors.toCollection(ArrayList::new)));
+        view.setTags(sharedImageTags(source.getRegion(), source));
         view.setLaunchPermissionUserIds(Set.of());
         return view;
+    }
+
+    private List<Tag> sharedImageTags(String region, Image source) {
+        return getTagsForAccount(source.getOwnerId(), region, source.getImageId(), source.getTags()).stream()
+                .filter(tag -> tag.getKey() != null && tag.getKey().startsWith("ec2:SharedTag/"))
+                .map(tag -> new Tag(tag.getKey(), tag.getValue())).collect(Collectors.toCollection(ArrayList::new));
     }
 
     private Image sharedCopySource(String region, String imageId) {
@@ -8362,11 +8372,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         if (!"available".equals(source.getState())) {
             throw new AwsException("InvalidAMIID.Unavailable", "The source image is not available.", 400);
-        }
-        List<Tag> sourceTags = getTagsForAccount(entry.accountId(), region, imageId, source.getTags());
-        if (sourceTags != null && sourceTags.stream().anyMatch(tag -> tag.getKey() != null
-                && tag.getKey().startsWith("ec2:SharedTag/"))) {
-            throw new AwsException("UnsupportedOperation", "Copying shared AMI tags is not supported.", 400);
         }
         return source;
     }

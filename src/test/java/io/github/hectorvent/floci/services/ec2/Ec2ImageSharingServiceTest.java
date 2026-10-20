@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.HashMap;
@@ -69,6 +70,36 @@ class Ec2ImageSharingServiceTest {
         assertEquals(sourceSnapshotId, owner.describeSnapshots(REGION, List.of(sourceSnapshotId),
                 List.of("self"), Map.of()).getFirst().getSnapshotId());
         assertEquals(Set.of(RECIPIENT), source.getLaunchPermissionUserIds());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,us-west-2", "true,us-east-1", "true,us-west-2"})
+    void copiesSharedTagsWithoutOwnerPrivateTags(boolean foreign, String destination) {
+        Image source = source();
+        owner.createTags(REGION, List.of(source.getImageId()), List.of(
+                new Tag("Private", "owner"), new Tag("ec2:SharedTag/purpose", "worker"),
+                new Tag("ec2:SharedTag/empty", "")));
+        owner.createSystemTags(REGION, List.of(source.getImageId()), List.of(new Tag("aws:source", "system")));
+        if (foreign) {
+            grant(source);
+        }
+        Ec2Service copier = foreign ? recipient : owner;
+        Image copy = copier.copyImage(destination, REGION, source.getImageId(), "tagged-copy", null);
+
+        assertEquals(List.of("ec2:SharedTag/purpose=worker", "ec2:SharedTag/empty="),
+                copier.describeImages(destination, List.of(copy.getImageId()), List.of("self"), Map.of())
+                        .getFirst().getTags().stream().map(tag -> tag.getKey() + "=" + tag.getValue()).toList());
+        assertEquals(2, copier.describeTags(destination,
+                Map.of("resource-id", List.of(copy.getImageId()))).size());
+        assertTrue(copier.describeImages(destination, List.of(copy.getImageId()), List.of(),
+                Map.of("tag:Private", List.of("owner"))).isEmpty());
+        assertTrue(copier.describeSnapshots(destination, List.of(snapshotId(copy)), List.of("self"), Map.of())
+                .getFirst().getTags().isEmpty());
+        copier.createTags(destination, List.of(copy.getImageId()), List.of(
+                new Tag("ec2:SharedTag/purpose", "changed")));
+        assertEquals(List.of("Private=owner", "ec2:SharedTag/purpose=worker", "ec2:SharedTag/empty=", "aws:source=system"),
+                owner.describeImages(REGION, List.of(source.getImageId()), List.of("self"), Map.of())
+                        .getFirst().getTags().stream().map(tag -> tag.getKey() + "=" + tag.getValue()).toList());
     }
 
     @ParameterizedTest
