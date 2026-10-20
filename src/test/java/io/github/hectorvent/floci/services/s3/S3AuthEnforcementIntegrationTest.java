@@ -76,6 +76,14 @@ class S3AuthEnforcementIntegrationTest {
     private static final S3RequestSigner BAD_KEY_SIGNER = S3RequestSigner.signedAs("bad-key", "bad-secret");
     private static final S3RequestSigner ACCOUNT_SHAPED_SIGNER = S3RequestSigner.signedAs("123456789012", "test");
 
+    @Test
+    @Order(60)
+    void legacyHeadersRemainRejectedWhenS3AuthenticationIsEnforced() {
+        given().header("Authorization", "AWS 000000000001:local-signature")
+                .put("/legacy-auth-rejected")
+                .then().statusCode(400).body(containsString("AuthorizationHeaderMalformed"));
+    }
+
     private static void enableLegacyAcls(String bucket) {
         given().filter(LOCAL_SIGNER)
                 .body("<OwnershipControls><Rule><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>")
