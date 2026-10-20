@@ -46,6 +46,20 @@
 definition, role, logging, tracing, encryption, and tags without replacing the state machine;
 changes to `StateMachineName` or `StateMachineType` use replacement semantics.
 
+## Nested task credentials
+
+Nested `states:startExecution` tasks, including `.sync` and `.sync:2`, and the SDK
+`sfn:startExecution` and `sfn:startSyncExecution` integrations accept `Credentials.RoleArn`.
+JSONPath `RoleArn.$` resolves against the state input after `InputPath` and before
+`Parameters`. The role must exist with its exact ARN in the execution's partition.
+The child call and polling use that role's account; parent history, subsequent states,
+and cancellation checks retain the parent's account.
+
+This supports account routing with IAM enforcement disabled. It does not implement
+STS role-assumption authorization or task-role permission enforcement. Task credentials
+with IAM enforcement enabled, on other integrations, or with callback suffixes fail
+explicitly. A foreign state-machine ARN without task credentials grants no account access.
+
 ## Execution history events
 
 `GetExecutionHistory` emits an event family around a Task state's `TaskStateEntered` and
@@ -523,6 +537,12 @@ the wire and the task fails with `Sfn.StateMachineDoesNotExistException`.
 | `arn:aws:states:::aws-sdk:scheduler:deleteSchedule` | `{}` | `Scheduler.ResourceNotFoundException` |
 | `arn:aws:states:::aws-sdk:sns:publish` | `{MessageId}` | `Sns.NotFoundException` when the topic does not exist |
 
+Callback tokens are owned by the execution account. Foreign callbacks return
+`AccessDeniedException`; unknown tokens return `InvalidToken`. Recently closed tokens return
+`TaskTimedOut`. Closed-token classification retains at most 1,024 tokens for five minutes; older
+or evicted tokens return `InvalidToken`. Invalid JSON output leaves a pending token available
+for a corrected callback. Token state remains in memory.
+
 Redshift Data API execution returns a statement `Id` before SQL completes. Follow the
 `executeStatement` task with `describeStatement`, a Choice on `Status`, and a Wait state
 before polling again. Read results only after `FINISHED`; route `FAILED` and `ABORTED`
@@ -847,3 +867,8 @@ aws stepfunctions get-execution-history \
   --execution-arn $EXEC_ARN \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+A missing or mismatched task role fails with `States.TaskFailed`. A target account
+that does not match the selected task account fails with
+`StepFunctions.AWSStepFunctionsException` for optimized integrations or
+`Sfn.SfnException` for SDK integrations, matching the live AWS probes.
