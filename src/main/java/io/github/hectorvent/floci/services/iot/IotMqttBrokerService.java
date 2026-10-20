@@ -757,19 +757,33 @@ public class IotMqttBrokerService implements Resettable {
             }
             return;
         }
-        ruleWorker.executeBlocking(() -> {
-            if (ruleState.get() == admitted) {
-                rules.run();
-            }
-            return null;
-        }, false).onComplete(result -> {
-            if (pendingRuleEvaluations.decrementAndGet() == 0) {
-                ruleEvaluationsThrottled.set(false);
-            }
-            if (result.failed()) {
-                LOG.warnv(result.cause(), "IoT rule evaluation for topic {0} failed", topic);
-            }
-        });
+        AtomicBoolean released = new AtomicBoolean();
+        try {
+            ruleWorker.executeBlocking(() -> {
+                try {
+                    if (ruleState.get() == admitted) {
+                        rules.run();
+                    }
+                    return null;
+                } finally {
+                    releaseRuleEvaluation(released);
+                }
+            }, false).onComplete(result -> {
+                releaseRuleEvaluation(released);
+                if (result.failed()) {
+                    LOG.warnv(result.cause(), "IoT rule evaluation for topic {0} failed", topic);
+                }
+            });
+        } catch (RuntimeException dispatchFailure) {
+            releaseRuleEvaluation(released);
+            throw dispatchFailure;
+        }
+    }
+
+    private void releaseRuleEvaluation(AtomicBoolean released) {
+        if (released.compareAndSet(false, true) && pendingRuleEvaluations.decrementAndGet() == 0) {
+            ruleEvaluationsThrottled.set(false);
+        }
     }
 
     private void fanOut(String topic, byte[] payload, boolean retained) {
