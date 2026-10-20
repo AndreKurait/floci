@@ -804,6 +804,9 @@ in every partition. State machine and execution ARNs follow the region they are 
 `arn:...:states:::apigateway:invoke` supports regional, same-account REST APIs with `POST`,
 `IAM_ROLE`, a named stage and resource path, and an object request body without null values.
 Headers accept multiple string values and HTTP token names. AWS-reserved headers are rejected.
+Literal reserved names, including `Expect`, `Upgrade`, `Authorization` and `Host`, and the
+`X-Amz-`, `X-Amzn-` and `X-Forwarded-` prefixes are rejected case-insensitively when a
+definition is created, updated or validated, including JSONata arguments and nested workflows.
 An explicit `Content-Length` must equal the serialized body size; the HTTP client writes that header.
 Private endpoints, resource-policy authentication, query parameters and `AllowNullValues` remain unsupported.
 
