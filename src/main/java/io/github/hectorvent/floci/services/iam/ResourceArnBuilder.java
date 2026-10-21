@@ -118,11 +118,22 @@ public class ResourceArnBuilder {
             case "ssm"            -> List.of(buildSsmArn(ctx, region, accountId));
             case "kms"            -> List.of(buildKmsArn(path, region, accountId));
             case "iam"            -> buildIamArns(ctx, region, accountId);
+            case "elasticloadbalancing" -> List.of(buildProvisionedCapacityArn(ctx));
             case "resource-groups" -> List.of(buildResourceGroupArn(ctx, region, accountId));
             case "scheduler"      -> List.of(buildSchedulerArn(path, ctx, region, accountId, partition));
             case "pipes"          -> List.of(buildPipesArn(path, ctx, region, accountId, partition));
             default               -> List.of("*");
         };
+    }
+
+    private String buildProvisionedCapacityArn(ContainerRequestContext ctx) {
+        String action = AwsQueryServiceResolver.action(RequestBodyReader.formField(ctx, "Action"),
+                RequestBodyReader.formField(ctx, "Operation"));
+        if (!"DescribeProvisionedCapacity".equals(action)) {
+            return "*";
+        }
+        String arn = RequestBodyReader.formField(ctx, "LoadBalancerArn");
+        return arn == null || arn.isBlank() ? "*" : arn;
     }
 
     private String buildResourceGroupArn(ContainerRequestContext ctx, String region, String accountId) {

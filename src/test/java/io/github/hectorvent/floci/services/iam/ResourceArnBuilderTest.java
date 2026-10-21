@@ -70,6 +70,24 @@ class ResourceArnBuilderTest {
         }).when(ctx).setProperty(any(), any());
     }
 
+    @Test
+    void provisionedCapacityExtensionUsesTheNamedResourceForActionAndOperation() {
+        String arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:"
+                + "loadbalancer/app/allowed/0123456789abcdef";
+        for (String selector : List.of("Action", "Operation")) {
+            setFormBody(selector + "=DescribeProvisionedCapacity&LoadBalancerArn=" + arn);
+            assertEquals(arn, builder.build("elasticloadbalancing", ctx, "us-east-1", ACCOUNT));
+        }
+    }
+
+    @Test
+    void provisionedCapacityExtensionDoesNotChangeOtherElbResourceTargets() {
+        setFormBody("Action=DescribeCapacityReservation&LoadBalancerArn=not-a-resource");
+        assertEquals("*", builder.build("elasticloadbalancing", ctx, "us-east-1", ACCOUNT));
+        setFormBody("Action=DescribeProvisionedCapacity");
+        assertEquals("*", builder.build("elasticloadbalancing", ctx, "us-east-1", ACCOUNT));
+    }
+
     /** Query-protocol services carry their parameters in a form body, as IAM does. */
     private void setFormBody(String form) {
         contextProperties.clear();
