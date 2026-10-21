@@ -11,6 +11,7 @@ import software.amazon.awssdk.services.eventbridge.model.DescribeConnectionRespo
 import software.amazon.awssdk.services.eventbridge.model.PutEventsRequestEntry;
 import software.amazon.awssdk.services.eventbridge.model.ResourceNotFoundException;
 
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.Map;
@@ -27,6 +28,13 @@ class CloudFormationEventBridgeConnectionTest {
     @Test
     void createsDeliversUpdatesReplacesRollsBackAndDeletes() throws Exception {
         String stack = TestFixtures.uniqueName("compat-cfn-connection");
+        String host = System.getenv("FLOCI_API_DESTINATION_SINK_HOST");
+        if (host == null || host.isBlank()) {
+            host = switch (TestFixtures.endpoint().getHost()) {
+                case "localhost", "127.0.0.1", "::1", "[::1]" -> "127.0.0.1";
+                default -> InetAddress.getLocalHost().getHostAddress();
+            };
+        }
         LinkedBlockingQueue<String> deliveries = new LinkedBlockingQueue<>();
         HttpServer sink = HttpServer.create(new InetSocketAddress("0.0.0.0", 0), 0);
         sink.createContext("/", exchange -> {
@@ -36,7 +44,6 @@ class CloudFormationEventBridgeConnectionTest {
             exchange.close();
         });
         sink.start();
-        String host = System.getenv().getOrDefault("FLOCI_API_DESTINATION_SINK_HOST", "127.0.0.1");
         String endpoint = "http://" + host + ":" + sink.getAddress().getPort();
         try (CloudFormationClient cfn = TestFixtures.cloudFormationClient();
                 EventBridgeClient events = TestFixtures.eventBridgeClient()) {
