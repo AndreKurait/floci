@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.lambda;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
+import io.github.hectorvent.floci.core.common.ContainerTeardowns;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
@@ -21,9 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
@@ -384,26 +383,7 @@ public class WarmPool implements ContainerTeardown {
     }
 
     private void stopInParallel(List<ContainerHandle> handles) {
-        if (handles.isEmpty()) {
-            return;
-        }
-        ExecutorService pool = Executors.newThreadPerTaskExecutor(
-                Thread.ofVirtual().name("warm-pool-drainer-", 0).factory());
-        try {
-            List<Future<?>> futures = new ArrayList<>(handles.size());
-            for (ContainerHandle handle : handles) {
-                futures.add(pool.submit(() -> stopQuietly(handle)));
-            }
-            for (Future<?> f : futures) {
-                try {
-                    f.get(15, TimeUnit.SECONDS);
-                } catch (Exception e) {
-                    LOG.warnv("Drain task did not finish cleanly: {0}", e.getMessage());
-                }
-            }
-        } finally {
-            pool.shutdownNow();
-        }
+        ContainerTeardowns.stopInParallel(handles, this::stopQuietly, LOG);
     }
 
     private void drainAll() {
