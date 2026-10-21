@@ -173,6 +173,82 @@ class Ec2ServiceTest {
     }
 
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void createNetworkInterfaceRejectsMissingGroupsBeforeAllocatingAddresses(boolean includeExistingGroup) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        String missingGroup = "sg-0f294603eafad4835";
+        SecurityGroup existingGroup = service.createSecurityGroup(region, "interface-validation",
+                "interface validation", subnet.getVpcId());
+        List<String> groupIds = includeExistingGroup
+                ? List.of(existingGroup.getGroupId(), missingGroup) : List.of(missingGroup);
+        int availableAddresses = subnet.getAvailableIpAddressCount();
+
+        AwsException error = assertThrows(AwsException.class, () -> service.createNetworkInterface(
+                region, subnet.getSubnetId(), null, null, List.of(), groupIds, List.of()));
+
+        assertEquals("InvalidSecurityGroupID.NotFound", error.getErrorCode());
+        assertEquals("The securityGroup ID '" + missingGroup + "' does not exist", error.getMessage());
+        assertEquals(400, error.getHttpStatus());
+        assertTrue(service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().isEmpty());
+        assertEquals(availableAddresses, service.describeSubnets(region, List.of(subnet.getSubnetId()), Map.of())
+                .getFirst().getAvailableIpAddressCount());
+    }
+
+    @Test
+    void createNetworkInterfaceRejectsGroupsFromAnotherVpcBeforeAllocatingAddresses() {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        String foreignVpc = service.createVpc(region, "10.93.0.0/16", false).getVpcId();
+        SecurityGroup foreignGroup = service.createSecurityGroup(region, "foreign-interface-group",
+                "foreign interface group", foreignVpc);
+        int availableAddresses = subnet.getAvailableIpAddressCount();
+
+        AwsException error = assertThrows(AwsException.class, () -> service.createNetworkInterface(
+                region, subnet.getSubnetId(), null, null, List.of(),
+                List.of(foreignGroup.getGroupId()), List.of()));
+
+        assertEquals("InvalidGroup.NotFound", error.getErrorCode());
+        assertTrue(service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().isEmpty());
+        assertEquals(availableAddresses, service.describeSubnets(region, List.of(subnet.getSubnetId()), Map.of())
+                .getFirst().getAvailableIpAddressCount());
+    }
+
+    @Test
+    void createNetworkInterfaceRetainsAnExistingSubnetVpcGroup() {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        SecurityGroup group = service.createSecurityGroup(region, "valid-interface-group",
+                "valid interface group", subnet.getVpcId());
+
+        NetworkInterface networkInterface = service.createNetworkInterface(region, subnet.getSubnetId(),
+                null, null, List.of(), List.of(group.getGroupId()), List.of());
+
+        assertEquals(List.of(group.getGroupId()), networkInterface.getGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+        assertEquals(subnet.getVpcId(), networkInterface.getVpcId());
+        assertEquals(1, service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().size());
+    }
+
+    @Test
+    void runInstancesRetainsItsMissingSecurityGroupErrorWithoutAllocatingResources() {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+
+        AwsException error = assertThrows(AwsException.class, () -> service.runInstances(
+                region, "ami-test", "t3.micro", 1, 1, null, List.of("sg-0f294603eafad4835"),
+                subnet.getSubnetId(), null, List.of(), null, null));
+
+        assertEquals("InvalidGroup.NotFound", error.getErrorCode());
+        assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeVolumes(region, List.of(), Map.of()).isEmpty());
+    }
+
     @Test
     void subnetAvailableAddressesTrackAllocationsAndRelease() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
