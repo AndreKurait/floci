@@ -151,6 +151,19 @@ class S3StreamedUploadTest {
     }
 
     @Test
+    void conflictingAclHeadersFailBeforeTheBodyIsRead() {
+        AwsException error = assertThrows(AwsException.class, () -> s3Service.putObject("bucket",
+                "conflicting-acl.txt", unreadable(), NO_CHECKSUMS, "text/plain", Map.of(),
+                new PutObjectOptions().withAcl("private").withGrantRead("id=\"000000000000\"")));
+
+        assertEquals("InvalidRequest", error.getErrorCode());
+        assertEquals("Specifying both Canned ACLs and Header Grants is not allowed", error.getMessage());
+        assertEquals("NoSuchKey", assertThrows(AwsException.class,
+                () -> s3Service.headObject("bucket", "conflicting-acl.txt")).getErrorCode());
+        assertNothingStaged();
+    }
+
+    @Test
     void aBodyThatBreaksPartwayLeavesNothingBehind() {
         assertThrows(UncheckedIOException.class, () -> s3Service.putObject("bucket", "broken.txt",
                 breaksAfter(BODY), NO_CHECKSUMS, "text/plain", Map.of(), new PutObjectOptions()));

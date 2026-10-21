@@ -651,6 +651,9 @@ public class S3Service implements Resettable, ResourceProvider {
         AccountAwareStorageBackend.OwnedEntry<Bucket> checkedBucket = resolveBucketEntry(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
                         "The specified bucket does not exist.", 404));
+        resolveObjectAclXml(checkedBucket.account(), effectiveOptions.getAcl(), effectiveOptions.getGrantRead(),
+                effectiveOptions.getGrantWrite(), effectiveOptions.getGrantFullControl(),
+                effectiveOptions.getGrantReadAcp(), effectiveOptions.getGrantWriteAcp());
         rejectUploadAclWhenOwnershipEnforced(checkedBucket.value(), checkedBucket.account(), effectiveOptions);
         rejectConflictingServerSideEncryption(
                 normalizeServerSideEncryption(effectiveOptions.getServerSideEncryption()),
@@ -833,11 +836,11 @@ public class S3Service implements Resettable, ResourceProvider {
             object.setSseCustomerAlgorithm(sseCustomerKey.algorithm());
             object.setSseCustomerKeyMd5(sseCustomerKey.keyMd5());
         }
-        rejectUploadAclWhenOwnershipEnforced(bucket, bucketOwnerAccount, effectiveOptions);
         String objectAcl = resolveObjectAclXml(bucketOwnerAccount,
                 effectiveOptions.getAcl(), effectiveOptions.getGrantRead(),
                 effectiveOptions.getGrantWrite(), effectiveOptions.getGrantFullControl(),
                 effectiveOptions.getGrantReadAcp(), effectiveOptions.getGrantWriteAcp());
+        rejectUploadAclWhenOwnershipEnforced(bucket, bucketOwnerAccount, effectiveOptions);
         // BlockPublicAcls fails a PutObject that carries a public ACL. The bucket and its owner
         // are already resolved here, so the settings are read without a second lookup.
         if (objectAcl != null && S3AclPublicAccessEvaluator.aclIsPublic(objectAcl)
@@ -4033,10 +4036,10 @@ public class S3Service implements Resettable, ResourceProvider {
                     .orElseThrow(() -> new AwsException("NoSuchBucket",
                             "The specified bucket does not exist.", 404));
             String ownerAccount = getBucketOwnerAccountId(bucket);
-            rejectUploadAclWhenOwnershipEnforced(destination, ownerAccount, objectOptions);
             resolveObjectAclXml(ownerAccount, acl, objectOptions.getGrantRead(), objectOptions.getGrantWrite(),
                     objectOptions.getGrantFullControl(), objectOptions.getGrantReadAcp(),
                     objectOptions.getGrantWriteAcp());
+            rejectUploadAclWhenOwnershipEnforced(destination, ownerAccount, objectOptions);
             String normalizedServerSideEncryption = normalizeServerSideEncryption(serverSideEncryption);
             SseCustomerKey customerKey = validateSseCustomerKey(sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
             rejectConflictingServerSideEncryption(normalizedServerSideEncryption, customerKey);
@@ -5405,9 +5408,9 @@ public class S3Service implements Resettable, ResourceProvider {
                               String grantWrite, String grantFullControl, String grantReadAcp, String grantWriteAcp) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
-        rejectAclWhenOwnershipEnforced(bucket);
         String resolvedAcl = resolveObjectAclXml(
                 cannedAcl, grantRead, grantWrite, grantFullControl, grantReadAcp, grantWriteAcp);
+        rejectAclWhenOwnershipEnforced(bucket);
         String newAcl = resolvedAcl != null ? resolvedAcl : (bodyAcl.isBlank() ? null : bodyAcl);
         rejectPublicAclWhenBlocked(bucketName, newAcl);
         bucket.setAcl(newAcl);
@@ -5433,9 +5436,9 @@ public class S3Service implements Resettable, ResourceProvider {
         S3Object obj = ownedObject.value();
         Bucket bucket = resolveBucket(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
-        rejectAclWhenOwnershipEnforced(bucket);
         String resolvedAcl = resolveObjectAclXml(ownedObject.account(), cannedAcl, grantRead,
                 grantWrite, grantFullControl, grantReadAcp, grantWriteAcp);
+        rejectAclWhenOwnershipEnforced(bucket);
         String newAcl = resolvedAcl != null ? resolvedAcl : (bodyAcl.isBlank() ? null : bodyAcl);
         rejectPublicAclWhenBlocked(bucketName, newAcl);
         obj.setAcl(newAcl);
