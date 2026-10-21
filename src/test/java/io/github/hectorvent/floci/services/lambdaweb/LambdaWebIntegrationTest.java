@@ -52,7 +52,7 @@ class LambdaWebIntegrationTest {
     @BeforeAll
     void seedCode() {
         s3Service.createBucket(BUCKET, "us-east-1");
-        s3Service.putObject(BUCKET, KEY, "zip".getBytes(StandardCharsets.UTF_8), "application/zip", Map.of());
+        s3Service.putObject(BUCKET, KEY, LambdaWebZips.indexJs(""), "application/zip", Map.of());
     }
 
     @Test
@@ -583,5 +583,84 @@ class LambdaWebIntegrationTest {
         given().when().get(BASE + "/web-account-settings")
                 .then().statusCode(200)
                 .body("accountUsage.functionCount", equalTo(0));
+    }
+
+    @Test
+    @Order(11)
+    void codeThatIsNotAZipFailsTheRevisionAndItsEndpoint() {
+        String fn = FN + "-failed";
+        s3Service.putObject(BUCKET, "notzip.zip", "this is not a zip\n".getBytes(StandardCharsets.UTF_8),
+                "application/zip", Map.of());
+        s3Service.putObject(BUCKET, "empty.zip", new byte[0], "application/zip", Map.of());
+        String notZip = """
+                {"buildConfig": {"codeConfig": {"s3Object": {"bucket": "%s", "key": "notzip.zip"}},
+                                 "runtimeConfig": {"runtime": "nodejs24.x"}},
+                 "serviceConfig": {"executionRoleArn": "%s"}}
+                """.formatted(BUCKET, ROLE);
+        String failed = given().contentType("application/json")
+                .body("""
+                        {"functionName": "%s", "revisionConfig": %s,
+                         "endpointConfig": {"endpointName": "dev", "endpointType": "HomeRegion",
+                                            "authType": "ApplicationManaged", "autoDeploymentMode": "LatestRevision"}}
+                        """.formatted(fn, notZip))
+                .when().put(BASE + "/web-functions")
+                .then().statusCode(202)
+                .body("revision.state", equalTo("Pending"))
+                .body("endpoint.state", equalTo("Pending"))
+                .extract().path("revision.revisionId");
+
+        String reason = "Failed to read zip file: zip: not a valid zip file";
+        given().when().get(BASE + "/web-functions/" + fn).then().statusCode(200).body("state", equalTo("Active"));
+        given().when().get(BASE + "/web-functions/" + fn + "/revisions/" + failed)
+                .then().statusCode(200)
+                .body("state", equalTo("Failed"))
+                .body("stateReason", equalTo(reason));
+        given().when().get(BASE + "/web-functions/" + fn + "/endpoints/dev")
+                .then().statusCode(200)
+                .body("state", equalTo("Failed"))
+                .body("stateReason", equalTo("The endpoint activation failed in [us-east-1]. The endpoint is not"
+                        + " invokable in any region. For details, see the stateReason for those regions in"
+                        + " regionalEndpoints. To retry, delete the endpoint and create it again."))
+                .body("updateStatus", nullValue())
+                .body("revisionWeights[0].revisionId", equalTo(failed))
+                .body("regionalEndpoints.us-east-1.state", equalTo("Failed"))
+                .body("regionalEndpoints.us-east-1.stateReason",
+                        equalTo("The endpoint activation failed because of an internal error."))
+                .body("regionalEndpoints.us-east-1.updateStatus", nullValue());
+        String failedFilter = "{\"filters\": [{\"name\": \"state\", \"values\": [\"Failed\"]}]}";
+        given().contentType("application/json").body(failedFilter)
+                .when().post(BASE + "/web-functions/" + fn + "/list-revisions")
+                .then().statusCode(200)
+                .body("revisions", hasSize(1))
+                .body("revisions[0].state", equalTo("Failed"))
+                .body("revisions[0].stateReason", equalTo(reason));
+        given().contentType("application/json").body(failedFilter)
+                .when().post(BASE + "/web-functions/" + fn + "/list-endpoints")
+                .then().statusCode(200)
+                .body("endpoints", hasSize(1))
+                .body("endpoints[0].state", equalTo("Failed"));
+        given().contentType("application/json").body("{\"description\": \"retry\"}")
+                .when().patch(BASE + "/web-functions/" + fn + "/endpoints/dev")
+                .then().statusCode(409)
+                .header("X-Amzn-Errortype", "ConflictException")
+                .body("message", equalTo("The endpoint dev is in Failed state. The operation is allowed only when"
+                        + " the endpoint is in Active state."));
+        given().contentType("application/json").body(notZip)
+                .when().post(BASE + "/web-functions/" + fn + "/revisions")
+                .then().statusCode(202)
+                .body("state", equalTo("Pending"));
+
+        // An empty object is an internal error with an empty body, as on AWS.
+        given().contentType("application/json").body(notZip.replace("notzip.zip", "empty.zip"))
+                .when().post(BASE + "/web-functions/" + fn + "/revisions")
+                .then().statusCode(500)
+                .header("X-Amzn-Errortype", "InternalServerException")
+                .body(equalTo("{}"));
+        given().contentType("application/json").body("{}")
+                .when().post(BASE + "/web-functions/" + fn + "/list-revisions")
+                .then().statusCode(200)
+                .body("revisions", hasSize(2));
+
+        given().when().delete(BASE + "/web-functions/" + fn).then().statusCode(204);
     }
 }

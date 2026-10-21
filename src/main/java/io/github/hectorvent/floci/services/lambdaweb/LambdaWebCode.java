@@ -21,6 +21,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.stream.Stream;
+import java.util.zip.ZipException;
+import java.util.zip.ZipFile;
 
 /**
  * The code package each revision copied from S3 when it was created. AWS prepares its own copy at
@@ -45,14 +47,25 @@ public class LambdaWebCode {
         this.baseDir = baseDir;
     }
 
-    void store(String accountId, String region, String functionName, String revisionId, InputStream zip) {
+    /** Returns the number of bytes kept. */
+    long store(String accountId, String region, String functionName, String revisionId, InputStream zip) {
         Path file = file(accountId, region, functionName, revisionId);
         try {
             Files.createDirectories(file.getParent());
-            Files.copy(zip, file, StandardCopyOption.REPLACE_EXISTING);
+            return Files.copy(zip, file, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException e) {
             deleteRevision(accountId, region, functionName, revisionId);
             throw new UncheckedIOException("Could not keep the code of " + functionName + " revision " + revisionId, e);
+        }
+    }
+
+    boolean opensAsZip(String accountId, String region, String functionName, String revisionId) {
+        try (ZipFile ignored = new ZipFile(file(accountId, region, functionName, revisionId).toFile())) {
+            return true;
+        } catch (ZipException e) {
+            return false;
+        } catch (IOException e) {
+            throw new UncheckedIOException("Could not read the code of " + functionName + " revision " + revisionId, e);
         }
     }
 

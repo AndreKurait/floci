@@ -19,6 +19,7 @@ final class LambdaWebErrorPages {
     static final Page FORBIDDEN = new Page(403, "Forbidden", null, "You are not authorized to access this endpoint.");
     static final Page INVALID_ENDPOINT = new Page(404, "Not Found", "Platform.InvalidEndpoint",
             "The requested endpoint could not be found.");
+    static final Page ENDPOINT_NOT_ACTIVE = new Page(409, "Conflict", "Platform.EndpointNotActive", APPLICATION_ERROR);
     static final Page ENDPOINT_DISABLED = new Page(503, "Service Unavailable", "Platform.EndpointDisabled",
             "The service is temporarily unable to handle your request. Please try again later.");
     static final Page REQUEST_TIMEOUT = new Page(504, "Gateway Timeout", "Runtime.RequestTimeout",

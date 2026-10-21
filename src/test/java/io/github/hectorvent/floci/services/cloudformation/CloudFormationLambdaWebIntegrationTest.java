@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.services.lambdaweb.LambdaWebZips;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
@@ -37,7 +39,7 @@ class CloudFormationLambdaWebIntegrationTest {
     @Test
     void stackProvisionsFunctionRevisionAndEndpoint() {
         s3Service.createBucket(BUCKET, "us-east-1");
-        s3Service.putObject(BUCKET, "app.zip", "zip".getBytes(StandardCharsets.UTF_8), "application/zip", Map.of());
+        s3Service.putObject(BUCKET, "app.zip", LambdaWebZips.indexJs(""), "application/zip", Map.of());
         String suffix = Long.toString(System.nanoTime(), 36);
         String functionName = "cfn-web-" + suffix;
         String stackName = "cfn-web-stack-" + suffix;
@@ -97,6 +99,50 @@ class CloudFormationLambdaWebIntegrationTest {
         cloudFormation(stackName, "DeleteStack", null);
         await().untilAsserted(() -> given().when().get("/2025-03-07/web-functions/" + functionName)
                 .then().statusCode(404));
+    }
+
+    @Test
+    void aRevisionOnCodeThatIsNotAZipFailsItsResource() {
+        s3Service.createBucket(BUCKET, "us-east-1");
+        s3Service.putObject(BUCKET, "app.zip", LambdaWebZips.indexJs(""), "application/zip", Map.of());
+        s3Service.putObject(BUCKET, "notzip.zip", "this is not a zip\n".getBytes(StandardCharsets.UTF_8),
+                "application/zip", Map.of());
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String functionName = "cfn-web-bad-" + suffix;
+        String stackName = "cfn-web-bad-stack-" + suffix;
+        String notZip = template(functionName, 30).replace("\"app.zip\"", "\"notzip.zip\"");
+
+        cloudFormation(stackName, "CreateStack", notZip);
+        await().untilAsserted(() -> describeStacks(stackName, "ROLLBACK_COMPLETE"));
+        stackEvents(stackName).body(containsString(
+                "<ResourceStatusReason>Failed to read zip file: zip: not a valid zip file</ResourceStatusReason>"));
+        given().when().get("/2025-03-07/web-functions/" + functionName).then().statusCode(404);
+        cloudFormation(stackName, "DeleteStack", null);
+
+        // A replacement on such code fails the update, and the rollback deletes it.
+        String updatedStack = stackName + "-update";
+        cloudFormation(updatedStack, "CreateStack", template(functionName, 30));
+        String revisionId = outputs(describeStacks(updatedStack, "CREATE_COMPLETE")).get("RevId");
+        cloudFormation(updatedStack, "UpdateStack", notZip);
+        await().untilAsserted(() -> describeStacks(updatedStack, "UPDATE_ROLLBACK_COMPLETE"));
+        given().contentType("application/json").body("{}")
+                .when().post("/2025-03-07/web-functions/" + functionName + "/list-revisions")
+                .then().statusCode(200)
+                .body("revisions", hasSize(1))
+                .body("revisions[0].revisionId", equalTo(revisionId));
+
+        cloudFormation(updatedStack, "DeleteStack", null);
+        await().untilAsserted(() -> given().when().get("/2025-03-07/web-functions/" + functionName)
+                .then().statusCode(404));
+    }
+
+    private static ValidatableResponse stackEvents(String stackName) {
+        return given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "DescribeStackEvents")
+            .formParam("StackName", stackName)
+        .when().post("/").then().statusCode(200);
     }
 
     /** A revision whose code object does not exist, created after the endpoint, so the update fails there. */

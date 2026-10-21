@@ -26,6 +26,8 @@ public final class WebFunctionEndpoint {
     public ScalingConfig scalingConfig;
     public ThrottleConfig throttleConfig;
     public String updateStatus;
+    /** Created on a revision that failed. It stays Failed until it is deleted. */
+    public boolean failed;
     public Map<String, String> regionalDomainNames = new LinkedHashMap<>();
     public Instant createdAt;
     public Instant updatedAt;

@@ -52,10 +52,11 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Control plane of Lambda Web Functions (apiVersion 2025-03-07). A revision and an endpoint are
- * stored Active and an endpoint update is stored Successful. The create and update responses show
- * the transitional state AWS reports. Invocation through an endpoint domain is not part of this
- * service.
+ * Control plane of Lambda Web Functions (apiVersion 2025-03-07). A revision is stored Active, or
+ * Failed when its code is not a zip. An endpoint is stored Active, or Failed when CreateWebFunction
+ * gives it a Failed revision, and an endpoint update is stored Successful. The create and update
+ * responses show the transitional state AWS reports. Invocation through an endpoint domain is not
+ * part of this service.
  */
 @ApplicationScoped
 public class LambdaWebService implements Resettable {
@@ -98,6 +99,7 @@ public class LambdaWebService implements Resettable {
     private static final Set<String> PRINCIPAL_KEYS = Set.of("AWS", "Service", "Federated", "CanonicalUser");
     private static final String POLICY_SYNTAX = "Policy has syntax errors.";
     private static final String INVALID_PRINCIPAL = "The provided principal was invalid. Please check the principal and try again.";
+    private static final String NOT_A_ZIP = "Failed to read zip file: zip: not a valid zip file";
     private static final String INVALID_TAGS = "One or more of your tags are invalid. Please ensure none of your tag keys"
             + " start with \"aws:\", none are empty, and there are no duplicate tag keys.";
 
@@ -308,6 +310,7 @@ public class LambdaWebService implements Resettable {
             WebFunctionRevision revision = buildRevision(fn, revisionConfig);
             keepCode(region, fn, revision);
             attachEndpoint(region, fn, endpoint, revision);
+            endpoint.failed = revision.failureReason != null;
             fn.revisions.put(revision.revisionId, revision);
             fn.endpoints.put(endpoint.endpointName, endpoint);
             indexDomains(fn, endpoint);
@@ -408,7 +411,7 @@ public class LambdaWebService implements Resettable {
             keepCode(region, fn, revision);
             fn.revisions.put(revision.revisionId, revision);
             for (WebFunctionEndpoint endpoint : fn.endpoints.values()) {
-                if ("LatestRevision".equals(endpoint.autoDeploymentMode)) {
+                if ("LatestRevision".equals(endpoint.autoDeploymentMode) && revision.failureReason == null) {
                     endpoint.revisionWeights = List.of(weight(revision.revisionId, 100));
                     endpoint.updatedAt = now();
                 }
@@ -434,9 +437,10 @@ public class LambdaWebService implements Resettable {
         synchronized (lockFor(region, functionName)) {
             WebFunction fn = function(region, functionName);
             List<WebFunctionRevision> snapshots = fn.revisions.values().stream()
+                    .filter(r -> list.matchesState(r.failureReason == null ? "Active" : "Failed"))
                     .map(r -> copy(r, WebFunctionRevision.class))
                     .toList();
-            return page(list.matchesState("Active") ? snapshots : List.of(), list,
+            return page(snapshots, list,
                     scope("ListWebFunctionRevisions", region, functionName, list), LambdaWebService::newestFirst);
         }
     }
@@ -590,10 +594,11 @@ public class LambdaWebService implements Resettable {
         if (s3Service == null) {
             return;
         }
+        String accountId = AwsArnUtils.parse(fn.functionArn).accountId();
         WebFunctionRevision.BuildConfig build = revision.buildConfig;
+        long size;
         try (S3Service.ObjectRead object = s3Service.openObject(build.bucket, build.key, build.versionId)) {
-            code.store(AwsArnUtils.parse(fn.functionArn).accountId(), region, fn.functionName, revision.revisionId,
-                    object.body());
+            size = code.store(accountId, region, fn.functionName, revision.revisionId, object.body());
         } catch (IOException e) {
             throw new UncheckedIOException("Could not close the code object s3://" + build.bucket + "/" + build.key, e);
         } catch (AwsException e) {
@@ -611,6 +616,15 @@ public class LambdaWebService implements Resettable {
             }
             throw new AwsException("ValidationException", "The S3 object " + object + " (versionId=" + build.versionId
                     + ") is inaccessible. Verify the request parameters and permissions are correct.", 400);
+        }
+        if (size == 0) {
+            // An empty object is an internal error on AWS.
+            code.deleteRevision(accountId, region, fn.functionName, revision.revisionId);
+            throw new LambdaWebInternalServerException();
+        }
+        if (!code.opensAsZip(accountId, region, fn.functionName, revision.revisionId)) {
+            code.deleteRevision(accountId, region, fn.functionName, revision.revisionId);
+            revision.failureReason = NOT_A_ZIP;
         }
     }
 
@@ -715,9 +729,10 @@ public class LambdaWebService implements Resettable {
         synchronized (lockFor(region, functionName)) {
             WebFunction fn = function(region, functionName);
             List<WebFunctionEndpoint> snapshots = fn.endpoints.values().stream()
+                    .filter(e -> list.matchesState(e.failed ? "Failed" : "Active"))
                     .map(e -> copy(e, WebFunctionEndpoint.class))
                     .toList();
-            return page(list.matchesState("Active") ? snapshots : List.of(), list,
+            return page(snapshots, list,
                     scope("ListWebFunctionEndpoints", region, functionName, list), e -> e.endpointName);
         }
     }
@@ -738,6 +753,10 @@ public class LambdaWebService implements Resettable {
         synchronized (lockFor(region, functionName)) {
             WebFunction fn = function(region, functionName);
             WebFunctionEndpoint endpoint = endpoint(fn, endpointName);
+            if (endpoint.failed) {
+                throw new AwsException("ConflictException", "The endpoint " + endpoint.endpointName
+                        + " is in Failed state. The operation is allowed only when the endpoint is in Active state.", 409);
+            }
             WebFunctionEndpoint before = copy(endpoint, WebFunctionEndpoint.class);
 
             String effectiveMode = mode != null ? mode : endpoint.autoDeploymentMode;
@@ -941,18 +960,29 @@ public class LambdaWebService implements Resettable {
     private static List<WebFunctionEndpoint.RevisionWeight> resolveWeights(WebFunction fn,
                                                                            List<WebFunctionEndpoint.RevisionWeight> weights) {
         for (WebFunctionEndpoint.RevisionWeight weight : weights) {
-            if (!fn.revisions.containsKey(weight.revisionId)) {
+            WebFunctionRevision revision = fn.revisions.get(weight.revisionId);
+            if (revision == null) {
                 throw new AwsException("ResourceNotFoundException",
                         "The revision " + weight.revisionId + " does not exist.", 404);
+            }
+            if (revision.failureReason != null) {
+                throw new AwsException("ConflictException", "The revision " + weight.revisionId
+                        + " is in Failed state and cannot be deployed. Only revisions in Active state can be deployed.", 409);
             }
         }
         return List.copyOf(weights);
     }
 
+    /** The newest revision, which LatestRevision mode deploys. */
     private static Optional<String> latestRevision(WebFunction fn) {
-        return fn.revisions.values().stream()
-                .max(Comparator.comparing((WebFunctionRevision r) -> r.createdAt))
-                .map(r -> r.revisionId);
+        Optional<WebFunctionRevision> latest = fn.revisions.values().stream()
+                .max(Comparator.comparing((WebFunctionRevision r) -> r.createdAt));
+        if (latest.isPresent() && latest.get().failureReason != null) {
+            throw new AwsException("ConflictException", "The latest revision " + latest.get().revisionId
+                    + " is in Failed state and cannot be deployed. Only revisions in Active state can be deployed."
+                    + " Create a new revision.", 409);
+        }
+        return latest.map(r -> r.revisionId);
     }
 
     private static WebFunctionEndpoint.RevisionWeight weight(String revisionId, int weight) {

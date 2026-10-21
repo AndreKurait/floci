@@ -171,6 +171,11 @@ public class LambdaWebDataPlane {
             return;
         }
         WebFunctionTarget target = located.get();
+        if (target.endpoint().failed) {
+            metrics.answered(target, LambdaWebErrorPages.ENDPOINT_NOT_ACTIVE.status());
+            page(request, LambdaWebErrorPages.ENDPOINT_NOT_ACTIVE, requestId, false);
+            return;
+        }
         Integer rateLimit = target.endpoint().throttleConfig == null ? null : target.endpoint().throttleConfig.rateLimit;
         if (Integer.valueOf(0).equals(rateLimit)) {
             metrics.answered(target, LambdaWebErrorPages.ENDPOINT_DISABLED.status());

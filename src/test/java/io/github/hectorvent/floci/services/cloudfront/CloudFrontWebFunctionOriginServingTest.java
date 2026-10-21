@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.services.cloudfront.model.DefaultCacheBehavior
 import io.github.hectorvent.floci.services.cloudfront.model.Distribution;
 import io.github.hectorvent.floci.services.cloudfront.model.DistributionConfig;
 import io.github.hectorvent.floci.services.cloudfront.model.Origin;
+import io.github.hectorvent.floci.services.lambdaweb.LambdaWebZips;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.quarkus.test.junit.QuarkusTest;
@@ -11,7 +12,6 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
-import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -83,7 +83,7 @@ class CloudFrontWebFunctionOriginServingTest {
 
     static String createFunction(S3Service s3Service, PartitionCleanup cleanup, String functionName, String authType) {
         s3Service.createBucket(BUCKET, "us-east-1");
-        s3Service.putObject(BUCKET, "app.zip", "zip".getBytes(StandardCharsets.UTF_8), "application/zip", Map.of());
+        s3Service.putObject(BUCKET, "app.zip", LambdaWebZips.indexJs(""), "application/zip", Map.of());
         String domain = given().contentType("application/json")
                 .body("""
                         {"functionName": "%s",

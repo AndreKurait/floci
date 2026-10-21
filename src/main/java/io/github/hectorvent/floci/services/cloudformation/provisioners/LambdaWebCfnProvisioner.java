@@ -169,6 +169,14 @@ public class LambdaWebCfnProvisioner implements CfnResourceProvisioner {
             revision = service.createRevision(ctx.region(), functionName, request);
         }
         r.setPhysicalId(revision.revisionArn);
+        if (revision.failureReason != null) {
+            // The AWS handler waits for Active, so a Failed revision fails the resource as NotStabilized.
+            AwsException failure = new AwsException("NotStabilized", revision.failureReason, 400);
+            CfnRollback.guarded(r, ctx, true, () -> delete(REVISION, r.getPhysicalId(), ctx.region()), () -> { },
+                    () -> {
+                        throw failure;
+                    });
+        }
         ReplacementCleanup.record(r, ctx, attributesBefore);
         r.getAttributes().put("FunctionArn", revision.functionArn);
         r.getAttributes().put("RevisionArn", revision.revisionArn);

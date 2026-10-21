@@ -94,6 +94,38 @@ class LambdaWebDataPlaneIntegrationTest {
         given().when().delete(BASE + "/web-functions/" + functionName).then().statusCode(204);
     }
 
+    @Test
+    void anEndpointCreatedOnAFailedRevisionIsNotActive() {
+        String functionName = "dp-failed-" + Long.toString(System.nanoTime(), 36);
+        String domain = createFunction(functionName, "ApplicationManaged",
+                "this is not a zip\n".getBytes(StandardCharsets.UTF_8));
+
+        Response response = given().header("Host", domain).when().get("/");
+        response.then().statusLine("HTTP/1.1 409 Conflict")
+                .header("content-type", "text/html")
+                .header("connection", "keep-alive")
+                .header("lambda-web-error-type", "Platform.EndpointNotActive")
+                .header("lambda-web-request-id", matchesPattern(REQUEST_ID))
+                .header("content-length", "225")
+                .body(equalTo(LambdaWebErrorPages.html(LambdaWebErrorPages.ENDPOINT_NOT_ACTIVE,
+                        response.header("lambda-web-request-id"))));
+        given().header("Host", domain).when().head("/")
+                .then().statusCode(409)
+                .header("lambda-web-error-type", "Platform.EndpointNotActive")
+                .header("content-length", "225")
+                .body(equalTo(""));
+        Map<String, String> endpoint = Map.of("FunctionName", functionName, "EndpointName", "dev");
+        metrics.awaitPublished(Duration.ofSeconds(5));
+        assertEquals(2, LambdaWebMetricStatistics.of(LambdaWebMetrics.NAMESPACE, "HTTPResponseStatusClass4XX",
+                endpoint, "Sum"));
+        assertEquals(0, LambdaWebMetricStatistics.of(LambdaWebMetrics.NAMESPACE, "ExecutedRequests", endpoint, "Sum"));
+
+        given().when().delete(BASE + "/web-functions/" + functionName + "/endpoints/dev").then().statusCode(204);
+        given().header("Host", domain).when().get("/")
+                .then().statusCode(404).header("lambda-web-error-type", "Platform.InvalidEndpoint");
+        given().when().delete(BASE + "/web-functions/" + functionName).then().statusCode(204);
+    }
+
     private static String readUntil(InputStream in, String end) throws IOException {
         StringBuilder read = new StringBuilder();
         while (!read.toString().endsWith(end)) {
@@ -246,8 +278,12 @@ class LambdaWebDataPlaneIntegrationTest {
     }
 
     private String createFunction(String functionName, String authType) {
+        return createFunction(functionName, authType, LambdaWebZips.indexJs(""));
+    }
+
+    private String createFunction(String functionName, String authType, byte[] code) {
         s3Service.createBucket(BUCKET, "us-east-1");
-        s3Service.putObject(BUCKET, "app.zip", "zip".getBytes(StandardCharsets.UTF_8), "application/zip", Map.of());
+        s3Service.putObject(BUCKET, "app.zip", code, "application/zip", Map.of());
         return given().contentType("application/json")
                 .body("""
                         {"functionName": "%s",

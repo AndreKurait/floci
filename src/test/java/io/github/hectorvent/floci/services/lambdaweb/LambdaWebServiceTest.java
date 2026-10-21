@@ -29,9 +29,12 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -46,6 +49,7 @@ class LambdaWebServiceTest {
     private static final String ACCOUNT_ID = "000000000000";
     private static final String ARN = "arn:aws:lambda:us-east-1:000000000000:web-function/app";
     private static final String ROLE = "arn:aws:iam::000000000000:role/web";
+    private static final byte[] NOT_A_ZIP = "this is not a zip\n".getBytes(StandardCharsets.UTF_8);
 
     private final ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
 
@@ -603,13 +607,15 @@ class LambdaWebServiceTest {
         S3Service s3 = mock(S3Service.class);
         LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", s3);
         LambdaWebCode code = new LambdaWebCode(storageDir.resolve("code"));
-        when(s3.openObject("code", "app.zip", null)).thenReturn(object("first"));
+        byte[] v1 = LambdaWebZips.indexJs("v1");
+        byte[] v2 = LambdaWebZips.indexJs("v2");
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(v1));
         String first = service.createFunction(REGION, createRequest("app")).revisions.keySet().iterator().next();
-        when(s3.openObject("code", "app.zip", null)).thenReturn(object("second"));
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(v2));
         String second = service.createRevision(REGION, "app", revisionConfig(30)).revisionId;
 
-        assertEquals("first", Files.readString(code.file(ACCOUNT_ID, REGION, "app", first)));
-        assertEquals("second", Files.readString(code.file(ACCOUNT_ID, REGION, "app", second)));
+        assertArrayEquals(v1, Files.readAllBytes(code.file(ACCOUNT_ID, REGION, "app", first)));
+        assertArrayEquals(v2, Files.readAllBytes(code.file(ACCOUNT_ID, REGION, "app", second)));
         service.deleteRevision(REGION, "app", first);
         assertFalse(Files.exists(code.file(ACCOUNT_ID, REGION, "app", first)));
         service.deleteFunction(REGION, "app");
@@ -619,7 +625,8 @@ class LambdaWebServiceTest {
     @Test
     void aStartKeepsOnlyTheCopiesOfStoredRevisions() throws IOException {
         S3Service s3 = mock(S3Service.class);
-        when(s3.openObject("code", "app.zip", null)).thenReturn(object("code"));
+        byte[] zip = LambdaWebZips.indexJs("code");
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(zip));
         FileStorageFactory storage = new FileStorageFactory(storageDir);
         String revisionId = service(storage, "http://localhost:4566", s3).createFunction(REGION, createRequest("app"))
                 .revisions.keySet().iterator().next();
@@ -627,7 +634,7 @@ class LambdaWebServiceTest {
         code.store(ACCOUNT_ID, REGION, "app", "rev-stray", new ByteArrayInputStream(new byte[] {1}));
 
         service(new FileStorageFactory(storageDir), "http://localhost:4566", s3);
-        assertEquals("code", Files.readString(code.file(ACCOUNT_ID, REGION, "app", revisionId)));
+        assertArrayEquals(zip, Files.readAllBytes(code.file(ACCOUNT_ID, REGION, "app", revisionId)));
         assertFalse(Files.exists(code.file(ACCOUNT_ID, REGION, "app", "rev-stray")));
 
         service(new MemoryStorageFactory(), "http://localhost:4566", s3);
@@ -667,8 +674,110 @@ class LambdaWebServiceTest {
                 message(() -> service.createFunction(REGION, createRequest("app"))));
     }
 
-    private static S3Service.ObjectRead object(String data) {
-        byte[] bytes = data.getBytes(StandardCharsets.UTF_8);
+    @Test
+    void aRevisionWhoseCodeIsNotAZipIsFailedAndCannotBeDeployed() {
+        S3Service s3 = mock(S3Service.class);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", s3);
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(LambdaWebZips.indexJs("v1")));
+        String good = service.createFunction(REGION, createRequest("app")).revisions.keySet().iterator().next();
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(NOT_A_ZIP));
+        WebFunctionRevision bad = service.createRevision(REGION, "app", revisionConfig(30));
+
+        assertEquals("Failed to read zip file: zip: not a valid zip file", bad.failureReason);
+        assertFalse(Files.exists(new LambdaWebCode(storageDir.resolve("code")).file(ACCOUNT_ID, REGION, "app",
+                bad.revisionId)));
+        assertEquals(good, service.getEndpoint(REGION, "app", "dev").revisionWeights.get(0).revisionId,
+                "a LatestRevision endpoint stays on its revision");
+        assertEquals(List.of(bad.revisionId), service.listRevisions(REGION, "app", stateFilter("Failed")).items()
+                .stream().map(r -> r.revisionId).toList());
+
+        String refusal = "The revision " + bad.revisionId + " is in Failed state and cannot be deployed."
+                + " Only revisions in Active state can be deployed.";
+        ObjectNode toBad = mapper.createObjectNode().put("autoDeploymentMode", "Disabled");
+        toBad.putArray("revisionWeights").addObject().put("revisionId", bad.revisionId).put("weight", 100);
+        AwsException update = error(() -> service.updateEndpoint(REGION, "app", "dev", toBad));
+        assertEquals("ConflictException", update.getErrorCode());
+        assertEquals(409, update.getHttpStatus());
+        assertEquals(refusal, update.getMessage());
+        assertEquals(good, service.getEndpoint(REGION, "app", "dev").revisionWeights.get(0).revisionId);
+        ObjectNode weighted = endpointConfig("web").put("autoDeploymentMode", "Disabled");
+        weighted.set("revisionWeights", toBad.get("revisionWeights"));
+        assertEquals(refusal, message(() -> service.createEndpoint(REGION, "app", weighted)));
+
+        String latestRefusal = "The latest revision " + bad.revisionId + " is in Failed state and cannot be deployed."
+                + " Only revisions in Active state can be deployed. Create a new revision.";
+        ObjectNode disabled = mapper.createObjectNode().put("autoDeploymentMode", "Disabled");
+        disabled.putArray("revisionWeights").addObject().put("revisionId", good).put("weight", 100);
+        service.updateEndpoint(REGION, "app", "dev", disabled);
+        assertEquals(latestRefusal, message(() -> service.updateEndpoint(REGION, "app", "dev",
+                mapper.createObjectNode().put("autoDeploymentMode", "LatestRevision"))));
+        assertEquals(latestRefusal, message(() -> service.createEndpoint(REGION, "app", endpointConfig("auto"))));
+
+        service.deleteRevision(REGION, "app", bad.revisionId);
+        assertEquals(List.of(good), List.copyOf(service.getFunction(REGION, "app").revisions.keySet()));
+    }
+
+    @Test
+    void aFunctionCreatedOnCodeThatIsNotAZipHasAFailedEndpoint() {
+        S3Service s3 = mock(S3Service.class);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", s3);
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(NOT_A_ZIP));
+        service.createFunction(REGION, createRequest("app"));
+
+        WebFunctionEndpoint dev = service.getEndpoint(REGION, "app", "dev");
+        assertTrue(dev.failed);
+        String bad = dev.revisionWeights.get(0).revisionId;
+        assertNotNull(service.getRevision(REGION, "app", bad).failureReason);
+        AwsException update = error(() -> service.updateEndpoint(REGION, "app", "dev",
+                mapper.createObjectNode().put("description", "retry")));
+        assertEquals("ConflictException", update.getErrorCode());
+        assertEquals("The endpoint dev is in Failed state. The operation is allowed only when the endpoint is in"
+                + " Active state.", update.getMessage());
+
+        // A good revision still moves the endpoint's weights, and the endpoint stays Failed, as on AWS.
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(LambdaWebZips.indexJs("v2")));
+        String good = service.createRevision(REGION, "app", revisionConfig(30)).revisionId;
+        dev = service.getEndpoint(REGION, "app", "dev");
+        assertEquals(good, dev.revisionWeights.get(0).revisionId);
+        assertTrue(dev.failed);
+        assertEquals(1, service.listEndpoints(REGION, "app", stateFilter("Failed")).items().size());
+        assertTrue(service.listEndpoints(REGION, "app", stateFilter("Active")).items().isEmpty());
+
+        service.deleteRevision(REGION, "app", bad);
+        service.deleteEndpoint(REGION, "app", "dev");
+    }
+
+    @Test
+    void anEmptyObjectIsAnInternalErrorThatCreatesNoRevision() throws IOException {
+        S3Service s3 = mock(S3Service.class);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", s3);
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(new byte[0]));
+
+        AwsException create = error(() -> service.createFunction(REGION, createRequest("app")));
+        assertInstanceOf(LambdaWebInternalServerException.class, create);
+        assertEquals("InternalServerException", create.getErrorCode());
+        assertEquals(500, create.getHttpStatus());
+        assertEquals("The function arn:aws:lambda:us-east-1:000000000000:web-function/app does not exist.",
+                message(() -> service.getFunction(REGION, "app")));
+
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(LambdaWebZips.indexJs("v1")));
+        service.createFunction(REGION, createRequest("app"));
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(new byte[0]));
+        assertInstanceOf(LambdaWebInternalServerException.class,
+                error(() -> service.createRevision(REGION, "app", revisionConfig(30))));
+        assertEquals(1, service.getFunction(REGION, "app").revisions.size());
+        try (Stream<Path> copies = Files.walk(storageDir.resolve("code"))) {
+            assertEquals(1, copies.filter(Files::isRegularFile).count());
+        }
+    }
+
+    private ObjectNode stateFilter(String state) {
+        ObjectNode request = mapper.createObjectNode();
+        request.putArray("filters").addObject().put("name", "state").putArray("values").add(state);
+        return request;
+    }
+
+    private static S3Service.ObjectRead object(byte[] bytes) {
         return new S3Service.ObjectRead(new S3Object("code", "app.zip", bytes, "application/zip"),
                 new ByteArrayInputStream(bytes));
     }

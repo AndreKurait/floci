@@ -272,6 +272,20 @@ class LambdaWebCfnProvisionerTest {
     }
 
     @Test
+    void aFailedRevisionFailsTheResourceAndIsDeleted() {
+        WebFunctionRevision failed = revision("rev-aaaaa");
+        failed.failureReason = "Failed to read zip file: zip: not a valid zip file";
+        when(service.createRevision(eq(REGION), eq("app"), any())).thenReturn(failed);
+        StackResource r = resource(LambdaWebCfnProvisioner.REVISION);
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r, revisionProps(), ctx(null)));
+
+        assertEquals("Failed to read zip file: zip: not a valid zip file", e.getMessage());
+        verify(service).deleteRevision(REGION, FN_ARN, failed.revisionArn);
+        assertFalse(r.getAttributes().containsKey(CfnRollback.ROLLBACK_OWNED_ATTR));
+    }
+
+    @Test
     void unchangedRevisionIsKeptOnUpdate() {
         WebFunctionRevision existing = revision("rev-aaaaa");
         when(service.getFunction(REGION, "app")).thenReturn(function(FN_ARN));

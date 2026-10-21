@@ -17,6 +17,8 @@ public final class WebFunctionRevision {
     public BuildConfig buildConfig = new BuildConfig();
     public ServiceConfig serviceConfig = new ServiceConfig();
     public Instant createdAt;
+    /** The stateReason of a Failed revision. */
+    public String failureReason;
 
     @RegisterForReflection
     public static final class BuildConfig {
