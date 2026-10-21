@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSession;
 import javax.net.ssl.SSLSocket;
@@ -47,10 +48,6 @@ import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.security.MessageDigest;
@@ -145,6 +142,57 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     static void stopTargetServer() {
         if (targetServer != null) {
             targetServer.stop(0);
+        }
+    }
+
+    @Test
+    @Order(-8)
+    void localRequestsPreserveHostAndVerifiedSniWithoutPublicDns() throws Exception {
+        String host = "loopback.elb.invalid";
+        LoadBalancerRef loadBalancer = null;
+        Certificate certificate = null;
+        try {
+            loadBalancer = createLoadBalancer("tls-local-transport");
+            CertificateGenerator.GeneratedCertificate pair = new CertificateGenerator().generateSelfSignedCertificate(
+                    host, List.of(), KeyAlgorithm.RSA_2048);
+            certificate = acmService.importCertificate(pair.certificatePem(), pair.privateKeyPem(),
+                    null, null, Map.of(), REGION);
+            String https = createFixedResponseListener(loadBalancer.arn(), "HTTPS", HTTPS_PORT,
+                    certificate.getArn(), "fallback");
+            String http = createFixedResponseListener(loadBalancer.arn(), "HTTP", HTTP_PORT, null, "fallback");
+            for (String listener : List.of(https, http)) {
+                given().header("Authorization", AUTH)
+                        .formParam("Action", "CreateRule").formParam("ListenerArn", listener)
+                        .formParam("Priority", "1")
+                        .formParam("Conditions.member.1.Field", "host-header")
+                        .formParam("Conditions.member.1.HostHeaderConfig.Values.member.1", host)
+                        .formParam("Actions.member.1.Type", "fixed-response")
+                        .formParam("Actions.member.1.FixedResponseConfig.StatusCode", "200")
+                        .formParam("Actions.member.1.FixedResponseConfig.ContentType", "text/plain")
+                        .formParam("Actions.member.1.FixedResponseConfig.MessageBody", "local-only")
+                        .when().post("/").then().statusCode(200);
+            }
+            awaitPlainResponse(host, HTTP_PORT, "local-only");
+            awaitHttpsMaterial(host, 200, "local-only", certificate, certificate);
+            Certificate expected = certificate;
+            assertThrows(SSLHandshakeException.class,
+                    () -> httpsRequest("other.elb.invalid", HTTPS_PORT, expected));
+        } finally {
+            LoadBalancerRef ownedLoadBalancer = loadBalancer;
+            Certificate ownedCertificate = certificate;
+            assertAll("Delete the local transport fixture after any failure",
+                    () -> {
+                        if (ownedLoadBalancer != null) {
+                            given().header("Authorization", AUTH).formParam("Action", "DeleteLoadBalancer")
+                                    .formParam("LoadBalancerArn", ownedLoadBalancer.arn())
+                                    .when().post("/").then().statusCode(200);
+                        }
+                    },
+                    () -> {
+                        if (ownedCertificate != null) {
+                            acmService.deleteCertificate(ownedCertificate.getArn(), REGION);
+                        }
+                    });
         }
     }
 
@@ -703,10 +751,10 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     }
 
     private static void assertPlainResponse(String host, int port, String body) throws Exception {
-        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build()) {
-            HttpResponse<String> response = client.send(HttpRequest.newBuilder(
-                    URI.create("http://" + host + ":" + port + "/"))
-                    .timeout(Duration.ofSeconds(2)).GET().build(), HttpResponse.BodyHandlers.ofString());
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("127.0.0.1", port), 2000);
+            socket.setSoTimeout(2000);
+            HttpResult response = request(socket, host);
             assertEquals(200, response.statusCode());
             assertEquals(body, response.body());
         }
@@ -754,14 +802,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
         LoadBalancerRef http = createLoadBalancer("http-control");
         httpLbArn = http.arn();
         httpListenerArn = createFixedResponseListener(http.arn(), "HTTP", HTTP_PORT, null, "plain");
-        given()
-                .baseUri("http://" + http.dnsName())
-                .port(HTTP_PORT)
-            .when()
-                .get("/")
-            .then()
-                .statusCode(200)
-                .body(equalTo("plain"));
+        assertPlainResponse(http.dnsName(), HTTP_PORT, "plain");
 
         deleteListener(firstListenerArn);
         firstListenerArn = null;
@@ -770,16 +811,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
 
         deleteListener(secondListenerArn);
         secondListenerArn = null;
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            Exception failure = assertThrows(Exception.class,
-                    () -> trustedClient(secondCertificate).send(
-                            HttpRequest.newBuilder(URI.create("https://" + second.dnsName() + ":" + HTTPS_PORT + "/"))
-                                    .timeout(Duration.ofSeconds(1))
-                                    .GET()
-                                    .build(),
-                            HttpResponse.BodyHandlers.ofString()));
-            assertTrue(hasCause(failure, ConnectException.class), failure.toString());
-        });
+        awaitListenerPortClosed();
     }
 
     @Test
@@ -827,7 +859,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
 
     @Test
     @Order(3)
-    void rejectedMixedProtocolChangePreservesBothHttpListeners() {
+    void rejectedMixedProtocolChangePreservesBothHttpListeners() throws Exception {
         LoadBalancerRef first = createLoadBalancer("mixed-before-first");
         LoadBalancerRef second = createLoadBalancer("mixed-before-second");
         Certificate certificate = requestCertificate(first.dnsName());
@@ -836,10 +868,8 @@ class ElbV2HttpsDataPlaneIntegrationTest {
         try {
             firstListener = createFixedResponseListener(first.arn(), "HTTP", HTTP_PORT, null, "first");
             secondListener = createFixedResponseListener(second.arn(), "HTTP", HTTP_PORT, null, "second");
-            given().baseUri("http://" + first.dnsName()).port(HTTP_PORT)
-                    .when().get("/").then().statusCode(200).body(equalTo("first"));
-            given().baseUri("http://" + second.dnsName()).port(HTTP_PORT)
-                    .when().get("/").then().statusCode(200).body(equalTo("second"));
+            assertPlainResponse(first.dnsName(), HTTP_PORT, "first");
+            assertPlainResponse(second.dnsName(), HTTP_PORT, "second");
             Response rejected = given().header("Authorization", AUTH)
                     .formParam("Action", "ModifyListener").formParam("ListenerArn", firstListener)
                     .formParam("Protocol", "HTTPS")
@@ -850,10 +880,8 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                     .formParam("ListenerArns.member.1", firstListener).when().post("/")
                     .then().statusCode(200)
                     .body("DescribeListenersResponse.DescribeListenersResult.Listeners.member.Protocol", equalTo("HTTP"));
-            given().baseUri("http://" + first.dnsName()).port(HTTP_PORT)
-                    .when().get("/").then().statusCode(200).body(equalTo("first"));
-            given().baseUri("http://" + second.dnsName()).port(HTTP_PORT)
-                    .when().get("/").then().statusCode(200).body(equalTo("second"));
+            assertPlainResponse(first.dnsName(), HTTP_PORT, "first");
+            assertPlainResponse(second.dnsName(), HTTP_PORT, "second");
         } finally {
             deleteListener(firstListener);
             deleteListener(secondListener);
@@ -908,8 +936,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
             second = createLoadBalancer("create-mixed-second");
             certificate = requestCertificate(second.dnsName());
             firstListener = createFixedResponseListener(first.arn(), "HTTP", HTTP_PORT, null, "first");
-            given().baseUri("http://" + first.dnsName()).port(HTTP_PORT)
-                    .when().get("/").then().statusCode(200).body(equalTo("first"));
+            assertPlainResponse(first.dnsName(), HTTP_PORT, "first");
             Response refused = given().header("Authorization", AUTH)
                     .formParam("Action", "CreateListener").formParam("LoadBalancerArn", second.arn())
                     .formParam("Protocol", "HTTPS").formParam("Port", HTTP_PORT)
@@ -924,8 +951,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                     .when().post("/").then().statusCode(200).extract().xmlPath()
                     .getList("DescribeListenersResponse.DescribeListenersResult.Listeners.member.ListenerArn");
             assertTrue(remaining.isEmpty());
-            given().baseUri("http://" + first.dnsName()).port(HTTP_PORT)
-                    .when().get("/").then().statusCode(200).body(equalTo("first"));
+            assertPlainResponse(first.dnsName(), HTTP_PORT, "first");
             retryListener = createFixedResponseListener(second.arn(), "HTTPS", HTTPS_PORT,
                     certificate.getArn(), "retry");
             HttpsResult retry = awaitHttps(second.dnsName(), certificate);
@@ -1099,9 +1125,9 @@ class ElbV2HttpsDataPlaneIntegrationTest {
             assertEquals(200, before.statusCode());
             assertEquals("before", before.body());
             assertPeerCertificate(before.session(), original, loadBalancer.dnsName());
-            try (HttpClient trust = trustedClient(original, replacement); Socket transport = new Socket()) {
+            try (Socket transport = new Socket()) {
                 transport.connect(new InetSocketAddress("127.0.0.1", HTTPS_PORT), 2000);
-                try (SSLSocket socket = (SSLSocket) trust.sslContext().getSocketFactory()
+                try (SSLSocket socket = (SSLSocket) trustedContext(original, replacement).getSocketFactory()
                         .createSocket(transport, loadBalancer.dnsName(), HTTPS_PORT, true)) {
                     socket.setSoTimeout(2000);
                     SSLParameters parameters = socket.getSSLParameters();
@@ -1668,20 +1694,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     private static HttpsResult awaitHttpsAtPort(String host, int port, Certificate... trustedCertificates) {
         HttpsResult[] result = new HttpsResult[1];
         await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
-            HttpResponse<String> response;
-            try (HttpClient client = trustedClient(trustedCertificates)) {
-                try {
-                    response = client.send(
-                            HttpRequest.newBuilder(URI.create("https://" + host + ":" + port + "/"))
-                                    .timeout(Duration.ofSeconds(2))
-                                    .GET()
-                                    .build(),
-                            HttpResponse.BodyHandlers.ofString());
-                } catch (IOException failure) {
-                    throw new IOException("TLS request to " + host + " failed", failure);
-                }
-            }
-            result[0] = new HttpsResult(response.statusCode(), response.body(), response.sslSession().orElseThrow());
+            result[0] = httpsRequest(host, port, trustedCertificates);
         });
         return result[0];
     }
@@ -1689,22 +1702,42 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     private static void awaitHttpsMaterial(String host, int status, String body, Certificate expected,
                                           Certificate... trustedCertificates) {
         await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
-            try (HttpClient client = trustedClient(trustedCertificates)) {
-                HttpResponse<String> response;
-                try {
-                    response = client.send(HttpRequest.newBuilder(URI.create("https://" + host + ":" + HTTPS_PORT + "/"))
-                            .timeout(Duration.ofSeconds(2)).GET().build(), HttpResponse.BodyHandlers.ofString());
-                } catch (IOException failure) {
-                    throw new AssertionError("TLS material has not converged for " + host, failure);
-                }
-                assertEquals(status, response.statusCode());
-                assertEquals(body, response.body());
-                assertPeerCertificate(response.sslSession().orElseThrow(), expected, host);
-            }
+            HttpsResult response = httpsRequest(host, HTTPS_PORT, trustedCertificates);
+            assertEquals(status, response.statusCode());
+            assertEquals(body, response.body());
+            assertPeerCertificate(response.session(), expected, host);
         });
     }
 
-    private static HttpClient trustedClient(Certificate... certificates) throws Exception {
+    private static HttpsResult httpsRequest(String host, int port, Certificate... certificates) throws Exception {
+        try (Socket transport = new Socket()) {
+            transport.connect(new InetSocketAddress("127.0.0.1", port), 2000);
+            try (SSLSocket socket = (SSLSocket) trustedContext(certificates).getSocketFactory()
+                    .createSocket(transport, host, port, true)) {
+                socket.setSoTimeout(2000);
+                SSLParameters parameters = socket.getSSLParameters();
+                parameters.setEndpointIdentificationAlgorithm("HTTPS");
+                socket.setSSLParameters(parameters);
+                socket.startHandshake();
+                HttpResult response = request(socket, host);
+                return new HttpsResult(response.statusCode(), response.body(), socket.getSession());
+            }
+        }
+    }
+
+    private static HttpResult request(Socket socket, String host) throws IOException {
+        socket.getOutputStream().write(("GET / HTTP/1.1\r\nHost: " + host
+                + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+        socket.getOutputStream().flush();
+        String response = new String(socket.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        int headersEnd = response.indexOf("\r\n\r\n");
+        assertTrue(headersEnd >= 0, "Incomplete HTTP response: " + response);
+        String statusLine = response.substring(0, response.indexOf("\r\n"));
+        int statusCode = Integer.parseInt(statusLine.split(" ", 3)[1]);
+        return new HttpResult(statusCode, response.substring(headersEnd + 4));
+    }
+
+    private static SSLContext trustedContext(Certificate... certificates) throws Exception {
         KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
         trustStore.load(null, null);
         for (int i = 0; i < certificates.length; i++) {
@@ -1714,10 +1747,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
         trustManagerFactory.init(trustStore);
         SSLContext sslContext = SSLContext.getInstance("TLS");
         sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
-        return HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(2))
-                .sslContext(sslContext)
-                .build();
+        return sslContext;
     }
 
     private static void assertPeerCertificate(SSLSession session, Certificate expected, String expectedHost)
@@ -1784,6 +1814,8 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     }
 
     private record LoadBalancerRef(String arn, String dnsName) {}
+
+    private record HttpResult(int statusCode, String body) {}
 
     private record HttpsResult(int statusCode, String body, SSLSession session) {}
 }
