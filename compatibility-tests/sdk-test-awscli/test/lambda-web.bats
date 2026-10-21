@@ -10,7 +10,13 @@ setup() {
     BUCKET="cli-lambda-web-code-$$"
     ROLE_ARN="arn:aws:iam::000000000000:role/lambda-web"
     aws_cmd s3api create-bucket --bucket "$BUCKET" >/dev/null 2>&1 || true
-    printf 'zip' > "$BATS_TEST_TMPDIR/app.zip"
+    python3 - "$BATS_TEST_TMPDIR/app.zip" <<'PY'
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1], "w") as code:
+    code.writestr("index.js", "exports.handler = async () => ({ statusCode: 200 });")
+PY
     aws_cmd s3api put-object --bucket "$BUCKET" --key app.zip --body "$BATS_TEST_TMPDIR/app.zip" >/dev/null
 }
 

@@ -56,7 +56,7 @@ class LambdaWebTest {
         s3 = TestFixtures.s3Client();
         bucket = TestFixtures.uniqueName("sdk-test-web-code");
         s3.createBucket(r -> r.bucket(bucket));
-        s3.putObject(r -> r.bucket(bucket).key("app.zip"), RequestBody.fromString("zip"));
+        s3.putObject(r -> r.bucket(bucket).key("app.zip"), RequestBody.fromBytes(TestFixtures.probeZip()));
     }
 
     /** Only "already gone" is tolerated; any other failure to clean up fails the run. */
