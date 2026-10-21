@@ -46,6 +46,27 @@
 definition, role, logging, tracing, encryption, and tags without replacing the state machine;
 changes to `StateMachineName` or `StateMachineType` use replacement semantics.
 
+## Nested task credentials
+
+Nested `states:startExecution` tasks, including `.sync` and `.sync:2`, and the SDK
+`sfn:startExecution` and `sfn:startSyncExecution` integrations accept `Credentials.RoleArn`.
+JSONPath `RoleArn.$` resolves against the state input after `InputPath` and before
+`Parameters`. The role must exist with its exact ARN in the execution's partition.
+The child call and polling use that role's account; parent history, subsequent states,
+and cancellation checks retain the parent's account.
+
+With IAM enforcement enabled, the existing task authorizer checks the execution role's
+permission to assume the task role, its trust policy, and the task role's permission to
+start the child. Account routing also works with enforcement disabled. The `.sync`
+polling and cancellation paths retain the task account; their additional IAM permissions
+are not evaluated. Other integrations retain their existing credential handling.
+A foreign state-machine ARN without task credentials grants no account access.
+
+A missing or mismatched task role fails with `States.TaskFailed`. A target account
+that does not match the selected task account fails with
+`StepFunctions.AWSStepFunctionsException` for optimized integrations or
+`Sfn.SfnException` for SDK integrations, matching the live AWS probes.
+
 ## Execution history events
 
 `GetExecutionHistory` emits an event family around a Task state's `TaskStateEntered` and
