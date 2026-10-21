@@ -1,11 +1,8 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.async.ResultCallback;
-import com.github.dockerjava.api.command.ExecCreateCmdResponse;
-import com.github.dockerjava.api.model.Frame;
-import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
@@ -123,7 +120,7 @@ class EksRegistryHostsDockerIntegrationTest {
         String containerId = cluster.getContainerId();
 
         // Verify symlink was created before container started
-        ExecResult linkResult = execInContainerWithExitCode(containerId,
+        ContainerExec.Result linkResult = execInContainerWithExitCode(containerId,
                 new String[]{"readlink", "/etc/containerd/certs.d"});
         assertEquals(0, linkResult.exitCode(), "readlink /etc/containerd/certs.d must succeed");
         assertEquals(EksClusterManager.CONTAINERD_CERTS_TARGET, linkResult.stdout().trim());
@@ -207,12 +204,12 @@ class EksRegistryHostsDockerIntegrationTest {
         long saDeadline = System.currentTimeMillis() + 30000;
         boolean ready = false;
         while (System.currentTimeMillis() < saDeadline) {
-            ExecResult saResult = execInContainerWithExitCode(containerId,
+            ContainerExec.Result saResult = execInContainerWithExitCode(containerId,
                     new String[]{"kubectl", "--request-timeout=2s", "get", "serviceaccount", "default"});
-            ExecResult nodeReady = execInContainerWithExitCode(containerId,
+            ContainerExec.Result nodeReady = execInContainerWithExitCode(containerId,
                     new String[]{"kubectl", "--request-timeout=2s", "wait",
                             "--for=condition=Ready", "nodes", "--all", "--timeout=1s"});
-            ExecResult leases = execInContainerWithExitCode(containerId,
+            ContainerExec.Result leases = execInContainerWithExitCode(containerId,
                     new String[]{"kubectl", "--request-timeout=2s", "get", "leases", "-n", "kube-node-lease",
                             "-o", "jsonpath={.items[*].spec.renewTime}"});
             String renewals = leases.stdout().trim();
@@ -244,7 +241,7 @@ class EksRegistryHostsDockerIntegrationTest {
         long deadline = System.currentTimeMillis() + 45000;
         boolean running = false;
         while (System.currentTimeMillis() < deadline) {
-            ExecResult status = execInContainerWithExitCode(containerId,
+            ContainerExec.Result status = execInContainerWithExitCode(containerId,
                     new String[]{"kubectl", "get", "pod", "registry-hosts-pod", "-o", "jsonpath={.status.phase}"});
             if ("Running".equalsIgnoreCase(status.stdout().trim())) {
                 running = true;
@@ -430,43 +427,21 @@ class EksRegistryHostsDockerIntegrationTest {
     }
 
     private String execInContainer(String containerId, String[] cmd) {
-        ExecResult result = execInContainerWithExitCode(containerId, cmd);
+        ContainerExec.Result result = execInContainerWithExitCode(containerId, cmd);
         if (result.exitCode() != 0) {
-            throw new IllegalStateException("Command failed with exit code " + result.exitCode() + ": " + result.stdout());
+            throw new IllegalStateException("Command failed with exit code " + result.exitCode() + ": " + result.summary());
         }
         return result.stdout();
     }
 
-    private record ExecResult(int exitCode, String stdout) {}
-
-    private ExecResult execInContainerWithExitCode(String containerId, String[] cmd) {
+    private ContainerExec.Result execInContainerWithExitCode(String containerId, String[] cmd) {
         try {
-            ExecCreateCmdResponse exec = dockerClient.execCreateCmd(containerId)
-                    .withCmd(cmd)
-                    .withAttachStdout(true)
-                    .withAttachStderr(true)
-                    .exec();
-
-            StringBuilder stdout = new StringBuilder();
-            dockerClient.execStartCmd(exec.getId())
-                    .exec(new ResultCallback.Adapter<Frame>() {
-                        @Override
-                        public void onNext(Frame frame) {
-                            if (frame.getStreamType() == StreamType.STDOUT
-                                    || frame.getStreamType() == StreamType.STDERR) {
-                                stdout.append(new String(frame.getPayload(), StandardCharsets.UTF_8));
-                            }
-                        }
-                    })
-                    .awaitCompletion(30, TimeUnit.SECONDS);
-
-            Long exitCode = dockerClient.inspectExecCmd(exec.getId()).exec().getExitCodeLong();
-            return new ExecResult(exitCode != null ? exitCode.intValue() : -1, stdout.toString());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Exec command interrupted", e);
-        } catch (Exception e) {
-            return new ExecResult(-1, e.getMessage());
+            return ContainerExec.run(dockerClient, containerId, cmd, 30);
+        } catch (RuntimeException failure) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw failure;
+            }
+            return new ContainerExec.Result(-1, "", failure.toString(), false);
         }
     }
 }
