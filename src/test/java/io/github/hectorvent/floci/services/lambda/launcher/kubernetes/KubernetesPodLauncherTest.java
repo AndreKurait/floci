@@ -11,11 +11,13 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.TlsConfigSource;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
+import io.github.hectorvent.floci.services.lambda.LambdaLayerFixtures;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageResolver;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.lambda.model.LambdaLayerVersion;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
 import io.github.hectorvent.floci.services.s3.PreSignedUrlGenerator;
@@ -26,6 +28,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
@@ -41,6 +44,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -140,6 +144,44 @@ class KubernetesPodLauncherTest {
         launcher = new KubernetesPodLauncher(apiClient, config, runtimeApiServerFactory, imageResolver,
                 addressResolver, awsEnv, layerService, new LambdaPodSpecFactory(config),
                 logStreamer, s3Service, presignGenerator);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"000000000000", "123456789012"})
+    void backgroundColdStartDownloadsOnlyTheFunctionsOwnedLayer(String account) throws Exception {
+        String defaultAccount = "000000000000";
+        String owner = "123456789012";
+        String region = "eu-west-1";
+        LambdaLayerVersion defaultLayer = LambdaLayerFixtures.layer(defaultAccount, region, "shared", 1);
+        LambdaLayerVersion ownerLayer = LambdaLayerFixtures.layer(owner, region, "shared", 1);
+        LambdaLayerService layers = LambdaLayerFixtures.accountScopedService(
+                defaultAccount, region, Map.of(defaultAccount, defaultLayer, owner, ownerLayer));
+        KubernetesPodLauncher backgroundLauncher = new KubernetesPodLauncher(
+                apiClient, config, runtimeApiServerFactory, imageResolver, addressResolver, awsEnv,
+                layers, new LambdaPodSpecFactory(config), logStreamer, s3Service, presignGenerator);
+        LambdaFunction fn = function();
+        fn.setAccountId(account);
+        fn.setFunctionArn("arn:aws:lambda:" + region + ":" + account + ":function:my-fn");
+        fn.setLayers(List.of((defaultAccount.equals(account) ? defaultLayer : ownerLayer).getLayerVersionArn()));
+        markPodPhaseInBackground("floci-lambda-my-fn-", "Running");
+
+        ContainerHandle handle = CompletableFuture.supplyAsync(() -> backgroundLauncher.launch(fn))
+                .get(10, TimeUnit.SECONDS);
+        try {
+            Pod pod = client.pods().inNamespace("default").withName(handle.getContainerId()).get();
+            String initScript = pod.getSpec().getInitContainers().getFirst().getCommand().get(2);
+            assertThat(initScript).contains("/awslambda-" + region + "-tasks/layers/"
+                    + account + "/shared/1?X-Amz-Algorithm=AWS4-HMAC-SHA256")
+                    .contains("unzip -oq /tmp/layer0.zip -d /opt");
+            String otherAccount = defaultAccount.equals(account) ? owner : defaultAccount;
+            assertThat(initScript).doesNotContain("/layers/" + otherAccount + "/");
+            verify(presignGenerator).generatePresignedUrl(
+                    eq("http://10.0.0.5:4566"), eq("awslambda-" + region + "-tasks"),
+                    eq("layers/" + account + "/shared/1"), eq("GET"), eq(0), eq(region), eq(account));
+        } finally {
+            backgroundLauncher.stop(handle);
+        }
+        assertThat(client.pods().inNamespace("default").withName(handle.getContainerId()).get()).isNull();
     }
 
     /** The mock server's cert is self-signed and generated per run; trust it, not the JVM default. */

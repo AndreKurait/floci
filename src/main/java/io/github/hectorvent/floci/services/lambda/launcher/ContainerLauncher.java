@@ -389,7 +389,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // 3. Copy layer contents into /opt (layers are merged in order)
         if (fn.getLayers() != null && !fn.getLayers().isEmpty()) {
             for (String layerArn : fn.getLayers()) {
-                LambdaLayerVersion layer = layerService.resolveLayerByArn(layerArn);
+                LambdaLayerVersion layer = layerService.resolveLayerByArnForAccount(
+                        layerArn, lambdaAccountId, lambdaRegion);
                 if (layer != null && layer.getCodeLocalPath() != null) {
                     Path layerPath = Path.of(layer.getCodeLocalPath());
                     if (Files.exists(layerPath)) {

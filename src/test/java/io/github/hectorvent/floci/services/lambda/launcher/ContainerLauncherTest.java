@@ -25,8 +25,11 @@ import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
+import io.github.hectorvent.floci.services.lambda.LambdaLayerFixtures;
+import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFileSystemConfig;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.lambda.model.LambdaLayerVersion;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
@@ -55,6 +58,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
@@ -93,6 +97,7 @@ class ContainerLauncherTest {
     /** Collects remote paths passed to withRemotePath across all copy mocks. */
     final java.util.List<String> capturedRemotePaths = new java.util.ArrayList<>();
     String capturedRuntimeBootstrap;
+    final Map<String, String> capturedLayerFiles = new LinkedHashMap<>();
 
     @BeforeEach
     void setUp() {
@@ -166,6 +171,7 @@ class ContainerLauncherTest {
         // when the pipe buffer fills.
         capturedRemotePaths.clear();
         capturedRuntimeBootstrap = null;
+        capturedLayerFiles.clear();
         lenient().when(dockerClient.copyArchiveToContainerCmd(any())).thenAnswer(inv -> {
             CopyArchiveToContainerCmd cmd = mock(CopyArchiveToContainerCmd.class);
             final java.io.InputStream[] captured = {null};
@@ -188,6 +194,18 @@ class ContainerLauncherTest {
                         }
                         return null;
                     }
+                    if ("/opt".equals(remote[0])) {
+                        try (TarArchiveInputStream tar = new TarArchiveInputStream(captured[0])) {
+                            TarArchiveEntry entry;
+                            while ((entry = tar.getNextEntry()) != null) {
+                                if (!entry.isDirectory()) {
+                                    capturedLayerFiles.put(entry.getName(),
+                                            new String(tar.readAllBytes(), StandardCharsets.UTF_8));
+                                }
+                            }
+                        }
+                        return null;
+                    }
                     try { captured[0].transferTo(java.io.OutputStream.nullOutputStream()); }
                     catch (Exception ignored) {}
                 }
@@ -195,6 +213,46 @@ class ContainerLauncherTest {
             }).when(cmd).exec();
             return cmd;
         });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"000000000000", "123456789012"})
+    void backgroundColdStartCopiesOnlyTheFunctionsOwnedLayer(String account) throws Exception {
+        String defaultAccount = "000000000000";
+        String owner = "123456789012";
+        String region = "eu-west-1";
+        LambdaLayerVersion defaultLayer = LambdaLayerFixtures.layer(defaultAccount, region, "shared", 1);
+        LambdaLayerVersion ownerLayer = LambdaLayerFixtures.layer(owner, region, "shared", 1);
+        Map<String, LambdaLayerVersion> ownedLayers = Map.of(defaultAccount, defaultLayer, owner, ownerLayer);
+        for (Map.Entry<String, LambdaLayerVersion> entry : ownedLayers.entrySet()) {
+            Path layerPath = Files.createDirectory(tempDir.resolve(entry.getKey()));
+            Files.writeString(layerPath.resolve("owner.txt"), entry.getKey());
+            entry.getValue().setCodeLocalPath(layerPath.toString());
+        }
+        LambdaLayerService layers = LambdaLayerFixtures.accountScopedService(
+                defaultAccount, region, Map.of(defaultAccount, defaultLayer, owner, ownerLayer));
+        ContainerReachableEndpoint endpoint =
+                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, 4566);
+        ContainerLauncher backgroundLauncher = new ContainerLauncher(
+                new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer),
+                lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layers,
+                new LaunchedContainerAwsEnv(endpoint), executionRoleCredentials);
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("background-layer");
+        fn.setFunctionArn("arn:aws:lambda:" + region + ":" + account + ":function:background-layer");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setHotReloadHostPath(tempDir.toString());
+        fn.setLayers(List.of((defaultAccount.equals(account) ? defaultLayer : ownerLayer).getLayerVersionArn()));
+
+        ContainerHandle handle = CompletableFuture.supplyAsync(() -> backgroundLauncher.launch(fn))
+                .get(10, TimeUnit.SECONDS);
+        try {
+            assertEquals(Map.of("owner.txt", account), capturedLayerFiles);
+        } finally {
+            backgroundLauncher.stop(handle);
+        }
     }
 
     /**
