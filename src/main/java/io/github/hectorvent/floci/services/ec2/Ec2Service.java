@@ -26,6 +26,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2InstanceTypeCatalog.CatalogIns
 import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.CapacityReservation;
+import io.github.hectorvent.floci.services.ec2.model.CapacityReservationMove;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
 import io.github.hectorvent.floci.services.ec2.model.EgressOnlyInternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.EgressOnlyInternetGatewayListResult;
@@ -307,6 +308,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // resourceId → List<Tag>
     private final StorageBackend<String, List<Tag>> tags;
     private final StorageBackend<String, CapacityReservation> capacityReservations;
+    private final Object capacityReservationLock = new Object();
     private final StorageBackend<String, Host> hosts;
     private final StorageBackend<String, EgressOnlyInternetGateway> egressOnlyInternetGateways;
     // Serialises a launch onto a host against ModifyHosts/ReleaseHosts, so a host cannot be
@@ -9825,15 +9827,18 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     List<CapacityReservation> describeCapacityReservations(String region, List<String> ids,
             List<Map.Entry<String, List<String>>> filters) {
-        ensureDefaultResources(region);
-        for (String id : ids) {
-            getRequiredCapacityReservation(region, id);
+        synchronized (capacityReservationLock) {
+            ensureDefaultResources(region);
+            for (String id : ids) {
+                getRequiredCapacityReservation(region, id);
+            }
+            return capacityReservations.scan(k -> true).stream()
+                    .filter(r -> r.getRegion().equals(region))
+                    .filter(r -> ids.isEmpty() || ids.contains(r.getCapacityReservationId()))
+                    .filter(r -> matchesFilters(r, filters, region))
+                    .map(CapacityReservation::new)
+                    .collect(Collectors.toList());
         }
-        return capacityReservations.scan(k -> true).stream()
-                .filter(r -> r.getRegion().equals(region))
-                .filter(r -> ids.isEmpty() || ids.contains(r.getCapacityReservationId()))
-                .filter(r -> matchesFilters(r, filters, region))
-                .collect(Collectors.toList());
     }
 
     /**
@@ -9843,29 +9848,31 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public CapacityReservation modifyCapacityReservation(String region, String capacityReservationId,
             Integer instanceCount, java.time.Instant endDate, String endDateType, String instanceMatchCriteria) {
-        ensureDefaultResources(region);
-        CapacityReservation reservation = getRequiredCapacityReservation(region, capacityReservationId);
-        if (instanceCount != null) {
-            int delta = requirePositiveInstanceCount(instanceCount) - reservation.getTotalInstanceCount();
-            reservation.setTotalInstanceCount(instanceCount);
-            reservation.setAvailableInstanceCount(Math.max(0, reservation.getAvailableInstanceCount() + delta));
+        synchronized (capacityReservationLock) {
+            ensureDefaultResources(region);
+            CapacityReservation reservation = getRequiredCapacityReservation(region, capacityReservationId);
+            if (instanceCount != null) {
+                int delta = requirePositiveInstanceCount(instanceCount) - reservation.getTotalInstanceCount();
+                reservation.setTotalInstanceCount(instanceCount);
+                reservation.setAvailableInstanceCount(Math.max(0, reservation.getAvailableInstanceCount() + delta));
+            }
+            if (endDateType != null) {
+                reservation.setEndDateType(endDateType);
+            }
+            // AWS clears EndDate when EndDateType moves back to "unlimited"; ModifyCapacityReservation
+            // has no way to explicitly clear EndDate otherwise (CancelCapacityReservation is the only
+            // other transition), so mirror that here rather than leaving a stale date behind.
+            if ("unlimited".equals(reservation.getEndDateType())) {
+                reservation.setEndDate(null);
+            } else if (endDate != null) {
+                reservation.setEndDate(endDate);
+            }
+            if (instanceMatchCriteria != null) {
+                reservation.setInstanceMatchCriteria(instanceMatchCriteria);
+            }
+            capacityReservations.put(key(region, capacityReservationId), reservation);
+            return reservation;
         }
-        if (endDateType != null) {
-            reservation.setEndDateType(endDateType);
-        }
-        // AWS clears EndDate when EndDateType moves back to "unlimited"; ModifyCapacityReservation
-        // has no way to explicitly clear EndDate otherwise (CancelCapacityReservation is the only
-        // other transition), so mirror that here rather than leaving a stale date behind.
-        if ("unlimited".equals(reservation.getEndDateType())) {
-            reservation.setEndDate(null);
-        } else if (endDate != null) {
-            reservation.setEndDate(endDate);
-        }
-        if (instanceMatchCriteria != null) {
-            reservation.setInstanceMatchCriteria(instanceMatchCriteria);
-        }
-        capacityReservations.put(key(region, capacityReservationId), reservation);
-        return reservation;
     }
 
     /**
@@ -9874,11 +9881,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * appears in DescribeCapacityReservations.
      */
     public void cancelCapacityReservation(String region, String capacityReservationId) {
-        ensureDefaultResources(region);
-        CapacityReservation reservation = getRequiredCapacityReservation(region, capacityReservationId);
-        reservation.setState("cancelled");
-        reservation.setAvailableInstanceCount(0);
-        capacityReservations.put(key(region, capacityReservationId), reservation);
+        synchronized (capacityReservationLock) {
+            ensureDefaultResources(region);
+            CapacityReservation reservation = getRequiredCapacityReservation(region, capacityReservationId);
+            reservation.setState("cancelled");
+            reservation.setAvailableInstanceCount(0);
+            capacityReservations.put(key(region, capacityReservationId), reservation);
+        }
     }
 
     private int requirePositiveInstanceCount(int instanceCount) {
@@ -9888,6 +9897,126 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             + "InstanceCount must be greater than 0.", 400);
         }
         return instanceCount;
+    }
+
+    public record CapacityReservationMoveResult(CapacityReservation source,
+                                                CapacityReservation destination, int instanceCount) {
+    }
+
+    /**
+     * Transfers available capacity. Completed tokens are retained on the source reservation,
+     * including its cancelled tombstone, using the same account-aware persistent store.
+     */
+    public CapacityReservationMoveResult moveCapacityReservationInstances(String region, String sourceId,
+            String destinationId, Integer instanceCount, String clientToken) {
+        requireCapacityMoveId(sourceId, "SourceCapacityReservationId");
+        requireCapacityMoveId(destinationId, "DestinationCapacityReservationId");
+        if (instanceCount == null) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter InstanceCount.", 400);
+        }
+        if (sourceId.equals(destinationId)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "The source and destination Capacity Reservations must be different.", 400);
+        }
+        if (instanceCount < 1 || instanceCount > 1000) {
+            throw new AwsException("InvalidParameterValue",
+                    "The instance count to move must be between 1 and 1000.", 400);
+        }
+        int count = instanceCount;
+        CapacityReservationMove requested = new CapacityReservationMove(sourceId, destinationId, count);
+        synchronized (capacityReservationLock) {
+            boolean retry = false;
+            if (clientToken != null) {
+                for (CapacityReservation reservation : capacityReservations.scan(k -> true)) {
+                    if (!region.equals(reservation.getRegion())) {
+                        continue;
+                    }
+                    CapacityReservationMove completed = reservation.getCompletedMoves().get(clientToken);
+                    if (completed != null) {
+                        if (!completed.equals(requested)) {
+                            throw new AwsException("IdempotentParameterMismatch",
+                                    "The parameters do not match the previous request with this client token.", 400);
+                        }
+                        retry = true;
+                        break;
+                    }
+                }
+            }
+            CapacityReservation source = getRequiredCapacityReservation(region, sourceId);
+            CapacityReservation destination = getRequiredCapacityReservation(region, destinationId);
+            if (!"active".equals(source.getState()) || !"active".equals(destination.getState())) {
+                throw new AwsException("Unsupported",
+                        "Both Capacity Reservations must be active.", 400);
+            }
+            if (!Objects.equals(source.getOwnerId(), destination.getOwnerId())
+                    || !Objects.equals(source.getOwnerId(), callerAccountId())) {
+                throw new AwsException("InvalidParameterValue",
+                        "Both Capacity Reservations must be owned by the calling account.", 400);
+            }
+            if (retry) {
+                return capacityMoveResult(region, requested);
+            }
+            validateCapacityMoveAttributes(region, source, destination);
+            if (count > source.getAvailableInstanceCount()) {
+                throw new AwsException("InvalidParameterValue",
+                        "There is insufficient available capacity in the source Capacity Reservation.", 400);
+            }
+            if ((long) destination.getTotalInstanceCount() + count > Integer.MAX_VALUE
+                    || (long) destination.getAvailableInstanceCount() + count > Integer.MAX_VALUE) {
+                throw new AwsException("InvalidParameterValue",
+                        "The destination Capacity Reservation instance count is too large.", 400);
+            }
+            source.setTotalInstanceCount(source.getTotalInstanceCount() - count);
+            source.setAvailableInstanceCount(source.getAvailableInstanceCount() - count);
+            destination.setTotalInstanceCount(destination.getTotalInstanceCount() + count);
+            destination.setAvailableInstanceCount(destination.getAvailableInstanceCount() + count);
+            if (source.getTotalInstanceCount() == 0) {
+                source.setState("cancelled");
+            }
+            if (clientToken != null) {
+                source.getCompletedMoves().put(clientToken, requested);
+            }
+            capacityReservations.putAll(Map.of(key(region, sourceId), source, key(region, destinationId), destination));
+            return capacityMoveResult(region, requested);
+        }
+    }
+
+    private CapacityReservationMoveResult capacityMoveResult(String region, CapacityReservationMove move) {
+        return new CapacityReservationMoveResult(
+                new CapacityReservation(getRequiredCapacityReservation(region, move.sourceId())),
+                new CapacityReservation(getRequiredCapacityReservation(region, move.destinationId())),
+                move.instanceCount());
+    }
+
+    private void requireCapacityMoveId(String value, String parameter) {
+        if (value == null || value.isBlank()) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter " + parameter + ".", 400);
+        }
+    }
+
+    private void validateCapacityMoveAttributes(String region, CapacityReservation source,
+                                                CapacityReservation destination) {
+        if (!Objects.equals(source.getInstanceType(), destination.getInstanceType())
+                || !Objects.equals(source.getInstancePlatform(), destination.getInstancePlatform())
+                || !Objects.equals(capacityReservationZone(region, source), capacityReservationZone(region, destination))
+                || !Objects.equals(source.getTenancy(), destination.getTenancy())
+                || !Objects.equals(source.getPlacementGroupArn(), destination.getPlacementGroupArn())) {
+            throw new AwsException("InvalidParameterValue",
+                    "Capacity Reservations must have matching instance type, platform, Availability Zone, "
+                            + "tenancy and placement group.", 400);
+        }
+        if (!Objects.equals(source.getEndDateType(), destination.getEndDateType())
+                || (!"unlimited".equals(source.getEndDateType())
+                        && !Objects.equals(source.getEndDate(), destination.getEndDate()))) {
+            throw new AwsException("Unsupported",
+                    "Moving capacity between reservations with different end dates is not supported.", 400);
+        }
+    }
+
+    private String capacityReservationZone(String region, CapacityReservation reservation) {
+        return isSet(reservation.getAvailabilityZoneId())
+                ? zoneNameForZoneId(region, reservation.getAvailabilityZoneId()) : reservation.getAvailabilityZone();
     }
 
     private CapacityReservation getRequiredCapacityReservation(String region, String capacityReservationId) {
