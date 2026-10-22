@@ -13,6 +13,8 @@ import io.github.hectorvent.floci.services.route53.model.ResourceRecord;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecordSet;
 import io.github.hectorvent.floci.services.route53.model.VpcAssociation;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.Mockito;
 
 import java.util.ArrayList;
@@ -192,6 +194,49 @@ class Route53ServiceTest {
         List<ResourceRecordSet> records = service.listResourceRecordSets(zoneId, "alias.example.com.", "A", 1);
         assertThat(records, hasSize(1));
         assertEquals("target1.example.com.", records.get(0).getAliasTarget().getDnsName());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"target.example.com,target.example.com.",
+            "target.example.com.,target.example.com",
+            "Target.Example.COM,target.example.com."})
+    void aliasDeletionAcceptsEquivalentDnsSpelling(String storedName, String requestedName) {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com.", "ref-alias-spelling", null, null).zone().getId();
+        service.changeResourceRecordSets(zoneId,
+                List.of(change("CREATE", aliasRecord("alias.example.com.", storedName, false))), null);
+
+        service.changeResourceRecordSets(zoneId, List.of(
+                change("UPSERT", aRecord("marker.example.com.", 60, "192.0.2.21")),
+                change("DELETE", aliasRecord("alias.example.com.", requestedName, false))), null);
+
+        List<ResourceRecordSet> records = service.listResourceRecordSets(zoneId, null, null, 100);
+        assertFalse(records.stream().anyMatch(record -> "alias.example.com.".equals(record.getName())));
+        assertTrue(records.stream().anyMatch(record -> "marker.example.com.".equals(record.getName())));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"ZOTHER,false", "Z1ALIASZONE,true"})
+    void aliasDeletionStillRejectsOtherTargetDifferencesAtomically(String zone, boolean health) {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com.", "ref-alias-mismatch", null, null).zone().getId();
+        service.changeResourceRecordSets(zoneId,
+                List.of(change("CREATE", aliasRecord("alias.example.com.", "target.example.com", false))), null);
+        ResourceRecordSet requested = aliasRecord("alias.example.com.", "TARGET.example.com.", health);
+        requested.getAliasTarget().setHostedZoneId(zone);
+
+        AwsException error = assertThrows(AwsException.class, () -> service.changeResourceRecordSets(zoneId,
+                List.of(change("UPSERT", aRecord("marker.example.com.", 60, "192.0.2.21")),
+                        change("DELETE", requested)), null));
+
+        assertEquals("InvalidChangeBatch", error.getErrorCode());
+        List<ResourceRecordSet> records = service.listResourceRecordSets(zoneId, null, null, 100);
+        assertFalse(records.stream().anyMatch(record -> "marker.example.com.".equals(record.getName())));
+        ResourceRecordSet retained = records.stream().filter(record -> "alias.example.com.".equals(record.getName()))
+                .findFirst().orElseThrow();
+        assertEquals("target.example.com", retained.getAliasTarget().getDnsName());
+        assertEquals("Z1ALIASZONE", retained.getAliasTarget().getHostedZoneId());
+        assertFalse(retained.getAliasTarget().isEvaluateTargetHealth());
     }
 
     @Test
