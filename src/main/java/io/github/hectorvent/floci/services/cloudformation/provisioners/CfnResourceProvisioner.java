@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.TextNode;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 
@@ -20,6 +21,11 @@ import java.util.function.Consumer;
 public interface CfnResourceProvisioner {
 
     Set<String> resourceTypes();
+
+    /** The JSON type of a stored GetAtt value; most resource attributes are strings. */
+    default JsonNode attributeValue(String resourceType, String attributeName, String value) {
+        return TextNode.valueOf(value);
+    }
 
     void provision(StackResource resource, JsonNode properties, ProvisionContext ctx);
 
