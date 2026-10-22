@@ -36,6 +36,10 @@ class Route53ServiceTest {
     private final Map<String, AccountAwareStorageBackend<?>> stores = new HashMap<>();
 
     private Route53Service newService() {
+        return newService(".");
+    }
+
+    private Route53Service newService(String suffix) {
         StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
         Mockito.when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
                 .thenAnswer(invocation -> {
@@ -52,16 +56,30 @@ class Route53ServiceTest {
         Mockito.when(config.defaultAccountId()).thenReturn(ACCOUNT);
         Mockito.when(config.services()).thenReturn(servicesConfig);
         Mockito.when(servicesConfig.route53()).thenReturn(route53Config);
-        Mockito.when(route53Config.defaultNameserver1()).thenReturn("ns-1.awsdns-00.com.");
-        Mockito.when(route53Config.defaultNameserver2()).thenReturn("ns-2.awsdns-00.net.");
-        Mockito.when(route53Config.defaultNameserver3()).thenReturn("ns-3.awsdns-00.org.");
-        Mockito.when(route53Config.defaultNameserver4()).thenReturn("ns-4.awsdns-00.co.uk.");
+        Mockito.when(route53Config.defaultNameserver1()).thenReturn("ns-1.awsdns-00.com" + suffix);
+        Mockito.when(route53Config.defaultNameserver2()).thenReturn("ns-2.awsdns-00.net" + suffix);
+        Mockito.when(route53Config.defaultNameserver3()).thenReturn("ns-3.awsdns-00.org" + suffix);
+        Mockito.when(route53Config.defaultNameserver4()).thenReturn("ns-4.awsdns-00.co.uk" + suffix);
         Mockito.when(route53Config.vpcAssociationControlPlaneDelayMs()).thenReturn(0L);
 
         Ec2Service ec2Service = Mockito.mock(Ec2Service.class);
         RegionResolver regionResolver = new RegionResolver("us-east-1", ACCOUNT);
 
         return new Route53Service(storageFactory, config, regionResolver, ec2Service);
+    }
+
+    @Test
+    void defaultAuthorityRecordsUseAbsoluteNamesWithOrWithoutConfiguredDot() {
+        for (String suffix : List.of("", ".")) {
+            Route53Service service = newService(suffix);
+            String zone = service.createHostedZone("authority.example", "authority-" + suffix, null, null).zone().getId();
+            List<ResourceRecordSet> records = service.listResourceRecordSets(zone, null, null, 100);
+            ResourceRecordSet soa = records.stream().filter(record -> "SOA".equals(record.getType())).findFirst().orElseThrow();
+            assertTrue(soa.getRecords().getFirst().getValue().startsWith("ns-1.awsdns-00.com. "));
+            ResourceRecordSet ns = records.stream().filter(record -> "NS".equals(record.getType())).findFirst().orElseThrow();
+            assertEquals(List.of("ns-1.awsdns-00.com.", "ns-2.awsdns-00.net.", "ns-3.awsdns-00.org.",
+                    "ns-4.awsdns-00.co.uk."), ns.getRecords().stream().map(ResourceRecord::getValue).toList());
+        }
     }
 
     @Test

@@ -78,13 +78,13 @@ Public address routing, aliases, CNAME chasing, health-based or weighted record 
 
 ## Default Nameservers
 
-New zones use these nameservers (configurable via `floci.services.route53.*`):
+New zones use these nameservers (configurable via `floci.services.route53.*`). They resolve to Floci through its embedded resolver; clients using external resolvers must forward `route53.localhost.floci.io` to Floci. Existing zones retain their stored NS/SOA records:
 
 ```
-ns-1.awsdns-01.org
-ns-2.awsdns-02.net
-ns-3.awsdns-03.com
-ns-4.awsdns-04.co.uk
+ns-1.route53.localhost.floci.io
+ns-2.route53.localhost.floci.io
+ns-3.route53.localhost.floci.io
+ns-4.route53.localhost.floci.io
 ```
 
 ## Configuration
@@ -92,10 +92,10 @@ ns-4.awsdns-04.co.uk
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_ROUTE53_ENABLED` | `true` | Enable or disable the service |
-| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER1` | `ns-1.awsdns-01.org` | First default nameserver returned in delegation sets |
-| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER2` | `ns-2.awsdns-02.net` | Second default nameserver |
-| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER3` | `ns-3.awsdns-03.com` | Third default nameserver |
-| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER4` | `ns-4.awsdns-04.co.uk` | Fourth default nameserver |
+| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER1` | `ns-1.route53.localhost.floci.io` | First default nameserver returned in delegation sets |
+| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER2` | `ns-2.route53.localhost.floci.io` | Second default nameserver |
+| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER3` | `ns-3.route53.localhost.floci.io` | Third default nameserver |
+| `FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER4` | `ns-4.route53.localhost.floci.io` | Fourth default nameserver |
 | `FLOCI_SERVICES_ROUTE53_VPC_ASSOCIATION_CONTROL_PLANE_DELAY_MS` | `0` | Optional VPC association/auth processing window used to reproduce documented retryable overlap errors |
 
 ## CLI Examples
