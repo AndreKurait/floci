@@ -464,7 +464,7 @@ class SamTransformIntegrationTest {
     }
 
     @Test
-    void samAutoPublishAliasKeepsPublishedConfiguration() {
+    void samAutoPublishAliasKeepsPublishedConfigurationAndQualifiesForProvisionedConcurrency() {
         String stackName = "sam-published-config-stack";
         String function = "sam-published-config-func";
         stacksToDelete.add(stackName);
@@ -503,6 +503,12 @@ class SamTransformIntegrationTest {
         .when().get("/2015-03-31/functions/" + function + "/configuration")
             .then().statusCode(200).body("Version", equalTo("1"))
             .body("MemorySize", equalTo(128)).body("Environment.Variables.MARKER", equalTo("original"));
+
+        // No allocation exists, but the generated alias is an eligible immutable target.
+        given().queryParam("Qualifier", "production")
+        .when().get("/2019-09-30/functions/" + function + "/provisioned-concurrency")
+            .then().statusCode(404)
+            .body("__type", equalTo("ProvisionedConcurrencyConfigNotFoundException"));
     }
 
     @Test

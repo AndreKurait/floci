@@ -708,10 +708,11 @@ public class ResourceArnBuilder {
         // path: /2015-03-31/functions/name or similar
         String name = extractSegmentAfter(path, "functions");
         if (name == null) return "*";
-        boolean invoke = path.endsWith("/functions/" + name + "/invocations")
-                || path.endsWith("/functions/" + name + "/response-streaming-invocations");
+        boolean qualifiedTarget = path.endsWith("/functions/" + name + "/invocations")
+                || path.endsWith("/functions/" + name + "/response-streaming-invocations")
+                || path.endsWith("/functions/" + name + "/provisioned-concurrency");
         try {
-            if (!invoke) {
+            if (!qualifiedTarget) {
                 LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(name);
                 boolean namedAccount = readsInTheAccountItNames(path, name, ref, ctx);
                 return AwsArnUtils.Arn.of("lambda",
