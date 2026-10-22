@@ -2115,12 +2115,22 @@ aws iam list-roles --endpoint-url $AWS_ENDPOINT_URL
 
 `FLOCI_SERVICES_IAM_ISSUED_SESSION_VERIFICATION_ENABLED=true` enables two local
 management operations. They are disabled by default and are not AWS API operations.
-Keep this management interface on a trusted local network: exact-selector lookup
-returns issuer metadata without authenticating the selector's holder. Neither
-operation grants authorization or evaluates IAM policies.
+Keep this management interface on a trusted local network. `Lookup` requires a
+complete SigV4 request signed with a current registered IAM or STS credential,
+including its session token when temporary, and returns identities only in the
+authenticated credential's account. The local `test` pair, numeric account
+credentials and unsigned headers do not authenticate lookup requests. This
+requirement applies even when global signature validation is disabled. `Verify`
+retains its credential-possession proof contract. Neither operation grants
+authorization or evaluates IAM policies.
 
 Both accept JSON over POST, reject unknown/duplicate fields, and return
 `Cache-Control: no-store`. Request bodies are limited to 16,384 bytes.
+
+Consumers of the previous unsigned trusted-peer lookup protocol must migrate to
+registered signing credentials. There is no request-body account selector or
+automatic cross-account inspection grant. These management credentials do not
+change how the other AWS-compatible APIs are configured or authorized.
 
 * `/_floci/iam/issued-sessions/verify` requires `correlationId`, `accessKeyId`,
   `sessionToken`, `stringToSign` and `signature`. It checks the original four-line
@@ -2158,7 +2168,7 @@ disabled implementation without sending any credential material.
 
 `FLOCI_SERVICES_IAM_LAMBDA_IDENTITY_VERIFICATION_ENABLED=true` enables
 `POST /_floci/lambda/issued-identities/lookup` and `/verify`. The existing IAM
-issued-session endpoints retain their original contract. These observations
+issued-session endpoints retain their proof and response contracts. These observations
 are identity evidence, not IAM authorization decisions, and never contain
 credentials. Both operations use the same strict request fields as the IAM
 issued-session protocol above.
@@ -2171,12 +2181,17 @@ object always identifies the original execution: `accountId`, `functionArn`,
 `functionVersion`, `roleArn`, `principalArn`, `principalId`, `codeSha256`,
 `containerId`, and `containerStartedAt`.
 
+`Lookup` uses the same registered, signed management caller requirement as IAM
+lookup above and scopes results to the original function owner's account,
+including directly derived sessions whose current role may belong to another
+account. The selector does not authenticate its holder; `Verify` does.
+
 The issuer binds its generated credential to its native launch record. Every
 observation checks the current role ID, function version/code/revision, exact
 credential record, and running container/start time before and after proof
 verification. A stopped or restarted container, retired credential, replaced
 role, changed function, or ambiguous principal lookup is refused. A lookup
-selects records but does not authenticate the caller or confer lineage. Only an
+selects records and does not confer lineage. Only an
 `accessKeyId`-selected `Lookup` returns `accessKeyId`, taken from the selected
 current root or derived session; principal lookups and `Verify` omit the field.
 

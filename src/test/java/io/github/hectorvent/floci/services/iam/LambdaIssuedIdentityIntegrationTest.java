@@ -62,6 +62,9 @@ class LambdaIssuedIdentityIntegrationTest {
     private SessionCreds credentials;
     private String roleName;
     private final List<String> issuedKeys = new ArrayList<>();
+    private final List<ManagementKey> managementKeys = new ArrayList<>();
+
+    private record ManagementKey(String account, String user, SessionCreds credentials) {}
 
     public static class Enabled implements QuarkusTestProfile {
         @Override public Map<String, String> getConfigOverrides() {
@@ -105,6 +108,11 @@ class LambdaIssuedIdentityIntegrationTest {
         }
         if (roleName != null) {
             query(Map.of("Action", "DeleteRole", "RoleName", roleName), null).statusCode(200);
+        }
+        for (ManagementKey key : managementKeys) {
+            queryAs(key.account(), Map.of("Action", "DeleteAccessKey", "UserName", key.user(),
+                    "AccessKeyId", key.credentials().accessKeyId())).statusCode(200);
+            queryAs(key.account(), Map.of("Action", "DeleteUser", "UserName", key.user())).statusCode(200);
         }
     }
 
@@ -181,7 +189,7 @@ class LambdaIssuedIdentityIntegrationTest {
             assertFalse(verified.containsKey("accessKeyId"));
             for (String selector : List.of("accessKeyId", "principalId", "principalArn")) {
                 String value = selector.equals("accessKeyId") ? selected.accessKeyId() : (String) verified.get(selector);
-                Map<String, Object> identity = given().contentType("application/json")
+                Map<String, Object> identity = given().filter(lookupSigner()).contentType("application/json")
                         .body(Map.of("correlationId", "binding", selector, value)).post(BASE + "lookup")
                         .then().statusCode(200).extract().as(Map.class);
                 if (selector.equals("accessKeyId")) {
@@ -195,9 +203,129 @@ class LambdaIssuedIdentityIntegrationTest {
         }
         issuer.unregister(ACCOUNT, credentials.accessKeyId());
         for (SessionCreds selected : List.of(credentials, derived)) {
-            given().contentType("application/json")
+            given().filter(lookupSigner()).contentType("application/json")
                     .body(Map.of("correlationId", "revoked", "accessKeyId", selected.accessKeyId()))
                     .post(BASE + "lookup").then().statusCode(403);
+        }
+    }
+
+    @Test
+    void lookupRejectsUnsignedAndForgedSelectorsWithoutLeakingMetadata() throws Exception {
+        Map<String, Object> identity = verify(credentials, Instant.now()).statusCode(200).extract().as(Map.class);
+        for (String selector : List.of("accessKeyId", "principalId", "principalArn")) {
+            String value = selector.equals("accessKeyId") ? credentials.accessKeyId() : (String) identity.get(selector);
+            Map<String, String> request = Map.of("correlationId", "authentication", selector, value);
+            given().filter(lookupSigner()).contentType("application/json").body(request)
+                    .post(BASE + "lookup").then().statusCode(200);
+            given().contentType("application/json").body(request).post(BASE + "lookup")
+                    .then().statusCode(403).header("Cache-Control", "no-store")
+                    .body("code", equalTo("LambdaIdentityVerificationFailed"));
+            for (AwsRequestSigner caller : List.of(lookupSigner().withSecret("wrong-secret"),
+                    lookupSigner().withSessionToken("wrong-token"),
+                    AwsRequestSigner.signedAs(ACCOUNT, "test", "lambda"),
+                    AwsRequestSigner.signedAs("test", "test", "lambda"))) {
+                given().filter(caller).contentType("application/json").body(request).post(BASE + "lookup")
+                        .then().statusCode(403).header("Cache-Control", "no-store")
+                        .body("code", equalTo("LambdaIdentityVerificationFailed"));
+            }
+        }
+    }
+
+    @Test
+    void registeredOwnerCanInspectWhileRegisteredForeignCallerCannot() throws Exception {
+        ManagementKey owner = managementKey(ACCOUNT);
+        ManagementKey foreign = managementKey("111122223333");
+        SessionCreds derived = assume(credentials, true);
+        Map<String, Object> derivedIdentity = verify(derived, Instant.now()).statusCode(200).extract().as(Map.class);
+        for (SessionCreds selected : List.of(credentials, derived)) {
+            Map<String, Object> identity = verify(selected, Instant.now()).statusCode(200).extract().as(Map.class);
+            for (String selector : List.of("accessKeyId", "principalId", "principalArn")) {
+                String value = selector.equals("accessKeyId") ? selected.accessKeyId() : (String) identity.get(selector);
+                Map<String, String> request = Map.of("correlationId", "account-scope", selector, value);
+                AwsRequestSigner ownerSigner = AwsRequestSigner.signedAs(owner.credentials().accessKeyId(),
+                        owner.credentials().secretAccessKey(), "lambda");
+                given().filter(ownerSigner).contentType("application/json").body(request).post(BASE + "lookup")
+                        .then().statusCode(200).body("lambda.accountId", equalTo(ACCOUNT));
+                AwsRequestSigner foreignSigner = AwsRequestSigner.signedAs(foreign.credentials().accessKeyId(),
+                        foreign.credentials().secretAccessKey(), "lambda");
+                given().filter(foreignSigner).contentType("application/json").body(request).post(BASE + "lookup")
+                        .then().statusCode(403).header("Cache-Control", "no-store")
+                        .body("code", equalTo("LambdaIdentityVerificationFailed"));
+            }
+        }
+        for (String selector : List.of("principalArn", "principalId")) {
+            Map<String, String> request = Map.of("correlationId", "issuer-scope",
+                    selector, (String) derivedIdentity.get(selector));
+            AwsRequestSigner ownerSigner = AwsRequestSigner.signedAs(owner.credentials().accessKeyId(),
+                    owner.credentials().secretAccessKey(), "iam");
+            given().filter(ownerSigner).contentType("application/json").body(request)
+                    .post("/_floci/iam/issued-sessions/lookup").then().statusCode(200);
+            AwsRequestSigner foreignSigner = AwsRequestSigner.signedAs(foreign.credentials().accessKeyId(),
+                    foreign.credentials().secretAccessKey(), "iam");
+            given().filter(foreignSigner).contentType("application/json").body(request)
+                    .post("/_floci/iam/issued-sessions/lookup").then().statusCode(403)
+                    .body("code", equalTo("IssuedSessionVerificationFailed"));
+        }
+    }
+
+    @Test
+    void lookupRequiresTheSignedBodyAndACompleteAuthenticationHeader() throws Exception {
+        String body = new ObjectMapper().writeValueAsString(Map.of(
+                "correlationId", "body-integrity", "accessKeyId", credentials.accessKeyId()));
+        Map<String, String> headers = lookupSigner().headersFor("POST", endpoint.resolve(BASE + "lookup"),
+                Map.of(), body.getBytes(StandardCharsets.UTF_8));
+        given().headers(headers).contentType("application/json").body(body).post(BASE + "lookup")
+                .then().statusCode(200);
+        given().headers(headers).contentType("application/json").body(body + " ").post(BASE + "lookup")
+                .then().statusCode(403).header("Cache-Control", "no-store")
+                .body("code", equalTo("LambdaIdentityVerificationFailed"));
+        given().header("Authorization", "AWS4-HMAC-SHA256 Credential=" + credentials.accessKeyId()
+                        + "/20261020/us-east-1/lambda/aws4_request")
+                .header("X-Amz-Security-Token", credentials.sessionToken())
+                .contentType("application/json").body(body).post(BASE + "lookup")
+                .then().statusCode(403).header("Cache-Control", "no-store")
+                .body("code", equalTo("LambdaIdentityVerificationFailed"));
+    }
+
+    @Test
+    void derivedForeignRoleDoesNotTransferTheOriginalExecutionInspectionScope() throws Exception {
+        String foreignAccount = "111122223333";
+        ManagementKey owner = managementKey(ACCOUNT);
+        ManagementKey foreign = managementKey(foreignAccount);
+        String targetName = "inspection-target-" + UUID.randomUUID();
+        String targetArn = queryAs(foreignAccount, Map.of("Action", "CreateRole", "RoleName", targetName,
+                "AssumeRolePolicyDocument", "{\"Version\":\"2012-10-17\",\"Statement\":[]}"))
+                .statusCode(200).extract().path("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        try {
+            ValidatableResponse assumed = query(Map.of("Action", "AssumeRole", "RoleArn", targetArn,
+                    "RoleSessionName", "inspection-hop"), credentials).statusCode(200);
+            String prefix = "AssumeRoleResponse.AssumeRoleResult.Credentials.";
+            SessionCreds derived = new SessionCreds(assumed.extract().path(prefix + "AccessKeyId"),
+                    assumed.extract().path(prefix + "SecretAccessKey"),
+                    assumed.extract().path(prefix + "SessionToken"));
+            issuedKeys.add(derived.accessKeyId());
+            Map<String, Object> identity = verify(derived, Instant.now()).statusCode(200)
+                    .body("accountId", equalTo(foreignAccount)).body("lambda.accountId", equalTo(ACCOUNT))
+                    .extract().as(Map.class);
+            for (String selector : List.of("accessKeyId", "principalId", "principalArn")) {
+                String value = selector.equals("accessKeyId") ? derived.accessKeyId() : (String) identity.get(selector);
+                Map<String, String> request = Map.of("correlationId", "lineage-scope", selector, value);
+                AwsRequestSigner ownerSigner = AwsRequestSigner.signedAs(owner.credentials().accessKeyId(),
+                        owner.credentials().secretAccessKey(), "lambda");
+                AwsRequestSigner foreignSigner = AwsRequestSigner.signedAs(foreign.credentials().accessKeyId(),
+                        foreign.credentials().secretAccessKey(), "lambda");
+                given().filter(ownerSigner).contentType("application/json").body(request).post(BASE + "lookup")
+                        .then().statusCode(200).body("lambda.accountId", equalTo(ACCOUNT));
+                given().filter(foreignSigner).contentType("application/json").body(request).post(BASE + "lookup")
+                        .then().statusCode(403).body("code", equalTo("LambdaIdentityVerificationFailed"));
+                given().filter(ownerSigner).contentType("application/json").body(request)
+                        .post("/_floci/iam/issued-sessions/lookup").then().statusCode(403);
+                given().filter(foreignSigner).contentType("application/json").body(request)
+                        .post("/_floci/iam/issued-sessions/lookup").then().statusCode(200)
+                        .body("accountId", equalTo(foreignAccount)).body("originAccountId", equalTo(ACCOUNT));
+            }
+        } finally {
+            queryAs(foreignAccount, Map.of("Action", "DeleteRole", "RoleName", targetName)).statusCode(200);
         }
     }
 
@@ -258,7 +386,8 @@ class LambdaIssuedIdentityIntegrationTest {
         issuer.bindStartedContainer(function, another.accessKeyId(), CONTAINER, START);
         String principal = verify(credentials, Instant.now()).statusCode(200).extract().path("principalId");
         verify(another, Instant.now()).statusCode(200);
-        given().contentType("application/json").body(Map.of("correlationId", "lookup", "principalId", principal))
+        given().filter(lookupSigner()).contentType("application/json")
+                .body(Map.of("correlationId", "lookup", "principalId", principal))
                 .post(BASE + "lookup").then().statusCode(403);
     }
 
@@ -305,6 +434,29 @@ class LambdaIssuedIdentityIntegrationTest {
         when(docker.inspectContainerCmd(CONTAINER)).thenReturn(command);
         when(command.exec()).thenReturn(new ObjectMapper().readValue("{\"Id\":\"" + CONTAINER
                 + "\",\"State\":{\"Running\":" + running + ",\"StartedAt\":\"" + start + "\"}}", InspectContainerResponse.class));
+    }
+
+    private AwsRequestSigner lookupSigner() {
+        return AwsRequestSigner.signedAs(credentials.accessKeyId(), credentials.secretAccessKey(), "lambda")
+                .withSessionToken(credentials.sessionToken());
+    }
+
+    private ManagementKey managementKey(String account) {
+        String name = "identity-inspector-" + UUID.randomUUID();
+        queryAs(account, Map.of("Action", "CreateUser", "UserName", name)).statusCode(200);
+        ValidatableResponse response = queryAs(account, Map.of("Action", "CreateAccessKey", "UserName", name))
+                .statusCode(200);
+        String prefix = "CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.";
+        ManagementKey key = new ManagementKey(account, name, new SessionCreds(
+                response.extract().path(prefix + "AccessKeyId"),
+                response.extract().path(prefix + "SecretAccessKey"), null));
+        managementKeys.add(key);
+        return key;
+    }
+
+    private static ValidatableResponse queryAs(String account, Map<String, String> parameters) {
+        return given().filter(AwsRequestSigner.signedAs(account, "test", "iam"))
+                .contentType("application/x-www-form-urlencoded").body(form(parameters)).post("/").then();
     }
 
     private ValidatableResponse verify(SessionCreds session, Instant timestamp) throws Exception {

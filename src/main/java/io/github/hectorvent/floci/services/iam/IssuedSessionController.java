@@ -6,6 +6,7 @@ import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RequestContext;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.POST;
@@ -33,16 +34,22 @@ public class IssuedSessionController {
     private static final Set<String> SELECTORS = Set.of("accessKeyId", "principalId", "principalArn");
     private final IssuedSessionVerifier verifier;
     private final boolean enabled;
+    private final RequestContext requestContext;
 
     @Inject
-    public IssuedSessionController(IssuedSessionVerifier verifier, EmulatorConfig config) {
+    public IssuedSessionController(IssuedSessionVerifier verifier, EmulatorConfig config, RequestContext requestContext) {
         this(verifier, config.services().iam().enabled()
-                && config.services().iam().issuedSessionVerificationEnabled());
+                && config.services().iam().issuedSessionVerificationEnabled(), requestContext);
     }
 
     IssuedSessionController(IssuedSessionVerifier verifier, boolean enabled) {
+        this(verifier, enabled, new RequestContext());
+    }
+
+    IssuedSessionController(IssuedSessionVerifier verifier, boolean enabled, RequestContext requestContext) {
         this.verifier = verifier;
         this.enabled = enabled;
+        this.requestContext = requestContext;
     }
 
     @POST
@@ -67,8 +74,12 @@ public class IssuedSessionController {
         } catch (IOException | IllegalArgumentException error) {
             return error(400, "InvalidIssuedSessionRequest");
         }
+        if (!verify && requestContext.getVerifiedAccountId() == null) {
+            return error(403, "IssuedSessionVerificationFailed");
+        }
         try {
-            return Response.ok(verify ? verifier.verify(request) : verifier.lookup(request))
+            return Response.ok(verify ? verifier.verify(request)
+                    : verifier.lookup(request, requestContext.getVerifiedAccountId()))
                     .header("Cache-Control", "no-store").build();
         } catch (RuntimeException error) {
             return error(403, "IssuedSessionVerificationFailed");
