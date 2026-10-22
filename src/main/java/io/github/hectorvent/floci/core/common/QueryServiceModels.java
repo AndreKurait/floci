@@ -9,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * The API versions and the operations of every Query service Floci serves, read once from the
@@ -37,6 +38,22 @@ final class QueryServiceModels {
     private static final Map<String, ServiceModel> SERVICES = VendoredResources.read(RESOURCE_NAME,
             "Query service models", QueryServiceModels::parse);
 
+    private static final Set<String> LEGACY_CLOUDWATCH_UNKNOWN_OPERATIONS = Set.of(
+            "AssociateDatasetKmsKey", "DisassociateDatasetKmsKey", "GetDataset",
+            "CreateResourceMetricsConfiguration", "DeleteResourceMetricsConfiguration",
+            "GetResourceMetricsConfiguration", "UpdateResourceMetricsConfiguration",
+            "DeleteAlarmMuteRule", "GetAlarmMuteRule", "ListAlarmMuteRules", "PutAlarmMuteRule",
+            "DeleteAnomalyDetector", "DescribeAnomalyDetectors", "PutAnomalyDetector",
+            "DeleteMetricStream", "GetMetricStream", "ListMetricStreams", "PutMetricStream",
+            "StartMetricStreams", "StopMetricStreams", "DescribeAlarmContributors",
+            "GetOTelEnrichment", "StartOTelEnrichment", "StopOTelEnrichment", "UpdateOTelEnrichment",
+            "ListManagedInsightRules", "PutManagedInsightRules", "DescribeInsightRules",
+            "ListTagsForResource", "TagResource", "UntagResource", "PutLogAlarm");
+
+    private static final Set<String> LEGACY_CLOUDWATCH_OPERATIONS = of("monitoring").operations().stream()
+            .filter(operation -> !LEGACY_CLOUDWATCH_UNKNOWN_OPERATIONS.contains(operation))
+            .collect(Collectors.toUnmodifiableSet());
+
     private QueryServiceModels() {
     }
 
@@ -47,6 +64,11 @@ final class QueryServiceModels {
             throw new IllegalStateException(RESOURCE_NAME + " has no service " + service);
         }
         return model;
+    }
+
+    /** Excludes current operations that AWS's 2013 target rejects; input shapes remain protocol-specific. */
+    static Set<String> legacyCloudWatchOperations() {
+        return LEGACY_CLOUDWATCH_OPERATIONS;
     }
 
     /** The file's services, keyed by the name the credential scope uses. */
