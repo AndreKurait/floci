@@ -109,7 +109,7 @@ public class EcsContainerManager {
 
     /** EC2 error codes the task ENI path can raise, none of which RunTask declares. */
     private static final Set<String> EC2_NETWORK_LOOKUP_FAILURES =
-            Set.of("InvalidSubnetID.NotFound", "InvalidGroup.NotFound");
+            Set.of("InvalidSubnetID.NotFound", "InvalidGroup.NotFound", "InvalidSecurityGroupID.NotFound");
     /** How long a container waits for a dependency that has to COMPLETE, SUCCEED or get HEALTHY. */
     private static final int DEPENDENCY_WAIT_SECONDS = 60;
     private static final long DEPENDENCY_POLL_MILLIS = 200;
