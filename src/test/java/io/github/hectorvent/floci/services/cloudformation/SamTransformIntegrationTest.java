@@ -310,6 +310,17 @@ class SamTransformIntegrationTest {
             .then().statusCode(200).body("FunctionVersion", equalTo("2"));
         given().when().get("/2015-03-31/functions/" + function + "/versions")
             .then().statusCode(200).body("Versions.Version", equalTo(List.of("$LATEST", "1", "2")));
+
+        given().contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack").formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted("cccccccccc", "second"))
+            .formParam("Capabilities.member.1", "CAPABILITY_IAM")
+        .when().post("/").then().statusCode(200);
+        waitForStackStatus(stackName, "UPDATE_COMPLETE");
+        given().when().get("/2015-03-31/functions/" + function + "/aliases/live")
+            .then().statusCode(200).body("FunctionVersion", equalTo("3"));
+        given().when().get("/2015-03-31/functions/" + function + "/configuration")
+            .then().statusCode(200).body("Description", equalTo("cccccccccc"));
     }
 
     /** Under AutoPublishAliasAllProperties a property outside the default hash, here Timeout, publishes. */
