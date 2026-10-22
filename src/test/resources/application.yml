@@ -159,6 +159,8 @@ floci:
       enabled: true
       container-drain-timeout-seconds: 15
       docker-flags: ""
+      container-readiness-command: ""
+      container-readiness-timeout-seconds: 60
       # additional-docker-networks: []
       honour-architectures: false
       zip-max-entries: 100000
