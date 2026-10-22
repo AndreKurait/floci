@@ -344,12 +344,12 @@ class SqsEventSourcePollerTest {
         when(functionStore.getForAccount("000000000000", "us-east-1", "throwfn", "1"))
                 .thenReturn(Optional.of(version1));
         stubReceive(esm, List.of(message("m1")));
-        when(executorService.invoke(any(LambdaFunction.class), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(executorService.invoke(any(LambdaFunction.class), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("1")))
                 .thenReturn(new InvokeResult());
 
         poller.pollAndInvoke(esm);
 
-        verify(executorService, timeout(2000)).invoke(eq(version1), any(byte[].class), eq(InvocationType.RequestResponse));
+        verify(executorService, timeout(2000)).invoke(eq(version1), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("1"));
     }
 
     @Test
@@ -370,12 +370,12 @@ class SqsEventSourcePollerTest {
         when(functionStore.getForAccount("000000000000", "us-east-1", "throwfn", "2"))
                 .thenReturn(Optional.of(version2));
         stubReceive(esm, List.of(message("m1")));
-        when(executorService.invoke(any(LambdaFunction.class), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(executorService.invoke(any(LambdaFunction.class), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("live")))
                 .thenReturn(new InvokeResult());
 
         poller.pollAndInvoke(esm);
 
-        verify(executorService, timeout(2000)).invoke(eq(version2), any(byte[].class), eq(InvocationType.RequestResponse));
+        verify(executorService, timeout(2000)).invoke(eq(version2), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("live"));
     }
 
     @Test
