@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.config.EncoderConfig;
@@ -9,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * End-to-end check that CloudFormation provisions Application Auto Scaling for real rather than
@@ -79,6 +81,8 @@ class CloudFormationApplicationAutoScalingIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stackName, CFN_AUTH).status());
 
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -164,6 +168,8 @@ class CloudFormationApplicationAutoScalingIntegrationTest {
         .then()
             .statusCode(200);
 
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stackName, CFN_AUTH).status());
+
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", CFN_AUTH)
@@ -173,6 +179,8 @@ class CloudFormationApplicationAutoScalingIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+
+        CfnStackWaits.awaitStackDeleted(stackName, CFN_AUTH);
 
         given()
             .config(RestAssured.config().encoderConfig(EncoderConfig.encoderConfig()
