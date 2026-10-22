@@ -8589,6 +8589,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Image copyImage(String destinationRegion, String sourceRegion, String sourceImageId,
                            String name, String description, boolean dryRun) {
+        return copyImage(destinationRegion, sourceRegion, sourceImageId, name, description, dryRun, false);
+    }
+
+    public Image copyImage(String destinationRegion, String sourceRegion, String sourceImageId,
+                           String name, String description, boolean dryRun, boolean copyImageTags) {
         if (sourceImageId == null || sourceImageId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter SourceImageId", 400);
         }
@@ -8633,6 +8638,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // Fresh snapshot ids: two AMIs sharing one snapshot would make deleting either appear
             // to take the other's backing with it, and the copy's snapshots live in the
             // destination region anyway.
+            List<Tag> copiedTags = copyImageTags
+                    ? (foreign ? sharedImageView(source).getTags()
+                    : getTagsForAccount(callerAccountId(), sourceRegion, sourceImageId, source.getTags()))
+                            .stream().filter(tag -> !isAwsTagKey(tag.getKey()))
+                            .map(tag -> new Tag(tag.getKey(), tag.getValue())).toList()
+                    : List.of();
+            validateCreationTags(copiedTags);
             List<BlockDeviceMapping> mappings = foreign
                     ? sharedCopyMappings(sourceRegion, source) : sourceImageMappings(source);
             String ancestor = foreign ? sharedCopyAncestor(sourceRegion, source)
@@ -8656,7 +8668,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // emptiness CreateImage itself used to produce. The layer is shared rather than
             // duplicated; reclamation accounts for that.
             copy.setDockerImage(foreign ? null : capturedImageFor(sourceRegion, sourceImageId));
+            copy.setTags(new ArrayList<>(copiedTags));
             registeredImages.put(key(destinationRegion, copy.getImageId()), copy);
+            if (!copiedTags.isEmpty()) {
+                createTags(destinationRegion, List.of(copy.getImageId()), copiedTags);
+            }
             return copy;
         }
     }
@@ -8805,11 +8821,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private Image sharedImageView(Image source) {
         Image view = new Image(source);
-        view.setTags(getTagsForAccount(source.getOwnerId(), source.getRegion(), source.getImageId(), source.getTags()).stream()
-                .filter(tag -> tag.getKey() != null && tag.getKey().startsWith("ec2:SharedTag/"))
-                .map(tag -> new Tag(tag.getKey(), tag.getValue())).collect(Collectors.toCollection(ArrayList::new)));
+        List<Tag> visibleTags = sharedImageTags(source.getRegion(), source);
+        getTagsForAccount(callerAccountId(), source.getRegion(), source.getImageId(), List.of()).stream()
+                .filter(tag -> tag.getKey() != null && !tag.getKey().startsWith("ec2:SharedTag/"))
+                .map(tag -> new Tag(tag.getKey(), tag.getValue())).forEach(visibleTags::add);
+        view.setTags(visibleTags);
         view.setLaunchPermissionUserIds(Set.of());
         return view;
+    }
+
+    private List<Tag> sharedImageTags(String region, Image source) {
+        return getTagsForAccount(source.getOwnerId(), region, source.getImageId(), source.getTags()).stream()
+                .filter(tag -> tag.getKey() != null && tag.getKey().startsWith("ec2:SharedTag/"))
+                .map(tag -> new Tag(tag.getKey(), tag.getValue())).collect(Collectors.toCollection(ArrayList::new));
     }
 
     private Image sharedCopySource(String region, String imageId) {
@@ -8827,11 +8851,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         if (!"available".equals(source.getState())) {
             throw new AwsException("InvalidAMIID.Unavailable", "The source image is not available.", 400);
-        }
-        List<Tag> sourceTags = getTagsForAccount(entry.accountId(), region, imageId, source.getTags());
-        if (sourceTags != null && sourceTags.stream().anyMatch(tag -> tag.getKey() != null
-                && tag.getKey().startsWith("ec2:SharedTag/"))) {
-            throw new AwsException("UnsupportedOperation", "Copying shared AMI tags is not supported.", 400);
         }
         return source;
     }
@@ -9726,6 +9745,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         for (String resourceId : resourceIds) {
             requireTaggableResource(region, resourceId);
         }
+        validateSharedImageTagChanges(region, resourceIds, tagList, "create");
         // The limit is checked under the same locks as the write, so two requests cannot both pass
         // it and then together exceed it, and a rejected request writes nothing.
         withTagWriteLocks(region, resourceIds, () -> {
@@ -9793,6 +9813,27 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
+    static void validateCreationTags(List<Tag> tagList) {
+        validateUserTagKeys(tagList);
+        validateTagLengths(tagList);
+        requireWithinTagLimit(List.of(), tagList);
+    }
+
+    private void validateSharedImageTagChanges(String region, List<String> resourceIds,
+                                              List<Tag> tagList, String operation) {
+        if (tagList.stream().noneMatch(tag -> tag.getKey() != null
+                && tag.getKey().startsWith("ec2:SharedTag/"))) {
+            return;
+        }
+        for (String resourceId : resourceIds) {
+            if (resourceId.startsWith("ami-") && imageForCaller(region, resourceId).isEmpty()
+                    && sharedImageForCaller(region, resourceId).isPresent()) {
+                throw new AwsException("AccessDenied", "Only the resource owner can " + operation
+                        + " shared tags on resource '" + resourceId + "'.", 403);
+            }
+        }
+    }
+
     private static void validateTagLengths(List<Tag> tagList) {
         for (Tag tag : tagList) {
             if (tag.getKey().codePointCount(0, tag.getKey().length()) > MAX_TAG_KEY_LENGTH) {
@@ -9847,7 +9888,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // Not describeImages: it answers an unknown ami- id with a launchable fallback image.
             case "ami" -> requireFound(imageCatalog.findByIdOrAlias(resourceId).isPresent()
                             || registeredImages.get(key(region, resourceId))
-                                    .filter(image -> !DEREGISTERED_STATE.equals(image.getState())).isPresent(),
+                                    .filter(image -> !DEREGISTERED_STATE.equals(image.getState())).isPresent()
+                            || sharedImageForCaller(region, resourceId).isPresent(),
                     "InvalidAMIID.NotFound", "The image id '[" + resourceId + "]' does not exist");
             case "snap" -> requireFound(!describeSnapshots(region, List.of(resourceId), List.of(), Map.of()).isEmpty(),
                     "InvalidSnapshot.NotFound", "The snapshot '" + resourceId + "' does not exist.");
@@ -9883,8 +9925,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /** At most 50 user tags on a resource after the change; tags with the aws: prefix do not count. */
     private void requireWithinTagLimit(String region, String resourceId, List<Tag> tagList) {
+        requireWithinTagLimit(tagsOf(region, resourceId).orElse(List.of()), tagList);
+    }
+
+    private static void requireWithinTagLimit(List<Tag> currentTags, List<Tag> tagList) {
         Set<String> userKeys = new HashSet<>();
-        for (Tag tag : tagsOf(region, resourceId).orElse(List.of())) {
+        for (Tag tag : currentTags) {
             if (!isAwsTagKey(tag.getKey())) {
                 userKeys.add(tag.getKey());
             }
@@ -9941,6 +9987,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public void deleteTags(String region, List<String> resourceIds, List<Tag> tagList) {
         validateTagTargets(region, resourceIds);
         validateUserTagKeys(tagList);
+        validateSharedImageTagChanges(region, resourceIds, tagList, "delete");
         deleteResourceTags(region, resourceIds, tagList);
     }
 
