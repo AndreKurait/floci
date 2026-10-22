@@ -133,7 +133,7 @@ public class ResolvedServiceCatalog {
                         5000L, AwsNamespaces.S3, ServiceProtocol.REST_XML,
                         protocols(ServiceProtocol.REST_XML),
                         // s3express: directory-bucket (S3 Express One Zone) clients sign with it
-                        Set.of(), Set.of("s3", "s3express"), Set.of(), Set.of(S3Controller.class)),
+                        Set.of(), Set.of("s3", "s3express"), Set.of(), Set.of(S3Controller.class)).withLegacyAuthorization(),
                 descriptor("dynamodb", "dynamodb", config.services().dynamodb().enabled(), true,
                         "dynamodb", storageMode(config.storage().services().dynamodb().mode(), config.storage().mode()),
                         config.storage().services().dynamodb().flushIntervalMs(), null, ServiceProtocol.JSON,

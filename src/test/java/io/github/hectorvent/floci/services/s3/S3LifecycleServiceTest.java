@@ -198,7 +198,8 @@ class S3LifecycleServiceTest {
 
         s3Service.applyLifecycleExpiration(Instant.now());
 
-        assertEquals(List.of("lifecycle"), notifications.functionNames);
+        assertEquals(List.of("arn:aws:lambda:us-east-1:000000000000:function:lifecycle"),
+                notifications.functionNames);
         JsonNode record = new ObjectMapper().readTree(notifications.payloads.getFirst()).path("Records").get(0);
         assertEquals("LifecycleExpiration:Delete", record.path("eventName").asText());
         // The user guide's example names S3 itself, not a requester.

@@ -57,6 +57,14 @@ class SigV4HeaderSignatureIntegrationTest {
     private static String userAccessKeyId;
     private static String userSecretKey;
 
+    @Test
+    @Order(100)
+    void legacyS3HeadersRemainRejectedWhenGlobalSignatureValidationIsEnabled() {
+        given().header("Authorization", "AWS 000000000001:local-signature")
+                .put("/legacy-signature-rejected")
+                .then().statusCode(400).body(containsString("AuthorizationHeaderMalformed"));
+    }
+
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();

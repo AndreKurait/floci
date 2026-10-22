@@ -298,7 +298,7 @@ class FirehoseServiceTest {
 
         firehoseService.flush("000000000000", "eu-west-1", "eu-default");
 
-        verify(s3Service).createBucket("floci-firehose-results", "us-east-1");
+        verify(s3Service).createInternalBucket("floci-firehose-results", "us-east-1");
     }
 
     @Test

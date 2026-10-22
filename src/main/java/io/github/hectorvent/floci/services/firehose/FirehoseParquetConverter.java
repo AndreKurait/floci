@@ -518,10 +518,9 @@ public class FirehoseParquetConverter {
 
     private void ensureStagingBucket() {
         try {
-            s3Service.createBucket(stagingBucket, regionResolver.getDefaultRegion());
+            s3Service.createInternalBucket(stagingBucket, regionResolver.getDefaultRegion());
         } catch (AwsException e) {
-            if (!"BucketAlreadyOwnedByYou".equals(e.getErrorCode())
-                    && !"BucketAlreadyExists".equals(e.getErrorCode())) {
+            if (!"BucketAlreadyOwnedByYou".equals(e.getErrorCode())) {
                 throw e;
             }
         }

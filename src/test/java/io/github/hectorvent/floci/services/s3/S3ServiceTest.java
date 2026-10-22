@@ -723,7 +723,8 @@ class S3ServiceTest {
                 "application/json", null);
 
         assertEquals("ap-northeast-1", lambdaInvoker.region);
-        assertEquals("s3-notif-test", lambdaInvoker.functionName);
+        assertEquals("arn:aws:lambda:ap-northeast-1:000000000000:function:s3-notif-test",
+                lambdaInvoker.functionName);
         assertEquals(InvocationType.Event, lambdaInvoker.type);
         assertNotNull(lambdaInvoker.payload);
     }
@@ -762,7 +763,8 @@ class S3ServiceTest {
 
         service.putObject("test-bucket", "a.json", "{}".getBytes(StandardCharsets.UTF_8), "application/json", null);
 
-        assertEquals("s3-notif-test:PROD", lambdaInvoker.functionName);
+        assertEquals("arn:aws:lambda:ap-northeast-1:000000000000:function:s3-notif-test:PROD",
+                lambdaInvoker.functionName);
     }
 
     @Test

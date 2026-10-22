@@ -1267,7 +1267,11 @@ public class FirehoseService implements ResourceProvider {
                 ? AwsArnUtils.regionOrDefault(stream.getDeliveryStreamARN(), regionResolver.getDefaultRegion())
                 : regionResolver.getDefaultRegion();
         try {
-            s3Service.createBucket(bucket, region);
+            if (ownDestination) {
+                s3Service.createBucket(bucket, region);
+            } else {
+                s3Service.createInternalBucket(bucket, region);
+            }
         } catch (Exception ignored) {
             // The bucket usually exists already; a real problem with it surfaces on the write that follows.
         }

@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.s3.PreSignedUrlGenerator;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
@@ -27,7 +28,6 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
-import jakarta.ws.rs.core.UriBuilder;
 import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
 
@@ -53,12 +53,15 @@ public class LambdaController {
     private final LambdaService lambdaService;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
+    private final PreSignedUrlGenerator presignGenerator;
 
     @Inject
-    public LambdaController(LambdaService lambdaService, RegionResolver regionResolver, ObjectMapper objectMapper) {
+    public LambdaController(LambdaService lambdaService, RegionResolver regionResolver, ObjectMapper objectMapper,
+                            PreSignedUrlGenerator presignGenerator) {
         this.lambdaService = lambdaService;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
+        this.presignGenerator = presignGenerator;
     }
 
     // ──────────────────────────── CreateFunction ────────────────────────────
@@ -102,12 +105,14 @@ public class LambdaController {
             code.put("ImageUri", fn.getImageUri());
             code.put("ResolvedImageUri", fn.getImageUri());
         } else {
-            // Path-style URL to the package in Floci's own S3, built from the
-            // request so it targets the same endpoint the client is talking to.
-            String location = UriBuilder.fromUri(uriInfo.getBaseUri())
-                    .path(LambdaService.tasksBucketName(region))
-                    .path(LambdaService.codeObjectKey(fn))
-                    .build().toString();
+            String base = uriInfo.getBaseUri().toString();
+            if (base.endsWith("/")) {
+                base = base.substring(0, base.length() - 1);
+            }
+            String codeRegion = AwsArnUtils.regionOrDefault(fn.getFunctionArn(), region);
+            String location = presignGenerator.generatePresignedUrl(base,
+                    LambdaService.tasksBucketName(codeRegion), LambdaService.codeObjectKey(fn),
+                    "GET", 0, codeRegion, LambdaService.ownerAccount(fn));
             code.put("Location", location);
             code.put("RepositoryType", "S3");
         }

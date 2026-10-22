@@ -3510,9 +3510,8 @@ public class LambdaService implements ResourceProvider {
         String bucket = tasksBucketName(region);
         try {
             try {
-                s3Service.createBucket(bucket, region);
+                s3Service.createInternalBucket(bucket, region);
             } catch (AwsException e) {
-                // createBucket is idempotent only in us-east-1; elsewhere it 409s if it exists.
                 if (!"BucketAlreadyOwnedByYou".equals(e.getErrorCode())) {
                     throw e;
                 }
