@@ -245,6 +245,19 @@ class ElbV2ServiceTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"HTTP", "HTTPS", "TCP"})
+    void createTargetGroupRejectsMissingPortBeforePublishing(String protocol) {
+        AwsException error = assertThrows(AwsException.class, () -> service.createTargetGroup(
+                REGION, "missing-port", protocol, null, null, "vpc-test", "ip",
+                null, null, null, null, null, null, null, null, null, null, Map.of()));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals("A port must be specified", error.getMessage());
+        assertEquals(400, error.getHttpStatus());
+        assertTrue(service.describeTargetGroups(REGION, null, List.of(), List.of()).isEmpty());
+        verifyNoInteractions(dataPlane, healthChecker);
+    }
+
+    @ParameterizedTest
     @NullAndEmptySource
     void httpsCreateNeedsADefaultBeforeAllocatingAListener(List<String> certificates) {
         String lb = service.createLoadBalancer(REGION, "https-default", "internal", "application", "ipv4",
@@ -816,6 +829,57 @@ class ElbV2ServiceTest {
             service.registerTargets(REGION, tgArn, List.of(target));
         }
         assertEquals(4, service.describeTargetGroups(REGION, null, List.of(tgArn), null).getFirst().getTargets().size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void registerTargetsUsesEffectivePortForIdentity(boolean initiallyExplicit) {
+        String tgArn = createTargetGroup("default-port-tg");
+        TargetDescription original = target("i-default", initiallyExplicit ? 9999 : null);
+        TargetDescription replacement = target("i-default", initiallyExplicit ? null : 9999);
+        TargetDescription override = target("i-default", 10000);
+        service.registerTargets(REGION, tgArn, List.of(original, override));
+
+        service.registerTargets(REGION, tgArn, List.of(replacement));
+
+        List<TargetDescription> registered = service.describeTargetGroups(
+                REGION, null, List.of(tgArn), null).getFirst().getTargets();
+        assertEquals(2, registered.size());
+        assertTrue(registered.stream().allMatch(t -> "i-default".equals(t.getId())));
+        List<Integer> ports = registered.stream().map(TargetDescription::getPort).toList();
+        assertTrue(ports.contains(10000));
+        assertTrue(ports.contains(9999));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void deregisterTargetsMatchesDefaultPortWithoutRemovingAnOverride(boolean initiallyExplicit) {
+        String tgArn = createTargetGroup("remove-default-port-tg");
+        TargetDescription original = target("i-default", initiallyExplicit ? 9999 : null);
+        TargetDescription override = target("i-default", 10000);
+        service.registerTargets(REGION, tgArn, List.of(original, override));
+        TargetDescription removal = target("i-default", initiallyExplicit ? null : 9999);
+
+        service.deregisterTargets(REGION, tgArn, List.of(removal));
+        service.deregisterTargets(REGION, tgArn, List.of(removal));
+
+        List<TargetDescription> registered = service.describeTargetGroups(
+                REGION, null, List.of(tgArn), null).getFirst().getTargets();
+        assertEquals(1, registered.size());
+        assertEquals("i-default", registered.getFirst().getId());
+        assertEquals(10000, registered.getFirst().getPort());
+        TargetHealth removed = service.describeTargetHealth(REGION, tgArn, List.of(removal)).getFirst();
+        assertEquals("unused", removed.getState());
+        assertEquals("Target.NotRegistered", removed.getReason());
+        assertEquals("9999", removed.getHealthCheckPort());
+        verify(healthChecker, times(2)).removeTargets(eq(tgArn), eq(List.of(removal)), any(TargetGroup.class));
+    }
+
+    private static TargetDescription target(String id, Integer port) {
+        TargetDescription target = new TargetDescription();
+        target.setId(id);
+        target.setPort(port);
+        return target;
     }
 
     private String createTargetGroup(String name) {
