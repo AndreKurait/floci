@@ -25,6 +25,7 @@ public class LambdaFunctionStore implements Resettable {
 
     private final StorageBackend<String, LambdaFunction> backend;
     private final ConcurrentHashMap<String, LambdaFunction> urlIdIndex = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Object> concurrencyOpLocks = new ConcurrentHashMap<>();
 
     @Inject
     public LambdaFunctionStore(StorageFactory storageFactory) {
@@ -37,6 +38,10 @@ public class LambdaFunctionStore implements Resettable {
     LambdaFunctionStore(StorageBackend<String, LambdaFunction> backend) {
         this.backend = backend;
         loadIndex();
+    }
+
+    Object lockForConcurrencyOp(String functionArn) {
+        return concurrencyOpLocks.computeIfAbsent(functionArn, key -> new Object());
     }
 
     private void loadIndex() {
