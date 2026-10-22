@@ -1125,32 +1125,24 @@ class ElbV2HttpsDataPlaneIntegrationTest {
             assertEquals(200, before.statusCode());
             assertEquals("before", before.body());
             assertPeerCertificate(before.session(), original, loadBalancer.dnsName());
-            try (Socket transport = new Socket()) {
-                transport.connect(new InetSocketAddress("127.0.0.1", HTTPS_PORT), 2000);
-                try (SSLSocket socket = (SSLSocket) trustedContext(original, replacement).getSocketFactory()
-                        .createSocket(transport, loadBalancer.dnsName(), HTTPS_PORT, true)) {
-                    socket.setSoTimeout(2000);
-                    SSLParameters parameters = socket.getSSLParameters();
-                    parameters.setEndpointIdentificationAlgorithm("HTTPS");
-                    socket.setSSLParameters(parameters);
-                    socket.startHandshake();
-                    assertPeerCertificate(socket.getSession(), original, loadBalancer.dnsName());
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(
-                            socket.getInputStream(), StandardCharsets.UTF_8));
-                    assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "before");
-                    given().header("Authorization", AUTH)
-                            .formParam("Action", "ModifyListener").formParam("ListenerArn", listener)
-                            .formParam("Certificates.member.1.CertificateArn", replacement.getArn())
-                            .formParam("DefaultActions.member.1.Type", "fixed-response")
-                            .formParam("DefaultActions.member.1.FixedResponseConfig.StatusCode", "200")
-                            .formParam("DefaultActions.member.1.FixedResponseConfig.ContentType", "text/plain")
-                            .formParam("DefaultActions.member.1.FixedResponseConfig.MessageBody", "after")
-                            .when().post("/").then().statusCode(200);
-                    awaitHttpsMaterial(loadBalancer.dnsName(), 200, "after", replacement, original, replacement);
-                    assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "after");
-                    assertPeerCertificate(socket.getSession(), original, loadBalancer.dnsName());
-                    assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "after");
-                }
+            try (SSLSocket socket = openTlsConnection(loadBalancer.dnsName(), HTTPS_PORT,
+                    original, replacement)) {
+                assertPeerCertificate(socket.getSession(), original, loadBalancer.dnsName());
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        socket.getInputStream(), StandardCharsets.UTF_8));
+                assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "before");
+                given().header("Authorization", AUTH)
+                        .formParam("Action", "ModifyListener").formParam("ListenerArn", listener)
+                        .formParam("Certificates.member.1.CertificateArn", replacement.getArn())
+                        .formParam("DefaultActions.member.1.Type", "fixed-response")
+                        .formParam("DefaultActions.member.1.FixedResponseConfig.StatusCode", "200")
+                        .formParam("DefaultActions.member.1.FixedResponseConfig.ContentType", "text/plain")
+                        .formParam("DefaultActions.member.1.FixedResponseConfig.MessageBody", "after")
+                        .when().post("/").then().statusCode(200);
+                awaitHttpsMaterial(loadBalancer.dnsName(), 200, "after", replacement, original, replacement);
+                assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "after");
+                assertPeerCertificate(socket.getSession(), original, loadBalancer.dnsName());
+                assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "after");
             }
         } finally {
             String ownedListener = listener;
@@ -1710,17 +1702,33 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     }
 
     private static HttpsResult httpsRequest(String host, int port, Certificate... certificates) throws Exception {
-        try (Socket transport = new Socket()) {
+        try (SSLSocket socket = openTlsConnection(host, port, certificates)) {
+            HttpResult response = request(socket, host);
+            return new HttpsResult(response.statusCode(), response.body(), socket.getSession());
+        }
+    }
+
+    private static SSLSocket openTlsConnection(String host, int port, Certificate... certificates) throws Exception {
+        SSLContext context = trustedContext(certificates);
+        Socket transport = new Socket();
+        try {
             transport.connect(new InetSocketAddress("127.0.0.1", port), 2000);
-            try (SSLSocket socket = (SSLSocket) trustedContext(certificates).getSocketFactory()
-                    .createSocket(transport, host, port, true)) {
+            SSLSocket socket = (SSLSocket) context.getSocketFactory().createSocket(transport, host, port, true);
+            try {
                 socket.setSoTimeout(2000);
                 SSLParameters parameters = socket.getSSLParameters();
                 parameters.setEndpointIdentificationAlgorithm("HTTPS");
                 socket.setSSLParameters(parameters);
                 socket.startHandshake();
-                HttpResult response = request(socket, host);
-                return new HttpsResult(response.statusCode(), response.body(), socket.getSession());
+                return socket;
+            } catch (Exception failure) {
+                try (socket) {
+                    throw failure;
+                }
+            }
+        } catch (Exception failure) {
+            try (transport) {
+                throw failure;
             }
         }
     }
