@@ -528,6 +528,33 @@ public class AutoScalingQueryHandler {
                 .end("CreateOrUpdateTagsResponse").build());
     }
 
+    private Response handleEnableMetricsCollection(MultivaluedMap<String, String> p, String region) {
+        service.enableMetricsCollection(region, p.getFirst("AutoScalingGroupName"),
+                memberList(p, "Metrics"), p.getFirst("Granularity"));
+        return ok(new XmlBuilder()
+                .start("EnableMetricsCollectionResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("EnableMetricsCollectionResponse").build());
+    }
+
+    private Response handleDisableMetricsCollection(MultivaluedMap<String, String> p, String region) {
+        service.disableMetricsCollection(region, p.getFirst("AutoScalingGroupName"), memberList(p, "Metrics"));
+        return ok(new XmlBuilder()
+                .start("DisableMetricsCollectionResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("DisableMetricsCollectionResponse").build());
+    }
+
+    private Response handleDeleteTags(MultivaluedMap<String, String> p, String region) {
+        for (TagRequest tag : parseTagRequests(p)) {
+            service.deleteTags(region, tag.resourceId(), tag.resourceType(), List.of(tag.key()));
+        }
+        return ok(new XmlBuilder()
+                .start("DeleteTagsResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("DeleteTagsResponse").build());
+    }
+
     private Response handleDescribeTags(MultivaluedMap<String, String> p, String region) {
         List<Map.Entry<String, List<String>>> filters = new ArrayList<>();
         for (int i = 1; ; i++) {
@@ -570,33 +597,6 @@ public class AutoScalingQueryHandler {
            .raw(AwsQueryResponse.responseMetadata())
            .end("DescribeTagsResponse");
         return ok(xml.build());
-    }
-
-    private Response handleEnableMetricsCollection(MultivaluedMap<String, String> p, String region) {
-        service.enableMetricsCollection(region, p.getFirst("AutoScalingGroupName"),
-                memberList(p, "Metrics"), p.getFirst("Granularity"));
-        return ok(new XmlBuilder()
-                .start("EnableMetricsCollectionResponse", NS)
-                  .raw(AwsQueryResponse.responseMetadata())
-                .end("EnableMetricsCollectionResponse").build());
-    }
-
-    private Response handleDisableMetricsCollection(MultivaluedMap<String, String> p, String region) {
-        service.disableMetricsCollection(region, p.getFirst("AutoScalingGroupName"), memberList(p, "Metrics"));
-        return ok(new XmlBuilder()
-                .start("DisableMetricsCollectionResponse", NS)
-                  .raw(AwsQueryResponse.responseMetadata())
-                .end("DisableMetricsCollectionResponse").build());
-    }
-
-    private Response handleDeleteTags(MultivaluedMap<String, String> p, String region) {
-        for (TagRequest tag : parseTagRequests(p)) {
-            service.deleteTags(region, tag.resourceId(), tag.resourceType(), List.of(tag.key()));
-        }
-        return ok(new XmlBuilder()
-                .start("DeleteTagsResponse", NS)
-                  .raw(AwsQueryResponse.responseMetadata())
-                .end("DeleteTagsResponse").build());
     }
 
     // ── Instances ─────────────────────────────────────────────────────────────
