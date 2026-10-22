@@ -255,6 +255,7 @@ public class Ec2QueryHandler {
                 case "DescribeCapacityReservations" -> handleDescribeCapacityReservations(params, region);
                 case "ModifyCapacityReservation" -> handleModifyCapacityReservation(params, region);
                 case "CancelCapacityReservation" -> handleCancelCapacityReservation(params, region);
+            case "MoveCapacityReservationInstances" -> handleMoveCapacityReservationInstances(params, region);
                 // Dedicated Hosts
                 case "AllocateHosts" -> handleAllocateHosts(params, region);
                 case "DescribeHosts" -> handleDescribeHosts(params, region);
@@ -4291,6 +4292,23 @@ public class Ec2QueryHandler {
     private Response handleCancelCapacityReservation(MultivaluedMap<String, String> p, String region) {
         service.cancelCapacityReservation(region, p.getFirst("CapacityReservationId"));
         return booleanResponse("CancelCapacityReservation");
+    }
+
+    private Response handleMoveCapacityReservationInstances(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        Ec2Service.CapacityReservationMoveResult moved = service.moveCapacityReservationInstances(region,
+                p.getFirst("SourceCapacityReservationId"), p.getFirst("DestinationCapacityReservationId"),
+                intOrNull(p, "InstanceCount"), p.getFirst("ClientToken"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("MoveCapacityReservationInstancesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("sourceCapacityReservation").raw(capacityReservationXml(moved.source()))
+                .end("sourceCapacityReservation")
+                .start("destinationCapacityReservation").raw(capacityReservationXml(moved.destination()))
+                .end("destinationCapacityReservation")
+                .elem("instanceCount", moved.instanceCount())
+                .end("MoveCapacityReservationInstancesResponse");
+        return xmlResponse(xml.build());
     }
 
     private String capacityReservationXml(CapacityReservation reservation) {
