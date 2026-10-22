@@ -207,7 +207,6 @@ class DsqlDataPlaneIntegrationTest {
         }
         try (Socket socket = new Socket("127.0.0.1", endpoint.port())) {
             socket.getOutputStream().write(PostgresWire.int32(7));
-            socket.getOutputStream().write(new byte[3]);
             assertEquals(-1, socket.getInputStream().read());
         }
     }
