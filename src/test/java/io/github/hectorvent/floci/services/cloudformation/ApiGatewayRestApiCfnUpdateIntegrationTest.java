@@ -160,6 +160,60 @@ class ApiGatewayRestApiCfnUpdateIntegrationTest {
         }
     }
 
+    @Test
+    void failedCreateAndStackDeleteRemoveOnlyTheApiCreatedForTheRejectedImport() {
+        String stack = "apigw-cfn-restapi-import-failure-it";
+        String foreignId = given().contentType("application/json")
+                .body("{\"name\":\"cfn-restapi-import-failure\",\"description\":\"outside the stack\"}")
+                .when().post("/restapis").then().statusCode(201).extract().path("id");
+        String failedApiId = null;
+        boolean stackDeleted = false;
+        try {
+            stackAction(stack, "CreateStack", """
+                    {"Resources":{"Api":{"Type":"AWS::ApiGateway::RestApi","Properties":{
+                      "Name":"cfn-restapi-import-failure","Body":{
+                        "openapi":"3.0.1","info":{"title":"invalid import","version":"1"},
+                        "components":{"securitySchemes":{
+                          "iam":{"type":"apiKey","name":"Authorization","in":"header",
+                            "x-amazon-apigateway-authtype":"awsSigv4"},
+                          "custom":{"type":"apiKey","name":"Authorization","in":"header",
+                            "x-amazon-apigateway-authorizer":{"type":"request","authorizerUri":"unused"}}}},
+                        "paths":{"/items":{"get":{"security":[{"iam":[]},{"custom":[]}],
+                          "responses":{"200":{"description":"ok"}}}}}
+                      }}}}}
+                    """);
+            assertEquals("ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+            String resources = given().contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", "DescribeStackResources").formParam("StackName", stack)
+                    .when().post("/").then().statusCode(200).extract().asString();
+            failedApiId = XmlParser.extractGroups(resources, "member").stream()
+                    .filter(resource -> "Api".equals(resource.get("LogicalResourceId")))
+                    .findFirst().orElseThrow().get("PhysicalResourceId");
+            given().when().get("/restapis/" + foreignId).then().statusCode(200)
+                    .body("description", equalTo("outside the stack"));
+
+            deleteStack(stack);
+            stackDeleted = true;
+            given().contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", "DescribeStacks").formParam("StackName", stack)
+                    .when().post("/").then().statusCode(400);
+            given().when().get("/restapis/" + failedApiId).then().statusCode(404);
+            given().when().get("/restapis/" + foreignId).then().statusCode(200)
+                    .body("description", equalTo("outside the stack"));
+        } finally {
+            try {
+                if (!stackDeleted) {
+                    deleteStack(stack);
+                }
+            } finally {
+                if (failedApiId != null) {
+                    given().when().delete("/restapis/" + failedApiId);
+                }
+                given().when().delete("/restapis/" + foreignId);
+            }
+        }
+    }
+
     private static void assertPaths(String apiId, String... paths) {
         given().when().get("/restapis/" + apiId + "/resources").then().statusCode(200)
                 .body("item.path", containsInAnyOrder(paths));
