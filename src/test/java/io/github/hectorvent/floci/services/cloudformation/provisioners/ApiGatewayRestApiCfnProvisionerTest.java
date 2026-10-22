@@ -26,6 +26,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -35,6 +36,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -66,6 +68,49 @@ class ApiGatewayRestApiCfnProvisionerTest {
         assertEquals("api-1", r.getAttributes().get("RestApiId"));
         assertEquals("root-1", r.getAttributes().get("RootResourceId"));
         verify(api, never()).putRestApi(anyString(), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void restApiCreateDeletesOnlyItsNewApiWhenItsBodyIsRejected() throws Exception {
+        when(api.createRestApi(eq("us-east-1"), anyMap())).thenReturn(restApi("api-1", "shop", null, "REGIONAL"));
+        when(api.findRootResourceId("us-east-1", "api-1")).thenReturn(Optional.of("root-1"));
+        AwsException rejected = new AwsException("BadRequestException", "Invalid OpenAPI input", 400);
+        when(api.putRestApi(eq("us-east-1"), eq("api-1"), eq("overwrite"), anyString())).thenThrow(rejected);
+        StackResource r = resource("AWS::ApiGateway::RestApi", "Api");
+
+        AwsException failure = assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"Name": "shop", "Body": {"openapi": "3.0.1", "paths": {}}}
+                """), ctx()));
+
+        assertSame(rejected, failure);
+        ArgumentCaptor<String> deleted = ArgumentCaptor.forClass(String.class);
+        verify(api).deleteRestApi(eq("us-east-1"), deleted.capture());
+        assertEquals("api-1", deleted.getValue());
+        assertFalse(r.getAttributes().containsKey(CfnRollback.ROLLBACK_OWNED_ATTR));
+    }
+
+    @Test
+    void restApiCreateRetainsItsOwnedIdWhenCompensationFailsSoRollbackCanRetry() throws Exception {
+        when(api.createRestApi(eq("us-east-1"), anyMap())).thenReturn(restApi("api-1", "shop", null, "REGIONAL"));
+        when(api.findRootResourceId("us-east-1", "api-1")).thenReturn(Optional.of("root-1"));
+        AwsException rejected = new AwsException("BadRequestException", "Invalid OpenAPI input", 400);
+        when(api.putRestApi(eq("us-east-1"), eq("api-1"), eq("overwrite"), anyString())).thenThrow(rejected);
+        AwsException cleanupFailure = new AwsException("TooManyRequestsException", "Too Many Requests", 429);
+        doThrow(cleanupFailure).doNothing().when(api).deleteRestApi("us-east-1", "api-1");
+        StackResource r = resource("AWS::ApiGateway::RestApi", "Api");
+
+        AwsException failure = assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"Name": "shop", "Body": {"openapi": "3.0.1", "paths": {}}}
+                """), ctx()));
+
+        assertSame(rejected, failure);
+        assertEquals(1, failure.getSuppressed().length);
+        assertSame(cleanupFailure, failure.getSuppressed()[0]);
+        assertEquals("api-1", r.getPhysicalId());
+        assertEquals("true", r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
+        assertFalse(r.getAttributes().containsKey(CfnRollback.REPLACEMENT_CLEANUP_ATTR));
+        provisioner.delete(r, "us-east-1");
+        verify(api, times(2)).deleteRestApi("us-east-1", "api-1");
     }
 
     @Test
@@ -162,6 +207,7 @@ class ApiGatewayRestApiCfnProvisionerTest {
                 op("replace", "/name", "shop"), op("replace", "/description", "v2")));
         verify(api).updateRestApi("us-east-1", "api-1", List.of(
                 op("replace", "/name", "shop"), op("replace", "/description", "v1")));
+        verify(api, never()).deleteRestApi(anyString(), anyString());
         assertFalse(r.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
     }
 
