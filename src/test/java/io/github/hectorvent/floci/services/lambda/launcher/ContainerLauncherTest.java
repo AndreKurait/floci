@@ -1389,7 +1389,7 @@ class ContainerLauncherTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void stopRevokesCredentialsOnFailureAndRetainsRuntimeUntilRemovalSucceeds(boolean extensions) throws Exception {
+    void stopRetainsRuntimeAndCredentialsUntilRemovalSucceeds(boolean extensions) throws Exception {
         Path codePath = Files.createDirectory(tempDir.resolve("role-session-stop-retry"));
         LambdaFunction fn = new LambdaFunction();
         fn.setFunctionName("role-session-stop-retry-fn");
@@ -1411,7 +1411,7 @@ class ContainerLauncherTest {
         verify(runtimeApiServer).quiesce();
         verify(runtimeApiServer, never()).close();
         verify(runtimeApiServerFactory, never()).release(runtimeApiServer);
-        verify(executionRoleCredentials).unregister("222233334444", "ASIARETRYSESSION");
+        verify(executionRoleCredentials, never()).unregister(any(), any());
 
         launcher.stop(handle);
 
@@ -1419,13 +1419,42 @@ class ContainerLauncherTest {
                 executionRoleCredentials);
         order.verify(runtimeApiServer).quiesce();
         order.verify(lifecycleManager).stopAndRemoveStrict("container-123", handle.getLogStream(), timeout);
-        order.verify(executionRoleCredentials).unregister("222233334444", "ASIARETRYSESSION");
         order.verify(runtimeApiServer).quiesce();
         order.verify(lifecycleManager).stopAndRemoveStrict("container-123", handle.getLogStream(), timeout);
-        order.verify(executionRoleCredentials).unregister("222233334444", "ASIARETRYSESSION");
-
         order.verify(runtimeApiServer).close();
         order.verify(runtimeApiServerFactory).release(runtimeApiServer);
+        order.verify(executionRoleCredentials).unregister("222233334444", "ASIARETRYSESSION");
+    }
+
+    @ParameterizedTest
+    @CsvSource({"STOPPED,true", "ABSENT,true", "RUNNING,false", "UNKNOWN,false"})
+    void failedRemovalRetiresOnlyTheSessionOfConfirmedStoppedExecution(
+            ContainerLifecycleManager.ContainerPresence presence, boolean retireSession) throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("role-session-confirmed-stop"));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("role-session-confirmed-stop-fn");
+        fn.setAccountId("222233334444");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        when(executionRoleCredentials.forFunction(fn)).thenReturn(Optional.of(
+                new SessionCreds("ASIACONFIRMEDSTOP", "role-secret", "role-token")));
+        ContainerHandle handle = launcher.launch(fn);
+        IllegalStateException failure = new IllegalStateException("Docker removal failed");
+        doThrow(failure).when(lifecycleManager)
+                .stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(), 1);
+        lenient().when(lifecycleManager.presenceOf(handle.getContainerId())).thenReturn(presence);
+
+        assertSame(failure, assertThrows(IllegalStateException.class, () -> launcher.stop(handle)));
+
+        verify(runtimeApiServer).quiesce();
+        verify(runtimeApiServer, never()).close();
+        verify(runtimeApiServerFactory, never()).release(runtimeApiServer);
+        if (retireSession) {
+            verify(executionRoleCredentials).unregister("222233334444", "ASIACONFIRMEDSTOP");
+        } else {
+            verify(executionRoleCredentials, never()).unregister(any(), any());
+        }
     }
 
     @Test
@@ -1444,6 +1473,8 @@ class ContainerLauncherTest {
         IllegalStateException retirementFailure = new IllegalStateException("Session storage unavailable");
         doThrow(removalFailure).when(lifecycleManager)
                 .stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(), 1);
+        when(lifecycleManager.presenceOf(handle.getContainerId()))
+                .thenReturn(ContainerLifecycleManager.ContainerPresence.STOPPED);
         doThrow(retirementFailure).when(executionRoleCredentials)
                 .unregister("222233334444", "ASIARETIREMENTFAIL");
 
