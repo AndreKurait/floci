@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.appconfig.model.DeploymentSummary;
 import io.github.hectorvent.floci.services.appconfig.model.Environment;
 import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersion;
 import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersionSummary;
+import io.github.hectorvent.floci.services.appconfig.model.Monitor;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -92,6 +93,7 @@ public class AppConfigService {
         env.setName((String) request.get("Name"));
         env.setDescription((String) request.get("Description"));
         env.setState("READY");
+        env.setMonitors(monitors(request.get("Monitors")));
         environmentStore.put(env.getId(), env);
         return env;
     }
@@ -131,6 +133,29 @@ public class AppConfigService {
                 .toList();
     }
 
+    private static List<Monitor> monitors(Object value) {
+        if (value == null) {
+            return List.of();
+        }
+        if (!(value instanceof List<?> entries) || entries.size() > 5) {
+            throw new AwsException("BadRequestException", "Monitors must contain at most five monitors", 400);
+        }
+        List<Monitor> result = new ArrayList<>();
+        for (Object entry : entries) {
+            if (!(entry instanceof Map<?, ?> monitor)
+                    || !(monitor.get("AlarmArn") instanceof String alarmArn)
+                    || alarmArn.isBlank() || alarmArn.length() > 2048) {
+                throw new AwsException("BadRequestException", "A monitor requires a nonempty AlarmArn", 400);
+            }
+            Object role = monitor.get("AlarmRoleArn");
+            if (role != null && (!(role instanceof String roleArn) || roleArn.isBlank() || roleArn.length() > 2048)) {
+                throw new AwsException("BadRequestException", "AlarmRoleArn must be a nonempty string", 400);
+            }
+            result.add(new Monitor(alarmArn, (String) role));
+        }
+        return result;
+    }
+
     // ──────────────────────────── Configuration Profile ────────────────────────────
 
     public ConfigurationProfile createConfigurationProfile(String applicationIdentifier, Map<String, Object> request) {
@@ -141,7 +166,7 @@ public class AppConfigService {
         profile.setName((String) request.get("Name"));
         profile.setDescription((String) request.get("Description"));
         profile.setLocationUri((String) request.get("LocationUri"));
-        profile.setType((String) request.get("Type"));
+        profile.setType((String) request.getOrDefault("Type", "AWS.Freeform"));
         profileStore.put(profile.getId(), profile);
         return profile;
     }
@@ -344,8 +369,9 @@ public class AppConfigService {
                                                     Map<String, Object> request) {
         String appId = resolveApplication(applicationIdentifier).getId();
         String envId = resolveEnvironment(appId, environmentIdentifier).getId();
-        String profileId = resolveConfigurationProfile(
-                appId, (String) request.get("ConfigurationProfileId")).getId();
+        ConfigurationProfile profile = resolveConfigurationProfile(
+                appId, (String) request.get("ConfigurationProfileId"));
+        String profileId = profile.getId();
         String version = (String) request.get("ConfigurationVersion");
         String strategyId = (String) request.get("DeploymentStrategyId");
 
@@ -355,6 +381,8 @@ public class AppConfigService {
         deployment.setApplicationId(appId);
         deployment.setEnvironmentId(envId);
         deployment.setConfigurationProfileId(profileId);
+        deployment.setConfigurationName(profile.getName());
+        deployment.setConfigurationLocationUri(profile.getLocationUri());
         deployment.setConfigurationVersion(version);
         deployment.setDeploymentStrategyId(strategyId);
         int nextDeploymentNumber = deploymentStore.scan(key -> true).stream()
