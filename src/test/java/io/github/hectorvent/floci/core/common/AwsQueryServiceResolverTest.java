@@ -58,6 +58,10 @@ class AwsQueryServiceResolverTest {
      */
     @ParameterizedTest
     @CsvSource(nullValues = "none", value = {
+            "CreateSnapshot, none, ec2",
+            "DeleteSnapshot, none, ec2",
+            "CreateSnapshot, 2015-02-02, elasticache",
+            "DeleteSnapshot, 2015-02-02, elasticache",
             "CreateUser, 2015-02-02, elasticache",
             "CreateUser, 2010-05-08, iam",
             "CreateUser, none, iam",

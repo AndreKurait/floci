@@ -20,6 +20,7 @@ import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.Ports;
+import com.github.dockerjava.api.model.Ulimit;
 import com.github.dockerjava.api.model.Volume;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.ContainerCaBundle;
@@ -541,15 +542,19 @@ public class ContainerLifecycleManager {
      * only once the container is gone; when removal fails it is left open for the retry.
      */
     public void stopAndRemoveStrict(String containerId, Closeable logStream) {
-        withTeardownSlot(() -> stopAndRemoveStrictAdmitted(containerId, logStream));
+        stopAndRemoveStrict(containerId, logStream, 5);
     }
 
-    private void stopAndRemoveStrictAdmitted(String containerId, Closeable logStream) {
+    public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds) {
+        withTeardownSlot(() -> stopAndRemoveStrictAdmitted(containerId, logStream, stopTimeoutSeconds));
+    }
+
+    private void stopAndRemoveStrictAdmitted(String containerId, Closeable logStream, int stopTimeoutSeconds) {
         LOG.infov("Stopping container {0}", containerId);
 
         Exception stopFailure = null;
         try {
-            dockerClient.stopContainerCmd(containerId).withTimeout(5).exec();
+            dockerClient.stopContainerCmd(containerId).withTimeout(stopTimeoutSeconds).exec();
         } catch (NotFoundException e) {
             LOG.debugv("Container {0} not found (already removed)", containerId);
             closeLogStreamIfPresent(logStream);
@@ -1296,6 +1301,12 @@ public class ContainerLifecycleManager {
         // Memory limit
         if (spec.hasMemoryLimit()) {
             hostConfig.withMemory(spec.memoryBytes());
+        }
+        if (!spec.ulimits().isEmpty()) {
+            hostConfig.withUlimits(spec.ulimits().entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .map(entry -> new Ulimit(entry.getKey(), entry.getValue().soft(), entry.getValue().hard()))
+                    .toArray(Ulimit[]::new));
         }
         if (linux.memorySwapBytes() != null) {
             hostConfig.withMemorySwap(linux.memorySwapBytes());
