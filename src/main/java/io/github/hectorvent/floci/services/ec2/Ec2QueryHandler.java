@@ -3716,6 +3716,8 @@ public class Ec2QueryHandler {
     }
 
     private Response handleRegisterImage(MultivaluedMap<String, String> p, String region) {
+        List<Tag> imageTags = parseTagsForResource(p, "image", true);
+        Ec2Service.validateCreationTags(imageTags);
         Image image = service.registerImage(
                 region,
                 p.getFirst("Name"),
@@ -3723,6 +3725,7 @@ public class Ec2QueryHandler {
                 p.getFirst("Architecture"),
                 p.getFirst("RootDeviceName"),
                 parseBlockDeviceMappings(p));
+        applyResourceTags(imageTags, region, image.getImageId());
         XmlBuilder xml = new XmlBuilder()
                 .start("RegisterImageResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -3769,11 +3772,10 @@ public class Ec2QueryHandler {
      */
     private Response handleCopyImage(MultivaluedMap<String, String> p, String region) {
         if (p.containsKey("KmsKeyId") || Boolean.parseBoolean(p.getFirst("Encrypted"))
-                || Boolean.parseBoolean(p.getFirst("CopyImageTags"))
                 || p.keySet().stream().anyMatch(name -> name.startsWith("Destination")
                         || name.startsWith("TagSpecification") || name.equals("SnapshotCopyCompletionDurationMinutes"))) {
             throw new AwsException("UnsupportedOperation",
-                    "CopyImage supports regional copies without encryption, copy tags or placement options.", 400);
+                    "CopyImage supports regional copies without encryption, tag specifications or placement options.", 400);
         }
         Image image = service.copyImage(
                 region,
@@ -3781,7 +3783,8 @@ public class Ec2QueryHandler {
                 p.getFirst("SourceImageId"),
                 p.getFirst("Name"),
                 p.getFirst("Description"),
-                Boolean.parseBoolean(p.getFirst("DryRun")));
+                Boolean.parseBoolean(p.getFirst("DryRun")),
+                Boolean.parseBoolean(p.getFirst("CopyImageTags")));
         XmlBuilder xml = new XmlBuilder()
                 .start("CopyImageResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
