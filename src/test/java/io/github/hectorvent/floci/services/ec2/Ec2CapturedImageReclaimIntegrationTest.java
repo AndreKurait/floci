@@ -5,6 +5,9 @@ import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
+import io.github.hectorvent.floci.services.ec2.model.Volume;
+import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
@@ -72,6 +75,9 @@ class Ec2CapturedImageReclaimIntegrationTest {
     @InjectMock
     Ec2ContainerManager containerManager;
 
+    @InjectMock
+    Ec2VolumeBlockDeviceManager volumeDevices;
+
     /**
      * Mocked so the reference a launch resolves is observable, and so a launch can be suspended
      * inside the section that reads the AMI. The real resolver only maps an AMI id to a base
@@ -131,7 +137,7 @@ class Ec2CapturedImageReclaimIntegrationTest {
     /** The image reference the container manager was asked to launch for the given instance. */
     private ResolvedAmiImage launchedImageOf(Instance instance) {
         ArgumentCaptor<ResolvedAmiImage> resolved = ArgumentCaptor.forClass(ResolvedAmiImage.class);
-        verify(containerManager).launch(eq(instance), resolved.capture(), any(), anyString(), any(), any(), any());
+        verify(containerManager).launch(eq(instance), resolved.capture(), any(), anyString(), any(), any(), any(), any());
         return resolved.getValue();
     }
 
@@ -142,6 +148,42 @@ class Ec2CapturedImageReclaimIntegrationTest {
         Image image = service.createImage(REGION, source.getInstanceId(), name, "captured", true);
         service.terminateInstances(REGION, List.of(source.getInstanceId()));
         return image;
+    }
+
+    @Test
+    void initialLaunchAttachesOnlyTheOwnersDataVolumesEvenFromAnotherAccountThread() {
+        String owner = "914000000001";
+        String foreign = "914000000002";
+        LaunchTemplateData.BlockDeviceMapping data = new LaunchTemplateData.BlockDeviceMapping();
+        data.setDeviceName("/dev/xvdf");
+        LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
+        ebs.setVolumeSize(8);
+        ebs.setVolumeType("gp3");
+        data.setEbs(ebs);
+        Instance instance = RequestScopes.callAs(owner, () -> service.runInstances(REGION, BASE_AMI,
+                "t3.micro", 1, 1, null, List.of(), null, null, List.of(), null, null,
+                null, null, 0, null, null, null, null, false, null, null, List.of(data))
+                .getInstances().getFirst());
+        Volume ownData = RequestScopes.callAs(owner, () -> service.describeVolumes(REGION, List.of(), Map.of())
+                .stream().filter(volume -> !volume.getVolumeId().equals(instance.getRootVolumeId()))
+                .findFirst().orElseThrow());
+        Volume otherData = new Volume();
+        otherData.setVolumeId(ownData.getVolumeId());
+        otherData.setRegion(REGION);
+        VolumeAttachment otherAttachment = new VolumeAttachment();
+        otherAttachment.setInstanceId(instance.getInstanceId());
+        otherAttachment.setDevice("/dev/xvdg");
+        otherData.getAttachments().add(otherAttachment);
+        RequestScopes.runAs(foreign, () -> service.putVolumeForTest(otherData));
+        ArgumentCaptor<Runnable> postLaunch = ArgumentCaptor.forClass(Runnable.class);
+        verify(containerManager).launch(eq(instance), any(), any(), eq(REGION), any(), any(), any(),
+                postLaunch.capture());
+
+        RequestScopes.runAs(foreign, postLaunch.getValue());
+
+        verify(volumeDevices).attachVolume(ownData, instance, "/dev/xvdf");
+        verify(volumeDevices, never()).attachVolume(eq(otherData), any(), any());
+        verify(volumeDevices, never()).attachVolume(any(), any(), eq(instance.getRootDeviceName()));
     }
 
     @Test
