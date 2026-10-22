@@ -710,6 +710,10 @@
     "HostedZoneName",
     "HostedZoneId"
   ],
+  "AWS::Route53::RecordSetGroup": [
+    "HostedZoneName",
+    "HostedZoneId"
+  ],
   "AWS::S3::Bucket": [
     "BucketName",
     "BucketNamePrefix",
@@ -773,5 +777,12 @@
   "AWS::WAFv2::WebACL": [
     "Name",
     "Scope"
+  ],
+  "AWS::EC2::KeyPair": [
+    "KeyName",
+    "KeyType",
+    "KeyFormat",
+    "PublicKeyMaterial",
+    "Tags"
   ]
 }
