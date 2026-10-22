@@ -525,6 +525,12 @@ public class WarmPool implements ContainerTeardown, Resettable {
         stopInParallel(handles);
     }
 
+    public void retireFunctionCode(List<LambdaFunction> deletedFunctions) {
+        if (lambdaRuntimeLauncher != null) {
+            lambdaRuntimeLauncher.retireFunctionCode(deletedFunctions);
+        }
+    }
+
     private List<ContainerHandle> detachFunction(String functionName) {
         PoolState poolState = poolStates.computeIfAbsent(functionName, ignored -> new PoolState());
         List<ContainerHandle> toStop;
