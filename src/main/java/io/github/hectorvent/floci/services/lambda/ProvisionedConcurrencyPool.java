@@ -52,6 +52,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
     private final LambdaRuntimeLauncher launcher;
     private final LambdaFunctionStore functions;
     private final LambdaAliasStore aliases;
+    private final LambdaConcurrencyLimiter concurrencyLimiter;
     private final StorageBackend<String, Configuration> storage;
     private final Clock clock;
     private final int maxPerFunction;
@@ -105,19 +106,34 @@ public class ProvisionedConcurrencyPool implements Resettable {
     @Inject
     public ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
                                      LambdaAliasStore aliases, StorageFactory storageFactory,
-                                     EmulatorConfig config, Clock clock) {
+                                     EmulatorConfig config, Clock clock, LambdaConcurrencyLimiter concurrencyLimiter) {
         this(launcher, functions, aliases, storageFactory.create("lambda",
                         "lambda-provisioned-concurrency.json", new TypeReference<>() {}),
                 clock, WarmPool.resolveMaxPerFunction(config), WarmPool.resolveMaxTotal(config),
-                config.services().lambda().ephemeral(), WarmPool.resolveDrainTimeout(config));
+                config.services().lambda().ephemeral(), WarmPool.resolveDrainTimeout(config), concurrencyLimiter);
+    }
+
+    ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
+                              LambdaAliasStore aliases, StorageFactory storageFactory,
+                              EmulatorConfig config, Clock clock) {
+        this(launcher, functions, aliases, storageFactory, config, clock, new LambdaConcurrencyLimiter());
     }
 
     ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
                               LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
                               Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds) {
+        this(launcher, functions, aliases, storage, clock, maxPerFunction, maxTotal, ephemeral,
+                drainSeconds, new LambdaConcurrencyLimiter());
+    }
+
+    ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
+                              LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
+                              Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds,
+                              LambdaConcurrencyLimiter concurrencyLimiter) {
         this.launcher = launcher;
         this.functions = functions;
         this.aliases = aliases;
+        this.concurrencyLimiter = concurrencyLimiter;
         this.storage = storage;
         this.clock = clock;
         this.maxPerFunction = maxPerFunction;
@@ -133,6 +149,8 @@ public class ProvisionedConcurrencyPool implements Resettable {
                     ? aware.scanAllAccounts() : storage.scan(ignored -> true);
             for (Configuration configuration : stored) {
                 allocations.put(configuration.key(), new Allocation(configuration));
+                concurrencyLimiter.setProvisioned(configuration.functionArn(),
+                        configuration.qualifier(), configuration.requested());
             }
         }
         scheduler.scheduleWithFixedDelay(() -> {
@@ -190,15 +208,12 @@ public class ProvisionedConcurrencyPool implements Resettable {
                     otherFunction += entry.configuration.requested();
                 }
             }
-            if ((long) otherFunction + count > maxPerFunction
-                    || (maxTotal > 0 && (long) otherTotal + count > maxTotal)) {
-                throw invalid("Requested provisioned concurrency exceeds the configured local warm-pool capacity");
-            }
             LambdaFunction latest = functions.getForAccount(target.account(), target.region(), target.name()).orElseThrow(
                     () -> missing("Function no longer exists"));
             Integer reserved = latest.getReservedConcurrentExecutions();
             if (reserved != null && (long) otherFunction + count > reserved) {
-                throw invalid("Provisioned concurrency cannot exceed the function's reserved concurrency");
+                throw invalid("Requested Provisioned Concurrency should not be greater than "
+                        + "the reservedConcurrentExecution for function");
             }
             if (versionConflict) {
                 throw new AwsException("ResourceConflictException",
@@ -211,7 +226,19 @@ public class ProvisionedConcurrencyPool implements Resettable {
                     && previous.configuration.requested() == count && !"FAILED".equals(previous.status)) {
                 return status(previous);
             }
-            write(target);
+            Integer previousCount = concurrencyLimiter.validateAndSetProvisioned(
+                    target.functionArn(), target.qualifier(), count);
+            try {
+                if ((long) otherFunction + count > maxPerFunction
+                        || (maxTotal > 0 && (long) otherTotal + count > maxTotal)) {
+                    throw invalid("Requested provisioned concurrency exceeds the configured local warm-pool capacity");
+                }
+                write(target);
+            } catch (RuntimeException failure) {
+                concurrencyLimiter.rollbackProvisionedIfExpected(
+                        target.functionArn(), target.qualifier(), count, previousCount);
+                throw failure;
+            }
             Allocation next = new Allocation(target);
             allocations.put(target.key(), next);
             if (previous != null) {
@@ -240,7 +267,9 @@ public class ProvisionedConcurrencyPool implements Resettable {
 
     public void delete(String region, String name, String qualifier, String account) {
         Target target = resolveTarget(region, name, qualifier, account);
-        deleteMatching(target.functionArn(), qualifier);
+        synchronized (functions.lockForConcurrencyOp(target.functionArn())) {
+            deleteMatching(target.functionArn(), qualifier);
+        }
     }
 
     /** Returns null when the matching allocation has no idle capacity: on-demand execution may spill over. */
@@ -331,6 +360,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                         && (qualifier == null || qualifier.equals(value.qualifier()))) {
                     erase(value);
                     allocations.remove(value.key());
+                    concurrencyLimiter.clearProvisioned(value.functionArn(), value.qualifier());
                     retired.addAll(retire(entry));
                 }
             }
@@ -770,7 +800,10 @@ public class ProvisionedConcurrencyPool implements Resettable {
     public void clear() {
         stopManagedContainers();
         synchronized (lock) {
+            List<Configuration> configured = storage instanceof AccountAwareStorageBackend<Configuration> aware
+                    ? aware.scanAllAccounts() : storage.scan(ignored -> true);
             storage.clear();
+            configured.forEach(value -> concurrencyLimiter.clearProvisioned(value.functionArn(), value.qualifier()));
             stopped = false;
         }
     }
