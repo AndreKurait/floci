@@ -8,6 +8,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Instant;
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -93,23 +94,62 @@ class CloudWatchQueryGetIntegrationTest {
 
     @ParameterizedTest
     @CsvSource(value = {
-            "ListMetrics, OMITTED, 200", "ListMetrics, 2009-05-15, 200", "ListMetrics, 2010-08-01, 200",
-            "ListMetrics, '', 404", "ListMetrics, 2000-01-01, 404",
-            "ListMetricStreams, OMITTED, 404", "ListMetricStreams, 2009-05-15, 404",
-            "ListMetricStreams, 2010-08-01, 200"
+            "GET, ListMetrics, OMITTED, 200", "GET, ListMetrics, 2009-05-15, 200",
+            "GET, ListMetrics, 2010-08-01, 200", "GET, ListMetrics, '', 404",
+            "GET, ListMetrics, 2000-01-01, 404", "GET, ListMetricStreams, OMITTED, 404",
+            "GET, ListMetricStreams, 2009-05-15, 404", "GET, ListMetricStreams, 2010-08-01, 200",
+            "GET, DescribeAlarms, 2013-01-16, 200", "POST, DescribeAlarms, 2013-01-16, 200",
+            "GET, ListMetrics, 2013-01-16, 200", "POST, ListMetrics, 2013-01-16, 200",
+            "GET, LegacyMetricExtension, 2013-01-16, 404",
+            "POST, LegacyMetricExtension, 2013-01-16, 404",
+            "POST, ListMetrics, 2000-01-01, 404", "POST, ListMetrics, '', 404",
+            "POST, ListMetricStreams, 2009-05-15, 404", "POST, ListMetricStreams, 2010-08-01, 200",
+            "POST, ListMetricStreams, OMITTED, 200"
     }, nullValues = "OMITTED")
-    void versionSelectsTheCurrentOrLegacyOperations(String action, String version, int status) {
-        RequestSpecification request = given().header("Authorization", authorization("monitoring"))
-                .queryParam("Action", action);
-        if (version != null) {
-            request.queryParam("Version", version);
+    void versionSelectsTheCurrentOrLegacyOperations(String method, String action, String version, int status) {
+        RequestSpecification request = given().header("Authorization", authorization("monitoring"));
+        if ("POST".equals(method)) {
+            request.contentType("application/x-www-form-urlencoded").formParam("Action", action);
+            if (version != null) {
+                request.formParam("Version", version);
+            }
+        } else {
+            request.queryParam("Action", action);
+            if (version != null) {
+                request.queryParam("Version", version);
+            }
         }
         if (status == 200) {
-            request.get("/").then().statusCode(status).body(containsString(action + "Response"));
+            request.request(method, "/").then().statusCode(status).body(containsString(action + "Response"));
         } else {
-            request.get("/").then().statusCode(status)
+            request.request(method, "/").then().statusCode(status)
                     .body("ErrorResponse.Error.Code", equalTo("InvalidAction"));
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GET", "POST"})
+    void currentVersionStillServesMetricData(String method) {
+        Instant now = Instant.now();
+        Map<String, String> parameters = Map.of(
+                "Action", "GetMetricData",
+                "Version", "2010-08-01",
+                "StartTime", now.minusSeconds(120).toString(),
+                "EndTime", now.toString(),
+                "MetricDataQueries.member.1.Id", "requests",
+                "MetricDataQueries.member.1.MetricStat.Metric.Namespace", "Example/QueryGet",
+                "MetricDataQueries.member.1.MetricStat.Metric.MetricName", "Unpublished",
+                "MetricDataQueries.member.1.MetricStat.Period", "60",
+                "MetricDataQueries.member.1.MetricStat.Stat", "Sum");
+        RequestSpecification request = given().header("Authorization", authorization("monitoring"));
+        if ("POST".equals(method)) {
+            request.contentType("application/x-www-form-urlencoded").formParams(parameters);
+        } else {
+            request.queryParams(parameters);
+        }
+        request.request(method, "/").then().statusCode(200)
+                .body("GetMetricDataResponse.GetMetricDataResult.MetricDataResults.member.Id", equalTo("requests"))
+                .body("GetMetricDataResponse.GetMetricDataResult.MetricDataResults.member.StatusCode", equalTo("Complete"));
     }
 
     @ParameterizedTest
