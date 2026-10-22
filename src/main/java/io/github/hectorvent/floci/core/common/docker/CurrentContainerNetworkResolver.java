@@ -5,6 +5,7 @@ import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.Ports;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -32,14 +33,21 @@ public class CurrentContainerNetworkResolver {
 
     private final DockerClient dockerClient;
     private final ContainerDetector containerDetector;
+    private final String configuredNetwork;
     private final Map<Integer, OptionalInt> cachedPublishedPorts = new ConcurrentHashMap<>();
 
     private volatile Optional<CurrentContainerNetwork> cachedNetwork;
 
-    @Inject
     public CurrentContainerNetworkResolver(DockerClient dockerClient, ContainerDetector containerDetector) {
+        this(dockerClient, containerDetector, null);
+    }
+
+    @Inject
+    public CurrentContainerNetworkResolver(DockerClient dockerClient, ContainerDetector containerDetector,
+                                           EmulatorConfig config) {
         this.dockerClient = dockerClient;
         this.containerDetector = containerDetector;
+        this.configuredNetwork = config == null ? null : config.services().dockerNetwork().orElse(null);
     }
 
     public Optional<String> resolveNetworkName() {
@@ -155,6 +163,14 @@ public class CurrentContainerNetworkResolver {
     }
 
     private Optional<CurrentContainerNetwork> selectNetwork(Map<String, ContainerNetwork> networks) {
+        if (configuredNetwork != null) {
+            return networks.entrySet().stream()
+                    .filter(entry -> isUsable(entry.getValue()))
+                    .filter(entry -> configuredNetwork.equals(entry.getKey())
+                            || configuredNetwork.equals(entry.getValue().getNetworkID()))
+                    .map(entry -> new CurrentContainerNetwork(entry.getKey(), entry.getValue().getIpAddress()))
+                    .findFirst();
+        }
         return networks.entrySet().stream()
                 .filter(entry -> isUsable(entry.getValue()))
                 .filter(entry -> isUserDefinedNetwork(entry.getKey()))
