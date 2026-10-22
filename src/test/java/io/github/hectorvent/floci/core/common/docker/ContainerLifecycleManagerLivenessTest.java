@@ -94,4 +94,53 @@ class ContainerLifecycleManagerLivenessTest {
 
         assertFalse(manager.isContainerRunning("c1"));
     }
+
+    @Test
+    void presenceDoesNotInferStoppedExecutionFromMissingState() {
+        InspectContainerResponse response = mock(InspectContainerResponse.class);
+        when(inspectCmd.exec()).thenReturn(response);
+
+        assertEquals(ContainerLifecycleManager.ContainerPresence.UNKNOWN, manager.presenceOf("c1"));
+    }
+
+    @Test
+    void presenceDoesNotInferStoppedExecutionFromMissingRunningFlag() {
+        InspectContainerResponse response = mock(InspectContainerResponse.class);
+        InspectContainerResponse.ContainerState state = mock(InspectContainerResponse.ContainerState.class);
+        when(response.getState()).thenReturn(state);
+        when(state.getRunning()).thenReturn(null);
+        when(inspectCmd.exec()).thenReturn(response);
+
+        assertEquals(ContainerLifecycleManager.ContainerPresence.UNKNOWN, manager.presenceOf("c1"));
+    }
+
+    @Test
+    void presenceReportsConfirmedRunningExecution() {
+        InspectContainerResponse response = inspectResponse(true);
+        when(inspectCmd.exec()).thenReturn(response);
+
+        assertEquals(ContainerLifecycleManager.ContainerPresence.RUNNING, manager.presenceOf("c1"));
+    }
+
+    @Test
+    void presenceReportsConfirmedStoppedExecution() {
+        InspectContainerResponse response = inspectResponse(false);
+        when(inspectCmd.exec()).thenReturn(response);
+
+        assertEquals(ContainerLifecycleManager.ContainerPresence.STOPPED, manager.presenceOf("c1"));
+    }
+
+    @Test
+    void presenceReportsAuthoritativeAbsence() {
+        when(inspectCmd.exec()).thenThrow(new NotFoundException("No such container"));
+
+        assertEquals(ContainerLifecycleManager.ContainerPresence.ABSENT, manager.presenceOf("c1"));
+    }
+
+    @Test
+    void presenceRetainsUnknownExecutionWhenInspectionFails() {
+        when(inspectCmd.exec()).thenThrow(new UncheckedIOException(new IOException("Broken pipe")));
+
+        assertEquals(ContainerLifecycleManager.ContainerPresence.UNKNOWN, manager.presenceOf("c1"));
+    }
 }
