@@ -80,8 +80,7 @@ final class SamRestApiAuth {
                 if (!(method.getValue() instanceof ObjectNode operation)) {
                     throw invalid("Auth requires inline operation objects.");
                 }
-                JsonNode existing = operation.has("security")
-                        ? operation.get("security") : document.path("security");
+                JsonNode existing = operation.path("security");
                 ArrayNode security = security(existing, definitions);
                 if (iam && !hasScheme(security, "AWS_IAM")) {
                     security.add(mapper.createObjectNode().set("AWS_IAM", mapper.createArrayNode()));
