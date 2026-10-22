@@ -940,7 +940,8 @@ public class AslExecutor {
         String credentialsRoleArn = credentials == null ? null : credentials.path("RoleArn").asText(null);
 
         // Registered after the input template resolved, so a template failure leaves no token behind.
-        CompletableFuture<JsonNode> tokenFuture = needsToken ? sfnService.get().registerPendingToken(taskToken) : null;
+        CompletableFuture<JsonNode> tokenFuture = needsToken ? sfnService.get().registerPendingToken(taskToken,
+                AwsArnUtils.parse(sm.getStateMachineArn()).accountId()) : null;
         TaskEventProfile profile = taskEventProfile(resource, isActivity);
         JsonNode taskResult;
         // Read before the scheduled event is built, so a large input or a slow history callback
@@ -1715,8 +1716,10 @@ public class AslExecutor {
      */
     private JsonNode invokeAwsSdkSfnSendTaskSuccess(JsonNode input) throws Exception {
         String taskToken = input.path("TaskToken").asText(null);
-        if (!sfnService.get().sendTaskSuccess(taskToken, sdkPayload(input.path("Output")))) {
-            throw new FailStateException("Sfn.InvalidTokenException", "Invalid Token: 'Invalid token'");
+        try {
+            sfnService.get().sendTaskSuccess(taskToken, sdkPayload(input.path("Output")));
+        } catch (AwsException e) {
+            throw new FailStateException(sdkExceptionName("Sfn", e.getErrorCode()), e.getMessage());
         }
         return objectMapper.createObjectNode();
     }
@@ -1724,9 +1727,11 @@ public class AslExecutor {
     /** AWS SDK integration for {@code sfn:sendTaskFailure}, token semantics as in SendTaskSuccess. */
     private JsonNode invokeAwsSdkSfnSendTaskFailure(JsonNode input) {
         String taskToken = input.path("TaskToken").asText(null);
-        if (!sfnService.get().sendTaskFailure(taskToken, input.path("Cause").asText(null),
-                input.path("Error").asText(null))) {
-            throw new FailStateException("Sfn.InvalidTokenException", "Invalid Token: 'Invalid token'");
+        try {
+            sfnService.get().sendTaskFailure(taskToken, input.path("Cause").asText(null),
+                    input.path("Error").asText(null));
+        } catch (AwsException e) {
+            throw new FailStateException(sdkExceptionName("Sfn", e.getErrorCode()), e.getMessage());
         }
         return objectMapper.createObjectNode();
     }
