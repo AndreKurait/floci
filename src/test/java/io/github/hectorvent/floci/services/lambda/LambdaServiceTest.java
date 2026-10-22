@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.services.s3.model.S3ObjectUpdatedEvent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayInputStream;
@@ -1639,6 +1640,49 @@ class LambdaServiceTest {
         AwsException error = assertThrows(AwsException.class,
                 () -> service.deleteAlias(REGION, "some-fn", "123"));
         assertEquals("ValidationException", error.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void deletingQualifierWaitsForProvisionedConcurrencyLock(boolean alias, boolean qualifiedName) throws Exception {
+        String name = "qualifier-deletion-lock";
+        LambdaFunction latest = service.createFunction(REGION, baseRequest(name));
+        LambdaFunction version = service.publishVersion(REGION, name, null);
+        if (alias) {
+            service.createAlias(REGION, name, "live", version.getVersion(), null, null);
+        }
+        String reference = qualifiedName ? latest.getFunctionArn() + ":" + version.getVersion() : name;
+        AtomicReference<Thread> requester = new AtomicReference<>();
+        try (ExecutorService tasks = Executors.newSingleThreadExecutor()) {
+            Future<?> deletion;
+            synchronized (service.lockForConcurrencyOp(latest.getFunctionArn())) {
+                deletion = tasks.submit(() -> {
+                    requester.set(Thread.currentThread());
+                    if (alias) {
+                        service.deleteAlias(REGION, reference, "live");
+                    } else {
+                        service.deleteVersion(REGION, reference, version.getVersion());
+                    }
+                });
+                awaitBlockedOrDone(requester, deletion);
+                assertFalse(deletion.isDone());
+                if (alias) {
+                    assertEquals(version.getVersion(), service.getAlias(REGION, name, "live").getFunctionVersion());
+                } else {
+                    assertEquals(version.getVersion(), service.getFunction(REGION, name, version.getVersion()).getVersion());
+                }
+            }
+            deletion.get(5, TimeUnit.SECONDS);
+        }
+        AwsException missing = assertThrows(AwsException.class, () -> {
+            if (alias) {
+                service.getAlias(REGION, name, "live");
+            } else {
+                service.getFunction(REGION, name, version.getVersion());
+            }
+        });
+        assertEquals("ResourceNotFoundException", missing.getErrorCode());
+        assertEquals("$LATEST", service.getFunction(REGION, name).getVersion());
     }
 
     @Test
