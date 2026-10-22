@@ -53,16 +53,16 @@ class SamRestApiAuthIntegrationTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
-    void importedSamApiRequiresBothValidSignatureAndEnabledStageKey(boolean swagger, boolean existingScheme)
+    @CsvSource({"false,none", "false,custom-authentication", "false,awsSigv4",
+            "true,none", "true,custom-authentication", "true,awsSigv4"})
+    void importedSamApiRequiresBothValidSignatureAndEnabledStageKey(boolean swagger, String existingAuthType)
             throws Exception {
         ObjectNode template = template(swagger);
-        if (existingScheme) {
+        if (!"none".equals(existingAuthType)) {
             ObjectNode body = (ObjectNode) template.at("/Resources/Api/Properties/DefinitionBody");
-            ObjectNode schemes = mapper.createObjectNode().set("existing", mapper.readTree("""
-                    {"type":"apiKey","name":"Authorization","in":"header",
-                     "x-amazon-apigateway-authtype":"custom-authentication"}
-                    """));
+            ObjectNode schemes = mapper.createObjectNode().set("existing", mapper.createObjectNode()
+                    .put("type", "apiKey").put("name", "Authorization").put("in", "header")
+                    .put("x-amazon-apigateway-authtype", existingAuthType));
             if (swagger) {
                 body.set("securityDefinitions", schemes);
             } else {
