@@ -687,25 +687,25 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // extension shutdown work — only that we will not preempt PID 1 for at least
         // that long if it happens to be slow.
         int stopTimeoutSeconds = server.hasRegisteredExtensions() ? 2 : 1;
-        RuntimeException cleanupFailure = null;
         try {
             lifecycleManager.stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(),
                     stopTimeoutSeconds);
-        } catch (RuntimeException failure) {
-            cleanupFailure = failure;
-            throw failure;
-        } finally {
+        } catch (RuntimeException cleanupFailure) {
             try {
-                executionRoleCredentials.unregister(
-                        handle.getExecutionRoleSessionAccountId(), handle.getExecutionRoleAccessKeyId());
-            } catch (RuntimeException retirementFailure) {
-                if (cleanupFailure == null) {
-                    throw retirementFailure;
+                ContainerLifecycleManager.ContainerPresence presence =
+                        lifecycleManager.presenceOf(handle.getContainerId());
+                if (presence == ContainerLifecycleManager.ContainerPresence.STOPPED
+                        || presence == ContainerLifecycleManager.ContainerPresence.ABSENT) {
+                    // Execution has ended, but keep the runtime/log/handle ownership for removal retry.
+                    executionRoleCredentials.unregister(
+                            handle.getExecutionRoleSessionAccountId(), handle.getExecutionRoleAccessKeyId());
                 }
+            } catch (RuntimeException retirementFailure) {
                 if (retirementFailure != cleanupFailure) {
                     cleanupFailure.addSuppressed(retirementFailure);
                 }
             }
+            throw cleanupFailure;
         }
 
         // Only now close the runtime API socket. Any pollers that were still parked when
@@ -721,7 +721,16 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             LOG.warnv(e, "RuntimeApiServer did not close cleanly for container {0}",
                     handle.getContainerId());
         } finally {
-            runtimeApiServerFactory.release(server);
+            try {
+                runtimeApiServerFactory.release(server);
+            } finally {
+                // The session is only reachable while the container is alive, so it is retired
+                // here rather than on the launch path's failure branch alone. Runs even if the
+                // release above throws, otherwise a failed release strands the registration and
+                // its credentials stay authorizable for the rest of the process lifetime.
+                executionRoleCredentials.unregister(
+                        handle.getExecutionRoleSessionAccountId(), handle.getExecutionRoleAccessKeyId());
+            }
         }
     }
 
