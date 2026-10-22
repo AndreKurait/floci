@@ -432,10 +432,24 @@ public class StepFunctionsJsonHandler {
     }
 
     private Response handleListExecutions(JsonNode request) {
+        String statusFilter = optionalText(request, "statusFilter");
+        if (statusFilter != null && !Set.of(
+                "RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED", "PENDING_REDRIVE")
+                .contains(statusFilter)) {
+            throw new AwsException("ValidationException", "Invalid statusFilter.", 400);
+        }
+        if ("PENDING_REDRIVE".equals(statusFilter) && request.hasNonNull("stateMachineArn")) {
+            throw new AwsException("ValidationException",
+                    "PENDING_REDRIVE requires mapRunArn instead of stateMachineArn.", 400);
+        }
         List<Execution> list = service.listExecutions(request.path("stateMachineArn").asText());
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("executions");
         for (Execution e : list) {
+            String status = e.getStatus();
+            if (statusFilter != null && !statusFilter.equals(status)) {
+                continue;
+            }
             ObjectNode item = array.addObject();
             item.put("executionArn", e.getExecutionArn());
             item.put("stateMachineArn", e.getStateMachineArn());
@@ -446,7 +460,7 @@ public class StepFunctionsJsonHandler {
                 item.put("stateMachineAliasArn", e.getStateMachineAliasArn());
             }
             item.put("name", e.getName());
-            item.put("status", e.getStatus());
+            item.put("status", status);
             item.put("startDate", e.getStartDate());
             if (e.getStopDate() != null) item.put("stopDate", e.getStopDate());
         }
