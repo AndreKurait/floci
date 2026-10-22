@@ -923,6 +923,7 @@ Route table ids follow the live API's own inconsistency: an id that does not exi
 | DescribeCapacityReservations | Lists or returns stored Capacity Reservations. |
 | ModifyCapacityReservation | Updates `InstanceCount`, `EndDate`, `EndDateType` or `InstanceMatchCriteria` in place. |
 | CancelCapacityReservation | Marks a Capacity Reservation `cancelled` and its available count `0`, matching real AWS's retain-but-cancel behaviour rather than deleting the record. |
+| MoveCapacityReservationInstances | Transfers available capacity between compatible reservations and returns both updated reservations. |
 
 `InstanceType`, `InstancePlatform` and `InstanceCount` are required, matching the AWS API, and
 one of `AvailabilityZone` or `AvailabilityZoneId` must be given; a request missing any of
@@ -934,6 +935,20 @@ through `payment-pending`/`assessing`. `DescribeCapacityReservations` supports t
 `availability-zone`, `end-date-type`, `instance-match-criteria`, `instance-platform`,
 `instance-type`, `state` and `tenancy` filters alongside the shared `tag:`, `tag-key` and
 `tag-value` filters.
+
+Capacity moves require different, active reservations in the caller's account and region
+with matching instance type, platform, Availability Zone, tenancy, placement group and
+end time. Eligibility (`open` or `targeted`) and tags can differ. Both total and available
+counts are updated, and moving all capacity cancels the empty source reservation.
+`DryRun` checks permissions without moving capacity. Case-sensitive `ClientToken` retries
+do not move capacity twice, including after source cancellation or a storage restart;
+changed parameters return `IdempotentParameterMismatch`. Retries return the reservations'
+current metadata. Moves, modifications, cancellations and describes share a lock.
+
+Reservation capacity is currently metadata: instance launches do not consume it.
+Moving running instances, shared used capacity, future-dated commitment periods and
+Capacity Blocks are not modeled. A move exceeding the source's available capacity is
+rejected without changing either reservation.
 
 ### Dedicated Hosts
 
