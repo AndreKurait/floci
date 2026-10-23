@@ -168,13 +168,13 @@ class KinesisEventSourcePollerTest {
         stubFunction();
         LambdaFunction version1 = stubVersion("1");
         stubStreamWith(List.of(record("s1", "p1", "{}")));
-        when(executorService.invoke(any(), any(), eq(InvocationType.RequestResponse))).thenReturn(new InvokeResult());
+        when(executorService.invoke(any(), any(), eq(InvocationType.RequestResponse), eq(0), eq("1"))).thenReturn(new InvokeResult());
         EventSourceMapping esm = esm();
         esm.setFunctionArn("arn:aws:lambda:" + REGION + ":" + ACCOUNT + ":function:fn:1");
 
         poller.pollAndInvoke(esm);
 
-        verify(executorService, timeout(2000)).invoke(eq(version1), any(), eq(InvocationType.RequestResponse));
+        verify(executorService, timeout(2000)).invoke(eq(version1), any(), eq(InvocationType.RequestResponse), eq(0), eq("1"));
     }
 
     @Test
@@ -187,13 +187,13 @@ class KinesisEventSourcePollerTest {
         alias.setFunctionVersion("2");
         when(aliasStore.getForAccount(ACCOUNT, REGION, "fn", "live")).thenReturn(Optional.of(alias));
         stubStreamWith(List.of(record("s1", "p1", "{}")));
-        when(executorService.invoke(any(), any(), eq(InvocationType.RequestResponse))).thenReturn(new InvokeResult());
+        when(executorService.invoke(any(), any(), eq(InvocationType.RequestResponse), eq(0), eq("live"))).thenReturn(new InvokeResult());
         EventSourceMapping esm = esm();
         esm.setFunctionArn("arn:aws:lambda:" + REGION + ":" + ACCOUNT + ":function:fn:live");
 
         poller.pollAndInvoke(esm);
 
-        verify(executorService, timeout(2000)).invoke(eq(version2), any(), eq(InvocationType.RequestResponse));
+        verify(executorService, timeout(2000)).invoke(eq(version2), any(), eq(InvocationType.RequestResponse), eq(0), eq("live"));
     }
 
     private LambdaFunction stubVersion(String version) {
