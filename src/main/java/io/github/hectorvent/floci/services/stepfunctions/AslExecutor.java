@@ -60,6 +60,7 @@ import io.github.hectorvent.floci.services.scheduler.model.ScheduleRequest;
 import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService.TokenTimeout;
+import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService.TokenWait;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.MapRun;
@@ -1084,13 +1085,12 @@ public class AslExecutor {
                 try {
                     return future.get(wakeAtNanos - nanoTime.getAsLong(), TimeUnit.NANOSECONDS);
                 } catch (java.util.concurrent.TimeoutException e) {
-                    TokenTimeout expired = sfnService.get().expirePendingToken(taskToken, nanoTime.getAsLong(),
+                    TokenWait decision = sfnService.get().expirePendingToken(taskToken, nanoTime.getAsLong(),
                             executionDeadlineNanos, timeoutDeadlineNanos, heartbeatSeconds);
-                    if (expired == TokenTimeout.CLAIMED) {
-                        // Claiming removes the token before completing its future outside the lock.
-                        return future.get();
+                    if (decision.timeout() == TokenTimeout.CLAIMED) {
+                        return decision.result().get();
                     }
-                    RuntimeException timeout = switch (expired) {
+                    RuntimeException timeout = switch (decision.timeout()) {
                         case EXECUTION -> new ExecutionTimedOutException();
                         case TASK -> new TaskTimedOutException("States.Timeout");
                         case HEARTBEAT -> new TaskTimedOutException("States.HeartbeatTimeout");
