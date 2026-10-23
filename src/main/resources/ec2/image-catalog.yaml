@@ -284,7 +284,7 @@ images:
     creationDate: "2026-01-01T00:00:00.000Z"
 
   - imageId: ami-rocky10
-    dockerImage: quay.io/rockylinux/rockylinux:10
+    dockerImage: quay.io/rockylinux/rockylinux:10.0
     name: Rocky-10-EC2-Base-10.0-20260101.0.x86_64
     description: Rocky Linux 10
     ownerId: "792107900819"
