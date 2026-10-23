@@ -5,8 +5,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -18,8 +25,40 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.*;
 
 class RedshiftDataStatementStoreTest {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void receiptSweepFailureDoesNotPreventOwnedStatementEviction(boolean receiptFailure) {
+        StorageFactory factory = mock(StorageFactory.class);
+        AccountAwareStorageBackend<RedshiftDataStatementStore.StoredStatement> backend =
+                AccountAwareStorageBackend.inMemory("000000000000");
+        when(factory.<RedshiftDataStatementStore.StoredStatement>create(eq("redshift-data"),
+                eq("statements.json"), any())).thenReturn(backend);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().redshiftData().resultTtlHours()).thenReturn(24);
+        RedshiftDataIdempotencyStore receipts = mock(RedshiftDataIdempotencyStore.class);
+        if (receiptFailure) {
+            doThrow(new UncheckedIOException(new IOException("receipt replacement failed")))
+                    .when(receipts).sweep();
+        }
+        RedshiftDataStatementStore store = new RedshiftDataStatementStore(factory, config, receipts);
+        Instant now = Instant.now();
+        store.putForAccount("111111111111", statement("same-id", now.minus(Duration.ofHours(48))));
+        store.putForAccount("222222222222", statement("same-id", now.minus(Duration.ofHours(1))));
+        RedshiftDataStatementStore.StoredStatement active = statement("active", now.minus(Duration.ofHours(48)));
+        active.status = RedshiftDataStatementStore.Status.STARTED;
+        store.putForAccount("111111111111", active);
+
+        store.sweep();
+
+        verify(receipts).sweep();
+        assertNull(store.getForAccount("111111111111", "same-id"));
+        assertNotNull(store.getForAccount("222222222222", "same-id"));
+        assertNotNull(store.getForAccount("111111111111", "active"));
+    }
 
     @Test
     void recoveryFailsInterruptedWorkWithoutChangingTerminalResults() {
