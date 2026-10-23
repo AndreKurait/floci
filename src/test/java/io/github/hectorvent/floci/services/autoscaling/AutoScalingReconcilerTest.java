@@ -28,6 +28,7 @@ import org.mockito.ArgumentCaptor;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -35,10 +36,13 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.anyString;
+import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.isNull;
@@ -183,7 +187,8 @@ class AutoScalingReconcilerTest {
         when(ec2Service.iamInstanceProfileArn(version.getData()))
                 .thenReturn("arn:aws:iam::000000000000:instance-profile/app-profile");
         List<Tag> instanceTags = List.of(new Tag("app.ClusterId", "development"));
-        List<Tag> propagatedTags = List.of(new Tag("app.ClusterId", "development"), new Tag("job-id", "2001"));
+        List<Tag> propagatedTags = List.of(new Tag("app.ClusterId", "development"), new Tag("job-id", "2001"),
+                new Tag("aws:autoscaling:groupName", "app-asg"));
         version.getData().setTagSpecifications(List.of(
                 new LaunchTemplateData.TagSpecification("instance", instanceTags)));
         when(ec2Service.describeLaunchTemplates("us-east-1", List.of("lt-123"), List.of(), Map.of()))
@@ -221,6 +226,47 @@ class AutoScalingReconcilerTest {
         assertEquals("development", tags.getValue().get(0).getValue());
         assertEquals("job-id", tags.getValue().get(1).getKey());
         assertEquals("2001", tags.getValue().get(1).getValue());
+        assertEquals("aws:autoscaling:groupName", tags.getValue().get(2).getKey());
+        assertEquals("app-asg", tags.getValue().get(2).getValue());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void scaleOutUsesActualGroupNameDespiteConflictingUserTags(boolean propagateSystemTag) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        AutoScalingReconciler reconciler =
+                new AutoScalingReconciler(asgService, ec2Service, mock(ElbV2Service.class));
+        AutoScalingGroup asg = launchTemplateAsg();
+        asg.getTags().put("aws:autoscaling:groupName", "spoofed-group");
+        asg.getTagPropagateAtLaunch().put("aws:autoscaling:groupName", propagateSystemTag);
+        asg.getTags().put("shared", "group-value");
+        asg.getTagPropagateAtLaunch().put("shared", true);
+        asg.getTags().put("control-plane-only", "private");
+        asg.getTagPropagateAtLaunch().put("control-plane-only", false);
+        LaunchTemplate version = stubLaunchTemplate(ec2Service, "ami-version-1", "t3.micro");
+        version.getData().setTagSpecifications(List.of(new LaunchTemplateData.TagSpecification(
+                "instance", List.of(new Tag("aws:autoscaling:groupName", "spoofed-template"),
+                new Tag("shared", "template-value"), new Tag("template-only", "kept")))));
+        when(asgService.saveAutoScalingGroupIfPresent(asg)).thenReturn(true);
+        when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
+                anyList(), eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any(), anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull()))
+                .thenReturn(reservation(ec2Instance("i-tagged", InstanceState.pending())));
+
+        reconciler.reconcile(asg);
+
+        ArgumentCaptor<List<Tag>> tags = ArgumentCaptor.captor();
+        verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
+                tags.capture(), eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any(), anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull());
+        assertEquals(Map.of("aws:autoscaling:groupName", "app-asg", "shared", "group-value",
+                "template-only", "kept"),
+                tags.getValue().stream().collect(Collectors.toMap(Tag::getKey, Tag::getValue)));
+        assertEquals("spoofed-group", asg.getTags().get("aws:autoscaling:groupName"));
+        assertEquals("spoofed-template", version.getData().getInstanceTags().getFirst().getValue());
     }
 
     @Test
@@ -238,7 +284,7 @@ class AutoScalingReconcilerTest {
         Reservation reservation = new Reservation();
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
-                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null), eq(List.of()),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null), onlyGroupNameTag("app-asg"),
                 eq(null), eq(null), eq(null),
                 isNull(), eq(0), isNull(), isNull(), isNull(), any(),
                 anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
@@ -333,7 +379,7 @@ class AutoScalingReconcilerTest {
         Reservation reservation = new Reservation();
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
-                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null), eq(List.of()),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null), onlyGroupNameTag("app-asg"),
                 eq(null), eq(null), eq(null),
                 isNull(), eq(0), isNull(), isNull(), isNull(), any(),
                 anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
@@ -380,7 +426,7 @@ class AutoScalingReconcilerTest {
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-lc"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), anyList(), eq(null), eq(null),
-                anyList(), eq(null), eq(null), eq(associatePublicIp),
+                onlyGroupNameTag("app-asg"), eq(null), eq(null), eq(associatePublicIp),
                 isNull(), eq(0), isNull(), isNull(), isNull(), any(),
                 anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
 
@@ -388,7 +434,7 @@ class AutoScalingReconcilerTest {
 
         verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-lc"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), anyList(), eq(null), eq(null),
-                anyList(), eq(null), eq(null), eq(associatePublicIp),
+                onlyGroupNameTag("app-asg"), eq(null), eq(null), eq(associatePublicIp),
                 isNull(), eq(0), isNull(), isNull(), isNull(), any(), anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull());
     }
 
@@ -422,7 +468,7 @@ class AutoScalingReconcilerTest {
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-7"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                eq(List.of()), eq(null), eq(null), eq(null),
+                onlyGroupNameTag("app-asg"), eq(null), eq(null), eq(null),
                 isNull(), eq(0), isNull(), isNull(), isNull(), any(),
                 anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
 
@@ -430,6 +476,97 @@ class AutoScalingReconcilerTest {
 
         assertEquals("$Latest", asg.getLaunchTemplateVersion());
         assertEquals("7", asg.getInstances().getFirst().getLaunchTemplateVersion());
+    }
+
+    @ParameterizedTest
+    @MethodSource("launchTemplateVersionSelections")
+    void scaleOutDefaultsOmittedLaunchTemplateVersionAndPreservesExplicitVersions(
+            boolean mixed, String requestedVersion, String expectedSelector, String expectedVersion,
+            String expectedImage) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        AutoScalingReconciler reconciler =
+                new AutoScalingReconciler(asgService, ec2Service, mock(ElbV2Service.class));
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        asg.setDesiredCapacity(1);
+        when(asgService.saveAutoScalingGroupIfPresent(asg)).thenReturn(true);
+        if (mixed) {
+            MixedInstancesPolicy.LaunchTemplateSpecification specification =
+                    new MixedInstancesPolicy.LaunchTemplateSpecification();
+            specification.setLaunchTemplateId("lt-123");
+            specification.setVersion(requestedVersion);
+            MixedInstancesPolicy.LaunchTemplate policyTemplate = new MixedInstancesPolicy.LaunchTemplate();
+            policyTemplate.setLaunchTemplateSpecification(specification);
+            MixedInstancesPolicy policy = new MixedInstancesPolicy();
+            policy.setLaunchTemplate(policyTemplate);
+            asg.setMixedInstancesPolicy(policy);
+        } else {
+            asg.setLaunchTemplateId("lt-123");
+            asg.setLaunchTemplateVersion(requestedVersion);
+        }
+
+        LaunchTemplate template = new LaunchTemplate();
+        template.setLaunchTemplateId("lt-123");
+        template.setDefaultVersionNumber("1");
+        template.setLatestVersionNumber("2");
+        LaunchTemplate defaultVersion = new LaunchTemplate();
+        defaultVersion.setLatestVersionNumber("1");
+        defaultVersion.getData().setImageId("ami-default");
+        defaultVersion.getData().setInstanceType("t3.micro");
+        LaunchTemplate latestVersion = new LaunchTemplate();
+        latestVersion.setLatestVersionNumber("2");
+        latestVersion.getData().setImageId("ami-latest");
+        latestVersion.getData().setInstanceType("t3.small");
+        when(ec2Service.describeLaunchTemplates("us-east-1", List.of("lt-123"), List.of(), Map.of()))
+                .thenReturn(List.of(template));
+        when(ec2Service.describeLaunchTemplateVersions(eq("us-east-1"), eq("lt-123"), isNull(), anyList()))
+                .thenAnswer(invocation -> {
+                    List<String> selectors = invocation.getArgument(3);
+                    String selector = selectors.isEmpty() ? "$Latest" : selectors.getFirst();
+                    return switch (selector) {
+                        case "$Default", "1" -> List.of(defaultVersion);
+                        case "$Latest", "2" -> List.of(latestVersion);
+                        default -> throw new AssertionError("Unexpected version selector: " + selectors);
+                    };
+                });
+        Instance ec2Instance = new Instance();
+        ec2Instance.setInstanceId("i-launched");
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(ec2Instance));
+        when(ec2Service.runInstances(eq("us-east-1"), anyString(), anyString(),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
+                onlyGroupNameTag("app-asg"), eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any(),
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
+
+        reconciler.reconcile(asg);
+
+        assertEquals(1, asg.getInstances().size());
+        assertEquals(expectedVersion, asg.getInstances().getFirst().getLaunchTemplateVersion());
+        assertEquals(requestedVersion, mixed
+                ? asg.getMixedInstancesPolicy().getLaunchTemplate().getLaunchTemplateSpecification().getVersion()
+                : asg.getLaunchTemplateVersion());
+        verify(ec2Service).describeLaunchTemplateVersions(
+                "us-east-1", "lt-123", null, List.of(expectedSelector));
+        verify(ec2Service).runInstances(eq("us-east-1"), eq(expectedImage), anyString(),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
+                onlyGroupNameTag("app-asg"), eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any(),
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull());
+    }
+
+    static Stream<Arguments> launchTemplateVersionSelections() {
+        return Stream.of(
+                Arguments.of(false, null, "$Default", "1", "ami-default"),
+                Arguments.of(true, null, "$Default", "1", "ami-default"),
+                Arguments.of(false, "$Default", "$Default", "1", "ami-default"),
+                Arguments.of(true, "$Default", "$Default", "1", "ami-default"),
+                Arguments.of(false, "$Latest", "$Latest", "2", "ami-latest"),
+                Arguments.of(true, "$Latest", "$Latest", "2", "ami-latest"),
+                Arguments.of(false, "2", "2", "2", "ami-latest"),
+                Arguments.of(true, "2", "2", "2", "ami-latest"));
     }
 
     @Test
@@ -480,7 +617,7 @@ class AutoScalingReconcilerTest {
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-3"), eq("t3.small"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                eq(List.of()), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null),
+                onlyGroupNameTag("app-asg"), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null),
                 isNull(), eq(0), isNull(), eq(metadata), isNull(), any(),
                 anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
 
@@ -493,7 +630,7 @@ class AutoScalingReconcilerTest {
         assertEquals("t3.small", asg.getInstances().getFirst().getInstanceType());
         verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-version-3"), eq("t3.small"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                eq(List.of()), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null),
+                onlyGroupNameTag("app-asg"), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null),
                 isNull(), eq(0), isNull(), eq(metadata), isNull(), any(), anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull());
         assertNull(version.getData().getUserData());
     }
@@ -1100,7 +1237,13 @@ class AutoScalingReconcilerTest {
         return asg;
     }
 
-    private static void stubLaunchTemplate(Ec2Service ec2Service, String imageId, String instanceType) {
+    private static List<Tag> onlyGroupNameTag(String groupName) {
+        return argThat(tags -> tags != null && tags.size() == 1
+                && "aws:autoscaling:groupName".equals(tags.getFirst().getKey())
+                && groupName.equals(tags.getFirst().getValue()));
+    }
+
+    private static LaunchTemplate stubLaunchTemplate(Ec2Service ec2Service, String imageId, String instanceType) {
         LaunchTemplate launchTemplate = new LaunchTemplate();
         launchTemplate.setLaunchTemplateId("lt-123");
         LaunchTemplate version = new LaunchTemplate();
@@ -1111,6 +1254,7 @@ class AutoScalingReconcilerTest {
                 .thenReturn(List.of(launchTemplate));
         when(ec2Service.describeLaunchTemplateVersions("us-east-1", "lt-123", null, List.of("1")))
                 .thenReturn(List.of(version));
+        return version;
     }
 
     private static AsgInstance instance(String lifecycleState) {
