@@ -7,6 +7,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -59,6 +60,20 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
         candidate.putAll(Map.copyOf(entries));
         store = candidate;
         dirty.set(true);
+    }
+
+    @Override
+    public synchronized void putAllDurably(Map<K, V> entries) {
+        synchronized (flushLock) {
+            ConcurrentHashMap<K, V> candidate = new ConcurrentHashMap<>(store);
+            candidate.putAll(Map.copyOf(entries));
+            try {
+                StorageFiles.writeAtomically(filePath, tempFile -> objectMapper.writeValue(tempFile.toFile(), candidate));
+            } catch (IOException exception) {
+                throw new UncheckedIOException("Failed to persist atomic batch to " + filePath, exception);
+            }
+            store = candidate;
+        }
     }
 
     @Override
@@ -131,6 +146,19 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
     private void flushIfDirty() {
         if (dirty.compareAndSet(true, false)) {
             persistToDisk();
+        }
+    }
+
+    @Override
+    public void flushOrThrow() {
+        synchronized (flushLock) {
+            Map<K, V> snapshot = store;
+            try {
+                StorageFiles.writeAtomically(filePath, tempFile -> objectMapper.writeValue(tempFile.toFile(), snapshot));
+            } catch (IOException exception) {
+                dirty.set(true);
+                throw new UncheckedIOException("Failed to persist data to " + filePath, exception);
+            }
         }
     }
 
