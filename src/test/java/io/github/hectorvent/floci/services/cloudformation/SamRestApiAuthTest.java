@@ -43,7 +43,7 @@ class SamRestApiAuthTest {
     }
 
     @Test
-    void preservesInheritedIamAndAnExistingApiKeyWhenDefaultIsFalse() throws Exception {
+    void doesNotApplyRootSecurityWhenNoMethodDefaultWasDeclared() throws Exception {
         ObjectNode template = template(false);
         ObjectNode properties = (ObjectNode) template.at("/Resources/Api/Properties");
         properties.set("Auth", mapper.readTree("{\"ApiKeyRequired\":false}"));
@@ -57,7 +57,34 @@ class SamRestApiAuthTest {
                 """));
         body.set("security", mapper.readTree("[{\"existingSigV4\":[]},{\"existingKey\":[]}]"));
         JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
-        assertEquals(body.get("security"), expanded.at("/paths/~1items/get/security"));
+        assertEquals(body.get("security"), expanded.get("security"));
+        assertEquals(mapper.createArrayNode(), expanded.at("/paths/~1items/get/security"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rootSecurityDoesNotDuplicateTheSamMethodDefaults(boolean swagger) throws Exception {
+        ObjectNode template = template(swagger);
+        ObjectNode body = (ObjectNode) template.at("/Resources/Api/Properties/DefinitionBody");
+        ObjectNode schemes = (ObjectNode) mapper.readTree("""
+                {"existingSigV4":{"type":"apiKey","name":"Authorization","in":"header",
+                                  "x-amazon-apigateway-authtype":"awsSigv4"},
+                 "existingKey":{"type":"apiKey","name":"x-api-key","in":"header"}}
+                """);
+        if (swagger) {
+            body.set("securityDefinitions", schemes);
+        } else {
+            body.set("components", mapper.createObjectNode().set("securitySchemes", schemes));
+        }
+        body.set("security", mapper.readTree("[{\"existingSigV4\":[]},{\"existingKey\":[]}]"));
+        JsonNode original = template.deepCopy();
+        JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
+        assertEquals(original, template);
+        assertEquals(body.get("security"), expanded.get("security"));
+        for (String method : new String[] {"get", "x-amazon-apigateway-any-method"}) {
+            assertEquals(mapper.readTree("[{\"AWS_IAM\":[]},{\"api_key\":[]}]"),
+                    expanded.path("paths").path("/items").path(method).path("security"));
+        }
     }
 
     @ParameterizedTest
@@ -80,7 +107,8 @@ class SamRestApiAuthTest {
     void preservesExistingCustomSecurityAndAddsTheNamedDefault() throws Exception {
         ObjectNode template = template(false);
         ObjectNode body = (ObjectNode) template.at("/Resources/Api/Properties/DefinitionBody");
-        body.set("security", mapper.readTree("[{\"custom\":[\"read\"]}]"));
+        ((ObjectNode) body.at("/paths/~1items/get")).set("security",
+                mapper.readTree("[{\"custom\":[\"read\"]}]"));
         body.set("components", mapper.readTree("""
                 {"securitySchemes":{"custom":{"type":"apiKey","name":"Authorization","in":"header",
                   "x-amazon-apigateway-authorizer":{"type":"request","authorizerUri":"unused"}}}}
@@ -104,7 +132,8 @@ class SamRestApiAuthTest {
                 .put("x-amazon-apigateway-authtype", authType);
         body.set("components", mapper.createObjectNode().set("securitySchemes",
                 mapper.createObjectNode().set("existing", scheme)));
-        body.set("security", mapper.readTree("[{\"existing\":[]}]"));
+        ((ObjectNode) body.at("/paths/~1items/get")).set("security",
+                mapper.readTree("[{\"existing\":[]}]"));
         JsonNode original = template.deepCopy();
         JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
         assertEquals(original, template);
@@ -121,7 +150,7 @@ class SamRestApiAuthTest {
         body.set("components", mapper.readTree("""
                 {"securitySchemes":{"existing":{"type":"oauth2","flows":{}}}}
                 """));
-        body.set("security", mapper.readTree(security));
+        ((ObjectNode) body.at("/paths/~1items/get")).set("security", mapper.readTree(security));
         JsonNode original = template.deepCopy();
         assertThrows(AwsException.class, () -> processor.expandSamTemplate(template));
         assertEquals(original, template);
