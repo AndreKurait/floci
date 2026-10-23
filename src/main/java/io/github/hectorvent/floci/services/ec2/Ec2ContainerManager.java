@@ -991,19 +991,20 @@ public class Ec2ContainerManager {
             instance.setState(InstanceState.stopped());
             return;
         }
-        instance.setState(InstanceState.stopping());
+        InstanceState stopping = InstanceState.stopping();
+        instance.setState(stopping);
         executor.submit(() -> {
             // Sidecars forward to the container's current IP, which Docker reassigns on the
             // next start; tear them down so no forward is left pointing at a stale address.
             portForwardManager.unpublishAll(instance);
             try {
                 dockerClient.stopContainerCmd(containerId).withTimeout(30).exec();
-            } catch (NotFoundException e) {
-                // already gone
+            } catch (NotFoundException ignored) {
+                // An already removed container needs no further stop.
             } catch (Exception e) {
                 LOG.warnv("Error stopping EC2 container {0}: {1}", containerId, e.getMessage());
             }
-            instance.setState(InstanceState.stopped());
+            instance.compareAndSetState(stopping, InstanceState.stopped());
         });
     }
 
@@ -1027,7 +1028,8 @@ public class Ec2ContainerManager {
             }
             return;
         }
-        instance.setState(InstanceState.pending());
+        InstanceState pending = InstanceState.pending();
+        instance.setState(pending);
         executor.submit(() -> {
             try {
                 dockerClient.startContainerCmd(containerId).exec();
@@ -1065,14 +1067,16 @@ public class Ec2ContainerManager {
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                instance.setState(InstanceState.stopped());
+                instance.compareAndSetState(pending, InstanceState.stopped());
                 return;
             } catch (Exception e) {
                 LOG.warnv("Error starting EC2 container {0}: {1}", containerId, e.getMessage());
-                instance.setState(InstanceState.stopped());
+                instance.compareAndSetState(pending, InstanceState.stopped());
                 return;
             }
-            instance.setState(InstanceState.running());
+            if (!instance.compareAndSetState(pending, InstanceState.running())) {
+                return;
+            }
             if (postStart != null) {
                 try {
                     postStart.run();
