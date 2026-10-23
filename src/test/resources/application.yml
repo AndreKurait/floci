@@ -157,6 +157,7 @@ floci:
       enabled: true
     lambda:
       enabled: true
+      container-drain-timeout-seconds: 15
       docker-flags: ""
       honour-architectures: false
       zip-max-entries: 100000
