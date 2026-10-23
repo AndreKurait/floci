@@ -3245,6 +3245,9 @@ public interface EmulatorConfig {
         /** Optional full EC2 catalog file for locally built guest images. */
         Optional<String> imageCatalogPath();
 
+        /** Optional JSON file of additional regional AWS-managed prefix lists. */
+        Optional<String> managedPrefixListCatalogPath();
+
         /**
          * Explicit guest environment entries, each {@code KEY=VALUE}. Duplicate keys and
          * Floci-owned identity, credential, region, endpoint and IMDS settings are rejected.
