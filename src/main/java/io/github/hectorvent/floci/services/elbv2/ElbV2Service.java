@@ -473,7 +473,11 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                           Integer healthyThreshold, Integer unhealthyThreshold,
                                           String matcher, String ipAddressType,
                                           Map<String, String> initialTags) {
+        validatePort(port, "port");
         validateName(name, "target group");
+        if (port == null && !"lambda".equals(targetType)) {
+            throw new AwsException("ValidationError", "A port must be specified", 400);
+        }
         validateHealthCheckPort(healthCheckPort);
         Map<String, TargetGroup> regionTgs = targetGroups.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
         boolean duplicate = regionTgs.values().stream()
@@ -987,6 +991,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     // ── Targets ───────────────────────────────────────────────────────────────
 
     public void registerTargets(String region, String tgArn, List<TargetDescription> targets) {
+        validateTargetPorts(targets);
         TargetGroup tg = requireTargetGroup(region, tgArn);
         if (!"lambda".equals(tg.getTargetType())) {
             for (TargetDescription t : targets) {
@@ -995,8 +1000,12 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         }
         List<TargetDescription> existing = tg.getTargets();
         for (TargetDescription t : targets) {
+            if (t.getPort() == null && tg.getPort() != null) {
+                t.setPort(tg.getPort());
+            }
             // replace if same id+port already registered
-            existing.removeIf(e -> e.getId().equals(t.getId()) && Objects.equals(e.getPort(), t.getPort()));
+            existing.removeIf(e -> e.getId().equals(t.getId())
+                    && ElbV2HealthChecker.effectivePort(e, tg) == ElbV2HealthChecker.effectivePort(t, tg));
             existing.add(t);
         }
         persistRegion(targetGroups, region);
@@ -1016,9 +1025,11 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     }
 
     public void deregisterTargets(String region, String tgArn, List<TargetDescription> targets) {
+        validateTargetPorts(targets);
         TargetGroup tg = requireTargetGroup(region, tgArn);
         for (TargetDescription t : targets) {
-            tg.getTargets().removeIf(e -> e.getId().equals(t.getId()) && Objects.equals(e.getPort(), t.getPort()));
+            tg.getTargets().removeIf(e -> e.getId().equals(t.getId())
+                    && ElbV2HealthChecker.effectivePort(e, tg) == ElbV2HealthChecker.effectivePort(t, tg));
         }
         persistRegion(targetGroups, region);
         healthChecker.removeTargets(tgArn, targets, tg);
@@ -1026,6 +1037,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     public List<TargetHealth> describeTargetHealth(String region, String tgArn,
                                                      List<TargetDescription> filterTargets) {
+        validateTargetPorts(filterTargets);
         TargetGroup tg = requireTargetGroup(region, tgArn);
         boolean hasFilterTargets = filterTargets != null && !filterTargets.isEmpty();
         List<TargetDescription> candidates = hasFilterTargets ? filterTargets : tg.getTargets();
@@ -1543,6 +1555,24 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                     try { return Integer.parseInt(r.getPriority()); } catch (NumberFormatException e) { return Integer.MAX_VALUE; }
                 }))
                 .collect(Collectors.toList());
+    }
+
+    private static void validateTargetPorts(List<TargetDescription> targets) {
+        if (targets == null) {
+            return;
+        }
+        for (int i = 0; i < targets.size(); i++) {
+            validatePort(targets.get(i).getPort(), "targets." + (i + 1) + ".member.port");
+        }
+    }
+
+    private static void validatePort(Integer port, String member) {
+        if (port == null || (port >= 1 && port <= 65535)) {
+            return;
+        }
+        String constraint = port < 1 ? "greater than or equal to 1" : "less than or equal to 65535";
+        throw new AwsException("ValidationError", "1 validation error detected: Value '" + port
+                + "' at '" + member + "' failed to satisfy constraint: Member must have value " + constraint, 400);
     }
 
     /** {@code HealthCheckPort} is either {@code traffic-port} or a port number from 1 to 65535. */
