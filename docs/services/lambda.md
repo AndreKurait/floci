@@ -483,14 +483,14 @@ for Get does not authorize Put, Delete, or another qualifier.
 
 Provisioned environments are separate from ordinary idle eviction. Desired configurations
 are persisted; restarting Floci initializes new processes before reporting `READY`.
-Deleting the configuration, alias or function removes the owned environments. If an
-alias changes its version, this stage marks its old allocation `FAILED` and retires its
-environments. Invocations use on-demand capacity until a new Put initializes the new
-version. Automatic alias retargeting is a separate follow-up. The requested quota is
-retained until configuration replacement or deletion. An invalid replacement Put preserves
-the existing healthy allocation. An alias with a configuration cannot move to `$LATEST`
-or to a version targeted by another configuration; remove the conflicting configuration
-first. Get and Delete remain available if the alias gains
+Deleting the configuration, alias or function removes the owned environments. Changing an
+alias's version reinitializes its existing allocation for the new published version and
+releases the old version's configuration conflict. The alias retains its requested quota;
+retired environments retain their local container capacity until cleanup succeeds. An identical
+Put preserves the existing healthy allocation. Failed background alias refreshes retain their
+previous allocation and retry on later reconciliation without blocking other configurations.
+An alias with a configuration cannot move to
+`$LATEST`; remove the configuration first. Get and Delete remain available if the alias gains
 unsupported weighted routing.
 
 This implementation supports the non-ephemeral Docker executor with immutable published
