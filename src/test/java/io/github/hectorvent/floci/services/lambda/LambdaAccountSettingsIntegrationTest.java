@@ -81,6 +81,15 @@ class LambdaAccountSettingsIntegrationTest {
             .body("AccountUsage.TotalCodeSize", equalTo(codeSize))
             .body("AccountLimit.ConcurrentExecutions", equalTo(1000))
             .body("AccountLimit.UnreservedConcurrentExecutions", equalTo(975));
+
+        given()
+            .header("Authorization", auth("000000000403"))
+        .when()
+            .get(SETTINGS_PATH)
+        .then()
+            .statusCode(200)
+            .body("AccountUsage.FunctionCount", equalTo(0))
+            .body("AccountLimit.UnreservedConcurrentExecutions", equalTo(1000));
     }
 
     private static String auth(String accountId) {
