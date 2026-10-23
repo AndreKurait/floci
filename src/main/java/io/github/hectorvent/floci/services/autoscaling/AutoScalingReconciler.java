@@ -552,7 +552,7 @@ public class AutoScalingReconciler {
                         propagatedInstanceTags(asg, launchSource), launchSource.userData(),
                         launchSource.launchConfigurationName() == null ? launchSource.iamInstanceProfile()
                                 : asgService.resolveLaunchConfigurationProfile(launchSource.iamInstanceProfile()),
-                        launchSource.associatePublicIpAddress(), null, 0, null, launchSource.metadataOptions(), null,
+                        launchSource.associatePublicIpAddress(), null, 0, placement.availabilityZone(), launchSource.metadataOptions(), null,
                         launchSource.encodedUserData() != null ? launchSource.encodedUserData()
                                 : encodeLegacyUserData(launchSource.userData()),
                         false, null, null, launchSource.blockDeviceMappings(), false, null,
