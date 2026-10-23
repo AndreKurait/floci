@@ -335,7 +335,7 @@ class Ec2SharedCapacityReservationServiceTest {
             f.launch(reservation.getCapacityReservationId());
             return true;
         } catch (AwsException failure) {
-            assertEquals("InsufficientInstanceCapacity", failure.getErrorCode());
+            assertEquals("ReservationCapacityExceeded", failure.getErrorCode());
             return false;
         }
     }
