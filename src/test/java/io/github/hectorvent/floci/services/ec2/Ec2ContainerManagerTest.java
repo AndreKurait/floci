@@ -13,6 +13,7 @@ import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.command.PingCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
+import com.github.dockerjava.api.command.StopContainerCmd;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerConfig;
@@ -322,6 +323,61 @@ class Ec2ContainerManagerTest {
         verify(metadataServer, never()).reconcileContainerAddresses(anySet(), any());
         assertEquals("172.17.0.4", instance.getImdsSourceIp(),
                 "a transient Docker failure must not drop an existing IMDS source registration");
+    }
+
+    @Test
+    void restartWaitsForPhysicalStopBeforeStartingTheContainer() {
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        when(lifecycle.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
+        DockerClient docker = mock(DockerClient.class);
+        when(docker.startContainerCmd(TEST_CONTAINER_ID)).thenReturn(mock(StartContainerCmd.class, RETURNS_SELF));
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(docker.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse response = vpcAttachedInspectResponse("10.0.1.10", "172.17.0.9");
+        when(inspect.exec()).thenReturn(response);
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        when(docker.stopContainerCmd(TEST_CONTAINER_ID)).thenReturn(stop);
+        ExecutorService executor = mock(ExecutorService.class);
+        List<Runnable> tasks = new ArrayList<>();
+        doAnswer(invocation -> {
+            tasks.add(invocation.getArgument(0));
+            return null;
+        }).when(executor).submit(any(Runnable.class));
+        Ec2ContainerManager manager = new Ec2ContainerManager(mock(ContainerBuilder.class), lifecycle,
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class), mock(DockerHostResolver.class),
+                docker, mock(PortAllocator.class), mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
+                mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class), executor, Duration.ofSeconds(5));
+        Instance instance = new Instance();
+        instance.setInstanceId("i-stop-restart");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        List<String> operations = new ArrayList<>();
+        AtomicBoolean physicalRunning = new AtomicBoolean(true);
+        when(lifecycle.isContainerRunning(TEST_CONTAINER_ID)).thenAnswer(invocation -> physicalRunning.get());
+        doAnswer(invocation -> {
+            operations.add("stop");
+            physicalRunning.set(false);
+            return null;
+        }).when(stop).exec();
+        StartContainerCmd start = docker.startContainerCmd(TEST_CONTAINER_ID);
+        doAnswer(invocation -> {
+            operations.add("start");
+            physicalRunning.set(true);
+            return null;
+        }).when(start).exec();
+
+        manager.stop(instance);
+        manager.start(instance);
+        assertEquals(1, tasks.size(), "start must wait until the physical stop completes");
+        tasks.getFirst().run();
+        assertEquals(List.of("stop"), operations);
+        assertEquals(2, tasks.size());
+        tasks.get(1).run();
+
+        assertEquals(List.of("stop", "start"), operations);
+        assertTrue(physicalRunning.get());
+        assertEquals("running", instance.getState().getName());
     }
 
     @Test
