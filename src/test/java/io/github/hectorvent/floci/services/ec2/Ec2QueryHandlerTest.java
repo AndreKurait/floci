@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
@@ -21,6 +22,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Answers;
 import org.mockito.ArgumentCaptor;
 
 import java.nio.charset.StandardCharsets;
@@ -28,6 +30,7 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static io.github.hectorvent.floci.core.common.SshPublicKeysTest.withTrailing;
@@ -51,6 +54,41 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class Ec2QueryHandlerTest {
+    @ParameterizedTest
+    @CsvSource(value = {"us-east-1b,us-east-1c,us-east-1b", "NULL,us-east-1c,us-east-1c",
+            "'',us-east-1c,us-east-1c", "'   ',us-east-1c,us-east-1c", "us-east-1b,NULL,us-east-1b",
+            "NULL,NULL,NULL"}, nullValues = "NULL")
+    void runInstancesForwardsRequestZoneBeforeTemplateZone(String requestZone, String templateZone,
+                                                          String expectedZone) {
+        AtomicReference<String> forwarded = new AtomicReference<>("not invoked");
+        Ec2Service service = mock(Ec2Service.class, invocation -> {
+            if (invocation.getMethod().getName().equals("runInstances")) {
+                forwarded.set(invocation.getArgument(15));
+                return new Reservation();
+            }
+            return Answers.RETURNS_DEFAULTS.answer(invocation);
+        });
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("MinCount", "1");
+        params.putSingle("MaxCount", "1");
+        params.putSingle("ImageId", "ami-test");
+        params.putSingle("InstanceType", "t3.micro");
+        if (requestZone != null) {
+            params.putSingle("Placement.AvailabilityZone", requestZone);
+        }
+        if (templateZone != null) {
+            params.putSingle("LaunchTemplate.LaunchTemplateId", "lt-test");
+            LaunchTemplateData data = new LaunchTemplateData();
+            LaunchTemplateData.Placement placement = new LaunchTemplateData.Placement();
+            placement.setAvailabilityZone(templateZone);
+            data.setPlacement(placement);
+            when(service.resolveLaunchTemplateData("us-east-1", "lt-test", null, null, true)).thenReturn(data);
+        }
+        Response response = handler(service).handle("RunInstances", params, "us-east-1");
+        assertEquals(200, response.getStatus(), response.getEntity().toString());
+        assertEquals(expectedZone, forwarded.get());
+    }
+
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
