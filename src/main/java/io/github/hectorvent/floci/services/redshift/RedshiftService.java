@@ -203,7 +203,7 @@ public class RedshiftService {
                     LOG.warnv(ex, "Failed to stop proxy during recovery rollback for cluster {0}", cluster.getClusterIdentifier());
                 }
                 try {
-                    containerManager.stop(entry.accountId(), cluster.getClusterIdentifier());
+                    containerManager.rollbackStartup(entry.accountId(), cluster.getClusterIdentifier());
                 } catch (Exception ex) {
                     LOG.warnv(ex, "Failed to stop container during recovery rollback for cluster {0}", cluster.getClusterIdentifier());
                 }
@@ -950,8 +950,8 @@ public class RedshiftService {
         Cluster cluster = clusters.get(clusterIdentifier)
                 .orElseThrow(() -> new AwsException("ClusterNotFound", "Cluster " + clusterIdentifier + " not found", 404));
 
-        // The container backing a cluster has no persistent volume (see RedshiftContainerManager),
-        // so a plain stop+recreate would silently drop the cluster's data. Dump before stopping and
+        // Replacement containers do not reattach the old anonymous volume, so a plain stop+recreate
+        // would silently drop the cluster's data. Dump before stopping and
         // restore immediately after starting, using a throwaway temp file, so no Snapshot resource is
         // created or exposed to the caller.
         Path tempDump;
@@ -964,16 +964,18 @@ public class RedshiftService {
         // Hoisted so a failure after the proxy is (re)started still tears it down and
         // returns the port, matching createCluster/restoreFromClusterSnapshot rollback.
         int proxyPort = cluster.getProxyPort() > 0 ? cluster.getProxyPort() : -1;
-        boolean originalTornDown = false; // original proxy + container already stopped
+        boolean teardownStarted = false;
+        boolean containerTeardownStarted = false;
         boolean rebooted = false;
         try {
             String accountId = clusters.accountId();
             String key = relayKey(accountId, clusterIdentifier);
 
             containerManager.takeSnapshot(accountId, clusterIdentifier, cluster.getMasterUsername(), tempDump);
+            teardownStarted = true;
             proxyManager.stopProxy(key);
+            containerTeardownStarted = true;
             containerManager.stop(accountId, clusterIdentifier);
-            originalTornDown = true;
 
             String password = cluster.getMasterPassword() != null ? cluster.getMasterPassword() : "admin";
             RedshiftContainerHandle handle = containerManager.start(
@@ -997,15 +999,15 @@ public class RedshiftService {
             cluster.setClusterStatus("available");
             rebooted = true;
         } catch (AwsException e) {
-            rollbackReboot(clusterIdentifier, originalTornDown);
-            if (originalTornDown) {
+            rollbackReboot(clusterIdentifier, containerTeardownStarted);
+            if (teardownStarted) {
                 cluster.setClusterStatus("failed");
             }
             clusters.flush();
             throw e;
         } catch (Exception e) {
-            rollbackReboot(clusterIdentifier, originalTornDown);
-            if (originalTornDown) {
+            rollbackReboot(clusterIdentifier, containerTeardownStarted);
+            if (teardownStarted) {
                 cluster.setClusterStatus("failed");
             }
             clusters.flush();
@@ -1018,9 +1020,9 @@ public class RedshiftService {
                     LOG.warnv(ex, "Failed to clean up temporary dump file {0} after rebooting cluster {1}", tempDump, clusterIdentifier);
                 }
             } else {
-                if (originalTornDown) {
-                    // Once the original container is torn down it holds no volume, so this dump can
-                    // be the only surviving copy of the cluster's data, so keep it for manual recovery.
+                if (teardownStarted) {
+                    // Teardown may have removed the original container before failing. Keep the
+                    // dump for manual recovery even when removal or log closure did not finish.
                     LOG.warnv("Reboot of cluster {0} did not complete; retained pre-reboot data dump at {1}",
                             clusterIdentifier, tempDump);
                 } else {
@@ -2115,17 +2117,14 @@ public class RedshiftService {
     }
 
     /**
-     * Undo a failed reboot. If {@code originalTornDown} is false the reboot failed before
-     * the original proxy + container were stopped, so the original data-bearing container
-     * is still running and nothing must be touched. Once it is true the original is gone:
-     * tear down the (replacement's) proxy and return its port, and remove any container
-     * running under the cluster's name: {@code containerManager.stop} works by name, so
-     * this also cleans a replacement that {@code containerManager.start} created before
-     * throwing (e.g. its readiness check timed out). The pre-reboot data dump is kept by
-     * the caller.
+     * Undo a failed reboot once container teardown has started. Before that point the
+     * original data-bearing container must be preserved, even if proxy shutdown failed.
+     * Teardown may be partial: stop the proxy and remove the container tracked by the
+     * manager, including a replacement retained after a failed readiness check. The
+     * caller keeps the pre-reboot data dump.
      */
-    private void rollbackReboot(String identifier, boolean originalTornDown) {
-        if (!originalTornDown) {
+    private void rollbackReboot(String identifier, boolean containerTeardownStarted) {
+        if (!containerTeardownStarted) {
             return;
         }
         try {
