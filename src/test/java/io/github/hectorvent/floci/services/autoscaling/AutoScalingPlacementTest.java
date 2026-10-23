@@ -33,6 +33,7 @@ import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.eq;
+import static org.mockito.Mockito.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -355,7 +356,7 @@ class AutoScalingPlacementTest {
             });
             when(ec2.runInstances(any(), any(), any(), anyInt(), anyInt(), any(), any(), any(), any(),
                     any(), any(), any(), any(), any(), anyInt(), any(), any(), any(), any(), eq(false),
-                    any(), any(), anyList())).thenAnswer(call -> {
+                    any(), any(), anyList(), eq(false), isNull(), isNull())).thenAnswer(call -> {
                         if (allocations >= failAfter) {
                             if (deleteOnFailure) {
                                 groupPresent = false;
