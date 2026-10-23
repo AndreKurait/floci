@@ -28,7 +28,6 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
-import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.anyString;
@@ -355,8 +354,8 @@ class AutoScalingPlacementTest {
                 return List.of(reservation);
             });
             when(ec2.runInstances(any(), any(), any(), anyInt(), anyInt(), any(), any(), any(), any(),
-                    any(), any(), any(), any(), any(), anyInt(), any(), any(), any(), any(),
-                    anyBoolean(), any(), any(), any())).thenAnswer(call -> {
+                    any(), any(), any(), any(), any(), anyInt(), any(), any(), any(), any(), eq(false),
+                    any(), any(), anyList())).thenAnswer(call -> {
                         if (allocations >= failAfter) {
                             if (deleteOnFailure) {
                                 groupPresent = false;
@@ -364,7 +363,7 @@ class AutoScalingPlacementTest {
                             throw launchFailure;
                         }
                         String subnet = call.getArgument(7);
-                        String zone = null;
+                        String zone = call.getArgument(15);
                         if (subnet != null) {
                             if (!ipv6Only.contains(subnet) && availableIps.getOrDefault(subnet, 251) == 0) {
                                 throw new AwsException("InsufficientFreeAddressesInSubnet",
