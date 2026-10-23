@@ -17,6 +17,8 @@ public class Deployment {
     private int deploymentNumber;
     @JsonProperty("ConfigurationName")
     private String configurationName;
+    @JsonProperty("ConfigurationLocationUri")
+    private String configurationLocationUri;
     @JsonProperty("ConfigurationVersion")
     private String configurationVersion;
     @JsonProperty("DeploymentStrategyId")
@@ -42,6 +44,9 @@ public class Deployment {
 
     public String getConfigurationName() { return configurationName; }
     public void setConfigurationName(String configurationName) { this.configurationName = configurationName; }
+
+    public String getConfigurationLocationUri() { return configurationLocationUri; }
+    public void setConfigurationLocationUri(String configurationLocationUri) { this.configurationLocationUri = configurationLocationUri; }
 
     public String getConfigurationVersion() { return configurationVersion; }
     public void setConfigurationVersion(String configurationVersion) { this.configurationVersion = configurationVersion; }
