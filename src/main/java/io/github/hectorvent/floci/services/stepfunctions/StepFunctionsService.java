@@ -1213,6 +1213,29 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         return reportedAt != null ? reportedAt : System.nanoTime();
     }
 
+    enum TokenTimeout { NONE, CLAIMED, EXECUTION, TASK, HEARTBEAT }
+
+    /** Selects an expired clock and closes its token under the callback and heartbeat lock. */
+    synchronized TokenTimeout expirePendingToken(String taskToken, long now, long executionDeadlineNanos,
+                                                 long timeoutDeadlineNanos, int heartbeatSeconds) {
+        if (!pendingTaskTokens.containsKey(taskToken)) {
+            return TokenTimeout.CLAIMED;
+        }
+        TokenTimeout expired;
+        if (now >= executionDeadlineNanos) {
+            expired = TokenTimeout.EXECUTION;
+        } else if (now >= timeoutDeadlineNanos) {
+            expired = TokenTimeout.TASK;
+        } else if (heartbeatSeconds > 0 && now >= lastTaskHeartbeatNanos(taskToken)
+                + TimeUnit.SECONDS.toNanos(heartbeatSeconds)) {
+            expired = TokenTimeout.HEARTBEAT;
+        } else {
+            return TokenTimeout.NONE;
+        }
+        discardPendingToken(taskToken);
+        return expired;
+    }
+
     /** Retires a token when its task stops waiting, including timeout and resource failure. */
     public synchronized void discardPendingToken(String taskToken) {
         if (taskToken != null) {
