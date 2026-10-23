@@ -3678,13 +3678,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         LaunchTemplateData.CapacityReservationTarget capacityTarget = capacitySpecification == null ? null
                 : capacitySpecification.getCapacityReservationTarget();
         String capacityTargetId = capacityTarget == null ? null : capacityTarget.getCapacityReservationId();
-        if (!Set.of("open", "none").contains(capacityPreference)) {
+        if (!Set.of("open", "none", "capacity-reservations-only").contains(capacityPreference)) {
             throw new AwsException("InvalidParameterValue", "Invalid Capacity Reservation preference.", 400);
         }
         if (capacityTarget != null && capacityTarget.getCapacityReservationResourceGroupArn() != null) {
             throw new AwsException("Unsupported", "Capacity Reservation resource group targeting is not supported.", 400);
         }
-        if (capacityTargetId != null && ("none".equals(capacityPreference) || spot)) {
+        if ((capacityTargetId != null && "none".equals(capacityPreference))
+                || (spot && (capacityTargetId != null || "capacity-reservations-only".equals(capacityPreference)))) {
             throw new AwsException("InvalidParameterCombination", "Invalid Capacity Reservation target combination.", 400);
         }
         if (privateIpAddress != null && privateIpAddress.isBlank()) {
@@ -3790,10 +3791,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             privateIpAddress = validateRequestedPrivateIp(privateIpAddress, subnet, suppliedEni, maxCount);
         }
         int capacityMaxCount = maxCount;
-        if (capacityTargetId != null) {
+        if (capacityTargetId != null || "capacity-reservations-only".equals(capacityPreference)) {
             synchronized (capacityReservationLock) {
                 reconcileCapacityMembership(region);
-                CapacityReservation target = getRequiredCapacityReservation(region, capacityTargetId);
+                CapacityReservation target = capacityTargetId == null ? null
+                        : getRequiredCapacityReservation(region, capacityTargetId);
                 Instance requested = new Instance();
                 requested.setOwnerId(callerAccountId());
                 requested.setRegion(region);
@@ -3804,15 +3806,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     requestedPlacement.setTenancy(tenancy);
                 }
                 requested.setPlacement(requestedPlacement);
-                if (!matchesCapacityReservation(requested, target)) {
+                if (target != null && !matchesCapacityReservation(requested, target)) {
                     throw new AwsException("InsufficientInstanceCapacity",
                             "The targeted Capacity Reservation has no matching available capacity.", 400);
                 }
-                if (target.getAvailableInstanceCount() < minCount) {
-                    throw new AwsException("ReservationCapacityExceeded",
-                            "The targeted Capacity Reservation has insufficient available capacity.", 400);
+                long available = target == null
+                        ? capacityReservations.scan(k -> k.startsWith(region + "::")).stream()
+                                .filter(candidate -> "open".equals(candidate.getInstanceMatchCriteria()))
+                                .filter(candidate -> matchesCapacityReservation(requested, candidate))
+                                .mapToLong(CapacityReservation::getAvailableInstanceCount).sum()
+                        : target.getAvailableInstanceCount();
+                if (available < Math.max(minCount, 1)) {
+                    throw new AwsException(target == null ? "InsufficientInstanceCapacity" : "ReservationCapacityExceeded",
+                            target == null ? "No matching Capacity Reservation has sufficient available capacity."
+                                    : "The targeted Capacity Reservation has insufficient available capacity.", 400);
                 }
-                capacityMaxCount = Math.min(maxCount, target.getAvailableInstanceCount());
+                capacityMaxCount = (int) Math.min(maxCount, available);
                 count = capacityMaxCount;
             }
         }
@@ -10020,6 +10029,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         }
                         throw new AwsException("InsufficientInstanceCapacity",
                                 "The targeted Capacity Reservation has no matching available capacity.", 400);
+                    }
+                    if ("capacity-reservations-only".equals(instance.getCapacityReservationPreference())) {
+                        throw new AwsException("InsufficientInstanceCapacity",
+                                "No matching Capacity Reservation has available capacity.", 400);
                     }
                     continue;
                 }
