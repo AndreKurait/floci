@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.services.marketplace.MarketplaceEntitlementCon
 import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsJsonHandler;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
@@ -292,6 +293,7 @@ public class AwsJsonCborController {
     @Path("service/{serviceId}/operation/{operation}")
     @Consumes({GENERIC_CBOR_MEDIA_TYPE, AWS_CBOR_1_1_MEDIA_TYPE})
     @Produces({GENERIC_CBOR_MEDIA_TYPE, AWS_CBOR_1_1_MEDIA_TYPE})
+    @RunOnVirtualThread
     public Response handleSmithyRpcV2Cbor(
             @PathParam(RPC_V2_SERVICE_PARAMETER) String serviceId,
             @PathParam(RPC_V2_OPERATION_PARAMETER) String operation,
@@ -384,6 +386,7 @@ public class AwsJsonCborController {
     @POST
     @Consumes({GENERIC_CBOR_MEDIA_TYPE, AWS_CBOR_1_1_MEDIA_TYPE})
     @Produces({GENERIC_CBOR_MEDIA_TYPE, AWS_CBOR_1_1_MEDIA_TYPE})
+    @RunOnVirtualThread
     public Response handleCborRequest(
             @HeaderParam("X-Amz-Target") String target,
             @Context HttpHeaders httpHeaders,
