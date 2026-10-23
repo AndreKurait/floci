@@ -9,6 +9,8 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -30,7 +32,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       inflight invocations are counted against that value and do not consume
  *       the region's unreserved pool.</li>
  *   <li><b>Unreserved (account-and-region-shared)</b>: functions without a reserved value
- *       share {@code regionLimit - Σreserved} permits within their account and region.</li>
+ *       share capacity left after reservations and unreserved provisioned allocations
+ *       within their account and region.</li>
  * </ul>
  */
 @ApplicationScoped
@@ -55,13 +58,14 @@ public class LambdaConcurrencyLimiter implements Resettable {
             = new ConcurrentHashMap<>();
     /**
      * Running sum of {@link #reservedByScope} values per account and region. Maintained
-     * under {@link #reservedLock} on every mutation so that unreserved
-     * acquisition can read a consistent cap in O(1).
+     * under {@link #reservedLock} on every mutation for reservation reporting.
      */
     private final ConcurrentHashMap<String, AtomicInteger> scopeReservedTotal = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Map<String, Integer>> provisionedByFunction = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicInteger> scopeCommittedTotal = new ConcurrentHashMap<>();
     /** Unreserved inflight counters partitioned by account and region. */
     private final ConcurrentHashMap<String, AtomicInteger> unreservedByScope = new ConcurrentHashMap<>();
-    /** Guards atomic validate-then-set and rollback operations on the reserved state. */
+    /** Guards atomic validate-then-set and rollback operations on concurrency commitments. */
     private final Object reservedLock = new Object();
     private final int regionLimit;
     private final int unreservedMin;
@@ -92,6 +96,10 @@ public class LambdaConcurrencyLimiter implements Resettable {
         return acquireReserved(fn.getFunctionArn(), r);
     }
 
+    Permit acquireProvisioned(LambdaFunction fn) {
+        return fn.getReservedConcurrentExecutions() == null ? () -> {} : acquire(fn);
+    }
+
     private Permit acquireReserved(String key, int limit) {
         AtomicInteger counter = inflight.computeIfAbsent(key, k -> new AtomicInteger());
         while (true) {
@@ -107,13 +115,10 @@ public class LambdaConcurrencyLimiter implements Resettable {
 
     private Permit acquireUnreserved(String scope) {
         AtomicInteger counter = unreservedByScope.computeIfAbsent(scope, k -> new AtomicInteger());
-        AtomicInteger reservedTotal = scopeTotal(scope);
+        AtomicInteger committedTotal = committedTotal(scope);
         while (true) {
             int current = counter.get();
-            // reservedTotal is an AtomicInteger updated under reservedLock on
-            // each reserved change, so the cap is consistent and computed in
-            // O(1) regardless of the number of reserved functions.
-            int cap = Math.max(0, regionLimit - reservedTotal.get());
+            int cap = Math.max(0, regionLimit - committedTotal.get());
             if (current >= cap) {
                 throw throttle();
             }
@@ -173,6 +178,10 @@ public class LambdaConcurrencyLimiter implements Resettable {
     public Integer validateAndSetReserved(String functionArn, int target) {
         String scope = scopeOf(functionArn);
         synchronized (reservedLock) {
+            if (target < totalProvisioned(functionArn)) {
+                throw new AwsException("InvalidParameterValueException",
+                        "Reserved concurrency cannot be lower than provisioned concurrency", 400);
+            }
             ConcurrentHashMap<String, Integer> scopeReserved = reservedOf(scope);
             int currentForThis = scopeReserved.getOrDefault(functionArn, 0);
             // A reduction (or no-op) cannot decrease unreserved capacity any
@@ -181,7 +190,10 @@ public class LambdaConcurrencyLimiter implements Resettable {
             // lowering region-concurrency-limit at runtime — without first
             // having to delete every reservation.
             if (target > currentForThis) {
-                int otherReserved = scopeTotal(scope).get() - currentForThis;
+                int otherReserved = committedTotal(scope).get() - currentForThis;
+                if (!scopeReserved.containsKey(functionArn)) {
+                    otherReserved -= totalProvisioned(functionArn);
+                }
                 int maxAllowed = regionLimit - unreservedMin - otherReserved;
                 if (target > maxAllowed) {
                     LOG.warnv("Account/region {0} reservation pool exhausted: requested={1}, "
@@ -218,6 +230,56 @@ public class LambdaConcurrencyLimiter implements Resettable {
         }
     }
 
+    Integer validateAndSetProvisioned(String functionArn, String qualifier, int target) {
+        synchronized (reservedLock) {
+            String scope = scopeOf(functionArn);
+            Map<String, Integer> values = provisionedByFunction.getOrDefault(functionArn, Map.of());
+            int previous = values.getOrDefault(qualifier, 0);
+            Integer reserved = reservedOf(scope).get(functionArn);
+            if (reserved != null) {
+                if ((long) totalProvisioned(functionArn) - previous + target > reserved) {
+                    throw new AwsException("InvalidParameterValueException",
+                            "Requested Provisioned Concurrency should not be greater than "
+                                    + "the reservedConcurrentExecution for function", 400);
+                }
+            } else if (target > previous) {
+                int available = regionLimit - committedTotal(scope).get() + previous;
+                if (target > available) {
+                    throw new AwsException("InvalidParameterValueException",
+                            "Specified ConcurrentExecutions for function is greater than account's "
+                                    + "unreserved concurrency [" + available + "].", 400);
+                }
+                if (available - target < unreservedMin) {
+                    throw new AwsException("InvalidParameterValueException",
+                            "Specified ConcurrentExecutions for function decreases account's "
+                                    + "UnreservedConcurrentExecution below its minimum value of ["
+                                    + unreservedMin + "].", 400);
+                }
+            }
+            return writeProvisioned(functionArn, qualifier, target);
+        }
+    }
+
+    void setProvisioned(String functionArn, String qualifier, int value) {
+        synchronized (reservedLock) {
+            writeProvisioned(functionArn, qualifier, value);
+        }
+    }
+
+    void clearProvisioned(String functionArn, String qualifier) {
+        synchronized (reservedLock) {
+            writeProvisioned(functionArn, qualifier, null);
+        }
+    }
+
+    void rollbackProvisionedIfExpected(String functionArn, String qualifier, int expected, Integer previous) {
+        synchronized (reservedLock) {
+            if (Objects.equals(provisionedByFunction.getOrDefault(functionArn, Map.of()).get(qualifier), expected)) {
+                writeProvisioned(functionArn, qualifier, previous);
+            }
+        }
+    }
+
     /**
      * Clears the reserved entry for a deleted function. The inflight counter
      * is intentionally retained — permits held by still-running invocations
@@ -244,6 +306,8 @@ public class LambdaConcurrencyLimiter implements Resettable {
             inflight.clear();
             reservedByScope.clear();
             scopeReservedTotal.clear();
+            provisionedByFunction.clear();
+            scopeCommittedTotal.clear();
             unreservedByScope.clear();
         }
     }
@@ -255,7 +319,11 @@ public class LambdaConcurrencyLimiter implements Resettable {
     public int availableUnreserved(String accountId, String region) {
         AtomicInteger counter = unreservedByScope.get(region + ":" + accountId);
         int inflightNow = counter == null ? 0 : counter.get();
-        return Math.max(0, regionLimit - totalReserved(accountId, region) - inflightNow);
+        return Math.max(0, unreservedCapacity(accountId, region) - inflightNow);
+    }
+
+    public int unreservedCapacity(String accountId, String region) {
+        return Math.max(0, regionLimit - committedTotal(region + ":" + accountId).get());
     }
 
     int inflightCount(String functionArn) {
@@ -283,7 +351,31 @@ public class LambdaConcurrencyLimiter implements Resettable {
         if (delta != 0) {
             scopeTotal(scope).addAndGet(delta);
         }
+        int provisioned = totalProvisioned(functionArn);
+        int previousUnreserved = previous == null ? provisioned : 0;
+        int nextUnreserved = newValue == null ? provisioned : 0;
+        committedTotal(scope).addAndGet(delta + nextUnreserved - previousUnreserved);
         return previous;
+    }
+
+    private Integer writeProvisioned(String functionArn, String qualifier, Integer value) {
+        Map<String, Integer> values = new HashMap<>(provisionedByFunction.getOrDefault(functionArn, Map.of()));
+        Integer previous = value == null ? values.remove(qualifier) : values.put(qualifier, value);
+        if (values.isEmpty()) {
+            provisionedByFunction.remove(functionArn);
+        } else {
+            provisionedByFunction.put(functionArn, Map.copyOf(values));
+        }
+        String scope = scopeOf(functionArn);
+        if (!reservedOf(scope).containsKey(functionArn)) {
+            committedTotal(scope).addAndGet((value == null ? 0 : value) - (previous == null ? 0 : previous));
+        }
+        return previous;
+    }
+
+    private int totalProvisioned(String functionArn) {
+        return provisionedByFunction.getOrDefault(functionArn, Map.of()).values().stream()
+                .mapToInt(Integer::intValue).sum();
     }
 
     private ConcurrentHashMap<String, Integer> reservedOf(String scope) {
@@ -292,6 +384,10 @@ public class LambdaConcurrencyLimiter implements Resettable {
 
     private AtomicInteger scopeTotal(String scope) {
         return scopeReservedTotal.computeIfAbsent(scope, k -> new AtomicInteger());
+    }
+
+    private AtomicInteger committedTotal(String scope) {
+        return scopeCommittedTotal.computeIfAbsent(scope, ignored -> new AtomicInteger());
     }
 
     /**
