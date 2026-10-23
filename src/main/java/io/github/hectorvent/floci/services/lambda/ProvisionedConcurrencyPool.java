@@ -163,9 +163,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             throw invalid("Provisioned concurrency requires the non-ephemeral Docker Lambda executor");
         }
         LambdaFunction fn = currentFunction(target);
-        if (fn.isHotReload() || fn.isDurable()) {
-            throw invalid("Provisioned concurrency is not supported for hot-reload or durable functions");
-        }
+        validateSupportedTarget(fn);
         List<ContainerHandle> retired = List.of();
         Status result;
         synchronized (lock) {
@@ -378,7 +376,15 @@ public class ProvisionedConcurrencyPool implements Resettable {
             if (stopped) {
                 return;
             }
-            for (Allocation allocation : new ArrayList<>(allocations.values())) {
+            for (Allocation previous : new ArrayList<>(allocations.values())) {
+                Allocation allocation;
+                try {
+                    allocation = refreshAlias(previous, retired);
+                } catch (RuntimeException failure) {
+                    LOG.warnv(failure, "Could not refresh provisioned Lambda alias allocation {0}",
+                            previous.configuration.key());
+                    continue;
+                }
                 if ("FAILED".equals(allocation.status)) {
                     continue;
                 }
@@ -434,6 +440,37 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 .map(LambdaAlias::getFunctionVersion).orElse(null);
     }
 
+    private Allocation refreshAlias(Allocation previous, List<ContainerHandle> retired) {
+        Configuration value = previous.configuration;
+        if (value.qualifier().matches("[0-9]+")) {
+            return previous;
+        }
+        LambdaAlias alias = aliases.getForAccount(value.account(), value.region(), value.name(), value.qualifier())
+                .orElse(null);
+        if (alias == null || Objects.equals(value.version(), alias.getFunctionVersion())
+                || (alias.getRoutingConfig() != null && !alias.getRoutingConfig().isEmpty())
+                || alias.getFunctionVersion() == null || !alias.getFunctionVersion().matches("[0-9]+")) {
+            return previous;
+        }
+        if (functions.getForAccount(value.account(), value.region(), value.name()).isEmpty()) {
+            return previous;
+        }
+        LambdaFunction fn = functions.getForAccount(value.account(), value.region(), value.name(),
+                alias.getFunctionVersion()).orElse(null);
+        if (fn == null) {
+            return previous;
+        }
+        validateSupportedTarget(fn);
+        Configuration target = new Configuration(value.account(), value.region(), value.name(),
+                value.functionArn(), value.qualifier(), fn.getVersion(), fn.getRevisionId(), value.requested(),
+                LAST_MODIFIED.format(Instant.ofEpochMilli(clock.millis())));
+        write(target);
+        Allocation next = new Allocation(target);
+        allocations.put(target.key(), next);
+        retired.addAll(retire(previous));
+        return next;
+    }
+
     void validateAliasUpdate(LambdaFunction fn, String qualifier, String version) {
         synchronized (lock) {
             String functionArn = baseArn(fn);
@@ -443,6 +480,11 @@ public class ProvisionedConcurrencyPool implements Resettable {
             if ("$LATEST".equals(version)) {
                 throw invalid("Provisioned Concurrency Configs cannot be applied to unpublished function versions.");
             }
+            if (version != null && version.matches("[0-9]+")) {
+                AwsArnUtils.Arn arn = AwsArnUtils.parse(functionArn);
+                functions.getForAccount(arn.accountId(), arn.region(), fn.getFunctionName(), version)
+                        .ifPresent(ProvisionedConcurrencyPool::validateSupportedTarget);
+            }
             if (version != null && version.matches("[0-9]+") && allocations.values().stream()
                     .anyMatch(entry -> functionArn.equals(entry.configuration.functionArn())
                             && !qualifier.equals(entry.configuration.qualifier())
@@ -450,6 +492,12 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 throw new AwsException("ResourceConflictException",
                         "Alias can't be used for Provisioned Concurrency configuration on an already Provisioned version", 409);
             }
+        }
+    }
+
+    private static void validateSupportedTarget(LambdaFunction fn) {
+        if (fn.isHotReload() || fn.isDurable()) {
+            throw invalid("Provisioned concurrency is not supported for hot-reload or durable functions");
         }
     }
 
