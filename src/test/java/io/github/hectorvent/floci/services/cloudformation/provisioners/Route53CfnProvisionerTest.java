@@ -630,6 +630,37 @@ class Route53CfnProvisionerTest {
     }
 
     @Test
+    void anUpdateThatOnlyChangesNameCaseKeepsTheRecord() {
+        Route53Service service = mock(Route53Service.class);
+        ResourceRecordSet stored = new ResourceRecordSet();
+        stored.setName("www.example.com.");
+        stored.setType("A");
+        when(service.listResourceRecordSets("Z1", null, null, 0)).thenReturn(List.of(stored));
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode props = mapper.createObjectNode()
+                .put("HostedZoneId", "Z1")
+                .put("Name", "WWW.EXAMPLE.COM.")
+                .put("Type", "A");
+        ProvisionContext context = new ProvisionContext(recordEngine(), "us-east-1", "623666680275",
+                "dns-stack", "www.example.com");
+        StackResource resource = new StackResource();
+        resource.setLogicalId("Www");
+        resource.setResourceType("AWS::Route53::RecordSet");
+        resource.setPhysicalId("www.example.com");
+        resource.getAttributes().put("__FlociRoute53RecordZoneId", "Z1");
+        resource.getAttributes().put("__FlociRoute53RecordType", "A");
+
+        new Route53CfnProvisioner(service).provision(resource, props, context);
+
+        // Both names are the same record once fully qualified, so the UPSERT is the only change: a
+        // DELETE of the "prior" name would remove the record the UPSERT just wrote.
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<Map<String, Object>>> captor = ArgumentCaptor.forClass(List.class);
+        verify(service).changeResourceRecordSets(eq("Z1"), captor.capture(), any());
+        assertEquals("UPSERT", captor.getValue().get(0).get("action"));
+    }
+
+    @Test
     void anUpdateWithABlankSetIdentifierKeepsTheRecordWithoutOne() {
         Route53Service service = mock(Route53Service.class);
         ObjectMapper mapper = new ObjectMapper();
