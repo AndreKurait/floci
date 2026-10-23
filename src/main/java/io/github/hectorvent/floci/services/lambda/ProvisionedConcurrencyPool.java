@@ -378,7 +378,8 @@ public class ProvisionedConcurrencyPool implements Resettable {
             if (stopped) {
                 return;
             }
-            for (Allocation allocation : new ArrayList<>(allocations.values())) {
+            for (Allocation previous : new ArrayList<>(allocations.values())) {
+                Allocation allocation = refreshAlias(previous, retired);
                 if ("FAILED".equals(allocation.status)) {
                     continue;
                 }
@@ -432,6 +433,36 @@ public class ProvisionedConcurrencyPool implements Resettable {
         return aliases.getForAccount(configuration.account(), configuration.region(),
                 configuration.name(), configuration.qualifier())
                 .map(LambdaAlias::getFunctionVersion).orElse(null);
+    }
+
+    private Allocation refreshAlias(Allocation previous, List<ContainerHandle> retired) {
+        Configuration value = previous.configuration;
+        if (value.qualifier().matches("[0-9]+")) {
+            return previous;
+        }
+        LambdaAlias alias = aliases.getForAccount(value.account(), value.region(), value.name(), value.qualifier())
+                .orElse(null);
+        if (alias == null || Objects.equals(value.version(), alias.getFunctionVersion())
+                || (alias.getRoutingConfig() != null && !alias.getRoutingConfig().isEmpty())
+                || alias.getFunctionVersion() == null || !alias.getFunctionVersion().matches("[0-9]+")) {
+            return previous;
+        }
+        if (functions.getForAccount(value.account(), value.region(), value.name()).isEmpty()) {
+            return previous;
+        }
+        LambdaFunction fn = functions.getForAccount(value.account(), value.region(), value.name(),
+                alias.getFunctionVersion()).orElse(null);
+        if (fn == null) {
+            return previous;
+        }
+        Configuration target = new Configuration(value.account(), value.region(), value.name(),
+                value.functionArn(), value.qualifier(), fn.getVersion(), fn.getRevisionId(), value.requested(),
+                LAST_MODIFIED.format(Instant.ofEpochMilli(clock.millis())));
+        write(target);
+        Allocation next = new Allocation(target);
+        allocations.put(target.key(), next);
+        retired.addAll(retire(previous));
+        return next;
     }
 
     void validateAliasUpdate(LambdaFunction fn, String qualifier, String version) {
