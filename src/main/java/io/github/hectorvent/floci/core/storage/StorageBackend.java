@@ -25,6 +25,16 @@ public interface StorageBackend<K, V> {
         entries.forEach(this::put);
     }
 
+    /**
+     * Publish replacement values as one batch, including in snapshots and WAL replay.
+     * Callers must not mutate values already stored here. Persistent and WAL backends
+     * report write failures before publishing; hybrid retains its asynchronous durability.
+     * Unsupported backends reject the operation without changing any entries.
+     */
+    default void putAllAtomically(Map<K, V> entries) {
+        throw new UnsupportedOperationException("Atomic batches are not supported by this backend");
+    }
+
     Optional<V> get(K key);
 
     void delete(K key);

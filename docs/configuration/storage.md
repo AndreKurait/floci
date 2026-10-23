@@ -11,6 +11,28 @@ Floci supports four storage backends. You can set a global default and override 
 | `hybrid` | Yes | In-memory reads, async flush to disk | General local development |
 | `wal` | Yes | Append-only write-ahead log with compaction | High-write workloads |
 
+### Atomic replacement batches
+
+Services that need to replace related records together can use the opt-in
+`StorageBackend.putAllAtomically` operation. Values must be copied before modification;
+the operation does not make existing mutable objects immutable. Memory publication and
+individual scans see the whole batch. Separate reads are not a transaction. Atomic batches
+copy the store's key/value map before publishing it, so their memory and CPU cost grows
+with the number of stored entries. Reads remain lock-free during snapshot writes and WAL
+compaction; ordinary writes retain their existing storage policy.
+
+Persistent storage writes the complete candidate snapshot before publishing it in memory.
+WAL storage writes a single framed batch, so replay applies either the whole batch or none
+of a truncated frame. Both report write errors to the caller. Hybrid storage swaps in the prepared
+batch map and retains its configured asynchronous flush interval; an unflushed batch can still be lost on restart. Ordinary `putAll` keeps its
+existing batching behavior and does not provide this atomicity guarantee. Partitioned
+stores do not implement the opt-in operation.
+
+WAL replay still accepts existing PUT and DELETE records. Older Floci versions cannot
+read the new batch record format; do not downgrade a store containing batch records
+without first making a backup and completing a clean shutdown that compacts its WAL.
+This is a batch/replay guarantee, not a claim of hardware power-loss durability.
+
 ## Global Configuration
 
 | Variable | Default | Description |
