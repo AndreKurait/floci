@@ -960,7 +960,7 @@ class SamTransformProcessor {
         resources.set(logicalId, lambdaResource);
 
         String aliasLogicalId = expandAutoPublishAlias(logicalId, properties,
-                lambdaResource.path("Properties"), passthrough, template, parameterValues, resources);
+                (ObjectNode) lambdaResource.path("Properties"), passthrough, template, parameterValues, resources);
         List<ObjectNode> eventInvokePolicies = expandEventInvokeConfig(
                 logicalId, properties, aliasLogicalId, passthrough, template, resources, parameterValues);
 
@@ -999,7 +999,7 @@ class SamTransformProcessor {
      * which publishes, and the alias follows it; a given {@code AutoPublishCodeSha256} fixes the id
      * instead.
      */
-    private String expandAutoPublishAlias(String functionLogicalId, JsonNode properties, JsonNode functionProperties,
+    private String expandAutoPublishAlias(String functionLogicalId, JsonNode properties, ObjectNode functionProperties,
                                           ObjectNode passthrough, JsonNode template,
                                           Map<String, String> parameterValues, ObjectNode resources) {
         validateVersionProperties(functionLogicalId, properties);
@@ -1007,6 +1007,20 @@ class SamTransformProcessor {
         if (aliasName.isMissingNode() || aliasName.isNull()
                 || (aliasName.isTextual() && aliasName.asText().isBlank())) {
             return null;
+        }
+
+        String codeSha256 = autoPublishCodeSha256(functionLogicalId, properties, template, parameterValues);
+        if (codeSha256 != null && !codeSha256.isEmpty()) {
+            JsonNode description = resolveParameterRefs(properties.path("Description"), template, parameterValues);
+            if (!isTruthy(description) || description.isTextual()) {
+                functionProperties.put("Description", isTruthy(description)
+                        ? description.asText() + " " + codeSha256 : codeSha256);
+            } else {
+                ObjectNode joined = objectMapper.createObjectNode();
+                joined.set("Fn::Join", objectMapper.createArrayNode().add(" ")
+                        .add(objectMapper.createArrayNode().add(description).add(codeSha256)));
+                functionProperties.set("Description", joined);
+            }
         }
 
         String versionId = uniqueId(
@@ -1630,6 +1644,7 @@ class SamTransformProcessor {
         copyIfPresent(properties, "Handler", lambdaProps);
         copyIfPresent(properties, "Runtime", lambdaProps);
         copyIfPresent(properties, "ImageConfig", lambdaProps);
+        copyIfPresent(properties, "Description", lambdaProps);
 
         lambdaProps.set("Code", buildLambdaCode(properties));
 
