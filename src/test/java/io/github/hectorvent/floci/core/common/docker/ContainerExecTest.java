@@ -14,7 +14,9 @@ import org.junit.jupiter.api.Test;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.function.Consumer;
 
@@ -122,6 +124,20 @@ class ContainerExecTest {
         assertEquals(-1L, result.exitCode());
         assertEquals("partial", result.stdout());
         assertEquals("warning\nTimed out after 0s", result.stderr());
+        verify(attach).close();
+        verify(dockerClient, never()).inspectExecCmd(EXEC_ID);
+    }
+
+    @Test
+    void subsecondTimeoutClosesAttachWithoutInspectingExit() throws IOException {
+        Closeable attach = mock(Closeable.class);
+        startWith(callback -> callback.onStart(attach));
+
+        ContainerExec.Result result = ContainerExec.run(dockerClient, CONTAINER_ID, CMD,
+                Duration.ofNanos(1), OutputStream.nullOutputStream(), OutputStream.nullOutputStream());
+
+        assertTrue(result.timedOut());
+        assertEquals("Timed out after PT0.000000001S", result.stderr());
         verify(attach).close();
         verify(dockerClient, never()).inspectExecCmd(EXEC_ID);
     }
