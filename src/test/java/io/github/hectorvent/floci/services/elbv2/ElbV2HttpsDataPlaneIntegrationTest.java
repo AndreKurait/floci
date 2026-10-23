@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.elbv2;
 import com.sun.net.httpserver.HttpServer;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
+import io.github.hectorvent.floci.core.common.CertificateReferenceResolver.CertificateMaterial;
 import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.Certificate;
@@ -11,6 +12,7 @@ import io.github.hectorvent.floci.services.acm.model.CertificateStatus;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import io.github.hectorvent.floci.services.acm.model.ValidationMethod;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.testing.InlineMocks;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.arc.ClientProxy;
 import io.quarkus.test.junit.QuarkusTest;
@@ -18,12 +20,6 @@ import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
-import io.vertx.core.Future;
-import io.vertx.core.Vertx;
-import io.vertx.core.buffer.Buffer;
-import io.vertx.core.http.HttpServerOptions;
-import io.vertx.core.net.PemKeyCertOptions;
-import io.vertx.core.net.SSLOptions;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -1310,40 +1306,39 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     @Order(Integer.MAX_VALUE - 1)
     void identicalCertificateUpdateRecoversAfterAnActualSslRefreshFailure() throws Exception {
         ElbV2DataPlane runtime = ClientProxy.unwrap(dataPlane);
-        Vertx originalVertx = runtime.vertx;
-        Vertx delegatingVertx = mock(Vertx.class, delegatesTo(originalVertx));
-        AtomicBoolean failOnce = new AtomicBoolean(true);
+        CertificateReferenceResolver originalResolver = runtime.certificateResolver;
+        CertificateReferenceResolver wrapped = mock(CertificateReferenceResolver.class, delegatesTo(originalResolver));
         AtomicInteger updates = new AtomicInteger();
-        AtomicReference<Future<Boolean>> failedUpdate = new AtomicReference<>();
-        CountDownLatch failureCompleted = new CountDownLatch(1);
-        doAnswer(creation -> {
-            // Qualify Vert.x HttpServer to distinguish it from the fixture's JDK HttpServer.
-            io.vertx.core.http.HttpServer actual = originalVertx.createHttpServer(
-                    (HttpServerOptions) creation.getArgument(0));
-            io.vertx.core.http.HttpServer wrapped = mock(io.vertx.core.http.HttpServer.class, delegatesTo(actual));
-            doAnswer(update -> {
-                updates.incrementAndGet();
-                if (failOnce.compareAndSet(true, false)) {
-                    SSLOptions invalid = new SSLOptions().setKeyCertOptions(new PemKeyCertOptions()
-                            .addKeyValue(Buffer.buffer("not a PEM private key"))
-                            .addCertValue(Buffer.buffer("not a PEM certificate")));
-                    Future<Boolean> failure = actual.updateSSLOptions(invalid, true);
-                    failedUpdate.set(failure);
-                    failure.onComplete(ignored -> failureCompleted.countDown());
-                    return failure;
+        AtomicReference<String> replacementArn = new AtomicReference<>();
+        AtomicReference<CertificateMaterial> failedMaterial = new AtomicReference<>();
+        doAnswer(call -> {
+            CertificateMaterial material = originalResolver.publishedMaterial(
+                    call.getArgument(0), call.getArgument(1), call.getArgument(2));
+            if (material.arn().equals(replacementArn.get())) {
+                int read = updates.incrementAndGet();
+                if (read == 1) {
+                    CertificateMaterial invalid = InlineMocks.inlineSpy(material);
+                    // Let pair validation succeed, then fail the key-manager load.
+                    AtomicInteger keyReads = new AtomicInteger();
+                    doAnswer(ignored -> keyReads.incrementAndGet() == 1 ? material.privateKey() : "not a PEM private key")
+                            .when(invalid).privateKey();
+                    failedMaterial.set(invalid);
                 }
-                return actual.updateSSLOptions((SSLOptions) update.getArgument(0), true);
-            }).when(wrapped).updateSSLOptions(any(SSLOptions.class), eq(true));
-            return wrapped;
-        }).when(delegatingVertx).createHttpServer(any(HttpServerOptions.class));
+                if (read <= 2) {
+                    return failedMaterial.get();
+                }
+            }
+            return material;
+        }).when(wrapped).publishedMaterial(anyString(), anyString(), anyString());
         LoadBalancerRef loadBalancer = createLoadBalancer("https-refresh-retry");
         Certificate original = null;
         Certificate replacement = null;
         String listener = null;
         try {
-            runtime.vertx = delegatingVertx;
+            runtime.certificateResolver = wrapped;
             original = requestCertificate(loadBalancer.dnsName());
             replacement = requestCertificate(loadBalancer.dnsName());
+            replacementArn.set(replacement.getArn());
             assertNotEquals(fingerprint(parseCertificate(original.getCertificateBody())),
                     fingerprint(parseCertificate(replacement.getCertificateBody())));
             listener = createFixedResponseListener(loadBalancer.arn(), "HTTPS", HTTPS_PORT,
@@ -1355,17 +1350,15 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                         .formParam("Certificates.member.1.CertificateArn", replacement.getArn())
                         .when().post("/").then().statusCode(200);
                 if (attempt == 0) {
-                    assertTrue(failureCompleted.await(5, TimeUnit.SECONDS));
-                    assertNotNull(failedUpdate.get());
-                    assertTrue(failedUpdate.get().failed(), "malformed PEM must fail the real SSL update");
+                    assertEquals(2, updates.get(), "the failed snapshot must pass the publication recheck");
                     awaitHttpsMaterial(loadBalancer.dnsName(), 200, "retry", original, original, replacement);
                 } else {
                     awaitHttpsMaterial(loadBalancer.dnsName(), 200, "retry", replacement, original, replacement);
                 }
             }
-            assertEquals(2, updates.get(), "identical API retry must retry the real server update");
+            assertEquals(4, updates.get(), "both API attempts must resolve and recheck their certificate snapshot");
         } finally {
-            runtime.vertx = originalVertx;
+            runtime.certificateResolver = originalResolver;
             String ownedListener = listener;
             Certificate ownedOriginal = original;
             Certificate ownedReplacement = replacement;
