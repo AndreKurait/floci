@@ -10,11 +10,13 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
 import io.github.hectorvent.floci.services.ec2.model.VolumeModification;
 import io.github.hectorvent.floci.testing.IndependentServiceSettingsProfile;
+import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
@@ -38,6 +40,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.when;
 
 /**
  * EBS volumes backed by real storage: attaching one gives a running instance container a block
@@ -68,6 +72,9 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
 
     @Inject
     EmulatorConfig config;
+
+    @InjectMock
+    AmiImageResolver images;
 
     private static final Logger LOG = Logger.getLogger(Ec2VolumeBlockDeviceDockerIntegrationTest.class);
 
@@ -205,6 +212,35 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
     }
 
     @Test
+    void runInstancesAttachesDataDevicesBeforeTheFirstUserDataCommand() {
+        when(images.resolveImage(anyString())).thenReturn(ResolvedAmiImage.minimal("alpine:3.21"));
+        LaunchTemplateData.BlockDeviceMapping data = new LaunchTemplateData.BlockDeviceMapping();
+        data.setDeviceName("/dev/xvdf");
+        LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
+        ebs.setVolumeSize(1);
+        ebs.setVolumeType("gp3");
+        data.setEbs(ebs);
+        Instance instance = ec2Service.runInstances("us-east-1", "ami-first-boot-data", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(),
+                "#!/bin/sh\nif test -b /dev/xvdf; then echo ready; else echo missing; fi > /root/first-boot-data\n",
+                null, null, null, 0, null, null, null, null, false, null, null, List.of(data))
+                .getInstances().getFirst();
+        instancesToClean.add(instance.getInstanceId());
+        try {
+            await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
+                assertEquals("running", instance.getState().getName());
+                assertNotNull(instance.getDockerContainerId());
+                ContainerExec.Result result = execIn(instance.getDockerContainerId(), "cat /root/first-boot-data");
+                assertEquals(0, result.exitCode(), result.summary());
+                assertEquals("ready", result.stdout().trim());
+            });
+        } finally {
+            ec2Service.terminateInstances("us-east-1", List.of(instance.getInstanceId()));
+            await().atMost(Duration.ofSeconds(30)).until(() -> "terminated".equals(instance.getState().getName()));
+        }
+    }
+
+    @Test
     void volumeAttachedProducesUsableBlockDeviceOfCorrectSize() {
         String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 10);
         Instance instance = createRunningTestInstance(suffix);
@@ -233,7 +269,7 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
         assertEquals(0, mkfs.exitCode(), "mkfs.ext4 should succeed: " + mkfs.summary());
 
         ContainerExec.Result mountAndWrite = execIn(targetContainerId,
-                "mkdir -p /mnt/vol && mount /dev/xvdf /mnt/vol && echo 'floci-ebs-test-data' > /mnt/vol/test.txt && cat /mnt/vol/test.txt && umount /mnt/vol");
+                "mkdir -p /mnt/vol && mount -t ext4 /dev/xvdf /mnt/vol && echo 'floci-ebs-test-data' > /mnt/vol/test.txt && cat /mnt/vol/test.txt && umount /mnt/vol");
         assertEquals(0, mountAndWrite.exitCode(), "Mount, write, read and umount should succeed: " + mountAndWrite.summary());
         assertTrue(mountAndWrite.stdout().contains("floci-ebs-test-data"));
     }
@@ -290,7 +326,7 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
 
         // Format and write data on instance1
         ContainerExec.Result formatAndWrite = execIn(instance1.getDockerContainerId(),
-                "mkfs.ext4 -F /dev/xvdf && mkdir -p /mnt/vol1 && mount /dev/xvdf /mnt/vol1 && echo 'persisted-payload' > /mnt/vol1/hello.txt && umount /mnt/vol1");
+                "mkfs.ext4 -F /dev/xvdf && mkdir -p /mnt/vol1 && mount -t ext4 /dev/xvdf /mnt/vol1 && echo 'persisted-payload' > /mnt/vol1/hello.txt && umount /mnt/vol1");
         assertEquals(0, formatAndWrite.exitCode(), formatAndWrite.summary());
 
         // Detach from instance1
@@ -301,7 +337,7 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
 
         // Verify device exists on instance2 and data is preserved
         ContainerExec.Result verifyData = execIn(instance2.getDockerContainerId(),
-                "mkdir -p /mnt/vol2 && mount /dev/xvdg /mnt/vol2 && cat /mnt/vol2/hello.txt && umount /mnt/vol2");
+                "mkdir -p /mnt/vol2 && mount -t ext4 /dev/xvdg /mnt/vol2 && cat /mnt/vol2/hello.txt && umount /mnt/vol2");
         assertEquals(0, verifyData.exitCode(), "Data should be preserved across detach and re-attach: " + verifyData.summary());
         assertTrue(verifyData.stdout().contains("persisted-payload"));
     }
