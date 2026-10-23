@@ -67,6 +67,25 @@ class Route53ServiceTest {
     }
 
     @Test
+    void rejectedBatchDoesNotRenameSharedStoredRecord() {
+        Route53Service service = newService();
+        String zone = service.createHostedZone("EXAMPLE.COM", "shared-record", null, null).zone().getId();
+        ResourceRecordSet stored = service.listResourceRecordSets(zone, null, null, 100).stream()
+                .filter(record -> "NS".equals(record.getType())).findFirst().orElseThrow();
+        String originalName = stored.getName();
+        assertEquals("EXAMPLE.COM.", originalName);
+        assertThrows(AwsException.class, () -> service.changeResourceRecordSets(zone,
+                List.of(change("UPSERT", stored), change("DELETE", aRecord("missing.example.com.", 60, "192.0.2.1"))), null));
+        assertEquals(originalName, stored.getName());
+        assertEquals(originalName, service.listResourceRecordSets(zone, null, null, 100).stream()
+                .filter(record -> "NS".equals(record.getType())).findFirst().orElseThrow().getName());
+        service.changeResourceRecordSets(zone, List.of(change("UPSERT", stored)), null);
+        assertEquals(originalName, stored.getName());
+        assertEquals("example.com.", service.listResourceRecordSets(zone, null, null, 100).stream()
+                .filter(record -> "NS".equals(record.getType())).findFirst().orElseThrow().getName());
+    }
+
+    @Test
     void publicZoneIndexAvoidsStorageScansOutsideOwnedNamesAndTracksDeletion() {
         Route53Service service = newService();
         AccountAwareStorageBackend<?> zones = stores.get("route53-zones.json");
@@ -85,6 +104,81 @@ class Route53ServiceTest {
         Mockito.clearInvocations(zones);
         assertTrue(service.publicDnsZones("text.owned.example").isEmpty());
         Mockito.verifyNoInteractions(zones);
+    }
+
+    @Test
+    void recordIdentityFoldsOnlyAsciiLettersAndPreservesPolicyIdentity() {
+        ResourceRecordSet upper = weightedRecord("WWW.example.com", 60, "Blue", 1, "192.0.2.1");
+        ResourceRecordSet lower = weightedRecord("www.example.com.", 60, "Blue", 1, "192.0.2.1");
+        assertTrue(Route53Service.sameRecord(upper, lower));
+        lower.setSetIdentifier("blue");
+        assertFalse(Route53Service.sameRecord(upper, lower));
+        lower.setSetIdentifier("Blue");
+        lower.setType("AAAA");
+        assertFalse(Route53Service.sameRecord(upper, lower));
+        assertFalse(Route53Service.sameRecord(aRecord("Ä.example", 60), aRecord("ä.example", 60)));
+        assertFalse(Route53Service.sameRecord(aRecord("\\127.example", 60), aRecord("w.example", 60)));
+    }
+
+    @Test
+    void caseVariantCreateCannotDuplicateOrPartiallyCommitBatch() {
+        Route53Service service = newService();
+        String zone = service.createHostedZone("example.com", "case-duplicate", null, null).zone().getId();
+        service.changeResourceRecordSets(zone, List.of(change("CREATE", aRecord("www.example.com", 60, "192.0.2.1"))), null);
+        AwsException error = assertThrows(AwsException.class, () -> service.changeResourceRecordSets(zone, List.of(
+                change("CREATE", aRecord("other.example.com", 60, "192.0.2.2")),
+                change("CREATE", aRecord("WWW.EXAMPLE.COM.", 60, "192.0.2.3"))), null));
+        assertEquals("InvalidChangeBatch", error.getErrorCode());
+        assertEquals(3, service.listResourceRecordSets(zone, null, null, 100).size());
+    }
+
+    @Test
+    void caseVariantUpsertAndDeleteRetainWeightedSiblingAndRejectWrongValue() {
+        Route53Service service = newService();
+        String zone = service.createHostedZone("example.com", "case-weight", null, null).zone().getId();
+        service.changeResourceRecordSets(zone, List.of(
+                change("CREATE", weightedRecord("WWW.example.com", 60, "Blue", 1, "192.0.2.1")),
+                change("CREATE", weightedRecord("www.example.com", 60, "blue", 2, "192.0.2.2"))), null);
+        service.changeResourceRecordSets(zone, List.of(change("UPSERT",
+                weightedRecord("WwW.example.com", 60, "Blue", 3, "192.0.2.3"))), null);
+        assertEquals(4, service.listResourceRecordSets(zone, null, null, 100).size());
+        assertThrows(AwsException.class, () -> service.changeResourceRecordSets(zone, List.of(change("DELETE",
+                weightedRecord("WWW.example.com", 60, "Blue", 3, "192.0.2.4"))), null));
+        service.changeResourceRecordSets(zone, List.of(change("DELETE",
+                weightedRecord("WWW.example.com", 60, "Blue", 3, "192.0.2.3"))), null);
+        List<ResourceRecordSet> remaining = service.listResourceRecordSets(zone, "www.example.com", "A", 100);
+        assertEquals(1, remaining.size());
+        assertEquals("blue", remaining.getFirst().getSetIdentifier());
+        assertEquals("www.example.com.", remaining.getFirst().getName());
+    }
+
+    @Test
+    void caseVariantApexDeleteRemainsForbidden() {
+        Route53Service service = newService();
+        String zone = service.createHostedZone("Example.COM", "case-apex", null, null).zone().getId();
+        ResourceRecordSet ns = service.listResourceRecordSets(zone, null, null, 100).stream()
+                .filter(record -> "NS".equals(record.getType())).findFirst().orElseThrow();
+        ResourceRecordSet request = new ResourceRecordSet();
+        request.setName("EXAMPLE.com");
+        request.setType("NS");
+        request.setTtl(ns.getTtl());
+        request.setRecords(ns.getRecords());
+        AwsException error = assertThrows(AwsException.class, () -> service.changeResourceRecordSets(
+                zone, List.of(change("DELETE", request)), null));
+        assertTrue(error.getMessage().contains("apex"));
+        assertEquals(2, service.listResourceRecordSets(zone, null, null, 100).size());
+    }
+
+    @Test
+    void recordListingSortsAndFiltersWithTheSameNormalizedName() {
+        Route53Service service = newService();
+        String zone = service.createHostedZone("EXAMPLE.com", "case-page", null, null).zone().getId();
+        service.changeResourceRecordSets(zone, List.of(change("CREATE",
+                aRecord("a.example.com", 60, "192.0.2.1"))), null);
+        List<ResourceRecordSet> page = service.listResourceRecordSets(zone, "A.EXAMPLE.COM", "A", 1);
+        assertEquals(1, page.size());
+        assertEquals("a.example.com.", page.getFirst().getName());
+        assertEquals("A", page.getFirst().getType());
     }
 
     private static Map<String, Object> change(String action, ResourceRecordSet rrs) {
