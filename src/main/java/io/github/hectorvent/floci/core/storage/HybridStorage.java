@@ -10,7 +10,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -48,24 +47,30 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public void put(K key, V value) {
+    public synchronized void put(K key, V value) {
         store.put(key, value);
         dirty.set(true);
     }
 
     @Override
-    public Optional<V> get(K key) {
+    public synchronized void putAllAtomically(Map<K, V> entries) {
+        store.putAll(Map.copyOf(entries));
+        dirty.set(true);
+    }
+
+    @Override
+    public synchronized Optional<V> get(K key) {
         return Optional.ofNullable(store.get(key));
     }
 
     @Override
-    public void delete(K key) {
+    public synchronized void delete(K key) {
         store.remove(key);
         dirty.set(true);
     }
 
     @Override
-    public List<V> scan(Predicate<K> keyFilter) {
+    public synchronized List<V> scan(Predicate<K> keyFilter) {
         return store.entrySet().stream()
                 .filter(e -> keyFilter.test(e.getKey()))
                 .map(Map.Entry::getValue)
@@ -73,8 +78,8 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public Set<K> keys() {
-        return Collections.unmodifiableSet(store.keySet());
+    public synchronized Set<K> keys() {
+        return Set.copyOf(store.keySet());
     }
 
     @Override
@@ -99,7 +104,7 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public void clear() {
+    public synchronized void clear() {
         store.clear();
         dirty.set(true);
     }

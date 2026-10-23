@@ -1,8 +1,8 @@
 package io.github.hectorvent.floci.core.storage;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -17,22 +17,27 @@ public class InMemoryStorage<K, V> implements StorageBackend<K, V> {
     private final ConcurrentHashMap<K, V> store = new ConcurrentHashMap<>();
 
     @Override
-    public void put(K key, V value) {
+    public synchronized void put(K key, V value) {
         store.put(key, value);
     }
 
     @Override
-    public Optional<V> get(K key) {
+    public synchronized void putAllAtomically(Map<K, V> entries) {
+        store.putAll(Map.copyOf(entries));
+    }
+
+    @Override
+    public synchronized Optional<V> get(K key) {
         return Optional.ofNullable(store.get(key));
     }
 
     @Override
-    public void delete(K key) {
+    public synchronized void delete(K key) {
         store.remove(key);
     }
 
     @Override
-    public List<V> scan(Predicate<K> keyFilter) {
+    public synchronized List<V> scan(Predicate<K> keyFilter) {
         List<V> result = new ArrayList<>();
         store.forEach((k, v) -> {
             if (keyFilter.test(k)) {
@@ -43,8 +48,8 @@ public class InMemoryStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public Set<K> keys() {
-        return Collections.unmodifiableSet(store.keySet());
+    public synchronized Set<K> keys() {
+        return Set.copyOf(store.keySet());
     }
 
     @Override
@@ -53,12 +58,12 @@ public class InMemoryStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public void load() {
+    public synchronized void load() {
         // No-op for in-memory storage
     }
 
     @Override
-    public void clear() {
+    public synchronized void clear() {
         store.clear();
     }
 }

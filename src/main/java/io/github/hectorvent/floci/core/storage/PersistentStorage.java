@@ -7,10 +7,11 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -44,13 +45,13 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public void put(K key, V value) {
+    public synchronized void put(K key, V value) {
         store.put(key, value);
         persistToDisk();
     }
 
     @Override
-    public void putAll(Map<K, V> entries) {
+    public synchronized void putAll(Map<K, V> entries) {
         if (entries.isEmpty()) {
             return;
         }
@@ -59,18 +60,34 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public Optional<V> get(K key) {
+    public synchronized void putAllAtomically(Map<K, V> entries) {
+        Map<K, V> replacements = Map.copyOf(entries);
+        if (replacements.isEmpty()) {
+            return;
+        }
+        Map<K, V> candidate = new HashMap<>(store);
+        candidate.putAll(replacements);
+        try {
+            StorageFiles.writeAtomically(filePath, tempFile -> objectMapper.writeValue(tempFile.toFile(), candidate));
+        } catch (IOException exception) {
+            throw new UncheckedIOException("Failed to commit atomic batch to " + filePath, exception);
+        }
+        store.putAll(replacements);
+    }
+
+    @Override
+    public synchronized Optional<V> get(K key) {
         return Optional.ofNullable(store.get(key));
     }
 
     @Override
-    public void delete(K key) {
+    public synchronized void delete(K key) {
         store.remove(key);
         persistToDisk();
     }
 
     @Override
-    public List<V> scan(Predicate<K> keyFilter) {
+    public synchronized List<V> scan(Predicate<K> keyFilter) {
         return store.entrySet().stream()
                 .filter(e -> keyFilter.test(e.getKey()))
                 .map(Map.Entry::getValue)
@@ -78,8 +95,8 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public Set<K> keys() {
-        return Collections.unmodifiableSet(store.keySet());
+    public synchronized Set<K> keys() {
+        return Set.copyOf(store.keySet());
     }
 
     @Override
@@ -88,7 +105,7 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public void load() {
+    public synchronized void load() {
         if (!Files.exists(filePath)) {
             LOG.debugv("No persistent file found at {0}, starting with empty store", filePath);
             return;
@@ -108,7 +125,7 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public void clear() {
+    public synchronized void clear() {
         store.clear();
         persistToDisk();
     }
