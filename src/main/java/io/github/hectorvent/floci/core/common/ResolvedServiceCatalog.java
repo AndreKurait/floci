@@ -268,7 +268,7 @@ public class ResolvedServiceCatalog {
                         config.storage().services().cloudwatchmetrics().flushIntervalMs(), AwsNamespaces.CW, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY, ServiceProtocol.JSON, ServiceProtocol.CBOR),
                         Set.of("GraniteServiceVersion20100801."), Set.of("monitoring"),
-                        Set.of("GraniteServiceVersion20100801"), Set.of()),
+                        Set.of("GraniteServiceVersion20100801"), Set.of(), "CloudWatchVersion20130116."),
                 descriptor("secretsmanager", "secretsmanager", config.services().secretsmanager().enabled(), true,
                         "secretsmanager", storageMode(config.storage().services().secretsmanager().mode(), config.storage().mode()),
                         config.storage().services().secretsmanager().flushIntervalMs(), null, ServiceProtocol.JSON,
