@@ -14,7 +14,6 @@ import jakarta.ws.rs.ext.ReaderInterceptorContext;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.zip.GZIPInputStream;
 
 /** Decompresses CloudWatch publication after request filters authenticate the wire bytes. */
 @Provider
@@ -47,16 +46,7 @@ public class CloudWatchGzipReaderInterceptor implements ReaderInterceptor {
         }
 
         InputStream original = context.getInputStream();
-        try (GZIPInputStream compressed = new GZIPInputStream(original)) {
-            byte[] body = compressed.readNBytes(MAX_BODY_BYTES + 1);
-            if (body.length > MAX_BODY_BYTES) {
-                throw new AwsException("RequestEntityTooLargeException",
-                        "Request size exceeded " + MAX_BODY_BYTES + " bytes", 413);
-            }
-            context.setInputStream(new ByteArrayInputStream(body));
-        } catch (IOException error) {
-            throw new AwsException("InvalidRequestException", "Failed to decode request body", 400);
-        }
+        context.setInputStream(new ByteArrayInputStream(AwsJsonGzipBody.decode(original, MAX_BODY_BYTES)));
         try {
             return context.proceed();
         } finally {
