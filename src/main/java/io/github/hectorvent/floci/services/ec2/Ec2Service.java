@@ -3804,9 +3804,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     requestedPlacement.setTenancy(tenancy);
                 }
                 requested.setPlacement(requestedPlacement);
-                if (!matchesCapacityReservation(requested, target) || target.getAvailableInstanceCount() < minCount) {
+                if (!matchesCapacityReservation(requested, target)) {
                     throw new AwsException("InsufficientInstanceCapacity",
                             "The targeted Capacity Reservation has no matching available capacity.", 400);
+                }
+                if (target.getAvailableInstanceCount() < minCount) {
+                    throw new AwsException("ReservationCapacityExceeded",
+                            "The targeted Capacity Reservation has insufficient available capacity.", 400);
                 }
                 capacityMaxCount = Math.min(maxCount, target.getAvailableInstanceCount());
                 count = capacityMaxCount;
@@ -10008,7 +10012,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         .filter(r -> r.getAvailableInstanceCount() > 0).findFirst().orElse(null);
                 if (selected == null) {
                     if (target != null) {
-                        getRequiredCapacityReservation(region, target);
+                        CapacityReservation reservation = getRequiredCapacityReservation(region, target);
+                        if (matchesCapacityReservation(instance, reservation)
+                                && reservation.getAvailableInstanceCount() <= 0) {
+                            throw new AwsException("ReservationCapacityExceeded",
+                                    "The targeted Capacity Reservation has insufficient available capacity.", 400);
+                        }
                         throw new AwsException("InsufficientInstanceCapacity",
                                 "The targeted Capacity Reservation has no matching available capacity.", 400);
                     }
