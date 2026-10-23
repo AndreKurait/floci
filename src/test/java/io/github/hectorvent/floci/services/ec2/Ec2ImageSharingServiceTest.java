@@ -16,12 +16,14 @@ import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -69,6 +71,76 @@ class Ec2ImageSharingServiceTest {
         assertEquals(sourceSnapshotId, owner.describeSnapshots(REGION, List.of(sourceSnapshotId),
                 List.of("self"), Map.of()).getFirst().getSnapshotId());
         assertEquals(Set.of(RECIPIENT), source.getLaunchPermissionUserIds());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,us-west-2", "true,us-east-1", "true,us-west-2"})
+    void copiesOnlyTagsVisibleToTheCallerWhenRequested(boolean foreign, String destination) {
+        Image source = source();
+        owner.createTags(REGION, List.of(source.getImageId()), List.of(
+                new Tag("Private", "owner"), new Tag("ec2:SharedTag/purpose", "worker"),
+                new Tag("ec2:SharedTag/empty", "")));
+        owner.createSystemTags(REGION, List.of(source.getImageId()), List.of(new Tag("aws:source", "system")));
+        if (foreign) {
+            grant(source);
+            recipient.createTags(REGION, List.of(source.getImageId()), List.of(new Tag("ReceiverPrivate", "receiver")));
+        }
+        Ec2Service copier = foreign ? recipient : owner;
+        Image withoutTags = copier.copyImage(destination, REGION, source.getImageId(), "untagged-copy", null);
+        assertTrue(withoutTags.getTags().isEmpty());
+        Image copy = copier.copyImage(destination, REGION, source.getImageId(), "tagged-copy", null, false, true);
+
+        assertEquals(Map.of("ec2:SharedTag/purpose", "worker", "ec2:SharedTag/empty", "",
+                        foreign ? "ReceiverPrivate" : "Private", foreign ? "receiver" : "owner"),
+                copier.describeImages(destination, List.of(copy.getImageId()), List.of("self"), Map.of())
+                        .getFirst().getTags().stream().collect(Collectors.toMap(Tag::getKey, Tag::getValue)));
+        assertEquals(3, copier.describeTags(destination,
+                Map.of("resource-id", List.of(copy.getImageId()))).size());
+        assertEquals(foreign, copier.describeImages(destination, List.of(copy.getImageId()), List.of(),
+                Map.of("tag:Private", List.of("owner"))).isEmpty());
+        assertTrue(copier.describeSnapshots(destination, List.of(snapshotId(copy)), List.of("self"), Map.of())
+                .getFirst().getTags().isEmpty());
+        copier.createTags(destination, List.of(copy.getImageId()), List.of(
+                new Tag("ec2:SharedTag/purpose", "changed")));
+        assertEquals(List.of("Private=owner", "ec2:SharedTag/purpose=worker", "ec2:SharedTag/empty=", "aws:source=system"),
+                owner.describeImages(REGION, List.of(source.getImageId()), List.of("self"), Map.of())
+                        .getFirst().getTags().stream().map(tag -> tag.getKey() + "=" + tag.getValue()).toList());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void recipientCannotModifyOwnersSharedTagsButKeepsPrivateTags(boolean delete) {
+        Image source = source();
+        grant(source);
+        owner.createTags(REGION, List.of(source.getImageId()), List.of(
+                new Tag("ec2:SharedTag/purpose", "owner"), new Tag("OwnerPrivate", "private")));
+        recipient.createTags(REGION, List.of(source.getImageId()), List.of(new Tag("ReceiverPrivate", "receiver")));
+        List<Tag> update = List.of(new Tag("ReceiverPrivate", "changed"), new Tag("ec2:SharedTag/purpose", "changed"));
+
+        AwsException failure = assertThrows(AwsException.class, () -> {
+            if (delete) {
+                recipient.deleteTags(REGION, List.of(source.getImageId()), update);
+            } else {
+                recipient.createTags(REGION, List.of(source.getImageId()), update);
+            }
+        });
+
+        assertEquals("AccessDenied", failure.getErrorCode());
+        assertEquals(403, failure.getHttpStatus());
+        assertEquals("Only the resource owner can " + (delete ? "delete" : "create")
+                + " shared tags on resource '" + source.getImageId() + "'.", failure.getMessage());
+        assertEquals(Map.of("ec2:SharedTag/purpose", "owner", "ReceiverPrivate", "receiver"),
+                recipient.describeImages(REGION, List.of(source.getImageId()), List.of(), Map.of()).getFirst()
+                        .getTags().stream().collect(Collectors.toMap(Tag::getKey, Tag::getValue)));
+        recipient.deleteTags(REGION, List.of(source.getImageId()), List.of(new Tag("ReceiverPrivate", null)));
+        assertEquals(List.of("ec2:SharedTag/purpose"), recipient.describeImages(REGION, List.of(source.getImageId()),
+                List.of(), Map.of()).getFirst().getTags().stream().map(Tag::getKey).toList());
+        assertEquals(Map.of("ec2:SharedTag/purpose", "owner", "OwnerPrivate", "private"),
+                owner.describeImages(REGION, List.of(source.getImageId()), List.of(), Map.of()).getFirst()
+                        .getTags().stream().collect(Collectors.toMap(Tag::getKey, Tag::getValue)));
+        owner.modifyImageLaunchPermissions(REGION, source.getImageId(), List.of(), List.of(RECIPIENT), false);
+        assertEquals("InvalidAMIID.NotFound", assertThrows(AwsException.class, () -> recipient.createTags(
+                REGION, List.of(source.getImageId()), List.of(new Tag("ReceiverPrivate", "after-revocation")))).getErrorCode());
     }
 
     @ParameterizedTest
