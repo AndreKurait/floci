@@ -157,12 +157,19 @@ public class Ec2LaunchTemplateCfnProvisioner implements CfnResourceProvisioner {
             LaunchTemplateData.MetadataOptions metadata = Ec2CfnMetadataOptions.read(
                     "LaunchTemplateData/MetadataOptions", metadataOptions,
                     Ec2CfnMetadataOptions.LAUNCH_TEMPLATE_SHAPE, ctx.engine());
+            JsonNode capacity = written != null && written.isObject()
+                    && !CloudFormationTemplateEngine.callsIntrinsic(written)
+                    ? written.get("CapacityReservationSpecification") : null;
+            LaunchTemplateData.CapacityReservationSpecification specification =
+                    capacityReservationSpecification(capacity, ctx.engine());
             JsonNode dataNode = node.deepCopy();
             if (dataNode instanceof ObjectNode object) {
                 object.remove("MetadataOptions");
+                object.remove("CapacityReservationSpecification");
             }
             LaunchTemplateData data = MAPPER.treeToValue(dataNode, LaunchTemplateData.class);
             data.setMetadataOptions(metadata);
+            data.setCapacityReservationSpecification(specification);
             String encodedUserData = node.path("UserData").asText(null);
             data.setEncodedUserData(encodedUserData);
             data.setUserData(Ec2UserDataDecoder.decode(encodedUserData));
@@ -172,4 +179,30 @@ public class Ec2LaunchTemplateCfnProvisioner implements CfnResourceProvisioner {
                     + e.getOriginalMessage(), 400);
         }
     }
+
+    private LaunchTemplateData.CapacityReservationSpecification capacityReservationSpecification(
+            JsonNode raw, CloudFormationTemplateEngine engine) {
+        CfnPropertyTypes.Reader types = new CfnPropertyTypes.Reader(engine);
+        String shape = CfnPropertyTypes.memberShape(
+                CfnPropertyTypes.propertyShape("AWS::EC2::LaunchTemplate", "LaunchTemplateData"),
+                "CapacityReservationSpecification");
+        JsonNode block = types.read("LaunchTemplateData/CapacityReservationSpecification", raw, shape);
+        types.finish();
+        if (block == null || block.isEmpty()) {
+            return null;
+        }
+        LaunchTemplateData.CapacityReservationSpecification specification =
+                new LaunchTemplateData.CapacityReservationSpecification();
+        specification.setCapacityReservationPreference(block.path("CapacityReservationPreference").asText(null));
+        JsonNode targetNode = block.path("CapacityReservationTarget");
+        if (targetNode.isObject()) {
+            LaunchTemplateData.CapacityReservationTarget target = new LaunchTemplateData.CapacityReservationTarget();
+            target.setCapacityReservationId(targetNode.path("CapacityReservationId").asText(null));
+            target.setCapacityReservationResourceGroupArn(
+                    targetNode.path("CapacityReservationResourceGroupArn").asText(null));
+            specification.setCapacityReservationTarget(target);
+        }
+        return specification;
+    }
+
 }
