@@ -7,6 +7,7 @@ import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.command.ListVolumesResponse;
+import com.github.dockerjava.api.command.RemoveContainerCmd;
 import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
@@ -127,16 +128,34 @@ public class ContainerLifecycleManager {
      * @return information about the created container including resolved endpoints and published ports
      */
     public ContainerInfo createAndStart(ContainerSpec spec) {
-        String containerId = create(spec);
+        return createAndStart(spec, false);
+    }
+
+    /** Starts a disposable container, reclaiming its anonymous volumes if startup fails. */
+    public ContainerInfo createAndStartEphemeral(ContainerSpec spec) {
+        return createAndStart(spec, true);
+    }
+
+    private ContainerInfo createAndStart(ContainerSpec spec, boolean removeAnonymousVolumes) {
+        String resolvedImage = imageCacheService.ensureImageExists(spec.image());
+        String containerId = create(spec, resolvedImage, null, removeAnonymousVolumes);
         try {
-            ContainerInfo info = startCreated(containerId, spec);
-            return withPublishedHostPorts(info, spec);
-        } catch (Exception e) {
-            // A failed start (e.g. host-port conflict) must not leak the created
-            // container: retrying callers would accumulate Created containers and
-            // fixed-name callers would hit name conflicts on the next attempt.
-            removeIfExists(containerId);
-            throw e;
+            return withPublishedHostPorts(startCreated(containerId, spec), spec);
+        } catch (RuntimeException failure) {
+            if (removeAnonymousVolumes) {
+                removeFailedEphemeralContainer(containerId, failure);
+            } else {
+                removeIfExists(containerId);
+            }
+            throw failure;
+        }
+    }
+
+    private void removeFailedEphemeralContainer(String containerId, RuntimeException failure) {
+        try {
+            removeIfExistsStrict(containerId, true);
+        } catch (RuntimeException cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
         }
     }
 
@@ -175,12 +194,20 @@ public class ContainerLifecycleManager {
     }
 
     private String create(ContainerSpec spec, String resolvedImage, String platform) {
-        String containerId = createWithCaBundle(spec, resolvedImage, platform);
+        return create(spec, resolvedImage, platform, false);
+    }
+
+    private String create(ContainerSpec spec, String resolvedImage, String platform, boolean removeAnonymousVolumes) {
+        String containerId = createWithCaBundle(spec, resolvedImage, platform, removeAnonymousVolumes);
         if (spec.hasNetworkConfiguration()) {
             try {
                 attachNetworkBeforeStart(containerId, spec);
             } catch (RuntimeException e) {
-                removeIfExists(containerId);
+                if (removeAnonymousVolumes) {
+                    removeFailedEphemeralContainer(containerId, e);
+                } else {
+                    removeIfExists(containerId);
+                }
                 throw new IllegalStateException(
                         "Failed to attach pre-start network configuration for container " + containerId, e);
             }
@@ -188,7 +215,8 @@ public class ContainerLifecycleManager {
         return containerId;
     }
 
-    private String createWithCaBundle(ContainerSpec spec, String resolvedImage, String platform) {
+    private String createWithCaBundle(ContainerSpec spec, String resolvedImage, String platform,
+                                      boolean removeAnonymousVolumes) {
         LOG.debugv("Creating container from spec: image={0}, name={1}", spec.image(), spec.name());
 
         // Built once: a dynamic port binding allocates its host port here.
@@ -204,7 +232,11 @@ public class ContainerLifecycleManager {
         }
         // SSL_CERT_FILE and friends replace the image's trust store, so they must never name a
         // file that is not there. Start over without them: the container keeps its own trust.
-        dockerClient.removeContainerCmd(containerId).withForce(true).exec();
+        if (removeAnonymousVolumes) {
+            removeIfExistsStrict(containerId, true);
+        } else {
+            dockerClient.removeContainerCmd(containerId).withForce(true).exec();
+        }
         return createContainer(spec, resolvedImage, platform, hostConfig, spec.env());
     }
 
@@ -1046,8 +1078,17 @@ public class ContainerLifecycleManager {
      * @param name the container name to remove
      */
     public void removeIfExistsStrict(String name) {
+        removeIfExistsStrict(name, false);
+    }
+
+    /** Removes a container, optionally reclaiming anonymous volumes that are no longer in use. */
+    public void removeIfExistsStrict(String name, boolean removeAnonymousVolumes) {
         try {
-            dockerClient.removeContainerCmd(name).withForce(true).exec();
+            RemoveContainerCmd remove = dockerClient.removeContainerCmd(name).withForce(true);
+            if (removeAnonymousVolumes) {
+                remove.withRemoveVolumes(true);
+            }
+            remove.exec();
             LOG.infov("Removed stale container {0}", name);
         } catch (NotFoundException e) {
             // Not found means the fixed name is available.
