@@ -4,41 +4,72 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ContainerTeardowns;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher;
+import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
 
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
-/** Stores desired capacity. Runtime allocation is introduced by the next stage. */
+/**
+ * Owns initialized environments separately from the on-demand idle pool.
+ * Persisted requests never imply readiness: every new process must finish real initialization.
+ */
 @ApplicationScoped
 public class ProvisionedConcurrencyPool implements Resettable {
+    private static final Logger LOG = Logger.getLogger(ProvisionedConcurrencyPool.class);
     private static final DateTimeFormatter LAST_MODIFIED =
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssZ").withZone(ZoneOffset.UTC);
     private final Object lock = new Object();
+    private final LambdaRuntimeLauncher launcher;
     private final LambdaFunctionStore functions;
     private final LambdaAliasStore aliases;
     private final StorageBackend<String, Configuration> storage;
     private final Clock clock;
     private final int maxPerFunction;
     private final int maxTotal;
-    private final boolean supported;
-    private final Map<String, Configuration> configurations = new HashMap<>();
+    private final boolean ephemeral;
+    private final long drainTimeoutNanos;
+    private final Map<String, Allocation> allocations = new HashMap<>();
+    private final Map<ContainerHandle, Allocation> leases = new HashMap<>();
+    private final Map<ContainerHandle, Configuration> owned = new HashMap<>();
+    private final Set<Allocation> launchingAllocations = new HashSet<>();
+    private final Set<ContainerHandle> pendingTeardown = new HashSet<>();
+    private final Map<ContainerHandle, CountDownLatch> stopping = new HashMap<>();
+    private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
+            Thread.ofPlatform().daemon().name("lambda-provisioned-concurrency").factory());
+    private boolean stopped;
+    private int activeLaunches;
+    private long shutdownDeadlineNanos;
 
     @RegisterForReflection
     public record Configuration(String account, String region, String name, String functionArn,
@@ -52,32 +83,47 @@ public class ProvisionedConcurrencyPool implements Resettable {
     public record Status(int requested, int allocated, int available, String status,
                          String reason, String lastModified) {}
 
+    private static final class Allocation {
+        final Configuration configuration;
+        final Set<ContainerHandle> handles = new HashSet<>();
+        final ArrayDeque<ContainerHandle> idle = new ArrayDeque<>();
+        int launching;
+        String status = "IN_PROGRESS";
+        String reason;
+
+        Allocation(Configuration configuration) {
+            this.configuration = configuration;
+        }
+    }
+
+    private static final class TargetUnavailableException extends RuntimeException {
+        TargetUnavailableException() {
+            super("The configured function version or alias is no longer available");
+        }
+    }
+
     @Inject
-    public ProvisionedConcurrencyPool(LambdaFunctionStore functions, LambdaAliasStore aliases,
-                                     StorageFactory storageFactory, EmulatorConfig config, Clock clock) {
-        this(functions, aliases, storageFactory.create("lambda",
+    public ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
+                                     LambdaAliasStore aliases, StorageFactory storageFactory,
+                                     EmulatorConfig config, Clock clock) {
+        this(launcher, functions, aliases, storageFactory.create("lambda",
                         "lambda-provisioned-concurrency.json", new TypeReference<>() {}),
                 clock, WarmPool.resolveMaxPerFunction(config), WarmPool.resolveMaxTotal(config),
-                !config.services().lambda().ephemeral()
-                        && "docker".equalsIgnoreCase(config.services().lambda().executor().trim()));
+                config.services().lambda().ephemeral(), WarmPool.resolveDrainTimeout(config));
     }
 
-    ProvisionedConcurrencyPool(LambdaFunctionStore functions, LambdaAliasStore aliases,
-                              StorageBackend<String, Configuration> storage,
-                              Clock clock, int maxPerFunction, int maxTotal) {
-        this(functions, aliases, storage, clock, maxPerFunction, maxTotal, true);
-    }
-
-    ProvisionedConcurrencyPool(LambdaFunctionStore functions, LambdaAliasStore aliases,
-                              StorageBackend<String, Configuration> storage,
-                              Clock clock, int maxPerFunction, int maxTotal, boolean supported) {
-        this.supported = supported;
+    ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
+                              LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
+                              Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds) {
+        this.launcher = launcher;
         this.functions = functions;
         this.aliases = aliases;
         this.storage = storage;
         this.clock = clock;
         this.maxPerFunction = maxPerFunction;
         this.maxTotal = maxTotal;
+        this.ephemeral = ephemeral;
+        this.drainTimeoutNanos = TimeUnit.SECONDS.toNanos(drainSeconds);
     }
 
     @PostConstruct
@@ -86,9 +132,16 @@ public class ProvisionedConcurrencyPool implements Resettable {
             List<Configuration> stored = storage instanceof AccountAwareStorageBackend<Configuration> aware
                     ? aware.scanAllAccounts() : storage.scan(ignored -> true);
             for (Configuration configuration : stored) {
-                configurations.put(configuration.key(), configuration);
+                allocations.put(configuration.key(), new Allocation(configuration));
             }
         }
+        scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                reconcileSafely();
+            } catch (RuntimeException failure) {
+                LOG.errorv(failure, "Provisioned concurrency reconciliation failed");
+            }
+        }, 0, 1, TimeUnit.SECONDS);
     }
 
     public Status put(String region, String name, String qualifier, int count, String account) {
@@ -106,27 +159,35 @@ public class ProvisionedConcurrencyPool implements Resettable {
 
     private Status put(Configuration target) {
         int count = target.requested();
-        if (!supported) {
+        if (ephemeral || !launcher.supportsProvisionedConcurrency()) {
             throw invalid("Provisioned concurrency requires the non-ephemeral Docker Lambda executor");
         }
-        LambdaFunction fn = functions.getForAccount(target.account(), target.region(), target.name(), target.version())
-                .orElseThrow(() -> missing("Function no longer exists"));
+        LambdaFunction fn = currentFunction(target);
         if (fn.isHotReload() || fn.isDurable()) {
             throw invalid("Provisioned concurrency is not supported for hot-reload or durable functions");
         }
+        List<ContainerHandle> retired = List.of();
+        Status result;
         synchronized (lock) {
-            Configuration previous = configurations.get(target.key());
+            if (stopped) {
+                throw new AwsException("ResourceConflictException", "Lambda executor is stopping", 409);
+            }
+            if (hasPendingTeardown(target)) {
+                throw new AwsException("ResourceConflictException",
+                        "The previous provisioned allocation is still being removed", 409);
+            }
+            Allocation previous = allocations.get(target.key());
             long otherFunction = 0;
             long otherTotal = 0;
             boolean versionConflict = false;
-            for (Configuration entry : configurations.values()) {
+            for (Allocation entry : allocations.values()) {
                 if (entry == previous) {
                     continue;
                 }
-                otherTotal += entry.requested();
-                if (target.functionArn().equals(entry.functionArn())) {
-                    versionConflict |= target.version().equals(pointedVersion(entry));
-                    otherFunction += entry.requested();
+                otherTotal += entry.configuration.requested();
+                if (target.functionArn().equals(entry.configuration.functionArn())) {
+                    versionConflict |= target.version().equals(pointedVersion(entry.configuration));
+                    otherFunction += entry.configuration.requested();
                 }
             }
             if (otherFunction + count > maxPerFunction
@@ -146,24 +207,33 @@ public class ProvisionedConcurrencyPool implements Resettable {
                                 : "Alias can't be used for Provisioned Concurrency configuration "
                                         + "on an already Provisioned version", 409);
             }
-            if (previous != null && sameTarget(previous, target) && previous.requested() == count) {
+            if (previous != null && sameTarget(previous.configuration, target)
+                    && previous.configuration.requested() == count && !"FAILED".equals(previous.status)) {
                 return status(previous);
             }
             write(target);
-            configurations.put(target.key(), target);
-            return status(target);
+            Allocation next = new Allocation(target);
+            allocations.put(target.key(), next);
+            if (previous != null) {
+                retired = retire(previous);
+            }
+            result = status(next);
         }
+        stop(retired);
+        reconcile();
+        return result;
     }
 
     public Status get(String region, String name, String qualifier, String account) {
         Target target = resolveTarget(region, name, qualifier, account);
+        reconcile();
         synchronized (lock) {
-            Configuration configuration = configurations.get(target.key());
-            if (configuration == null) {
+            Allocation allocation = allocations.get(target.key());
+            if (allocation == null) {
                 throw new AwsException("ProvisionedConcurrencyConfigNotFoundException",
                         "No Provisioned Concurrency Config found for this function", 404);
             }
-            return status(configuration);
+            return status(allocation);
         }
     }
 
@@ -173,6 +243,71 @@ public class ProvisionedConcurrencyPool implements Resettable {
             resolveTarget(region, name, qualifier, account);
             deleteMatching(target.functionArn(), qualifier);
         }
+    }
+
+    /** Returns null when the matching allocation has no idle capacity: on-demand execution may spill over. */
+    ContainerHandle acquire(LambdaFunction fn, String qualifier) {
+        if (qualifier == null) {
+            return null;
+        }
+        String baseArn = baseArn(fn);
+        List<ContainerHandle> discarded = new ArrayList<>();
+        ContainerHandle selected = null;
+        synchronized (lock) {
+            Allocation allocation = allocations.get(baseArn + ":" + qualifier);
+            if (allocation == null || !allocation.configuration.version().equals(fn.getVersion())) {
+                return null;
+            }
+            try {
+                currentFunction(allocation.configuration);
+            } catch (TargetUnavailableException changed) {
+                return null;
+            }
+            while (!allocation.idle.isEmpty()) {
+                ContainerHandle candidate = allocation.idle.removeFirst();
+                if (healthy(candidate) && current(allocation)) {
+                    selected = candidate;
+                    leases.put(candidate, allocation);
+                    candidate.setState(ContainerState.BUSY);
+                    break;
+                }
+                allocation.handles.remove(candidate);
+                pendingTeardown.add(candidate);
+                discarded.add(candidate);
+            }
+        }
+        stop(discarded);
+        return selected;
+    }
+
+    boolean release(ContainerHandle handle, boolean failed) {
+        boolean retire;
+        synchronized (lock) {
+            Allocation allocation = leases.remove(handle);
+            if (allocation == null) {
+                return false;
+            }
+            retire = failed || !current(allocation) || !healthy(handle);
+            if (retire) {
+                allocation.handles.remove(handle);
+                pendingTeardown.add(handle);
+            } else {
+                handle.setState(ContainerState.WARM);
+                allocation.idle.addLast(handle);
+            }
+        }
+        if (retire) {
+            boolean shutdownDrain;
+            long deadline;
+            synchronized (lock) {
+                shutdownDrain = stopped;
+                long now = System.nanoTime();
+                deadline = stopped && shutdownDeadlineNanos > now
+                        ? shutdownDeadlineNanos : now + drainTimeoutNanos;
+            }
+            stop(List.of(handle), shutdownDrain, deadline);
+        }
+        return true;
     }
 
     void deleteFunction(LambdaFunction fn) {
@@ -188,9 +323,9 @@ public class ProvisionedConcurrencyPool implements Resettable {
             return;
         }
         synchronized (lock) {
-            long requested = configurations.values().stream()
-                    .filter(entry -> entry.functionArn().equals(baseArn(fn)))
-                    .mapToLong(entry -> entry.requested()).sum();
+            long requested = allocations.values().stream()
+                    .filter(entry -> entry.configuration.functionArn().equals(baseArn(fn)))
+                    .mapToLong(entry -> entry.configuration.requested()).sum();
             if (requested > reserved) {
                 throw invalid("Reserved concurrency cannot be lower than provisioned concurrency");
             }
@@ -198,19 +333,96 @@ public class ProvisionedConcurrencyPool implements Resettable {
     }
 
     private void deleteMatching(String functionArn, String qualifier) {
+        List<ContainerHandle> retired = new ArrayList<>();
         synchronized (lock) {
-            for (Configuration value : new ArrayList<>(configurations.values())) {
+            for (Allocation entry : new ArrayList<>(allocations.values())) {
+                Configuration value = entry.configuration;
                 if (value.functionArn().equals(functionArn)
                         && (qualifier == null || qualifier.equals(value.qualifier()))) {
                     erase(value);
-                    configurations.remove(value.key());
+                    allocations.remove(value.key());
+                    retired.addAll(retire(entry));
+                }
+            }
+            for (ContainerHandle handle : pendingTeardown) {
+                Configuration value = owned.get(handle);
+                if (value.functionArn().equals(functionArn)
+                        && (qualifier == null || qualifier.equals(value.qualifier()))) {
+                    retired.add(handle);
                 }
             }
         }
+        stop(retired);
     }
 
-    private Status status(Configuration configuration) {
-        return new Status(configuration.requested(), 0, 0, "IN_PROGRESS", null, configuration.lastModified());
+    private boolean hasPendingTeardown(Configuration configuration) {
+        return pendingTeardown.stream().anyMatch(handle ->
+                configuration.key().equals(owned.get(handle).key()));
+    }
+
+    void reconcileSafely() {
+        List<ContainerHandle> retry;
+        synchronized (lock) {
+            if (stopped) {
+                return;
+            }
+            retry = new ArrayList<>(pendingTeardown);
+        }
+        stop(retry);
+        reconcile();
+    }
+
+    void reconcile() {
+        List<ContainerHandle> retired = new ArrayList<>();
+        synchronized (lock) {
+            if (stopped) {
+                return;
+            }
+            for (Allocation allocation : new ArrayList<>(allocations.values())) {
+                if ("FAILED".equals(allocation.status)) {
+                    continue;
+                }
+                LambdaFunction fn;
+                try {
+                    fn = currentFunction(allocation.configuration);
+                } catch (TargetUnavailableException failure) {
+                    allocation.status = "FAILED";
+                    allocation.reason = "The configured function version or alias is no longer available";
+                    retired.addAll(retire(allocation));
+                    continue;
+                }
+                for (ContainerHandle handle : new ArrayList<>(allocation.idle)) {
+                    if (!healthy(handle)) {
+                        allocation.idle.remove(handle);
+                        allocation.handles.remove(handle);
+                        pendingTeardown.add(handle);
+                        retired.add(handle);
+                    }
+                }
+                if (hasPendingTeardown(allocation.configuration)) {
+                    continue;
+                }
+                int missing = allocation.configuration.requested()
+                        - allocation.handles.size() - allocation.launching;
+                missing = Math.min(missing, availableCapacity(allocation.configuration));
+                if (missing > 0) {
+                    allocation.status = "IN_PROGRESS";
+                    for (int i = 0; i < missing; i++) {
+                        allocation.launching++;
+                        launchingAllocations.add(allocation);
+                        activeLaunches++;
+                        try {
+                            workers.execute(() -> initialize(allocation, fn));
+                        } catch (RejectedExecutionException failure) {
+                            finishedLaunching(allocation);
+                            activeLaunches--;
+                            throw failure;
+                        }
+                    }
+                }
+            }
+        }
+        stop(retired);
     }
 
     private String pointedVersion(Configuration configuration) {
@@ -225,19 +437,209 @@ public class ProvisionedConcurrencyPool implements Resettable {
     void validateAliasUpdate(LambdaFunction fn, String qualifier, String version) {
         synchronized (lock) {
             String functionArn = baseArn(fn);
-            if (!configurations.containsKey(functionArn + ":" + qualifier)) {
+            if (!allocations.containsKey(functionArn + ":" + qualifier)) {
                 return;
             }
             if ("$LATEST".equals(version)) {
                 throw invalid("Provisioned Concurrency Configs cannot be applied to unpublished function versions.");
             }
-            if (version != null && version.matches("[0-9]+") && configurations.values().stream()
-                    .anyMatch(entry -> functionArn.equals(entry.functionArn())
-                            && !qualifier.equals(entry.qualifier())
-                            && version.equals(pointedVersion(entry)))) {
+            if (version != null && version.matches("[0-9]+") && allocations.values().stream()
+                    .anyMatch(entry -> functionArn.equals(entry.configuration.functionArn())
+                            && !qualifier.equals(entry.configuration.qualifier())
+                            && version.equals(pointedVersion(entry.configuration)))) {
                 throw new AwsException("ResourceConflictException",
                         "Alias can't be used for Provisioned Concurrency configuration on an already Provisioned version", 409);
             }
+        }
+    }
+
+    private int availableCapacity(Configuration configuration) {
+        long functionOwned = owned.values().stream()
+                .filter(value -> value.functionArn().equals(configuration.functionArn())).count();
+        long functionLaunching = launchingAllocations.stream()
+                .filter(value -> value.configuration.functionArn().equals(configuration.functionArn()))
+                .mapToLong(value -> value.launching).sum();
+        long available = maxPerFunction - functionOwned - functionLaunching;
+        if (maxTotal > 0) {
+            long launching = launchingAllocations.stream().mapToLong(value -> value.launching).sum();
+            available = Math.min(available, maxTotal - owned.size() - launching);
+        }
+        return (int) Math.max(0, available);
+    }
+
+    private void finishedLaunching(Allocation allocation) {
+        allocation.launching--;
+        if (allocation.launching == 0) {
+            launchingAllocations.remove(allocation);
+        }
+    }
+
+    private void initialize(Allocation allocation, LambdaFunction fn) {
+        ContainerHandle handle = null;
+        boolean retained = false;
+        List<ContainerHandle> retired = List.of();
+        try {
+            handle = launcher.launchProvisioned(fn);
+            synchronized (lock) {
+                owned.put(handle, allocation.configuration);
+                finishedLaunching(allocation);
+                if (!current(allocation)) {
+                    return;
+                }
+                allocation.handles.add(handle);
+            }
+            long timeoutMs = Math.max(130, fn.getTimeout()) * 1000L;
+            handle.getRuntimeApiServer().awaitInitialization(timeoutMs);
+            synchronized (lock) {
+                currentFunction(allocation.configuration);
+                if (current(allocation) && healthy(handle)) {
+                    allocation.idle.addLast(handle);
+                    retained = true;
+                    if (allocation.handles.size() == allocation.configuration.requested()
+                            && allocation.handles.stream().allMatch(this::healthy)) {
+                        allocation.status = "READY";
+                    }
+                }
+            }
+        } catch (Exception failure) {
+            synchronized (lock) {
+                if (handle == null) {
+                    finishedLaunching(allocation);
+                }
+                if (current(allocation)) {
+                    allocation.status = "FAILED";
+                    allocation.reason = "Execution environment initialization failed: "
+                            + failure.getClass().getSimpleName()
+                            + (failure.getMessage() == null ? "" : ": " + failure.getMessage());
+                    retired = retire(allocation);
+                }
+            }
+            LOG.warnv(failure, "Provisioned Lambda initialization failed");
+            if (failure instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+        } finally {
+            Set<ContainerHandle> toStop = new HashSet<>(retired);
+            if (!retained && handle != null) {
+                synchronized (lock) {
+                    allocation.handles.remove(handle);
+                    allocation.idle.remove(handle);
+                }
+                toStop.add(handle);
+            }
+            boolean shutdownDrain;
+            long deadline;
+            synchronized (lock) {
+                shutdownDrain = stopped;
+                long now = System.nanoTime();
+                deadline = stopped && shutdownDeadlineNanos > now
+                        ? shutdownDeadlineNanos : now + drainTimeoutNanos;
+            }
+            try {
+                stop(new ArrayList<>(toStop), shutdownDrain, deadline);
+            } finally {
+                synchronized (lock) {
+                    activeLaunches--;
+                    lock.notifyAll();
+                }
+            }
+        }
+    }
+
+    private Status status(Allocation allocation) {
+        int healthy = (int) allocation.handles.stream().filter(this::healthy).count();
+        int available = (int) allocation.idle.stream().filter(this::healthy).count();
+        String state = allocation.status;
+        if ("READY".equals(state) && healthy != allocation.configuration.requested()) {
+            state = "IN_PROGRESS";
+        }
+        return new Status(allocation.configuration.requested(), healthy, available, state,
+                allocation.reason, allocation.configuration.lastModified());
+    }
+
+    private boolean healthy(ContainerHandle handle) {
+        return handle.getState() != ContainerState.STOPPED
+                && handle.getRuntimeApiServer().isInitialized();
+    }
+
+    private boolean current(Allocation allocation) {
+        return !stopped && allocations.get(allocation.configuration.key()) == allocation
+                && !"FAILED".equals(allocation.status);
+    }
+
+    private List<ContainerHandle> retire(Allocation allocation) {
+        List<ContainerHandle> result = allocation.handles.stream()
+                .filter(handle -> !leases.containsKey(handle)).toList();
+        allocation.handles.clear();
+        allocation.idle.clear();
+        pendingTeardown.addAll(result);
+        return result;
+    }
+
+    private void stop(List<ContainerHandle> handles) {
+        stop(handles, false);
+    }
+
+    private void stop(List<ContainerHandle> handles, boolean shutdownDrain) {
+        stop(handles, shutdownDrain, System.nanoTime() + drainTimeoutNanos);
+    }
+
+    private void stop(List<ContainerHandle> handles, boolean shutdownDrain, long deadlineNanos) {
+        handles = handles.stream().distinct().toList();
+        synchronized (lock) {
+            for (ContainerHandle handle : handles) {
+                if (owned.containsKey(handle)) {
+                    pendingTeardown.add(handle);
+                    handle.setState(ContainerState.STOPPED);
+                }
+            }
+            if (stopped && !shutdownDrain) {
+                return;
+            }
+        }
+        ContainerTeardowns.stopInParallel(handles, handle -> stop(handle, shutdownDrain, deadlineNanos),
+                LOG, deadlineNanos);
+    }
+
+    private void stop(ContainerHandle handle, boolean shutdownDrain, long deadlineNanos) {
+        CountDownLatch completion;
+        boolean alreadyStopping;
+        synchronized (lock) {
+            if (!owned.containsKey(handle) || (stopped && !shutdownDrain)) {
+                return;
+            }
+            completion = stopping.get(handle);
+            alreadyStopping = completion != null;
+            if (!alreadyStopping) {
+                completion = new CountDownLatch(1);
+                stopping.put(handle, completion);
+            }
+        }
+        if (alreadyStopping) {
+            // An admitted retry owns this stop. Shutdown joins it within the same bounded
+            // drain instead of returning while it runs, or issuing another Docker stop.
+            if (shutdownDrain) {
+                try {
+                    completion.await(Math.max(0, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return;
+        }
+        try {
+            launcher.stop(handle);
+            synchronized (lock) {
+                pendingTeardown.remove(handle);
+                owned.remove(handle);
+            }
+        } catch (RuntimeException failure) {
+            LOG.warnv(failure, "Could not stop provisioned Lambda environment {0}", handle.getContainerId());
+        } finally {
+            synchronized (lock) {
+                stopping.remove(handle);
+            }
+            completion.countDown();
         }
     }
 
@@ -298,6 +700,25 @@ public class ProvisionedConcurrencyPool implements Resettable {
         return new Target(account, region, ref.name(), baseArn(latest), qualifier, alias);
     }
 
+    private LambdaFunction currentFunction(Configuration configuration) {
+        functions.getForAccount(configuration.account(), configuration.region(), configuration.name())
+                .orElseThrow(TargetUnavailableException::new);
+        if (!configuration.qualifier().matches("[0-9]+")) {
+            LambdaAlias alias = aliases.getForAccount(configuration.account(), configuration.region(),
+                    configuration.name(), configuration.qualifier()).orElseThrow(TargetUnavailableException::new);
+            if (!configuration.version().equals(alias.getFunctionVersion())
+                    || (alias.getRoutingConfig() != null && !alias.getRoutingConfig().isEmpty())) {
+                throw new TargetUnavailableException();
+            }
+        }
+        LambdaFunction fn = functions.getForAccount(configuration.account(), configuration.region(),
+                configuration.name(), configuration.version()).orElseThrow(TargetUnavailableException::new);
+        if (!Objects.equals(configuration.revision(), fn.getRevisionId())) {
+            throw new TargetUnavailableException();
+        }
+        return fn;
+    }
+
     private static boolean sameTarget(Configuration first, Configuration second) {
         return first.key().equals(second.key()) && first.version().equals(second.version())
                 && Objects.equals(first.revision(), second.revision());
@@ -327,9 +748,66 @@ public class ProvisionedConcurrencyPool implements Resettable {
 
     @Override
     public void clear() {
+        stopManagedContainers();
         synchronized (lock) {
             storage.clear();
-            configurations.clear();
+            stopped = false;
+        }
+    }
+
+    public void stopManagedContainers() {
+        stopManagedContainers(System.nanoTime() + drainTimeoutNanos);
+    }
+
+    void stopManagedContainers(long deadlineNanos) {
+        List<ContainerHandle> retired;
+        synchronized (lock) {
+            if (stopped) {
+                return;
+            }
+            stopped = true;
+            shutdownDeadlineNanos = deadlineNanos;
+            allocations.values().forEach(this::retire);
+            allocations.clear();
+            retired = new ArrayList<>(owned.keySet());
+        }
+        stop(retired, true, deadlineNanos);
+        synchronized (lock) {
+            try {
+                long remaining;
+                while (activeLaunches > 0 && (remaining = deadlineNanos - System.nanoTime()) > 0) {
+                    TimeUnit.NANOSECONDS.timedWait(lock, remaining);
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            if (activeLaunches > 0) {
+                LOG.warnv("Shutdown deadline reached with {0} provisioned Lambda launch(es) still pending",
+                        activeLaunches);
+            }
+        }
+        synchronized (lock) {
+            if (!owned.isEmpty()) {
+                LOG.warnv("Shutdown drain ended with {0} provisioned Lambda environment(s) still owned",
+                        owned.size());
+            }
+        }
+    }
+
+    void shutdown() {
+        stopManagedContainers();
+        closeExecutors();
+    }
+
+    void closeExecutors() {
+        scheduler.shutdownNow();
+        workers.shutdownNow();
+    }
+
+    @Override
+    public void afterReset() {
+        synchronized (lock) {
+            stopped = false;
         }
     }
 
