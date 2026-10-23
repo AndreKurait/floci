@@ -8580,4 +8580,27 @@ class Ec2ServiceTest {
         assertEquals(1, service.allocateHosts("us-east-1", "us-east-1c", "m5.large", null, 1,
                 null, null, null, null, null).size());
     }
+    @Test
+    void capacityAssociationScansStayWithinTheCallerAccount() {
+        // Instance is the EC2 model in this file, so qualify the CDI Instance type.
+        jakarta.enterprise.inject.Instance<RequestContext> contexts = mock(jakarta.enterprise.inject.Instance.class);
+        RequestContext context = new RequestContext();
+        context.setAccountId("111111111111");
+        when(contexts.isResolvable()).thenReturn(true);
+        when(contexts.get()).thenReturn(context);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(contexts), contexts);
+        String region = "us-east-1";
+        String capacityId = service.createCapacityReservation(region, "t3.micro", "Linux/UNIX", region + "a",
+                null, 1, null, null, null, null, null, null, null, null).getCapacityReservationId();
+        String instanceId = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null, List.of(),
+                null, null, List.of(), null, null).getInstances().getFirst().getInstanceId();
+        assertEquals(capacityId, service.capacityReservationAssociations(region).get(instanceId));
+        context.setAccountId("222222222222");
+        assertTrue(service.capacityReservationAssociations(region).isEmpty());
+        assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
+        context.setAccountId("111111111111");
+        assertEquals(capacityId, service.capacityReservationAssociations(region).get(instanceId));
+    }
 }
