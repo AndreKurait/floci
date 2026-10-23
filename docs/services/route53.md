@@ -167,6 +167,11 @@ aws route53 disassociate-vpc-from-hosted-zone \
 aws route53 delete-hosted-zone --id Z1PA6795UKMFR9
 ```
 
+Record names in change batches are stored with lowercase ASCII letters and a trailing dot.
+CREATE, UPSERT, and DELETE use that name identity while keeping the record type and
+routing set identifier distinct. A case-only CloudFormation record-name update retains
+the record. DELETE still requires matching record values and routing properties.
+
 ## Not Supported (Phase 2)
 
 - Reusable delegation sets
