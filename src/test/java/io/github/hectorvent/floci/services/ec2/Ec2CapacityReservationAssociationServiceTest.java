@@ -293,6 +293,7 @@ class Ec2CapacityReservationAssociationServiceTest {
             AwsException failure = assertThrows(AwsException.class,
                     () -> fixture.launch(capacity.getCapacityReservationId()));
             assertEquals("ReservationCapacityExceeded", failure.getErrorCode());
+            assertEquals("The targeted Capacity Reservation has insufficient available capacity.", failure.getMessage());
             assertEquals(List.of(admitted.getInstanceId()), fixture.describe(capacity).getInstanceIds());
             assertEquals(1, fixture.service.describeVolumes(REGION, List.of(), Map.of()).size());
         }
@@ -311,6 +312,7 @@ class Ec2CapacityReservationAssociationServiceTest {
             AwsException failure = assertThrows(AwsException.class,
                     () -> fixture.launch(capacity.getCapacityReservationId()));
             assertEquals("ReservationCapacityExceeded", failure.getErrorCode());
+            assertEquals("The targeted Capacity Reservation has insufficient available capacity.", failure.getMessage());
             assertEquals(List.of(winner.get().getInstanceId()), fixture.describe(capacity).getInstanceIds());
             assertEquals(1, fixture.service.describeVolumes(REGION, List.of(), Map.of()).size());
             assertEquals(1, fixture.service.describeInstances(REGION, List.of(), Map.of()).stream()
@@ -329,9 +331,125 @@ class Ec2CapacityReservationAssociationServiceTest {
             AwsException failure = assertThrows(AwsException.class,
                     () -> fixture.service.startInstances(REGION, List.of(stopped.getInstanceId())));
             assertEquals("ReservationCapacityExceeded", failure.getErrorCode());
+            assertEquals("The targeted Capacity Reservation has insufficient available capacity.", failure.getMessage());
             assertEquals(List.of(occupant.getInstanceId()), fixture.describe(capacity).getInstanceIds());
             assertEquals("stopped", fixture.service.describeInstances(REGION,
                     List.of(stopped.getInstanceId()), Map.of()).getFirst().getInstances().getFirst().getState().getName());
+        }
+    }
+
+    @Test
+    void reservationOnlyLaunchDoesNotFallBackToOnDemand() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> fixture.launchWithPreference("capacity-reservations-only"));
+            assertEquals("InsufficientInstanceCapacity", failure.getErrorCode());
+            assertTrue(fixture.service.describeInstances(REGION, List.of(), Map.of()).isEmpty());
+            assertTrue(fixture.service.describeVolumes(REGION, List.of(), Map.of()).isEmpty());
+        }
+    }
+
+    @Test
+    void reservationOnlyLaunchConsumesAndReleasesOpenCapacity() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation capacity = fixture.create(1);
+            Instance instance = fixture.launchWithPreference("capacity-reservations-only");
+            assertEquals(capacity.getCapacityReservationId(),
+                    fixture.service.instanceCapacityReservationId(instance));
+            assertEquals(0, fixture.describe(capacity).getAvailableInstanceCount());
+            fixture.service.stopInstances(REGION, List.of(instance.getInstanceId()));
+            assertEquals(1, fixture.describe(capacity).getAvailableInstanceCount());
+            fixture.service.startInstances(REGION, List.of(instance.getInstanceId()));
+            assertEquals(0, fixture.describe(capacity).getAvailableInstanceCount());
+            fixture.service.terminateInstances(REGION, List.of(instance.getInstanceId()));
+            assertEquals(1, fixture.describe(capacity).getAvailableInstanceCount());
+        }
+    }
+
+    @Test
+    void reservationOnlyRestartCannotFallBackAfterCapacityIsCancelled() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation capacity = fixture.create(1);
+            Instance instance = fixture.launchWithPreference("capacity-reservations-only");
+            fixture.service.stopInstances(REGION, List.of(instance.getInstanceId()));
+            fixture.service.cancelCapacityReservation(REGION, capacity.getCapacityReservationId());
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> fixture.service.startInstances(REGION, List.of(instance.getInstanceId())));
+            assertEquals("InsufficientInstanceCapacity", failure.getErrorCode());
+            assertEquals("stopped", fixture.service.describeInstances(REGION,
+                    List.of(instance.getInstanceId()), Map.of()).getFirst().getInstances().getFirst()
+                    .getState().getName());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void reservationOnlyAdmissionCapsAtMatchingOpenCapacity(boolean enforceQuotas) {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            when(fixture.config.services().ec2().enforceVcpuQuotas()).thenReturn(enforceQuotas);
+            when(fixture.config.services().servicequotas().standardOnDemandVcpus()).thenReturn(20);
+            CapacityReservation first = fixture.create(1);
+            CapacityReservation second = fixture.create(1);
+            fixture.service.createCapacityReservation(REGION, "t3.small", "Linux/UNIX", REGION + "a",
+                    null, 5, null, null, null, null, null, null, null, null);
+            LaunchTemplateData.CapacityReservationSpecification specification =
+                    new LaunchTemplateData.CapacityReservationSpecification();
+            specification.setCapacityReservationPreference("capacity-reservations-only");
+            List<Instance> instances = fixture.service.runInstances(REGION, "ami-test", "t3.micro", 1, 3,
+                    null, List.of(), null, null, List.of(), null, null, null, null, 0, null, null, null,
+                    null, false, null, null, null, false, null, specification).getInstances();
+            assertEquals(2, instances.size());
+            assertEquals(0, fixture.describe(first).getAvailableInstanceCount());
+            assertEquals(0, fixture.describe(second).getAvailableInstanceCount());
+        }
+    }
+
+    @Test
+    void reservationOnlyRechecksCapacityAtAdmission() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation capacity = fixture.create(1);
+            doAnswer(invocation -> {
+                fixture.service.cancelCapacityReservation(REGION, capacity.getCapacityReservationId());
+                return invocation.callRealMethod();
+            }).when(fixture.service).acquireCapacity(eq(REGION), any());
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> fixture.launchWithPreference("capacity-reservations-only"));
+            assertEquals("InsufficientInstanceCapacity", failure.getErrorCode());
+            assertTrue(fixture.service.describeVolumes(REGION, List.of(), Map.of()).isEmpty());
+            assertTrue(fixture.service.describeInstances(REGION, List.of(), Map.of()).stream()
+                    .flatMap(reservation -> reservation.getInstances().stream())
+                    .allMatch(instance -> "terminated".equals(instance.getState().getName())));
+        }
+    }
+
+    @Test
+    void reservationOnlySpotLaunchIsRejectedBeforeMutation() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            fixture.create(1);
+            LaunchTemplateData.CapacityReservationSpecification specification =
+                    new LaunchTemplateData.CapacityReservationSpecification();
+            specification.setCapacityReservationPreference("capacity-reservations-only");
+            AwsException failure = assertThrows(AwsException.class, () -> fixture.service.runInstances(
+                    REGION, "ami-test", "t3.micro", 1, 1, null, List.of(), null, null, List.of(), null,
+                    null, null, null, 0, null, null, null, null, false, null, null, null, true, null, specification));
+            assertEquals("InvalidParameterCombination", failure.getErrorCode());
+            assertTrue(fixture.service.describeInstances(REGION, List.of(), Map.of()).isEmpty());
+        }
+    }
+
+    @Test
+    void reservationOnlyInsufficientMinimumDoesNotConsumeCapacity() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation capacity = fixture.create(1);
+            LaunchTemplateData.CapacityReservationSpecification specification =
+                    new LaunchTemplateData.CapacityReservationSpecification();
+            specification.setCapacityReservationPreference("capacity-reservations-only");
+            AwsException failure = assertThrows(AwsException.class, () -> fixture.service.runInstances(
+                    REGION, "ami-test", "t3.micro", 2, 3, null, List.of(), null, null, List.of(), null,
+                    null, null, null, 0, null, null, null, null, false, null, null, null, false, null, specification));
+            assertEquals("InsufficientInstanceCapacity", failure.getErrorCode());
+            assertEquals(1, fixture.describe(capacity).getAvailableInstanceCount());
+            assertTrue(fixture.service.describeInstances(REGION, List.of(), Map.of()).isEmpty());
         }
     }
 
