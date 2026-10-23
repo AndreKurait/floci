@@ -90,7 +90,7 @@ metadata.
 | `ami-sles15sp6` | | `registry.suse.com/bci/bci-base:15.6` |
 | `ami-sles15sp7` | | `registry.suse.com/bci/bci-base:15.7` |
 | `ami-sles160` | | `registry.suse.com/bci/bci-base:16.0` |
-| `ami-rocky9` | | `public.ecr.aws/docker/library/rockylinux:9` |
+| `ami-rocky9` | | `quay.io/rockylinux/rockylinux:9.6` |
 | `ami-rocky10` | | `quay.io/rockylinux/rockylinux:10` |
 | `ami-rhel8` | | `registry.access.redhat.com/ubi8/ubi:8.10` |
 | `ami-rhel9` | | `registry.access.redhat.com/ubi9/ubi:9.5` |
