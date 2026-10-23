@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
@@ -7,7 +8,9 @@ import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.CloudWatchDashboardsService;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.model.Dashboard;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Alarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.AlarmMetricDataQuery;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.CompositeAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
@@ -53,12 +56,17 @@ public class CloudWatchMetricsQueryHandler {
 
     public Response handle(String action, MultivaluedMap<String, String> params, String region) {
         String normalizedAction = action.substring(0, 1).toUpperCase() + action.substring(1);
+        if ("2013-01-16".equals(params.getFirst("Version")) && "GetMetricData".equals(normalizedAction)) {
+            throw new AwsException("UnsupportedOperation",
+                    "CloudWatch GetMetricData for API version 2013-01-16 is not implemented.", 400);
+        }
         return switch (normalizedAction) {
             case "PutMetricData" -> handlePutMetricData(params, region);
             case "ListMetrics" -> handleListMetrics(params, region);
             case "GetMetricStatistics" -> handleGetMetricStatistics(params, region);
             case "GetMetricData" -> handleGetMetricData(params, region);
             case "PutMetricAlarm" -> handlePutMetricAlarm(params, region);
+            case "PutCompositeAlarm" -> handlePutCompositeAlarm(params, region);
             case "DescribeAlarms" -> handleDescribeAlarms(params, region);
             case "DeleteAlarms" -> handleDeleteAlarms(params, region);
             case "SetAlarmState" -> handleSetAlarmState(params, region);
@@ -84,7 +92,7 @@ public class CloudWatchMetricsQueryHandler {
         String namespace = params.getFirst("Namespace");
         List<MetricDatum> datums = parseMetricData(params);
         metricsService.putMetricData(namespace, datums, region);
-        return Response.ok(AwsQueryResponse.envelopeNoResult("PutMetricData", null)).build();
+        return Response.ok(AwsQueryResponse.envelopeNoResult("PutMetricData", queryNamespace(params, null))).build();
     }
 
     private Response handleListMetrics(MultivaluedMap<String, String> params, String region) {
@@ -110,7 +118,7 @@ public class CloudWatchMetricsQueryHandler {
             xml.end("Dimensions").end("member");
         }
         xml.end("Metrics");
-        return Response.ok(AwsQueryResponse.envelope("ListMetrics", null, xml.build())).build();
+        return Response.ok(AwsQueryResponse.envelope("ListMetrics", queryNamespace(params, null), xml.build())).build();
     }
 
     private Response handleGetMetricStatistics(MultivaluedMap<String, String> params, String region) {
@@ -160,7 +168,8 @@ public class CloudWatchMetricsQueryHandler {
             xml.elem("Unit", dp.unit()).end("member");
         }
         xml.end("Datapoints");
-        return Response.ok(AwsQueryResponse.envelope("GetMetricStatistics", AwsNamespaces.CW, xml.build())).build();
+        return Response.ok(AwsQueryResponse.envelope("GetMetricStatistics",
+                queryNamespace(params, AwsNamespaces.CW), xml.build())).build();
     }
 
     private Response handleGetMetricData(MultivaluedMap<String, String> params, String region) {
@@ -241,7 +250,36 @@ public class CloudWatchMetricsQueryHandler {
     private Response handlePutMetricAlarm(MultivaluedMap<String, String> params, String region) {
         MetricAlarm alarm = parseAlarm(params);
         metricsService.putMetricAlarm(alarm, region);
-        return Response.ok(AwsQueryResponse.envelopeNoResult("PutMetricAlarm", null)).build();
+        return Response.ok(AwsQueryResponse.envelopeNoResult("PutMetricAlarm", queryNamespace(params, null))).build();
+    }
+
+    private Response handlePutCompositeAlarm(MultivaluedMap<String, String> params, String region) {
+        if (params.containsKey("ActionsSuppressor") || params.containsKey("ActionsSuppressorWaitPeriod")
+                || params.containsKey("ActionsSuppressorExtensionPeriod")) {
+            throw new AwsException("ValidationError", "Composite action suppression is not supported", 400);
+        }
+        CompositeAlarm alarm = new CompositeAlarm();
+        alarm.setAlarmName(params.getFirst("AlarmName"));
+        alarm.setAlarmDescription(params.getFirst("AlarmDescription"));
+        alarm.setActionsEnabled(!"false".equals(params.getFirst("ActionsEnabled")));
+        alarm.setAlarmRule(params.getFirst("AlarmRule"));
+        alarm.setAlarmActions(alarmMembers(params, "AlarmActions"));
+        alarm.setOkActions(alarmMembers(params, "OKActions"));
+        alarm.setInsufficientDataActions(alarmMembers(params, "InsufficientDataActions"));
+        for (int i = 1; params.getFirst("Tags.member." + i + ".Key") != null; i++) {
+            alarm.getTags().put(params.getFirst("Tags.member." + i + ".Key"),
+                    params.getFirst("Tags.member." + i + ".Value"));
+        }
+        metricsService.putCompositeAlarm(alarm, region);
+        return Response.ok(AwsQueryResponse.envelopeNoResult("PutCompositeAlarm", queryNamespace(params, null))).build();
+    }
+
+    private static List<String> alarmMembers(MultivaluedMap<String, String> params, String key) {
+        List<String> values = new ArrayList<>();
+        for (int i = 1; params.getFirst(key + ".member." + i) != null; i++) {
+            values.add(params.getFirst(key + ".member." + i));
+        }
+        return values;
     }
 
     private Response handleDescribeAlarms(MultivaluedMap<String, String> params, String region) {
@@ -253,14 +291,25 @@ public class CloudWatchMetricsQueryHandler {
         }
         String prefix = params.getFirst("AlarmNamePrefix");
 
-        List<MetricAlarm> alarms = metricsService.describeAlarms(alarmNames, prefix, region);
+        List<String> types = alarmMembers(params, "AlarmTypes");
+        metricsService.validateAlarmTypes(types);
+        List<MetricAlarm> alarms = types.isEmpty() || types.contains("MetricAlarm")
+                ? metricsService.describeAlarms(alarmNames, prefix, region) : List.of();
 
         XmlBuilder xml = new XmlBuilder().start("MetricAlarms");
         for (MetricAlarm a : alarms) {
             toAlarmXml(xml, a);
         }
-        xml.end("MetricAlarms");
-        return Response.ok(AwsQueryResponse.envelope("DescribeAlarms", null, xml.build())).build();
+        xml.end("MetricAlarms").start("CompositeAlarms");
+        if (types.contains("CompositeAlarm")) {
+            for (CompositeAlarm alarm : metricsService.describeCompositeAlarms(alarmNames, prefix, region)) {
+                xml.start("member");
+                describeAlarmFields(xml, alarm);
+                xml.elem("AlarmRule", alarm.getAlarmRule()).end("member");
+            }
+        }
+        xml.end("CompositeAlarms");
+        return Response.ok(AwsQueryResponse.envelope("DescribeAlarms", queryNamespace(params, null), xml.build())).build();
     }
 
     private Response handleDeleteAlarms(MultivaluedMap<String, String> params, String region) {
@@ -271,7 +320,7 @@ public class CloudWatchMetricsQueryHandler {
             alarmNames.add(name);
         }
         metricsService.deleteAlarms(alarmNames, region);
-        return Response.ok(AwsQueryResponse.envelopeNoResult("DeleteAlarms", null)).build();
+        return Response.ok(AwsQueryResponse.envelopeNoResult("DeleteAlarms", queryNamespace(params, null))).build();
     }
 
     private Response handleSetAlarmState(MultivaluedMap<String, String> params, String region) {
@@ -280,7 +329,7 @@ public class CloudWatchMetricsQueryHandler {
         String reason = params.getFirst("StateReason");
         String reasonData = params.getFirst("StateReasonData");
         metricsService.setAlarmState(name, state, reason, reasonData, region);
-        return Response.ok(AwsQueryResponse.envelopeNoResult("SetAlarmState", null)).build();
+        return Response.ok(AwsQueryResponse.envelopeNoResult("SetAlarmState", queryNamespace(params, null))).build();
     }
 
     private Response handleListTagsForResource(MultivaluedMap<String, String> params, String region) {
@@ -357,7 +406,7 @@ public class CloudWatchMetricsQueryHandler {
         String xml = new XmlBuilder()
                 .start("DashboardValidationMessages").end("DashboardValidationMessages")
                 .build();
-        return Response.ok(AwsQueryResponse.envelope("PutDashboard", null, xml)).build();
+        return Response.ok(AwsQueryResponse.envelope("PutDashboard", queryNamespace(params, null), xml)).build();
     }
 
     private Response handleGetDashboard(MultivaluedMap<String, String> params, String region) {
@@ -367,7 +416,7 @@ public class CloudWatchMetricsQueryHandler {
                 .elem("DashboardName", dashboard.getDashboardName())
                 .elem("DashboardBody", dashboard.getDashboardBody())
                 .build();
-        return Response.ok(AwsQueryResponse.envelope("GetDashboard", null, xml)).build();
+        return Response.ok(AwsQueryResponse.envelope("GetDashboard", queryNamespace(params, null), xml)).build();
     }
 
     private Response handleListDashboards(MultivaluedMap<String, String> params, String region) {
@@ -385,7 +434,7 @@ public class CloudWatchMetricsQueryHandler {
                     .end("member");
         }
         xml.end("DashboardEntries");
-        return Response.ok(AwsQueryResponse.envelope("ListDashboards", null, xml.build())).build();
+        return Response.ok(AwsQueryResponse.envelope("ListDashboards", queryNamespace(params, null), xml.build())).build();
     }
 
     private Response handleDeleteDashboards(MultivaluedMap<String, String> params, String region) {
@@ -396,7 +445,7 @@ public class CloudWatchMetricsQueryHandler {
             names.add(name);
         }
         dashboardsService.deleteDashboards(names, region);
-        return Response.ok(AwsQueryResponse.envelopeEmptyResult("DeleteDashboards", null)).build();
+        return Response.ok(AwsQueryResponse.envelopeEmptyResult("DeleteDashboards", queryNamespace(params, null))).build();
     }
 
     // ──────────────────────────── Metric Streams ────────────────────────────
@@ -483,6 +532,10 @@ public class CloudWatchMetricsQueryHandler {
     private Response handleStopMetricStreams(MultivaluedMap<String, String> params, String region) {
         metricStreamsService.stopMetricStreams(parseNames(params), region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult("StopMetricStreams", null)).build();
+    }
+
+    private static String queryNamespace(MultivaluedMap<String, String> params, String currentNamespace) {
+        return "2013-01-16".equals(params.getFirst("Version")) ? AwsNamespaces.CW_2013 : currentNamespace;
     }
 
     private List<String> parseNames(MultivaluedMap<String, String> params) {
@@ -783,22 +836,8 @@ public class CloudWatchMetricsQueryHandler {
     }
 
     private void toAlarmXml(XmlBuilder xml, MetricAlarm a) {
-        xml.start("member")
-                .elem("AlarmName", a.getAlarmName())
-                .elem("AlarmArn", a.getAlarmArn())
-                .elem("AlarmDescription", a.getAlarmDescription());
-        xml.start("AlarmActions");
-        a.getAlarmActions().forEach(act -> xml.elem("member", act));
-        xml.end("AlarmActions")
-                .elem("AlarmConfigurationUpdatedTimestamp", Instant.ofEpochSecond(a.getAlarmConfigurationUpdatedTimestamp()).toString())
-                .elem("ActionsEnabled", String.valueOf(a.isActionsEnabled()));
-
-        xml.start("OKActions");
-        a.getOkActions().forEach(act -> xml.elem("member", act));
-        xml.end("OKActions");
-        xml.start("InsufficientDataActions");
-        a.getInsufficientDataActions().forEach(act -> xml.elem("member", act));
-        xml.end("InsufficientDataActions");
+        xml.start("member");
+        describeAlarmFields(xml, a);
         if (!a.getMetrics().isEmpty()) {
             toAlarmMetricsXml(xml, a.getMetrics());
         } else {
@@ -814,11 +853,7 @@ public class CloudWatchMetricsQueryHandler {
                     .elem("Unit", a.getUnit());
         }
 
-        xml.elem("StateValue", a.getStateValue())
-                .elem("StateReason", a.getStateReason())
-                .elem("StateReasonData", a.getStateReasonData())
-                .elem("StateUpdatedTimestamp", Instant.ofEpochSecond(a.getStateUpdatedTimestamp()).toString())
-                .elem("EvaluationPeriods", String.valueOf(a.getEvaluationPeriods()))
+        xml.elem("EvaluationPeriods", String.valueOf(a.getEvaluationPeriods()))
                 .elem("Threshold", String.valueOf(a.getThreshold()))
                 .elem("ComparisonOperator", a.getComparisonOperator())
                 .elem("TreatMissingData", a.getTreatMissingData());
@@ -828,6 +863,28 @@ public class CloudWatchMetricsQueryHandler {
         }
 
         xml.end("member");
+    }
+
+    private void describeAlarmFields(XmlBuilder xml, Alarm a) {
+        xml.elem("AlarmName", a.getAlarmName())
+                .elem("AlarmArn", a.getAlarmArn())
+                .elem("AlarmDescription", a.getAlarmDescription());
+        xml.start("AlarmActions");
+        a.getAlarmActions().forEach(act -> xml.elem("member", act));
+        xml.end("AlarmActions")
+                .elem("AlarmConfigurationUpdatedTimestamp", Instant.ofEpochSecond(a.getAlarmConfigurationUpdatedTimestamp()).toString())
+                .elem("ActionsEnabled", String.valueOf(a.isActionsEnabled()));
+
+        xml.start("OKActions");
+        a.getOkActions().forEach(act -> xml.elem("member", act));
+        xml.end("OKActions");
+        xml.start("InsufficientDataActions");
+        a.getInsufficientDataActions().forEach(act -> xml.elem("member", act));
+        xml.end("InsufficientDataActions");
+        xml.elem("StateValue", a.getStateValue())
+                .elem("StateReason", a.getStateReason())
+                .elem("StateReasonData", a.getStateReasonData())
+                .elem("StateUpdatedTimestamp", Instant.ofEpochSecond(a.getStateUpdatedTimestamp()).toString());
     }
 
     private void toAlarmMetricsXml(XmlBuilder xml, List<AlarmMetricDataQuery> metrics) {

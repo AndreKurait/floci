@@ -134,6 +134,10 @@ public class AwsJsonController {
 
         String serviceKey = targetMatch.descriptor().externalKey();
         String action = targetMatch.action();
+        if ("CloudWatchVersion20130116.".equals(targetMatch.prefix())
+                && !QueryServiceModels.legacyCloudWatchOperations().contains(action)) {
+            return JsonErrorResponseUtils.createUnknownOperationErrorResponse(target);
+        }
         LOG.debugv("{0} JSON action: {1}", serviceKey, action);
 
         JsonNode request;
@@ -170,7 +174,9 @@ public class AwsJsonController {
                 case "sns" -> snsJsonHandler.handle(action, request, region);
                 case "states" -> sfnJsonHandler.handle(action, request, region);
                 case "swf" -> swfJsonHandler.handle(action, request, region);
-                case "monitoring" -> cloudWatchMetricsJsonHandler.handle(action, request, region);
+                case "monitoring" -> "CloudWatchVersion20130116.".equals(targetMatch.prefix())
+                        ? cloudWatchMetricsJsonHandler.handleLegacy(action, request, region)
+                        : cloudWatchMetricsJsonHandler.handle(action, request, region);
                 case "cloudcontrol" -> cloudControlJsonHandler.handle(
                                         action, request, region, regionResolver.getAccountId());
                 case "network-firewall" -> networkFirewallJsonHandler.handle(
