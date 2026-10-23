@@ -13726,7 +13726,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
         if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
             for (String sgId : securityGroupIds) {
-                SecurityGroup sg = getRequiredSecurityGroup(region, sgId);
+                SecurityGroup sg = launchSubnetId == null
+                        ? securityGroups.get(key(region, sgId)).orElseThrow(() ->
+                                new AwsException("InvalidSecurityGroupID.NotFound",
+                                        "The securityGroup ID '" + sgId + "' does not exist", 400))
+                        : getRequiredSecurityGroup(region, sgId);
                 if (!vpcId.equals(sg.getVpcId())) {
                     if (launchSubnetId != null) {
                         throw new AwsException("InvalidParameter", "Security group " + sgId + " and subnet "
