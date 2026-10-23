@@ -59,6 +59,7 @@ import io.github.hectorvent.floci.services.scheduler.model.Schedule;
 import io.github.hectorvent.floci.services.scheduler.model.ScheduleRequest;
 import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
+import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService.TokenTimeout;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.MapRun;
@@ -1073,7 +1074,7 @@ public class AslExecutor {
      * picks the task up, which is the instant it emits ActivityStarted; Floci emits that event at
      * schedule time, so there is no later instant to anchor on here.
      */
-    private JsonNode awaitToken(CompletableFuture<JsonNode> future, JsonNode stateDef, String taskToken,
+    JsonNode awaitToken(CompletableFuture<JsonNode> future, JsonNode stateDef, String taskToken,
                                 long executionDeadlineNanos, long timeoutDeadlineNanos) throws Exception {
         int heartbeatSeconds = stateDef.path("HeartbeatSeconds").asInt(0);
         try {
@@ -1083,22 +1084,21 @@ public class AslExecutor {
                 try {
                     return future.get(wakeAtNanos - nanoTime.getAsLong(), TimeUnit.NANOSECONDS);
                 } catch (java.util.concurrent.TimeoutException e) {
-                    // The execution's budget is read first: when it is the clock that ran out, the
-                    // execution ends as TIMED_OUT and the task's own timeout never applies.
-                    if (nanoTime.getAsLong() >= executionDeadlineNanos) {
-                        future.cancel(true);
-                        throw new ExecutionTimedOutException();
+                    TokenTimeout expired = sfnService.get().expirePendingToken(taskToken, nanoTime.getAsLong(),
+                            executionDeadlineNanos, timeoutDeadlineNanos, heartbeatSeconds);
+                    if (expired == TokenTimeout.CLAIMED) {
+                        // Claiming removes the token before completing its future outside the lock.
+                        return future.get();
                     }
-                    if (nanoTime.getAsLong() >= timeoutDeadlineNanos) {
+                    RuntimeException timeout = switch (expired) {
+                        case EXECUTION -> new ExecutionTimedOutException();
+                        case TASK -> new TaskTimedOutException("States.Timeout");
+                        case HEARTBEAT -> new TaskTimedOutException("States.HeartbeatTimeout");
+                        case NONE, CLAIMED -> null;
+                    };
+                    if (timeout != null) {
                         future.cancel(true);
-                        throw new TaskTimedOutException("States.Timeout");
-                    }
-                    // Read the gap again rather than trusting the one this thread parked on: a
-                    // heartbeat that landed meanwhile has already moved it past now, and the task
-                    // goes back to waiting on the later deadline.
-                    if (nanoTime.getAsLong() >= heartbeatDeadlineNanos(taskToken, heartbeatSeconds)) {
-                        future.cancel(true);
-                        throw new TaskTimedOutException("States.HeartbeatTimeout");
+                        throw timeout;
                     }
                 }
             }
