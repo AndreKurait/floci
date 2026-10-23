@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.route53;
 
 import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
 import io.github.hectorvent.floci.core.common.dns.DnsLookupHelper;
+import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.services.route53.model.AliasTarget;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecord;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecordSet;
@@ -32,6 +33,9 @@ class Route53DnsResolutionTest {
 
     @InjectMock
     DnsLookupHelper dnsLookupHelper;
+
+    @InjectMock
+    EmbeddedDnsServer dnsServer;
 
     @Inject
     Route53DnsRecordSource dnsRecordSource;
@@ -355,6 +359,18 @@ class Route53DnsResolutionTest {
         assertTrue(result.isPresent());
         String expectedIp = InetAddress.getLocalHost().getHostAddress();
         assertEquals(List.of(expectedIp), result.get().addresses());
+    }
+
+    @Test
+    void privateCnameToEmulatorSuffixUsesTheAdvertisedDnsAddress() {
+        Mockito.when(dnsServer.getServerIp()).thenReturn(Optional.of("172.26.0.2"));
+        String zone = uniqueZone();
+        String zoneId = createPrivateZone(zone);
+        addRecord(zoneId, "service." + zone, "CNAME", "s3.localhost.floci.io");
+
+        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("service." + zone);
+        assertTrue(result.isPresent());
+        assertEquals(List.of("172.26.0.2"), result.get().addresses());
     }
 
     @Test
