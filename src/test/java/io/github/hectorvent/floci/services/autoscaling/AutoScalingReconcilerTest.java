@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 import java.util.List;
@@ -131,7 +132,7 @@ class AutoScalingReconcilerTest {
         verify(service).completeInstanceRefreshIfSettled("us-east-1", "bad-data");
         verify(ec2, never()).runInstances(any(), any(), any(), any(Integer.class), any(Integer.class), any(),
                 any(), any(), any(), any(), any(), any(), any(), any(), any(Integer.class), any(), any(), any(), any(),
-                anyBoolean(), isNull(), isNull(), any());
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull());
     }
 
     static Stream<Arguments> templateUserData() {
@@ -198,7 +199,7 @@ class AutoScalingReconcilerTest {
                 anyList(), eq(expectedText),
                 eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null),
                 isNull(), eq(0), isNull(), eq(metadata), isNull(), eq(expectedEncoding),
-                anyBoolean(), isNull(), isNull(), any())).thenReturn(reservation);
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -212,7 +213,7 @@ class AutoScalingReconcilerTest {
                 tags.capture(), eq(expectedText),
                 eq("arn:aws:iam::000000000000:instance-profile/app-profile"), eq(null),
                 isNull(), eq(0), isNull(), eq(metadata), isNull(), eq(expectedEncoding),
-                anyBoolean(), isNull(), isNull(), any());
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull());
         assertEquals(storedText, version.getData().getUserData());
         assertEquals(storedEncoding, version.getData().getEncodedUserData());
         assertEquals(propagatedTags.size(), tags.getValue().size());
@@ -240,7 +241,7 @@ class AutoScalingReconcilerTest {
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null), eq(List.of()),
                 eq(null), eq(null), eq(null),
                 isNull(), eq(0), isNull(), isNull(), isNull(), any(),
-                anyBoolean(), isNull(), isNull(), any())).thenReturn(reservation);
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -269,15 +270,52 @@ class AutoScalingReconcilerTest {
         reservation.setInstances(List.of(ec2Instance));
         when(ec2Service.runInstances(any(), any(), any(), any(Integer.class), any(Integer.class), any(),
                 any(), any(), any(), any(), any(), any(), any(), any(), any(Integer.class), any(), any(), any(), any(),
-                anyBoolean(), any(), any(), any())).thenReturn(reservation);
+                anyBoolean(), any(), any(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
         ArgumentCaptor<List<LaunchTemplateData.BlockDeviceMapping>> mappings = ArgumentCaptor.captor();
         verify(ec2Service).runInstances(any(), any(), any(), any(Integer.class), any(Integer.class), any(),
                 any(), any(), any(), any(), any(), any(), any(), any(), any(Integer.class), any(), any(), any(), any(),
-                anyBoolean(), any(), any(), mappings.capture());
+                anyBoolean(), any(), any(), mappings.capture(), eq(false), isNull(), isNull());
         assertEquals(List.of(root), mappings.getValue());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"none", "targeted"})
+    void scaleOutPassesTheLaunchTemplateCapacityReservationSpecification(String preference) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(asgService, ec2Service, mock(ElbV2Service.class));
+        AutoScalingGroup asg = launchTemplateAsg();
+        stubLaunchTemplate(ec2Service, "ami-version-1", "t3.micro");
+        LaunchTemplateData.CapacityReservationSpecification capacity =
+                new LaunchTemplateData.CapacityReservationSpecification();
+        LaunchTemplateData.CapacityReservationTarget target = new LaunchTemplateData.CapacityReservationTarget();
+        target.setCapacityReservationId("cr-0123456789abcdef0");
+        if ("none".equals(preference)) {
+            capacity.setCapacityReservationPreference("none");
+        } else {
+            capacity.setCapacityReservationTarget(target);
+        }
+        ec2Service.describeLaunchTemplateVersions("us-east-1", "lt-123", null, List.of("1"))
+                .getFirst().getData().setCapacityReservationSpecification(capacity);
+        when(asgService.saveAutoScalingGroupIfPresent(asg)).thenReturn(true);
+        Instance ec2Instance = new Instance();
+        ec2Instance.setInstanceId("i-gp3");
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(ec2Instance));
+        when(ec2Service.runInstances(any(), any(), any(), any(Integer.class), any(Integer.class), any(),
+                any(), any(), any(), any(), any(), any(), any(), any(), any(Integer.class), any(), any(), any(), any(),
+                anyBoolean(), any(), any(), any(), eq(false), isNull(), eq(capacity))).thenReturn(reservation);
+
+        reconciler.reconcile(asg);
+
+        ArgumentCaptor<LaunchTemplateData.CapacityReservationSpecification> specification = ArgumentCaptor.captor();
+        verify(ec2Service).runInstances(any(), any(), any(), any(Integer.class), any(Integer.class), any(),
+                any(), any(), any(), any(), any(), any(), any(), any(), any(Integer.class), any(), any(), any(), any(),
+                anyBoolean(), any(), any(), any(), eq(false), isNull(), specification.capture());
+        assertEquals(capacity, specification.getValue());
     }
 
     @Test
@@ -298,7 +336,7 @@ class AutoScalingReconcilerTest {
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null), eq(List.of()),
                 eq(null), eq(null), eq(null),
                 isNull(), eq(0), isNull(), isNull(), isNull(), any(),
-                anyBoolean(), isNull(), isNull(), any())).thenReturn(reservation);
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -344,14 +382,14 @@ class AutoScalingReconcilerTest {
                 eq(1), eq(1), eq(null), anyList(), eq(null), eq(null),
                 anyList(), eq(null), eq(null), eq(associatePublicIp),
                 isNull(), eq(0), isNull(), isNull(), isNull(), any(),
-                anyBoolean(), isNull(), isNull(), any())).thenReturn(reservation);
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
         verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-lc"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), anyList(), eq(null), eq(null),
                 anyList(), eq(null), eq(null), eq(associatePublicIp),
-                isNull(), eq(0), isNull(), isNull(), isNull(), any(), anyBoolean(), isNull(), isNull(), any());
+                isNull(), eq(0), isNull(), isNull(), isNull(), any(), anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull());
     }
 
     @Test
@@ -386,7 +424,7 @@ class AutoScalingReconcilerTest {
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
                 eq(List.of()), eq(null), eq(null), eq(null),
                 isNull(), eq(0), isNull(), isNull(), isNull(), any(),
-                anyBoolean(), isNull(), isNull(), any())).thenReturn(reservation);
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -444,7 +482,7 @@ class AutoScalingReconcilerTest {
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
                 eq(List.of()), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null),
                 isNull(), eq(0), isNull(), eq(metadata), isNull(), any(),
-                anyBoolean(), isNull(), isNull(), any())).thenReturn(reservation);
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -456,7 +494,7 @@ class AutoScalingReconcilerTest {
         verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-version-3"), eq("t3.small"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
                 eq(List.of()), eq("#!/bin/bash\necho hi\n"), eq(null), eq(null),
-                isNull(), eq(0), isNull(), eq(metadata), isNull(), any(), anyBoolean(), isNull(), isNull(), any());
+                isNull(), eq(0), isNull(), eq(metadata), isNull(), any(), anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull());
         assertNull(version.getData().getUserData());
     }
 
@@ -532,7 +570,7 @@ class AutoScalingReconcilerTest {
                 org.mockito.ArgumentMatchers.anyBoolean(),
                 org.mockito.ArgumentMatchers.isNull(),
                 org.mockito.ArgumentMatchers.isNull(),
-                org.mockito.ArgumentMatchers.any());
+                org.mockito.ArgumentMatchers.any(), eq(false), isNull(), isNull());
     }
 
     @Test
