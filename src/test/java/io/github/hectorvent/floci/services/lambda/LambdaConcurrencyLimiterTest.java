@@ -15,6 +15,8 @@ class LambdaConcurrencyLimiterTest {
     private static final String OTHER_REGION = "ap-northeast-1";
     private static final String ARN = "arn:aws:lambda:us-east-1:000000000000:function:fn";
     private static final String ARN2 = "arn:aws:lambda:us-east-1:000000000000:function:other";
+    private static final String ARN_OTHER_ACCOUNT = "arn:aws:lambda:us-east-1:111111111111:function:fn";
+    private static final String ARN2_OTHER_ACCOUNT = "arn:aws:lambda:us-east-1:111111111111:function:other";
     private static final String ARN_OTHER_REGION = "arn:aws:lambda:ap-northeast-1:000000000000:function:fn-apne1";
 
     private LambdaFunction fn(String arn, Integer reserved) {
@@ -38,7 +40,7 @@ class LambdaConcurrencyLimiterTest {
         assertEquals(429, ex.getHttpStatus());
         p1.close();
         p2.close();
-        assertEquals(0, limiter.unreservedInflightCount(REGION));
+        assertEquals(0, limiter.unreservedInflightCount("000000000000", REGION));
     }
 
     @Test
@@ -133,7 +135,7 @@ class LambdaConcurrencyLimiterTest {
         assertThrows(AwsException.class, () -> limiter.validateAndSetReserved(ARN, 951));
         // But a reduction must succeed so the operator can recover.
         assertDoesNotThrow(() -> limiter.validateAndSetReserved(ARN, 500));
-        assertEquals(500, limiter.totalReserved(REGION));
+        assertEquals(500, limiter.totalReserved("000000000000", REGION));
     }
 
     @Test
@@ -168,7 +170,7 @@ class LambdaConcurrencyLimiterTest {
         LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter();
         limiter.setReserved(ARN, 1);
         limiter.reset(ARN);
-        assertEquals(0, limiter.totalReserved(REGION));
+        assertEquals(0, limiter.totalReserved("000000000000", REGION));
     }
 
     @Test
@@ -192,7 +194,7 @@ class LambdaConcurrencyLimiterTest {
         limiter.setReserved(ARN, 5);
         limiter.setReserved(ARN, 10); // now at 10
         limiter.rollbackReservedIfExpected(ARN, 10, 5);
-        assertEquals(5, limiter.totalReserved(REGION));
+        assertEquals(5, limiter.totalReserved("000000000000", REGION));
     }
 
     @Test
@@ -203,7 +205,7 @@ class LambdaConcurrencyLimiterTest {
         limiter.setReserved(ARN, 20);
         // A's rollback expects 10 still present — must not clobber 20
         limiter.rollbackReservedIfExpected(ARN, 10, null);
-        assertEquals(20, limiter.totalReserved(REGION));
+        assertEquals(20, limiter.totalReserved("000000000000", REGION));
     }
 
     @Test
@@ -211,11 +213,11 @@ class LambdaConcurrencyLimiterTest {
         LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter();
         limiter.setReserved(ARN, 50);
         limiter.setReserved(ARN2, 30);
-        assertEquals(80, limiter.totalReserved(REGION));
+        assertEquals(80, limiter.totalReserved("000000000000", REGION));
         limiter.setReserved(ARN, 100); // +50
-        assertEquals(130, limiter.totalReserved(REGION));
+        assertEquals(130, limiter.totalReserved("000000000000", REGION));
         limiter.clearReserved(ARN2); // -30
-        assertEquals(100, limiter.totalReserved(REGION));
+        assertEquals(100, limiter.totalReserved("000000000000", REGION));
     }
 
     @Test
@@ -241,8 +243,8 @@ class LambdaConcurrencyLimiterTest {
         limiter.validateAndSetReserved(ARN, 900);
         // Another region starts fresh — Put up to 900 still allowed
         assertDoesNotThrow(() -> limiter.validateAndSetReserved(ARN_OTHER_REGION, 900));
-        assertEquals(900, limiter.totalReserved(REGION));
-        assertEquals(900, limiter.totalReserved(OTHER_REGION));
+        assertEquals(900, limiter.totalReserved("000000000000", REGION));
+        assertEquals(900, limiter.totalReserved("000000000000", OTHER_REGION));
 
         // Unreserved pool is also per-region
         LambdaConcurrencyLimiter small = new LambdaConcurrencyLimiter(1, 0);
@@ -255,7 +257,60 @@ class LambdaConcurrencyLimiterTest {
         }
         // After close, both regions have capacity again
         try (LambdaConcurrencyLimiter.Permit reacquire = small.acquire(fn(ARN, null))) {
-            assertEquals(1, small.unreservedInflightCount(REGION));
+            assertEquals(1, small.unreservedInflightCount("000000000000", REGION));
+        }
+    }
+
+    @Test
+    void accountsHaveIndependentUnreservedPermitsAndRelease() {
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter(1, 0);
+        try (LambdaConcurrencyLimiter.Permit first = limiter.acquire(fn(ARN, null));
+             LambdaConcurrencyLimiter.Permit other = limiter.acquire(fn(ARN_OTHER_ACCOUNT, null))) {
+            assertThrows(AwsException.class, () -> limiter.acquire(fn(ARN2, null)));
+            assertThrows(AwsException.class, () -> limiter.acquire(fn(ARN2_OTHER_ACCOUNT, null)));
+            first.close();
+            try (LambdaConcurrencyLimiter.Permit reacquired = limiter.acquire(fn(ARN2, null))) {
+                assertThrows(AwsException.class, () -> limiter.acquire(fn(ARN2_OTHER_ACCOUNT, null)));
+            }
+        }
+        try (LambdaConcurrencyLimiter.Permit first = limiter.acquire(fn(ARN, null));
+             LambdaConcurrencyLimiter.Permit other = limiter.acquire(fn(ARN_OTHER_ACCOUNT, null))) {
+            assertThrows(AwsException.class, () -> limiter.acquire(fn(ARN2, null)));
+        }
+    }
+
+    @Test
+    void accountsHaveIndependentReservationsAndClear() {
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter(1000, 100);
+        limiter.validateAndSetReserved(ARN, 900);
+        limiter.validateAndSetReserved(ARN_OTHER_ACCOUNT, 900);
+        assertThrows(AwsException.class, () -> limiter.validateAndSetReserved(ARN2_OTHER_ACCOUNT, 1));
+        limiter.clearReserved(ARN);
+        assertThrows(AwsException.class, () -> limiter.validateAndSetReserved(ARN2_OTHER_ACCOUNT, 1));
+        limiter.validateAndSetReserved(ARN2, 900);
+        limiter.reset(ARN_OTHER_ACCOUNT);
+        assertDoesNotThrow(() -> limiter.validateAndSetReserved(ARN2_OTHER_ACCOUNT, 900));
+    }
+
+    @Test
+    void reservationRollbackPreservesOtherAccountBudget() {
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter(1000, 100);
+        limiter.setReserved(ARN, 500);
+        limiter.setReserved(ARN_OTHER_ACCOUNT, 500);
+        limiter.rollbackReservedIfExpected(ARN, 500, 200);
+        assertDoesNotThrow(() -> limiter.validateAndSetReserved(ARN2_OTHER_ACCOUNT, 400));
+        limiter.rollbackReservedIfExpected(ARN, 200, null);
+        assertThrows(AwsException.class, () -> limiter.validateAndSetReserved(ARN2_OTHER_ACCOUNT, 401));
+    }
+
+    @Test
+    void malformedIdentifiersRetainSharedFallbackAndRelease() {
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter(1, 0);
+        try (LambdaConcurrencyLimiter.Permit held = limiter.acquire(fn("not-an-arn", null))) {
+            assertThrows(AwsException.class, () -> limiter.acquire(fn(null, null)));
+        }
+        try (LambdaConcurrencyLimiter.Permit released = limiter.acquire(fn(null, null))) {
+            assertThrows(AwsException.class, () -> limiter.acquire(fn("not-an-arn", null)));
         }
     }
 }
