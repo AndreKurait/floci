@@ -68,7 +68,7 @@ class AutoScalingCapacitySuspensionTest {
                 .thenReturn(List.of(template));
         when(ec2.runInstances(eq(REGION), any(), any(), anyInt(), anyInt(), any(), anyList(), any(), any(),
                 anyList(), any(), any(), any(),
-                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), anyList(), eq(false), isNull(), isNull())).thenReturn(reservation("i-replacement"));
+                any(), anyInt(), eq(REGION + "a"), any(), any(), any(), anyBoolean(), any(), any(), anyList(), eq(false), isNull(), isNull())).thenReturn(reservation("i-replacement"));
     }
 
     @ParameterizedTest
@@ -84,7 +84,7 @@ class AutoScalingCapacitySuspensionTest {
             verify(ec2, never()).terminateInstances(anyString(), anyList());
             verify(ec2, never()).runInstances(eq(REGION), any(), any(), anyInt(), anyInt(), any(), anyList(),
                     any(), any(), anyList(), any(), any(), any(),
-                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), anyList(), eq(false), isNull(), isNull());
+                any(), anyInt(), eq(REGION + "a"), any(), any(), any(), anyBoolean(), any(), any(), anyList(), eq(false), isNull(), isNull());
             assertEquals(List.of("i-original"), group.getInstances().stream()
                     .map(AsgInstance::getInstanceId).toList());
             service.resumeProcesses(REGION, "suspended-group", processes);
@@ -96,7 +96,7 @@ class AutoScalingCapacitySuspensionTest {
         } else {
             verify(ec2).runInstances(eq(REGION), any(), any(), eq(1), eq(1), any(), anyList(),
                     any(), any(), anyList(), any(), any(), any(),
-                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), anyList(), eq(false), isNull(), isNull());
+                any(), anyInt(), eq(REGION + "a"), any(), any(), any(), anyBoolean(), any(), any(), anyList(), eq(false), isNull(), isNull());
         }
     }
 
@@ -164,7 +164,7 @@ class AutoScalingCapacitySuspensionTest {
             reconciler.reconcile(group);
             verify(ec2, never()).runInstances(eq(REGION), any(), any(), anyInt(), anyInt(), any(), anyList(),
                     any(), any(), anyList(), any(), any(), any(),
-                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), anyList(), eq(false), isNull(), isNull());
+                any(), anyInt(), eq(REGION + "a"), any(), any(), any(), anyBoolean(), any(), any(), anyList(), eq(false), isNull(), isNull());
             verify(ec2, never()).terminateInstances(anyString(), anyList());
         } finally {
             releaseOperation.countDown();
@@ -187,7 +187,7 @@ class AutoScalingCapacitySuspensionTest {
         reconciler.reconcile(group);
         verify(ec2, never()).runInstances(eq(REGION), any(), any(), anyInt(), anyInt(), any(), anyList(),
                 any(), any(), anyList(), any(), any(), any(),
-                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), anyList(), eq(false), isNull(), isNull());
+                any(), anyInt(), eq(REGION + "a"), any(), any(), any(), anyBoolean(), any(), any(), anyList(), eq(false), isNull(), isNull());
         if (recreate) {
             assertTrue(service.describeAutoScalingGroups(REGION, List.of("suspended-group"))
                     .getFirst().getInstances().isEmpty());
