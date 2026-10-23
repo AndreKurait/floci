@@ -5,10 +5,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -312,6 +316,37 @@ class SamTransformProcessorTest {
         assertEquals("MyFuncVersionabc", publishedVersionId(template.formatted(code, "abc")));
         assertEquals("MyFuncVersion102360dfc3", publishedVersionId(template.formatted(code, "")),
                 "an empty AutoPublishCodeSha256 gives no hash, so the code is hashed");
+    }
+
+    @ParameterizedTest
+    @MethodSource("publishedDescriptions")
+    void autoPublishCodeSha256ReachesTheFunctionDescription(String description, String alias,
+                                                            String sha, String expected) throws Exception {
+        String template = """
+                {"Transform":"AWS::Serverless-2016-10-31",
+                "Parameters":{"Desc":{"Type":"String","Default":"default-desc"}},
+                "Resources":{"Bucket":{"Type":"AWS::S3::Bucket"},
+                "Function":{"Type":"AWS::Serverless::Function","Properties":{
+                "Handler":"index.handler","Runtime":"python3.13","InlineCode":"def handler(e, c): return e",
+                "AutoPublishCodeSha256":"%s"%s%s}}}}
+                """.formatted(sha, alias, description);
+        JsonNode transformed = processor.expandSamTemplate(objectMapper.readTree(template),
+                Map.of("Desc", "overridden"));
+        assertEquals(objectMapper.readTree(expected),
+                transformed.path("Resources").path("Function").path("Properties").path("Description"));
+    }
+
+    private static Stream<Arguments> publishedDescriptions() {
+        String alias = ",\"AutoPublishAlias\":\"live\"";
+        return Stream.of(
+                Arguments.of("", alias, "release123", "\"release123\""),
+                Arguments.of(",\"Description\":\"deployment\"", alias, "release123", "\"deployment release123\""),
+                Arguments.of(",\"Description\":\"\"", alias, "release123", "\"release123\""),
+                Arguments.of(",\"Description\":{\"Ref\":\"Desc\"}", alias, "release123", "\"overridden release123\""),
+                Arguments.of(",\"Description\":{\"Fn::GetAtt\":[\"Bucket\",\"Arn\"]}", alias, "release123",
+                        "{\"Fn::Join\":[\" \",[{\"Fn::GetAtt\":[\"Bucket\",\"Arn\"]},\"release123\"]]}"),
+                Arguments.of(",\"Description\":\"deployment\"", "", "release123", "\"deployment\""),
+                Arguments.of(",\"Description\":\"deployment\"", alias, "", "\"deployment\""));
     }
 
     /**
