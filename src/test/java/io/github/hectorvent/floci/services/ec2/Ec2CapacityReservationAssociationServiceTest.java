@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
@@ -9,6 +10,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.model.CapacityReservation;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
+import io.github.hectorvent.floci.services.resourcegroups.ResourceGroupsService;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -16,6 +18,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -45,6 +48,7 @@ class Ec2CapacityReservationAssociationServiceTest {
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";
     private static final String FILE = "ec2-capacity-reservations.json";
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @TempDir
     Path directory;
@@ -453,11 +457,136 @@ class Ec2CapacityReservationAssociationServiceTest {
         }
     }
 
+    @Test
+    void groupTargetUsesOnlyMatchingMembersAndReturnsReleasedCapacity() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation outside = fixture.create(3);
+            CapacityReservation first = fixture.create(1);
+            CapacityReservation second = fixture.create(1);
+            fixture.service.modifyCapacityReservation(REGION, first.getCapacityReservationId(),
+                    null, null, null, "targeted");
+            String group = fixture.group(first, second);
+            List<Instance> launched = fixture.launchGroup(group, "capacity-reservations-only", 2, 3);
+            assertEquals(2, launched.size());
+            assertEquals(3, fixture.describe(outside).getAvailableInstanceCount());
+            assertEquals(0, fixture.describe(first).getAvailableInstanceCount());
+            assertEquals(0, fixture.describe(second).getAvailableInstanceCount());
+            assertTrue(launched.stream().allMatch(instance -> group.equals(instance.getCapacityReservationGroupArn())));
+            fixture.service.terminateInstances(REGION, launched.stream().map(Instance::getInstanceId).toList());
+            assertEquals(1, fixture.describe(first).getAvailableInstanceCount());
+            assertEquals(1, fixture.describe(second).getAvailableInstanceCount());
+        }
+    }
+
+    @Test
+    void groupFallbackNeverConsumesOutsideCapacityAndAdoptsNewMembers() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation outside = fixture.create(4);
+            String group = fixture.group();
+            List<Instance> launched = fixture.launchGroup(group, null, 2, 2);
+            fixture.service.describeInstances(REGION, launched.stream().map(Instance::getInstanceId).toList(), Map.of());
+            assertTrue(fixture.service.capacityReservationAssociations(REGION).isEmpty());
+            CapacityReservation added = fixture.create(2);
+            assertEquals(2, fixture.describe(added).getAvailableInstanceCount());
+            fixture.groups.add(REGION, ACCOUNT, MAPPER.valueToTree(
+                    Map.of("Group", group, "ResourceArns", List.of(added.getCapacityReservationArn()))));
+            assertEquals(0, fixture.describe(added).getAvailableInstanceCount());
+            assertEquals(4, fixture.describe(outside).getAvailableInstanceCount());
+        }
+    }
+
+    @Test
+    void cancelledGroupCapacityMovesToAnotherMemberWithoutChangingTheTarget() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation first = fixture.create(1);
+            CapacityReservation second = fixture.create(1);
+            String group = fixture.group(first, second);
+            Instance instance = fixture.launchGroup(group, null, 1, 1).getFirst();
+            fixture.service.describeInstances(REGION, List.of(instance.getInstanceId()), Map.of());
+            String acquired = fixture.service.instanceCapacityReservationId(instance);
+            fixture.service.cancelCapacityReservation(REGION, acquired);
+            String other = acquired.equals(first.getCapacityReservationId())
+                    ? second.getCapacityReservationId() : first.getCapacityReservationId();
+            assertEquals(other, fixture.service.instanceCapacityReservationId(instance));
+            assertEquals(group, instance.getCapacityReservationGroupArn());
+        }
+    }
+
+    @Test
+    void deletingGroupLeavesAcquiredCapacityUntilTheInstanceStops() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation capacity = fixture.create(1);
+            String group = fixture.group(capacity);
+            Instance instance = fixture.launchGroup(group, null, 1, 1).getFirst();
+            fixture.groups.delete(REGION, ACCOUNT, MAPPER.valueToTree(Map.of("Group", group)));
+            assertEquals(capacity.getCapacityReservationId(), fixture.service.instanceCapacityReservationId(instance));
+            fixture.service.stopInstances(REGION, List.of(instance.getInstanceId()));
+            assertEquals(1, fixture.describe(capacity).getAvailableInstanceCount());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void groupTargetAndMembershipSurviveRecovery(String mode) {
+        String group;
+        String instanceId;
+        String reservationId;
+        try (Fixture fixture = new Fixture(mode, directory)) {
+            CapacityReservation capacity = fixture.create(1);
+            reservationId = capacity.getCapacityReservationId();
+            group = fixture.group(capacity);
+            instanceId = fixture.launchGroup(group, null, 1, 1).getFirst().getInstanceId();
+        }
+        try (Fixture fixture = new Fixture(mode, directory)) {
+            Instance instance = fixture.service.describeInstances(REGION, List.of(instanceId), Map.of())
+                    .getFirst().getInstances().getFirst();
+            assertEquals(group, instance.getCapacityReservationGroupArn());
+            assertEquals(reservationId, fixture.service.instanceCapacityReservationId(instance));
+            fixture.service.stopInstances(REGION, List.of(instanceId));
+            assertEquals(null, fixture.service.instanceCapacityReservationId(instance));
+            fixture.service.startInstances(REGION, List.of(instanceId));
+            assertEquals(reservationId, fixture.service.instanceCapacityReservationId(instance));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "foreign-account", "foreign-region", "none", "insufficient"})
+    void invalidOrInsufficientGroupRequestDoesNotPublishInstances(String condition) {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            fixture.create(3);
+            String group = fixture.group();
+            group = switch (condition) {
+                case "missing" -> group + "-absent";
+                case "foreign-account" -> group.replace(ACCOUNT, "222222222222");
+                case "foreign-region" -> group.replace(REGION, "us-west-2");
+                default -> group;
+            };
+            String selected = group;
+            assertThrows(AwsException.class, () -> fixture.launchGroup(selected,
+                    "none".equals(condition) ? "none" : "capacity-reservations-only", 1, 1));
+            assertTrue(fixture.service.describeInstances(REGION, List.of(), Map.of()).isEmpty());
+            assertTrue(fixture.service.describeVolumes(REGION, List.of(), Map.of()).isEmpty());
+        }
+    }
+
+    @Test
+    void groupLaunchDoesNotWaitForTheResourceGroupsOperationMonitor() throws Exception {
+        try (Fixture fixture = new Fixture("memory", directory);
+                ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            String group = fixture.group(fixture.create(1));
+            synchronized (fixture.groups) {
+                Future<List<Instance>> launched = executor.submit(() -> fixture.launchGroup(group, null, 1, 1));
+                assertEquals(1, launched.get(5, TimeUnit.SECONDS).size());
+            }
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         private final EmulatorConfig config;
         private final StorageFactory factory;
         private final AccountAwareStorageBackend<CapacityReservation> store;
         private final Ec2Service service;
+        private final ResourceGroupsService groups;
 
         private Fixture(String mode, Path path) {
             config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
@@ -470,6 +599,8 @@ class Ec2CapacityReservationAssociationServiceTest {
             ServiceConfigAccess access = mock(ServiceConfigAccess.class);
             when(access.storageMode("ec2")).thenReturn(mode);
             when(access.storageFlushInterval("ec2")).thenReturn(3600000L);
+            when(access.storageMode("resource-groups")).thenReturn(mode);
+            when(access.storageFlushInterval("resource-groups")).thenReturn(3600000L);
             factory = new StorageFactory(config, access);
             store = spy(factory.create("ec2", FILE, new TypeReference<Map<String, CapacityReservation>>() {}));
             StorageFactory serviceFactory = spy(factory);
@@ -477,6 +608,37 @@ class Ec2CapacityReservationAssociationServiceTest {
             Ec2ImageCatalog catalog = new Ec2ImageCatalog();
             service = spy(new Ec2Service(config, null, null, new AmiImageResolver(catalog),
                     catalog, new Ec2InstanceTypeCatalog(), serviceFactory));
+            groups = new ResourceGroupsService(factory, service);
+            // CDI Instance clashes with the EC2 Instance model.
+            service.resourceGroupsServices = mock(jakarta.enterprise.inject.Instance.class);
+            when(service.resourceGroupsServices.isResolvable()).thenReturn(true);
+            when(service.resourceGroupsServices.get()).thenReturn(groups);
+        }
+
+        private String group(CapacityReservation... reservations) {
+            String arn = groups.create(REGION, ACCOUNT, MAPPER.valueToTree(Map.of(
+                    "Name", "capacity-pool", "Configuration", List.of(
+                            Map.of("Type", "AWS::EC2::CapacityReservationPool"),
+                            Map.of("Type", "AWS::ResourceGroups::Generic", "Parameters",
+                                    List.of(Map.of("Name", "allowed-resource-types",
+                                            "Values", List.of("AWS::EC2::CapacityReservation")))))))).arn();
+            if (reservations.length > 0) {
+                groups.add(REGION, ACCOUNT, MAPPER.valueToTree(Map.of("Group", arn, "ResourceArns",
+                        Arrays.stream(reservations).map(CapacityReservation::getCapacityReservationArn).toList())));
+            }
+            return arn;
+        }
+
+        private List<Instance> launchGroup(String group, String preference, int minimum, int maximum) {
+            LaunchTemplateData.CapacityReservationSpecification specification =
+                    new LaunchTemplateData.CapacityReservationSpecification();
+            specification.setCapacityReservationPreference(preference);
+            LaunchTemplateData.CapacityReservationTarget target = new LaunchTemplateData.CapacityReservationTarget();
+            target.setCapacityReservationResourceGroupArn(group);
+            specification.setCapacityReservationTarget(target);
+            return service.runInstances(REGION, "ami-test", "t3.micro", minimum, maximum,
+                    null, List.of(), null, null, List.of(), null, null, null, null, 0, null, null,
+                    null, null, false, null, null, null, false, null, specification).getInstances();
         }
 
         private Instance launch() {
