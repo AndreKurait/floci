@@ -436,11 +436,11 @@ public class Route53Service implements Resettable {
         });
 
         if (startName != null && !startName.isEmpty()) {
-            String normalizedStart = normalizeName(startName);
+            String normalizedStart = normalizeRecordName(startName);
             final String finalStartType = startType;
             records = records.stream()
                     .filter(r -> {
-                        int cmp = r.getName().compareTo(normalizedStart);
+                        int cmp = normalizeRecordName(r.getName()).compareTo(normalizedStart);
                         if (cmp > 0) return true;
                         if (cmp == 0 && finalStartType != null && !finalStartType.isEmpty()) {
                             return r.getType().compareTo(finalStartType) >= 0;
@@ -889,6 +889,18 @@ public class Route53Service implements Resettable {
         return name.endsWith(".") ? name : name + ".";
     }
 
+    public static String normalizeRecordName(String name) {
+        String normalized = normalizeName(name);
+        if (normalized == null) {
+            return null;
+        }
+        StringBuilder result = new StringBuilder(normalized.length());
+        for (int i = 0; i < normalized.length(); i++) {
+            result.append(asciiLower(normalized.charAt(i)));
+        }
+        return result.toString();
+    }
+
     private static String generateZoneId() {
         StringBuilder sb = new StringBuilder("Z");
         for (int i = 0; i < 14; i++) {
@@ -936,7 +948,7 @@ public class Route53Service implements Resettable {
     }
 
     private boolean isApexSoaOrNs(ResourceRecordSet rrs, String zoneName) {
-        return rrs.getName().equals(zoneName) &&
+        return normalizeRecordName(rrs.getName()).equals(normalizeRecordName(zoneName)) &&
                 ("SOA".equals(rrs.getType()) || "NS".equals(rrs.getType()));
     }
 
@@ -975,10 +987,14 @@ public class Route53Service implements Resettable {
 
     private void applyChange(String action, ResourceRecordSet rrs, List<ResourceRecordSet> current) {
         switch (action) {
-            case "CREATE" -> current.add(rrs);
+            case "CREATE" -> {
+                rrs.setName(normalizeRecordName(rrs.getName()));
+                current.add(rrs);
+            }
             case "DELETE" -> current.remove(deleteTarget(current, rrs));
             case "UPSERT" -> {
                 current.removeIf(r -> sameRecord(r, rrs));
+                rrs.setName(normalizeRecordName(rrs.getName()));
                 current.add(rrs);
             }
         }
@@ -986,12 +1002,12 @@ public class Route53Service implements Resettable {
 
     /**
      * Whether two record sets share an identity: name, type and set identifier. Route 53 treats a
-     * name with or without the trailing dot as the same, and requires a set identifier of at least one
+     * name with ASCII case differences or without the trailing dot as the same, and requires a set identifier of at least one
      * character, so a blank one is none. That also matches a record an earlier CloudFormation
      * provisioner stored with the template's undotted Name or empty SetIdentifier.
      */
     public static boolean sameRecord(ResourceRecordSet a, ResourceRecordSet b) {
-        return normalizeName(a.getName()).equals(normalizeName(b.getName()))
+        return normalizeRecordName(a.getName()).equals(normalizeRecordName(b.getName()))
                 && a.getType().equals(b.getType())
                 && Objects.equals(blankToNull(a.getSetIdentifier()), blankToNull(b.getSetIdentifier()));
     }
