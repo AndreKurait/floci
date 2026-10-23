@@ -45,6 +45,29 @@ class CloudWatchLogsMissingResourceIntegrationTest {
         }
     }
 
+    @Test
+    void filterLogEventsChecksGroupBeforePatternAndPreservesExistingGroupResults() {
+        String group = "/filter-missing-resource/" + UUID.randomUUID();
+        try (CloudWatchLogsClient logs = client()) {
+            assertResourceNotFound("The specified log group does not exist.",
+                    () -> logs.filterLogEvents(request -> request.logGroupName(group)));
+            assertResourceNotFound("The specified log group does not exist.",
+                    () -> logs.filterLogEvents(request -> request.logGroupName(group).filterPattern("[")));
+            logs.createLogGroup(request -> request.logGroupName(group));
+            try {
+                assertEquals(0, logs.filterLogEvents(request -> request.logGroupName(group)).events().size());
+                logs.createLogStream(request -> request.logGroupName(group).logStreamName(STREAM));
+                put(logs, group);
+                assertEquals("x", logs.filterLogEvents(request -> request.logGroupName(group))
+                        .events().getFirst().message());
+            } finally {
+                logs.deleteLogGroup(request -> request.logGroupName(group));
+            }
+            assertResourceNotFound("The specified log group does not exist.",
+                    () -> logs.filterLogEvents(request -> request.logGroupName(group)));
+        }
+    }
+
     private static void put(CloudWatchLogsClient logs, String group) {
         logs.putLogEvents(request -> request.logGroupName(group).logStreamName(STREAM)
                 .logEvents(event -> event.timestamp(Instant.now().toEpochMilli()).message("x")));
