@@ -95,8 +95,8 @@ public class WarmPool implements ContainerTeardown, Resettable {
     @Inject
     public WarmPool(LambdaRuntimeLauncher lambdaRuntimeLauncher, EmulatorConfig config, Clock clock,
                     ProvisionedConcurrencyPool provisioned) {
-        this.provisioned = provisioned;
         this.lambdaRuntimeLauncher = lambdaRuntimeLauncher;
+        this.provisioned = provisioned;
         this.config = config;
         this.clock = clock;
         this.maxPoolSizePerFunction = resolveMaxPerFunction(config);
@@ -195,13 +195,24 @@ public class WarmPool implements ContainerTeardown, Resettable {
             pendingTeardown.addAll(knownHandles);
             pendingTeardown.removeIf(handle -> !owned.contains(handle));
         }
-        drainAll(shutdownState, knownHandles);
+        List<Runnable> drains = new ArrayList<>();
+        if (provisioned != null) {
+            drains.add(() -> provisioned.stopManagedContainers(shutdownState.deadlineNanos));
+        }
+        drains.add(() -> drainAll(shutdownState, knownHandles));
+        ContainerTeardowns.stopInParallel(drains, Runnable::run, LOG, shutdownState.deadlineNanos);
     }
 
     @PreDestroy
     void shutdown() {
         evictionScheduler.shutdownNow();
-        stopManagedContainers();
+        try {
+            stopManagedContainers();
+        } finally {
+            if (provisioned != null) {
+                provisioned.closeExecutors();
+            }
+        }
     }
 
     @Override
@@ -330,6 +341,9 @@ public class WarmPool implements ContainerTeardown, Resettable {
      * Otherwise it is returned to the warm pool.
      */
     public void release(ContainerHandle handle) {
+        if (provisioned != null && provisioned.release(handle, false)) {
+            return;
+        }
         Lease lease = activeLeases.remove(handle);
         if (!owned.contains(handle)) {
             return;
@@ -449,10 +463,17 @@ public class WarmPool implements ContainerTeardown, Resettable {
      * stop is needed — no pool bookkeeping required.
      */
     public void destroyHandle(ContainerHandle handle) {
+        if (provisioned != null && provisioned.release(handle, true)) {
+            return;
+        }
         activeLeases.remove(handle);
         LOG.debugv("Destroying timed-out container {0} for function {1}",
                 handle.getContainerId(), handle.getFunctionName());
         stopQuietly(handle);
+    }
+
+    ContainerHandle acquireProvisioned(LambdaFunction fn, String qualifier) {
+        return provisioned == null ? null : provisioned.acquire(fn, qualifier);
     }
 
     void deleteProvisionedFunction(LambdaFunction fn) {
