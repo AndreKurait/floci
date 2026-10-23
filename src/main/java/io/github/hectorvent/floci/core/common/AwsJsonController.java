@@ -20,6 +20,7 @@ import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsJsonHandle
 import io.github.hectorvent.floci.services.swf.SwfJsonHandler;
 import io.github.hectorvent.floci.services.timestreaminfluxdb.TimestreamInfluxDbJsonHandler;
 import io.github.hectorvent.floci.services.verifiedpermissions.VerifiedPermissionsJsonHandler;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
@@ -100,6 +101,7 @@ public class AwsJsonController {
     @POST
     @Consumes("application/json")
     @Produces("application/json")
+    @RunOnVirtualThread
     public Response handlePlainJsonRequest(
             @HeaderParam("X-Amz-Target") String target,
             @Context HttpHeaders httpHeaders,
@@ -118,6 +120,7 @@ public class AwsJsonController {
     @POST
     @Consumes(CONTENT_TYPE_AWS_JSON_1_0)
     @Produces(CONTENT_TYPE_AWS_JSON_1_0)
+    @RunOnVirtualThread
     public Response handleJsonRequest(
             @HeaderParam("X-Amz-Target") String target,
             @Context HttpHeaders httpHeaders,
