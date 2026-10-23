@@ -3004,7 +3004,7 @@ public interface EmulatorConfig {
         int containerIdleTimeoutSeconds();
 
         /**
-         * One shutdown drain budget shared by on-demand Lambda containers.
+         * One shutdown drain budget shared by provisioned and on-demand Lambda containers.
          * Values outside 1 through 300 seconds fail initialization.
          *
          * Env var: FLOCI_SERVICES_LAMBDA_CONTAINER_DRAIN_TIMEOUT_SECONDS
