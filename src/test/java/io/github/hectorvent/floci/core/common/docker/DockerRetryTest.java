@@ -2,12 +2,15 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import org.apache.hc.core5.http.ConnectionRequestTimeoutException;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.net.BindException;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
+import java.nio.channels.ClosedByInterruptException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -152,6 +155,27 @@ class DockerRetryTest {
             }));
             assertTrue(Thread.currentThread().isInterrupted());
             assertEquals(1, calls.get());
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void interruptedChannelIsNotRetriedEvenWhenWrapped(boolean wrapped) {
+        ClosedByInterruptException cancellation = new ClosedByInterruptException();
+        IOException failure = wrapped ? new IOException("wrapper", cancellation) : cancellation;
+        AtomicInteger calls = new AtomicInteger();
+        try {
+            RuntimeException thrown = assertThrows(RuntimeException.class, () -> DockerRetry.call(5, 0L, () -> {
+                calls.incrementAndGet();
+                Thread.currentThread().interrupt();
+                throw failure;
+            }));
+            assertSame(failure, thrown.getCause());
+            assertTrue(Thread.currentThread().isInterrupted());
+            assertEquals(1, calls.get());
+            assertFalse(DockerRetry.isTransientIo(failure));
         } finally {
             Thread.interrupted();
         }
