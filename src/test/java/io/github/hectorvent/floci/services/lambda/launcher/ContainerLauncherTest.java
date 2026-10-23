@@ -1026,6 +1026,46 @@ class ContainerLauncherTest {
         verify(executionRoleCredentials).unregister("222233334444", "ASIASTOPSESSION");
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void stopRevokesCredentialsOnFailureAndRetainsRuntimeUntilRemovalSucceeds(boolean extensions) throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("role-session-stop-retry"));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("role-session-stop-retry-fn");
+        fn.setAccountId("222233334444");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        when(executionRoleCredentials.forFunction(fn)).thenReturn(Optional.of(
+                new SessionCreds("ASIARETRYSESSION", "role-secret", "role-token")));
+        when(runtimeApiServer.hasRegisteredExtensions()).thenReturn(extensions);
+        ContainerHandle handle = launcher.launch(fn);
+        int timeout = extensions ? 2 : 1;
+        IllegalStateException failure = new IllegalStateException("Docker removal failed");
+        doThrow(failure).doNothing().when(lifecycleManager)
+                .stopAndRemoveStrict("container-123", null, timeout);
+
+        assertSame(failure, assertThrows(IllegalStateException.class, () -> launcher.stop(handle)));
+
+        verify(runtimeApiServer).quiesce();
+        verify(runtimeApiServer, never()).close();
+        verify(runtimeApiServerFactory, never()).release(runtimeApiServer);
+        verify(executionRoleCredentials).unregister("222233334444", "ASIARETRYSESSION");
+
+        launcher.stop(handle);
+
+        InOrder order = inOrder(lifecycleManager, runtimeApiServer, runtimeApiServerFactory,
+                executionRoleCredentials);
+        order.verify(runtimeApiServer).quiesce();
+        order.verify(lifecycleManager).stopAndRemoveStrict("container-123", null, timeout);
+        order.verify(executionRoleCredentials).unregister("222233334444", "ASIARETRYSESSION");
+        order.verify(runtimeApiServer).quiesce();
+        order.verify(lifecycleManager).stopAndRemoveStrict("container-123", null, timeout);
+        order.verify(executionRoleCredentials).unregister("222233334444", "ASIARETRYSESSION");
+        order.verify(runtimeApiServer).close();
+        order.verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
     @Test
     void launchFailureUnregistersExecutionRoleSession() throws Exception {
         Path codePath = Files.createDirectory(tempDir.resolve("role-session-failure"));
