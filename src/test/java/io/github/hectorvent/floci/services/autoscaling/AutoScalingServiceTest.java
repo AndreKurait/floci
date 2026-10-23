@@ -26,6 +26,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -1447,6 +1448,33 @@ class AutoScalingServiceTest {
                 new AsgOptionalFields(null, null, null, null, null, null, null, specification)));
 
         assertEquals(AutoScalingService.CAPACITY_RESERVATION_TARGET_WITH_NONE_MESSAGE, error.getMessage());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ids", "groups", "mixed"})
+    void capacityReservationRejectsMultipleTargetsBeforeCreateOrUpdate(String kind) {
+        CapacityReservationSpecification specification = new CapacityReservationSpecification();
+        specification.setCapacityReservationPreference("capacity-reservations-only");
+        if ("ids".equals(kind)) {
+            specification.setCapacityReservationIds(List.of("cr-one", "cr-two"));
+        } else if ("groups".equals(kind)) {
+            specification.setCapacityReservationResourceGroupArns(List.of("group-one", "group-two"));
+        } else {
+            specification.setCapacityReservationIds(List.of("cr-one"));
+            specification.setCapacityReservationResourceGroupArns(List.of("group-one"));
+        }
+        AsgOptionalFields options = new AsgOptionalFields(null, null, null, null, null, null, null, specification);
+        AwsException create = assertThrows(AwsException.class, () -> createWithStructures("multi-target", options));
+        assertEquals("ValidationError", create.getErrorCode());
+        assertTrue(service.describeAutoScalingGroups(REGION, List.of("multi-target")).isEmpty());
+        AutoScalingGroup before = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
+        int desired = before.getDesiredCapacity();
+        AwsException update = assertThrows(AwsException.class, () -> service.updateAutoScalingGroup(REGION,
+                "test-asg", null, null, null, null, null, null, null, 2, null, null, null, null, null, null, options));
+        assertEquals("ValidationError", update.getErrorCode());
+        AutoScalingGroup after = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
+        assertEquals(desired, after.getDesiredCapacity());
+        assertNull(after.getCapacityReservationSpecification());
     }
 
     @Test
