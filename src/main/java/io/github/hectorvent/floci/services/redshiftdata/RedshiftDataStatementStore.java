@@ -132,7 +132,11 @@ class RedshiftDataStatementStore {
 
     void sweep() {
         if (idempotency != null) {
-            idempotency.sweep();
+            try {
+                idempotency.sweep();
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "Failed to sweep expired Redshift Data API client-token receipts");
+            }
         }
         Instant cutoff = Instant.now(clock).minus(ttl);
         // The sweep thread has no request context, so it iterates every account's partition
