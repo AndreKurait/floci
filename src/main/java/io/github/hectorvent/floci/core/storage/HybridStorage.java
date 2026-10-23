@@ -10,7 +10,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -29,11 +28,12 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
 
     private static final Logger LOG = Logger.getLogger(HybridStorage.class);
 
-    private final ConcurrentHashMap<K, V> store = new ConcurrentHashMap<>();
+    private volatile ConcurrentHashMap<K, V> store = new ConcurrentHashMap<>();
     private final Path filePath;
     private final ObjectMapper objectMapper;
     private final TypeReference<Map<K, V>> typeReference;
     private final ScheduledExecutorService scheduler;
+    private final Object flushLock = new Object();
     private final AtomicBoolean dirty = new AtomicBoolean(false);
 
     public HybridStorage(Path filePath, TypeReference<Map<K, V>> typeReference, long flushIntervalMs) {
@@ -48,8 +48,16 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public void put(K key, V value) {
+    public synchronized void put(K key, V value) {
         store.put(key, value);
+        dirty.set(true);
+    }
+
+    @Override
+    public synchronized void putAllAtomically(Map<K, V> entries) {
+        ConcurrentHashMap<K, V> candidate = new ConcurrentHashMap<>(store);
+        candidate.putAll(Map.copyOf(entries));
+        store = candidate;
         dirty.set(true);
     }
 
@@ -59,7 +67,7 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public void delete(K key) {
+    public synchronized void delete(K key) {
         store.remove(key);
         dirty.set(true);
     }
@@ -74,7 +82,7 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
 
     @Override
     public Set<K> keys() {
-        return Collections.unmodifiableSet(store.keySet());
+        return Set.copyOf(store.keySet());
     }
 
     @Override
@@ -99,7 +107,7 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
-    public void clear() {
+    public synchronized void clear() {
         store.clear();
         dirty.set(true);
     }
@@ -115,13 +123,16 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
         }
     }
 
-    private synchronized void persistToDisk() {
-        try {
-            StorageFiles.writeAtomically(filePath, tempFile -> objectMapper.writeValue(tempFile.toFile(), store));
-            LOG.debugv("Flushed {0} entries to {1}", store.size(), filePath);
-        } catch (IOException e) {
-            LOG.errorv(e, "Failed to persist data to {0}", filePath);
-            dirty.set(true);
+    private void persistToDisk() {
+        synchronized (flushLock) {
+            Map<K, V> snapshot = store;
+            try {
+                StorageFiles.writeAtomically(filePath, tempFile -> objectMapper.writeValue(tempFile.toFile(), snapshot));
+                LOG.debugv("Flushed {0} entries to {1}", snapshot.size(), filePath);
+            } catch (IOException e) {
+                LOG.errorv(e, "Failed to persist data to {0}", filePath);
+                dirty.set(true);
+            }
         }
     }
 }
