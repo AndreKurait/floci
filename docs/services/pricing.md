@@ -28,7 +28,7 @@ The default snapshot on the classpath covers:
 
 | ServiceCode | Regions | Notes |
 |-------------|---------|-------|
-| `AmazonEC2` | `us-east-1` (Linux/Shared tenancy, 3 instance types) | `t3.micro`, `m5.large`, `c5.large` |
+| `AmazonEC2` | `us-east-1` (Linux/Shared tenancy, 4 instance types) | `t3.micro`, `m5.large`, `c5.large`, `m6g.large` |
 | `AmazonS3` | `us-east-1` (Standard storage) | |
 | `AWSLambda` | `us-east-1` (Requests) | |
 
