@@ -1008,6 +1008,17 @@ cancellation and expiration release membership; a restart acquires capacity usin
 instance's retained launch preference and target. A failed membership write reports an error;
 subsequent access reconciles released membership from persisted instance state.
 
+`CapacityReservationResourceGroupArn` targets the members of an existing capacity pool
+in the caller's account and region. Only members with matching instance type, platform,
+Availability Zone and tenancy are eligible. Both open and targeted member reservations
+can supply capacity. The default permits On-Demand fallback when the group has no
+matching available capacity; `capacity-reservations-only` forbids that fallback at launch
+and restart. A group target cannot accompany a reservation ID, `none`, or a Spot request.
+DescribeInstances retains the group target separately from the acquired reservation ID.
+Running group-targeted instances can acquire newly added matching members or move to
+another matching member after cancellation or expiration. Existing membership survives
+group deletion until the instance releases its reservation.
+
 Moves between open reservations can transfer consumed capacity and reassign the associated
 running instances with an `open` preference. An explicitly targeted instance remains in its
 reservation; moving capacity that requires it returns `Unsupported`. Unused capacity moves first. Reservation membership, counts and the move
