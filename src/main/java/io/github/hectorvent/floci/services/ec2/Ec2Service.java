@@ -866,7 +866,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             });
         }
-        if (config.services().ec2().mock()) {
+        if (!config.services().ec2().enabled() || config.services().ec2().mock()) {
             return;
         }
 
@@ -4919,7 +4919,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     @Override
     public void stopManagedContainers() {
-        if (config.services().ec2().mock()) {
+        if (!config.services().ec2().enabled() || config.services().ec2().mock()) {
             return;
         }
         for (AccountAwareStorageBackend.AccountEntry<Instance> entry : entriesOfEveryAccount(instances)) {
