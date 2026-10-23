@@ -271,6 +271,70 @@ class Ec2CapacityReservationAssociationServiceTest {
         }
     }
 
+    @Test
+    void targetedMismatchKeepsItsExistingErrorAndFreeCapacity() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation capacity = fixture.service.createCapacityReservation(REGION, "t3.small",
+                    "Linux/UNIX", REGION + "a", null, 1, null, null, null, null, null, null, null, null);
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> fixture.launch(capacity.getCapacityReservationId()));
+            assertEquals("InsufficientInstanceCapacity", failure.getErrorCode());
+            assertEquals(1, fixture.describe(capacity).getAvailableInstanceCount());
+            assertTrue(fixture.describe(capacity).getInstanceIds().isEmpty());
+            assertTrue(fixture.service.describeVolumes(REGION, List.of(), Map.of()).isEmpty());
+        }
+    }
+
+    @Test
+    void targetedShortageRejectsLaunchWithoutPublishingResources() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation capacity = fixture.create(1);
+            Instance admitted = fixture.launch(capacity.getCapacityReservationId());
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> fixture.launch(capacity.getCapacityReservationId()));
+            assertEquals("ReservationCapacityExceeded", failure.getErrorCode());
+            assertEquals(List.of(admitted.getInstanceId()), fixture.describe(capacity).getInstanceIds());
+            assertEquals(1, fixture.service.describeVolumes(REGION, List.of(), Map.of()).size());
+        }
+    }
+
+    @Test
+    void targetedShortageDuringAdmissionReclaimsFailedLaunch() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation capacity = fixture.create(1);
+            AtomicReference<Instance> winner = new AtomicReference<>();
+            doAnswer(invocation -> {
+                reset(fixture.service);
+                winner.set(fixture.launch(capacity.getCapacityReservationId()));
+                return invocation.callRealMethod();
+            }).when(fixture.service).acquireCapacity(eq(REGION), any());
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> fixture.launch(capacity.getCapacityReservationId()));
+            assertEquals("ReservationCapacityExceeded", failure.getErrorCode());
+            assertEquals(List.of(winner.get().getInstanceId()), fixture.describe(capacity).getInstanceIds());
+            assertEquals(1, fixture.service.describeVolumes(REGION, List.of(), Map.of()).size());
+            assertEquals(1, fixture.service.describeInstances(REGION, List.of(), Map.of()).stream()
+                    .flatMap(reservation -> reservation.getInstances().stream())
+                    .filter(instance -> !"terminated".equals(instance.getState().getName())).count());
+        }
+    }
+
+    @Test
+    void targetedShortageOnRestartPreservesStoppedInstanceAndOccupant() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation capacity = fixture.create(1);
+            Instance stopped = fixture.launch(capacity.getCapacityReservationId());
+            fixture.service.stopInstances(REGION, List.of(stopped.getInstanceId()));
+            Instance occupant = fixture.launch(capacity.getCapacityReservationId());
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> fixture.service.startInstances(REGION, List.of(stopped.getInstanceId())));
+            assertEquals("ReservationCapacityExceeded", failure.getErrorCode());
+            assertEquals(List.of(occupant.getInstanceId()), fixture.describe(capacity).getInstanceIds());
+            assertEquals("stopped", fixture.service.describeInstances(REGION,
+                    List.of(stopped.getInstanceId()), Map.of()).getFirst().getInstances().getFirst().getState().getName());
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         private final EmulatorConfig config;
         private final StorageFactory factory;
