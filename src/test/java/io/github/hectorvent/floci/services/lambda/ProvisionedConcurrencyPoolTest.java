@@ -627,6 +627,56 @@ class ProvisionedConcurrencyPoolTest {
         assertEquals(2, launcher.starts.get());
     }
 
+    @Test
+    void targetChangeRefusesOldInitializedEnvironment() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        function(ACCOUNT, REGION, "2");
+        alias(ACCOUNT, REGION, "live", "2", Map.of());
+        assertNull(pool.acquire(version, "live"));
+        assertEquals("IN_PROGRESS", get().status());
+        assertEquals(1, first.stops.get());
+        pool.reconcile();
+        Environment second = launched();
+        second.initialized.complete(null);
+        ready();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void movedAliasFreesItsOldVersionButRetainsItsReservedBudget(boolean previouslyFailed) throws Exception {
+        LambdaFunction latest = functions.getForAccount(ACCOUNT, REGION, "example").orElseThrow();
+        latest.setReservedConcurrentExecutions(2);
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        if (previouslyFailed) {
+            alias(ACCOUNT, REGION, "live", "1", Map.of("2", 0.1));
+            assertEquals("FAILED", get().status());
+        }
+        function(ACCOUNT, REGION, "2");
+        alias(ACCOUNT, REGION, "live", "2", Map.of());
+
+        pool.put(REGION, "example", "1", 1, ACCOUNT);
+        assertEquals("2", storage.scanAllAccounts().stream()
+                .filter(value -> "live".equals(value.qualifier())).findFirst().orElseThrow().version());
+        assertEquals(1, first.stops.get());
+        assertEquals(2, storage.scanAllAccounts().size());
+        AwsException budget = assertThrows(AwsException.class,
+                () -> pool.put(REGION, "example", "1", 2, ACCOUNT));
+        assertEquals("InvalidParameterValueException", budget.getErrorCode());
+        AwsException bothInvalid = assertThrows(AwsException.class,
+                () -> pool.put(REGION, "example", "2", 1, ACCOUNT));
+        assertEquals("InvalidParameterValueException", bothInvalid.getErrorCode());
+        latest.setReservedConcurrentExecutions(3);
+        AwsException conflict = assertThrows(AwsException.class,
+                () -> pool.put(REGION, "example", "2", 1, ACCOUNT));
+        assertEquals("Version is pointed by a Provisioned Concurrency alias", conflict.getMessage());
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"weighted", "latest"})
     void changedAliasRemainsReadableAndDeletable(String change) throws Exception {
@@ -653,6 +703,29 @@ class ProvisionedConcurrencyPoolTest {
         assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "live", "2"));
         pool.delete(REGION, "example", "live", ACCOUNT);
         assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "live", "$LATEST"));
+    }
+
+    @Test
+    void aliasRetargetStorageFailurePreservesThePriorAllocation() throws Exception {
+        AccountAwareStorageBackend<ProvisionedConcurrencyPool.Configuration> backend = spy(storage);
+        pool.closeExecutors();
+        pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, backend,
+                Clock.systemUTC(), 4, 8, false, 15);
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        function(ACCOUNT, REGION, "2");
+        alias(ACCOUNT, REGION, "live", "2", Map.of());
+        IllegalStateException failure = new IllegalStateException("controlled alias write failure");
+        doThrow(failure).when(backend).putForAccount(eq(ACCOUNT), any(), any());
+        assertSame(failure, assertThrows(IllegalStateException.class, this::get));
+        assertEquals("1", storage.scanAllAccounts().getFirst().version());
+        assertEquals(0, first.stops.get());
+        doCallRealMethod().when(backend).putForAccount(eq(ACCOUNT), any(), any());
+        assertEquals("IN_PROGRESS", get().status());
+        assertEquals("2", storage.scanAllAccounts().getFirst().version());
+        assertEquals(1, first.stops.get());
     }
 
     @Test
@@ -1056,26 +1129,6 @@ class ProvisionedConcurrencyPoolTest {
                 factory.shutdownAll();
             }
         }
-    }
-
-    @Test
-    void changedAliasRequiresExplicitPutBeforeUsingNewVersion() throws Exception {
-        put(1);
-        Environment first = launched();
-        first.initialized.complete(null);
-        ready();
-        function(ACCOUNT, REGION, "2");
-        alias(ACCOUNT, REGION, "live", "2", Map.of());
-        assertNull(pool.acquire(version, "live"));
-        assertEquals("FAILED", get().status());
-        assertEquals(1, get().requested());
-        assertEquals(1, first.stops.get());
-        assertEquals("1", storage.scanAllAccounts().getFirst().version());
-        put(1);
-        Environment second = launched();
-        second.initialized.complete(null);
-        ready();
-        assertEquals("2", storage.scanAllAccounts().getFirst().version());
     }
 
     @ParameterizedTest
