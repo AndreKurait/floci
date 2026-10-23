@@ -29,6 +29,12 @@ weighted. An alias with a configuration cannot move to `$LATEST` or to a version
 configured directly or through another alias. Description-only changes and unconfigured aliases
 remain allowed.
 
+Published versions with `SnapStart.ApplyOn=PublishedVersions` reject provisioned concurrency
+with `ResourceConflictException`, including through an alias. A configured alias cannot
+retarget to such a version. Eligibility uses the published snapshot, so changing `$LATEST`
+does not change older versions. Get and Delete retain their normal configuration lookup
+behavior, and unconfigured aliases can still point to SnapStart versions.
+
 Deleting a version, alias, or function removes its corresponding configurations. Delete is
 idempotent for an existing target without a configuration; an absent target returns
 `ResourceNotFoundException`. Desired configuration uses the Lambda storage mode through
