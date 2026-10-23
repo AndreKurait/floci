@@ -557,7 +557,8 @@ public class AutoScalingReconciler {
                         launchSource.associatePublicIpAddress(), null, 0, null, launchSource.metadataOptions(), null,
                         launchSource.encodedUserData() != null ? launchSource.encodedUserData()
                                 : encodeLegacyUserData(launchSource.userData()),
-                        false, null, null, launchSource.blockDevices());
+                        false, null, null, launchSource.blockDevices(), false, null,
+                        launchSource.capacityReservationSpecification());
             } catch (RuntimeException launchFailure) {
                 if (!refreshLaunch) {
                     throw launchFailure;
@@ -835,7 +836,7 @@ public class AutoScalingReconciler {
                     // Forwarded as-is: an explicit false has to beat a public
                     // subnet's MapPublicIpOnLaunch, and only null means
                     // "fall back to the subnet default".
-                    lc.getAssociatePublicIpAddress(), launchConfigurationBlockDevices(lc), lc.getMetadataOptions());
+                    lc.getAssociatePublicIpAddress(), launchConfigurationBlockDevices(lc), lc.getMetadataOptions(), null);
         }
 
         LaunchTemplate launchTemplate = resolveLaunchTemplate(asg);
@@ -865,7 +866,7 @@ public class AutoScalingReconciler {
                     asg.getLaunchTemplateName(),
                     resolvedVersion,
                     version.getData().effectiveAssociatePublicIpAddress(), version.getData().getBlockDeviceMappings(),
-                    version.getData().getMetadataOptions());
+                    version.getData().getMetadataOptions(), version.getData().getCapacityReservationSpecification());
         }
 
         MixedInstancesPolicy.LaunchTemplateSpecification specification =
@@ -900,7 +901,7 @@ public class AutoScalingReconciler {
                         specification.getLaunchTemplateName(),
                         resolvedVersion,
                         version.getData().effectiveAssociatePublicIpAddress(), version.getData().getBlockDeviceMappings(),
-                        version.getData().getMetadataOptions());
+                        version.getData().getMetadataOptions(), version.getData().getCapacityReservationSpecification());
             }
         }
 
@@ -1037,7 +1038,8 @@ public class AutoScalingReconciler {
             String launchTemplateVersion,
             Boolean associatePublicIpAddress,
             List<LaunchTemplateData.BlockDeviceMapping> blockDevices,
-            LaunchTemplateData.MetadataOptions metadataOptions) {}
+            LaunchTemplateData.MetadataOptions metadataOptions,
+            LaunchTemplateData.CapacityReservationSpecification capacityReservationSpecification) {}
 
     // Override for describeAutoScalingGroups with null region (all regions)
     // The service only filters by region when non-null; null means all.

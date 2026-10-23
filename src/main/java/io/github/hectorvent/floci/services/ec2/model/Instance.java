@@ -19,6 +19,9 @@ public class Instance {
     private String stateTransitionReason;
     private String instanceType;
     private boolean spot;
+    private String capacityReservationPlatform = "Linux/UNIX";
+    private String capacityReservationPreference = "open";
+    private String capacityReservationTarget;
     private Placement placement;
     private String subnetId;
     private String vpcId;
@@ -110,6 +113,13 @@ public class Instance {
 
     public String getStateTransitionReason() { return stateTransitionReason; }
     public void setStateTransitionReason(String stateTransitionReason) { this.stateTransitionReason = stateTransitionReason; }
+
+    public String getCapacityReservationPlatform() { return capacityReservationPlatform; }
+    public void setCapacityReservationPlatform(String platform) { capacityReservationPlatform = platform; }
+    public String getCapacityReservationPreference() { return capacityReservationPreference; }
+    public void setCapacityReservationPreference(String preference) { capacityReservationPreference = preference; }
+    public String getCapacityReservationTarget() { return capacityReservationTarget; }
+    public void setCapacityReservationTarget(String target) { capacityReservationTarget = target; }
 
     public boolean isSpot() { return spot; }
     public void setSpot(boolean spot) { this.spot = spot; }
