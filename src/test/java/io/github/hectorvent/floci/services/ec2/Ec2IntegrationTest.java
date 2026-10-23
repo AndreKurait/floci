@@ -2915,6 +2915,7 @@ class Ec2IntegrationTest {
             .formParam("LaunchTemplate.Version", "$Default")
             .formParam("ImageId", "ami-sample-override")
             .formParam("InstanceType", "c7g.large")
+            .formParam("SubnetId", subnetId)
             .formParam("MinCount", "1")
             .formParam("MaxCount", "1")
             .formParam("TagSpecification.1.ResourceType", "instance")
@@ -2929,6 +2930,8 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .body("RunInstancesResponse.instancesSet.item.imageId", equalTo("ami-sample-override"))
             .body("RunInstancesResponse.instancesSet.item.instanceType", equalTo("c7g.large"))
+            .body("RunInstancesResponse.instancesSet.item.vpcId", equalTo(vpcId))
+            .body("RunInstancesResponse.instancesSet.item.subnetId", equalTo(subnetId))
             .body("RunInstancesResponse.instancesSet.item.keyName", equalTo("test-key"))
             .body("RunInstancesResponse.instancesSet.item.iamInstanceProfile.arn",
                     equalTo("arn:aws:iam::000000000000:instance-profile/sample-profile-v2"))
@@ -2941,18 +2944,29 @@ class Ec2IntegrationTest {
                     equalTo("sample-local"))
             .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
 
-        given()
-            .formParam("Action", "DescribeInstances")
-            .formParam("InstanceId.1", launchedInstanceId)
-            .header("Authorization", AUTH_HEADER)
-        .when()
-            .post("/")
-        .then()
-            .statusCode(200)
-            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceId",
-                    equalTo(launchedInstanceId))
-            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.iamInstanceProfile.arn",
-                    equalTo("arn:aws:iam::000000000000:instance-profile/sample-profile-v2"));
+        try {
+            given()
+                .formParam("Action", "DescribeInstances")
+                .formParam("InstanceId.1", launchedInstanceId)
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceId",
+                        equalTo(launchedInstanceId))
+                .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.iamInstanceProfile.arn",
+                        equalTo("arn:aws:iam::000000000000:instance-profile/sample-profile-v2"));
+        } finally {
+            given()
+                .formParam("Action", "TerminateInstances")
+                .formParam("InstanceId.1", launchedInstanceId)
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
+        }
     }
 
     @Test
@@ -5714,7 +5728,8 @@ class Ec2IntegrationTest {
         assertEquals("io1", rootVolumeType(launch(Map.of(
             "LaunchTemplate.LaunchTemplateId", templateId,
             "BlockDeviceMapping.1.DeviceName", "/dev/xvda",
-            "BlockDeviceMapping.1.Ebs.VolumeType", "io1"))));
+            "BlockDeviceMapping.1.Ebs.VolumeType", "io1",
+            "BlockDeviceMapping.1.Ebs.Iops", "100"))));
     }
 
     @Test
@@ -5757,7 +5772,8 @@ class Ec2IntegrationTest {
             "LaunchTemplate.LaunchTemplateId", templateId,
             "BlockDeviceMapping.1.DeviceName", "/dev/xvdb",
             "BlockDeviceMapping.1.Ebs.VolumeSize", "10",
-            "BlockDeviceMapping.1.Ebs.VolumeType", "io1"))));
+            "BlockDeviceMapping.1.Ebs.VolumeType", "io1",
+            "BlockDeviceMapping.1.Ebs.Iops", "100"))));
     }
 
     @Test
@@ -5815,7 +5831,7 @@ class Ec2IntegrationTest {
 
     @Test
     @Order(335)
-    void runInstancesNoDeviceRootMappingFallsBackToAmiRootVolumeType() {
+    void runInstancesRejectsRemovalOfTheEbsRootMapping() {
         String templateId = given()
             .formParam("Action", "CreateLaunchTemplate")
             .formParam("LaunchTemplateName", "gp3-root-nodevice-template")
@@ -5828,21 +5844,41 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .extract().path("CreateLaunchTemplateResponse.launchTemplate.launchTemplateId");
 
-        // NoDevice removes the template's root mapping, so the AMI's gp2 root applies.
-        assertEquals("gp2", rootVolumeType(launch(Map.of(
-            "LaunchTemplate.LaunchTemplateId", templateId,
-            "BlockDeviceMapping.1.DeviceName", "/dev/xvda",
-            "BlockDeviceMapping.1.NoDevice", ""))));
+        given()
+            .formParam("Action", "RunInstances")
+            .formParam("ImageId", "ami-0abcdef1234567890")
+            .formParam("InstanceType", "t2.micro")
+            .formParam("MinCount", "1")
+            .formParam("MaxCount", "1")
+            .formParam("LaunchTemplate.LaunchTemplateId", templateId)
+            .formParam("BlockDeviceMapping.1.DeviceName", "/dev/xvda")
+            .formParam("BlockDeviceMapping.1.NoDevice", "")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>InvalidBlockDeviceMapping</Code>"));
     }
 
     @Test
     @Order(336)
-    void runInstancesIgnoresVolumeTypeOnANoDeviceMapping() {
-        // The device is removed regardless of the assigned value, so gp9 is never validated.
-        assertEquals("gp2", rootVolumeType(launch(Map.of(
-            "BlockDeviceMapping.1.DeviceName", "/dev/xvda",
-            "BlockDeviceMapping.1.NoDevice", "",
-            "BlockDeviceMapping.1.Ebs.VolumeType", "gp9"))));
+    void runInstancesRejectsNoDeviceCombinedWithEbs() {
+        given()
+            .formParam("Action", "RunInstances")
+            .formParam("ImageId", "ami-0abcdef1234567890")
+            .formParam("InstanceType", "t2.micro")
+            .formParam("MinCount", "1")
+            .formParam("MaxCount", "1")
+            .formParam("BlockDeviceMapping.1.DeviceName", "/dev/xvda")
+            .formParam("BlockDeviceMapping.1.NoDevice", "")
+            .formParam("BlockDeviceMapping.1.Ebs.VolumeType", "gp9")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("<Code>InvalidBlockDeviceMapping</Code>"));
     }
 
     private String launch(Map<String, String> params) {
@@ -5871,6 +5907,7 @@ class Ec2IntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .extract().path("DescribeVolumesResponse.volumeSet.item.volumeType");
+            .extract().path("DescribeVolumesResponse.volumeSet.item.find { "
+                + "it.attachmentSet.item.device == '/dev/xvda' }.volumeType");
     }
 }
