@@ -448,6 +448,26 @@ A layer ARN outside the caller's partition is refused whatever that setting says
 isolated, so no resource policy can ever make such a layer readable, and `GetLayerVersionByArn`
 rejects one outright with `InvalidParameterValueException: Invalid layer version ...`.
 
+## Container shutdown
+
+Shutdown drains on-demand containers concurrently within one
+`floci.services.lambda.container-drain-timeout-seconds` budget. The default is 15 seconds;
+set `FLOCI_SERVICES_LAMBDA_CONTAINER_DRAIN_TIMEOUT_SECONDS` when a larger fleet needs more
+time for Docker to finish removing stopped containers. Supported values are 1 through 300;
+invalid values fail initialization. The parent process's stop grace must exceed this
+budget. The destruction hook does not start another drain budget. Failed removals remain
+owned for a later retirement or reset retry; a completed removal is not repeated.
+A launch that outlasts the deadline is reported as incomplete cleanup. Its invocation is
+refused, and any returned container remains owned for a later cleanup retry; the deadline
+does not guarantee cancellation of an unresponsive container launcher.
+If an invocation finishes after the shutdown deadline, releasing its still-owned
+container starts a separate bounded cleanup attempt. This does not extend the
+initial shutdown wait.
+
+When using `floci-cli`, set `floci stop --timeout <seconds>` above the configured
+drain budget. The CLI currently defaults to 10 seconds, including for `floci restart`.
+For a longer drain, explicitly stop with the larger timeout and then start Floci.
+
 ## Not Implemented
 
 These AWS Lambda operations have no handler in Floci. Calls will return `404` or an error:
