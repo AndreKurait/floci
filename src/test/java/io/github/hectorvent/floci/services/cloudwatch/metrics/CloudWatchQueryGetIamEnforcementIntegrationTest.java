@@ -97,15 +97,18 @@ class CloudWatchQueryGetIamEnforcementIntegrationTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"Action,false", "Operation,false", "Action,true", "Operation,true"})
-    void deniedSignedReadsReturnQueryAuthorizationErrors(String actionParameter, boolean presigned) {
+    @CsvSource({"Action,false,ListMetrics,2010-08-01", "Operation,false,ListMetrics,2010-08-01",
+            "Action,true,ListMetrics,2010-08-01", "Operation,true,ListMetrics,2010-08-01",
+            "Action,false,DescribeAlarms,2013-01-16", "Action,true,DescribeAlarms,2013-01-16"})
+    void deniedSignedReadsReturnQueryAuthorizationErrors(
+            String actionParameter, boolean presigned, String action, String version) {
         String user = "query-denied-" + UUID.randomUUID();
         String accessKey = EnforcementFixtures.createUser(
                 cleanup, baseUri.getPort(), auth("000000000000", "iam"), user).accessKeyId();
 
         signedRequest(accessKey, presigned)
-                .queryParam(actionParameter, "ListMetrics")
-                .queryParam("Version", "2010-08-01")
+                .queryParam(actionParameter, action)
+                .queryParam("Version", version)
         .when().get("/")
         .then()
                 .statusCode(403)
@@ -114,9 +117,13 @@ class CloudWatchQueryGetIamEnforcementIntegrationTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"GET,Action", "GET,Operation", "PRESIGNED,Action", "PRESIGNED,Operation",
-            "POST,Action", "JSON,Action"})
-    void anAllowedSignedReadStillReachesCloudWatch(String protocol, String actionParameter) {
+    @CsvSource({"GET,Action,ListMetrics,2010-08-01", "GET,Operation,ListMetrics,2010-08-01",
+            "PRESIGNED,Action,ListMetrics,2010-08-01", "PRESIGNED,Operation,ListMetrics,2010-08-01",
+            "POST,Action,ListMetrics,2010-08-01", "JSON,Action,ListMetrics,2010-08-01",
+            "GET,Action,DescribeAlarms,2013-01-16", "PRESIGNED,Action,DescribeAlarms,2013-01-16",
+            "POST,Action,DescribeAlarms,2013-01-16"})
+    void anAllowedSignedReadStillReachesCloudWatch(
+            String protocol, String actionParameter, String action, String version) {
         String user = "query-allowed-" + UUID.randomUUID();
         String admin = auth("000000000000", "iam");
         String accessKey = EnforcementFixtures.createUser(
@@ -130,9 +137,9 @@ class CloudWatchQueryGetIamEnforcementIntegrationTest {
                 .formParam("PolicyName", "list-metrics")
                 .formParam("PolicyDocument", """
                         {"Version":"2012-10-17","Statement":[{
-                          "Effect":"Allow","Action":"cloudwatch:ListMetrics","Resource":"*"
+                          "Effect":"Allow","Action":"cloudwatch:%s","Resource":"*"
                         }]}
-                        """)
+                        """.formatted(action))
         .when().post("/")
         .then().statusCode(200);
 
@@ -143,15 +150,15 @@ class CloudWatchQueryGetIamEnforcementIntegrationTest {
                             .encodeContentTypeAs("application/x-amz-json-1.0", ContentType.JSON)))
                     .header("X-Amz-Target", "GraniteServiceVersion20100801.ListMetrics").body("{}").post("/");
             case "POST" -> request.contentType("application/x-www-form-urlencoded")
-                    .formParam(actionParameter, "ListMetrics").formParam("Version", "2010-08-01").post("/");
-            default -> request.queryParam(actionParameter, "ListMetrics")
-                    .queryParam("Version", "2010-08-01").get("/");
+                    .formParam(actionParameter, action).formParam("Version", version).post("/");
+            default -> request.queryParam(actionParameter, action)
+                    .queryParam("Version", version).get("/");
         };
         response.then().statusCode(200);
         if ("JSON".equals(protocol)) {
             response.then().contentType(containsString("json"));
         } else {
-            response.then().contentType(containsString("xml")).body(containsString("ListMetricsResponse"));
+            response.then().contentType(containsString("xml")).body(containsString(action + "Response"));
         }
     }
 
