@@ -181,6 +181,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             throw invalid("Provisioned concurrency requires the non-ephemeral Docker Lambda executor");
         }
         LambdaFunction fn = currentFunction(target);
+        validateSnapStart(fn);
         validateSupportedTarget(fn);
         List<ContainerHandle> retired = List.of();
         Status result;
@@ -511,7 +512,10 @@ public class ProvisionedConcurrencyPool implements Resettable {
             if (version != null && version.matches("[0-9]+")) {
                 AwsArnUtils.Arn arn = AwsArnUtils.parse(functionArn);
                 functions.getForAccount(arn.accountId(), arn.region(), fn.getFunctionName(), version)
-                        .ifPresent(ProvisionedConcurrencyPool::validateSupportedTarget);
+                        .ifPresent(target -> {
+                            validateSnapStart(target);
+                            validateSupportedTarget(target);
+                        });
             }
             if (version != null && version.matches("[0-9]+") && allocations.values().stream()
                     .anyMatch(entry -> functionArn.equals(entry.configuration.functionArn())
@@ -526,6 +530,13 @@ public class ProvisionedConcurrencyPool implements Resettable {
     private static void validateSupportedTarget(LambdaFunction fn) {
         if (fn.isHotReload() || fn.isDurable()) {
             throw invalid("Provisioned concurrency is not supported for hot-reload or durable functions");
+        }
+    }
+
+    private static void validateSnapStart(LambdaFunction fn) {
+        if ("PublishedVersions".equals(fn.getSnapStartApplyOn())) {
+            throw new AwsException("ResourceConflictException", "The operation cannot be performed at this time. "
+                    + "Provisioned Concurrency is not supported for SnapStart enabled functions", 409);
         }
     }
 
