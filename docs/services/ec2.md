@@ -739,7 +739,10 @@ through `payment-pending`/`assessing`. `DescribeCapacityReservations` supports t
 
 On-demand launches consume matching open reservation capacity unless their preference is
 `none`. RunInstances also honors an explicit reservation target, including one supplied by
-its launch template. CreateFleet and AutoScaling retain the template's preference and target;
+its launch template. `capacity-reservations-only` requires matching reservation capacity and
+never falls back to On-Demand capacity when launching or restarting. It can accompany an
+explicit reservation target; without one, only matching open reservations are eligible.
+CreateFleet and AutoScaling retain the template's preference and target;
 CloudFormation launch templates preserve the same declaration. Creating an open reservation
 adopts matching, unassociated running instances with an `open` preference. DescribeInstances
 reports the acquired reservation. Stop, termination,
