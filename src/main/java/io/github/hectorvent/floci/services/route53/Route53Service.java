@@ -1101,8 +1101,15 @@ public class Route53Service implements Resettable {
             return a == b;
         }
         return Objects.equals(a.getHostedZoneId(), b.getHostedZoneId())
-                && Objects.equals(a.getDnsName(), b.getDnsName())
+                && aliasDnsNamesMatch(a.getDnsName(), b.getDnsName())
                 && a.isEvaluateTargetHealth() == b.isEvaluateTargetHealth();
+    }
+
+    private static boolean aliasDnsNamesMatch(String a, String b) {
+        if (a == null || b == null) {
+            return a == b;
+        }
+        return normalizeName(a).equalsIgnoreCase(normalizeName(b));
     }
 
     private static boolean recordValuesMatch(List<ResourceRecord> a, List<ResourceRecord> b) {
