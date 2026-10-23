@@ -248,25 +248,55 @@ class Ec2ImageSnapshotPermissionIntegrationTest {
     }
 
     @Test
-    void explicitUnsupportedCopyOptionsAndSharedTagsRefuseBeforeInsertion() {
+    void explicitUnsupportedCopyOptionsRefuseBeforeInsertion() {
         Source source = source(1);
         try {
             modifyImage(source.imageId(), "Add", RECIPIENT).statusCode(200);
             modifySnapshot(source.snapshotIds().getFirst(), "Add", RECIPIENT).statusCode(200);
             int beforeImages = ownedImages(RECIPIENT, DESTINATION_REGION);
             int beforeSnapshots = ownedSnapshots(RECIPIENT, DESTINATION_REGION);
-            for (String option : List.of("Encrypted", "CopyImageTags", "KmsKeyId", "DestinationOutpostArn")) {
+            for (String option : List.of("Encrypted", "KmsKeyId", "DestinationOutpostArn")) {
                 copy(source.imageId()).formParam(option, "true").post("/").then().statusCode(400)
                         .body("Response.Errors.Error.Code", equalTo("UnsupportedOperation"));
             }
-            request("CreateTags", OWNER, SOURCE_REGION).formParam("ResourceId.1", source.imageId())
-                    .formParam("Tag.1.Key", "ec2:SharedTag/example").formParam("Tag.1.Value", "shared")
-                    .post("/").then().statusCode(200);
-            copy(source.imageId()).post("/").then().statusCode(400)
-                    .body("Response.Errors.Error.Code", equalTo("UnsupportedOperation"));
             assertEquals(beforeImages, ownedImages(RECIPIENT, DESTINATION_REGION));
             assertEquals(beforeSnapshots, ownedSnapshots(RECIPIENT, DESTINATION_REGION));
         } finally {
+            deregister(source.imageId(), OWNER, SOURCE_REGION);
+        }
+    }
+
+    @Test
+    void sharedImageTagsCopyWhenRequestedAndDryRunCreatesNothing() {
+        Source source = source(1);
+        String copyId = null;
+        try {
+            request("CreateTags", OWNER, SOURCE_REGION).formParam("ResourceId.1", source.imageId())
+                    .formParam("Tag.1.Key", "ec2:SharedTag/example").formParam("Tag.1.Value", "shared")
+                    .post("/").then().statusCode(200);
+            modifyImage(source.imageId(), "Add", RECIPIENT).statusCode(200);
+            modifySnapshot(source.snapshotIds().getFirst(), "Add", RECIPIENT).statusCode(200);
+            int beforeImages = ownedImages(RECIPIENT, DESTINATION_REGION);
+            int beforeSnapshots = ownedSnapshots(RECIPIENT, DESTINATION_REGION);
+            copy(source.imageId()).formParam("DryRun", true).post("/").then().statusCode(412)
+                    .body("Response.Errors.Error.Code", equalTo("DryRunOperation"));
+            assertEquals(beforeImages, ownedImages(RECIPIENT, DESTINATION_REGION));
+            assertEquals(beforeSnapshots, ownedSnapshots(RECIPIENT, DESTINATION_REGION));
+            copyId = copy(source.imageId()).formParam("CopyImageTags", true).post("/").then().statusCode(200)
+                    .extract().path("CopyImageResponse.imageId");
+            request("DescribeImages", RECIPIENT, DESTINATION_REGION).formParam("Owner.1", "self")
+                    .formParam("ImageId.1", copyId).formParam("Filter.1.Name", "tag:ec2:SharedTag/example")
+                    .formParam("Filter.1.Value.1", "shared").post("/").then().statusCode(200)
+                    .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo(copyId))
+                    .body("DescribeImagesResponse.imagesSet.item.tagSet.item.key", equalTo("ec2:SharedTag/example"))
+                    .body("DescribeImagesResponse.imagesSet.item.tagSet.item.value", equalTo("shared"));
+            request("DescribeTags", RECIPIENT, DESTINATION_REGION).formParam("Filter.1.Name", "resource-id")
+                    .formParam("Filter.1.Value.1", copyId).post("/").then().statusCode(200)
+                    .body("DescribeTagsResponse.tagSet.item.key", equalTo("ec2:SharedTag/example"));
+        } finally {
+            if (copyId != null) {
+                deregister(copyId, RECIPIENT, DESTINATION_REGION);
+            }
             deregister(source.imageId(), OWNER, SOURCE_REGION);
         }
     }
