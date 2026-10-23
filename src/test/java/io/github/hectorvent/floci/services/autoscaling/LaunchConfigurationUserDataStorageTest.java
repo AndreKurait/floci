@@ -104,7 +104,7 @@ class LaunchConfigurationUserDataStorageTest {
         when(ec2.runInstances(eq(REGION), eq("ami-original"), eq("t3.micro"), eq(1), eq(1),
                 isNull(), anyList(), isNull(), isNull(), anyList(), eq(text), isNull(), isNull(),
                 isNull(), eq(0), isNull(), isNull(), isNull(), eq(encoded),
-                anyBoolean(), isNull(), isNull(), any())).thenReturn(result);
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(result);
         AutoScalingReconciler reconciler = new AutoScalingReconciler(service, ec2, mock(ElbV2Service.class));
         try {
             reconciler.reconcile(group);
@@ -112,7 +112,7 @@ class LaunchConfigurationUserDataStorageTest {
             verify(ec2).runInstances(eq(REGION), eq("ami-original"), eq("t3.micro"), eq(1), eq(1),
                     isNull(), anyList(), isNull(), isNull(), anyList(), eq(text), isNull(), isNull(),
                     isNull(), eq(0), isNull(), isNull(), isNull(), eq(encoded),
-                    anyBoolean(), isNull(), isNull(), any());
+                    anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull());
             assertEquals(origin.equals("legacy") ? null : Boolean.TRUE, restored.getUserDataBase64Encoded());
             assertEquals(origin.equals("legacy") ? input : encoded, restored.getUserData());
         } finally {

@@ -737,6 +737,21 @@ through `payment-pending`/`assessing`. `DescribeCapacityReservations` supports t
 `instance-type`, `state` and `tenancy` filters alongside the shared `tag:`, `tag-key` and
 `tag-value` filters.
 
+On-demand launches consume matching open reservation capacity unless their preference is
+`none`. RunInstances also honors an explicit reservation target, including one supplied by
+its launch template. CreateFleet and AutoScaling retain the template's preference and target;
+CloudFormation launch templates preserve the same declaration. Creating an open reservation
+adopts matching, unassociated running instances with an `open` preference. DescribeInstances
+reports the acquired reservation. Stop, termination,
+cancellation and expiration release membership; a restart acquires capacity using the
+instance's retained launch preference and target. A failed membership write reports an error;
+subsequent access reconciles released membership from persisted instance state.
+
+Membership and available counts publish in one atomic storage batch. Older snapshots without
+membership remain readable. Capacity reservation resource-group targeting is unsupported.
+
+Capacity reservation zone IDs must be among those returned by `DescribeAvailabilityZones`.
+
 ### Dedicated Hosts
 
 | Action | Description |

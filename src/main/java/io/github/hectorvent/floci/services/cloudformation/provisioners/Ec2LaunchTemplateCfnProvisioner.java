@@ -73,6 +73,9 @@ public class Ec2LaunchTemplateCfnProvisioner implements CfnResourceProvisioner {
                     ? written.get("MetadataOptions") : null;
             data.setMetadataOptions(Ec2CfnMetadataOptions.read("LaunchTemplateData/MetadataOptions",
                     metadataOptions, Ec2CfnMetadataOptions.LAUNCH_TEMPLATE_SHAPE, ctx.engine()));
+            JsonNode capacity = written.isObject() && !CloudFormationTemplateEngine.callsIntrinsic(written)
+                    ? written.get("CapacityReservationSpecification") : null;
+            data.setCapacityReservationSpecification(capacityReservationSpecification(capacity, ctx.engine()));
             if (node.has("SecurityGroupIds")) {
                 List<String> securityGroupIds = new ArrayList<>();
                 for (JsonNode securityGroup : node.get("SecurityGroupIds")) {
@@ -171,6 +174,31 @@ public class Ec2LaunchTemplateCfnProvisioner implements CfnResourceProvisioner {
      * derives the ARN only at launch time, so normalizing {@code Name} into an ARN here would put
      * back the drift this provisioner's template data is read back through.
      */
+    private LaunchTemplateData.CapacityReservationSpecification capacityReservationSpecification(
+            JsonNode raw, CloudFormationTemplateEngine engine) {
+        CfnPropertyTypes.Reader types = new CfnPropertyTypes.Reader(engine);
+        String shape = CfnPropertyTypes.memberShape(
+                CfnPropertyTypes.propertyShape("AWS::EC2::LaunchTemplate", "LaunchTemplateData"),
+                "CapacityReservationSpecification");
+        JsonNode block = types.read("LaunchTemplateData/CapacityReservationSpecification", raw, shape);
+        types.finish();
+        if (block == null || block.isEmpty()) {
+            return null;
+        }
+        LaunchTemplateData.CapacityReservationSpecification specification =
+                new LaunchTemplateData.CapacityReservationSpecification();
+        specification.setCapacityReservationPreference(block.path("CapacityReservationPreference").asText(null));
+        JsonNode targetNode = block.path("CapacityReservationTarget");
+        if (targetNode.isObject()) {
+            LaunchTemplateData.CapacityReservationTarget target = new LaunchTemplateData.CapacityReservationTarget();
+            target.setCapacityReservationId(targetNode.path("CapacityReservationId").asText(null));
+            target.setCapacityReservationResourceGroupArn(
+                    targetNode.path("CapacityReservationResourceGroupArn").asText(null));
+            specification.setCapacityReservationTarget(target);
+        }
+        return specification;
+    }
+
     private LaunchTemplateData.IamInstanceProfile iamInstanceProfile(JsonNode profile) {
         String arn = profile.path("Arn").asText(null);
         String profileName = profile.path("Name").asText(null);
