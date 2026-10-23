@@ -407,6 +407,24 @@ class AccountAwareStorageBackendTest {
     }
 
     @Test
+    void exactLookupFindsAllOwnersAndLegacyEntriesWithoutRescanning() {
+        InMemoryStorage<String, String> raw = spy(new InMemoryStorage<String, String>());
+        AccountAwareStorageBackend<String> storage =
+                new AccountAwareStorageBackend<>(raw, null, "111111111111");
+        raw.put("KEY", "legacy");
+        storage.putForAccount("111111111111", "KEY", "own");
+        storage.putForAccount("222222222222", "KEY", "foreign");
+        assertEquals(3, storage.findAllAccountEntries("KEY").size());
+        clearInvocations(raw);
+        storage.putForAccount("333333333333", "KEY", "new");
+        assertEquals(Set.of("legacy", "own", "foreign", "new"), Set.copyOf(
+                storage.findAllAccountEntries("KEY").stream()
+                        .map(AccountAwareStorageBackend.AccountEntry::value).toList()));
+        assertTrue(storage.findAllAccountEntries("MISSING").isEmpty());
+        verify(raw, never()).keys();
+    }
+
+    @Test
     void findAnyAccountEntryScansOnceForLoadedData() {
         InMemoryStorage<String, String> raw = spy(new InMemoryStorage<String, String>());
         raw.put("222222222222/ASIAKEY", "session");
