@@ -5,6 +5,36 @@
 
 Floci Lambda runs your function code locally inside real Docker containers - close enough as AWS Lambda does (using Firecracker micro VM).
 
+## Provisioned concurrency configuration
+
+`PutProvisionedConcurrencyConfig`, `GetProvisionedConcurrencyConfig`, and
+`DeleteProvisionedConcurrencyConfig` use the AWS REST JSON route
+`/2019-09-30/functions/{FunctionName}/provisioned-concurrency?Qualifier=...`.
+They accept published versions and aliases pointing to published versions.
+Function names, partial ARNs, and full ARNs resolve in the named account and request region.
+IAM checks use the qualified function resource and the operation's own action.
+
+This stage implements the control plane only. Put returns HTTP 202 and stores the desired
+count. Get reports `IN_PROGRESS` with zero allocated and available environments. No runtime
+is initialized, no handler is invoked, and ordinary invocation routing is unchanged. Runtime
+initialization and routing are separate follow-up work; `READY` is not simulated.
+
+Requested counts share the existing `warm-pool-max-per-function` and `warm-pool-max-total`
+local limits, and cannot exceed the function's reserved concurrency. These local limits are
+not AWS account-quota emulation. A version and an alias targeting it cannot both have a
+configuration. Weighted aliases, hot-reload functions, and durable functions are not eligible
+for Put. Put requires the non-ephemeral Docker executor. Get and Delete still address an
+existing configuration if an alias later becomes
+weighted. An alias with a configuration cannot move to `$LATEST` or to a version already
+configured directly or through another alias. Description-only changes and unconfigured aliases
+remain allowed.
+
+Deleting a version, alias, or function removes its corresponding configurations. Delete is
+idempotent for an existing target without a configuration; an absent target returns
+`ResourceNotFoundException`. Desired configuration uses the Lambda storage mode through
+`StorageFactory` and is restored after restart. Reset removes it. Storage failures propagate
+before the in-memory configuration is replaced or removed, so callers can retry.
+
 ## Supported Operations
 
 | Operation | Description |
@@ -49,6 +79,9 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `PutFunctionConcurrency` | Set reserved concurrent executions |
 | `GetFunctionConcurrency` | Get reserved concurrent executions |
 | `DeleteFunctionConcurrency` | Clear reserved concurrent executions |
+| `PutProvisionedConcurrencyConfig` | Store requested capacity for a version or alias |
+| `GetProvisionedConcurrencyConfig` | Read requested capacity and configuration status |
+| `DeleteProvisionedConcurrencyConfig` | Remove requested capacity |
 | `GetAccountSettings` | Account limits plus usage derived from the caller's stored functions |
 | `PutFunctionEventInvokeConfig` | Set the asynchronous invocation settings of a function, version or alias (retries, event age, destinations) |
 | `UpdateFunctionEventInvokeConfig` | Change some of those settings, leaving the rest as they are |
@@ -90,16 +123,18 @@ part in authorizing calls to the function:
 - `GetFunction`, `GetFunctionConfiguration` and `ListDurableExecutionsByFunction`, given a full ARN
   with a version or alias, read the function in the account in the ARN, and need its function
   policy to allow the caller in the same way.
+- Provisioned-concurrency configuration operations also act in the account named by the function
+  reference. Cross-account access requires that function's policy to allow the caller.
 - Other operations act on the caller's own function of the name the ARN gives, whatever account
   the ARN names, and are authorized against that function. Floci does not serve them on another
   account's function, which AWS allows through a function policy.
 - Within one account, a statement naming the caller grants on its own. One naming only the
   account, as `AddPermission --principal <account-id>` writes it, delegates to the account, so the
   caller's identity policy has to allow the call too.
-- An invoke is authorized against the version or alias it names, in the function name or in
-  `Qualifier`. A grant added with `Qualifier` covers that version or alias only, and a grant on the
-  function does not cover a qualified invoke. Other operations are authorized against the
-  unqualified function.
+- An invoke or provisioned-concurrency configuration operation is authorized against the version or
+  alias it names, in the function name or in `Qualifier`. A grant added with `Qualifier` covers that
+  version or alias only, and a grant on the function does not cover a qualified operation.
+  Other operations are authorized against the unqualified function.
 - A statement conditioned on `InvokedViaFunctionUrl` does not admit a direct `Invoke`.
 - `aws:PrincipalOrgID` is not part of the request context, so a grant added with `PrincipalOrgID`
   admits no caller.
@@ -370,8 +405,8 @@ disabled fails with Lambda's error as the resource status reason.
     applies independently to each region. `PutFunctionConcurrency` validates
     that the requested value leaves at least
     `floci.services.lambda.unreserved-concurrency-min` (default 100) available
-    for unreserved functions in that region. `PutProvisionedConcurrencyConfig`
-    and related provisioned-concurrency operations remain unimplemented.
+    for unreserved functions in that region. Provisioned-concurrency requests
+    must fit within any reserved concurrency configured for the function.
 
     Reducing or clearing a function's reserved value does not kill
     invocations that are already in flight. This matches AWS, which
@@ -473,7 +508,7 @@ For a longer drain, explicitly stop with the larger timeout and then start Floci
 These AWS Lambda operations have no handler in Floci. Calls will return `404` or an error:
 
 - Layer permissions (`AddLayerVersionPermission`, `RemoveLayerVersionPermission`, `GetLayerVersionPolicy`)
-- Provisioned concurrency (`PutProvisionedConcurrencyConfig`, `GetProvisionedConcurrencyConfig`, `ListProvisionedConcurrencyConfigs`, `DeleteProvisionedConcurrencyConfig`)
+- `ListProvisionedConcurrencyConfigs`
 - `InvokeWithResponseStream`
 - Code signing enforcement. A configuration is created, read, updated, deleted and listed, and
   nothing verifies a signature against it, so it never gates a deployment. Attaching one to a

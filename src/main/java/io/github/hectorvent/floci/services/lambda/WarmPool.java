@@ -52,6 +52,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
     private static final int DEFAULT_MAX_POOL_SIZE = Math.max(4, Runtime.getRuntime().availableProcessors());
 
     private final LambdaRuntimeLauncher lambdaRuntimeLauncher;
+    private final ProvisionedConcurrencyPool provisioned;
     private final EmulatorConfig config;
     private final Clock clock;
     private final int maxPoolSizePerFunction;
@@ -92,7 +93,9 @@ public class WarmPool implements ContainerTeardown, Resettable {
     }
 
     @Inject
-    public WarmPool(LambdaRuntimeLauncher lambdaRuntimeLauncher, EmulatorConfig config, Clock clock) {
+    public WarmPool(LambdaRuntimeLauncher lambdaRuntimeLauncher, EmulatorConfig config, Clock clock,
+                    ProvisionedConcurrencyPool provisioned) {
+        this.provisioned = provisioned;
         this.lambdaRuntimeLauncher = lambdaRuntimeLauncher;
         this.config = config;
         this.clock = clock;
@@ -101,9 +104,14 @@ public class WarmPool implements ContainerTeardown, Resettable {
         this.drainTimeoutNanos = TimeUnit.SECONDS.toNanos(resolveDrainTimeout(config));
     }
 
+    public WarmPool(LambdaRuntimeLauncher launcher, EmulatorConfig config, Clock clock) {
+        this(launcher, config, clock, null);
+    }
+
     /** Package-private constructor for testing (empty pool, no containers to drain). */
     WarmPool() {
         this.lambdaRuntimeLauncher = null;
+        this.provisioned = null;
         this.config = null;
         this.clock = Clock.systemUTC();
         this.maxPoolSizePerFunction = DEFAULT_MAX_POOL_SIZE;
@@ -445,6 +453,30 @@ public class WarmPool implements ContainerTeardown, Resettable {
         LOG.debugv("Destroying timed-out container {0} for function {1}",
                 handle.getContainerId(), handle.getFunctionName());
         stopQuietly(handle);
+    }
+
+    void deleteProvisionedFunction(LambdaFunction fn) {
+        if (provisioned != null) {
+            provisioned.deleteFunction(fn);
+        }
+    }
+
+    void deleteProvisionedQualifier(LambdaFunction fn, String qualifier) {
+        if (provisioned != null) {
+            provisioned.deleteQualifier(fn, qualifier);
+        }
+    }
+
+    void validateProvisionedAliasUpdate(LambdaFunction fn, String qualifier, String version) {
+        if (provisioned != null) {
+            provisioned.validateAliasUpdate(fn, qualifier, version);
+        }
+    }
+
+    void validateProvisionedReservation(LambdaFunction fn, Integer reserved) {
+        if (provisioned != null) {
+            provisioned.validateReservation(fn, reserved);
+        }
     }
 
     /**

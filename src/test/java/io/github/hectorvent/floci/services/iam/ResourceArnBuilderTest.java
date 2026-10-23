@@ -1181,6 +1181,18 @@ class ResourceArnBuilderTest {
     }
 
     @Test
+    void provisionedConcurrencyKeepsTheOwnerAndQualifierItConfigures() {
+        when(uriInfo.getPath()).thenReturn(
+                "/2019-09-30/functions/arn:aws:lambda:us-east-1:111122223333:function:example/provisioned-concurrency");
+        queryParams.putSingle("Qualifier", "live");
+        assertEquals("arn:aws:lambda:us-east-1:111122223333:function:example:live",
+                builder.build("lambda", ctx, "us-east-1", "000000000000"));
+        when(uriInfo.getPath()).thenReturn("/2019-09-30/functions/example/provisioned-concurrency");
+        assertEquals("arn:aws:lambda:us-east-1:000000000000:function:example:live",
+                builder.build("lambda", ctx, "us-east-1", "000000000000"));
+    }
+
+    @Test
     void lambdaWebRoutesResolveTheFunctionRevisionOrEndpointTheyActOn() {
         String fn = "arn:aws:lambda:us-east-1:000000000000:web-function/app";
         when(uriInfo.getPath()).thenReturn("/2025-03-07/web-functions/app");
