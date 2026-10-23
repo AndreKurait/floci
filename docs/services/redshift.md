@@ -8,7 +8,7 @@ Floci emulates Amazon Redshift by managing a real [PostgreSQL](https://www.postg
 
 > **Always read the host and port from `DescribeClusters`** rather than assuming a fixed port. PostgreSQL listens on `5432` *inside* the container; the port you connect to is dynamically assigned on the host and returned as `Clusters[0].Endpoint.Port`. Redshift's conventional port is `5439`, but the emulator does not bind it: use whatever `DescribeClusters` reports.
 
-The container has **no persistent volume**: if the physical container survives a Floci restart it is adopted and its data is kept, but if the container itself is gone (host reboot, `docker rm`, a pruned dev box) the cluster comes back empty. Use `CreateClusterSnapshot` / `RestoreFromClusterSnapshot` to preserve data explicitly.
+The PostgreSQL image uses an anonymous volume, which Floci removes with the container and does not reattach to a replacement: if the physical container survives a Floci restart it is adopted and its data is kept, but if the container itself is gone (host reboot, `docker rm`, a pruned dev box) the cluster comes back empty. Use `CreateClusterSnapshot` / `RestoreFromClusterSnapshot` to preserve data explicitly. Failed recovery preserves an adopted container and its volume. Once reboot teardown begins, a failed reboot retains its pre-reboot dump for manual recovery. A failed proxy stop preserves the original database container.
 
 Snapshot-dump and catalog-seed uploads retry transient Docker I/O failures for up to six attempts with a fresh upload each time. The SQL commands themselves are not retried. An exhausted snapshot upload fails the restore; an exhausted catalog-seed upload retains the warning-only startup behavior.
 
