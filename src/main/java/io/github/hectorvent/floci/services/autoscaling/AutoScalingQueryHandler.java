@@ -1666,10 +1666,19 @@ public class AutoScalingQueryHandler {
         CapacityReservationSpecification specification = new CapacityReservationSpecification();
         specification.setCapacityReservationPreference(p.getFirst(prefix + "CapacityReservationPreference"));
         specification.setCapacityReservationIds(
-                memberList(p, prefix + "CapacityReservationTarget.CapacityReservationIds"));
+                capacityTargetMembers(p, prefix + "CapacityReservationTarget.CapacityReservationIds"));
         specification.setCapacityReservationResourceGroupArns(
-                memberList(p, prefix + "CapacityReservationTarget.CapacityReservationResourceGroupArns"));
+                capacityTargetMembers(p, prefix + "CapacityReservationTarget.CapacityReservationResourceGroupArns"));
         return specification;
+    }
+
+    private List<String> capacityTargetMembers(MultivaluedMap<String, String> params, String prefix) {
+        String memberPrefix = prefix + ".member.";
+        return params.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(memberPrefix))
+                .filter(entry -> entry.getKey().substring(memberPrefix.length()).matches("[1-9][0-9]*"))
+                .flatMap(entry -> entry.getValue().stream())
+                .toList();
     }
 
     private ParsedTags parseTags(MultivaluedMap<String, String> p) {
