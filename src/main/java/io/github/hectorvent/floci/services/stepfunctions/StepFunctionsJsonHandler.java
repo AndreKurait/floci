@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.stepfunctions.model.Activity;
 import io.github.hectorvent.floci.services.stepfunctions.model.ActivityTask;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
@@ -433,10 +434,9 @@ public class StepFunctionsJsonHandler {
 
     private Response handleListExecutions(JsonNode request) {
         String statusFilter = optionalText(request, "statusFilter");
-        if (statusFilter != null && !Set.of(
-                "RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED", "PENDING_REDRIVE")
-                .contains(statusFilter)) {
-            throw new AwsException("ValidationException", "Invalid statusFilter.", 400);
+        if (statusFilter != null && !EXECUTION_STATUSES.contains(statusFilter)) {
+            throw SmithyValidationErrors.validationException(
+                    SmithyValidationErrors.notInEnum(statusFilter, "statusFilter", EXECUTION_STATUSES));
         }
         if ("PENDING_REDRIVE".equals(statusFilter)) {
             throw new AwsException("ValidationException",
@@ -511,6 +511,8 @@ public class StepFunctionsJsonHandler {
 
     private static final Set<String> EXECUTION_DATA_FIELDS =
             Set.of("input", "inputDetails", "output", "outputDetails");
+    private static final List<String> EXECUTION_STATUSES =
+            List.of("SUCCEEDED", "TIMED_OUT", "PENDING_REDRIVE", "ABORTED", "FAILED", "RUNNING");
 
     static String historyEventDetailsField(String type) {
         if (type.endsWith("StateEntered")) {

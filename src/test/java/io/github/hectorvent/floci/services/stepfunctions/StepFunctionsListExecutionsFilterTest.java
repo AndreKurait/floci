@@ -80,6 +80,19 @@ class StepFunctionsListExecutionsFilterTest {
         assertInvalid(request().put("statusFilter", status));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"", "succeeded", "UNKNOWN"})
+    void invalidEnumValuesUseSmithyValidationWording(String status) {
+        AwsException error = assertThrows(AwsException.class,
+                () -> list(request().put("statusFilter", status)));
+        assertEquals("ValidationException", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertEquals("1 validation error detected: Value '" + status
+                + "' at 'statusFilter' failed to satisfy constraint: Member must satisfy enum value set: "
+                + "[SUCCEEDED, TIMED_OUT, PENDING_REDRIVE, ABORTED, FAILED, RUNNING]", error.getMessage());
+        verifyNoInteractions(service);
+    }
+
     @Test
     void pendingRedriveIsRejectedWithoutClaimingMapRunSupport() {
         assertInvalid(mapper.createObjectNode().put("statusFilter", "PENDING_REDRIVE"));

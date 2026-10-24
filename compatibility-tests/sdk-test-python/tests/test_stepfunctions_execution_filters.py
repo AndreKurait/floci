@@ -2,6 +2,8 @@
 import json
 
 import boto3
+import pytest
+from botocore.exceptions import ClientError
 
 
 def test_execution_filters_follow_current_status(aws_config, client_config, iam_client, unique_name):
@@ -48,6 +50,17 @@ def test_execution_filters_follow_current_status(aws_config, client_config, iam_
         client.stop_execution(executionArn=running)
         assert listed("RUNNING") == set()
         assert listed("ABORTED") == {running}
+        for invalid_status in ("", "succeeded", "UNKNOWN"):
+            with pytest.raises(ClientError) as error:
+                client.list_executions(stateMachineArn=machine, statusFilter=invalid_status)
+            response = error.value.response
+            assert response["ResponseMetadata"]["HTTPStatusCode"] == 400
+            assert response["Error"]["Code"] == "ValidationException"
+            assert response["Error"]["Message"] == (
+                f"1 validation error detected: Value '{invalid_status}' at 'statusFilter' "
+                "failed to satisfy constraint: Member must satisfy enum value set: "
+                "[SUCCEEDED, TIMED_OUT, PENDING_REDRIVE, ABORTED, FAILED, RUNNING]"
+            )
     finally:
         if running and client.describe_execution(executionArn=running)["status"] == "RUNNING":
             client.stop_execution(executionArn=running)
