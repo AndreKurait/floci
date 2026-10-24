@@ -467,7 +467,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
     }
 
     private String pointedVersion(Configuration configuration) {
-        if (configuration.qualifier().matches("[0-9]+")) {
+        if (isPublishedVersion(configuration.qualifier())) {
             return configuration.version();
         }
         return aliases.getForAccount(configuration.account(), configuration.region(),
@@ -477,14 +477,14 @@ public class ProvisionedConcurrencyPool implements Resettable {
 
     private Allocation refreshAlias(Allocation previous, List<ContainerHandle> retired) {
         Configuration value = previous.configuration;
-        if (value.qualifier().matches("[0-9]+")) {
+        if (isPublishedVersion(value.qualifier())) {
             return previous;
         }
         LambdaAlias alias = aliases.getForAccount(value.account(), value.region(), value.name(), value.qualifier())
                 .orElse(null);
         if (alias == null || Objects.equals(value.version(), alias.getFunctionVersion())
                 || (alias.getRoutingConfig() != null && !alias.getRoutingConfig().isEmpty())
-                || alias.getFunctionVersion() == null || !alias.getFunctionVersion().matches("[0-9]+")) {
+                || alias.getFunctionVersion() == null || !isPublishedVersion(alias.getFunctionVersion())) {
             return previous;
         }
         if (functions.getForAccount(value.account(), value.region(), value.name()).isEmpty()) {
@@ -515,7 +515,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             if ("$LATEST".equals(version)) {
                 throw invalid("Provisioned Concurrency Configs cannot be applied to unpublished function versions.");
             }
-            if (version != null && version.matches("[0-9]+")) {
+            if (version != null && isPublishedVersion(version)) {
                 AwsArnUtils.Arn arn = AwsArnUtils.parse(functionArn);
                 functions.getForAccount(arn.accountId(), arn.region(), fn.getFunctionName(), version)
                         .ifPresent(target -> {
@@ -523,7 +523,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                             validateSupportedTarget(target);
                         });
             }
-            if (version != null && version.matches("[0-9]+") && allocations.values().stream()
+            if (version != null && isPublishedVersion(version) && allocations.values().stream()
                     .anyMatch(entry -> functionArn.equals(entry.configuration.functionArn())
                             && !qualifier.equals(entry.configuration.qualifier())
                             && version.equals(pointedVersion(entry.configuration)))) {
@@ -756,7 +756,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             throw invalid("Weighted aliases are not supported for provisioned concurrency");
         }
         String version = alias == null ? qualifier : alias.getFunctionVersion();
-        if (version == null || !version.matches("[0-9]+")) {
+        if (version == null || !isPublishedVersion(version)) {
             throw invalid("Provisioned concurrency requires an immutable published version");
         }
         LambdaFunction fn = functions.getForAccount(target.account(), region, target.name(), version)
@@ -777,7 +777,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             throw invalid("Function ARN region must match the request region");
         }
         account = ref.account() != null ? ref.account() : account;
-        boolean publishedVersion = qualifier.matches("[0-9]+");
+        boolean publishedVersion = isPublishedVersion(qualifier);
         String qualifiedArn = AwsArnUtils.Arn.of("lambda", region, account,
                 "function:" + ref.name() + ":" + qualifier).toString();
         String notFoundMessage = (publishedVersion ? "Function not found: " : "Cannot find alias arn: ")
@@ -795,10 +795,24 @@ public class ProvisionedConcurrencyPool implements Resettable {
         return new Target(account, region, ref.name(), baseArn(latest), qualifier, alias);
     }
 
+    /** Published versions contain one or more ASCII digits; avoid compiling a regex per reconciliation. */
+    static boolean isPublishedVersion(String value) {
+        if (value == null || value.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char digit = value.charAt(i);
+            if (digit < '0' || digit > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private LambdaFunction currentFunction(Configuration configuration) {
         functions.getForAccount(configuration.account(), configuration.region(), configuration.name())
                 .orElseThrow(TargetUnavailableException::new);
-        if (!configuration.qualifier().matches("[0-9]+")) {
+        if (!isPublishedVersion(configuration.qualifier())) {
             LambdaAlias alias = aliases.getForAccount(configuration.account(), configuration.region(),
                     configuration.name(), configuration.qualifier()).orElseThrow(TargetUnavailableException::new);
             if (!configuration.version().equals(alias.getFunctionVersion())

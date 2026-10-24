@@ -51,6 +51,23 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 class ProvisionedConcurrencyPoolTest {
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "1", "1234567890", "0001"})
+    void publishedVersionAcceptsAsciiDigits(String value) {
+        assertTrue(ProvisionedConcurrencyPool.isPublishedVersion(value));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "$LATEST", "live", "+1", "-1", "1.0", " 1", "1 ", "1\n", "١", "１"})
+    void publishedVersionRejectsNonDigitQualifiers(String value) {
+        assertFalse(ProvisionedConcurrencyPool.isPublishedVersion(value));
+    }
+
+    @Test
+    void publishedVersionRejectsMissingQualifier() {
+        assertFalse(ProvisionedConcurrencyPool.isPublishedVersion(null));
+    }
+
     @TempDir
     Path storagePath;
 
