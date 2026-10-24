@@ -3218,6 +3218,9 @@ public interface EmulatorConfig {
         /** Optional full EC2 catalog file for locally built guest images. */
         Optional<String> imageCatalogPath();
 
+        /** Optional JSON file of additional regional AWS-managed prefix lists. */
+        Optional<String> managedPrefixListCatalogPath();
+
         @WithDefault("true")
         boolean enabled();
 

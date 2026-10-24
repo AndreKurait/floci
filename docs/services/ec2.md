@@ -552,6 +552,31 @@ Two AWS-managed prefix lists exist in every region without being created —
 read-only, and served by both `DescribePrefixLists` and `DescribeManagedPrefixLists`;
 modifying or deleting one returns `UnsupportedOperation`.
 
+Additional regional AWS-managed lists can be supplied through
+`FLOCI_SERVICES_EC2_MANAGED_PREFIX_LIST_CATALOG_PATH`. Set it to a readable JSON
+file inside the Floci container, for example:
+
+```json
+{
+  "eu-west-1": [{
+    "prefixListId": "pl-0123456789abcdef0",
+    "prefixListName": "example-managed-service",
+    "cidrs": ["192.0.2.0/24"]
+  }]
+}
+```
+
+The file is read once when EC2 starts. Each entry needs a unique ID and name
+within its region and at least one IPv4 CIDR. CIDRs are normalized to network
+blocks; repeated or equivalent blocks within one list are rejected. Entries
+cannot replace the built-in lists. Invalid or unreadable files prevent startup
+when EC2 is enabled; disabled EC2 does not read the catalog. Configured lists
+have the same AWS ownership, read-only behavior, security-group reference
+validation and describe/entry responses as the built-in lists. Both configured
+and built-in CIDRs participate in security-group policy evaluation and firewall
+rules when enforcement is enabled. They are available across accounts in their
+configured region. Leaving the setting unset keeps the built-in catalog.
+
 A customer-managed list may not take a name AWS reserves for its own: `com.amazonaws.`,
 `com.amazon.` or `com.aws.`, each including the trailing dot. `CreateManagedPrefixList`
 rejects those with `InvalidParameterValue`; a name that merely resembles one, such as
