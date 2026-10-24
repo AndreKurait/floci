@@ -255,17 +255,8 @@ public class CloudWatchMetricsQueryHandler {
             throw new AwsException("ValidationError", "Composite action suppression is not supported", 400);
         }
         CompositeAlarm alarm = new CompositeAlarm();
-        alarm.setAlarmName(params.getFirst("AlarmName"));
-        alarm.setAlarmDescription(params.getFirst("AlarmDescription"));
-        alarm.setActionsEnabled(!"false".equals(params.getFirst("ActionsEnabled")));
+        parseAlarmFields(params, alarm);
         alarm.setAlarmRule(params.getFirst("AlarmRule"));
-        alarm.setAlarmActions(alarmMembers(params, "AlarmActions"));
-        alarm.setOkActions(alarmMembers(params, "OKActions"));
-        alarm.setInsufficientDataActions(alarmMembers(params, "InsufficientDataActions"));
-        for (int i = 1; params.getFirst("Tags.member." + i + ".Key") != null; i++) {
-            alarm.getTags().put(params.getFirst("Tags.member." + i + ".Key"),
-                    params.getFirst("Tags.member." + i + ".Value"));
-        }
         metricsService.putCompositeAlarm(alarm, region);
         return Response.ok(AwsQueryResponse.envelopeNoResult("PutCompositeAlarm", null)).build();
     }
@@ -726,10 +717,7 @@ public class CloudWatchMetricsQueryHandler {
 
     private MetricAlarm parseAlarm(MultivaluedMap<String, String> params) {
         MetricAlarm a = new MetricAlarm();
-        a.setAlarmName(params.getFirst("AlarmName"));
-        a.setAlarmDescription(params.getFirst("AlarmDescription"));
-        String actionsEnabled = params.getFirst("ActionsEnabled");
-        a.setActionsEnabled(actionsEnabled == null || Boolean.parseBoolean(actionsEnabled));
+        parseAlarmFields(params, a);
         a.setMetricName(params.getFirst("MetricName"));
         a.setNamespace(params.getFirst("Namespace"));
         a.setStatistic(params.getFirst("Statistic"));
@@ -754,33 +742,22 @@ public class CloudWatchMetricsQueryHandler {
         }
         a.setDimensions(dims);
 
-        // Actions
-        for (int i = 1; ; i++) {
-            String act = params.getFirst("OKActions.member." + i);
-            if (act == null) break;
-            a.getOkActions().add(act);
-        }
-        for (int i = 1; ; i++) {
-            String act = params.getFirst("AlarmActions.member." + i);
-            if (act == null) break;
-            a.getAlarmActions().add(act);
-        }
-        for (int i = 1; ; i++) {
-            String act = params.getFirst("InsufficientDataActions.member." + i);
-            if (act == null) break;
-            a.getInsufficientDataActions().add(act);
-        }
-
-        // Tags
-        Map<String, String> tags = new LinkedHashMap<>();
-        for (int i = 1; ; i++) {
-            String key = params.getFirst("Tags.member." + i + ".Key");
-            if (key == null) break;
-            tags.put(key, params.getFirst("Tags.member." + i + ".Value"));
-        }
-        a.setTags(tags);
-
         return a;
+    }
+
+    private void parseAlarmFields(MultivaluedMap<String, String> params, Alarm alarm) {
+        alarm.setAlarmName(params.getFirst("AlarmName"));
+        alarm.setAlarmDescription(params.getFirst("AlarmDescription"));
+        String actionsEnabled = params.getFirst("ActionsEnabled");
+        alarm.setActionsEnabled(actionsEnabled == null || Boolean.parseBoolean(actionsEnabled));
+        alarm.setAlarmActions(alarmMembers(params, "AlarmActions"));
+        alarm.setOkActions(alarmMembers(params, "OKActions"));
+        alarm.setInsufficientDataActions(alarmMembers(params, "InsufficientDataActions"));
+        Map<String, String> tags = new LinkedHashMap<>();
+        for (int i = 1; params.getFirst("Tags.member." + i + ".Key") != null; i++) {
+            tags.put(params.getFirst("Tags.member." + i + ".Key"), params.getFirst("Tags.member." + i + ".Value"));
+        }
+        alarm.setTags(tags);
     }
 
     private List<AlarmMetricDataQuery> parseAlarmMetricQueries(MultivaluedMap<String, String> params) {

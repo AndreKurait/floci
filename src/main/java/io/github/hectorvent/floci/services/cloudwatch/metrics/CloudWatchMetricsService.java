@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -36,6 +37,8 @@ import java.util.stream.Collectors;
 public class CloudWatchMetricsService {
 
     private static final Logger LOG = Logger.getLogger(CloudWatchMetricsService.class);
+
+    private static final List<String> ALARM_TYPES = List.of("CompositeAlarm", "MetricAlarm", "LogAlarm");
 
     private final StorageBackend<String, MetricDatum> metricStore;
     private final StorageBackend<String, Alarm> alarmStore;
@@ -367,18 +370,22 @@ public class CloudWatchMetricsService {
     private void putAlarm(Alarm alarm, String region) {
         String name = alarm.getAlarmName();
         if (name == null || name.isBlank() || name.length() > 255) {
-            throw new AwsException("ValidationError", "AlarmName must contain between 1 and 255 characters", 400);
+            throw SmithyValidationErrors.validationError(name == null ? SmithyValidationErrors.notNull("alarmName")
+                    : "Value '" + name + "' at 'alarmName' failed to satisfy constraint: Member must have length "
+                            + (name.length() > 255 ? "less than or equal to 255" : "greater than or equal to 1"));
         }
         Alarm previous = alarmStore.get(region + "::" + name).orElse(null);
         if (previous != null) {
             if (!previous.getClass().equals(alarm.getClass())) {
                 throw new AwsException("ValidationError", "An alarm of another type already has this name", 400);
             }
-            alarm.setStateValue(previous.getStateValue());
-            alarm.setStateReason(previous.getStateReason());
-            alarm.setStateReasonData(previous.getStateReasonData());
-            alarm.setStateUpdatedTimestamp(previous.getStateUpdatedTimestamp());
-            alarm.setTags(new HashMap<>(previous.getTags()));
+            if (alarm instanceof CompositeAlarm) {
+                alarm.setStateValue(previous.getStateValue());
+                alarm.setStateReason(previous.getStateReason());
+                alarm.setStateReasonData(previous.getStateReasonData());
+                alarm.setStateUpdatedTimestamp(previous.getStateUpdatedTimestamp());
+                alarm.setTags(new HashMap<>(previous.getTags()));
+            }
         }
         if (alarm.getAlarmArn() == null) {
             alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + name));
@@ -401,8 +408,9 @@ public class CloudWatchMetricsService {
     }
 
     public void validateAlarmTypes(List<String> types) {
-        if (!Set.of("MetricAlarm", "CompositeAlarm").containsAll(types)) {
-            throw new AwsException("ValidationError", "Unknown alarm type", 400);
+        if (!ALARM_TYPES.containsAll(types)) {
+            throw SmithyValidationErrors.validationError(
+                    SmithyValidationErrors.notAllInEnum(types, "alarmTypes", ALARM_TYPES));
         }
     }
 
@@ -545,9 +553,6 @@ public class CloudWatchMetricsService {
     }
 
     public void setAlarmState(String alarmName, String stateValue, String stateReason, String stateReasonData, String region) {
-        if (stateValue == null || !Set.of("OK", "ALARM", "INSUFFICIENT_DATA").contains(stateValue)) {
-            throw new AwsException("ValidationError", "Invalid alarm state", 400);
-        }
         List<AlarmSnsNotifier.Notification> notifications = List.of();
         synchronized (this) {
             String key = region + "::" + alarmName;

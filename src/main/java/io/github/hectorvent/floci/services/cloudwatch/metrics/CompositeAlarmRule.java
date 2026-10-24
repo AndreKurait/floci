@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 
 import java.util.HashSet;
 import java.util.Set;
@@ -19,7 +20,9 @@ final class CompositeAlarmRule {
 
     static Rule parse(String input) {
         if (input == null || input.isBlank() || input.length() > 10240) {
-            throw invalid("AlarmRule must contain between 1 and 10240 characters");
+            throw SmithyValidationErrors.validationError(input == null ? SmithyValidationErrors.notNull("alarmRule")
+                    : "Value '" + input + "' at 'alarmRule' failed to satisfy constraint: Member must have length "
+                            + (input.length() > 10240 ? "less than or equal to 10240" : "greater than or equal to 1"));
         }
         CompositeAlarmRule parser = new CompositeAlarmRule(input);
         Expression expression = parser.or();

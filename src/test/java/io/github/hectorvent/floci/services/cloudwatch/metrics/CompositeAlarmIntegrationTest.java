@@ -94,6 +94,40 @@ class CompositeAlarmIntegrationTest {
                 "AlarmTypes", List.of("CompositeAlarm"))).asString().contains(name));
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void alarmTypeValidationAcceptsLogAlarmsAndUsesSmithyErrors(boolean json) throws Exception {
+        call(json, "DescribeAlarms", Map.of("AlarmTypes", List.of("LogAlarm"))).then().statusCode(200);
+        Response error = call(json, "DescribeAlarms", Map.of("AlarmTypes", List.of("Unknown")));
+        error.then().statusCode(400);
+        assertEquals("1 validation error detected: Value '[Unknown]' at 'alarmTypes' failed to satisfy constraint: "
+                + "Member must satisfy constraint: [Member must satisfy enum value set: "
+                + "[CompositeAlarm, MetricAlarm, LogAlarm]]", errorMessage(json, error));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void lengthErrorsUseSmithyMessages(boolean json) throws Exception {
+        for (String field : List.of("AlarmName", "AlarmRule")) {
+            int maximum = "AlarmName".equals(field) ? 255 : 10240;
+            String path = "AlarmName".equals(field) ? "alarmName" : "alarmRule";
+            for (String value : List.of("", "x".repeat(maximum + 1))) {
+                Map<String, String> request = new LinkedHashMap<>(Map.of("AlarmName", "length-validation", "AlarmRule", "TRUE"));
+                request.put(field, value);
+                Response error = call(json, "PutCompositeAlarm", request);
+                error.then().statusCode(400);
+                assertEquals("1 validation error detected: Value '" + value + "' at '" + path
+                        + "' failed to satisfy constraint: Member must have length "
+                        + (value.isEmpty() ? "greater than or equal to 1" : "less than or equal to " + maximum),
+                        errorMessage(json, error));
+            }
+        }
+    }
+
+    private String errorMessage(boolean json, Response response) {
+        return json ? response.jsonPath().getString("message") : response.xmlPath().getString("ErrorResponse.Error.Message");
+    }
+
     private Response call(boolean json, String operation, Map<String, ?> body)
             throws JsonProcessingException {
         if ("PutCompositeAlarm".equals(operation)) {
