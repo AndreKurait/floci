@@ -9,10 +9,14 @@ ACCOUNT = "111111111111"
 REGION = "us-east-1"
 
 
+def sdk_client(service, aws_config, client_config, account, region):
+    config = dict(aws_config, aws_access_key_id=account, aws_secret_access_key="test", region_name=region)
+    return boto3.client(service, config=client_config, **config)
+
+
 @pytest.fixture
 def pool(aws_config, client_config):
-    config = dict(aws_config, aws_access_key_id=ACCOUNT, aws_secret_access_key="test", region_name=REGION)
-    clients = {name: boto3.client(name, config=client_config, **config)
+    clients = {name: sdk_client(name, aws_config, client_config, ACCOUNT, REGION)
                for name in ("ec2", "resource-groups")}
     ec2, groups = clients["ec2"], clients["resource-groups"]
     created = {"reservations": [], "instances": [], "templates": []}
@@ -105,8 +109,7 @@ def test_group_default_uses_on_demand_without_outside_reservations(pool):
 @pytest.mark.parametrize("account,region", [("222222222222", REGION), (ACCOUNT, "us-west-2")])
 def test_group_target_cannot_cross_account_or_region(aws_config, client_config, pool, account, region):
     _, group, _, _ = pool
-    config = dict(aws_config, aws_access_key_id=account, aws_secret_access_key="test", region_name=region)
-    ec2 = boto3.client("ec2", config=client_config, **config)
+    ec2 = sdk_client("ec2", aws_config, client_config, account, region)
     try:
         before = {instance["InstanceId"] for reservation in ec2.describe_instances()["Reservations"]
                   for instance in reservation["Instances"]}
