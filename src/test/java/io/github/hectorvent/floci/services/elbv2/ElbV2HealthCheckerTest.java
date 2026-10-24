@@ -9,11 +9,14 @@ import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerResponse;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -233,6 +236,71 @@ class ElbV2HealthCheckerTest {
         } finally {
             close(slow);
             close(fast);
+        }
+    }
+
+    @Test
+    void blockedProbesRespectTheSharedConcurrencyLimit() throws Exception {
+        List<HttpServerResponse> requests = new CopyOnWriteArrayList<>();
+        HttpServer server = vertx.createHttpServer().requestHandler(request -> requests.add(request.response()))
+                .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        try {
+            ElbV2HealthChecker checker = healthChecker();
+            TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
+            group.setHealthCheckPort(Integer.toString(server.actualPort()));
+            group.setHealthCheckTimeoutSeconds(10);
+            List<TargetDescription> targets = new ArrayList<>();
+            for (int i = 0; i < 33; i++) {
+                targets.add(target("127.0.0.1", 10000 + i));
+            }
+            checker.addTargets(group.getTargetGroupArn(), targets, group);
+            await().atMost(Duration.ofSeconds(3)).until(() -> requests.size() == 32);
+            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1))
+                    .untilAsserted(() -> assertEquals(32, requests.size()));
+            for (HttpServerResponse response : List.copyOf(requests)) {
+                response.end();
+            }
+            await().atMost(Duration.ofSeconds(2)).until(() -> requests.size() == 33);
+            requests.get(32).end();
+            await().atMost(Duration.ofSeconds(2)).until(() -> targets.stream().allMatch(target ->
+                    "healthy".equals(checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()))));
+        } finally {
+            close(server);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"deregister", "stop", "reset"})
+    void lateProbeCannotPublishIntoANewRegistration(String removal) throws Exception {
+        List<HttpServerResponse> requests = new CopyOnWriteArrayList<>();
+        HttpServer server = vertx.createHttpServer().requestHandler(request -> requests.add(request.response()))
+                .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        try {
+            ElbV2HealthChecker checker = healthChecker();
+            TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
+            group.setHealthCheckTimeoutSeconds(10);
+            TargetDescription target = target("127.0.0.1", server.actualPort());
+            checker.startMonitoring(group);
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            await().atMost(Duration.ofSeconds(2)).until(() -> requests.size() == 1);
+            switch (removal) {
+                case "deregister" -> checker.removeTargets(group.getTargetGroupArn(), List.of(target), group);
+                case "stop" -> checker.stopMonitoring(group.getTargetGroupArn());
+                case "reset" -> checker.clear();
+                default -> throw new AssertionError(removal);
+            }
+            checker.startMonitoring(group);
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            await().atMost(Duration.ofSeconds(2)).until(() -> requests.size() == 2);
+            requests.getFirst().end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> assertEquals(
+                    "Elb.RegistrationInProgress",
+                    checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason()));
+            requests.get(1).setStatusCode(503).end();
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("unhealthy",
+                    checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+        } finally {
+            close(server);
         }
     }
 

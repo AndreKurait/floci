@@ -150,3 +150,17 @@ the timer wait; API latency stayed in the millisecond range in both builds. This
 is not a Lambda, OpenSearch or full fleet lifecycle speedup. The host was shared:
 recorded start/end one-minute load averages ranged from 21.08 to 23.92.
 Raw timings are in `tools/performance/results/reconciliation-20261024.json`.
+
+A separate fault-recovery smoke used a real Docker Python 3.12 Lambda runtime
+with one initialized provisioned environment. After killing that owned container,
+the test observed Docker alone until a replacement container was running, then
+checked `READY` and invoked the function successfully. The replacement was running
+after 1.788 seconds. No Lambda status read or invocation occurred during replacement.
+This is one recovery check, not a baseline/candidate latency comparison or a
+measurement of full runtime readiness at the moment Docker reported `running`.
+
+Automated coverage includes concurrent producer convergence, bounded admission,
+dirty-key fairness, shutdown interruption, real HTTP probe concurrency and stale
+results after configuration changes, deregistration, stop and reset. The AWS SDK
+integration exercises event-driven ASG convergence and deletion across separate
+accounts in commercial and GovCloud regions.
