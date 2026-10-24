@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AvailabilityZoneIds;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
@@ -108,7 +109,11 @@ import jakarta.enterprise.context.ContextNotActiveException;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -292,6 +297,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final StorageBackend<String, SpotInstanceRequest> spotInstanceRequests;
     private final StorageBackend<String, NetworkAcl> networkAcls;
     private final StorageBackend<String, ManagedPrefixList> managedPrefixLists;
+    private final Map<String, List<PrefixList>> configuredManagedPrefixLists;
     private final StorageBackend<String, TransitGateway> transitGateways;
     private final StorageBackend<String, TransitGatewayRouteTable> transitGatewayRouteTables;
     private final StorageBackend<String, TransitGatewayVpcAttachment> transitGatewayVpcAttachments;
@@ -849,6 +855,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         this.networkInterfaces = networkInterfaces;
         this.capacityReservations = capacityReservations;
         this.volumeModifications = volumeModifications;
+        this.configuredManagedPrefixLists = loadManagedPrefixListCatalog();
     }
 
     @PostConstruct
@@ -1655,6 +1662,66 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * {@code GatewayVpcEndpointAwsService}); the reversed-suffix names apply to interface endpoints only.
      */
     private List<ManagedPrefixList> awsManagedPrefixLists(String region) {
+        List<ManagedPrefixList> lists = new ArrayList<>(defaultAwsManagedPrefixLists(region));
+        for (PrefixList configured : configuredManagedPrefixLists.getOrDefault(region, List.of())) {
+            lists.add(awsManagedPrefixList(region, configured.getPrefixListId(),
+                    configured.getPrefixListName(), configured.getCidrs()));
+        }
+        return lists;
+    }
+
+    private Map<String, List<PrefixList>> loadManagedPrefixListCatalog() {
+        if (!config.services().ec2().enabled()) {
+            return Map.of();
+        }
+        Optional<String> path = config.services().ec2().managedPrefixListCatalogPath().filter(value -> !value.isBlank());
+        if (path.isEmpty()) {
+            return Map.of();
+        }
+        try (InputStream input = Files.newInputStream(Path.of(path.get()))) {
+            Map<String, List<PrefixList>> catalog = new ObjectMapper().readValue(input, new TypeReference<>() {});
+            if (catalog == null) {
+                throw new IllegalArgumentException("Expected a region-to-prefix-lists object");
+            }
+            for (Map.Entry<String, List<PrefixList>> region : catalog.entrySet()) {
+                if (region.getKey().isBlank() || region.getValue() == null) {
+                    throw new IllegalArgumentException("Expected a nonblank region and a list");
+                }
+                Set<String> ids = new HashSet<>();
+                Set<String> names = new HashSet<>();
+                for (ManagedPrefixList list : defaultAwsManagedPrefixLists(region.getKey())) {
+                    ids.add(list.getPrefixListId());
+                    names.add(list.getPrefixListName());
+                }
+                for (PrefixList list : region.getValue()) {
+                    if (list == null || list.getPrefixListId() == null
+                            || !list.getPrefixListId().matches("pl-(?:[0-9a-f]{8}|[0-9a-f]{17})")
+                            || list.getPrefixListName() == null || list.getPrefixListName().isBlank()
+                            || list.getCidrs() == null || list.getCidrs().isEmpty()
+                            || !ids.add(list.getPrefixListId()) || !names.add(list.getPrefixListName())) {
+                        throw new IllegalArgumentException("Invalid or duplicate prefix list in " + region.getKey());
+                    }
+                    Set<String> canonicalCidrs = new LinkedHashSet<>();
+                    for (String cidr : list.getCidrs()) {
+                        Optional<String> canonical = cidr == null || cidr.contains(":")
+                                ? Optional.empty() : CidrCanonicalizer.canonicalize(cidr);
+                        if (canonical.isEmpty()) {
+                            throw new IllegalArgumentException("Expected an IPv4 prefix list entry in " + region.getKey());
+                        }
+                        if (!canonicalCidrs.add(canonical.get())) {
+                            throw new IllegalArgumentException("Duplicate prefix list entry in " + region.getKey());
+                        }
+                    }
+                    list.setCidrs(List.copyOf(canonicalCidrs));
+                }
+            }
+            return Map.copyOf(catalog);
+        } catch (IOException | IllegalArgumentException error) {
+            throw new IllegalStateException("Invalid EC2 managed prefix list catalog: " + path.get(), error);
+        }
+    }
+
+    private List<ManagedPrefixList> defaultAwsManagedPrefixLists(String region) {
         return List.of(
                 awsManagedPrefixList(region, "pl-63a5400a", "com.amazonaws." + region + ".s3",
                         List.of("52.216.0.0/15", "54.231.0.0/16")),
@@ -4112,15 +4179,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private Map<String, List<String>> policyPrefixLists(String region, List<SecurityGroup> groups) {
+        Map<String, ManagedPrefixList> awsLists = awsManagedPrefixLists(region).stream()
+                .collect(Collectors.toMap(ManagedPrefixList::getPrefixListId, Function.identity()));
         Map<String, List<String>> resolved = new LinkedHashMap<>();
         for (SecurityGroup group : groups) {
             Stream.concat(group.getIpPermissions().stream(),
                             group.getIpPermissionsEgress().stream())
                     .flatMap(permission -> permission.getPrefixListIds().stream())
                     .map(PrefixListId::getPrefixListId).distinct()
-                    .forEach(id -> resolved.put(id, managedPrefixLists.get(key(region, id)).isEmpty()
-                            ? List.of() : getManagedPrefixListEntries(region, id, null).stream()
-                            .map(PrefixListEntry::getCidr).toList()));
+                    .forEach(id -> {
+                        ManagedPrefixList list = managedPrefixLists.get(key(region, id))
+                                .orElseGet(() -> awsLists.get(id));
+                        resolved.put(id, list == null ? List.of() : list.currentEntries().stream()
+                                .map(PrefixListEntry::getCidr).toList());
+                    });
         }
         return resolved;
     }

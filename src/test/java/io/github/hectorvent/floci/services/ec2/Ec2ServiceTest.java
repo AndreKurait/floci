@@ -67,6 +67,7 @@ import org.bouncycastle.openssl.PEMKeyPair;
 import org.bouncycastle.openssl.PEMParser;
 import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -75,10 +76,13 @@ import org.mockito.InOrder;
 import org.mockito.MockMakers;
 import org.mockito.MockedStatic;
 
+import java.io.IOException;
 import java.io.StringReader;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.KeyPairGenerator;
 import java.security.interfaces.RSAPrivateCrtKey;
 import java.time.Duration;
@@ -123,8 +127,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.atLeastOnce;
@@ -6006,10 +6012,174 @@ class Ec2ServiceTest {
     // =========================================================================
 
     private static Ec2Service prefixListService() {
-        return new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+        return prefixListService(mockConfig(true));
+    }
+
+    private static Ec2Service prefixListService(EmulatorConfig config) {
+        return new Ec2Service(config, mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class),
                 mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
                 new InMemoryStorageFactory());
+    }
+
+    @Test
+    void configuredAwsManagedPrefixListUsesExistingRegionalReadOnlyApis(@TempDir Path temp) throws IOException {
+        Path catalog = temp.resolve("prefix-lists.json");
+        Files.writeString(catalog, """
+                {"eu-west-1": [{"prefixListId": "pl-0123456789abcdef0",
+                  "prefixListName": "example-managed-service", "cidrs": ["192.0.2.19/24"]}]}
+                """);
+        EmulatorConfig config = mockConfig(true);
+        when(config.services().ec2().enabled()).thenReturn(true);
+        when(config.services().ec2().managedPrefixListCatalogPath()).thenReturn(Optional.of(catalog.toString()));
+        Ec2Service service = prefixListService(config);
+        String id = "pl-0123456789abcdef0";
+
+        ManagedPrefixList managed = service.describeManagedPrefixLists("eu-west-1", List.of(id), Map.of()).getFirst();
+        assertTrue(managed.isAwsManaged());
+        assertEquals("AWS", managed.getOwnerId());
+        assertEquals("IPv4", managed.getAddressFamily());
+        assertEquals("arn:aws:ec2:eu-west-1:aws:prefix-list/" + id, managed.getPrefixListArn());
+        assertEquals(List.of("192.0.2.0/24"), service.describePrefixLists("eu-west-1", List.of(id), Map.of())
+                .getFirst().getCidrs());
+        assertEquals("192.0.2.0/24", service.getManagedPrefixListEntries("eu-west-1", id, null).getFirst().getCidr());
+        assertEquals(3, service.describeManagedPrefixLists("eu-west-1", List.of(), Map.of()).size());
+        assertEquals("InvalidPrefixListID.NotFound", assertThrows(AwsException.class,
+                () -> service.describeManagedPrefixLists("us-east-1", List.of(id), Map.of())).getErrorCode());
+        assertEquals("UnsupportedOperation", assertThrows(AwsException.class,
+                () -> service.deleteManagedPrefixList("eu-west-1", id)).getErrorCode());
+        assertEquals("UnsupportedOperation", assertThrows(AwsException.class,
+                () -> service.modifyManagedPrefixList("eu-west-1", id, null, "changed", null,
+                        List.of(), List.of())).getErrorCode());
+
+        String groupId = service.createSecurityGroup("eu-west-1", "consumer", "consumer", null).getGroupId();
+        IpPermission permission = tcpPermission(443);
+        permission.getPrefixListIds().add(new PrefixListId(id, null));
+        assertEquals(id, service.authorizeSecurityGroupIngress("eu-west-1", groupId, List.of(permission))
+                .getFirst().getPrefixListId());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "not-json",
+            "null",
+            "{\"eu-west-1\": null}",
+            "{\"eu-west-1\": [null]}",
+            "{\"eu-west-1\": [{\"prefixListId\":\"pl-invalid\",\"prefixListName\":\"example\",\"cidrs\":[\"192.0.2.0/24\"]}]}",
+            "{\"eu-west-1\": [{\"prefixListId\":\"pl-12345678\",\"prefixListName\":\"example\",\"cidrs\":[]}]}",
+            "{\"eu-west-1\": [{\"prefixListId\":\"pl-12345678\",\"prefixListName\":\"example\",\"cidrs\":[\"2001:db8::/32\"]}]}",
+            "{\"eu-west-1\": [{\"prefixListId\":\"pl-12345678\",\"prefixListName\":\"example\",\"cidrs\":[\"invalid\"]}]}",
+            "{\"eu-west-1\": [{\"prefixListId\":\"pl-63a5400a\",\"prefixListName\":\"example\",\"cidrs\":[\"192.0.2.0/24\"]}]}",
+            "{\"eu-west-1\": [{\"prefixListId\":\"pl-12345678\",\"prefixListName\":\"com.amazonaws.eu-west-1.s3\","
+                    + "\"cidrs\":[\"192.0.2.0/24\"]}]}"
+    })
+    void invalidManagedPrefixListCatalogFailsStartup(String json, @TempDir Path temp) throws IOException {
+        Path catalog = temp.resolve("prefix-lists.json");
+        Files.writeString(catalog, json);
+        EmulatorConfig config = mockConfig(true);
+        when(config.services().ec2().enabled()).thenReturn(true);
+        when(config.services().ec2().managedPrefixListCatalogPath()).thenReturn(Optional.of(catalog.toString()));
+
+        IllegalStateException error = assertThrows(IllegalStateException.class, () -> prefixListService(config));
+        assertTrue(error.getMessage().contains(catalog.toString()));
+    }
+
+    @Test
+    void missingManagedPrefixListCatalogFailsStartup(@TempDir Path temp) {
+        EmulatorConfig config = mockConfig(true);
+        when(config.services().ec2().enabled()).thenReturn(true);
+        Path catalog = temp.resolve("missing.json");
+        when(config.services().ec2().managedPrefixListCatalogPath()).thenReturn(Optional.of(catalog.toString()));
+
+        assertThrows(IllegalStateException.class, () -> prefixListService(config));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"192.0.2.0/24", "192.0.2.19/24"})
+    void duplicateCanonicalCatalogEntriesFailStartup(String duplicate, @TempDir Path temp) throws IOException {
+        Path catalog = temp.resolve("prefix-lists.json");
+        Files.writeString(catalog, """
+                {"eu-west-1": [{"prefixListId": "pl-0123456789abcdef0",
+                  "prefixListName": "example-managed-service", "cidrs": ["192.0.2.0/24", "%s"]}]}
+                """.formatted(duplicate));
+        EmulatorConfig config = mockConfig(true);
+        when(config.services().ec2().enabled()).thenReturn(true);
+        when(config.services().ec2().managedPrefixListCatalogPath()).thenReturn(Optional.of(catalog.toString()));
+
+        assertThrows(IllegalStateException.class, () -> prefixListService(config));
+    }
+
+    @Test
+    void disabledEc2DoesNotReadManagedPrefixListCatalog(@TempDir Path temp) {
+        EmulatorConfig config = mockConfig(true);
+        when(config.services().ec2().enabled()).thenReturn(false);
+        when(config.services().ec2().managedPrefixListCatalogPath())
+                .thenReturn(Optional.of(temp.resolve("missing.json").toString()));
+
+        assertDoesNotThrow(() -> prefixListService(config));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"configured,false", "configured,true", "builtin,false", "builtin,true",
+            "customer,false", "customer,true"})
+    void prefixListFirewallConsumersReceiveCanonicalEntries(String kind, boolean egress, @TempDir Path temp)
+            throws IOException {
+        String region = "eu-west-1";
+        Path catalog = temp.resolve("prefix-lists.json");
+        Files.writeString(catalog, """
+                {"eu-west-1": [{"prefixListId": "pl-0123456789abcdef0",
+                  "prefixListName": "example-managed-service", "cidrs": ["192.0.2.19/24"]}]}
+                """);
+        EmulatorConfig config = mockConfig(false);
+        when(config.services().ec2().enabled()).thenReturn(true);
+        when(config.services().ec2().managedPrefixListCatalogPath()).thenReturn(Optional.of(catalog.toString()));
+        EmulatorConfig.NetworkConfig network = mock(EmulatorConfig.NetworkConfig.class);
+        EmulatorConfig.SecurityGroupEnforcementConfig enforcement = mock(EmulatorConfig.SecurityGroupEnforcementConfig.class);
+        when(config.network()).thenReturn(network);
+        when(network.securityGroupEnforcement()).thenReturn(enforcement);
+        when(enforcement.enabled()).thenReturn(true);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        AtomicReference<Map<String, List<String>>> policyLists = new AtomicReference<>();
+        doAnswer(invocation -> {
+            policyLists.set(invocation.getArgument(2));
+            return null;
+        }).when(manager).refreshSecurityGroups(eq(region), anyMap(), anyMap());
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String id = switch (kind) {
+            case "configured" -> "pl-0123456789abcdef0";
+            case "builtin" -> "pl-63a5400a";
+            case "customer" -> service.createManagedPrefixList(region, "customer-list", "IPv4", 1,
+                    List.of(new PrefixListEntry("192.0.2.0/24", "test")), List.of()).getPrefixListId();
+            default -> throw new AssertionError(kind);
+        };
+        SecurityGroup group = service.createSecurityGroup(region, "consumer", "consumer", null);
+        if (egress) {
+            service.revokeSecurityGroupEgress(region, group.getGroupId(), new ArrayList<>(group.getIpPermissionsEgress()));
+        }
+        IpPermission permission = tcpPermission(443);
+        permission.getPrefixListIds().add(new PrefixListId(id, null));
+        if (egress) {
+            service.authorizeSecurityGroupEgress(region, group.getGroupId(), List.of(permission));
+        } else {
+            service.authorizeSecurityGroupIngress(region, group.getGroupId(), List.of(permission));
+        }
+        String allowed = "builtin".equals(kind) ? "52.216.1.9" : "192.0.2.9";
+        String cidr = "builtin".equals(kind) ? "52.216.0.0/15" : "192.0.2.0/24";
+        Map<String, List<String>> resolved = policyLists.get();
+        assertNotNull(resolved);
+        assertTrue(resolved.get(id).contains(cidr));
+        SecurityGroupPolicy.Peer peer = new SecurityGroupPolicy.Peer(allowed, group.getOwnerId(),
+                group.getVpcId(), Set.of());
+        assertTrue(SecurityGroupPolicy.allows(List.of(group), egress, "tcp", 443, 0, peer, resolved));
+        assertFalse(SecurityGroupPolicy.allows(List.of(group), egress, "tcp", 444, 0, peer, resolved));
+        assertFalse(SecurityGroupPolicy.allows(List.of(group), egress, "tcp", 443, 0,
+                new SecurityGroupPolicy.Peer("203.0.113.9", group.getOwnerId(), group.getVpcId(), Set.of()), resolved));
+        SecurityGroupNftCompiler.Endpoint endpoint = new SecurityGroupNftCompiler.Endpoint(group.getOwnerId(), region,
+                group.getVpcId(), "eni-consumer", "10.0.0.9", "172.20.0.9", Set.of(group.getGroupId()), List.of(group));
+        String rules = SecurityGroupNftCompiler.compile(endpoint, List.of(), resolved);
+        assertTrue(rules.contains(cidr));
     }
 
     @Test
