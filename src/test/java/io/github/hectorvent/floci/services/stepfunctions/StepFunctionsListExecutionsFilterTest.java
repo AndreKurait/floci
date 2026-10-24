@@ -81,6 +81,13 @@ class StepFunctionsListExecutionsFilterTest {
     }
 
     @Test
+    void pendingRedriveIsRejectedWithoutClaimingMapRunSupport() {
+        assertInvalid(mapper.createObjectNode().put("statusFilter", "PENDING_REDRIVE"));
+        assertInvalid(mapper.createObjectNode().put("statusFilter", "PENDING_REDRIVE")
+                .put("mapRunArn", ARN + ":map-run"));
+    }
+
+    @Test
     void nonStringFiltersAreRejected() {
         assertInvalid(request().put("statusFilter", true));
         assertInvalid(request().put("statusFilter", 1));

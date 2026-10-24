@@ -438,9 +438,9 @@ public class StepFunctionsJsonHandler {
                 .contains(statusFilter)) {
             throw new AwsException("ValidationException", "Invalid statusFilter.", 400);
         }
-        if ("PENDING_REDRIVE".equals(statusFilter) && request.hasNonNull("stateMachineArn")) {
+        if ("PENDING_REDRIVE".equals(statusFilter)) {
             throw new AwsException("ValidationException",
-                    "PENDING_REDRIVE requires mapRunArn instead of stateMachineArn.", 400);
+                    "PENDING_REDRIVE execution listing is not supported.", 400);
         }
         List<Execution> list = service.listExecutions(request.path("stateMachineArn").asText());
         ObjectNode response = objectMapper.createObjectNode();

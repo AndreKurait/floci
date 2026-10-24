@@ -48,7 +48,8 @@ changes to `StateMachineName` or `StateMachineType` use replacement semantics.
 
 `ListExecutions` honors `statusFilter` when listing a state machine's executions.
 Omitting the filter returns all statuses. Invalid filter values or types return
-`ValidationException`, as does `PENDING_REDRIVE` with `stateMachineArn`.
+`ValidationException`. Map Run execution listing and `PENDING_REDRIVE` filtering are not
+supported; `PENDING_REDRIVE` returns `ValidationException` even when a `mapRunArn` is supplied.
 
 ## Nested task credentials
 

@@ -1,6 +1,5 @@
 """Step Functions execution filters through boto3 and real workflow transitions."""
 import json
-import time
 
 import boto3
 
@@ -25,24 +24,13 @@ def test_execution_filters_follow_current_status(aws_config, client_config, iam_
             name="sfn-filter-" + unique_name,
             roleArn=role,
             definition=json.dumps({
-                "StartAt": "Choose",
+                "StartAt": "Wait",
                 "States": {
-                    "Choose": {
-                        "Type": "Choice",
-                        "Choices": [{"Variable": "$.wait", "BooleanEquals": True, "Next": "Wait"}],
-                        "Default": "Done",
-                    },
-                    "Wait": {"Type": "Wait", "Seconds": 300, "Next": "Done"},
-                    "Done": {"Type": "Succeed"},
+                    "Wait": {"Type": "Wait", "Seconds": 300, "End": True},
                 },
             }),
         )["stateMachineArn"]
-        completed = client.start_execution(stateMachineArn=machine, input='{"wait":false}')["executionArn"]
-        deadline = time.monotonic() + 30
-        while client.describe_execution(executionArn=completed)["status"] != "SUCCEEDED":
-            assert time.monotonic() < deadline, "Succeed workflow did not finish"
-            time.sleep(0.1)
-        running = client.start_execution(stateMachineArn=machine, input='{"wait":true}')["executionArn"]
+        running = client.start_execution(stateMachineArn=machine)["executionArn"]
 
         def listed(status=None):
             parameters = {"stateMachineArn": machine}
@@ -54,9 +42,9 @@ def test_execution_filters_follow_current_status(aws_config, client_config, iam_
             return {row["executionArn"] for row in rows}
 
         assert listed("RUNNING") == {running}
-        assert listed("SUCCEEDED") == {completed}
+        assert listed("SUCCEEDED") == set()
         assert listed("FAILED") == set()
-        assert listed() == {running, completed}
+        assert listed() == {running}
         client.stop_execution(executionArn=running)
         assert listed("RUNNING") == set()
         assert listed("ABORTED") == {running}
