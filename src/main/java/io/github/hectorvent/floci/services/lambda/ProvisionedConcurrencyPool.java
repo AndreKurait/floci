@@ -496,6 +496,10 @@ public class ProvisionedConcurrencyPool implements Resettable {
     }
 
     private static void validateSupportedTarget(LambdaFunction fn) {
+        if ("PublishedVersions".equals(fn.getSnapStartApplyOn())) {
+            throw new AwsException("ResourceConflictException", "The operation cannot be performed at this time. "
+                    + "Provisioned Concurrency is not supported for SnapStart enabled functions", 409);
+        }
         if (fn.isHotReload() || fn.isDurable()) {
             throw invalid("Provisioned concurrency is not supported for hot-reload or durable functions");
         }

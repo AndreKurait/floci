@@ -103,6 +103,70 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     @ParameterizedTest
+    @CsvSource({"1, None", "live, None", "1, PublishedVersions", "live, PublishedVersions"})
+    void snapStartEligibilityUsesThePublishedSnapshot(String qualifier, String latestApplyOn) {
+        version.setSnapStartApplyOn("PublishedVersions");
+        functions.getForAccount(ACCOUNT, REGION, "example").orElseThrow().setSnapStartApplyOn(latestApplyOn);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> pool.put(REGION, "example", qualifier, 1, ACCOUNT));
+
+        assertSnapStartConflict(error);
+        assertTrue(storage.scanAllAccounts().isEmpty());
+        assertEquals("ProvisionedConcurrencyConfigNotFoundException",
+                assertThrows(AwsException.class, () -> pool.get(REGION, "example", qualifier, ACCOUNT)).getErrorCode());
+        assertDoesNotThrow(() -> pool.delete(REGION, "example", qualifier, ACCOUNT));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1", "live"})
+    void latestSnapStartDoesNotDisqualifyAnOlderVersion(String qualifier) {
+        functions.getForAccount(ACCOUNT, REGION, "example").orElseThrow().setSnapStartApplyOn("PublishedVersions");
+
+        assertEquals(1, pool.put(REGION, "example", qualifier, 1, ACCOUNT).requested());
+        assertEquals(1, pool.put(REGION, "example", qualifier, 1, ACCOUNT).requested());
+    }
+
+    @Test
+    void provisionedAliasCannotRetargetToASnapStartVersion() {
+        function(ACCOUNT, REGION, "2").setSnapStartApplyOn("PublishedVersions");
+        put(1);
+
+        assertSnapStartConflict(assertThrows(AwsException.class,
+                () -> pool.validateAliasUpdate(version, "live", "2")));
+        assertEquals("1", storage.scanAllAccounts().getFirst().version());
+        assertEquals(1, get().requested());
+        assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "live", null));
+        assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "unconfigured", "2"));
+        pool.delete(REGION, "example", "live", ACCOUNT);
+        assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "live", "2"));
+    }
+
+    @Test
+    void aliasSnapStartValidationUsesTheFunctionOwnerAndRegion() {
+        function(ACCOUNT, REGION, "2");
+        String owner = "222222222222";
+        String region = "eu-west-1";
+        LambdaFunction foreign = function(owner, region, "$LATEST");
+        function(owner, region, "1");
+        function(owner, region, "2").setSnapStartApplyOn("PublishedVersions");
+        alias(owner, region, "live", "1", Map.of());
+        pool.put(region, "example", "live", 1, owner);
+
+        assertSnapStartConflict(assertThrows(AwsException.class,
+                () -> pool.validateAliasUpdate(foreign, "live", "2")));
+        put(1);
+        assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "live", "2"));
+    }
+
+    private static void assertSnapStartConflict(AwsException error) {
+        assertEquals("ResourceConflictException", error.getErrorCode());
+        assertEquals(409, error.getHttpStatus());
+        assertEquals("The operation cannot be performed at this time. "
+                + "Provisioned Concurrency is not supported for SnapStart enabled functions", error.getMessage());
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"example", "absent"})
     void unpublishedVersionErrorsDependOnTheOperation(String name) {
         AwsException put = assertThrows(AwsException.class,

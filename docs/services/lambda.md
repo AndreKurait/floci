@@ -454,6 +454,12 @@ rejects one outright with `InvalidParameterValueException: Invalid layer version
 
 ## Provisioned concurrency
 
+Published versions with `SnapStart.ApplyOn=PublishedVersions` reject provisioned concurrency
+with `ResourceConflictException`, including through an alias. A configured alias cannot
+retarget to such a version. Eligibility uses the published snapshot, so changing `$LATEST`
+does not change older versions. Get and Delete retain their normal configuration lookup
+behavior, and unconfigured aliases can still point to SnapStart versions.
+
 Put, Get and Delete use `/2019-09-30/functions/{FunctionName}/provisioned-concurrency`
 with a required `Qualifier` query parameter. Put accepts a positive integer
 `ProvisionedConcurrentExecutions` and returns HTTP 202 with `IN_PROGRESS`. An existing
