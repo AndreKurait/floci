@@ -22,7 +22,7 @@ features or measured lifecycle savings.
 | Lambda code staging | Identical archives are unpacked into multiple function-owned volumes. | Follow-up: content-addressed, tenant-scoped immutable artifacts can remove redundant I/O. A usable design also needs atomic publication, single-flight preparation, reference ownership, bounded eviction, restart discovery and rollback cleanup. Hashing alone does not establish safe lifecycle ownership. |
 | Step Functions | Cached platform-thread executors host coordinator waits; nested `.sync` tasks poll and some paths sleep before their first read. | Follow-up: publish terminal execution futures and use notification-before-read registration. Keep cancellation propagation, task/execution deadlines, retries, history ordering and bounded admission. Virtual threads alone do not bound the number of executions. |
 | SWF | Long polls already use a versioned notification around an authoritative claim. Notifications are scoped to a domain, waking unrelated task lists; timeout expiry still scans. | Keep the correct lost-wakeup protection. Follow-up: task-list and task-kind indexes, plus deadline scheduling with periodic recovery. Preserve atomic claims and heartbeat changes. |
-| SQS | Sends notify receivers, but the empty scan and wait are separate: a notification in that gap can add up to the one-second retry interval. Receivers also rescan for visibility expiry. | Follow-up: a versioned signal, queue-incarnation guards and next-visible-message deadlines. Do not hold a signal lock across storage or dead-letter routing; preserve FIFO group eligibility and redrive counts. |
+| SQS | Sends notify receivers, but the empty scan and wait are separate: a notification in that gap can add up to the one-second retry interval. Empty receivers also rescan once per second. | Implement a versioned signal owned by the queue incarnation. Publish after successful message mutations, retain the scanned incarnation when claiming, and wake on close. Empty queues park until a change or the request deadline. Nonempty queues retain expiry/retry scans; eligibility indexes and next-visible-message deadlines remain follow-up work. |
 | Lambda stream/SQS event sources and Pipes | Per-mapping periodic scans and cached thread pools repeat work when idle. | Follow-up: publish source changes after committed writes and reconcile the affected mapping. Retry-not-before, batching windows, shard ordering, checkpoint ownership, disable/reset and admission throttles remain separate predicates. External DynamoDB/Kafka sources still require polling. |
 | ECS and container-backed services | ECS globally reconciles every five seconds; RDS, OpenSearch, EKS and other managers poll external readiness. | Follow-up: service-keyed work and Docker lifecycle notifications, with real readiness probes and repair. A Docker `start` event does not mean the service is ready. Keep existing reset and task ownership barriers. |
 | CloudWatch, Scheduler, TTL, retention and flushers | Many independent periodic scans allocate or traverse whole stores. Some timers encode required time semantics. | Follow-up: dirty-key evaluation, deadline heaps and shared timer infrastructure, separated from bounded blocking workers. Window boundaries, retention expiry and durability guarantees must remain correct. |
@@ -164,3 +164,57 @@ dirty-key fairness, shutdown interruption, real HTTP probe concurrency and stale
 results after configuration changes, deregistration, stop and reset. The AWS SDK
 integration exercises event-driven ASG convergence and deletion across separate
 accounts in commercial and GovCloud regions.
+
+## SQS notification and idle-work experiment
+
+`VersionedSignal` complements the keyed work queue for a caller that is already
+waiting. It snapshots a version before reading authoritative state and parks only
+while that version remains unchanged. A mutation between the empty read and the
+wait therefore cannot lose its notification. The signal owns no worker threads.
+
+Each `GuardedMessageQueue` owns its signal, so deletion, reset and shutdown can
+close that incarnation and release its waiters. Receivers keep the same queue
+object through the claim instead of resolving a replacement under the same URL.
+Message insertion, internal redrive delivery, deletion and visibility changes
+signal after successful persistence. A claim itself does not signal: an unresolved
+dead-letter destination must not cause an immediate self-triggered retry loop.
+
+Empty queues wait for the request deadline or a mutation. Nonempty queues retain
+the existing one-second expiry/retry ceiling. This does not add a visibility index
+or claim an improvement for every active-queue workload.
+
+The in-process benchmark runs 100 concurrent empty 20-second receives, each on its
+own queue, and counts authoritative queue-store reads. It has no network or Docker
+dependencies. Three runs per build used Java 25 with eight active processors and
+`-Xms128m -Xmx2g`. Baseline `f2173e8de` and candidate `edab9da04` produced:
+
+| Operation, per run | Baseline | Candidate |
+| --- | ---: | ---: |
+| Completed empty receives | 100 | 100 |
+| Requested wait | 20 s | 20 s |
+| Queue-store reads | 2,200 | 300 |
+| Reads per receive | 22 | 3 |
+| Observed completion range | 20.002-20.004 s | 20.002-20.006 s |
+
+That is 86.4% fewer queue-store reads with the requested wait preserved. It is not
+a measurement of CPU consumption, network throughput, or active-queue delivery
+latency. Raw results are in `tools/performance/results/sqs-idle-20261024.json`.
+The deterministic tests separately force a message into the scan-to-wait gap and
+verify notification, shutdown and incarnation behavior.
+
+To reproduce, keep `SqsIdlePollBenchmark.java` from the candidate checkout available
+to both builds and set `FLOCI_BENCHMARK_SOURCE` to its absolute path. In each
+checkout, build with Java 25 and run:
+
+```sh
+./mvnw package -DskipTests
+FLOCI_BENCHMARK_CP="$(find target/quarkus-app -name '*.jar' -print | paste -sd ':' -)"
+mkdir -p target/performance-classes
+javac -cp "$FLOCI_BENCHMARK_CP" -d target/performance-classes "$FLOCI_BENCHMARK_SOURCE"
+java -XX:ActiveProcessorCount=8 -Xms128m -Xmx2g \
+  -cp "target/performance-classes:$FLOCI_BENCHMARK_CP" \
+  io.github.hectorvent.floci.services.sqs.SqsIdlePollBenchmark \
+  baseline "$(git rev-parse HEAD)" 100 20 3
+```
+
+Use `candidate` as the label for the second build.
