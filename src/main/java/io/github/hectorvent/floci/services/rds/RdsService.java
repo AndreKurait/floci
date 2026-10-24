@@ -3847,6 +3847,11 @@ public class RdsService implements Resettable, ResourceProvider {
         return instance;
     }
 
+    /** Returns the runtime that owns an instance's backing container. Cluster members share their cluster runtime. */
+    public String instanceBackendRuntimeId(DbInstance instance) {
+        return instanceBackendIdentity(instance).runtimeId();
+    }
+
     private InstanceBackendIdentity instanceBackendIdentity(DbInstance instance) {
         String clusterId = instance.getDbClusterIdentifier();
         if (clusterId != null && !clusterId.isBlank()) {

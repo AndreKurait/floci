@@ -402,7 +402,8 @@ class RdsProxyManagerTest {
     }
 
     private static RdsAuthProxy authProxy(String key) {
-        return new RdsAuthProxy(key, "localhost", 1, DatabaseEngine.POSTGRES, false,
+        return new RdsAuthProxy(key, "localhost", 1, "runtime:" + key,
+                DatabaseEngine.POSTGRES, false,
                 "admin", "secret", "app", mock(RdsSigV4Validator.class),
                 mock(RdsProxyTlsCertificates.class), (user, password) -> true,
                 5000, 5000, 100);

@@ -30,6 +30,7 @@ For running SQL without a PostgreSQL wire connection (the way Lambda and Step Fu
 | `DescribeClusterParameterGroups` | List parameter groups, optionally filtered by name |
 | `DescribeClusterParameters` | Return the parameters of a group, with any values set by `ModifyClusterParameterGroup` |
 | `ModifyClusterParameterGroup` | Update parameter values on a group |
+| `ResetClusterParameterGroup` | Reset selected parameters or all parameters to the emulated defaults |
 | `DeleteClusterParameterGroup` | Remove a parameter group |
 | `CreateTags` | Add or overwrite tags on a cluster, snapshot, subnet group, parameter group, snapshot copy grant or snapshot schedule |
 | `DeleteTags` | Remove tags by key from a resource |
@@ -63,6 +64,40 @@ For running SQL without a PostgreSQL wire connection (the way Lambda and Step Fu
 | `GetClusterCredentials` | Issue a short-lived DbUser / DbPassword pair the auth proxy and Data API accept for a non-master user |
 | `GetClusterCredentialsWithIAM` | Issue short-lived credentials with the DbUser derived from the caller's IAM identity |
 <!-- floci:actions:end -->
+
+### Resetting parameter groups
+
+`ResetClusterParameterGroup` resets all parameters with `ResetAllParameters=true`, or the named
+parameters with `ResetAllParameters=false` and a `Parameters` list. Each list entry needs only
+`ParameterName`, and at most 20 entries are accepted. When the flag is omitted, Floci resets the
+supplied names, or all parameters if no names were supplied. An explicit `true` cannot be combined
+with a nonempty list, and an explicit `false` requires at least one name. An empty Query list,
+encoded as `Parameters=`, is treated like an omitted list. The API reference describes the omitted flag as
+defaulting to `true` but also describes supplying names without the flag; Floci resolves that
+ambiguity by using whether names were supplied. These combinations have not been verified against
+a live AWS cluster.
+
+Parameters report `Source=engine-default` initially, `user` after modification, and
+`engine-default` after reset. `DescribeClusterParameters` accepts `Source=user` or
+`Source=engine-default` to filter the result. The implicit `default.redshift-1.0` group is readable
+but cannot be modified or reset.
+
+Creating a group named `default.redshift-1.0` is rejected. Earlier Floci versions allowed such a
+group to be stored: for those legacy groups, both describe operations return the stored values,
+and modify/reset remain available. The read-only built-in group is used only when no stored
+group exists under that name.
+
+The default catalog remains limited to Floci's existing `max_cursor_result_set_size=0` and
+`wlm_json_configuration={}` values, rather than the complete AWS engine catalog. Modifications to
+other names are stored as before; resetting those names removes their overrides and omits them
+from subsequent descriptions because Floci has no default to report. Resetting all parameters
+restores the two catalog entries. Parameter groups remain metadata only: modifying or resetting
+them does not change PostgreSQL settings, and Floci does not track the clusters' pending reboot
+state. The reset response returns a descriptive `ParameterGroupStatus` message.
+
+Sources are persisted with parameter values. For older stored groups without a source, Floci
+reports `engine-default` when the value matches its catalog and `user` otherwise. The old format
+cannot distinguish an explicit assignment of a default value from an unchanged default.
 
 ### Snapshot copy grants
 

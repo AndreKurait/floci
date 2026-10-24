@@ -690,7 +690,7 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
             throw new UncheckedIOException("Could not make room for the code of " + fn.functionName, e);
         }
         try {
-            zipExtractor.extractTo(zip, dir, config.services().lambda().zipMaxEntries());
+            zipExtractor.extractTo(zip, dir, config.services().lambda().zipMaxEntries(), LambdaWebCode.MAX_BYTES);
             RetryingTarCopier.copyStreamed(lifecycleManager.getDockerClient(), containerId, TASK_DIR,
                     "web-" + fn.functionName, out -> tar(dir, out));
         } catch (IOException e) {

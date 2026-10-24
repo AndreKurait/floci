@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.redshift;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.IamEnforcementFilter;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -266,6 +267,13 @@ public class RedshiftQueryHandler {
                 throw new AwsException("InvalidParameterValue", "ParameterGroupName is required", 400);
             }
             List<Parameter> parameters = service.describeClusterParameters(parameterGroupName);
+            String source = params.getFirst("Source");
+            if (source != null) {
+                if (!"user".equals(source) && !"engine-default".equals(source)) {
+                    throw new AwsException("InvalidParameterValue", "Source must be user or engine-default.", 400);
+                }
+                parameters = parameters.stream().filter(parameter -> source.equals(parameter.getSource())).toList();
+            }
 
             XmlBuilder xmlBuilder = new XmlBuilder()
                     .start("DescribeClusterParametersResponse")
@@ -300,6 +308,28 @@ public class RedshiftQueryHandler {
                         .elem("RequestId", "test-req-id")
                       .end("ResponseMetadata")
                     .end("ModifyClusterParameterGroupResponse")
+                    .build();
+            return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
+        }
+        case "ResetClusterParameterGroup" -> {
+            List<String> parameterNames = parseParameters(params).stream().map(Parameter::getParameterName).toList();
+            String rawResetAll = params.getFirst("ResetAllParameters");
+            if (rawResetAll != null && !"true".equalsIgnoreCase(rawResetAll) && !"false".equalsIgnoreCase(rawResetAll)) {
+                throw new AwsException("InvalidParameterValue", "ResetAllParameters must be a boolean.", 400);
+            }
+            boolean resetAll = rawResetAll == null ? parameterNames.isEmpty() : Boolean.parseBoolean(rawResetAll);
+            String parameterGroupName = params.getFirst("ParameterGroupName");
+            service.resetClusterParameterGroup(parameterGroupName, resetAll, parameterNames);
+            String xml = new XmlBuilder()
+                    .start("ResetClusterParameterGroupResponse", AwsNamespaces.REDSHIFT)
+                      .start("ResetClusterParameterGroupResult")
+                        .elem("ParameterGroupName", parameterGroupName)
+                        .elem("ParameterGroupStatus", "Your parameter group has been updated.")
+                      .end("ResetClusterParameterGroupResult")
+                      .start("ResponseMetadata")
+                        .elem("RequestId", "test-req-id")
+                      .end("ResponseMetadata")
+                    .end("ResetClusterParameterGroupResponse")
                     .build();
             return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
         }
@@ -1203,6 +1233,7 @@ public class RedshiftQueryHandler {
         if (param.getDataType() != null) {
             builder.elem("DataType", param.getDataType());
         }
+        builder.elem("Source", param.getSource());
         return builder.end("Parameter").build();
     }
 
@@ -1359,21 +1390,30 @@ public class RedshiftQueryHandler {
     }
 
     private static List<Parameter> parseParameters(MultivaluedMap<String, String> params) {
-        List<Parameter> parsed = new ArrayList<>();
-        readParameters(params, "Parameters.member", parsed);
-        readParameters(params, "Parameters.Parameter", parsed);
-        return parsed;
-    }
-
-    private static void readParameters(MultivaluedMap<String, String> params, String prefix, List<Parameter> parsed) {
-        for (int i = 1; ; i++) {
-            String name = params.getFirst(prefix + "." + i + ".ParameterName");
-            if (name == null) {
-                break;
+        Map<String, Parameter> parsed = new LinkedHashMap<>();
+        for (String key : params.keySet().stream().sorted().toList()) {
+            if ("Parameters".equals(key)) {
+                if (!"".equals(params.getFirst(key))) {
+                    throw new AwsException("InvalidParameterValue", "Parameters must be an indexed list or empty.", 400);
+                }
+                continue;
             }
-            String value = params.getFirst(prefix + "." + i + ".ParameterValue");
-            parsed.add(new Parameter(name, value));
+            if (!key.startsWith("Parameters.")) {
+                continue;
+            }
+            if (!key.matches("Parameters\\.(?:member|Parameter)\\.[1-9]\\d*\\.[A-Za-z]+")) {
+                throw new AwsException("InvalidParameterValue", "Invalid Parameters member: " + key, 400);
+            }
+            String prefix = key.substring(0, key.lastIndexOf('.'));
+            String name = params.getFirst(prefix + ".ParameterName");
+            if (name == null || name.isBlank()) {
+                throw new AwsException("InvalidParameterValue", "Each parameter must have a ParameterName.", 400);
+            }
+            parsed.putIfAbsent(prefix, new Parameter(name, params.getFirst(prefix + ".ParameterValue")));
         }
+        return parsed.entrySet().stream()
+                .sorted(Comparator.comparingInt(entry -> numericSuffix(entry.getKey())))
+                .map(Map.Entry::getValue).toList();
     }
 
     private static Map<String, String> parseTags(MultivaluedMap<String, String> params) {

@@ -168,7 +168,7 @@ class RdsAuthProxyBackendResolutionTest {
                                RdsAuthProxy.BackendEndpointResolver endpointResolver,
                                DatabaseEngine engine) {
         RdsAuthProxy proxy = new RdsAuthProxy(
-                id, "127.0.0.1", initialBackendPort, endpointResolver,
+                id, "127.0.0.1", initialBackendPort, endpointResolver, "runtime:" + id,
                 engine, false, "sa", "Secret123", null,
                 mock(RdsSigV4Validator.class), mock(RdsProxyTlsCertificates.class),
                 (user, password) -> true, 5000, 5000, 100, null,

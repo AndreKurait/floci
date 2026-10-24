@@ -36,6 +36,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -1413,6 +1414,196 @@ class RedshiftServiceTest {
         assertEquals("1000", modified.getParameterValue());
         assertEquals("Maximum cursor result set size", modified.getDescription());
         assertEquals("integer", modified.getDataType());
+    }
+
+    @Test
+    void resetClusterParameterGroupRestoresOnlySelectedDefaults() {
+        ClusterParameterGroup group = new ClusterParameterGroup("reset-pg", "redshift-1.0", "description");
+        when(parameterGroupBackend.get("reset-pg")).thenReturn(Optional.of(group));
+        service.modifyClusterParameterGroup("reset-pg", List.of(
+                new Parameter("max_cursor_result_set_size", "1000"),
+                new Parameter("wlm_json_configuration", "custom")));
+
+        service.resetClusterParameterGroup("reset-pg", false, List.of("max_cursor_result_set_size"));
+
+        List<Parameter> parameters = service.describeClusterParameters("reset-pg");
+        assertEquals("0", parameters.get(0).getParameterValue());
+        assertEquals("engine-default", parameters.get(0).getSource());
+        assertEquals("integer", parameters.get(0).getDataType());
+        assertEquals("custom", parameters.get(1).getParameterValue());
+        assertEquals("user", parameters.get(1).getSource());
+        verify(parameterGroupBackend, times(2)).flush();
+    }
+
+    @Test
+    void resetAllClusterParametersDropsOverridesOutsideDefaultCatalog() {
+        ClusterParameterGroup group = new ClusterParameterGroup("reset-pg", "redshift-1.0", "description");
+        group.getTags().put("owner", "analytics");
+        when(parameterGroupBackend.get("reset-pg")).thenReturn(Optional.of(group));
+        service.modifyClusterParameterGroup("reset-pg", List.of(
+                new Parameter("max_cursor_result_set_size", "1000"), new Parameter("custom_parameter", "value")));
+
+        service.resetClusterParameterGroup("reset-pg", true, List.of());
+
+        List<Parameter> parameters = service.describeClusterParameters("reset-pg");
+        assertEquals(2, parameters.size());
+        assertEquals("0", parameters.get(0).getParameterValue());
+        assertEquals("{}", parameters.get(1).getParameterValue());
+        assertTrue(parameters.stream().allMatch(parameter -> "engine-default".equals(parameter.getSource())));
+        assertEquals("analytics", group.getTags().get("owner"));
+        assertEquals("description", group.getDescription());
+    }
+
+    @Test
+    void resetClusterParametersValidatesEveryNameBeforeMutating() {
+        ClusterParameterGroup group = new ClusterParameterGroup("reset-pg", "redshift-1.0", "description");
+        group.getParameters().get(0).setParameterValue("1000");
+        when(parameterGroupBackend.get("reset-pg")).thenReturn(Optional.of(group));
+
+        AwsException failure = assertThrows(AwsException.class, () -> service.resetClusterParameterGroup(
+                "reset-pg", false, List.of("max_cursor_result_set_size", "missing")));
+
+        assertEquals("InvalidParameterValue", failure.getErrorCode());
+        assertEquals("1000", group.getParameters().get(0).getParameterValue());
+        verify(parameterGroupBackend, never()).put(anyString(), any());
+        verify(parameterGroupBackend, never()).flush();
+    }
+
+    @Test
+    void resetClusterParameterGroupRejectsMissingGroup() {
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.resetClusterParameterGroup("missing", true, List.of()));
+
+        assertEquals("ClusterParameterGroupNotFound", failure.getErrorCode());
+        assertEquals(404, failure.getHttpStatus());
+    }
+
+    @Test
+    void resetClusterParameterGroupRejectsDefaultGroup() {
+        AwsException failure = assertThrows(AwsException.class, () -> service.resetClusterParameterGroup(
+                RedshiftService.DEFAULT_PARAMETER_GROUP_NAME, true, List.of()));
+
+        assertEquals("InvalidParameterValue", failure.getErrorCode());
+        verify(parameterGroupBackend, never()).flush();
+    }
+
+    @Test
+    void createClusterParameterGroupRejectsReservedDefaultName() {
+        AwsException failure = assertThrows(AwsException.class, () -> service.createClusterParameterGroup(
+                RedshiftService.DEFAULT_PARAMETER_GROUP_NAME, "redshift-1.0", "custom"));
+
+        assertEquals("InvalidParameterValue", failure.getErrorCode());
+        verify(parameterGroupBackend, never()).put(anyString(), any());
+        verify(parameterGroupBackend, never()).flush();
+    }
+
+    @Test
+    void describeLegacyDefaultNamedGroupPreservesStoredParameters() {
+        String name = RedshiftService.DEFAULT_PARAMETER_GROUP_NAME;
+        ClusterParameterGroup stored = new ClusterParameterGroup(name, "redshift-1.0", "legacy custom group");
+        stored.setParameters(List.of(new Parameter("max_cursor_result_set_size", "1000")));
+        when(parameterGroupBackend.get(name)).thenReturn(Optional.of(stored));
+
+        assertEquals("legacy custom group", service.describeClusterParameterGroups(name).getFirst().getDescription());
+        List<Parameter> parameters = service.describeClusterParameters(name);
+
+        assertEquals(1, parameters.size());
+        assertEquals("1000", parameters.getFirst().getParameterValue());
+        assertEquals("user", parameters.getFirst().getSource());
+        assertEquals("1000", stored.getParameters().getFirst().getParameterValue());
+        verify(parameterGroupBackend, never()).flush();
+    }
+
+    @Test
+    void legacyDefaultNamedGroupCanBeModifiedAndReset() {
+        String name = RedshiftService.DEFAULT_PARAMETER_GROUP_NAME;
+        ClusterParameterGroup stored = new ClusterParameterGroup(name, "redshift-1.0", "legacy custom group");
+        stored.setParameters(List.of(new Parameter("max_cursor_result_set_size", "1000")));
+        when(parameterGroupBackend.get(name)).thenReturn(Optional.of(stored));
+
+        service.modifyClusterParameterGroup(name, List.of(new Parameter("max_cursor_result_set_size", "2000")));
+        assertEquals("2000", service.describeClusterParameters(name).getFirst().getParameterValue());
+        service.resetClusterParameterGroup(name, false, List.of("max_cursor_result_set_size"));
+
+        assertEquals("0", service.describeClusterParameters(name).getFirst().getParameterValue());
+        assertEquals("engine-default", service.describeClusterParameters(name).getFirst().getSource());
+        assertEquals("legacy custom group", service.describeClusterParameterGroups(name).getFirst().getDescription());
+        verify(parameterGroupBackend, times(2)).put(eq(name), any());
+        verify(parameterGroupBackend, times(2)).flush();
+    }
+
+    @Test
+    void implicitDefaultGroupRemainsReadOnly() {
+        String name = RedshiftService.DEFAULT_PARAMETER_GROUP_NAME;
+
+        List<Parameter> parameters = service.describeClusterParameters(name);
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.modifyClusterParameterGroup(name, List.of(new Parameter("max_cursor_result_set_size", "2000"))));
+
+        assertEquals("0", parameters.getFirst().getParameterValue());
+        assertEquals("engine-default", parameters.getFirst().getSource());
+        assertEquals("InvalidParameterValue", failure.getErrorCode());
+        verify(parameterGroupBackend, never()).put(anyString(), any());
+    }
+
+    @Test
+    void resetClusterParameterGroupRequiresNamesUnlessResettingAll() {
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.resetClusterParameterGroup("reset-pg", false, List.of()));
+
+        assertEquals("InvalidParameterCombination", failure.getErrorCode());
+        verify(parameterGroupBackend, never()).flush();
+    }
+
+    @Test
+    void resetClusterParameterGroupRejectsConflictingOptions() {
+        AwsException failure = assertThrows(AwsException.class, () -> service.resetClusterParameterGroup(
+                "reset-pg", true, List.of("max_cursor_result_set_size")));
+
+        assertEquals("InvalidParameterCombination", failure.getErrorCode());
+        verify(parameterGroupBackend, never()).flush();
+    }
+
+    @Test
+    void resetClusterParameterGroupRejectsMoreThanTwentyParameters() {
+        AwsException failure = assertThrows(AwsException.class, () -> service.resetClusterParameterGroup(
+                "reset-pg", false, Collections.nCopies(21, "max_cursor_result_set_size")));
+
+        assertEquals("InvalidParameterValue", failure.getErrorCode());
+        verify(parameterGroupBackend, never()).flush();
+    }
+
+    @Test
+    void describeLegacyClusterParametersInfersSourceWithoutChangingStoredValues() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ClusterParameterGroup group = mapper.readValue("""
+                {"parameterGroupName":"legacy", "parameters":[
+                    {"parameterName":"max_cursor_result_set_size","parameterValue":"0"},
+                    {"parameterName":"wlm_json_configuration","parameterValue":"custom"}
+                ]}
+                """, ClusterParameterGroup.class);
+        when(parameterGroupBackend.get("legacy")).thenReturn(Optional.of(group));
+
+        List<Parameter> parameters = service.describeClusterParameters("legacy");
+
+        assertEquals("engine-default", parameters.get(0).getSource());
+        assertEquals("user", parameters.get(1).getSource());
+        assertNull(group.getParameters().get(0).getSource());
+    }
+
+    @Test
+    void resetSourceSurvivesSerialization() throws Exception {
+        ClusterParameterGroup group = new ClusterParameterGroup("reset-pg", "redshift-1.0", "description");
+        when(parameterGroupBackend.get("reset-pg")).thenReturn(Optional.of(group));
+        service.modifyClusterParameterGroup("reset-pg", List.of(new Parameter("max_cursor_result_set_size", "0")));
+        assertEquals("user", service.describeClusterParameters("reset-pg").getFirst().getSource());
+        service.resetClusterParameterGroup("reset-pg", true, List.of());
+        ObjectMapper mapper = new ObjectMapper();
+
+        ClusterParameterGroup reloaded = mapper.readValue(mapper.writeValueAsString(group), ClusterParameterGroup.class);
+
+        assertEquals("engine-default", reloaded.getParameters().getFirst().getSource());
+        assertEquals("0", reloaded.getParameters().getFirst().getParameterValue());
     }
 
     @Test

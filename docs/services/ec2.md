@@ -74,6 +74,26 @@ metadata.
 | `ami-debian12` | | `public.ecr.aws/docker/library/debian:12` |
 | `ami-alpine` | | `public.ecr.aws/docker/library/alpine:latest` |
 | `ami-0abcdef1234567893` | | `public.ecr.aws/amazonlinux/amazonlinux:2023` |
+| `ami-opensuse-leap160` | | `registry.opensuse.org/opensuse/leap:16.0` |
+| `ami-sles15sp4-byos` | | `registry.suse.com/bci/bci-base:15.4` |
+| `ami-sles15sp5-byos` | | `registry.suse.com/bci/bci-base:15.5` |
+| `ami-sles15sp6-byos` | | `registry.suse.com/bci/bci-base:15.6` |
+| `ami-sles15sp7-byos` | | `registry.suse.com/bci/bci-base:15.7` |
+| `ami-sles12sp5-byos` | | `registry.suse.com/bci/bci-base:15.7` |
+| `ami-sles-sap15sp5` | | `registry.suse.com/bci/bci-base:15.5` |
+| `ami-smlm-server51-x86-64` | | `registry.suse.com/bci/bci-base:15.7` |
+| `ami-smlm-server51-arm64` | | `registry.suse.com/bci/bci-base:15.7` |
+| `ami-smlm-proxy51-x86-64` | | `registry.suse.com/bci/bci-base:15.7` |
+| `ami-smlm-proxy51-arm64` | | `registry.suse.com/bci/bci-base:15.7` |
+| `ami-sles12sp5` | | `registry.suse.com/bci/bci-base:15.7` |
+| `ami-sles15sp5` | | `registry.suse.com/bci/bci-base:15.5` |
+| `ami-sles15sp6` | | `registry.suse.com/bci/bci-base:15.6` |
+| `ami-sles15sp7` | | `registry.suse.com/bci/bci-base:15.7` |
+| `ami-sles160` | | `registry.suse.com/bci/bci-base:16.0` |
+| `ami-rocky9` | | `public.ecr.aws/docker/library/rockylinux:9` |
+| `ami-rocky10` | | `quay.io/rockylinux/rockylinux:10` |
+| `ami-rhel8` | | `registry.access.redhat.com/ubi8/ubi:8.10` |
+| `ami-rhel9` | | `registry.access.redhat.com/ubi9/ubi:9.5` |
 
 Any unrecognized AMI ID (including real AWS AMI IDs like `ami-0abc12345678`) falls back to the catalog `defaultDockerImage` (`public.ecr.aws/amazonlinux/amazonlinux:2023` by default).
 

@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.core.common;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.s3.S3Controller;
 import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.container.ResourceInfo;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -15,11 +17,13 @@ import org.mockito.ArgumentCaptor;
 
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -36,6 +40,8 @@ class AccountContextFilterTest {
     private Map<String, String> sessionAccounts;
     private boolean allowUnknownRegions;
     private boolean strictPartitions;
+    private boolean enforceIam;
+    private ResolvedServiceCatalog catalog;
     private AccountContextFilter filter;
 
     @BeforeEach
@@ -46,9 +52,37 @@ class AccountContextFilterTest {
         sessionAccounts = new java.util.HashMap<>();
         allowUnknownRegions = false;
         strictPartitions = false;
+        enforceIam = false;
+        catalog = mock(ResolvedServiceCatalog.class);
+        when(catalog.byResourceClass(S3Controller.class)).thenReturn(Optional.of(legacyDescriptor()));
         SessionAccountLookup sessionLookup = akid -> Optional.ofNullable(sessionAccounts.get(akid));
         filter = new AccountContextFilter(accountResolver, regionResolver, requestContext, sessionLookup,
-                this::config);
+                this::config, () -> catalog);
+    }
+
+    private ServiceDescriptor legacyDescriptor() {
+        return new ServiceDescriptor("s3", "s3", true, true, "s3", "memory", 0L,
+                null, ServiceProtocol.REST_XML, Set.of(ServiceProtocol.REST_XML), Set.of(),
+                Set.of("s3"), Set.of(), Set.of(S3Controller.class), Set.of(), true);
+    }
+
+    @Test
+    void legacyAdmissionComesFromTheRegisteredService() {
+        filter.resourceInfo = mock(ResourceInfo.class);
+        doReturn(AccountContextFilterTest.class).when(filter.resourceInfo).getResourceClass();
+        when(catalog.byResourceClass(AccountContextFilterTest.class))
+                .thenReturn(Optional.of(legacyDescriptor()));
+        filter.filter(mockContext("AWS 000000000001:signature", null));
+        assertEquals("000000000001", requestContext.getAccountId());
+    }
+
+    @Test
+    void anUnregisteredResourceDoesNotAdmitLegacyAuthorization() {
+        filter.resourceInfo = mock(ResourceInfo.class);
+        doReturn(S3Controller.class).when(filter.resourceInfo).getResourceClass();
+        when(catalog.byResourceClass(S3Controller.class)).thenReturn(Optional.empty());
+        filter.filter(mockContext("AWS 000000000001:signature", null));
+        assertEquals(DEFAULT_ACCOUNT, requestContext.getAccountId());
     }
 
     private EmulatorConfig config() {
@@ -57,7 +91,57 @@ class AccountContextFilterTest {
         when(partitions.strict()).thenReturn(strictPartitions);
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.partitions()).thenReturn(partitions);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.IamServiceConfig iam = mock(EmulatorConfig.IamServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.iam()).thenReturn(iam);
+        when(iam.enforcementEnabled()).thenReturn(enforceIam);
         return config;
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"000000000001", "AKIAEXAMPLE", "ASIAEXAMPLE"})
+    void permissiveS3LegacyHeadersUseTheCredentialAccount(String accessKeyId) {
+        sessionAccounts.put(accessKeyId, "000000000001");
+        filter.resourceInfo = mock(ResourceInfo.class);
+        doReturn(S3Controller.class).when(filter.resourceInfo).getResourceClass();
+        filter.filter(mockContext("AWS " + accessKeyId + ":signature", null));
+        assertEquals("000000000001", requestContext.getAccountId());
+        assertEquals(accessKeyId, requestContext.getAccessKeyId());
+        assertEquals(DEFAULT_REGION, requestContext.getRegion());
+    }
+
+    @Test
+    void legacyHeadersLeaveOtherResourcesAndIamEnforcementUnchanged() {
+        filter.resourceInfo = mock(ResourceInfo.class);
+        doReturn(AccountContextFilterTest.class).when(filter.resourceInfo).getResourceClass();
+        filter.filter(mockContext("AWS 000000000001:signature", null));
+        assertEquals(DEFAULT_ACCOUNT, requestContext.getAccountId());
+        assertNull(requestContext.getAccessKeyId());
+
+        doReturn(S3Controller.class).when(filter.resourceInfo).getResourceClass();
+        enforceIam = true;
+        filter.filter(mockContext("AWS 000000000001:signature", null));
+        assertEquals(DEFAULT_ACCOUNT, requestContext.getAccountId());
+        assertNull(requestContext.getAccessKeyId());
+    }
+
+    @Test
+    void modernS3HeadersRetainTheirRegionAndUnknownLegacyKeysUseTheDefault() {
+        filter.resourceInfo = mock(ResourceInfo.class);
+        doReturn(S3Controller.class).when(filter.resourceInfo).getResourceClass();
+        filter.filter(mockContext("AWS4-HMAC-SHA256 Credential=000000000001/20260617/us-west-2/s3/aws4_request, "
+                + "SignedHeaders=host, Signature=abc", null));
+        assertEquals("000000000001", requestContext.getAccountId());
+        assertEquals("us-west-2", requestContext.getRegion());
+
+        filter.filter(mockContext("AWS unknown-key:signature", null));
+        assertEquals(DEFAULT_ACCOUNT, requestContext.getAccountId());
+        assertEquals(DEFAULT_REGION, requestContext.getRegion());
+        assertEquals("unknown-key", requestContext.getAccessKeyId());
+        filter.filter(mockContext(null, null));
+        assertEquals(DEFAULT_ACCOUNT, requestContext.getAccountId());
+        assertNull(requestContext.getAccessKeyId());
     }
 
     @Test
@@ -133,7 +217,7 @@ class AccountContextFilterTest {
     void anUnsignedRequestGetsTheDeploymentPartition() {
         RegionResolver china = new RegionResolver("cn-north-1", DEFAULT_ACCOUNT);
         AccountContextFilter chinaFilter = new AccountContextFilter(accountResolver, china, requestContext,
-                akid -> Optional.empty(), this::config);
+                akid -> Optional.empty(), this::config, () -> catalog);
         chinaFilter.filter(mockContext(null, null));
         assertEquals("cn-north-1", requestContext.getRegion());
         assertEquals("aws-cn", requestContext.getPartition());
@@ -523,7 +607,7 @@ class AccountContextFilterTest {
         strictPartitions = true;
         RegionResolver gov = new RegionResolver("us-gov-west-1", DEFAULT_ACCOUNT);
         AccountContextFilter govFilter = new AccountContextFilter(accountResolver, gov, requestContext,
-                key -> Optional.empty(), this::config);
+                key -> Optional.empty(), this::config, () -> catalog);
         String credential = "AKID/20261015/custom:222222222222/cloudfront/aws4_request";
         ContainerRequestContext ctx = mockContext(query ? null : "AWS4-HMAC-SHA256 Credential=" + credential,
                 query ? credential : null);

@@ -695,6 +695,10 @@ number from 100 to 599 (text that spells one, such as `"201"`, is taken) are ans
 boolean `body` is its text. Format 2.0 takes a result without a `statusCode` as a `200` whose body
 is the result itself.
 
+A result that carries a `statusCode` and a `body` and no `Content-Type` header of its own is
+answered `text/plain; charset=utf-8`, in both payload formats (measured). A REST (v1) API keeps
+answering `application/json`.
+
 An API with a `corsConfiguration` applies it as AWS does (measured). It ignores the CORS headers an
 integration returns, and sets its own on whatever answers a route: the integration, or API Gateway
 itself refusing the request (a JWT or Lambda authorizer's `401` or `403`, an unsigned call to an

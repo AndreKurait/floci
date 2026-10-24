@@ -832,6 +832,28 @@ was sent gets a `Delete` straight away for the same reason. An update that chang
 reaches no handler: it fails with `Modifying service token is not allowed.`, as on AWS, and its
 rollback sends nothing.
 
+### Node.js handlers that require HTTPS on port 443
+
+Some packaged Node.js handlers, including AWS's
+[`cfn-response` implementation](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-lambda-function-code-cfnresponsemodule.html#cfn-lambda-function-code-cfnresponsemodule-source),
+send the callback with `https.request` on port 443 instead of following the scheme and port in
+`ResponseURL`. With Floci's default HTTP-only configuration, these handlers can fail with
+`ECONNREFUSED` on port 443 and leave the custom resource waiting until its response timeout.
+
+Set `FLOCI_TLS_ENABLED=true` on Floci before starting the stack. Keep
+`FLOCI_TLS_AWS_HTTPS_PORT=443` (the default) and ensure that listener starts successfully and is
+reachable from the Lambda container at the hostname in `ResponseURL`. A failed port-443 bind is
+logged as a warning; HTTPS on port 4566 alone does not satisfy a handler that hard-codes port 443.
+Floci injects a CA bundle and `NODE_EXTRA_CA_CERTS` into launched Lambda containers, so keep
+certificate verification enabled. See [TLS / HTTPS](../configuration/tls.md) for trust configuration
+and function-level environment overrides.
+
+Floci's callback URL still uses `http://<container-reachable-host>:<port>/cfn-response/<token>`;
+enabling TLS does not turn it into an AWS presigned S3 URL. The bundled Node.js `cfn-response`
+module for inline `ZipFile` code follows that URL's scheme and port and does not require TLS for
+this callback. The HTTPS/443 requirement applies to handlers with the hard-coded behavior above,
+not to every custom-resource handler.
+
 ## Failed update rollbacks
 
 When an update fails, Floci rolls back the resources it changed. A resource whose rollback fails

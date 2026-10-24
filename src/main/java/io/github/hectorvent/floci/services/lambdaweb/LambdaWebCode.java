@@ -19,8 +19,10 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
 import java.util.zip.ZipException;
 import java.util.zip.ZipFile;
 
@@ -35,6 +37,9 @@ public class LambdaWebCode {
 
     /** The {@code @} keeps this tree apart from the Lambda function directories, whose names never have one. */
     private static final String ROOT = "@web-functions";
+
+    /** AWS refuses a larger object and fails a revision whose files add up to more. */
+    static final long MAX_BYTES = 512L * 1024 * 1024;
 
     private final Path baseDir;
 
@@ -59,15 +64,22 @@ public class LambdaWebCode {
         }
     }
 
-    boolean opensAsZip(String accountId, String region, String functionName, String revisionId) {
-        try (ZipFile ignored = new ZipFile(file(accountId, region, functionName, revisionId).toFile())) {
-            return true;
+    /** The unsigned sum of the sizes the zip declares for its files, or empty when the code is not a zip. */
+    OptionalLong unzippedSize(String accountId, String region, String functionName, String revisionId) {
+        try (ZipFile zip = new ZipFile(file(accountId, region, functionName, revisionId).toFile())) {
+            return OptionalLong.of(zip.stream().mapToLong(ZipEntry::getSize).reduce(0, LambdaWebCode::addSaturating));
         } catch (ZipException e) {
-            return false;
+            return OptionalLong.empty();
         } catch (IOException e) {
             deleteRevision(accountId, region, functionName, revisionId);
             throw new UncheckedIOException("Could not read the code of " + functionName + " revision " + revisionId, e);
         }
+    }
+
+    /** AWS adds the sizes as unsigned 64-bit numbers and stops at the largest one. */
+    private static long addSaturating(long total, long size) {
+        long sum = total + size;
+        return Long.compareUnsigned(sum, total) < 0 ? -1L : sum;
     }
 
     void deleteRevision(String accountId, String region, String functionName, String revisionId) {

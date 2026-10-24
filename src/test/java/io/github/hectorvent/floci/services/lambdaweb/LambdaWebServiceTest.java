@@ -658,7 +658,7 @@ class LambdaWebServiceTest {
         Path copy = code.file(ACCOUNT_ID, REGION, "app", "rev-aaaaa");
         Files.createDirectories(copy);
 
-        assertThrows(UncheckedIOException.class, () -> code.opensAsZip(ACCOUNT_ID, REGION, "app", "rev-aaaaa"));
+        assertThrows(UncheckedIOException.class, () -> code.unzippedSize(ACCOUNT_ID, REGION, "app", "rev-aaaaa"));
         assertFalse(Files.exists(copy));
     }
 
@@ -782,6 +782,69 @@ class LambdaWebServiceTest {
         }
     }
 
+    @Test
+    void aRevisionWhoseFilesAddUpPastTheLimitIsFailed() {
+        S3Service s3 = mock(S3Service.class);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", s3);
+        when(s3.openObject("code", "app.zip", null))
+                .thenReturn(object(LambdaWebZips.declaring(LambdaWebCode.MAX_BYTES)));
+        WebFunctionRevision full = service.createFunction(REGION, createRequest("app")).revisions.values()
+                .iterator().next();
+        when(s3.openObject("code", "app.zip", null))
+                .thenReturn(object(LambdaWebZips.declaring(LambdaWebCode.MAX_BYTES + 1)));
+        WebFunctionRevision over = service.createRevision(REGION, "app", revisionConfig(30));
+
+        assertNull(full.failureReason);
+        assertEquals("Uncompressed code size 536870913 bytes exceeds the maximum allowed size of 536870912 bytes",
+                over.failureReason);
+        LambdaWebCode code = new LambdaWebCode(storageDir.resolve("code"));
+        assertTrue(Files.exists(code.file(ACCOUNT_ID, REGION, "app", full.revisionId)));
+        assertFalse(Files.exists(code.file(ACCOUNT_ID, REGION, "app", over.revisionId)));
+    }
+
+    @Test
+    void declaredSizesAddUpWithoutWrappingAround() {
+        S3Service s3 = mock(S3Service.class);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", s3);
+        when(s3.openObject("code", "app.zip", null))
+                .thenReturn(object(LambdaWebZips.declaring(Long.MAX_VALUE, 1)));
+        WebFunctionRevision signed = service.createFunction(REGION, createRequest("app")).revisions.values()
+                .iterator().next();
+        when(s3.openObject("code", "app.zip", null))
+                .thenReturn(object(LambdaWebZips.declaring(Long.MAX_VALUE, Long.MAX_VALUE, 2)));
+        WebFunctionRevision unsigned = service.createRevision(REGION, "app", revisionConfig(30));
+
+        assertEquals("Uncompressed code size 9223372036854775808 bytes exceeds the maximum allowed size of "
+                + "536870912 bytes", signed.failureReason);
+        assertEquals("Uncompressed code size 18446744073709551615 bytes exceeds the maximum allowed size of "
+                + "536870912 bytes", unsigned.failureReason);
+    }
+
+    @Test
+    void anObjectPastTheZippedLimitIsRefusedAndCreatesNothing() throws IOException {
+        S3Service s3 = mock(S3Service.class);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", s3);
+        byte[] zip = LambdaWebZips.indexJs("");
+        String refusal = "Zipped size must be smaller than 536870912 bytes";
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(zip, LambdaWebCode.MAX_BYTES + 1));
+
+        AwsException create = error(() -> service.createFunction(REGION, createRequest("app")));
+        assertEquals("ValidationException", create.getErrorCode());
+        assertEquals(400, create.getHttpStatus());
+        assertEquals(refusal, create.getMessage());
+        assertEquals("The function arn:aws:lambda:us-east-1:000000000000:web-function/app does not exist.",
+                message(() -> service.getFunction(REGION, "app")));
+
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(zip, LambdaWebCode.MAX_BYTES));
+        service.createFunction(REGION, createRequest("app"));
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(zip, LambdaWebCode.MAX_BYTES + 1));
+        assertEquals(refusal, message(() -> service.createRevision(REGION, "app", revisionConfig(30))));
+        assertEquals(1, service.getFunction(REGION, "app").revisions.size());
+        try (Stream<Path> copies = Files.walk(storageDir.resolve("code"))) {
+            assertEquals(1, copies.filter(Files::isRegularFile).count());
+        }
+    }
+
     private ObjectNode stateFilter(String state) {
         ObjectNode request = mapper.createObjectNode();
         request.putArray("filters").addObject().put("name", "state").putArray("values").add(state);
@@ -790,6 +853,12 @@ class LambdaWebServiceTest {
 
     private static S3Service.ObjectRead object(byte[] bytes) {
         return new S3Service.ObjectRead(new S3Object("code", "app.zip", bytes, "application/zip"),
+                new ByteArrayInputStream(bytes));
+    }
+
+    /** An object S3 reports as {@code size} bytes, whatever its body. */
+    private static S3Service.ObjectRead object(byte[] bytes, long size) {
+        return new S3Service.ObjectRead(new S3Object("code", "app.zip", size, "application/zip", "etag"),
                 new ByteArrayInputStream(bytes));
     }
 

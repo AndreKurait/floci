@@ -8,32 +8,23 @@ package io.github.hectorvent.floci.services.rds.container;
 public interface RdsBackendGate {
 
     /** A gate for backends that never pause. */
-    RdsBackendGate OPEN = (host, port) -> Lease.NONE;
+    RdsBackendGate OPEN = runtimeId -> Lease.NONE;
 
     /**
-     * Waits until the container serving {@code host:port} can take a client, resuming it when it
+     * Waits until the container owned by {@code runtimeId} can take a client, resuming it when it
      * is auto-paused, and keeps it awake until the lease is closed. A backend with no auto-pause
      * gets {@link Lease#NONE}.
      *
      * @throws InterruptedException when interrupted while a pause or resume is under way
      */
-    Lease enter(String host, int port) throws InterruptedException;
+    Lease enterRuntime(String runtimeId) throws InterruptedException;
 
     /**
-     * Like {@link #enter(String, int)}, but with {@code waitForResume=false} starts resume in the
-     * background and throws {@link ResumingException} if the backend is not yet ready.
-     * Backends without auto-pause may use this default implementation.
+     * Like {@link #enterRuntime(String)}, but with {@code waitForResume=false} starts resume in the
+     * background and throws {@link ResumingException} if the runtime is not yet ready.
      */
-    default Lease enter(String host, int port, boolean waitForResume) throws InterruptedException {
-        return enter(host, port);
-    }
-
-    /**
-     * Enters the container owned by {@code runtimeId}. Backends that do not track runtime
-     * identities may use this default implementation.
-     */
-    default Lease enterRuntime(String runtimeId) throws InterruptedException {
-        return Lease.NONE;
+    default Lease enterRuntime(String runtimeId, boolean waitForResume) throws InterruptedException {
+        return enterRuntime(runtimeId);
     }
 
     /** The backend is being resumed; no lease was acquired and the caller must retry. */

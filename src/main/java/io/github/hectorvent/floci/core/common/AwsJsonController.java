@@ -205,6 +205,18 @@ public class AwsJsonController {
             }
             return DynamoDbResponses.withCrc32(response, objectMapper);
         }
+        if ("sqs".equals(serviceKey) && response.getEntity() != null
+                && !(response.getEntity() instanceof byte[])) {
+            byte[] bodyBytes = JsonResponseBytes.serializeOrNull(response.getEntity(), objectMapper,
+                    LOG, "Failed to serialize SQS JSON response");
+            if (bodyBytes == null) {
+                return response;
+            }
+            return Response.fromResponse(response)
+                    .entity(bodyBytes)
+                    .type(CONTENT_TYPE_AWS_JSON_1_0)
+                    .build();
+        }
         return response;
     }
 }

@@ -1,12 +1,9 @@
 package io.github.hectorvent.floci.services.lambda;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
-import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.sqs.SqsService;
-import io.github.hectorvent.floci.services.sqs.model.Message;
-import io.github.hectorvent.floci.services.sqs.model.Queue;
+import io.github.hectorvent.floci.testing.SqsTestQueue;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Assumptions;
@@ -17,8 +14,6 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Base64;
-import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -26,7 +21,6 @@ import java.util.zip.ZipOutputStream;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Runs a real failing function to prove the asynchronous retries wait as they do on AWS (scaled down by
@@ -41,7 +35,6 @@ class LambdaAsyncRetryDockerIntegrationTest {
     private static final String ACCOUNT = "000000000000";
     private static final String ROLE = "arn:aws:iam::" + ACCOUNT + ":role/lambda-role";
     private static final Duration RECEIVE_DEADLINE = Duration.ofSeconds(60);
-    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Inject
     DockerClient dockerClient;
@@ -68,7 +61,7 @@ class LambdaAsyncRetryDockerIntegrationTest {
             .then()
                     .statusCode(202);
 
-            JsonNode record = awaitRecord(fixture.aliasQueueUrl());
+            JsonNode record = fixture.aliasQueue().awaitJson(RECEIVE_DEADLINE);
             long elapsedMillis = Duration.ofNanos(System.nanoTime() - started).toMillis();
 
             assertTrue(elapsedMillis >= 3000,
@@ -79,7 +72,7 @@ class LambdaAsyncRetryDockerIntegrationTest {
             assertTrue(functionArn.endsWith(":1"), "functionArn should name the executed version: " + functionArn);
             assertEquals("1", record.path("responseContext").path("executedVersion").asText());
             assertEquals("alias", record.path("requestPayload").path("probe").asText());
-            assertTrue(receiveOnce(fixture.latestQueueUrl()).isEmpty(),
+            assertTrue(fixture.latestQueue().receive().isEmpty(),
                     "the unqualified OnFailure destination should receive nothing");
         } finally {
             deleteFunction(fixture.functionName());
@@ -98,12 +91,12 @@ class LambdaAsyncRetryDockerIntegrationTest {
             .then()
                     .statusCode(202);
 
-            JsonNode record = awaitRecord(fixture.latestQueueUrl());
+            JsonNode record = fixture.latestQueue().awaitJson(RECEIVE_DEADLINE);
 
             assertEquals("RetriesExhausted", record.path("requestContext").path("condition").asText());
             assertEquals(1, record.path("requestContext").path("approximateInvokeCount").asInt());
             assertEquals("latest", record.path("requestPayload").path("probe").asText());
-            assertTrue(receiveOnce(fixture.aliasQueueUrl()).isEmpty(),
+            assertTrue(fixture.aliasQueue().receive().isEmpty(),
                     "the alias OnFailure destination should receive nothing");
         } finally {
             deleteFunction(fixture.functionName());
@@ -113,8 +106,8 @@ class LambdaAsyncRetryDockerIntegrationTest {
     private Fixture setUp() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String functionName = "async-retry-" + suffix;
-        String latestQueueUrl = createQueue("async-retry-latest-" + suffix);
-        String aliasQueueUrl = createQueue("async-retry-alias-" + suffix);
+        SqsTestQueue latestQueue = SqsTestQueue.create(sqsService, ACCOUNT, REGION, "async-retry-latest-");
+        SqsTestQueue aliasQueue = SqsTestQueue.create(sqsService, ACCOUNT, REGION, "async-retry-alias-");
 
         given()
                 .contentType("application/json")
@@ -152,7 +145,7 @@ class LambdaAsyncRetryDockerIntegrationTest {
         given()
                 .contentType("application/json")
                 .body("{\"MaximumRetryAttempts\":0,\"DestinationConfig\":{\"OnFailure\":{\"Destination\":\"%s\"}}}"
-                        .formatted(queueArn(latestQueueUrl)))
+                        .formatted(latestQueue.arn()))
         .when()
                 .put(CONFIG_PATH + "/functions/" + functionName + "/event-invoke-config")
         .then()
@@ -161,39 +154,13 @@ class LambdaAsyncRetryDockerIntegrationTest {
         given()
                 .contentType("application/json")
                 .body("{\"MaximumRetryAttempts\":2,\"DestinationConfig\":{\"OnFailure\":{\"Destination\":\"%s\"}}}"
-                        .formatted(queueArn(aliasQueueUrl)))
+                        .formatted(aliasQueue.arn()))
         .when()
                 .put(CONFIG_PATH + "/functions/" + functionName + "/event-invoke-config?Qualifier=live")
         .then()
                 .statusCode(200);
 
-        return new Fixture(functionName, latestQueueUrl, aliasQueueUrl);
-    }
-
-    private String createQueue(String queueName) {
-        Queue queue = RequestScopes.callAs(ACCOUNT, () -> sqsService.createQueue(queueName, Map.of(), REGION));
-        return queue.getQueueUrl();
-    }
-
-    private String queueArn(String queueUrl) {
-        return RequestScopes.callAs(ACCOUNT, () ->
-                sqsService.getQueueAttributes(queueUrl, List.of("QueueArn"), REGION).get("QueueArn"));
-    }
-
-    private List<Message> receiveOnce(String queueUrl) {
-        return RequestScopes.callAs(ACCOUNT, () -> sqsService.receiveMessage(queueUrl, 1, 30, 0, REGION));
-    }
-
-    private JsonNode awaitRecord(String queueUrl) throws Exception {
-        long deadline = System.nanoTime() + RECEIVE_DEADLINE.toNanos();
-        while (System.nanoTime() < deadline) {
-            List<Message> messages = receiveOnce(queueUrl);
-            if (!messages.isEmpty()) {
-                return MAPPER.readTree(messages.get(0).getBody());
-            }
-            Thread.sleep(250);
-        }
-        return fail("no OnFailure record reached " + queueUrl + " within " + RECEIVE_DEADLINE.toSeconds() + " s");
+        return new Fixture(functionName, latestQueue, aliasQueue);
     }
 
     private static void deleteFunction(String functionName) {
@@ -221,6 +188,6 @@ class LambdaAsyncRetryDockerIntegrationTest {
         }
     }
 
-    private record Fixture(String functionName, String latestQueueUrl, String aliasQueueUrl) {
+    private record Fixture(String functionName, SqsTestQueue latestQueue, SqsTestQueue aliasQueue) {
     }
 }

@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import jakarta.ws.rs.core.HttpHeaders;
+import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
@@ -18,6 +19,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -370,6 +372,19 @@ class ApiGatewayExecuteControllerTest {
                 {"statusCode":200,"headers":{"X-Other":"value"},"body":"{}"}
                 """), false);
         assertEquals("application/json", response.getMediaType().toString());
+    }
+
+    @ParameterizedTest(name = "payload format {0}")
+    @ValueSource(strings = {"1.0", "2.0"})
+    void buildProxyResponseAnswersTextPlainWhenAnHttpApiResultHasNoContentType(String format) {
+        // Measured on HTTP APIs (eu-west-1, 2026-10-19): a result with a statusCode and a body but
+        // no Content-Type header of its own is answered text/plain; charset=utf-8, in both payload
+        // formats. A REST API keeps answering application/json.
+        ApiGatewayExecuteController controller = controller(new ObjectMapper());
+        Response response = controller.buildProxyResponse(proxyPayload("""
+                {"statusCode":200,"headers":{"X-Other":"value"},"body":"hello"}
+                """), true, "2.0".equals(format));
+        assertEquals(MediaType.valueOf("text/plain; charset=utf-8"), response.getMediaType());
     }
 
     @Test

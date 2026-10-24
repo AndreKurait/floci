@@ -28,6 +28,7 @@ import software.amazon.awssdk.services.redshift.model.DeleteSnapshotCopyGrantReq
 import software.amazon.awssdk.services.redshift.model.DeleteTagsRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeClusterParameterGroupsRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeClusterParameterGroupsResponse;
+import software.amazon.awssdk.services.redshift.model.DescribeClusterParametersRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeClusterSnapshotsRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeClusterSnapshotsResponse;
 import software.amazon.awssdk.services.redshift.model.DescribeClusterSubnetGroupsRequest;
@@ -41,10 +42,15 @@ import software.amazon.awssdk.services.redshift.model.DescribeTagsRequest;
 import software.amazon.awssdk.services.redshift.model.DescribeTagsResponse;
 import software.amazon.awssdk.services.redshift.model.ModifyClusterIamRolesRequest;
 import software.amazon.awssdk.services.redshift.model.ModifyClusterIamRolesResponse;
+import software.amazon.awssdk.services.redshift.model.ModifyClusterParameterGroupRequest;
 import software.amazon.awssdk.services.redshift.model.ModifyClusterRequest;
 import software.amazon.awssdk.services.redshift.model.ModifyClusterResponse;
+import software.amazon.awssdk.services.redshift.model.Parameter;
 import software.amazon.awssdk.services.redshift.model.RebootClusterRequest;
 import software.amazon.awssdk.services.redshift.model.RebootClusterResponse;
+import software.amazon.awssdk.services.redshift.model.RedshiftException;
+import software.amazon.awssdk.services.redshift.model.ResetClusterParameterGroupRequest;
+import software.amazon.awssdk.services.redshift.model.ResetClusterParameterGroupResponse;
 import software.amazon.awssdk.services.redshift.model.RestoreFromClusterSnapshotRequest;
 import software.amazon.awssdk.services.redshift.model.RestoreFromClusterSnapshotResponse;
 import software.amazon.awssdk.services.redshift.model.Snapshot;
@@ -276,6 +282,43 @@ class RedshiftOperationsTest {
         assertThat(foundPg).isNotNull();
         assertThat(foundPg.parameterGroupFamily()).isEqualTo("redshift-1.0");
         assertThat(foundPg.description()).isEqualTo("Test parameter group for Redshift");
+
+        DescribeClusterParametersRequest describeParameters = DescribeClusterParametersRequest.builder()
+                .parameterGroupName(pgName).build();
+        List<Parameter> defaults = client.describeClusterParameters(describeParameters).parameters();
+        String cursorDefault = defaults.stream()
+                .filter(parameter -> "max_cursor_result_set_size".equals(parameter.parameterName()))
+                .findFirst().orElseThrow().parameterValue();
+        client.modifyClusterParameterGroup(ModifyClusterParameterGroupRequest.builder()
+                .parameterGroupName(pgName)
+                .parameters(Parameter.builder().parameterName("max_cursor_result_set_size").parameterValue("1000").build(),
+                        Parameter.builder().parameterName("wlm_json_configuration").parameterValue("[{\"query_concurrency\":3}]").build())
+                .build());
+
+        assertThatThrownBy(() -> client.resetClusterParameterGroup(ResetClusterParameterGroupRequest.builder()
+                .parameterGroupName(pgName).parameters(Parameter.builder().parameterValue("1000").build()).build()))
+                .isInstanceOf(RedshiftException.class).hasMessageContaining("ParameterName");
+
+        ResetClusterParameterGroupResponse reset = client.resetClusterParameterGroup(ResetClusterParameterGroupRequest.builder()
+                .parameterGroupName(pgName).resetAllParameters(false)
+                .parameters(Parameter.builder().parameterName("max_cursor_result_set_size").build()).build());
+
+        assertThat(reset.parameterGroupName()).isEqualTo(pgName);
+        assertThat(reset.parameterGroupStatus()).isNotBlank();
+        List<Parameter> afterPartialReset = client.describeClusterParameters(describeParameters).parameters();
+        assertThat(afterPartialReset).anySatisfy(parameter -> {
+            assertThat(parameter.parameterName()).isEqualTo("max_cursor_result_set_size");
+            assertThat(parameter.parameterValue()).isEqualTo(cursorDefault);
+            assertThat(parameter.source()).isEqualTo("engine-default");
+        });
+        assertThat(client.describeClusterParameters(describeParameters.toBuilder().source("user").build()).parameters())
+                .extracting(Parameter::parameterName).containsExactly("wlm_json_configuration");
+
+        client.resetClusterParameterGroup(ResetClusterParameterGroupRequest.builder()
+                .parameterGroupName(pgName).resetAllParameters(true).build());
+        assertThat(client.describeClusterParameters(describeParameters).parameters())
+                .allSatisfy(parameter -> assertThat(parameter.source()).isEqualTo("engine-default"));
+        assertThat(client.describeClusterParameters(describeParameters.toBuilder().source("user").build()).parameters()).isEmpty();
 
         // 3. Delete cluster parameter group
         client.deleteClusterParameterGroup(DeleteClusterParameterGroupRequest.builder()

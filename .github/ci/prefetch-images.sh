@@ -120,7 +120,7 @@ grep -q 'RdsAwsIntegrationTest' "$SHARD_FILE" && [ -n "$SQLSERVER_IMAGE" ] && pu
 # provisioner tests reach it through Redshift. It was pulled inline in all four shards.
 REDSHIFT_PG_IMAGE="$(grep -oE 'image-version: *postgres:[^ ]+' src/main/resources/application.yml | awk '{print $2}')"
 grep -qE '/redshift/|/cloudformation/' "$SHARD_FILE" && [ -n "$REDSHIFT_PG_IMAGE" ] && pull "$REDSHIFT_PG_IMAGE"
-grep -q '/rds/' "$SHARD_FILE" && pull postgres:16.3-alpine
+grep -qE '/rds/|/rdsdata/' "$SHARD_FILE" && pull postgres:16.3-alpine
 # The InfluxDB and k3s pins live in application.yml like the sidecars above.
 INFLUX_IMAGE="$(grep -oE 'default-image: *"influxdb:[^"]+"' src/main/resources/application.yml | grep -oE '"[^"]+"' | tr -d '"')"
 grep -q '/timestreaminfluxdb/' "$SHARD_FILE" && [ -n "$INFLUX_IMAGE" ] && pull "$INFLUX_IMAGE"

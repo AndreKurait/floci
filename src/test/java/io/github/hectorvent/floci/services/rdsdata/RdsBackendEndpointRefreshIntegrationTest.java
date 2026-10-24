@@ -1,5 +1,7 @@
-package io.github.hectorvent.floci.services.rds.proxy;
+package io.github.hectorvent.floci.services.rdsdata;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.CreateNetworkResponse;
@@ -16,8 +18,14 @@ import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
+import io.github.hectorvent.floci.services.rds.container.RdsBackendEndpointResolver;
 import io.github.hectorvent.floci.services.rds.container.RdsBackendGate;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
+import io.github.hectorvent.floci.services.rds.proxy.RdsAuthProxy;
+import io.github.hectorvent.floci.services.rds.proxy.RdsProxyTlsCertificates;
+import io.github.hectorvent.floci.services.rds.proxy.RdsSigV4Validator;
+import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
 import io.github.hectorvent.floci.testutil.FreePorts;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -41,11 +49,13 @@ import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -53,15 +63,24 @@ import static org.mockito.Mockito.when;
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class RdsBackendEndpointRefreshIntegrationTest {
 
-    private static final String IMAGE = "postgres:16-alpine";
+    private static final String IMAGE = "postgres:16.3-alpine";
     private static final String USER = "admin";
     private static final String PASSWORD = "password123";
     private static final String DATABASE = "appdb";
+    private static final String REGION = "us-east-1";
+    private static final String FIRST_RESOURCE_ARN =
+            "arn:aws:rds:us-east-1:000000000000:cluster:data-refresh-first";
+    private static final String SECOND_RESOURCE_ARN =
+            "arn:aws:rds:us-east-1:000000000000:cluster:data-refresh-second";
+    private static final String SECRET_ARN =
+            "arn:aws:secretsmanager:us-east-1:000000000000:secret:data-refresh";
     private static final int POSTGRES_PORT = 5432;
 
+    private final ObjectMapper objectMapper = new ObjectMapper();
     private final List<RdsAuthProxy> proxies = new ArrayList<>();
     private DockerClient dockerClient;
     private ContainerLifecycleManager lifecycleManager;
+    private RdsDataService dataService;
     private String networkId;
     private String networkName;
     private String firstContainerId;
@@ -120,10 +139,15 @@ class RdsBackendEndpointRefreshIntegrationTest {
         assumeTrue(canConnectEventually(firstAddress, POSTGRES_PORT)
                         && canConnectEventually(secondAddress, POSTGRES_PORT),
                 "Docker bridge addresses are not reachable from this test JVM");
+        dataService = createDataService();
     }
 
     @AfterEach
     void tearDown() {
+        if (dataService != null) {
+            dataService.shutdown();
+            dataService = null;
+        }
         for (RdsAuthProxy proxy : proxies) {
             proxy.stop();
         }
@@ -143,15 +167,18 @@ class RdsBackendEndpointRefreshIntegrationTest {
     }
 
     @Test
-    void proxyPortsKeepTheirInstancesAfterContainerAddressesSwap() throws Exception {
+    void proxyAndDataApiKeepRuntimeIdentityAfterContainerAddressesSwap() throws Exception {
         int[] proxyPorts = FreePorts.anyInterfacePorts(2);
         RdsAuthProxy firstProxy = proxy("first", firstContainerId, firstAddress);
         RdsAuthProxy secondProxy = proxy("second", secondContainerId, secondAddress);
         firstProxy.start(proxyPorts[0]);
         secondProxy.start(proxyPorts[1]);
-        String firstSystemIdentifier = systemIdentifier(proxyPorts[0]);
-        String secondSystemIdentifier = systemIdentifier(proxyPorts[1]);
+        String firstSystemIdentifier = proxySystemIdentifier(proxyPorts[0]);
+        String secondSystemIdentifier = proxySystemIdentifier(proxyPorts[1]);
         assertNotEquals(firstSystemIdentifier, secondSystemIdentifier);
+        assertAll("both data planes initially reach their assigned runtime",
+                () -> assertEquals(firstSystemIdentifier, dataApiSystemIdentifier(FIRST_RESOURCE_ARN)),
+                () -> assertEquals(secondSystemIdentifier, dataApiSystemIdentifier(SECOND_RESOURCE_ARN)));
 
         stopAndDisconnect(firstContainerId);
         stopAndDisconnect(secondContainerId);
@@ -164,16 +191,20 @@ class RdsBackendEndpointRefreshIntegrationTest {
         assertEquals(secondAddress, containerAddress(firstContainerId));
         assertEquals(firstAddress, containerAddress(secondContainerId));
 
-        assertEquals(firstSystemIdentifier, systemIdentifier(proxyPorts[0]));
-        assertEquals(secondSystemIdentifier, systemIdentifier(proxyPorts[1]));
+        assertAll("both data planes follow runtime identity after the address swap",
+                () -> assertEquals(firstSystemIdentifier, proxySystemIdentifier(proxyPorts[0])),
+                () -> assertEquals(firstSystemIdentifier, dataApiSystemIdentifier(FIRST_RESOURCE_ARN)),
+                () -> assertEquals(secondSystemIdentifier, proxySystemIdentifier(proxyPorts[1])),
+                () -> assertEquals(secondSystemIdentifier, dataApiSystemIdentifier(SECOND_RESOURCE_ARN)));
     }
 
     @Test
-    void proxyUsesRestartedContainerWhenItsPreviousAddressIsUnused() throws Exception {
+    void proxyAndDataApiUseRestartedRuntimeWhenItsPreviousAddressIsUnused() throws Exception {
         int proxyPort = FreePorts.anyInterfacePort();
         RdsAuthProxy proxy = proxy("first", firstContainerId, firstAddress);
         proxy.start(proxyPort);
-        String systemIdentifier = systemIdentifier(proxyPort);
+        String systemIdentifier = proxySystemIdentifier(proxyPort);
+        assertEquals(systemIdentifier, dataApiSystemIdentifier(FIRST_RESOURCE_ARN));
 
         stopAndDisconnect(firstContainerId);
         stopAndDisconnect(secondContainerId);
@@ -184,7 +215,9 @@ class RdsBackendEndpointRefreshIntegrationTest {
         assertFalse(canConnect(firstAddress, POSTGRES_PORT),
                 "the stale backend address must be unused in this scenario");
 
-        assertEquals(systemIdentifier, systemIdentifier(proxyPort));
+        assertAll("both data planes follow the runtime when its old address is unused",
+                () -> assertEquals(systemIdentifier, proxySystemIdentifier(proxyPort)),
+                () -> assertEquals(systemIdentifier, dataApiSystemIdentifier(FIRST_RESOURCE_ARN)));
     }
 
     private RdsAuthProxy proxy(String id, String containerId, String initialAddress) {
@@ -194,13 +227,47 @@ class RdsBackendEndpointRefreshIntegrationTest {
             return new RdsAuthProxy.BackendEndpoint(endpoint.host(), endpoint.port());
         };
         RdsAuthProxy proxy = new RdsAuthProxy(
-                id, initialAddress, POSTGRES_PORT, resolver, DatabaseEngine.POSTGRES, false,
+                id, initialAddress, POSTGRES_PORT, resolver, containerId,
+                DatabaseEngine.POSTGRES, false,
                 USER, PASSWORD, DATABASE, mock(RdsSigV4Validator.class),
                 mock(RdsProxyTlsCertificates.class), (user, password) -> true,
                 5000, 5000, 100, null, username -> false,
                 RdsBackendGate.OPEN, RdsAuthProxy.EndpointKind.DATABASE);
         proxies.add(proxy);
         return proxy;
+    }
+
+    private RdsDataService createDataService() {
+        RdsDataResourceResolver resolver = mock(RdsDataResourceResolver.class);
+        when(resolver.resolve(FIRST_RESOURCE_ARN, REGION))
+                .thenReturn(target(FIRST_RESOURCE_ARN, firstContainerId));
+        when(resolver.resolve(SECOND_RESOURCE_ARN, REGION))
+                .thenReturn(target(SECOND_RESOURCE_ARN, secondContainerId));
+        SecretsManagerService secrets = mock(SecretsManagerService.class);
+        SecretVersion version = new SecretVersion();
+        version.setSecretString("{\"username\":\"" + USER + "\",\"password\":\"" + PASSWORD + "\"}");
+        when(secrets.getSecretValue(any(), any(), any(), any())).thenReturn(version);
+        RdsBackendEndpointResolver endpointResolver = (runtimeId, engine) ->
+                lifecycleManager.resolveEndpoint(runtimeId, POSTGRES_PORT, networkName);
+        return new RdsDataService(resolver, secrets, objectMapper, new RdsDataConnectionFactory(),
+                Duration.ofSeconds(60), RdsBackendGate.OPEN, endpointResolver);
+    }
+
+    private static RdsDataResourceResolver.DatabaseTarget target(String resourceArn, String runtimeId) {
+        return new RdsDataResourceResolver.DatabaseTarget(
+                resourceArn, runtimeId, DatabaseEngine.POSTGRES, USER, PASSWORD, DATABASE);
+    }
+
+    private String dataApiSystemIdentifier(String resourceArn) {
+        ObjectNode request = objectMapper.createObjectNode();
+        request.put("resourceArn", resourceArn);
+        request.put("secretArn", SECRET_ARN);
+        request.put("database", DATABASE);
+        request.put("sql", "SELECT system_identifier::text FROM pg_control_system()");
+        ObjectNode response = dataService.executeStatement(request, REGION);
+        String value = response.path("records").path(0).path(0).path("stringValue").asText();
+        assertFalse(value.isBlank(), "PostgreSQL must return its system identifier");
+        return value;
     }
 
     private String startPostgres(String suffix) {
@@ -239,7 +306,7 @@ class RdsBackendEndpointRefreshIntegrationTest {
                 .getNetworkSettings().getNetworks().get(networkName).getIpAddress();
     }
 
-    private String systemIdentifier(int proxyPort) throws Exception {
+    private String proxySystemIdentifier(int proxyPort) throws Exception {
         Class.forName("org.postgresql.Driver");
         Properties properties = new Properties();
         properties.setProperty("user", USER);

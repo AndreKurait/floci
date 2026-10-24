@@ -43,6 +43,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -54,10 +55,10 @@ import java.util.regex.Pattern;
 
 /**
  * Control plane of Lambda Web Functions (apiVersion 2025-03-07). A revision is stored Active, or
- * Failed when its code is not a zip. An endpoint is stored Active, or Failed when CreateWebFunction
- * gives it a Failed revision, and an endpoint update is stored Successful. The create and update
- * responses show the transitional state AWS reports. Invocation through an endpoint domain is not
- * part of this service.
+ * Failed when its code is not a zip or unzips past the size limit. An endpoint is stored Active, or
+ * Failed when CreateWebFunction gives it a Failed revision, and an endpoint update is stored
+ * Successful. The create and update responses show the transitional state AWS reports. Invocation
+ * through an endpoint domain is not part of this service.
  */
 @ApplicationScoped
 public class LambdaWebService implements Resettable {
@@ -594,10 +595,36 @@ public class LambdaWebService implements Resettable {
         String accountId = AwsArnUtils.parse(fn.functionArn).accountId();
         WebFunctionRevision.BuildConfig build = revision.buildConfig;
         long size;
-        try (S3Service.ObjectRead object = s3Service.openObject(build.bucket, build.key, build.versionId)) {
+        try (S3Service.ObjectRead object = openCode(build)) {
+            // AWS accepts an object of exactly this size, despite the wording.
+            if (LambdaWebCode.MAX_BYTES < object.object().getSize()) {
+                throw new AwsException("ValidationException", "Zipped size must be smaller than "
+                        + LambdaWebCode.MAX_BYTES + " bytes", 400);
+            }
             size = code.store(accountId, region, fn.functionName, revision.revisionId, object.body());
         } catch (IOException e) {
             throw new UncheckedIOException("Could not close the code object s3://" + build.bucket + "/" + build.key, e);
+        }
+        if (size == 0) {
+            // An empty object is an internal error on AWS.
+            code.deleteRevision(accountId, region, fn.functionName, revision.revisionId);
+            throw new LambdaWebInternalServerException();
+        }
+        OptionalLong unzipped = code.unzippedSize(accountId, region, fn.functionName, revision.revisionId);
+        if (unzipped.isEmpty()) {
+            revision.failureReason = NOT_A_ZIP;
+        } else if (Long.compareUnsigned(LambdaWebCode.MAX_BYTES, unzipped.getAsLong()) < 0) {
+            revision.failureReason = "Uncompressed code size " + Long.toUnsignedString(unzipped.getAsLong())
+                    + " bytes exceeds the maximum allowed size of " + LambdaWebCode.MAX_BYTES + " bytes";
+        }
+        if (revision.failureReason != null) {
+            code.deleteRevision(accountId, region, fn.functionName, revision.revisionId);
+        }
+    }
+
+    private S3Service.ObjectRead openCode(WebFunctionRevision.BuildConfig build) {
+        try {
+            return s3Service.openObject(build.bucket, build.key, build.versionId);
         } catch (AwsException e) {
             LOG.debugv("Web function code object s3://{0}/{1} is not readable: {2}", build.bucket, build.key,
                     e.getMessage());
@@ -613,15 +640,6 @@ public class LambdaWebService implements Resettable {
             }
             throw new AwsException("ValidationException", "The S3 object " + object + " (versionId=" + build.versionId
                     + ") is inaccessible. Verify the request parameters and permissions are correct.", 400);
-        }
-        if (size == 0) {
-            // An empty object is an internal error on AWS.
-            code.deleteRevision(accountId, region, fn.functionName, revision.revisionId);
-            throw new LambdaWebInternalServerException();
-        }
-        if (!code.opensAsZip(accountId, region, fn.functionName, revision.revisionId)) {
-            code.deleteRevision(accountId, region, fn.functionName, revision.revisionId);
-            revision.failureReason = NOT_A_ZIP;
         }
     }
 

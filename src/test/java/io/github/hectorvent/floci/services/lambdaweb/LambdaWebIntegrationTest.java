@@ -663,4 +663,39 @@ class LambdaWebIntegrationTest {
 
         given().when().delete(BASE + "/web-functions/" + fn).then().statusCode(204);
     }
+
+    @Test
+    @Order(12)
+    void codeThatUnzipsPastTheLimitFailsItsRevision() {
+        String fn = FN + "-large";
+        s3Service.putObject(BUCKET, "large.zip", LambdaWebZips.declaring(LambdaWebCode.MAX_BYTES + 1),
+                "application/zip", Map.of());
+        given().contentType("application/json")
+                .body("""
+                        {"functionName": "%s",
+                         "revisionConfig": {"buildConfig": %s, "serviceConfig": {"executionRoleArn": "%s"}},
+                         "endpointConfig": {"endpointName": "dev", "endpointType": "HomeRegion",
+                                            "authType": "ApplicationManaged", "autoDeploymentMode": "LatestRevision"}}
+                        """.formatted(fn, BUILD, ROLE))
+                .when().put(BASE + "/web-functions")
+                .then().statusCode(202);
+
+        String large = given().contentType("application/json")
+                .body("""
+                        {"buildConfig": {"codeConfig": {"s3Object": {"bucket": "%s", "key": "large.zip"}},
+                                         "runtimeConfig": {"runtime": "nodejs24.x"}},
+                         "serviceConfig": {"executionRoleArn": "%s"}}
+                        """.formatted(BUCKET, ROLE))
+                .when().post(BASE + "/web-functions/" + fn + "/revisions")
+                .then().statusCode(202)
+                .body("state", equalTo("Pending"))
+                .extract().path("revisionId");
+        given().when().get(BASE + "/web-functions/" + fn + "/revisions/" + large)
+                .then().statusCode(200)
+                .body("state", equalTo("Failed"))
+                .body("stateReason", equalTo("Uncompressed code size 536870913 bytes exceeds the maximum allowed size"
+                        + " of 536870912 bytes"));
+
+        given().when().delete(BASE + "/web-functions/" + fn).then().statusCode(204);
+    }
 }

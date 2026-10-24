@@ -4,12 +4,14 @@ Floci supports full per-account resource isolation out of the box. Resources cre
 
 ## How It Works
 
-Every incoming request carries an AWS SigV4 `Authorization` header. Floci reads the **Access Key ID** (AKID) from that header and resolves the account in this order:
+Floci reads the **Access Key ID** (AKID) from a signed request's `Authorization` header and resolves the account in this order:
 
 1. An exactly 12-digit AKID is used directly as the account ID.
 2. An active long-term IAM access key resolves to the account that owns it.
 3. A live STS temporary credential resolves to its recorded account.
 4. Any other key falls back to `FLOCI_DEFAULT_ACCOUNT_ID`.
+
+Legacy S3 headers (`Authorization: AWS <access-key>:<signature>`) use the same account-routing rules when IAM enforcement is disabled. This supplies request metadata, not SigV2 authentication. S3 still rejects these headers when `FLOCI_AUTH_VALIDATE_SIGNATURES` or `FLOCI_SERVICES_S3_ENFORCE_AUTH` is enabled.
 
 ```
 Authorization: AWS4-HMAC-SHA256 Credential=111111111111/20260510/us-east-1/sqs/aws4_request, ...

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.sqs;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -14,6 +15,7 @@ import java.util.Map;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -951,6 +953,58 @@ class SqsJsonProtocolTest {
                 .contentType(CONTENT_TYPE)
                 .header("X-Amz-Target", "AmazonSQS.DeleteQueue")
                 .body("{\"QueueUrl\":\"" + batchQueueUrl + "\"}")
+            .when().post("/");
+        }
+    }
+
+    @Test
+    void largeJsonReceiveMessageUsesContentLength() {
+        String framingQueueUrl = given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "AmazonSQS.CreateQueue")
+            .body("{\"QueueName\":\"json-response-framing-queue\"}")
+        .when().post("/")
+        .then().statusCode(200)
+            .extract().jsonPath().getString("QueueUrl");
+        try {
+            String messageBody = "x".repeat(12_000);
+            given()
+                .contentType(CONTENT_TYPE)
+                .header("X-Amz-Target", "AmazonSQS.SendMessage")
+                .body("{\"QueueUrl\":\"" + framingQueueUrl + "\",\"MessageBody\":\"" + messageBody + "\"}")
+            .when().post("/")
+            .then().statusCode(200);
+
+            for (String path : List.of("/", "/" + ACCOUNT_ID + "/json-response-framing-queue")) {
+                Response response = given()
+                    .contentType(CONTENT_TYPE)
+                    .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
+                    .body("{\"QueueUrl\":\"" + framingQueueUrl
+                            + "\",\"MaxNumberOfMessages\":1,\"VisibilityTimeout\":0}")
+                .when().post(path)
+                .then().statusCode(200)
+                    .body("Messages[0].Body", equalTo(messageBody))
+                    .extract().response();
+
+                int bodyLength = response.asByteArray().length;
+                assertTrue(bodyLength > 8_191);
+                assertEquals(Integer.toString(bodyLength), response.getHeader("Content-Length"));
+                assertNull(response.getHeader("Transfer-Encoding"));
+            }
+
+            given()
+                .contentType(CONTENT_TYPE)
+                .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
+                .body("{\"QueueUrl\":\"" + framingQueueUrl + "\",\"WaitTimeSeconds\":21}")
+            .when().post("/")
+            .then().statusCode(400)
+                .header("x-amzn-query-error", equalTo("InvalidParameterValue;Sender"))
+                .body("__type", equalTo("InvalidParameterValue"));
+        } finally {
+            given()
+                .contentType(CONTENT_TYPE)
+                .header("X-Amz-Target", "AmazonSQS.DeleteQueue")
+                .body("{\"QueueUrl\":\"" + framingQueueUrl + "\"}")
             .when().post("/");
         }
     }

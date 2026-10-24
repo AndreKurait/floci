@@ -62,6 +62,7 @@ public class RedshiftService {
 
     // The group every cluster starts on until one is named.
     static final String DEFAULT_PARAMETER_GROUP_NAME = "default.redshift-1.0";
+    private static final int MAX_RESET_PARAMETERS = 20;
 
     private final AccountAwareStorageBackend<Cluster> clusters;
     private final AccountAwareStorageBackend<Snapshot> snapshots;
@@ -1104,6 +1105,9 @@ public class RedshiftService {
     // ── Parameter Group Operations ───────────────────────────────────────────
 
     public ClusterParameterGroup createClusterParameterGroup(String parameterGroupName, String parameterGroupFamily, String description) {
+        if (DEFAULT_PARAMETER_GROUP_NAME.equals(parameterGroupName)) {
+            throw new AwsException("InvalidParameterValue", "The default parameter group name is reserved.", 400);
+        }
         if (parameterGroups.get(parameterGroupName).isPresent()) {
             throw new AwsException("ClusterParameterGroupAlreadyExists", "Cluster parameter group " + parameterGroupName + " already exists", 400);
         }
@@ -1144,18 +1148,22 @@ public class RedshiftService {
 
     public List<Parameter> describeClusterParameters(String parameterGroupName) {
         ClusterParameterGroup group = parameterGroups.get(parameterGroupName)
+                .or(() -> DEFAULT_PARAMETER_GROUP_NAME.equals(parameterGroupName)
+                        ? Optional.of(defaultParameterGroup()) : Optional.empty())
                 .orElseThrow(() -> new AwsException("ClusterParameterGroupNotFound",
                         "Cluster parameter group " + parameterGroupName + " not found", 404));
-        return group.getParameters();
+        return group.getParameters().stream().map(RedshiftService::copyParameterWithSource).toList();
     }
 
     public synchronized ClusterParameterGroup modifyClusterParameterGroup(
             String parameterGroupName, List<Parameter> updates) {
+        requireMutableParameterGroup(parameterGroupName);
         ClusterParameterGroup group = parameterGroups.get(parameterGroupName)
                 .orElseThrow(() -> new AwsException("ClusterParameterGroupNotFound",
                         "Cluster parameter group " + parameterGroupName + " not found", 404));
 
-        List<Parameter> current = new ArrayList<>(group.getParameters());
+        List<Parameter> current = new ArrayList<>(group.getParameters().stream()
+                .map(RedshiftService::copyParameterWithSource).toList());
         for (Parameter update : updates) {
             boolean matched = false;
             for (int i = 0; i < current.size(); i++) {
@@ -1163,6 +1171,7 @@ public class RedshiftService {
                 if (existing.getParameterName().equals(update.getParameterName())) {
                     // Preserve metadata (description, dataType) from existing parameter if not provided in update
                     existing.setParameterValue(update.getParameterValue());
+                    existing.setSource("user");
                     if (update.getDescription() != null) {
                         existing.setDescription(update.getDescription());
                     }
@@ -1174,13 +1183,82 @@ public class RedshiftService {
                 }
             }
             if (!matched) {
-                current.add(update);
+                Parameter added = copyParameterWithSource(update);
+                added.setSource("user");
+                current.add(added);
             }
         }
         group.setParameters(current);
         parameterGroups.put(parameterGroupName, group);
         parameterGroups.flush();
         return group;
+    }
+
+    public synchronized void resetClusterParameterGroup(String parameterGroupName, boolean resetAllParameters,
+                                                        List<String> parameterNames) {
+        requireMutableParameterGroup(parameterGroupName);
+        if (resetAllParameters && !parameterNames.isEmpty()) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Parameters cannot be specified when ResetAllParameters is true.", 400);
+        }
+        if (!resetAllParameters && parameterNames.isEmpty()) {
+            throw new AwsException("InvalidParameterCombination",
+                    "At least one parameter is required when ResetAllParameters is false.", 400);
+        }
+        if (parameterNames.size() > MAX_RESET_PARAMETERS) {
+            throw new AwsException("InvalidParameterValue", "A maximum of 20 parameters can be reset.", 400);
+        }
+        ClusterParameterGroup group = parameterGroups.get(parameterGroupName)
+                .orElseThrow(() -> new AwsException("ClusterParameterGroupNotFound",
+                        "Cluster parameter group " + parameterGroupName + " not found", 404));
+        Set<String> names = new LinkedHashSet<>();
+        for (String name : parameterNames) {
+            if (name == null || name.isBlank() || group.getParameters().stream()
+                    .noneMatch(parameter -> name.equals(parameter.getParameterName()))) {
+                throw new AwsException("InvalidParameterValue", "Unknown parameter: " + name, 400);
+            }
+            names.add(name);
+        }
+        List<Parameter> defaults = ClusterParameterGroup.defaultParameters();
+        List<Parameter> reset = defaults;
+        if (!resetAllParameters) {
+            reset = new ArrayList<>();
+            for (Parameter parameter : group.getParameters()) {
+                if (names.contains(parameter.getParameterName())) {
+                    defaults.stream().filter(candidate -> candidate.getParameterName().equals(parameter.getParameterName()))
+                            .findFirst().ifPresent(reset::add);
+                } else {
+                    reset.add(copyParameterWithSource(parameter));
+                }
+            }
+        }
+        group.setParameters(reset);
+        parameterGroups.put(parameterGroupName, group);
+        parameterGroups.flush();
+    }
+
+    private void requireMutableParameterGroup(String name) {
+        if (name == null || name.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "ParameterGroupName is required", 400);
+        }
+        if (DEFAULT_PARAMETER_GROUP_NAME.equals(name) && parameterGroups.get(name).isEmpty()) {
+            throw new AwsException("InvalidParameterValue", "The default parameter group cannot be modified.", 400);
+        }
+    }
+
+    private static Parameter copyParameterWithSource(Parameter parameter) {
+        Parameter copy = new Parameter(parameter.getParameterName(), parameter.getParameterValue(),
+                parameter.getDescription(), parameter.getDataType());
+        String source = parameter.getSource();
+        if (source == null) {
+            // Older persisted groups do not record whether a value was explicitly set to its default.
+            boolean engineDefault = ClusterParameterGroup.defaultParameters().stream().anyMatch(candidate ->
+                    candidate.getParameterName().equals(parameter.getParameterName())
+                            && candidate.getParameterValue().equals(parameter.getParameterValue()));
+            source = engineDefault ? "engine-default" : "user";
+        }
+        copy.setSource(source);
+        return copy;
     }
 
     public ClusterParameterGroup deleteClusterParameterGroup(String parameterGroupName) {

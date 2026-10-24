@@ -127,7 +127,7 @@ public final class SigV4TokenTestHelper {
             String accessKeyId,
             String secretKey,
             Instant timestamp,
-            int expiresSeconds,
+            long expiresSeconds,
             String sessionToken
     ) throws Exception {
         Map<String, String> params = new LinkedHashMap<>();
@@ -231,7 +231,7 @@ public final class SigV4TokenTestHelper {
             String region,
             String service,
             Instant timestamp,
-            int expiresSeconds,
+            long expiresSeconds,
             Map<String, String> params,
             Map<String, String> signedHeaders
     ) throws Exception {
@@ -243,7 +243,7 @@ public final class SigV4TokenTestHelper {
         queryParams.put("X-Amz-Algorithm", "AWS4-HMAC-SHA256");
         queryParams.put("X-Amz-Credential", accessKeyId + "/" + credentialScope);
         queryParams.put("X-Amz-Date", dateTime);
-        queryParams.put("X-Amz-Expires", Integer.toString(expiresSeconds));
+        queryParams.put("X-Amz-Expires", Long.toString(expiresSeconds));
         String signedHeaderNames = signedHeaders.keySet().stream()
                 .sorted()
                 .reduce((left, right) -> left + ";" + right)

@@ -6,6 +6,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.services.apigatewayv2.ApiGatewayV2Client;
 import software.amazon.awssdk.services.apigatewayv2.model.IntegrationType;
@@ -28,7 +29,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {"message":"Internal Server Error"}; a statusCode given as text that spells one is taken; format
  * 2.0 takes a result without a statusCode as a 200 whose body is the result itself. A body that is
  * an object, one said to be base64 that is not, and an isBase64Encoded of "yes" are answered 500
- * too, while "True" is read as true.
+ * too, while "True" is read as true. A result with a body and no Content-Type header of its own is
+ * answered text/plain; charset=utf-8.
  */
 @DisplayName("API Gateway V2 Lambda proxy responses")
 class ApiGatewayV2LambdaProxyResponseTest {
@@ -126,6 +128,21 @@ class ApiGatewayV2LambdaProxyResponseTest {
 
         assertThat(response.statusCode()).isEqualTo(status);
         assertThat(response.body()).isEqualTo(body);
+    }
+
+    @ParameterizedTest(name = "payload {0}")
+    @ValueSource(strings = {"1.0", "2.0"})
+    void aResultWithoutAContentTypeIsAnsweredAsTextPlain(String format) throws Exception {
+        // Measured on AWS (eu-west-1, 2026-10-19): a result with a statusCode and a body but no
+        // Content-Type header of its own is answered text/plain; charset=utf-8, in both formats.
+        HttpResponse<String> response = get(format, "ok");
+
+        assertThat(response.statusCode()).isEqualTo(200);
+        assertThat(response.headers().firstValue("Content-Type"))
+                .hasValueSatisfying(contentType -> {
+                    assertThat(contentType).startsWith("text/plain");
+                    assertThat(contentType.toLowerCase()).contains("charset=utf-8");
+                });
     }
 
     private static HttpResponse<String> get(String format, String mode) throws IOException {

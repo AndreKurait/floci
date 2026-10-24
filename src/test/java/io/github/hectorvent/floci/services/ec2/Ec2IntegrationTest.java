@@ -8,6 +8,8 @@ import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -791,6 +793,33 @@ class Ec2IntegrationTest {
             .body("DescribeImagesResponse.imagesSet.item.imageId",
                     containsInAnyOrder("ami-ubuntu2404-arm64", "ami-ubuntu2404-cloud-arm64"))
             .body("DescribeImagesResponse.imagesSet.item.architecture", everyItem(equalTo("arm64")));
+    }
+
+    @ParameterizedTest
+    @Order(9)
+    @CsvSource({
+        "679593333241, openSUSE-Leap-16-0-*, ami-opensuse-leap160",
+        "679593333241, suse-sles-15-sp6-byos-v*-hvm-ssd-x86_64, ami-sles15sp6-byos",
+        "013907871322, suse-sles-15-sp6-v*-hvm-ssd-x86_64, ami-sles15sp6",
+        "792107900819, Rocky-9-EC2-Base-9*, ami-rocky9",
+        "309956199498, RHEL-9.5.0_HVM-*, ami-rhel9"
+    })
+    void describeImagesFindsSuseAndRedHatFamilyImagesByOwnerAndName(String owner, String name, String imageId) {
+        given()
+            .formParam("Action", "DescribeImages")
+            .formParam("Owner.1", owner)
+            .formParam("Filter.1.Name", "name")
+            .formParam("Filter.1.Value.1", name)
+            .formParam("Filter.2.Name", "architecture")
+            .formParam("Filter.2.Value.1", "x86_64")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeImagesResponse.imagesSet.item.size()", equalTo(1))
+            .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo(imageId))
+            .body("DescribeImagesResponse.imagesSet.item.imageOwnerId", equalTo(owner));
     }
 
     @Test

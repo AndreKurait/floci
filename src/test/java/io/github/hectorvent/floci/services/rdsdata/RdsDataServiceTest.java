@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
+import io.github.hectorvent.floci.services.rds.container.RdsBackendEndpointResolver;
 import io.github.hectorvent.floci.services.rds.container.RdsBackendGate;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
@@ -28,6 +30,7 @@ import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -947,7 +950,7 @@ class RdsDataServiceTest {
 
         harness.service.executeStatement(harness.request("select 1"), REGION);
 
-        assertEquals(List.of("127.0.0.1:3306"), harness.gate.entered);
+        assertEquals(List.of(RESOURCE_ARN), harness.gate.entered);
         assertEquals(0, harness.gate.held.get());
     }
 
@@ -1001,6 +1004,60 @@ class RdsDataServiceTest {
     }
 
     @Test
+    void resolvesTheCurrentEndpointForEveryNewPhysicalConnection() {
+        TestHarness harness = new TestHarness();
+        EndpointInfo first = new EndpointInfo("198.18.200.10", 3306);
+        EndpointInfo second = new EndpointInfo("198.18.200.11", 3306);
+        harness.currentEndpoint.set(first);
+
+        harness.service.executeStatement(harness.request("select 1"), REGION);
+        harness.currentEndpoint.set(second);
+        harness.service.executeStatement(harness.request("select 1"), REGION);
+
+        assertEquals(2, harness.endpointsResolved.get());
+        assertEquals(List.of(first, second), harness.endpointsOpened);
+        assertEquals(List.of(RESOURCE_ARN, RESOURCE_ARN), harness.gate.entered);
+    }
+
+    @Test
+    void anOpenTransactionKeepsItsConnectionWhileNewConnectionsRefresh() {
+        TestHarness harness = new TestHarness();
+        EndpointInfo first = new EndpointInfo("198.18.200.10", 3306);
+        EndpointInfo second = new EndpointInfo("198.18.200.11", 3306);
+        harness.currentEndpoint.set(first);
+        String firstTransaction = harness.service.beginTransaction(harness.beginRequest(), REGION)
+                .path("transactionId").asText();
+        harness.currentEndpoint.set(second);
+
+        ObjectNode inTransaction = harness.request("select 1");
+        inTransaction.put("transactionId", firstTransaction);
+        harness.service.executeStatement(inTransaction, REGION);
+        harness.service.executeStatement(harness.request("select 1"), REGION);
+        String secondTransaction = harness.service.beginTransaction(harness.beginRequest(), REGION)
+                .path("transactionId").asText();
+
+        assertEquals(3, harness.endpointsResolved.get());
+        assertEquals(List.of(first, second, second), harness.endpointsOpened);
+        harness.service.rollbackTransaction(harness.transactionRequest(firstTransaction), REGION);
+        harness.service.rollbackTransaction(harness.transactionRequest(secondTransaction), REGION);
+    }
+
+    @Test
+    void endpointResolutionFailureFailsClosedAndReleasesTheLease() {
+        TestHarness harness = new TestHarness();
+        harness.endpointFailure = new IllegalStateException("Docker inspect failed");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> harness.service.executeStatement(harness.request("select 1"), REGION));
+
+        assertEquals("InternalServerErrorException", error.getErrorCode());
+        assertEquals(500, error.getHttpStatus());
+        assertEquals(1, harness.endpointsResolved.get());
+        assertEquals(0, harness.connectionsOpened.get());
+        assertEquals(0, harness.gate.held.get());
+    }
+
+    @Test
     void closesConnectionWhenTransactionSetupFails() {
         RdsDataResourceResolver resolver = mock(RdsDataResourceResolver.class);
         SecretsManagerService secrets = defaultSecrets();
@@ -1010,13 +1067,15 @@ class RdsDataServiceTest {
         RdsDataConnectionFactory failingFactory = new RdsDataConnectionFactory() {
             @Override
             Connection open(RdsDataResourceResolver.DatabaseTarget target,
+                            EndpointInfo endpoint,
                             String username,
                             String password,
                             String database) {
                 return throwingSetAutoCommitConnection(closed);
             }
         };
-        RdsDataService service = new RdsDataService(resolver, secrets, objectMapper, failingFactory, Duration.ofSeconds(60));
+        RdsDataService service = new RdsDataService(
+                resolver, secrets, objectMapper, failingFactory, Duration.ofSeconds(60), endpointResolver());
 
         AwsException error = assertThrows(AwsException.class, () -> service.beginTransaction(beginRequest(), REGION));
 
@@ -1107,8 +1166,12 @@ class RdsDataServiceTest {
     }
 
     private static RdsDataResourceResolver.DatabaseTarget target(String resourceArn, DatabaseEngine engine) {
-        return new RdsDataResourceResolver.DatabaseTarget(resourceArn, engine,
-                "127.0.0.1", 3306, "sa", "", "app");
+        return new RdsDataResourceResolver.DatabaseTarget(
+                resourceArn, resourceArn, engine, "sa", "", "app");
+    }
+
+    private static RdsBackendEndpointResolver endpointResolver() {
+        return (runtimeId, engine) -> new EndpointInfo("127.0.0.1", engine.defaultPort());
     }
 
     /** The H2 compatibility mode standing in for {@code engine}. */
@@ -1160,6 +1223,7 @@ class RdsDataServiceTest {
         assertEquals("DatabaseResumingException", error.getErrorCode());
         assertEquals(400, error.getHttpStatus());
         assertEquals(0, harness.connectionsOpened.get());
+        assertEquals(0, harness.endpointsResolved.get());
         assertEquals(0, harness.gate.held.get());
 
         harness.gate.resuming = false;
@@ -1206,19 +1270,19 @@ class RdsDataServiceTest {
         private boolean resuming;
 
         @Override
-        public Lease enter(String host, int port, boolean waitForResume) {
-            if (!waitForResume && resuming) {
-                throw new ResumingException();
-            }
-            return enter(host, port);
+        public Lease enterRuntime(String runtimeId) {
+            return enterRuntime(runtimeId, true);
         }
 
         @Override
-        public Lease enter(String host, int port) {
+        public Lease enterRuntime(String runtimeId, boolean waitForResume) {
+            if (!waitForResume && resuming) {
+                throw new ResumingException();
+            }
             if (failure != null) {
                 throw failure;
             }
-            entered.add(host + ":" + port);
+            entered.add(runtimeId);
             held.incrementAndGet();
             AtomicBoolean closed = new AtomicBoolean();
             return () -> {
@@ -1235,6 +1299,10 @@ class RdsDataServiceTest {
         private final RdsDataResourceResolver.DatabaseTarget target;
         private final CountingGate gate = new CountingGate();
         private final AtomicInteger connectionsOpened = new AtomicInteger();
+        private final AtomicInteger endpointsResolved = new AtomicInteger();
+        private final AtomicReference<EndpointInfo> currentEndpoint = new AtomicReference<>();
+        private final List<EndpointInfo> endpointsOpened = new CopyOnWriteArrayList<>();
+        private volatile RuntimeException endpointFailure;
         private final RdsDataService service;
 
         private TestHarness() {
@@ -1276,18 +1344,28 @@ class RdsDataServiceTest {
             when(resolver.resolve(OTHER_RESOURCE_ARN, REGION)).thenReturn(target(OTHER_RESOURCE_ARN));
             when(resolver.resolve(UNKNOWN_RESOURCE_ARN, REGION))
                     .thenThrow(new AwsException("BadRequestException", "resource is missing", 400));
+            currentEndpoint.set(new EndpointInfo("127.0.0.1", engine.defaultPort()));
+            RdsBackendEndpointResolver backendEndpointResolver = (runtimeId, databaseEngine) -> {
+                endpointsResolved.incrementAndGet();
+                if (endpointFailure != null) {
+                    throw endpointFailure;
+                }
+                return currentEndpoint.get();
+            };
             RdsDataConnectionFactory connectionFactory = new RdsDataConnectionFactory() {
                 @Override
                 Connection open(RdsDataResourceResolver.DatabaseTarget target,
+                                EndpointInfo endpoint,
                                 String username,
                                 String password,
                                 String database) throws SQLException {
+                    endpointsOpened.add(endpoint);
                     connectionsOpened.incrementAndGet();
                     return getConnection();
                 }
             };
             service = new RdsDataService(resolver, secrets, objectMapper, connectionFactory,
-                    transactionTtl, gate, resumingExceptionEnabled);
+                    transactionTtl, gate, backendEndpointResolver, resumingExceptionEnabled);
         }
 
         private Connection getConnection() throws SQLException {

@@ -1608,6 +1608,11 @@ public class ApiGatewayExecuteController {
         return buildProxyResponse(result, httpApiV2, httpApiV2);
     }
 
+    // The Content-Type an HTTP API answers with when the function's result carries a body and no
+    // Content-Type header of its own (measured on AWS, eu-west-1, 2026-10-19, in both payload
+    // formats). A REST API keeps answering application/json.
+    private static final String HTTP_API_DEFAULT_CONTENT_TYPE = "text/plain; charset=utf-8";
+
     // httpApi selects the HTTP API error response; payloadV2 selects the integration's format 2.0
     // response rules (inference and cookies). An HTTP API integration can still use format 1.0.
     Response buildProxyResponse(InvokeResult result, boolean httpApi, boolean payloadV2) {
@@ -1670,7 +1675,7 @@ public class ApiGatewayExecuteController {
                 byte[] bytes = base64 ? Base64.getDecoder().decode(bodyStr) : bodyStr.getBytes();
                 String ct = findHeaderIgnoreCase(multiHeaders, "Content-Type")
                         .or(() -> findHeaderIgnoreCase(respHeaders, "Content-Type"))
-                        .orElse(MediaType.APPLICATION_JSON);
+                        .orElse(httpApi ? HTTP_API_DEFAULT_CONTENT_TYPE : MediaType.APPLICATION_JSON);
                 builder.entity(bytes).type(ct);
             }
             return builder.build();

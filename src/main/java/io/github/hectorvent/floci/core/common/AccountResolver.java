@@ -11,6 +11,7 @@ import java.util.regex.Pattern;
 public class AccountResolver {
 
     private static final Pattern AKID_PATTERN = Pattern.compile("Credential=([^/]+)/");
+    private static final Pattern S3_SIGV2_AKID_PATTERN = Pattern.compile("AWS ([^\\s:]+):[^\\s:]+");
     public static final String SIGV4_SCHEME = "AWS4-HMAC-SHA256";
     private static final String SIGV4_PREFIX = SIGV4_SCHEME + " ";
     private static final String SIGV4A_PREFIX = "AWS4-ECDSA-P256-SHA256 ";
@@ -54,6 +55,16 @@ public class AccountResolver {
         }
         Matcher m = AKID_PATTERN.matcher(trimmed);
         return m.find() ? m.group(1) : null;
+    }
+
+    /** Extracts S3 routing metadata without adding SigV2 authentication support. */
+    public String extractS3AccessKeyId(String authorizationHeader) {
+        String akid = extractAccessKeyId(authorizationHeader);
+        if (akid != null || authorizationHeader == null) {
+            return akid;
+        }
+        Matcher legacyS3 = S3_SIGV2_AKID_PATTERN.matcher(authorizationHeader.trim());
+        return legacyS3.matches() ? legacyS3.group(1) : null;
     }
 
     /**

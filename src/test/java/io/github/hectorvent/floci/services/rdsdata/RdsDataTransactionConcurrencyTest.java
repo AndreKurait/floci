@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.rdsdata;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
@@ -63,14 +64,15 @@ class RdsDataTransactionConcurrencyTest {
     private RdsDataService createService(Duration ttl) throws SQLException {
         RdsDataResourceResolver resolver = mock(RdsDataResourceResolver.class);
         when(resolver.resolve(RESOURCE_ARN, REGION)).thenReturn(new RdsDataResourceResolver.DatabaseTarget(
-                RESOURCE_ARN, DatabaseEngine.POSTGRES, "127.0.0.1", 5432, "sa", "", "app"));
+                RESOURCE_ARN, RESOURCE_ARN, DatabaseEngine.POSTGRES, "sa", "", "app"));
         SecretsManagerService secrets = mock(SecretsManagerService.class);
         SecretVersion version = new SecretVersion();
         version.setSecretString("{\"username\":\"sa\",\"password\":\"\"}");
         when(secrets.getSecretValue(any(), any(), any(), any())).thenReturn(version);
         RdsDataConnectionFactory factory = mock(RdsDataConnectionFactory.class);
-        when(factory.open(any(), any(), any(), any())).thenAnswer(invocation -> connection());
-        return new RdsDataService(resolver, secrets, mapper, factory, ttl);
+        when(factory.open(any(), any(), any(), any(), any())).thenAnswer(invocation -> connection());
+        return new RdsDataService(resolver, secrets, mapper, factory, ttl,
+                (runtimeId, engine) -> new EndpointInfo("127.0.0.1", 5432));
     }
 
     @AfterEach

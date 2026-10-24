@@ -18,7 +18,7 @@ class EventSourceMappingSerializationTest {
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
-        controller = new LambdaController(null, null, objectMapper);
+        controller = new LambdaController(null, null, objectMapper, null);
     }
 
     @Test

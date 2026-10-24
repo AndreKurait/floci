@@ -51,11 +51,11 @@ import java.util.regex.Pattern;
 /**
  * Manages backend Docker container lifecycle for RDS DB instances and clusters.
  * Starts postgres/mysql/mariadb containers and resolves the backend host:port for the auth proxy.
- * Every client of a container enters it through {@link #enter}, which is how an Aurora Serverless
+ * Every client of a container enters it through {@link #enterRuntime(String)}, which is how an Aurora Serverless
  * v2 cluster with MinCapacity 0 knows when it is idle enough to pause and when to resume.
  */
 @ApplicationScoped
-public class RdsContainerManager implements RdsBackendGate, Resettable {
+public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointResolver, Resettable {
 
     private static final Logger LOG = Logger.getLogger(RdsContainerManager.class);
     private static final Pattern SAFE_STORAGE_COMPONENT = Pattern.compile("[A-Za-z0-9._-]+");
@@ -516,26 +516,16 @@ public class RdsContainerManager implements RdsBackendGate, Resettable {
 
     @Override
     public Lease enterRuntime(String runtimeId) throws InterruptedException {
-        AutoPauseController controller = runtimeId != null ? autoPauses.get(runtimeId) : null;
-        return controller != null ? controller.acquire() : Lease.NONE;
+        return enterRuntime(runtimeId, true);
     }
 
     @Override
-    public Lease enter(String host, int port) throws InterruptedException {
-        return enter(host, port, true);
-    }
-
-    @Override
-    public Lease enter(String host, int port, boolean waitForResume) throws InterruptedException {
-        if (host == null) {
-            return Lease.NONE;
+    public Lease enterRuntime(String runtimeId, boolean waitForResume) throws InterruptedException {
+        if (runtimeId == null || runtimeId.isBlank()) {
+            throw new IllegalArgumentException("RDS runtime ID is required to enter its backend");
         }
-        for (AutoPauseController controller : autoPauses.values()) {
-            if (controller.serves(host, port)) {
-                return controller.acquire(waitForResume);
-            }
-        }
-        return Lease.NONE;
+        AutoPauseController controller = autoPauses.get(runtimeId);
+        return controller != null ? controller.acquire(waitForResume) : Lease.NONE;
     }
 
     /**
@@ -571,8 +561,8 @@ public class RdsContainerManager implements RdsBackendGate, Resettable {
         AutoPauseController controller = new AutoPauseController(
                 handle.getContainerId(), handle.getHost(), handle.getPort(), dockerFreezer,
                 this::scheduleAutoPauseTask, autoPauseEvents, Clock.systemUTC(), resumeDelay);
-        // Clients find a container by its address, so the new container owns it from now on,
-        // even if Docker removed the previous owner without Floci stopping it.
+        // Drop any controller still tied to this endpoint: Docker may have removed its container
+        // without Floci observing the stop before assigning the endpoint to this runtime.
         for (Map.Entry<String, AutoPauseController> entry : List.copyOf(autoPauses.entrySet())) {
             if (entry.getValue().serves(handle.getHost(), handle.getPort())
                     && autoPauses.remove(entry.getKey(), entry.getValue())) {

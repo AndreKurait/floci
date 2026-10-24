@@ -40,7 +40,27 @@ class Ec2ImageCatalogTest {
                 "ami-ubuntu2404-cloud-arm64",
                 "ami-debian12",
                 "ami-alpine",
-                "ami-0abcdef1234567893"), imageIds);
+                "ami-0abcdef1234567893",
+                "ami-opensuse-leap160",
+                "ami-sles15sp4-byos",
+                "ami-sles15sp5-byos",
+                "ami-sles15sp6-byos",
+                "ami-sles15sp7-byos",
+                "ami-sles12sp5-byos",
+                "ami-sles-sap15sp5",
+                "ami-smlm-server51-x86-64",
+                "ami-smlm-server51-arm64",
+                "ami-smlm-proxy51-x86-64",
+                "ami-smlm-proxy51-arm64",
+                "ami-sles12sp5",
+                "ami-sles15sp5",
+                "ami-sles15sp6",
+                "ami-sles15sp7",
+                "ami-sles160",
+                "ami-rocky9",
+                "ami-rocky10",
+                "ami-rhel8",
+                "ami-rhel9"), imageIds);
 
         assertTrue(imageCatalog.findByIdOrAlias("ami-amazonlinux2").isPresent());
         assertTrue(imageCatalog.findByIdOrAlias("ami-amazonlinux2023").isPresent());
