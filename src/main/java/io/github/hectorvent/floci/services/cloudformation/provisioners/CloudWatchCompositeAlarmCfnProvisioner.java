@@ -169,7 +169,7 @@ public class CloudWatchCompositeAlarmCfnProvisioner implements CfnResourceProvis
 
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
-        if (resource.getAttributes().containsKey(SNAPSHOT)) {
+        if (resource.getAttributes().containsKey(SNAPSHOT) && !ReplacementCleanup.hasReplacement(resource)) {
             return new UpdateCleanupResult(true, true, null, 0, null);
         }
         return ReplacementCleanup.complete(resource, this::delete);
