@@ -116,6 +116,7 @@ public class RuntimeApiServer {
     // RegisteredExtension's pendingEvents/waitingContext. See class doc for the discipline.
     private final Object lock = new Object();
     private final CompletableFuture<Void> initialization = new CompletableFuture<>();
+    private final CompletableFuture<Void> runtimeFailure = new CompletableFuture<>();
     private boolean runtimeNextReceived;
 
     // Invocations queued before a /next poller arrived. Guarded by lock.
@@ -294,6 +295,11 @@ public class RuntimeApiServer {
      */
     public boolean isFaulted() {
         return faulted;
+    }
+
+    /** Registers a one-shot failure signal, including a failure that preceded registration. */
+    public void onRuntimeFailure(Runnable listener) {
+        runtimeFailure.thenRun(listener);
     }
 
     /** Waits for runtime and extension initialization, without enqueuing an invocation. */
@@ -961,6 +967,7 @@ public class RuntimeApiServer {
             stranded.addAll(inFlight.values());
             inFlight.clear();
         }
+        runtimeFailure.complete(null);
         for (PendingInvocation invocation : stranded) {
             invocation.getResultFuture().complete(
                     new InvokeResult(200, "Unhandled", payload, null, invocation.getRequestId()));
@@ -1089,6 +1096,7 @@ public class RuntimeApiServer {
             stranded.addAll(inFlight.values());
             inFlight.clear();
         }
+        runtimeFailure.complete(null);
         if (!stranded.isEmpty()) {
             LOG.warnv("Lambda runtime process on port {0} exited unexpectedly (status {1}) "
                             + "with {2} invocation(s) pending",
@@ -1182,6 +1190,7 @@ public class RuntimeApiServer {
             return;
         }
 
+        runtimeFailure.complete(null);
         LOG.warnv("Extension {0} ({1}) reported {2} error ({3}) on port {4}; "
                         + "retiring execution environment",
                 removed.getName(), identifier, phase, errorType, String.valueOf(port));

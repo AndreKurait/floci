@@ -3052,6 +3052,7 @@ public class LambdaService implements ResourceProvider {
             alias.setLastModifiedDate(System.currentTimeMillis() / 1000L);
             alias.setRevisionId(UUID.randomUUID().toString());
             if (aliasStore != null) aliasStore.save(region, alias);
+            warmPool.provisionedAliasUpdated();
             return alias;
         }
     }

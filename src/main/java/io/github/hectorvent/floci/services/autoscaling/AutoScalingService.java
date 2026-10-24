@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.iam.PassedRoleLookup;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Event;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -36,6 +37,24 @@ import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class AutoScalingService implements PassedRoleLookup {
+
+    private final Event<AutoScalingGroupChanged> groupChanges;
+
+    public AutoScalingService() {
+        this(null);
+    }
+
+    @Inject
+    AutoScalingService(Event<AutoScalingGroupChanged> groupChanges) {
+        this.groupChanges = groupChanges;
+    }
+
+    private void requestReconciliation(AutoScalingGroup group) {
+        if (groupChanges != null) {
+            groupChanges.fire(new AutoScalingGroupChanged(
+                    regionResolver.getAccountId(), group.getRegion(), group.getAutoScalingGroupName()));
+        }
+    }
 
     static final String GROUP_NAME_TAG = "aws:autoscaling:groupName";
     private static final Set<String> DETACHABLE_STATES = Set.of("InService", "Standby", "Pending:Retained",
@@ -422,6 +441,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 optionalFields.applyToNewGroup(asg);
             }
             groups.put(key, asg);
+            requestReconciliation(asg);
             return asg;
         }
     }
@@ -774,6 +794,7 @@ public class AutoScalingService implements PassedRoleLookup {
             times.keySet().retainAll(remaining);
             asg.updateSuspensionState(remaining, times);
             groups.put(key, asg);
+            requestReconciliation(asg);
         }
     }
 
@@ -841,6 +862,7 @@ public class AutoScalingService implements PassedRoleLookup {
             AutoScalingGroup asg = requireGroup(region, name);
             update.accept(asg);
             groups.put(key, asg);
+            requestReconciliation(asg);
         }
     }
 
@@ -861,6 +883,7 @@ public class AutoScalingService implements PassedRoleLookup {
             }
             update.accept(asg);
             groups.put(key, asg);
+            requestReconciliation(asg);
         }
     }
 
@@ -928,6 +951,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 }
                 asg.setDesiredCapacity((int) desired);
                 groups.put(asgKey(region, name), asg);
+                requestReconciliation(asg);
             }
         }
     }
@@ -1016,6 +1040,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 asg.setDesiredCapacity(desired);
             }
             groups.put(key, asg);
+            requestReconciliation(asg);
 
         }
     }
@@ -1118,6 +1143,7 @@ public class AutoScalingService implements PassedRoleLookup {
                     "Started instance refresh " + refresh.getInstanceRefreshId() + ".",
                     "At " + now + " an instance refresh was started.",
                     "Successful");
+            requestReconciliation(asg);
             return refresh;
         }
     }
