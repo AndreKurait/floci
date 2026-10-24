@@ -109,6 +109,20 @@ class RedshiftServerlessRuntimeTest {
     }
 
     @Test
+    void failedAdoptedProxyUsesRecoveryRollback() {
+        when(containers.adoptOrStart(ACCOUNT, BACKEND_ID, "root", "Secret123", "analytics")).thenReturn(handle());
+        doThrow(new RuntimeException("port in use")).when(proxies).startProxy(any(), anyInt(), any(), anyInt(),
+                any(), any(), any(), any(), any(PasswordValidator.class), any());
+
+        assertThrows(RuntimeException.class, () -> runtime.start(ACCOUNT, REGION, "my-wg", "root", "Secret123",
+                "analytics", ENDPOINT, true, Optional::empty));
+
+        verify(proxies).stopProxy(RELAY_KEY);
+        verify(containers).rollbackStartup(ACCOUNT, BACKEND_ID);
+        verify(containers, never()).stop(ACCOUNT, BACKEND_ID);
+    }
+
+    @Test
     void adoptReattachesToASurvivingContainer() {
         when(containers.adoptOrStart(ACCOUNT, BACKEND_ID, "root", "Secret123", "analytics")).thenReturn(handle());
 
@@ -130,7 +144,7 @@ class RedshiftServerlessRuntimeTest {
                 "analytics", ENDPOINT, false, Optional::empty));
 
         verify(proxies).stopProxy(RELAY_KEY);
-        verify(containers).stop(ACCOUNT, BACKEND_ID);
+        verify(containers).rollbackStartup(ACCOUNT, BACKEND_ID);
         assertTrue(broker.resolve(ACCOUNT, BACKEND_ID, "IAM:alice").isEmpty());
     }
 
