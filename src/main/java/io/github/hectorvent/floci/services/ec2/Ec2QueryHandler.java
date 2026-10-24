@@ -5323,9 +5323,10 @@ public class Ec2QueryHandler {
                 .end("privateDnsNameOptions")
                 .start("capacityReservationSpecification")
                 .elem("capacityReservationPreference", inst.getCapacityReservationPreference());
-        if (inst.getCapacityReservationTarget() != null) {
+        if (inst.getCapacityReservationTarget() != null || inst.getCapacityReservationGroupArn() != null) {
             xml.start("capacityReservationTarget")
                     .elem("capacityReservationId", inst.getCapacityReservationTarget())
+                    .elem("capacityReservationResourceGroupArn", inst.getCapacityReservationGroupArn())
                     .end("capacityReservationTarget");
         }
         xml.end("capacityReservationSpecification");
