@@ -837,6 +837,36 @@ class ElbV2ServiceTest {
         assertTrue(group.getTargets().isEmpty());
     }
 
+    @ParameterizedTest
+    @CsvSource({"register,1", "register,65535", "deregister,1", "deregister,65535", "health,1", "health,65535"})
+    void lambdaTargetPortsAreRejectedBeforeBatchMutation(String operation, int port) {
+        TargetGroup group = service.createTargetGroup(REGION, "lambda-port", null, null, null,
+                null, "lambda", null, null, false, null, null, null, null, null, null, null, Map.of());
+        String id = "arn:aws:lambda:us-west-2:000000000000:function:target";
+        service.registerTargets(REGION, group.getTargetGroupArn(), List.of(target(id, null)));
+        clearInvocations(healthChecker);
+        AwsException error = assertThrows(AwsException.class, () -> targetOperation(operation,
+                group.getTargetGroupArn(), List.of(target(id, null), target(id, port))));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals("Port cannot be specified for Lambda function targets", error.getMessage());
+        assertEquals(1, group.getTargets().size());
+        assertEquals(null, group.getTargets().getFirst().getPort());
+        verifyNoInteractions(healthChecker);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"register", "deregister", "health"})
+    void lambdaTargetPortRangeValidationPrecedesTargetTypeValidation(String operation) {
+        TargetGroup group = service.createTargetGroup(REGION, "lambda-range", null, null, null,
+                null, "lambda", null, null, false, null, null, null, null, null, null, null, Map.of());
+        clearInvocations(healthChecker);
+        AwsException error = assertThrows(AwsException.class, () -> targetOperation(operation,
+                group.getTargetGroupArn(), List.of(target("lambda-target", 65536))));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertTrue(error.getMessage().contains("targets.1.member.port"));
+        verifyNoInteractions(healthChecker);
+    }
+
     private void targetOperation(String operation, String arn, List<TargetDescription> targets) {
         switch (operation) {
             case "register" -> service.registerTargets(REGION, arn, targets);

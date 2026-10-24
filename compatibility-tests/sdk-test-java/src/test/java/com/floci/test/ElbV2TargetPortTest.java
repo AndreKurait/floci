@@ -83,4 +83,37 @@ class ElbV2TargetPortTest {
             client.deleteTargetGroup(r -> r.targetGroupArn(arn));
         }
     }
+
+    @ParameterizedTest
+    @CsvSource({"register,1", "register,65535", "register,65536", "deregister,1", "deregister,65535",
+            "deregister,65536", "health,1", "health,65535", "health,65536"})
+    @DisplayName("Lambda target ports are rejected after numeric range validation")
+    void lambdaTargetPort(String operation, int port) {
+        String arn = client.createTargetGroup(r -> r.name(TestFixtures.uniqueName("lambda-port"))
+                .targetType("lambda")).targetGroups().get(0).targetGroupArn();
+        try {
+            List<TargetDescription> targets = List.of(TargetDescription.builder()
+                    .id("arn:aws:lambda:us-east-1:000000000000:function:absent").port(port).build());
+            ElasticLoadBalancingV2Exception error = assertThrows(ElasticLoadBalancingV2Exception.class, () -> {
+                switch (operation) {
+                    case "register" -> client.registerTargets(r -> r.targetGroupArn(arn).targets(targets));
+                    case "deregister" -> client.deregisterTargets(r -> r.targetGroupArn(arn).targets(targets));
+                    case "health" -> client.describeTargetHealth(r -> r.targetGroupArn(arn).targets(targets));
+                    default -> throw new IllegalArgumentException(operation);
+                }
+            });
+            assertThat(error.awsErrorDetails().errorCode()).isEqualTo("ValidationError");
+            assertThat(error.statusCode()).isEqualTo(400);
+            if (port > 65535) {
+                assertThat(error.awsErrorDetails().errorMessage()).contains("targets.1.member.port");
+            } else {
+                assertThat(error.awsErrorDetails().errorMessage())
+                        .isEqualTo("Port cannot be specified for Lambda function targets");
+            }
+            assertThat(client.describeTargetHealth(r -> r.targetGroupArn(arn)).targetHealthDescriptions()).isEmpty();
+        } finally {
+            client.deleteTargetGroup(r -> r.targetGroupArn(arn));
+        }
+    }
+
 }

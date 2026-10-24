@@ -960,6 +960,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     public void registerTargets(String region, String tgArn, List<TargetDescription> targets) {
         validateTargetPorts(targets);
         TargetGroup tg = requireTargetGroup(region, tgArn);
+        validateLambdaTargetPorts(tg, targets);
         if (!"lambda".equals(tg.getTargetType())) {
             for (TargetDescription t : targets) {
                 requireNotMetadataAddress(t.getId());
@@ -994,6 +995,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     public void deregisterTargets(String region, String tgArn, List<TargetDescription> targets) {
         validateTargetPorts(targets);
         TargetGroup tg = requireTargetGroup(region, tgArn);
+        validateLambdaTargetPorts(tg, targets);
         for (TargetDescription t : targets) {
             tg.getTargets().removeIf(e -> e.getId().equals(t.getId())
                     && ElbV2HealthChecker.effectivePort(e, tg) == ElbV2HealthChecker.effectivePort(t, tg));
@@ -1006,6 +1008,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                                      List<TargetDescription> filterTargets) {
         validateTargetPorts(filterTargets);
         TargetGroup tg = requireTargetGroup(region, tgArn);
+        validateLambdaTargetPorts(tg, filterTargets);
         boolean hasFilterTargets = filterTargets != null && !filterTargets.isEmpty();
         List<TargetDescription> candidates = hasFilterTargets ? filterTargets : tg.getTargets();
 
@@ -1527,6 +1530,17 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                     try { return Integer.parseInt(r.getPriority()); } catch (NumberFormatException e) { return Integer.MAX_VALUE; }
                 }))
                 .collect(Collectors.toList());
+    }
+
+    private static void validateLambdaTargetPorts(TargetGroup group, List<TargetDescription> targets) {
+        if (!"lambda".equals(group.getTargetType()) || targets == null) {
+            return;
+        }
+        for (TargetDescription target : targets) {
+            if (target.getPort() != null) {
+                throw new AwsException("ValidationError", "Port cannot be specified for Lambda function targets", 400);
+            }
+        }
     }
 
     private static void validateTargetPorts(List<TargetDescription> targets) {
