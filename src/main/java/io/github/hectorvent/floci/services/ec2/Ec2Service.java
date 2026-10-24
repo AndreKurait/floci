@@ -102,6 +102,7 @@ import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
+import io.github.hectorvent.floci.services.resourcegroups.ResourceGroupsService;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.context.ContextNotActiveException;
@@ -308,6 +309,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final StorageBackend<String, List<Tag>> tags;
     private final StorageBackend<String, CapacityReservation> capacityReservations;
     private final Object capacityReservationLock = new Object();
+    // CDI Instance clashes with the EC2 Instance model imported above.
+    jakarta.enterprise.inject.Instance<ResourceGroupsService> resourceGroupsServices;
     private final StorageBackend<String, Host> hosts;
     private final StorageBackend<String, EgressOnlyInternetGateway> egressOnlyInternetGateways;
     // Serialises a launch onto a host against ModifyHosts/ReleaseHosts, so a host cannot be
@@ -477,7 +480,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                       jakarta.enterprise.inject.Instance<VpcRouteTableListener> routeTableListenersInstance,
                       jakarta.enterprise.inject.Instance<Ec2InstanceLaunchListener> instanceLaunchListenersInstance,
                       Ec2EbsEncryptionService ebsEncryptionService,
-                      jakarta.enterprise.inject.Instance<VpcDependencyProvider> vpcDependencyProviders) {
+                      jakarta.enterprise.inject.Instance<VpcDependencyProvider> vpcDependencyProviders,
+                      jakarta.enterprise.inject.Instance<ResourceGroupsService> resourceGroupsServices) {
         this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog,
                 instanceTypeCatalog, storageFactory, requestContextInstance, iamService, volumeBlockDeviceManager);
         this.vpcNetworkManager = vpcNetworkManager;
@@ -486,6 +490,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         this.instanceLaunchListenersInstance = instanceLaunchListenersInstance;
         this.ebsEncryptionService = ebsEncryptionService;
         this.vpcDependencyProviders = vpcDependencyProviders;
+        this.resourceGroupsServices = resourceGroupsServices;
     }
 
     public Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
@@ -1880,6 +1885,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public static String defaultSubnetId(String region, String azSuffix) {
         return "subnet-default-" + region + "-" + azSuffix;
+    }
+
+    public static boolean isModelledAvailabilityZone(String region, String zone) {
+        return Arrays.stream(MODELLED_ZONE_SUFFIXES).anyMatch(suffix -> (region + suffix).equals(zone));
     }
 
     public static String defaultSecurityGroupId(String region) {
@@ -3678,16 +3687,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         LaunchTemplateData.CapacityReservationTarget capacityTarget = capacitySpecification == null ? null
                 : capacitySpecification.getCapacityReservationTarget();
         String capacityTargetId = capacityTarget == null ? null : capacityTarget.getCapacityReservationId();
+        String capacityGroupArn = capacityTarget == null ? null
+                : capacityTarget.getCapacityReservationResourceGroupArn();
         if (!Set.of("open", "none", "capacity-reservations-only").contains(capacityPreference)) {
             throw new AwsException("InvalidParameterValue", "Invalid Capacity Reservation preference.", 400);
         }
-        if (capacityTarget != null && capacityTarget.getCapacityReservationResourceGroupArn() != null) {
-            throw new AwsException("Unsupported", "Capacity Reservation resource group targeting is not supported.", 400);
-        }
-        if ((capacityTargetId != null && "none".equals(capacityPreference))
-                || (spot && (capacityTargetId != null || "capacity-reservations-only".equals(capacityPreference)))) {
+        if ((capacityTargetId != null && capacityGroupArn != null)
+                || ((capacityTargetId != null || capacityGroupArn != null) && "none".equals(capacityPreference))
+                || (spot && (capacityTargetId != null || capacityGroupArn != null
+                        || "capacity-reservations-only".equals(capacityPreference)))) {
             throw new AwsException("InvalidParameterCombination", "Invalid Capacity Reservation target combination.", 400);
         }
+        Set<String> capacityGroupMembers = capacityGroupArn == null ? null
+                : capacityGroupMembers(region, callerAccountId(), capacityGroupArn, true);
         if (privateIpAddress != null && privateIpAddress.isBlank()) {
             privateIpAddress = null;
         }
@@ -3812,7 +3824,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
                 long available = target == null
                         ? capacityReservations.scan(k -> k.startsWith(region + "::")).stream()
-                                .filter(candidate -> "open".equals(candidate.getInstanceMatchCriteria()))
+                                .filter(candidate -> capacityGroupMembers == null
+                                        ? "open".equals(candidate.getInstanceMatchCriteria())
+                                        : capacityGroupMembers.contains(candidate.getCapacityReservationArn()))
                                 .filter(candidate -> matchesCapacityReservation(requested, candidate))
                                 .mapToLong(CapacityReservation::getAvailableInstanceCount).sum()
                         : target.getAvailableInstanceCount();
@@ -3891,6 +3905,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         inst.setCapacityReservationPlatform(capacityReservationPlatform(region, imageId));
                         inst.setCapacityReservationPreference(capacityTargetId == null ? capacityPreference : null);
                         inst.setCapacityReservationTarget(capacityTargetId);
+                        inst.setCapacityReservationGroupArn(capacityGroupArn);
                         Placement placement = new Placement(az);
                         placement.setHostId(hostId);
                         if (tenancy != null && !tenancy.isBlank()) {
@@ -10023,9 +10038,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private void reconcileCapacityMembership(String region) {
+        List<CapacityReservation> reconciled = new ArrayList<>();
         Map<String, CapacityReservation> changed = new LinkedHashMap<>();
         for (CapacityReservation stored : capacityReservations.scan(k -> k.startsWith(region + "::"))) {
             CapacityReservation updated = new CapacityReservation(stored);
+            reconciled.add(updated);
             boolean expired = "active".equals(updated.getState()) && updated.getEndDate() != null
                     && !updated.getEndDate().isAfter(Instant.now());
             if (expired) {
@@ -10038,6 +10055,36 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 updated.setAvailableInstanceCount("active".equals(updated.getState())
                         ? updated.getAvailableInstanceCount() + released : 0);
                 changed.put(key(region, updated.getCapacityReservationId()), updated);
+            }
+        }
+        List<CapacityReservation> available = reconciled.stream()
+                .filter(reservation -> "active".equals(reservation.getState())
+                        && reservation.getAvailableInstanceCount() > 0).toList();
+        if (!available.isEmpty()) {
+            Set<String> associated = new HashSet<>();
+            for (CapacityReservation reservation : reconciled) {
+                associated.addAll(reservation.getInstanceIds());
+            }
+            for (Instance instance : instances.scan(k -> k.startsWith(region + "::"))) {
+                if (instance.getState() == null || !"running".equals(instance.getState().getName())
+                        || instance.isSpot() || instance.getCapacityReservationGroupArn() == null
+                        || instance.getCapacityReservationTarget() != null
+                        || !Objects.equals(callerAccountId(), instance.getOwnerId())
+                        || associated.contains(instance.getInstanceId())) {
+                    continue;
+                }
+                Set<String> groupMembers = capacityGroupMembers(region, instance.getOwnerId(),
+                        instance.getCapacityReservationGroupArn(), false);
+                CapacityReservation selected = available.stream()
+                        .filter(reservation -> groupMembers.contains(reservation.getCapacityReservationArn()))
+                        .filter(reservation -> reservation.getAvailableInstanceCount() > 0)
+                        .filter(reservation -> matchesCapacityReservation(instance, reservation)).findFirst().orElse(null);
+                if (selected != null) {
+                    selected.getInstanceIds().add(instance.getInstanceId());
+                    selected.setAvailableInstanceCount(selected.getAvailableInstanceCount() - 1);
+                    associated.add(instance.getInstanceId());
+                    changed.put(key(region, selected.getCapacityReservationId()), selected);
+                }
             }
         }
         if (!changed.isEmpty()) {
@@ -10065,9 +10112,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     continue;
                 }
                 String target = instance.getCapacityReservationTarget();
+                Set<String> groupMembers = instance.getCapacityReservationGroupArn() == null ? null
+                        : capacityGroupMembers(region, instance.getOwnerId(),
+                                instance.getCapacityReservationGroupArn(), false);
                 CapacityReservation selected = candidates.stream()
-                        .filter(r -> target == null ? "open".equals(r.getInstanceMatchCriteria())
-                                : target.equals(r.getCapacityReservationId()))
+                        .filter(r -> groupMembers != null ? groupMembers.contains(r.getCapacityReservationArn())
+                                : target == null ? "open".equals(r.getInstanceMatchCriteria())
+                                        : target.equals(r.getCapacityReservationId()))
                         .filter(r -> matchesCapacityReservation(instance, r))
                         .filter(r -> r.getAvailableInstanceCount() > 0).findFirst().orElse(null);
                 if (selected == null) {
@@ -10123,6 +10174,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         capacityReservationZone(instance.getRegion(), reservation))
                 && Objects.equals(instance.getPlacement().getTenancy(), reservation.getTenancy())
                 && Objects.equals(instance.getCapacityReservationPlatform(), reservation.getInstancePlatform());
+    }
+
+    private Set<String> capacityGroupMembers(String region, String account, String arn, boolean launching) {
+        if (resourceGroupsServices == null || !resourceGroupsServices.isResolvable()) {
+            throw new AwsException("Unsupported", "Capacity Reservation resource groups are unavailable.", 400);
+        }
+        try {
+            return Set.copyOf(resourceGroupsServices.get().capacityReservationMembers(region, account, arn));
+        } catch (AwsException error) {
+            if ("NotFoundException".equals(error.getErrorCode()) && !launching) {
+                return Set.of();
+            }
+            if (Set.of("NotFoundException", "BadRequestException").contains(error.getErrorCode())) {
+                throw new AwsException("InvalidParameterValue", "The Capacity Reservation group ARN is invalid.", 400);
+            }
+            throw error;
+        }
     }
 
     /**
@@ -10193,6 +10261,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     if ("running".equals(instance.getState().getName()) && !instance.isSpot()
                             && "open".equals(instance.getCapacityReservationPreference())
                             && instance.getCapacityReservationTarget() == null
+                            && instance.getCapacityReservationGroupArn() == null
                             && !associated.contains(instance.getInstanceId())
                             && matchesCapacityReservation(instance, reservation)) {
                         reservation.getInstanceIds().add(instance.getInstanceId());
