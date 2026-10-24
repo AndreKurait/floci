@@ -219,6 +219,9 @@ notes:
 # Trailing prose appended to a row after its type list, for behaviour that belongs to the service
 # rather than to one type.
 row_notes:
+  AWS::CloudWatch: >-
+    Composite alarms have backing definitions with name Ref and Arn GetAtt, rollback, and
+    replacement cleanup. Composite actions are stored only; suppression properties are rejected.
   AWS::AppSync: >-
     `Ref` on `GraphQLApi` and `ApiKey` returns the id where AWS returns the ARN. See
     [AppSync](appsync.md#cloudformation) for `Ref` and `Fn::GetAtt` compared with AWS.

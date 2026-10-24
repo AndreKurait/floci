@@ -379,6 +379,7 @@ HTTP 404 `UnknownOperationException`. IAM policies use the `cloudwatch` action p
 | `GetMetricStatistics` | Get metric statistics (Average, Sum, etc.) |
 | `GetMetricData` | Query metrics with math expressions |
 | `PutMetricAlarm` | Create a metric alarm |
+| `PutCompositeAlarm` | Create or update a composite alarm rule |
 | `DescribeAlarms` | List alarms |
 | `DeleteAlarms` | Delete alarms |
 | `SetAlarmState` | Manually set alarm state |
@@ -401,6 +402,11 @@ delivers metrics to the Firehose delivery stream a metric stream names.
 
 SQS publishes its queue metrics under `AWS/SQS` once a minute; see
 [SQS CloudWatch Metrics](sqs.md#cloudwatch-metrics).
+
+Composite alarms support boolean rules over alarm states. Request `AlarmTypes` containing
+`CompositeAlarm` when describing them; the default describes metric alarms. Composite
+action lists are stored but not executed. Action suppression is not implemented and is
+rejected with `ValidationError`.
 
 ### SNS alarm actions
 
