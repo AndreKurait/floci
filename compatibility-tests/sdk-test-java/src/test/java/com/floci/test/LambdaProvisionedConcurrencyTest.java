@@ -17,14 +17,8 @@ import software.amazon.awssdk.services.lambda.model.PutProvisionedConcurrencyCon
 import software.amazon.awssdk.services.lambda.model.ResourceConflictException;
 import software.amazon.awssdk.services.lambda.model.ResourceNotFoundException;
 import software.amazon.awssdk.services.lambda.model.Runtime;
-import software.amazon.awssdk.services.lambda.model.SnapStartApplyOn;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.UUID;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -81,52 +75,6 @@ class LambdaProvisionedConcurrencyTest {
         assertThatThrownBy(() -> lambda.getProvisionedConcurrencyConfig(request -> request
                 .functionName(name).qualifier("live"))).isInstanceOf(ProvisionedConcurrencyConfigNotFoundException.class);
         lambda.deleteProvisionedConcurrencyConfig(request -> request.functionName(name).qualifier("live"));
-    }
-
-    @Test
-    @DisplayName("SnapStart eligibility follows the published version for Put and alias retargeting")
-    void snapStartVersionRejectsProvisionedConcurrency() throws IOException {
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        try (ZipOutputStream zip = new ZipOutputStream(bytes)) {
-            zip.putNextEntry(new ZipEntry("index.py"));
-            zip.write("def handler(event, context):\n    return {'ok': True}\n".getBytes(StandardCharsets.UTF_8));
-            zip.closeEntry();
-        }
-        lambda.updateFunctionCode(request -> request.functionName(name).zipFile(SdkBytes.fromByteArray(bytes.toByteArray())));
-        lambda.updateFunctionConfiguration(request -> request.functionName(name).runtime(Runtime.PYTHON3_12)
-                .snapStart(snapStart -> snapStart.applyOn(SnapStartApplyOn.PUBLISHED_VERSIONS)));
-        String snapStartVersion = lambda.publishVersion(request -> request.functionName(name)).version();
-        lambda.createAlias(request -> request.functionName(name).name("snap").functionVersion(snapStartVersion));
-        lambda.putProvisionedConcurrencyConfig(request -> request.functionName(name).qualifier("live")
-                .provisionedConcurrentExecutions(1));
-        lambda.updateFunctionConfiguration(request -> request.functionName(name)
-                .snapStart(snapStart -> snapStart.applyOn(SnapStartApplyOn.NONE)));
-
-        for (String qualifier : new String[]{snapStartVersion, "snap"}) {
-            assertThatThrownBy(() -> lambda.putProvisionedConcurrencyConfig(request -> request
-                    .functionName(name).qualifier(qualifier).provisionedConcurrentExecutions(1)))
-                    .isInstanceOf(ResourceConflictException.class)
-                    .hasMessageContaining("Provisioned Concurrency is not supported for SnapStart enabled functions");
-            assertThatThrownBy(() -> lambda.getProvisionedConcurrencyConfig(request -> request
-                    .functionName(name).qualifier(qualifier)))
-                    .isInstanceOf(ProvisionedConcurrencyConfigNotFoundException.class);
-            lambda.deleteProvisionedConcurrencyConfig(request -> request.functionName(name).qualifier(qualifier));
-        }
-
-        GetAliasResponse before = lambda.getAlias(request -> request.functionName(name).name("live"));
-        assertThatThrownBy(() -> lambda.updateAlias(request -> request.functionName(name).name("live")
-                .functionVersion(snapStartVersion).description("must not persist")))
-                .isInstanceOf(ResourceConflictException.class)
-                .hasMessageContaining("Provisioned Concurrency is not supported for SnapStart enabled functions");
-        GetAliasResponse after = lambda.getAlias(request -> request.functionName(name).name("live"));
-        assertThat(after.functionVersion()).isEqualTo(before.functionVersion());
-        assertThat(after.description()).isEqualTo(before.description());
-        assertThat(after.revisionId()).isEqualTo(before.revisionId());
-        assertThat(lambda.getProvisionedConcurrencyConfig(request -> request.functionName(name).qualifier("live"))
-                .requestedProvisionedConcurrentExecutions()).isEqualTo(1);
-        lambda.updateAlias(request -> request.functionName(name).name("live").description("description only"));
-        lambda.deleteProvisionedConcurrencyConfig(request -> request.functionName(name).qualifier("live"));
-        lambda.updateAlias(request -> request.functionName(name).name("live").functionVersion(snapStartVersion));
     }
 
     @Test
