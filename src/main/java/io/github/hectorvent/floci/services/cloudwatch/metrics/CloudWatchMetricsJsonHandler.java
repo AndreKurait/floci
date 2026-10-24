@@ -295,8 +295,12 @@ public class CloudWatchMetricsJsonHandler {
 
     private void describeAlarmFields(ObjectNode node, Alarm a) {
         node.put("AlarmName", a.getAlarmName());
-        if (a.getAlarmArn() != null) node.put("AlarmArn", a.getAlarmArn());
-        if (a.getAlarmDescription() != null) node.put("AlarmDescription", a.getAlarmDescription());
+        if (a.getAlarmArn() != null) {
+            node.put("AlarmArn", a.getAlarmArn());
+        }
+        if (a.getAlarmDescription() != null) {
+            node.put("AlarmDescription", a.getAlarmDescription());
+        }
         ArrayNode alarmActions = node.putArray("AlarmActions");
         a.getAlarmActions().forEach(alarmActions::add);
         ArrayNode okActions = node.putArray("OKActions");
@@ -304,9 +308,15 @@ public class CloudWatchMetricsJsonHandler {
         ArrayNode insufficientDataActions = node.putArray("InsufficientDataActions");
         a.getInsufficientDataActions().forEach(insufficientDataActions::add);
         node.put("ActionsEnabled", a.isActionsEnabled());
-        if (a.getStateValue() != null) node.put("StateValue", a.getStateValue());
-        if (a.getStateReason() != null) node.put("StateReason", a.getStateReason());
-        if (a.getStateReasonData() != null) node.put("StateReasonData", a.getStateReasonData());
+        if (a.getStateValue() != null) {
+            node.put("StateValue", a.getStateValue());
+        }
+        if (a.getStateReason() != null) {
+            node.put("StateReason", a.getStateReason());
+        }
+        if (a.getStateReasonData() != null) {
+            node.put("StateReasonData", a.getStateReasonData());
+        }
         node.put("StateUpdatedTimestamp", a.getStateUpdatedTimestamp());
         node.put("AlarmConfigurationUpdatedTimestamp", a.getAlarmConfigurationUpdatedTimestamp());
     }
