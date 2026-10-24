@@ -232,17 +232,18 @@ class ElastiCacheServiceTest {
         ExecutorService pool = Executors.newSingleThreadExecutor();
         CountDownLatch started = new CountDownLatch(1);
         try {
-            Future<String> tag = pool.submit(() -> {
-                started.countDown();
-                try {
-                    service.addTagsToResource(arn, Map.of("env", "test"), "us-east-1");
-                    return "tagged";
-                } catch (AwsException error) {
-                    return error.getErrorCode();
-                }
-            });
+            Future<String> tag;
             String completedBeforeDelete = null;
             synchronized (monitor) {
+                tag = pool.submit(() -> {
+                    started.countDown();
+                    try {
+                        service.addTagsToResource(arn, Map.of("env", "test"), "us-east-1");
+                        return "tagged";
+                    } catch (AwsException error) {
+                        return error.getErrorCode();
+                    }
+                });
                 assertTrue(started.await(5, TimeUnit.SECONDS));
                 try {
                     completedBeforeDelete = tag.get(1, TimeUnit.SECONDS);
