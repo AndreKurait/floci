@@ -142,16 +142,16 @@ public class ContainerLifecycleManager {
         try {
             return withPublishedHostPorts(startCreated(containerId, spec), spec);
         } catch (RuntimeException failure) {
-            if (removeAnonymousVolumes) {
-                removeFailedEphemeralContainer(containerId, failure);
-            } else {
-                removeIfExists(containerId);
-            }
+            removeFailedContainer(containerId, failure, removeAnonymousVolumes);
             throw failure;
         }
     }
 
-    private void removeFailedEphemeralContainer(String containerId, RuntimeException failure) {
+    private void removeFailedContainer(String containerId, RuntimeException failure, boolean removeAnonymousVolumes) {
+        if (!removeAnonymousVolumes) {
+            removeIfExists(containerId);
+            return;
+        }
         try {
             removeIfExistsStrict(containerId, true);
         } catch (RuntimeException cleanupFailure) {
@@ -203,11 +203,7 @@ public class ContainerLifecycleManager {
             try {
                 attachNetworkBeforeStart(containerId, spec);
             } catch (RuntimeException e) {
-                if (removeAnonymousVolumes) {
-                    removeFailedEphemeralContainer(containerId, e);
-                } else {
-                    removeIfExists(containerId);
-                }
+                removeFailedContainer(containerId, e, removeAnonymousVolumes);
                 throw new IllegalStateException(
                         "Failed to attach pre-start network configuration for container " + containerId, e);
             }
