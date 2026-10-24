@@ -65,6 +65,57 @@ class CompositeAlarmServiceTest {
     }
 
     @Test
+    void unrelatedWritesPreserveManualCompositeStatesAndParentStates() {
+        put("source", "FALSE");
+        put("aggregate", "ALARM(source)");
+        put("parent", "ALARM(aggregate)");
+        service.setAlarmState("aggregate", "ALARM", "manual", null, REGION);
+        assertEquals("ALARM", state("parent"));
+        put("unrelated", "TRUE");
+        assertEquals("ALARM", state("aggregate"));
+        assertEquals("ALARM", state("parent"));
+        MetricAlarm metric = new MetricAlarm();
+        metric.setAlarmName("unrelated-metric");
+        service.putMetricAlarm(metric, REGION);
+        assertEquals("ALARM", state("aggregate"));
+        service.setAlarmState("unrelated-metric", "ALARM", "unrelated", null, REGION);
+        assertEquals("ALARM", state("aggregate"));
+        service.deleteAlarms(List.of("unrelated"), REGION);
+        assertEquals("ALARM", state("aggregate"));
+        assertEquals("ALARM", state("parent"));
+        service.setAlarmState("source", "ALARM", "child changed", null, REGION);
+        service.setAlarmState("source", "OK", "child recovered", null, REGION);
+        assertEquals("OK", state("aggregate"));
+        assertEquals("OK", state("parent"));
+    }
+
+    @Test
+    void unchangedChildStateDoesNotResetManuallySetParent() {
+        put("source", "FALSE");
+        put("child", "ALARM(source) AND FALSE");
+        put("parent", "ALARM(child)");
+        service.setAlarmState("parent", "ALARM", "manual", null, REGION);
+        service.setAlarmState("source", "ALARM", "child condition remains false", null, REGION);
+        assertEquals("OK", state("child"));
+        assertEquals("ALARM", state("parent"));
+    }
+
+    @Test
+    void creationAndDeletionReevaluateOnlyReferencingComposites() {
+        MetricAlarm metric = new MetricAlarm();
+        metric.setAlarmName("late");
+        put("watcher", "INSUFFICIENT_DATA(late)");
+        put("outer", "ALARM(watcher)");
+        assertEquals("OK", state("watcher"));
+        service.putMetricAlarm(metric, REGION);
+        assertEquals("ALARM", state("watcher"));
+        assertEquals("ALARM", state("outer"));
+        service.deleteAlarms(List.of("late"), REGION);
+        assertEquals("OK", state("watcher"));
+        assertEquals("OK", state("outer"));
+    }
+
+    @Test
     void tagReadIsAnIndependentSnapshotOfTheOwnedAlarm() {
         CompositeAlarm alarm = put("tag-snapshot", "TRUE");
         service.tagResource(alarm.getAlarmArn(), Map.of("team", "old"), REGION);

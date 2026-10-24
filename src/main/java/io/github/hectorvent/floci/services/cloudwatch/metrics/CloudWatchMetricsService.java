@@ -326,7 +326,7 @@ public class CloudWatchMetricsService {
 
     public synchronized void putMetricAlarm(MetricAlarm alarm, String region) {
         putAlarm(alarm, region);
-        evaluateComposites(region, null);
+        evaluateComposites(region, Set.of(alarm.getAlarmName()), null);
     }
 
     public void putCompositeAlarm(CompositeAlarm alarm, String region) {
@@ -353,7 +353,7 @@ public class CloudWatchMetricsService {
         boolean created = alarmStore.get(region + "::" + alarm.getAlarmName()).isEmpty();
         putAlarm(alarm, region);
         if (created) {
-            evaluateComposites(region, null);
+            evaluateComposites(region, Set.of(), alarm.getAlarmName());
         }
     }
 
@@ -426,14 +426,38 @@ public class CloudWatchMetricsService {
         return alarms;
     }
 
-    private void evaluateComposites(String region, String manualAlarm) {
+    private void evaluateComposites(String region, Set<String> changedAlarmNames, String newAlarm) {
+        if (changedAlarmNames.isEmpty() && newAlarm == null) {
+            return;
+        }
         Map<String, Alarm> alarms = alarmIndex(region);
-        Map<String, CompositeAlarmRule.Rule> pending = new HashMap<>();
+        Set<String> changed = new HashSet<>(changedAlarmNames);
+        for (String name : changedAlarmNames) {
+            changed.add(regionResolver.buildArn("cloudwatch", region, "alarm:" + name));
+        }
+        Map<String, CompositeAlarmRule.Rule> candidates = new HashMap<>();
         for (Alarm alarm : new HashSet<>(alarms.values())) {
-            if (alarm instanceof CompositeAlarm composite && !alarm.getAlarmName().equals(manualAlarm)) {
-                pending.put(alarm.getAlarmName(), CompositeAlarmRule.parse(composite.getAlarmRule()));
+            if (alarm instanceof CompositeAlarm composite && !changedAlarmNames.contains(alarm.getAlarmName())) {
+                candidates.put(alarm.getAlarmName(), CompositeAlarmRule.parse(composite.getAlarmRule()));
             }
         }
+        Set<String> affected = new HashSet<>(changed);
+        Map<String, CompositeAlarmRule.Rule> pending = new HashMap<>();
+        boolean discovered;
+        do {
+            discovered = false;
+            Iterator<Map.Entry<String, CompositeAlarmRule.Rule>> iterator = candidates.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<String, CompositeAlarmRule.Rule> next = iterator.next();
+                if (next.getKey().equals(newAlarm) || next.getValue().references().stream().anyMatch(affected::contains)) {
+                    pending.put(next.getKey(), next.getValue());
+                    affected.add(next.getKey());
+                    affected.add(alarms.get(next.getKey()).getAlarmArn());
+                    iterator.remove();
+                    discovered = true;
+                }
+            }
+        } while (discovered);
         Set<String> cycles = pending.keySet().stream()
                 .filter(name -> isCyclic(name, alarms)).collect(Collectors.toSet());
         boolean progress;
@@ -445,6 +469,12 @@ public class CloudWatchMetricsService {
                 boolean blocked = next.getValue().references().stream().map(alarms::get)
                         .anyMatch(child -> child != null && pending.containsKey(child.getAlarmName()));
                 if (blocked || cycles.contains(next.getKey())) {
+                    continue;
+                }
+                if (!next.getKey().equals(newAlarm)
+                        && next.getValue().references().stream().noneMatch(changed::contains)) {
+                    iterator.remove();
+                    progress = true;
                     continue;
                 }
                 Alarm alarm = alarms.get(next.getKey());
@@ -459,6 +489,8 @@ public class CloudWatchMetricsService {
                     alarm.setStateReasonData(null);
                     alarm.setStateUpdatedTimestamp(Instant.now().getEpochSecond());
                     alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
+                    changed.add(alarm.getAlarmName());
+                    changed.add(alarm.getAlarmArn());
                 }
                 iterator.remove();
                 progress = true;
@@ -480,10 +512,14 @@ public class CloudWatchMetricsService {
                 throw new AwsException("ValidationError", "Break the composite alarm cycle before deleting " + name, 400);
             }
         }
+        Set<String> deletedNames = new HashSet<>();
         for (String name : alarmNames) {
+            if (alarmStore.get(region + "::" + name).isPresent()) {
+                deletedNames.add(name);
+            }
             alarmStore.delete(region + "::" + name);
         }
-        evaluateComposites(region, null);
+        evaluateComposites(region, deletedNames, null);
         LOG.infov("Deleted alarms: {0} in {1}", alarmNames, region);
     }
 
@@ -525,7 +561,7 @@ public class CloudWatchMetricsService {
             alarm.setStateUpdatedTimestamp(Instant.now().getEpochSecond());
 
             alarmStore.put(key, alarm);
-            evaluateComposites(region, alarmName);
+            evaluateComposites(region, Set.of(alarmName), null);
             LOG.infov("SetAlarmState: {0} -> {1}", alarmName, stateValue);
             if (alarmSnsNotifier != null && alarm instanceof MetricAlarm metricAlarm) {
                 notifications = alarmSnsNotifier.prepareTransition(metricAlarm, oldState);
