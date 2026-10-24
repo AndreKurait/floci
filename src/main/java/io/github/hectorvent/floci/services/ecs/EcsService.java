@@ -136,6 +136,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     // Replaced by afterReset() after a state reset, whose container teardown shuts this scheduler down.
     private volatile ScheduledExecutorService reconciler = newReconciler();
     private final Object reconcilerLock = new Object();
+    private final Object reconciliationPassLock = new Object();
     // False until a previous run's task containers are confirmed gone; no task starts before.
     private volatile boolean leftoverContainersRemoved = true;
     private volatile boolean leftoverTaskVolumesRemoved;
@@ -4782,25 +4783,27 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     // ── Service Reconciliation ────────────────────────────────────────────────
 
     void reconcile() {
-        try {
-            retryPreviousRunTaskVolumes();
-        } catch (Exception e) {
-            LOG.warnv(e, "ECS previous-run task volume cleanup failed: {0}", e.getMessage());
-        }
-        try {
-            reconcileTasks();
-        } catch (Exception e) {
-            LOG.warnv(e, "ECS task reconciliation tick failed: {0}", e.getMessage());
-        }
-        for (String accountId : reconcilableAccountIds()) {
-            RequestScopes.runAs(accountId, () -> {
-                try {
-                    reconcileServices();
-                } catch (Exception e) {
-                    LOG.warnv(e, "ECS service reconciliation tick failed for account {0}: {1}",
-                            accountId, e.getMessage());
-                }
-            });
+        synchronized (reconciliationPassLock) {
+            try {
+                retryPreviousRunTaskVolumes();
+            } catch (Exception e) {
+                LOG.warnv(e, "ECS previous-run task volume cleanup failed: {0}", e.getMessage());
+            }
+            try {
+                reconcileTasks();
+            } catch (Exception e) {
+                LOG.warnv(e, "ECS task reconciliation tick failed: {0}", e.getMessage());
+            }
+            for (String accountId : reconcilableAccountIds()) {
+                RequestScopes.runAs(accountId, () -> {
+                    try {
+                        reconcileServices();
+                    } catch (Exception e) {
+                        LOG.warnv(e, "ECS service reconciliation tick failed for account {0}: {1}",
+                                accountId, e.getMessage());
+                    }
+                });
+            }
         }
     }
 
@@ -5242,16 +5245,18 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     void reconcileServices() {
-        for (Map.Entry<String, EcsServiceModel> entry : services.entrySet()) {
-            try {
-                reconcileService(entry.getKey(), entry.getValue());
-            } catch (Exception e) {
-                LOG.debugv("Error reconciling ECS service {0}: {1}", entry.getKey(), e.getMessage());
-            }
-            try {
-                publishContainerInsights(entry.getKey(), entry.getValue());
-            } catch (Exception e) {
-                LOG.warnv(e, "Could not publish Container Insights task counts for ECS service {0}", entry.getKey());
+        synchronized (reconciliationPassLock) {
+            for (Map.Entry<String, EcsServiceModel> entry : services.entrySet()) {
+                try {
+                    reconcileService(entry.getKey(), entry.getValue());
+                } catch (Exception e) {
+                    LOG.debugv("Error reconciling ECS service {0}: {1}", entry.getKey(), e.getMessage());
+                }
+                try {
+                    publishContainerInsights(entry.getKey(), entry.getValue());
+                } catch (Exception e) {
+                    LOG.warnv(e, "Could not publish Container Insights task counts for ECS service {0}", entry.getKey());
+                }
             }
         }
     }
