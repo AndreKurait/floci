@@ -4016,10 +4016,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         volumes.put(key(region, rootVolId), rootVol);
 
                         instances.put(key(region, instanceId), inst);
-                        Set<String> groupInstances = capacityGroupInstanceIds.get(callerAccountId() + "::" + region);
-                        if (groupInstances != null && capacityGroupArn != null) {
-                            groupInstances.add(instanceId);
-                        }
                         launched.add(inst);
                         reservation.getInstances().add(inst);
                     }
@@ -6934,9 +6930,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private String resolveSubnetZoneName(String region, String availabilityZone, String availabilityZoneId) {
         if (!isSet(availabilityZoneId)) {
             String zoneName = isSet(availabilityZone) ? availabilityZone : region + "a";
-            boolean zoneExists = Arrays.stream(MODELLED_ZONE_SUFFIXES)
-                    .anyMatch(suffix -> zoneName.equals(region + suffix));
-            if (!zoneExists) {
+            if (!isModelledAvailabilityZone(region, zoneName)) {
                 throw new AwsException("InvalidParameterValue",
                         "Value (" + zoneName + ") for parameter availabilityZone is invalid. Subnets can "
                                 + "currently only be created in the following availability zones: "
@@ -10131,6 +10125,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     void acquireCapacity(String region, List<Instance> admitted) {
         synchronized (capacityReservationLock) {
+            Set<String> groupInstances = capacityGroupInstanceIds.get(callerAccountId() + "::" + region);
+            if (groupInstances != null) {
+                for (Instance instance : admitted) {
+                    if (instance.getCapacityReservationGroupArn() != null) {
+                        groupInstances.add(instance.getInstanceId());
+                    }
+                }
+            }
             reconcileCapacityMembership(region);
             List<CapacityReservation> candidates = capacityReservations.scan(k -> k.startsWith(region + "::"))
                     .stream().map(CapacityReservation::new).toList();
@@ -10435,9 +10437,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     "Value (" + count + ") for parameter Quantity is invalid.", 400);
         }
         validateHostSettings(autoPlacement, hostRecovery, hostMaintenance);
-        boolean zoneExists = Arrays.stream(MODELLED_ZONE_SUFFIXES)
-                .anyMatch(suffix -> availabilityZone.equals(region + suffix));
-        if (!zoneExists) {
+        if (!isModelledAvailabilityZone(region, availabilityZone)) {
             throw new AwsException("InvalidParameterValue",
                     "Invalid availability zone: [" + availabilityZone + "]", 400);
         }

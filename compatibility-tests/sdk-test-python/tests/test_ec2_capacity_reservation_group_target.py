@@ -1,72 +1,19 @@
 """Exercise capacity group targets through EC2 and Resource Groups SDKs."""
-import json
-import os
-import subprocess
-import urllib.request
-import time
 import uuid
 
 import boto3
 import pytest
-from botocore.config import Config
 from botocore.exceptions import ClientError
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("FLOCI_CAPACITY_ASSOCIATION_TEST_IMAGE"),
-    reason="Set FLOCI_CAPACITY_ASSOCIATION_TEST_IMAGE for Docker checks",
-)
 ACCOUNT = "111111111111"
 REGION = "us-east-1"
 
 
-def docker(*args):
-    result = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=60)
-    if result.returncode:
-        raise RuntimeError(f"docker {args[0]} failed: {result.stderr.strip()}")
-    return result.stdout.strip()
-
-
-@pytest.fixture(scope="module")
-def endpoint():
-    name = "floci-capacity-group-" + uuid.uuid4().hex[:12]
-    container = docker(
-        "run", "-d", "--name", name, "--publish", "127.0.0.1::4566",
-        "--env", "FLOCI_SERVICES_EC2_MOCK=true",
-        "--env", "FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=false",
-        "--env", "FLOCI_STORAGE_MODE=memory", os.environ["FLOCI_CAPACITY_ASSOCIATION_TEST_IMAGE"],
-    )
-    try:
-        port = json.loads(docker("inspect", container))[0]["NetworkSettings"]["Ports"]["4566/tcp"][0]["HostPort"]
-        url = "http://127.0.0.1:" + port
-        deadline = time.monotonic() + 60
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        while True:
-            try:
-                with opener.open(url + "/_localstack/health", timeout=2) as response:
-                    json.load(response)
-                break
-            except (OSError, ValueError):
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.2)
-        yield url
-    finally:
-        docker("rm", "-f", "-v", container)
-        assert not docker("ps", "-aq", "--filter", "id=" + container)
-
-
-def client(endpoint, service, account=ACCOUNT, region=REGION):
-    return boto3.client(
-        service, endpoint_url=endpoint, region_name=region,
-        aws_access_key_id=account, aws_secret_access_key="test",
-        config=Config(proxies={}, connect_timeout=2, read_timeout=5,
-                      retries={"total_max_attempts": 1}),
-    )
-
-
 @pytest.fixture
-def pool(endpoint):
-    clients = {name: client(endpoint, name) for name in ("ec2", "resource-groups")}
+def pool(aws_config, client_config):
+    config = dict(aws_config, aws_access_key_id=ACCOUNT, aws_secret_access_key="test", region_name=REGION)
+    clients = {name: boto3.client(name, config=client_config, **config)
+               for name in ("ec2", "resource-groups")}
     ec2, groups = clients["ec2"], clients["resource-groups"]
     created = {"reservations": [], "instances": [], "templates": []}
     group = groups.create_group(Name="pool-" + uuid.uuid4().hex, Configuration=[
@@ -127,7 +74,8 @@ def test_group_round_trip_matching_and_strict_fallback(pool, template):
     created["instances"].extend(row["InstanceId"] for row in launched)
     assert {row["CapacityReservationId"] for row in launched} == members
     described = ec2.describe_instances(InstanceIds=created["instances"])["Reservations"]
-    assert all(instance["CapacityReservationSpecification"] == specification
+    response_specification = {"CapacityReservationTarget": specification["CapacityReservationTarget"]}
+    assert all(instance["CapacityReservationSpecification"] == response_specification
                for reservation in described for instance in reservation["Instances"])
     with pytest.raises(ClientError) as error:
         ec2.run_instances(**request)
@@ -147,6 +95,7 @@ def test_group_default_uses_on_demand_without_outside_reservations(pool):
     )["Instances"][0]
     created["instances"].append(instance["InstanceId"])
     assert "CapacityReservationId" not in instance
+    assert "CapacityReservationPreference" not in instance["CapacityReservationSpecification"]
     assert instance["CapacityReservationSpecification"]["CapacityReservationTarget"] == {
         "CapacityReservationResourceGroupArn": group}
     assert ec2.describe_capacity_reservations(CapacityReservationIds=[outside])[
@@ -154,10 +103,13 @@ def test_group_default_uses_on_demand_without_outside_reservations(pool):
 
 
 @pytest.mark.parametrize("account,region", [("222222222222", REGION), (ACCOUNT, "us-west-2")])
-def test_group_target_cannot_cross_account_or_region(endpoint, pool, account, region):
+def test_group_target_cannot_cross_account_or_region(aws_config, client_config, pool, account, region):
     _, group, _, _ = pool
-    ec2 = client(endpoint, "ec2", account, region)
+    config = dict(aws_config, aws_access_key_id=account, aws_secret_access_key="test", region_name=region)
+    ec2 = boto3.client("ec2", config=client_config, **config)
     try:
+        before = {instance["InstanceId"] for reservation in ec2.describe_instances()["Reservations"]
+                  for instance in reservation["Instances"]}
         with pytest.raises(ClientError) as error:
             ec2.run_instances(
                 ImageId="ami-test", InstanceType="t3.micro", MinCount=1, MaxCount=1,
@@ -165,6 +117,8 @@ def test_group_target_cannot_cross_account_or_region(endpoint, pool, account, re
                     "CapacityReservationTarget": {"CapacityReservationResourceGroupArn": group}},
             )
         assert error.value.response["Error"]["Code"] == "InvalidParameterValue"
-        assert not ec2.describe_instances()["Reservations"]
+        after = {instance["InstanceId"] for reservation in ec2.describe_instances()["Reservations"]
+                 for instance in reservation["Instances"]}
+        assert after == before
     finally:
         ec2.close()

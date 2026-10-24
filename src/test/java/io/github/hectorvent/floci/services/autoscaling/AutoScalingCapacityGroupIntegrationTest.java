@@ -11,9 +11,17 @@ import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.resourcegroups.ResourceGroupsService;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.RestAssured;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.ec2.Ec2Client;
+import software.amazon.awssdk.services.ec2.model.DescribeInstancesResponse;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -22,6 +30,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 @QuarkusTest
 class AutoScalingCapacityGroupIntegrationTest {
@@ -94,6 +103,21 @@ class AutoScalingCapacityGroupIntegrationTest {
                 assertEquals(capacities.stream().map(CapacityReservation::getCapacityReservationId)
                         .collect(Collectors.toSet()), instances.stream()
                         .map(ec2::instanceCapacityReservationId).collect(Collectors.toSet()));
+                try (Ec2Client client = Ec2Client.builder()
+                        .endpointOverride(URI.create("http://localhost:" + RestAssured.port))
+                        .httpClientBuilder(UrlConnectionHttpClient.builder()).region(Region.of(REGION))
+                        .credentialsProvider(StaticCredentialsProvider.create(
+                                AwsBasicCredentials.create(ACCOUNT, "test"))).build()) {
+                    DescribeInstancesResponse response = client.describeInstances(request -> request.instanceIds(
+                            instances.stream().map(Instance::getInstanceId).toList()));
+                    assertEquals(2, response.reservations().stream().mapToInt(item -> item.instances().size()).sum());
+                    String expectedGroup = groupArn;
+                    response.reservations().forEach(reservation -> reservation.instances().forEach(instance -> {
+                        assertNull(instance.capacityReservationSpecification().capacityReservationPreferenceAsString());
+                        assertEquals(expectedGroup, instance.capacityReservationSpecification()
+                                .capacityReservationTarget().capacityReservationResourceGroupArn());
+                    }));
+                }
             } finally {
                 if (asgCreated) {
                     service.deleteAutoScalingGroup(REGION, name, true);

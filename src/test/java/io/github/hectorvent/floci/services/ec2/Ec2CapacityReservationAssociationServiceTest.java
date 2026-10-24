@@ -16,11 +16,14 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -472,6 +475,35 @@ class Ec2CapacityReservationAssociationServiceTest {
             fixture.service.capacityReservationAssociations(REGION);
             verify(fixture.instanceStore, never()).scan(any());
             verify(fixture.groups, never()).capacityReservationMembers(any(), any(), any());
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void groupLaunchRegistersMembershipUnderTheReconciliationLock() throws Exception {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            fixture.create(2);
+            String group = fixture.group();
+            fixture.service.capacityReservationAssociations(REGION);
+            Field lockField = Ec2Service.class.getDeclaredField("capacityReservationLock");
+            lockField.setAccessible(true);
+            Object lock = lockField.get(fixture.service);
+            Field indexField = Ec2Service.class.getDeclaredField("capacityGroupInstanceIds");
+            indexField.setAccessible(true);
+            Map<String, Set<String>> index = (Map<String, Set<String>>) indexField.get(fixture.service);
+            Set<String> ids = spy(new HashSet<String>());
+            doAnswer(invocation -> {
+                assertTrue(Thread.holdsLock(lock), "Registration must share the pruning lock");
+                return invocation.callRealMethod();
+            }).when(ids).add(any());
+            index.put(ACCOUNT + "::" + REGION, ids);
+            Instance launched = fixture.launchGroup(group, null, 1, 1).getFirst();
+            assertEquals(Set.of(launched.getInstanceId()), ids);
+            fixture.service.describeInstances(REGION, List.of(launched.getInstanceId()), Map.of());
+            CapacityReservation added = fixture.create(1);
+            fixture.groups.add(REGION, ACCOUNT, MAPPER.valueToTree(Map.of(
+                    "Group", group, "ResourceArns", List.of(added.getCapacityReservationArn()))));
+            assertEquals(added.getCapacityReservationId(), fixture.service.instanceCapacityReservationId(launched));
         }
     }
 
