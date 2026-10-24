@@ -369,9 +369,9 @@ public class CloudWatchMetricsService {
 
     private void putAlarm(Alarm alarm, String region) {
         String name = alarm.getAlarmName();
-        if (name == null || name.isBlank() || name.length() > 255) {
+        if (name == null || name.isBlank() || name.codePointCount(0, name.length()) > 255) {
             throw SmithyValidationErrors.validationError(name == null ? SmithyValidationErrors.notNull("alarmName")
-                    : name.length() > 255
+                    : name.codePointCount(0, name.length()) > 255
                             ? SmithyValidationErrors.lengthOutOfRange("alarmName", name, 1, 255)
                             : SmithyValidationErrors.lengthTooShort("alarmName", name, 1));
         }

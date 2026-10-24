@@ -82,10 +82,11 @@ public final class SmithyValidationErrors {
 
     /** The violation for a string outside its length bounds, or {@code null} for one inside. */
     public static String lengthOutOfRange(String path, String value, int min, int max) {
-        if (value.length() < min) {
+        int length = value.codePointCount(0, value.length());
+        if (length < min) {
             return lengthTooShort(path, value, min);
         }
-        if (value.length() > max) {
+        if (length > max) {
             return "Value '" + value + "' at '" + path + "' failed to satisfy constraint: "
                     + "Member must have length less than or equal to " + max;
         }

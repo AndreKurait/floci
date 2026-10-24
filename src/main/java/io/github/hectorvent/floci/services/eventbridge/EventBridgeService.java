@@ -1438,10 +1438,10 @@ public class EventBridgeService implements ResourceProvider {
             violations.add("Value '" + retentionDays + "' at 'retentionDays' failed to satisfy constraint: "
                     + "Member must have value greater than or equal to 0");
         }
-        if (description != null && description.length() > 512) {
+        if (description != null && description.codePointCount(0, description.length()) > 512) {
             violations.add(SmithyValidationErrors.lengthOutOfRange("description", description, 0, 512));
         }
-        if (eventPattern != null && eventPattern.length() > 4096) {
+        if (eventPattern != null && eventPattern.codePointCount(0, eventPattern.length()) > 4096) {
             violations.add(SmithyValidationErrors.lengthOutOfRange("eventPattern", eventPattern, 0, 4096));
         }
         if (!violations.isEmpty()) {

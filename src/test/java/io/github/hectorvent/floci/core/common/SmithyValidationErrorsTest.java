@@ -65,4 +65,15 @@ class SmithyValidationErrorsTest {
                         + "Member must have length greater than or equal to 1",
                 SmithyValidationErrors.lengthTooShort("name", " ", 1));
     }
+    @Test
+    void lengthBoundsCountSupplementaryCharactersOnce() {
+        String value = "\uD83D\uDE00";
+        assertNull(SmithyValidationErrors.lengthOutOfRange("name", value, 1, 1));
+        assertEquals(SmithyValidationErrors.lengthTooShort("name", value, 2),
+                SmithyValidationErrors.lengthOutOfRange("name", value, 2, 3));
+        assertEquals("Value '" + value.repeat(2) + "' at 'name' failed to satisfy constraint: "
+                        + "Member must have length less than or equal to 1",
+                SmithyValidationErrors.lengthOutOfRange("name", value.repeat(2), 0, 1));
+    }
+
 }

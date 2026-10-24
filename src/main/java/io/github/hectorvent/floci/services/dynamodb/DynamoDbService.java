@@ -708,11 +708,10 @@ public class DynamoDbService {
             requireVectorIndexMember(index.getProjectionType(), memberPath + ".projection");
             requireVectorIndexMember(index.getDistanceFunction(), memberPath + ".distanceFunction");
             String indexName = index.getIndexName();
-            if (indexName == null || indexName.length() < MIN_VECTOR_INDEX_NAME_LENGTH) {
+            if (indexName == null || indexName.codePointCount(0, indexName.length()) < MIN_VECTOR_INDEX_NAME_LENGTH) {
                 throw SmithyValidationErrors.validationException(
-                        "Value '" + indexName + "' at '"
-                        + memberPath + ".indexName' failed to satisfy constraint: "
-                        + "Member must have length greater than or equal to " + MIN_VECTOR_INDEX_NAME_LENGTH);
+                        SmithyValidationErrors.lengthTooShort(
+                                memberPath + ".indexName", indexName, MIN_VECTOR_INDEX_NAME_LENGTH));
             }
             String distanceFunction = index.getDistanceFunction();
             if (!VECTOR_DISTANCE_FUNCTIONS.contains(distanceFunction)) {
@@ -4932,9 +4931,10 @@ public class DynamoDbService {
         String s3BucketOwner = request.containsKey("S3BucketOwner") ? (String) request.get("S3BucketOwner") : null;
 
         List<String> violations = new ArrayList<>();
-        if (s3Prefix != null && 1024 < s3Prefix.codePointCount(0, s3Prefix.length())) {
-            violations.add("Value '" + s3Prefix
-                    + "' at 's3Prefix' failed to satisfy constraint: Member must have length less than or equal to 1024");
+        String prefixLengthViolation = s3Prefix == null ? null
+                : SmithyValidationErrors.lengthOutOfRange("s3Prefix", s3Prefix, 0, 1024);
+        if (prefixLengthViolation != null) {
+            violations.add(prefixLengthViolation);
         }
         if (!EXPORT_FORMATS.contains(exportFormat)) {
             violations.add(SmithyValidationErrors.notInEnum(exportFormat, "exportFormat", EXPORT_FORMATS));
@@ -4942,10 +4942,11 @@ public class DynamoDbService {
         if (!violations.isEmpty()) {
             throw SmithyValidationErrors.validationException(violations);
         }
-        if (s3Prefix != null && s3Prefix.codePointCount(0, s3Prefix.length()) < 3) {
-            throw new AwsException("ValidationException", "Invalid Request: " + SmithyValidationErrors.message(
-                    List.of("Value '" + s3Prefix + "' at 's3Prefix' failed to satisfy constraint: "
-                            + "Member must have length greater than or equal to 3")), 400);
+        prefixLengthViolation = s3Prefix == null ? null
+                : SmithyValidationErrors.lengthOutOfRange("s3Prefix", s3Prefix, 3, Integer.MAX_VALUE);
+        if (prefixLengthViolation != null) {
+            throw new AwsException("ValidationException", "Invalid Request: "
+                    + SmithyValidationErrors.message(List.of(prefixLengthViolation)), 400);
         }
         if ("INCREMENTAL_EXPORT".equals(exportType)) {
             throw new AwsException("ValidationException",
@@ -5478,8 +5479,7 @@ public class DynamoDbService {
         var clientToken = request.path("ClientToken").asText(null);
         if (clientToken != null && clientToken.isBlank()) {
             throw SmithyValidationErrors.validationException(
-                    "Value '" + clientToken
-                    + "' at 'clientToken' failed to satisfy constraint: Member must have length greater than or equal to 1");
+                    SmithyValidationErrors.lengthTooShort("clientToken", clientToken, 1));
         }
         if (clientToken == null || importStore == null) {
             return null;

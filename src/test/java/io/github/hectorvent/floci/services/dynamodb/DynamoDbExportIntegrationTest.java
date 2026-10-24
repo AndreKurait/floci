@@ -381,6 +381,21 @@ class DynamoDbExportIntegrationTest {
             .body("ExportDescription.S3Prefix", equalTo("ends-with/"));
     }
 
+    @Test
+    void s3PrefixLengthCountsSupplementaryCharactersOnce() {
+        String scalar = "\uD83D\uDE00";
+        String shortPrefix = scalar.repeat(2);
+        expectError(exportWithPrefix("ExportPrefixMissing", shortPrefix), "ValidationException",
+                "Invalid Request: 1 validation error detected: Value '" + shortPrefix
+                        + "' at 's3Prefix' failed to satisfy constraint: Member must have length greater than or equal to 3");
+        expectError(exportWithPrefix("ExportPrefixMissing", scalar.repeat(1024)), "TableNotFoundException",
+                "Table not found: " + TABLE_ARN_PREFIX + "ExportPrefixMissing");
+        String longPrefix = scalar.repeat(1025);
+        expectError(exportWithPrefix("ExportPrefixMissing", longPrefix), "ValidationException",
+                "1 validation error detected: Value '" + longPrefix
+                        + "' at 's3Prefix' failed to satisfy constraint: Member must have length less than or equal to 1024");
+    }
+
     // --- Helpers ---
 
     private static ValidatableResponse exportWithPrefix(String table, String prefix) {

@@ -308,6 +308,18 @@ class EventBridgeServiceTest {
                 .getEventSourceArn());
     }
 
+    @Test
+    void archiveLengthBoundsCountSupplementaryCharactersOnce() {
+        String scalar = "\uD83D\uDE00";
+        String pattern = "{\"detail\":[\"" + scalar.repeat(4081) + "\"]}";
+        assertDoesNotThrow(() -> service.createArchive(
+                "unicode-archive", DEFAULT_BUS, scalar.repeat(512), pattern, 0, REGION));
+        assertThrows(AwsException.class, () -> service.createArchive(
+                "long-description", DEFAULT_BUS, scalar.repeat(513), null, 0, REGION));
+        assertThrows(AwsException.class, () -> service.createArchive(
+                "long-pattern", DEFAULT_BUS, null, pattern + " ", 0, REGION));
+    }
+
     /** The messages AWS returns; the account is checked before the region. */
     @ParameterizedTest
     @CsvSource(delimiter = '|', value = {

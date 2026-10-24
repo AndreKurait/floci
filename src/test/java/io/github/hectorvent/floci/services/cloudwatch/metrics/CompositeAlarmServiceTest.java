@@ -259,6 +259,16 @@ class CompositeAlarmServiceTest {
         assertEquals(remove ? Map.of() : Map.of("team", "new"), result.getTags());
     }
 
+    @Test
+    void supplementaryCharactersRespectAlarmAndRuleLengthBounds() {
+        String scalar = "\uD83D\uDE00";
+        put(scalar.repeat(255), "TRUE");
+        assertThrows(AwsException.class, () -> put(scalar.repeat(256), "TRUE"));
+        String rule = "ALARM(\"" + scalar.repeat(10231) + "\")";
+        assertDoesNotThrow(() -> CompositeAlarmRule.parse(rule));
+        assertThrows(AwsException.class, () -> CompositeAlarmRule.parse(rule + " "));
+    }
+
     private CompositeAlarm put(String name, String rule) {
         CompositeAlarm alarm = new CompositeAlarm();
         alarm.setAlarmName(name);
