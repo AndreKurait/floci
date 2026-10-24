@@ -33,6 +33,28 @@ class ElbV2IntegrationTest {
     private static String ruleArn1;
     private static String ruleArn2;
 
+    @ParameterizedTest
+    @CsvSource({"RegisterTargets", "DeregisterTargets", "DescribeTargetHealth"})
+    void targetPortErrorsAggregateBeforeLookup(String action) {
+        given().header("Authorization", AUTH)
+                .formParam("Action", action)
+                .formParam("TargetGroupArn", "arn:aws:elasticloadbalancing:us-east-1:000000000000:"
+                        + "targetgroup/aggregate-missing/0000000000000000")
+                .formParam("Targets.member.1.Id", "10.0.0.10")
+                .formParam("Targets.member.1.Port", "80")
+                .formParam("Targets.member.2.Id", "10.0.0.10")
+                .formParam("Targets.member.2.Port", "65536")
+                .formParam("Targets.member.3.Id", "10.0.0.10")
+                .formParam("Targets.member.3.Port", "65537")
+                .when().post("/").then().statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("ValidationError"))
+                .body("ErrorResponse.Error.Message", equalTo("2 validation errors detected: "
+                        + "Value '65536' at 'targets.2.member.port' failed to satisfy constraint: "
+                        + "Member must have value less than or equal to 65535; "
+                        + "Value '65537' at 'targets.3.member.port' failed to satisfy constraint: "
+                        + "Member must have value less than or equal to 65535"));
+    }
+
     // ── Load Balancers ────────────────────────────────────────────────────────
 
     @Test
@@ -750,6 +772,9 @@ class ElbV2IntegrationTest {
         given()
                 .formParam("Action", "CreateTargetGroup")
                 .formParam("Name", "my-test-tg")
+                .formParam("Protocol", "HTTP")
+                .formParam("Port", "81")
+                .formParam("VpcId", "vpc-00000001")
                 .header("Authorization", AUTH)
             .when()
                 .post("/")
