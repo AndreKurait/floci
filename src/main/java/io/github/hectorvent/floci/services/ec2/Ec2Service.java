@@ -309,6 +309,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final StorageBackend<String, List<Tag>> tags;
     private final StorageBackend<String, CapacityReservation> capacityReservations;
     private final Object capacityReservationLock = new Object();
+    // Lazily seeded per owner/region, guarded by capacityReservationLock; values remain in storage.
+    private final Map<String, Set<String>> capacityGroupInstanceIds = new HashMap<>();
     // CDI Instance clashes with the EC2 Instance model imported above.
     jakarta.enterprise.inject.Instance<ResourceGroupsService> resourceGroupsServices;
     private final StorageBackend<String, Host> hosts;
@@ -4014,6 +4016,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         volumes.put(key(region, rootVolId), rootVol);
 
                         instances.put(key(region, instanceId), inst);
+                        Set<String> groupInstances = capacityGroupInstanceIds.get(callerAccountId() + "::" + region);
+                        if (groupInstances != null && capacityGroupArn != null) {
+                            groupInstances.add(instanceId);
+                        }
                         launched.add(inst);
                         reservation.getInstances().add(inst);
                     }
@@ -10065,7 +10071,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             for (CapacityReservation reservation : reconciled) {
                 associated.addAll(reservation.getInstanceIds());
             }
-            for (Instance instance : instances.scan(k -> k.startsWith(region + "::"))) {
+            Map<String, Set<String>> membersByGroup = new HashMap<>();
+            for (Instance instance : capacityGroupInstances(region)) {
                 if (instance.getState() == null || !"running".equals(instance.getState().getName())
                         || instance.isSpot() || instance.getCapacityReservationGroupArn() == null
                         || instance.getCapacityReservationTarget() != null
@@ -10073,8 +10080,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         || associated.contains(instance.getInstanceId())) {
                     continue;
                 }
-                Set<String> groupMembers = capacityGroupMembers(region, instance.getOwnerId(),
-                        instance.getCapacityReservationGroupArn(), false);
+                Set<String> groupMembers = membersByGroup.computeIfAbsent(instance.getCapacityReservationGroupArn(),
+                        arn -> capacityGroupMembers(region, instance.getOwnerId(), arn, false));
                 CapacityReservation selected = available.stream()
                         .filter(reservation -> groupMembers.contains(reservation.getCapacityReservationArn()))
                         .filter(reservation -> reservation.getAvailableInstanceCount() > 0)
@@ -10090,6 +10097,31 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (!changed.isEmpty()) {
             persistCapacityMembership(changed);
         }
+    }
+
+    private List<Instance> capacityGroupInstances(String region) {
+        String account = callerAccountId();
+        Set<String> ids = capacityGroupInstanceIds.computeIfAbsent(account + "::" + region, ignored -> {
+            Set<String> seeded = new HashSet<>();
+            for (Instance instance : instances.scan(k -> k.startsWith(region + "::"))) {
+                if (instance.getCapacityReservationGroupArn() != null && account.equals(instance.getOwnerId())) {
+                    seeded.add(instance.getInstanceId());
+                }
+            }
+            return seeded;
+        });
+        List<Instance> candidates = new ArrayList<>();
+        ids.removeIf(id -> {
+            Instance instance = instances.get(key(region, id)).orElse(null);
+            if (instance == null || instance.getCapacityReservationGroupArn() == null
+                    || !account.equals(instance.getOwnerId())
+                    || (instance.getState() != null && "terminated".equals(instance.getState().getName()))) {
+                return true;
+            }
+            candidates.add(instance);
+            return false;
+        });
+        return candidates;
     }
 
     private boolean holdsCapacity(Instance instance) {

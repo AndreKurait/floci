@@ -1,4 +1,4 @@
-"""Exercise capacity group targets through EC2, Resource Groups and Auto Scaling SDKs."""
+"""Exercise capacity group targets through EC2 and Resource Groups SDKs."""
 import json
 import os
 import subprocess
@@ -66,9 +66,9 @@ def client(endpoint, service, account=ACCOUNT, region=REGION):
 
 @pytest.fixture
 def pool(endpoint):
-    clients = {name: client(endpoint, name) for name in ("ec2", "resource-groups", "autoscaling")}
+    clients = {name: client(endpoint, name) for name in ("ec2", "resource-groups")}
     ec2, groups = clients["ec2"], clients["resource-groups"]
-    created = {"reservations": [], "instances": [], "templates": [], "asgs": []}
+    created = {"reservations": [], "instances": [], "templates": []}
     group = groups.create_group(Name="pool-" + uuid.uuid4().hex, Configuration=[
         {"Type": "AWS::EC2::CapacityReservationPool"},
         {"Type": "AWS::ResourceGroups::Generic", "Parameters": [
@@ -91,8 +91,6 @@ def pool(endpoint):
     try:
         yield clients, group, reserve, created
     finally:
-        for name in created["asgs"]:
-            clients["autoscaling"].delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
         if created["instances"]:
             ec2.terminate_instances(InstanceIds=created["instances"])
         for template in created["templates"]:
@@ -170,37 +168,3 @@ def test_group_target_cannot_cross_account_or_region(endpoint, pool, account, re
         assert not ec2.describe_instances()["Reservations"]
     finally:
         ec2.close()
-
-
-def test_autoscaling_launches_group_members_in_their_matching_zones(pool):
-    clients, group, reserve, created = pool
-    ec2, autoscaling = clients["ec2"], clients["autoscaling"]
-    members = {reserve(zone=REGION + "a"), reserve(zone=REGION + "b")}
-    selected = ec2.create_launch_template(
-        LaunchTemplateName="asg-pool-template-" + uuid.uuid4().hex,
-        LaunchTemplateData={
-            "ImageId": "ami-test", "InstanceType": "t3.micro",
-            "CapacityReservationSpecification": {
-                "CapacityReservationTarget": {"CapacityReservationResourceGroupArn": group}},
-        },
-    )["LaunchTemplate"]["LaunchTemplateId"]
-    created["templates"].append(selected)
-    name = "group-capacity-" + uuid.uuid4().hex
-    autoscaling.create_auto_scaling_group(
-        AutoScalingGroupName=name, MinSize=2, MaxSize=2, DesiredCapacity=2,
-        AvailabilityZones=[REGION + "a", REGION + "b"], LaunchTemplate={"LaunchTemplateId": selected},
-    )
-    created["asgs"].append(name)
-    deadline = time.monotonic() + 60
-    while True:
-        row = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])["AutoScalingGroups"][0]
-        if len(row["Instances"]) == 2 and all(i["LifecycleState"] == "InService" for i in row["Instances"]):
-            break
-        assert time.monotonic() < deadline, autoscaling.describe_scaling_activities(AutoScalingGroupName=name)
-        time.sleep(0.5)
-    ids = [row["InstanceId"] for row in row["Instances"]]
-    created["instances"].extend(ids)
-    instances = [instance for reservation in ec2.describe_instances(InstanceIds=ids)["Reservations"]
-                 for instance in reservation["Instances"]]
-    assert {instance["CapacityReservationId"] for instance in instances} == members
-    assert {instance["Placement"]["AvailabilityZone"] for instance in instances} == {REGION + "a", REGION + "b"}

@@ -36,12 +36,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class Ec2CapacityReservationAssociationServiceTest {
@@ -458,6 +462,40 @@ class Ec2CapacityReservationAssociationServiceTest {
     }
 
     @Test
+    void repeatedAssociationReadsDoNotRescanInstancesWithoutGroupTargets() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            fixture.create(4);
+            fixture.launch();
+            fixture.service.capacityReservationAssociations(REGION);
+            clearInvocations(fixture.instanceStore, fixture.groups);
+            fixture.service.capacityReservationAssociations(REGION);
+            fixture.service.capacityReservationAssociations(REGION);
+            verify(fixture.instanceStore, never()).scan(any());
+            verify(fixture.groups, never()).capacityReservationMembers(any(), any(), any());
+        }
+    }
+
+    @Test
+    void groupMembershipIsReadOncePerReconcileAndRefreshedAfterChanges() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            fixture.create(4);
+            fixture.service.capacityReservationAssociations(REGION);
+            String group = fixture.group();
+            List<Instance> launched = fixture.launchGroup(group, null, 2, 2);
+            fixture.service.describeInstances(REGION, launched.stream().map(Instance::getInstanceId).toList(), Map.of());
+            clearInvocations(fixture.instanceStore, fixture.groups);
+            assertTrue(fixture.service.capacityReservationAssociations(REGION).isEmpty());
+            verify(fixture.groups, times(1)).capacityReservationMembers(REGION, ACCOUNT, group);
+            verify(fixture.instanceStore, never()).scan(any());
+            CapacityReservation added = fixture.create(2);
+            fixture.groups.add(REGION, ACCOUNT, MAPPER.valueToTree(
+                    Map.of("Group", group, "ResourceArns", List.of(added.getCapacityReservationArn()))));
+            assertEquals(2, fixture.service.capacityReservationAssociations(REGION).size());
+            assertEquals(0, fixture.describe(added).getAvailableInstanceCount());
+        }
+    }
+
+    @Test
     void groupTargetUsesOnlyMatchingMembersAndReturnsReleasedCapacity() {
         try (Fixture fixture = new Fixture("memory", directory)) {
             CapacityReservation outside = fixture.create(3);
@@ -527,6 +565,29 @@ class Ec2CapacityReservationAssociationServiceTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void recoveredFallbackInstancesAdoptNewGroupCapacityWithoutRepeatedScans(String mode) {
+        String group;
+        String instanceId;
+        try (Fixture fixture = new Fixture(mode, directory)) {
+            group = fixture.group();
+            instanceId = fixture.launchGroup(group, null, 1, 1).getFirst().getInstanceId();
+            fixture.service.describeInstances(REGION, List.of(instanceId), Map.of());
+        }
+        try (Fixture fixture = new Fixture(mode, directory)) {
+            CapacityReservation capacity = fixture.create(1);
+            fixture.groups.add(REGION, ACCOUNT, MAPPER.valueToTree(Map.of(
+                    "Group", group, "ResourceArns", List.of(capacity.getCapacityReservationArn()))));
+            assertEquals(Map.of(instanceId, capacity.getCapacityReservationId()),
+                    fixture.service.capacityReservationAssociations(REGION));
+            clearInvocations(fixture.instanceStore);
+            assertEquals(Map.of(instanceId, capacity.getCapacityReservationId()),
+                    fixture.service.capacityReservationAssociations(REGION));
+            verify(fixture.instanceStore, never()).scan(any());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
     void groupTargetAndMembershipSurviveRecovery(String mode) {
         String group;
         String instanceId;
@@ -586,6 +647,7 @@ class Ec2CapacityReservationAssociationServiceTest {
         private final StorageFactory factory;
         private final AccountAwareStorageBackend<CapacityReservation> store;
         private final Ec2Service service;
+        private final AccountAwareStorageBackend<Instance> instanceStore;
         private final ResourceGroupsService groups;
 
         private Fixture(String mode, Path path) {
@@ -603,12 +665,15 @@ class Ec2CapacityReservationAssociationServiceTest {
             when(access.storageFlushInterval("resource-groups")).thenReturn(3600000L);
             factory = new StorageFactory(config, access);
             store = spy(factory.create("ec2", FILE, new TypeReference<Map<String, CapacityReservation>>() {}));
+            instanceStore = spy(factory.create("ec2", "ec2-instances.json",
+                    new TypeReference<Map<String, Instance>>() {}));
             StorageFactory serviceFactory = spy(factory);
+            doReturn(instanceStore).when(serviceFactory).create(eq("ec2"), eq("ec2-instances.json"), any());
             doReturn(store).when(serviceFactory).create(eq("ec2"), eq(FILE), any());
             Ec2ImageCatalog catalog = new Ec2ImageCatalog();
             service = spy(new Ec2Service(config, null, null, new AmiImageResolver(catalog),
                     catalog, new Ec2InstanceTypeCatalog(), serviceFactory));
-            groups = new ResourceGroupsService(factory, service);
+            groups = spy(new ResourceGroupsService(factory, service));
             // CDI Instance clashes with the EC2 Instance model.
             service.resourceGroupsServices = mock(jakarta.enterprise.inject.Instance.class);
             when(service.resourceGroupsServices.isResolvable()).thenReturn(true);
