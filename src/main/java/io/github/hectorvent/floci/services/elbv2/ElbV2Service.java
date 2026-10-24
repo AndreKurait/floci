@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
@@ -1547,18 +1548,30 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (targets == null) {
             return;
         }
+        List<String> violations = new ArrayList<>();
         for (int i = 0; i < targets.size(); i++) {
-            validatePort(targets.get(i).getPort(), "targets." + (i + 1) + ".member.port");
+            addPortViolation(violations, targets.get(i).getPort(), "targets." + (i + 1) + ".member.port");
+        }
+        if (!violations.isEmpty()) {
+            throw SmithyValidationErrors.validationError(violations);
         }
     }
 
     private static void validatePort(Integer port, String member) {
+        List<String> violations = new ArrayList<>();
+        addPortViolation(violations, port, member);
+        if (!violations.isEmpty()) {
+            throw SmithyValidationErrors.validationError(violations);
+        }
+    }
+
+    private static void addPortViolation(List<String> violations, Integer port, String member) {
         if (port == null || (port >= 1 && port <= 65535)) {
             return;
         }
         String constraint = port < 1 ? "greater than or equal to 1" : "less than or equal to 65535";
-        throw new AwsException("ValidationError", "1 validation error detected: Value '" + port
-                + "' at '" + member + "' failed to satisfy constraint: Member must have value " + constraint, 400);
+        violations.add("Value '" + port + "' at '" + member
+                + "' failed to satisfy constraint: Member must have value " + constraint);
     }
 
     /** {@code HealthCheckPort} is either {@code traffic-port} or a port number from 1 to 65535. */

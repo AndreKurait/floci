@@ -825,6 +825,29 @@ class ElbV2ServiceTest {
     }
 
     @ParameterizedTest
+    @CsvSource({"register,65536,65537", "deregister,65536,65537", "health,65536,65537",
+            "register,65537,65536", "deregister,65537,65536", "health,65537,65536"})
+    void targetPortErrorsAggregateBeforeMutation(String operation, int first, int second) {
+        String arn = createTargetGroup("aggregate-ports");
+        service.registerTargets(REGION, arn, List.of(target("i-valid", 9999)));
+        clearInvocations(healthChecker);
+        AwsException error = assertThrows(AwsException.class, () -> targetOperation(operation, arn,
+                List.of(target("i-valid", null), target("i-first", first), target("i-second", second))));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals("2 validation errors detected: Value '" + first
+                + "' at 'targets.2.member.port' failed to satisfy constraint: Member must have value "
+                + "less than or equal to 65535; Value '" + second
+                + "' at 'targets.3.member.port' failed to satisfy constraint: Member must have value "
+                + "less than or equal to 65535", error.getMessage());
+        List<TargetDescription> registered = service.describeTargetGroups(REGION, null, List.of(arn), null)
+                .getFirst().getTargets();
+        assertEquals(1, registered.size());
+        assertEquals("i-valid", registered.getFirst().getId());
+        assertEquals(9999, registered.getFirst().getPort());
+        verifyNoInteractions(healthChecker);
+    }
+
+    @ParameterizedTest
     @ValueSource(ints = {1, 65535})
     void targetPortBoundariesRemainUsable(int port) {
         TargetGroup group = service.createTargetGroup(REGION, "boundary-port", "HTTP", "HTTP1", port,
