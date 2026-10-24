@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class SmithyValidationErrorsTest {
@@ -48,5 +49,20 @@ class SmithyValidationErrorsTest {
     @Test
     void noViolations_isAProgrammingError() {
         assertThrows(IllegalArgumentException.class, () -> SmithyValidationErrors.message(List.of()));
+    }
+    @Test
+    void lengthBoundsPreserveValuesAndIncludeEndpoints() {
+        assertEquals("Value '' at 'name' failed to satisfy constraint: "
+                        + "Member must have length greater than or equal to 1",
+                SmithyValidationErrors.lengthOutOfRange("name", "", 1, 3));
+        assertEquals("Value 'abcd' at 'name' failed to satisfy constraint: "
+                        + "Member must have length less than or equal to 3",
+                SmithyValidationErrors.lengthOutOfRange("name", "abcd", 1, 3));
+        assertNull(SmithyValidationErrors.lengthOutOfRange("name", "a", 1, 3));
+        assertNull(SmithyValidationErrors.lengthOutOfRange("name", "abc", 1, 3));
+        assertNull(SmithyValidationErrors.lengthOutOfRange("name", " ", 1, 3));
+        assertEquals("Value ' ' at 'name' failed to satisfy constraint: "
+                        + "Member must have length greater than or equal to 1",
+                SmithyValidationErrors.lengthTooShort("name", " ", 1));
     }
 }

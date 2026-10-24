@@ -371,8 +371,9 @@ public class CloudWatchMetricsService {
         String name = alarm.getAlarmName();
         if (name == null || name.isBlank() || name.length() > 255) {
             throw SmithyValidationErrors.validationError(name == null ? SmithyValidationErrors.notNull("alarmName")
-                    : "Value '" + name + "' at 'alarmName' failed to satisfy constraint: Member must have length "
-                            + (name.length() > 255 ? "less than or equal to 255" : "greater than or equal to 1"));
+                    : name.length() > 255
+                            ? SmithyValidationErrors.lengthOutOfRange("alarmName", name, 1, 255)
+                            : SmithyValidationErrors.lengthTooShort("alarmName", name, 1));
         }
         Alarm previous = alarmStore.get(region + "::" + name).orElse(null);
         if (previous != null) {

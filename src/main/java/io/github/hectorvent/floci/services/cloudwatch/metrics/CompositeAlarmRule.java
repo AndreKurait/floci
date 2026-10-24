@@ -21,8 +21,9 @@ final class CompositeAlarmRule {
     static Rule parse(String input) {
         if (input == null || input.isBlank() || input.length() > 10240) {
             throw SmithyValidationErrors.validationError(input == null ? SmithyValidationErrors.notNull("alarmRule")
-                    : "Value '" + input + "' at 'alarmRule' failed to satisfy constraint: Member must have length "
-                            + (input.length() > 10240 ? "less than or equal to 10240" : "greater than or equal to 1"));
+                    : input.length() > 10240
+                            ? SmithyValidationErrors.lengthOutOfRange("alarmRule", input, 1, 10240)
+                            : SmithyValidationErrors.lengthTooShort("alarmRule", input, 1));
         }
         CompositeAlarmRule parser = new CompositeAlarmRule(input);
         Expression expression = parser.or();

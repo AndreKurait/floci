@@ -111,14 +111,14 @@ class CompositeAlarmIntegrationTest {
         for (String field : List.of("AlarmName", "AlarmRule")) {
             int maximum = "AlarmName".equals(field) ? 255 : 10240;
             String path = "AlarmName".equals(field) ? "alarmName" : "alarmRule";
-            for (String value : List.of("", "x".repeat(maximum + 1))) {
+            for (String value : List.of("", " ", "x".repeat(maximum + 1), " ".repeat(maximum + 1))) {
                 Map<String, String> request = new LinkedHashMap<>(Map.of("AlarmName", "length-validation", "AlarmRule", "TRUE"));
                 request.put(field, value);
                 Response error = call(json, "PutCompositeAlarm", request);
                 error.then().statusCode(400);
                 assertEquals("1 validation error detected: Value '" + value + "' at '" + path
                         + "' failed to satisfy constraint: Member must have length "
-                        + (value.isEmpty() ? "greater than or equal to 1" : "less than or equal to " + maximum),
+                        + (value.length() <= maximum ? "greater than or equal to 1" : "less than or equal to " + maximum),
                         errorMessage(json, error));
             }
         }

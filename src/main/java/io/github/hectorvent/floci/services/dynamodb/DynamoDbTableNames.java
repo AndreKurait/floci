@@ -34,8 +34,7 @@ public final class DynamoDbTableNames {
         }
         if (input.isEmpty()) {
             throw SmithyValidationErrors.validationException(
-                    "Value '" + input
-                    + "' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3");
+                    SmithyValidationErrors.lengthOutOfRange("tableName", input, 3, 255));
         }
         if (input.startsWith("arn:")) {
             throw invalid("TableName must be a short name, not an ARN: " + input);
@@ -59,7 +58,7 @@ public final class DynamoDbTableNames {
         }
         if (input.isEmpty()) {
             throw SmithyValidationErrors.validationException(
-                    "Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1");
+                    SmithyValidationErrors.lengthOutOfRange("tableName", input, 1, 255));
         }
         if (input.startsWith("arn:")) {
             return parseArn(input);
@@ -113,13 +112,11 @@ public final class DynamoDbTableNames {
     private static void validateTableNameForCreate(String tableName) {
         if (tableName.length() < 3) {
             throw SmithyValidationErrors.validationException(
-                    "Value '" + tableName
-                    + "' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3");
+                    SmithyValidationErrors.lengthOutOfRange("tableName", tableName, 3, 255));
         }
         if (tableName.length() > 255) {
             throw SmithyValidationErrors.validationException(
-                    "Value '" + tableName
-                    + "' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255");
+                    SmithyValidationErrors.lengthOutOfRange("tableName", tableName, 3, 255));
         }
         if (!TABLE_NAME_CHARS.matcher(tableName).matches()) {
             throw SmithyValidationErrors.validationException(
@@ -132,13 +129,11 @@ public final class DynamoDbTableNames {
     private static void validateTableNameForOps(String tableName) {
         if (tableName.length() < 3) {
             throw SmithyValidationErrors.validationException(
-                    "Value '" + tableName
-                    + "' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3");
+                    SmithyValidationErrors.lengthOutOfRange("tableName", tableName, 3, 255));
         }
         if (tableName.length() > 255) {
             throw SmithyValidationErrors.validationException(
-                    "Value '" + tableName
-                    + "' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255");
+                    SmithyValidationErrors.lengthOutOfRange("tableName", tableName, 3, 255));
         }
         if (!TABLE_NAME_CHARS.matcher(tableName).matches()) {
             throw SmithyValidationErrors.validationException(

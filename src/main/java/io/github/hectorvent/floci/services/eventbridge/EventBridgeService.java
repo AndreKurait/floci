@@ -1439,12 +1439,10 @@ public class EventBridgeService implements ResourceProvider {
                     + "Member must have value greater than or equal to 0");
         }
         if (description != null && description.length() > 512) {
-            violations.add("Value '" + description + "' at 'description' failed to satisfy constraint: "
-                    + "Member must have length less than or equal to 512");
+            violations.add(SmithyValidationErrors.lengthOutOfRange("description", description, 0, 512));
         }
         if (eventPattern != null && eventPattern.length() > 4096) {
-            violations.add("Value '" + eventPattern + "' at 'eventPattern' failed to satisfy constraint: "
-                    + "Member must have length less than or equal to 4096");
+            violations.add(SmithyValidationErrors.lengthOutOfRange("eventPattern", eventPattern, 0, 4096));
         }
         if (!violations.isEmpty()) {
             throw SmithyValidationErrors.validationException(violations);

@@ -80,6 +80,24 @@ public final class SmithyValidationErrors {
         return null;
     }
 
+    /** The violation for a string outside its length bounds, or {@code null} for one inside. */
+    public static String lengthOutOfRange(String path, String value, int min, int max) {
+        if (value.length() < min) {
+            return lengthTooShort(path, value, min);
+        }
+        if (value.length() > max) {
+            return "Value '" + value + "' at '" + path + "' failed to satisfy constraint: "
+                    + "Member must have length less than or equal to " + max;
+        }
+        return null;
+    }
+
+    /** Also used by services that reject whitespace-only input as an empty member. */
+    public static String lengthTooShort(String path, String value, int min) {
+        return "Value '" + value + "' at '" + path + "' failed to satisfy constraint: "
+                + "Member must have length greater than or equal to " + min;
+    }
+
     /** The violation for a value outside its enum, listing the allowed values in the model's order. */
     public static String notInEnum(String value, String path, List<String> allowed) {
         return "Value '" + value + "' at '" + path + "' failed to satisfy constraint: "
