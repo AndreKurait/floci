@@ -60,11 +60,14 @@ public final class SqsIdlePollBenchmark {
                         return service.receiveMessage(queue.getQueueUrl(), 1, 30, seconds, "us-east-1");
                     }));
                 }
-                if (!ready.await(10, TimeUnit.SECONDS)) {
-                    throw new IllegalStateException("Consumers did not start");
+                try {
+                    if (!ready.await(10, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("Consumers did not start");
+                    }
+                    started = System.nanoTime();
+                } finally {
+                    start.countDown();
                 }
-                started = System.nanoTime();
-                start.countDown();
                 for (Future<List<Message>> call : calls) {
                     if (!call.get(seconds + 10L, TimeUnit.SECONDS).isEmpty()) {
                         throw new IllegalStateException("Empty queue returned messages");
