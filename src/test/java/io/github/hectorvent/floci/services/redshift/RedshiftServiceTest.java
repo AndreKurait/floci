@@ -67,6 +67,70 @@ import static org.mockito.Mockito.*;
 
 class RedshiftServiceTest {
 
+    @Test
+    void recoveryProxyFailureDoesNotDestructivelyStopAnAdoptedContainer() {
+        Cluster cluster = new Cluster();
+        cluster.setClusterIdentifier("survivor");
+        cluster.setMasterUsername("admin");
+        cluster.setMasterPassword("Secret123");
+        cluster.setClusterStatus("available");
+        cluster.setProxyPort(7107);
+        when(clusterBackend.scanAllAccountEntries(any())).thenReturn(List.of(
+                new AccountAwareStorageBackend.AccountEntry<>("111111111111", "survivor", cluster)));
+        when(cm.adoptOrStart("111111111111", "survivor", "admin", "Secret123"))
+                .thenReturn(new RedshiftContainerHandle("surviving-container", "survivor", "localhost", 5432));
+        doThrow(new IllegalStateException("proxy bind failed")).when(proxyManager).startProxy(
+                anyString(), anyInt(), anyString(), anyInt(), anyString(), anyString(), anyString(), anyString(),
+                any(), anyList(), isNull());
+
+        service.onStart(null);
+
+        assertEquals("unavailable", cluster.getClusterStatus());
+        verify(cm, never()).stop("111111111111", "survivor");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rebootTeardownFailureKeepsDumpAndMarksClusterFailed(boolean proxyFailure) throws Exception {
+        Cluster cluster = new Cluster();
+        cluster.setClusterIdentifier("partial-stop");
+        cluster.setMasterUsername("admin");
+        cluster.setMasterPassword("Secret123");
+        cluster.setClusterStatus("available");
+        cluster.setProxyPort(7107);
+        when(clusterBackend.get("partial-stop")).thenReturn(Optional.of(cluster));
+        AtomicReference<Path> dump = new AtomicReference<>();
+        doAnswer(invocation -> {
+            Path path = invocation.getArgument(3, Path.class);
+            Files.writeString(path, "preserved database");
+            dump.set(path);
+            return null;
+        }).when(cm).takeSnapshot(eq("111111111111"), eq("partial-stop"), eq("admin"), any(Path.class));
+        if (proxyFailure) {
+            doThrow(new IllegalStateException("proxy stop failed"))
+                    .when(proxyManager).stopProxy("111111111111:partial-stop");
+        } else {
+            doThrow(new IllegalStateException("log close failed after container removal"))
+                    .when(cm).stop("111111111111", "partial-stop");
+        }
+        try {
+            assertThrows(AwsException.class, () -> service.rebootCluster("partial-stop"));
+            assertTrue(Files.exists(dump.get()), "The pre-reboot dump must survive partial teardown");
+            assertEquals("preserved database", Files.readString(dump.get()));
+            assertEquals("failed", cluster.getClusterStatus());
+            if (proxyFailure) {
+                verify(cm, never()).stop(anyString(), anyString());
+            } else {
+                verify(cm, atLeastOnce()).stop("111111111111", "partial-stop");
+            }
+        } finally {
+            if (dump.get() != null) {
+                Files.deleteIfExists(dump.get());
+            }
+        }
+    }
+
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void slowSnapshotDoesNotBlockOtherClusterMutation(boolean finalSnapshot) throws Exception {
