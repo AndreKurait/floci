@@ -34,7 +34,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
 import java.lang.reflect.Field;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -47,9 +50,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -230,32 +233,37 @@ class ElastiCacheServiceTest {
         locksField.setAccessible(true);
         Object monitor = ((ConcurrentHashMap<?, ?>) locksField.get(service)).get(name);
         ExecutorService pool = Executors.newSingleThreadExecutor();
-        CountDownLatch started = new CountDownLatch(1);
+        AtomicReference<Thread> writer = new AtomicReference<>();
         try {
-            Future<String> tag = pool.submit(() -> {
-                started.countDown();
-                try {
-                    service.addTagsToResource(arn, Map.of("env", "test"), "us-east-1");
-                    return "tagged";
-                } catch (AwsException error) {
-                    return error.getErrorCode();
-                }
-            });
-            String completedBeforeDelete = null;
+            Future<String> tag;
             synchronized (monitor) {
-                assertTrue(started.await(5, TimeUnit.SECONDS));
-                try {
-                    completedBeforeDelete = tag.get(1, TimeUnit.SECONDS);
-                } catch (TimeoutException expected) {
-                    // A tag writer using the lifecycle lock remains blocked until deletion exits.
-                }
+                tag = pool.submit(() -> {
+                    writer.set(Thread.currentThread());
+                    try {
+                        service.addTagsToResource(arn, Map.of("env", "test"), "us-east-1");
+                        return "tagged";
+                    } catch (AwsException error) {
+                        return error.getErrorCode();
+                    }
+                });
+                long ownerId = Thread.currentThread().threadId();
+                await().atMost(Duration.ofSeconds(5)).until(() -> {
+                    Thread thread = writer.get();
+                    ThreadInfo info = thread == null ? null
+                            : ManagementFactory.getThreadMXBean().getThreadInfo(thread.threadId());
+                    return tag.isDone() || info != null && info.getThreadState() == Thread.State.BLOCKED
+                            && info.getLockOwnerId() == ownerId && info.getLockInfo() != null
+                            && info.getLockInfo().getIdentityHashCode() == System.identityHashCode(monitor)
+                            && info.getLockInfo().getClassName().equals(monitor.getClass().getName());
+                });
+                assertFalse(tag.isDone(), "tagging bypassed the parameter-group lifecycle lock");
                 service.deleteCacheParameterGroup(name);
             }
-            assertNull(completedBeforeDelete, "tagging bypassed the parameter-group lifecycle lock");
             assertEquals("CacheParameterGroupNotFound", tag.get(5, TimeUnit.SECONDS));
             assertTrue(service.findParameterGroup(name).isEmpty());
         } finally {
             pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS), "tag writer did not terminate");
         }
     }
 
