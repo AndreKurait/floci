@@ -7,6 +7,8 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class EbsBlockDevice {
 
+    private Integer iops;
+    private Integer throughput;
     private String snapshotId;
     private Integer volumeSize;
     private String volumeType;
@@ -14,6 +16,11 @@ public class EbsBlockDevice {
     private Boolean encrypted;
 
     public EbsBlockDevice() {}
+
+    public Integer getIops() { return iops; }
+    public void setIops(Integer value) { iops = value; }
+    public Integer getThroughput() { return throughput; }
+    public void setThroughput(Integer value) { throughput = value; }
 
     public String getSnapshotId() { return snapshotId; }
     public void setSnapshotId(String snapshotId) { this.snapshotId = snapshotId; }
