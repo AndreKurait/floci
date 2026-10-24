@@ -20,6 +20,7 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.EnumMap;
@@ -517,15 +518,29 @@ public class ContainerLogStreamer {
 
         /** Appends a frame payload and returns the complete lines it produced (possibly none). */
         List<String> append(byte[] payload) {
+            int size = buffer.size();
+            boolean fitsWithinLimit = payload.length <= MAX_LINE_BYTES - 3 - size;
+            // A complete frame safely below the cap needs no byte-level reassembly or UTF-8 tracking.
+            // Keep empty lines, including the one before a final newline, for the emitter to handle.
+            if (size == 0 && payload.length > 0 && fitsWithinLimit && payload[payload.length - 1] == '\n') {
+                return Arrays.asList(new String(payload, 0, payload.length - 1, StandardCharsets.UTF_8)
+                        .split("\n", -1));
+            }
             List<String> lines = new ArrayList<>();
             int start = 0;
-            int size = buffer.size();
             for (int i = 0; i < payload.length; i++) {
                 byte b = payload[i];
                 if (b == '\n') {
                     lines.add(takeLine(payload, start, i));
                     start = i + 1;
                     size = 0;
+                    continue;
+                }
+                // Away from the cap, only the final four bytes can affect the next frame's UTF-8 state.
+                if (fitsWithinLimit) {
+                    if (i >= payload.length - 4) {
+                        trackUtf8(b);
+                    }
                     continue;
                 }
                 // Force-split BEFORE a character that would push the buffer past the cap, so the emitted
