@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -504,6 +505,44 @@ class Ec2CapacityReservationAssociationServiceTest {
             fixture.groups.add(REGION, ACCOUNT, MAPPER.valueToTree(Map.of(
                     "Group", group, "ResourceArns", List.of(added.getCapacityReservationArn()))));
             assertEquals(added.getCapacityReservationId(), fixture.service.instanceCapacityReservationId(launched));
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void groupIndexPrunesTerminatedFallbacksWithoutAvailableCapacity() throws Exception {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation capacity = fixture.create(1);
+            String group = fixture.group(capacity);
+            fixture.service.capacityReservationAssociations(REGION);
+            fixture.service.cancelCapacityReservation(REGION, capacity.getCapacityReservationId());
+            Instance launched = fixture.launchGroup(group, null, 1, 1).getFirst();
+            Field indexField = Ec2Service.class.getDeclaredField("capacityGroupInstanceIds");
+            indexField.setAccessible(true);
+            Map<String, Set<String>> index = (Map<String, Set<String>>) indexField.get(fixture.service);
+            Set<String> ids = index.get(ACCOUNT + "::" + REGION);
+            assertTrue(ids.contains(launched.getInstanceId()));
+            fixture.service.terminateInstances(REGION, List.of(launched.getInstanceId()));
+            clearInvocations(fixture.instanceStore, fixture.groups);
+            fixture.service.capacityReservationAssociations(REGION);
+            assertTrue(ids.isEmpty(), "Terminated fallback IDs must be pruned even without capacity");
+            verify(fixture.instanceStore, never()).scan(any());
+            verify(fixture.groups, never()).capacityReservationMembers(any(), any(), any());
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void resetClearsCapacityGroupIndex() throws Exception {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            fixture.create(1);
+            fixture.service.capacityReservationAssociations(REGION);
+            Field indexField = Ec2Service.class.getDeclaredField("capacityGroupInstanceIds");
+            indexField.setAccessible(true);
+            Map<String, Set<String>> index = (Map<String, Set<String>>) indexField.get(fixture.service);
+            assertFalse(index.isEmpty());
+            fixture.service.clear();
+            assertTrue(index.isEmpty(), "Reset must discard every seeded account and region");
         }
     }
 

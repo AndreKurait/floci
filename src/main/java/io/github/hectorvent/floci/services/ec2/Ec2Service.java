@@ -1291,6 +1291,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // VPC and subnets would never come back.
     @Override
     public void clear() {
+        synchronized (capacityReservationLock) {
+            capacityGroupInstanceIds.clear();
+        }
         seededAccountRegions.clear();
         seedDefaultRegionIfEnabled();
     }
@@ -10060,13 +10063,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         List<CapacityReservation> available = reconciled.stream()
                 .filter(reservation -> "active".equals(reservation.getState())
                         && reservation.getAvailableInstanceCount() > 0).toList();
+        List<Instance> groupInstances = capacityGroupInstances(region);
         if (!available.isEmpty()) {
             Set<String> associated = new HashSet<>();
             for (CapacityReservation reservation : reconciled) {
                 associated.addAll(reservation.getInstanceIds());
             }
             Map<String, Set<String>> membersByGroup = new HashMap<>();
-            for (Instance instance : capacityGroupInstances(region)) {
+            for (Instance instance : groupInstances) {
                 if (instance.getState() == null || !"running".equals(instance.getState().getName())
                         || instance.isSpot() || instance.getCapacityReservationGroupArn() == null
                         || instance.getCapacityReservationTarget() != null
