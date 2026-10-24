@@ -1297,3 +1297,10 @@ function code or AWS API responses. `/_floci/health` advertises
 `features.lambda_container_readiness: 1` so controllers can reject images without this support.
 When Lambda identity verification is enabled, Floci binds the running identity before
 the probe so initialization retains authenticated access while invocation waits.
+
+### Provisioned concurrency recovery
+
+Terminal runtime failures, failed leases, alias updates and completed teardown wake
+the serial capacity reconciler. A ten-second repair sweep covers unobserved changes.
+Replacement environments still finish actual initialization and obey account and
+function capacity limits before becoming available.

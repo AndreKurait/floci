@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardowns;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.concurrent.KeyedWorkQueue;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -68,6 +69,8 @@ public class ProvisionedConcurrencyPool implements Resettable {
     private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
             Thread.ofPlatform().daemon().name("lambda-provisioned-concurrency").factory());
+    private final KeyedWorkQueue<String> reconciliation = new KeyedWorkQueue<>(
+            "lambda-capacity-work", 1, 1, ignored -> reconcileSafely());
     private boolean stopped;
     private int activeLaunches;
     private long shutdownDeadlineNanos;
@@ -153,13 +156,12 @@ public class ProvisionedConcurrencyPool implements Resettable {
                         configuration.qualifier(), configuration.requested());
             }
         }
-        scheduler.scheduleWithFixedDelay(() -> {
-            try {
-                reconcileSafely();
-            } catch (RuntimeException failure) {
-                LOG.errorv(failure, "Provisioned concurrency reconciliation failed");
-            }
-        }, 0, 1, TimeUnit.SECONDS);
+        scheduler.scheduleWithFixedDelay(this::requestReconciliation, 0, 10, TimeUnit.SECONDS);
+    }
+
+    /** Local transitions wake one serial reconciler; periodic repair covers missed external changes. */
+    void requestReconciliation() {
+        reconciliation.submit("capacity");
     }
 
     public Status put(String region, String name, String qualifier, int count, String account) {
@@ -303,6 +305,9 @@ public class ProvisionedConcurrencyPool implements Resettable {
             }
         }
         stop(discarded);
+        if (!discarded.isEmpty()) {
+            requestReconciliation();
+        }
         return selected;
     }
 
@@ -332,6 +337,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                         ? shutdownDeadlineNanos : now + drainTimeoutNanos;
             }
             stop(List.of(handle), shutdownDrain, deadline);
+            requestReconciliation();
         }
         return true;
     }
@@ -576,6 +582,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 allocation.handles.add(handle);
             }
             long timeoutMs = Math.max(130, fn.getTimeout()) * 1000L;
+            handle.getRuntimeApiServer().onRuntimeFailure(this::requestReconciliation);
             handle.getRuntimeApiServer().awaitInitialization(timeoutMs);
             synchronized (lock) {
                 currentFunction(allocation.configuration);
@@ -720,6 +727,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 pendingTeardown.remove(handle);
                 owned.remove(handle);
             }
+            requestReconciliation();
         } catch (RuntimeException failure) {
             LOG.warnv(failure, "Could not stop provisioned Lambda environment {0}", handle.getContainerId());
         } finally {
@@ -891,6 +899,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
 
     void closeExecutors() {
         scheduler.shutdownNow();
+        reconciliation.close();
         workers.shutdownNow();
     }
 
