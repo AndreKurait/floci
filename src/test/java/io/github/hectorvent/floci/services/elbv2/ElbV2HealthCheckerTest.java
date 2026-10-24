@@ -6,10 +6,12 @@ import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpServer;
+import io.vertx.core.http.HttpServerResponse;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -18,6 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -25,9 +28,11 @@ import static org.mockito.Mockito.when;
 class ElbV2HealthCheckerTest {
 
     private final Vertx vertx = Vertx.vertx();
+    private final List<ElbV2HealthChecker> checkers = new ArrayList<>();
 
     @AfterEach
     void closeVertx() {
+        checkers.forEach(ElbV2HealthChecker::shutdown);
         vertx.close().toCompletionStage().toCompletableFuture().join();
     }
 
@@ -143,7 +148,8 @@ class ElbV2HealthCheckerTest {
                     checker.getHealth(targetGroup.getTargetGroupArn(), target.getId(), target.getPort()).state()));
 
             statusCode.set(200);
-            checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
+            targetGroup.setHealthCheckIntervalSeconds(1);
+            checker.startMonitoring(targetGroup);
             await().atMost(Duration.ofSeconds(2)).until(() -> requestCount.get() >= 2);
 
             await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
@@ -207,10 +213,102 @@ class ElbV2HealthCheckerTest {
         assertEquals("Target registration is in progress", health.description());
     }
 
+    @Test
+    void slowTargetDoesNotDelayAnUnrelatedHealthyTarget() throws Exception {
+        CompletableFuture<HttpServerResponse> slowRequest = new CompletableFuture<>();
+        HttpServer slow = vertx.createHttpServer().requestHandler(request -> slowRequest.complete(request.response()))
+                .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        HttpServer fast = startServer(200);
+        try {
+            ElbV2HealthChecker checker = healthChecker();
+            TargetGroup group = targetGroup(slow.actualPort(), "200", 1, 1);
+            group.setHealthCheckTimeoutSeconds(5);
+            checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", slow.actualPort())), group);
+            HttpServerResponse response = slowRequest.get(2, TimeUnit.SECONDS);
+            checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", fast.actualPort())), group);
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
+                    checker.getState(group.getTargetGroupArn(), "127.0.0.1", fast.actualPort())));
+            assertTrue(!response.ended());
+            response.end();
+        } finally {
+            close(slow);
+            close(fast);
+        }
+    }
+
+    @Test
+    void repeatedRegistrationsDoNotBypassConfiguredHealthThreshold() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer server = vertx.createHttpServer().requestHandler(request -> {
+            requests.incrementAndGet();
+            request.response().end();
+        }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        try {
+            ElbV2HealthChecker checker = healthChecker();
+            TargetGroup group = targetGroup(server.actualPort(), "200", 3, 1);
+            TargetDescription target = target("127.0.0.1", server.actualPort());
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            await().atMost(Duration.ofSeconds(2)).until(() -> requests.get() == 1);
+            for (int i = 0; i < 100; i++) {
+                checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            }
+            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
+                assertEquals(1, requests.get());
+                assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+            });
+        } finally {
+            close(server);
+        }
+    }
+
+    @Test
+    void changingIntervalPreservesCountersAndReplacesTheOldTimer() throws Exception {
+        HttpServer server = startServer(200);
+        try {
+            ElbV2HealthChecker checker = healthChecker();
+            TargetGroup group = targetGroup(server.actualPort(), "200", 2, 1);
+            group.setHealthCheckIntervalSeconds(30);
+            checker.startMonitoring(group);
+            checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", server.actualPort())), group);
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("Elb.InitialHealthChecking",
+                    checker.getHealth(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()).reason()));
+            group.setHealthCheckIntervalSeconds(1);
+            checker.startMonitoring(group);
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
+                    checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort())));
+        } finally {
+            close(server);
+        }
+    }
+
+    @Test
+    void resultFromPreviousHealthSettingsCannotChangeHealth() throws Exception {
+        CompletableFuture<HttpServerResponse> requestArrived = new CompletableFuture<>();
+        HttpServer server = vertx.createHttpServer().requestHandler(request -> requestArrived.complete(request.response()))
+                .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        try {
+            ElbV2HealthChecker checker = healthChecker();
+            TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
+            checker.startMonitoring(group);
+            checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", server.actualPort())), group);
+            HttpServerResponse response = requestArrived.get(2, TimeUnit.SECONDS);
+            group.setMatcher("503");
+            checker.startMonitoring(group);
+            response.end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> assertEquals(
+                    "Elb.RegistrationInProgress",
+                    checker.getHealth(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()).reason()));
+        } finally {
+            close(server);
+        }
+    }
+
     private ElbV2HealthChecker healthChecker() {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().elbv2().mock()).thenReturn(false);
-        return new ElbV2HealthChecker(vertx, config, mock(Ec2Service.class));
+        ElbV2HealthChecker checker = new ElbV2HealthChecker(vertx, config, mock(Ec2Service.class));
+        checkers.add(checker);
+        return checker;
     }
 
     private HttpServer startServer(int statusCode) throws Exception {

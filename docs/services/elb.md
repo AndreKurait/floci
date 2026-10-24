@@ -256,3 +256,11 @@ healthy and nothing else reports the collision.
 Public Route 53 records select their actual load balancer before its rules run. Rule evaluation
 still sees the original Host and request path. For names without such records, distinct
 `host-header` rules or distinct listener ports can disambiguate the shared local socket.
+
+### Target health scheduling
+
+ELBv2 probes independent targets concurrently, with up to 32 probes running and one
+outstanding probe per target. Repeated target registration preserves probe cadence.
+Changing the health interval reschedules monitoring, and late results from old
+registrations or settings cannot change current health. Configured healthy and
+unhealthy thresholds still apply to real HTTP results.
