@@ -50,6 +50,13 @@ changes to `StateMachineName` or `StateMachineType` use replacement semantics.
 Omitting the filter returns all statuses. Invalid filter values or types return
 `ValidationException`, as does `PENDING_REDRIVE` with `stateMachineArn`.
 
+Lambda task invocation retains the alias or version from `FunctionName` or a
+direct function ARN when acquiring execution capacity. A READY provisioned
+concurrency pool for that qualifier can serve the task; resolving an alias to
+its version does not discard its pool identity. Unqualified invocation retains
+the normal on-demand path, and existing authorization checks still precede
+execution.
+
 ## Nested task credentials
 
 Nested `states:startExecution` tasks, including `.sync` and `.sync:2`, and the SDK
