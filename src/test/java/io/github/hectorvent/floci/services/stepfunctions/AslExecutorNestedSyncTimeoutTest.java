@@ -8,12 +8,18 @@ import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
-import java.util.ArrayList;
+import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -86,11 +92,13 @@ class AslExecutorNestedSyncTimeoutTest {
         verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
     }
 
-    @Test
-    void syncIsNotCappedByAPollCountWhenNoTimeoutSecondsIsDeclared() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {".sync", ".sync:2"})
+    void syncWithNoTaskTimeoutCanFinishAfterFiveMinutes(String mode) throws Exception {
+        AtomicLong nanos = new AtomicLong();
         AtomicInteger polls = new AtomicInteger();
         when(sfnService.describeExecution(CHILD_ARN)).thenAnswer(invocation -> {
-            if (polls.incrementAndGet() < 700) {
+            if (polls.incrementAndGet() < 3502) {
                 return child("RUNNING");
             }
             Execution done = child("SUCCEEDED");
@@ -98,12 +106,28 @@ class AslExecutorNestedSyncTimeoutTest {
             return done;
         });
 
-        Execution execution = run(newExecutor(nanos -> { }), ".sync", 0, false);
+        Execution execution = run(newExecutor(nanos::addAndGet, nanos::get), mode, 0, false, 0, true);
 
         assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
-        assertEquals(700, polls.get());
-        assertTrue(objectMapper.readTree(execution.getOutput()).path("Output").asText().contains("42"));
+        assertEquals(3502, polls.get());
+        assertTrue(nanos.get() > TimeUnit.SECONDS.toNanos(300));
+        assertTrue(objectMapper.readTree(execution.getOutput()).path("Output").toString().contains("42"));
         verify(sfnService, never()).stopExecution(any(), any(), any());
+    }
+
+    @Test
+    void standardExecutionQuotaEndsAnUnboundedTaskAndAbortsItsChild() {
+        AtomicLong nanos = new AtomicLong();
+        when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("RUNNING"));
+
+        Execution execution = run(newExecutor(
+                pause -> nanos.addAndGet(Duration.ofDays(365).toNanos()), nanos::get),
+                ".sync:2", 0, false, 0, true);
+
+        assertEquals("TIMED_OUT", execution.getStatus());
+        assertTrue(history.stream().anyMatch(event -> "ExecutionTimedOut".equals(event.getType())));
+        assertTrue(history.stream().noneMatch(event -> "TaskTimedOut".equals(event.getType())));
+        verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
     }
 
     @Test
@@ -156,8 +180,12 @@ class AslExecutorNestedSyncTimeoutTest {
         return current;
     }
 
-    @SuppressWarnings("unchecked")
     private AslExecutor newExecutor(AslExecutor.Sleeper sleeper) {
+        return newExecutor(sleeper, System::nanoTime);
+    }
+
+    @SuppressWarnings("unchecked")
+    private AslExecutor newExecutor(AslExecutor.Sleeper sleeper, LongSupplier nanoTime) {
         Instance<StepFunctionsService> instance = mock(Instance.class);
         when(instance.get()).thenReturn(sfnService);
         return AslExecutorFixture.builder()
@@ -165,6 +193,7 @@ class AslExecutorNestedSyncTimeoutTest {
                 .sfnService(instance)
                 .customResourceLiveness(null)
                 .sleeper(sleeper)
+                .nanoTime(nanoTime)
                 .build();
     }
 
@@ -173,7 +202,12 @@ class AslExecutorNestedSyncTimeoutTest {
     }
 
     private Execution run(AslExecutor executor, String mode, int timeoutSeconds, boolean catchTimeout,
-                          int executionTimeoutSeconds) {
+                           int executionTimeoutSeconds) {
+        return run(executor, mode, timeoutSeconds, catchTimeout, executionTimeoutSeconds, false);
+    }
+
+    private Execution run(AslExecutor executor, String mode, int timeoutSeconds, boolean catchTimeout,
+                          int executionTimeoutSeconds, boolean asynchronous) {
         String timeout = timeoutSeconds > 0 ? "\"TimeoutSeconds\": %d,".formatted(timeoutSeconds) : "";
         String catcher = catchTimeout
                 ? "\"Catch\": [{\"ErrorEquals\": [\"States.Timeout\"], \"Next\": \"Recover\"}],"
@@ -211,8 +245,15 @@ class AslExecutorNestedSyncTimeoutTest {
         execution.setStateMachineArn(stateMachine.getStateMachineArn());
         execution.setInput("{}");
 
-        history = new ArrayList<>();
-        executor.executeSync(stateMachine, execution, history, (updated, events) -> { });
+        history = new CopyOnWriteArrayList<>();
+        if (asynchronous) {
+            executor.executeAsync(stateMachine, execution, history, (updated, events) -> { });
+            await().atMost(Duration.ofSeconds(10))
+                    .until(() -> history.stream().anyMatch(event -> event.getType().startsWith("Execution")
+                            && !event.getType().equals("ExecutionStarted")));
+        } else {
+            executor.executeSync(stateMachine, execution, history, (updated, events) -> { });
+        }
         return execution;
     }
 }
