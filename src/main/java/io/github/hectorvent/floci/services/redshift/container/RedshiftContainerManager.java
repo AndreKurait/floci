@@ -43,6 +43,7 @@ public class RedshiftContainerManager {
     private final EmulatorConfig config;
     private final long retryBackoffMillis;
     private final Map<String, RedshiftContainerHandle> containers = new ConcurrentHashMap<>();
+    private final Map<String, String> adoptedContainers = new ConcurrentHashMap<>();
 
     @Inject
     public RedshiftContainerManager(ContainerBuilder containerBuilder,
@@ -76,9 +77,8 @@ public class RedshiftContainerManager {
                                          String masterPassword, String databaseName) {
         String image = config.services().redshift().imageVersion();
         String containerName = containerName(accountId, clusterIdentifier);
-        // Only the current name: no volume backs this container, so removing a legacy-named survivor
-        // would destroy cluster data that adoptOrStart does not look for.
-        lifecycleManager.removeIfExists(containerName);
+        // Only the current name: adoptOrStart does not look for legacy-named survivors.
+        stop(accountId, clusterIdentifier);
 
         List<String> envVars = List.of(
                 "POSTGRES_USER=" + masterUsername,
@@ -101,7 +101,7 @@ public class RedshiftContainerManager {
         }
 
         ContainerSpec spec = specBuilder.build();
-        ContainerInfo info = lifecycleManager.createAndStart(spec);
+        ContainerInfo info = lifecycleManager.createAndStartEphemeral(spec);
         return initializeAndRegisterHandle(info, accountId, clusterIdentifier, masterUsername, containerName, enginePort,
                 databaseName);
     }
@@ -109,12 +109,12 @@ public class RedshiftContainerManager {
     /**
      * Starts a cluster's container the same way {@link #start}, except that a container
      * already running under this cluster's name (e.g. Floci's own process restarted but
-     * Docker did not) is adopted instead of destroyed and recreated. The container has no
-     * persistent volume, so a blind recreate would silently discard the cluster's data;
+     * Docker did not) is adopted instead of destroyed and recreated. The image's anonymous
+     * volume is not reattached on recreation, so a blind recreate would discard the cluster's data;
      * adopting preserves it whenever the physical container survived. If no such container
      * exists (first start, or the container itself was removed), this falls back to
      * {@link #start}, and in that case the previous data is unrecoverable, matching this
-     * project's decision not to back Redshift containers with a Docker volume.
+     * project's decision not to provision reusable named volumes for Redshift containers.
      */
     public RedshiftContainerHandle adoptOrStart(String accountId, String clusterIdentifier, String masterUsername, String masterPassword) {
         return adoptOrStart(accountId, clusterIdentifier, masterUsername, masterPassword, DEFAULT_DATABASE);
@@ -127,10 +127,11 @@ public class RedshiftContainerManager {
         Optional<Container> existing = lifecycleManager.findByName(containerName);
         if (existing.isEmpty()) {
             LOG.warnv("No surviving container for cluster {0}; starting a fresh empty one: the previous"
-                    + " contents are not recoverable (no Docker volume backs Redshift containers)", clusterIdentifier);
+                    + " contents are not recoverable (no reusable named volume backs Redshift containers)", clusterIdentifier);
             return start(accountId, clusterIdentifier, masterUsername, masterPassword, databaseName);
         }
 
+        adoptedContainers.put(containerKey(accountId, clusterIdentifier), existing.get().getId());
         LOG.infov("Adopting existing container {0} for cluster {1} to avoid discarding its data",
                 containerName, clusterIdentifier);
         int enginePort = 5432;
@@ -164,16 +165,56 @@ public class RedshiftContainerManager {
             LOG.warnv("Failed to stream logs for {0}", containerName);
         }
 
-        waitForReady(containerName, info.containerId(), masterUsername, databaseName);
-        bootstrapCatalog(info.containerId(), masterUsername, databaseName);
-
+        try {
+            waitForReady(containerName, info.containerId(), masterUsername, databaseName);
+            bootstrapCatalog(info.containerId(), masterUsername, databaseName);
+        } catch (RuntimeException e) {
+            containers.put(containerKey(accountId, clusterIdentifier), handle);
+            throw e;
+        }
         containers.put(containerKey(accountId, clusterIdentifier), handle);
         return handle;
     }
 
     public void stop(String accountId, String clusterIdentifier) {
-        containers.remove(containerKey(accountId, clusterIdentifier));
-        lifecycleManager.removeIfExists(containerName(accountId, clusterIdentifier));
+        String key = containerKey(accountId, clusterIdentifier);
+        RedshiftContainerHandle handle = containers.get(key);
+        String adoptedId = adoptedContainers.get(key);
+        String containerId = handle == null
+                ? adoptedContainers.getOrDefault(key, containerName(accountId, clusterIdentifier)) : handle.getContainerId();
+        lifecycleManager.removeIfExistsStrict(containerId, true);
+        releaseHandle(key, handle);
+        if (containerId.equals(adoptedId)) {
+            adoptedContainers.remove(key, adoptedId);
+        }
+    }
+
+    /** Rolls back startup without destroying a container that survived an earlier process. */
+    public void rollbackStartup(String accountId, String clusterIdentifier) {
+        String key = containerKey(accountId, clusterIdentifier);
+        String adoptedId = adoptedContainers.get(key);
+        if (adoptedId == null) {
+            stop(accountId, clusterIdentifier);
+            return;
+        }
+        RedshiftContainerHandle handle = containers.get(key);
+        if (handle != null && adoptedId.equals(handle.getContainerId())) {
+            releaseHandle(key, handle);
+        }
+    }
+
+    private void releaseHandle(String key, RedshiftContainerHandle handle) {
+        if (handle != null) {
+            Closeable stream = handle.getLogStream();
+            if (stream != null) {
+                try {
+                    stream.close();
+                } catch (Exception e) {
+                    throw new IllegalStateException("Failed to close logs for Redshift container " + handle.getContainerId(), e);
+                }
+            }
+            containers.remove(key, handle);
+        }
     }
 
     public Optional<RedshiftContainerHandle> getContainer(String accountId, String clusterIdentifier) {
