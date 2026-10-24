@@ -231,3 +231,11 @@ healthy and nothing else reports the collision.
 Giving each load balancer a `host-header` rule for the hostname it serves is usually enough, and it
 is the same configuration AWS needs. Moving one load balancer to a different listener port also
 works, at the cost of a Floci-only difference from the deployed template.
+
+### Target health scheduling
+
+ELBv2 probes independent targets concurrently, with up to 32 probes running and one
+outstanding probe per target. Repeated target registration preserves probe cadence.
+Changing the health interval reschedules monitoring, and late results from old
+registrations or settings cannot change current health. Configured healthy and
+unhealthy thresholds still apply to real HTTP results.
