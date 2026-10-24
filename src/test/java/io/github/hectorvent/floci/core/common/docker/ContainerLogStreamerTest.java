@@ -16,6 +16,7 @@ import java.io.Closeable;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -198,6 +199,38 @@ class ContainerLogStreamerTest {
 
         // append() splits faithfully; the emit layer is what skips blanks.
         assertEquals(List.of("a", "", "b"), buffer.append(utf8("a\n\nb\n")));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 3, 1024, 262145})
+    void frameBoundariesPreserveCappedUnicodeLinesAndTrailingContent(int frameSize) {
+        int cap = 256 * 1024;
+        String first = "a".repeat(cap - 3) + "€";
+        String rockets = "🚀".repeat(cap / 4);
+        byte[] payload = utf8(first + "\nshort\n" + rockets + "🚀\ntail");
+        ContainerLogStreamer.LogLineBuffer buffer = new ContainerLogStreamer.LogLineBuffer();
+        List<String> lines = new ArrayList<>();
+
+        for (int offset = 0; offset < payload.length; offset += frameSize) {
+            lines.addAll(buffer.append(Arrays.copyOfRange(payload, offset,
+                    Math.min(offset + frameSize, payload.length))));
+        }
+
+        assertEquals(List.of(first, "", "short", rockets, "🚀"), lines);
+        assertEquals("tail", buffer.flush().orElseThrow());
+        assertFalse(buffer.hasPendingBytes());
+    }
+
+    @Test
+    void emittedLinesAndBufferedFragmentsSurvivePayloadReuse() {
+        ContainerLogStreamer.LogLineBuffer buffer = new ContainerLogStreamer.LogLineBuffer();
+        byte[] payload = utf8("first\npartial");
+
+        List<String> lines = buffer.append(payload);
+        Arrays.fill(payload, (byte) 'x');
+
+        assertEquals(List.of("first"), lines);
+        assertEquals(List.of("partial"), buffer.append(utf8("\n")));
     }
 
     @Test

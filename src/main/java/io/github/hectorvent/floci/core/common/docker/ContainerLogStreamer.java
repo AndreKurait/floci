@@ -11,6 +11,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -19,7 +20,6 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.EnumMap;
@@ -509,10 +509,7 @@ public class ContainerLogStreamer {
          */
         private static final int MAX_LINE_BYTES = 256 * 1024;
 
-        // The callback serializes access to each buffer. A synchronized stream write per byte
-        // adds monitor traffic to every container log without providing additional protection.
-        private byte[] buffer = new byte[256];
-        private int size;
+        private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
 
         /** Continuation bytes still needed to complete the character at the buffer's tail; 0 means the
          *  buffer currently ends on a UTF-8 character boundary. */
@@ -521,9 +518,14 @@ public class ContainerLogStreamer {
         /** Appends a frame payload and returns the complete lines it produced (possibly none). */
         List<String> append(byte[] payload) {
             List<String> lines = new ArrayList<>();
-            for (byte b : payload) {
+            int start = 0;
+            int size = buffer.size();
+            for (int i = 0; i < payload.length; i++) {
+                byte b = payload[i];
                 if (b == '\n') {
-                    lines.add(takeLine());
+                    lines.add(takeLine(payload, start, i));
+                    start = i + 1;
+                    size = 0;
                     continue;
                 }
                 // Force-split BEFORE a character that would push the buffer past the cap, so the emitted
@@ -533,20 +535,24 @@ public class ContainerLogStreamer {
                 if (pendingContinuation == 0 && (b & 0xC0) != 0x80
                         && size > 0
                         && size + utf8CharLength(b) > MAX_LINE_BYTES) {
-                    lines.add(takeLine());
+                    lines.add(takeLine(payload, start, i));
+                    start = i;
+                    size = 0;
                 }
-                if (size == buffer.length) {
-                    buffer = Arrays.copyOf(buffer, Math.min(buffer.length * 2, MAX_LINE_BYTES + 3));
-                }
-                buffer[size++] = b;
+                size++;
                 trackUtf8(b);
                 if ((size >= MAX_LINE_BYTES && pendingContinuation == 0)
                         || size >= MAX_LINE_BYTES + 3) {
                     // Do not split a valid character whose continuation bytes arrive in a later frame.
                     // Malformed input may never reach a boundary, so allow at most the three continuation
                     // bytes a valid UTF-8 character could need before forcing the buffer to drain.
-                    lines.add(takeLine());
+                    lines.add(takeLine(payload, start, i + 1));
+                    start = i + 1;
+                    size = 0;
                 }
+            }
+            if (start < payload.length) {
+                buffer.write(payload, start, payload.length - start);
             }
             return lines;
         }
@@ -563,11 +569,11 @@ public class ContainerLogStreamer {
 
         /** Returns any buffered content not yet terminated by a newline, clearing the buffer. */
         Optional<String> flush() {
-            return size == 0 ? Optional.empty() : Optional.of(takeLine());
+            return buffer.size() == 0 ? Optional.empty() : Optional.of(takeLine());
         }
 
         boolean hasPendingBytes() {
-            return size > 0;
+            return buffer.size() > 0;
         }
 
         /** Updates how many UTF-8 continuation bytes are still expected after appending byte {@code b}. */
@@ -591,9 +597,18 @@ public class ContainerLogStreamer {
             }
         }
 
+        private String takeLine(byte[] payload, int start, int end) {
+            if (!hasPendingBytes()) {
+                pendingContinuation = 0;
+                return new String(payload, start, end - start, StandardCharsets.UTF_8);
+            }
+            buffer.write(payload, start, end - start);
+            return takeLine();
+        }
+
         private String takeLine() {
-            String line = new String(buffer, 0, size, StandardCharsets.UTF_8);
-            size = 0;
+            String line = buffer.toString(StandardCharsets.UTF_8);
+            buffer.reset();
             pendingContinuation = 0;
             return line;
         }
