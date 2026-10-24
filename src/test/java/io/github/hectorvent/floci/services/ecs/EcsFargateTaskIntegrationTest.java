@@ -7,6 +7,7 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 
 import static io.restassured.RestAssured.given;
@@ -292,8 +293,8 @@ class EcsFargateTaskIntegrationTest {
                 .body("service.capacityProviderStrategy[0].weight", equalTo(1))
                 .body("service.launchType", nullValue());
 
-        ecsService.reconcileServices();
-        ecsService.reconcileServices();
+        ecsService.awaitServiceStable(ecsService.describeServices(CLUSTER,
+                List.of("fargate-spot-svc"), "us-east-1").getFirst(), Duration.ofSeconds(30));
         call("DescribeServices", "{\"cluster\":\"" + CLUSTER
                 + "\",\"services\":[\"fargate-spot-svc\"]}", 200)
                 .then()
