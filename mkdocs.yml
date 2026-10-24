@@ -234,3 +234,5 @@ nav:
     - .NET: testcontainers/dotnet.md
     - Go: testcontainers/go.md
   - Contributing: contributing.md
+  - Performance:
+    - Event-driven reconciliation: performance/reconciliation.md
