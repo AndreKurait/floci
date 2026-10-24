@@ -9,9 +9,14 @@ import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -29,6 +34,52 @@ class CloudWatchMetricsServiceTest {
                 new InMemoryStorage<>(),
                 new RegionResolver("us-east-1", "000000000000")
         );
+    }
+
+    @Test
+    void metricDefinitionUpdatePreservesStateAndTags() {
+        MetricAlarm original = new MetricAlarm();
+        original.setAlarmName("updated");
+        original.setTags(new HashMap<>(Map.of("team", "original")));
+        service.putMetricAlarm(original, REGION);
+        service.setAlarmState("updated", "ALARM", "manual", "{}", REGION);
+        service.tagResource(original.getAlarmArn(), Map.of("owner", "retained"), REGION);
+        service.untagResource(original.getAlarmArn(), List.of("team"), REGION);
+        MetricAlarm replacement = new MetricAlarm();
+        replacement.setAlarmName("updated");
+        replacement.setThreshold(42.0);
+        replacement.setTags(new HashMap<>(Map.of("ignored", "update")));
+        service.putMetricAlarm(replacement, REGION);
+        MetricAlarm result = service.describeAlarms(List.of("updated"), null, REGION).getFirst();
+        assertEquals("ALARM", result.getStateValue());
+        assertEquals("manual", result.getStateReason());
+        assertEquals("{}", result.getStateReasonData());
+        assertEquals(original.getStateUpdatedTimestamp(), result.getStateUpdatedTimestamp());
+        assertEquals(42.0, result.getThreshold());
+        assertEquals(Map.of("owner", "retained"), result.getTags());
+        assertNotSame(original.getTags(), result.getTags());
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"", "alarm", "UNKNOWN"})
+    void invalidManualStatePreservesAlarm(String value) {
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName("manual");
+        service.putMetricAlarm(alarm, REGION);
+        service.setAlarmState("manual", "OK", "preserved", "{}", REGION);
+        long timestamp = alarm.getStateUpdatedTimestamp();
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.setAlarmState("manual", value, "rejected", "changed", REGION));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals(value == null
+                ? "1 validation error detected: Value null at 'stateValue' failed to satisfy constraint: Member must not be null"
+                : "1 validation error detected: Value '" + value + "' at 'stateValue' failed to satisfy constraint: "
+                        + "Member must satisfy enum value set: [OK, ALARM, INSUFFICIENT_DATA]", error.getMessage());
+        assertEquals("OK", alarm.getStateValue());
+        assertEquals("preserved", alarm.getStateReason());
+        assertEquals("{}", alarm.getStateReasonData());
+        assertEquals(timestamp, alarm.getStateUpdatedTimestamp());
     }
 
     private MetricDatum datum(String name, double value) {

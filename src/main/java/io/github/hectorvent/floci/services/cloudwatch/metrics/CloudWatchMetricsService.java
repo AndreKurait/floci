@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudwatch.metrics;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -17,6 +18,7 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -316,7 +318,15 @@ public class CloudWatchMetricsService {
         };
     }
 
-    public void putMetricAlarm(MetricAlarm alarm, String region) {
+    public synchronized void putMetricAlarm(MetricAlarm alarm, String region) {
+        MetricAlarm previous = alarmStore.get(region + "::" + alarm.getAlarmName()).orElse(null);
+        if (previous != null) {
+            alarm.setStateValue(previous.getStateValue());
+            alarm.setStateReason(previous.getStateReason());
+            alarm.setStateReasonData(previous.getStateReasonData());
+            alarm.setStateUpdatedTimestamp(previous.getStateUpdatedTimestamp());
+            alarm.setTags(new HashMap<>(previous.getTags()));
+        }
         if (alarm.getAlarmArn() == null) {
             alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + alarm.getAlarmName()));
         }
@@ -353,20 +363,31 @@ public class CloudWatchMetricsService {
     }
 
     public void setAlarmState(String alarmName, String stateValue, String stateReason, String stateReasonData, String region) {
-        String key = region + "::" + alarmName;
-        MetricAlarm alarm = alarmStore.get(key)
-                .orElseThrow(() -> new AwsException("ResourceNotFound", "Alarm not found: " + alarmName, 404));
+        List<String> states = List.of("OK", "ALARM", "INSUFFICIENT_DATA");
+        if (stateValue == null || !states.contains(stateValue)) {
+            throw SmithyValidationErrors.validationError(stateValue == null ? SmithyValidationErrors.notNull("stateValue")
+                    : SmithyValidationErrors.notInEnum(stateValue, "stateValue", states));
+        }
+        List<AlarmSnsNotifier.Notification> notifications = List.of();
+        synchronized (this) {
+            String key = region + "::" + alarmName;
+            MetricAlarm alarm = alarmStore.get(key)
+                    .orElseThrow(() -> new AwsException("ResourceNotFound", "Alarm not found: " + alarmName, 404));
 
-        String oldState = alarm.getStateValue();
-        alarm.setStateValue(stateValue);
-        alarm.setStateReason(stateReason);
-        alarm.setStateReasonData(stateReasonData);
-        alarm.setStateUpdatedTimestamp(Instant.now().getEpochSecond());
+            String oldState = alarm.getStateValue();
+            alarm.setStateValue(stateValue);
+            alarm.setStateReason(stateReason);
+            alarm.setStateReasonData(stateReasonData);
+            alarm.setStateUpdatedTimestamp(Instant.now().getEpochSecond());
 
-        alarmStore.put(key, alarm);
-        LOG.infov("SetAlarmState: {0} -> {1}", alarmName, stateValue);
+            alarmStore.put(key, alarm);
+            LOG.infov("SetAlarmState: {0} -> {1}", alarmName, stateValue);
+            if (alarmSnsNotifier != null) {
+                notifications = alarmSnsNotifier.prepareTransition(alarm, oldState);
+            }
+        }
         if (alarmSnsNotifier != null) {
-            alarmSnsNotifier.notifyTransition(alarm, oldState);
+            alarmSnsNotifier.publish(notifications);
         }
     }
 
@@ -397,13 +418,13 @@ public class CloudWatchMetricsService {
         return requireAlarm(resourceArn, region).getTags();
     }
 
-    public void tagResource(String resourceArn, Map<String, String> tags, String region) {
+    public synchronized void tagResource(String resourceArn, Map<String, String> tags, String region) {
         MetricAlarm alarm = requireAlarm(resourceArn, region);
         alarm.getTags().putAll(tags);
         alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
     }
 
-    public void untagResource(String resourceArn, List<String> tagKeys, String region) {
+    public synchronized void untagResource(String resourceArn, List<String> tagKeys, String region) {
         MetricAlarm alarm = requireAlarm(resourceArn, region);
         tagKeys.forEach(alarm.getTags()::remove);
         alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);

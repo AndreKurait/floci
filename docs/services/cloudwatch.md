@@ -402,6 +402,13 @@ delivers metrics to the Firehose delivery stream a metric stream names.
 SQS publishes its queue metrics under `AWS/SQS` once a minute; see
 [SQS CloudWatch Metrics](sqs.md#cloudwatch-metrics).
 
+### Metric alarm updates
+
+Updating a metric alarm preserves its current state, state reason, state timestamp and tags.
+Tags supplied to `PutMetricAlarm` apply only when creating an alarm; use `TagResource` and
+`UntagResource` to change existing tags. `SetAlarmState` rejects missing or unknown state
+values before changing the alarm.
+
 ### SNS alarm actions
 
 State transitions publish to same-account standard SNS topics in `AlarmActions`, `OKActions`, or

@@ -12,6 +12,11 @@ import org.mockito.ArgumentCaptor;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -123,5 +128,41 @@ class AlarmSnsNotifierTest {
         alarm.setAlarmActions(List.of(topic));
         service.setAlarmState("test-alarm", "ALARM", "breached", null, REGION);
         verify(sns).publish(eq(topic), isNull(), contains("arn:aws-cn:cloudwatch:"), anyString(), eq("cn-north-1"));
+    }
+
+    @Test
+    void blockedNotificationDoesNotHoldTheAlarmMutationLock() throws Exception {
+        CountDownLatch publishing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(call -> {
+            if (call.<String>getArgument(3).startsWith("ALARM:")) {
+                publishing.countDown();
+                assertTrue(release.await(5, TimeUnit.SECONDS));
+            }
+            return "message-id";
+        }).when(sns).publish(eq(TOPIC), isNull(), anyString(), anyString(), eq(REGION));
+
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            Future<?> transition = executor.submit(() ->
+                    service.setAlarmState("test-alarm", "ALARM", "breached", null, REGION));
+            try {
+                assertTrue(publishing.await(2, TimeUnit.SECONDS));
+                Future<?> unrelated = executor.submit(() -> {
+                    MetricAlarm unrelatedAlarm = new MetricAlarm();
+                    unrelatedAlarm.setAlarmName("unrelated");
+                    service.putMetricAlarm(unrelatedAlarm, REGION);
+                    service.setAlarmState("test-alarm", "OK", "recovered", null, REGION);
+                });
+                unrelated.get(2, TimeUnit.SECONDS);
+                assertEquals("OK", alarm.getStateValue());
+            } finally {
+                release.countDown();
+            }
+            transition.get(2, TimeUnit.SECONDS);
+        }
+        ArgumentCaptor<String> messages = ArgumentCaptor.forClass(String.class);
+        verify(sns, times(2)).publish(eq(TOPIC), isNull(), messages.capture(), anyString(), eq(REGION));
+        assertEquals("ALARM", mapper.readTree(messages.getAllValues().getFirst()).path("NewStateValue").asText());
+        assertEquals("OK", mapper.readTree(messages.getAllValues().getLast()).path("NewStateValue").asText());
     }
 }
