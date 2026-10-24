@@ -1,0 +1,96 @@
+name: Fork dev image
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: fork-dev-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'AndreKurait/floci' && github.ref == 'refs/heads/dev'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-images.yml
+    with:
+      source-ref: ${{ github.sha }}
+      image: ghcr.io/andrekurait/floci
+
+  smoke:
+    name: Smoke test (${{ matrix.arch }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    timeout-minutes: 10
+    permissions:
+      packages: read
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Smoke test published image
+        env:
+          IMAGE: ${{ needs.build.outputs.image-digest-ref }}
+        run: |
+          trap 'docker rm -fv floci-dev-smoke >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name floci-dev-smoke --publish 127.0.0.1:4566:4566 "$IMAGE"
+          deadline=$((SECONDS + 90))
+          until [[ "$(docker inspect --format '{{.State.Health.Status}}' floci-dev-smoke)" == healthy ]]; do
+            if (( SECONDS >= deadline )); then
+              docker logs floci-dev-smoke
+              exit 1
+            fi
+            sleep 1
+          done
+          docker exec floci-dev-smoke aws s3api list-buckets --output json
+
+  promote:
+    name: Update dev tag
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Point dev at the tested image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.build.outputs.image-digest-ref }}
+          SOURCE_SHA: ${{ needs.build.outputs.source-sha }}
+        run: |
+          current="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/dev" --jq '.object.sha')"
+          if [[ "$current" != "$SOURCE_SHA" ]]; then
+            echo "Dev advanced during this build; leaving the moving tag unchanged."
+            exit 0
+          fi
+          docker buildx imagetools create --tag ghcr.io/andrekurait/floci:dev "$IMAGE"
+          {
+            echo "Pull: \`docker pull ghcr.io/andrekurait/floci:dev\`"
+            echo
+            echo "Tested immutable image: \`$IMAGE\`"
+            echo "Source: \`$SOURCE_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
