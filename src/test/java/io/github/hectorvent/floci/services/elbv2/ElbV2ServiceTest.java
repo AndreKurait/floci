@@ -53,6 +53,7 @@ import java.util.function.Supplier;
 import static io.github.hectorvent.floci.services.elbv2.ElbV2PublicationTestSupport.allowPublications;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -980,13 +981,28 @@ class ElbV2ServiceTest {
         verifyNoInteractions(healthChecker);
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {1, 65535})
+    void lambdaTargetsDoNotInheritGroupPort(int port) {
+        TargetGroup group = service.createTargetGroup(REGION, "lambda-group-port", null, null, port,
+                null, "lambda", null, null, false, null, null, null, null, null, null, null, Map.of());
+        String arn = group.getTargetGroupArn();
+        String id = "arn:aws:lambda:us-west-2:000000000000:function:target";
+        service.registerTargets(REGION, arn, List.of(target(id, null)));
+        TargetDescription described = service.describeTargetHealth(REGION, arn, null).getFirst().getTarget();
+        assertNull(described.getPort());
+        service.deregisterTargets(REGION, arn, List.of(described));
+        assertTrue(service.describeTargetHealth(REGION, arn, null).isEmpty());
+    }
+
     private void targetOperation(String operation, String arn, List<TargetDescription> targets) {
-        switch (operation) {
-            case "register" -> service.registerTargets(REGION, arn, targets);
-            case "deregister" -> service.deregisterTargets(REGION, arn, targets);
-            case "health" -> service.describeTargetHealth(REGION, arn, targets);
+        Runnable request = switch (operation) {
+            case "register" -> () -> service.registerTargets(REGION, arn, targets);
+            case "deregister" -> () -> service.deregisterTargets(REGION, arn, targets);
+            case "health" -> () -> service.describeTargetHealth(REGION, arn, targets);
             default -> throw new IllegalArgumentException(operation);
-        }
+        };
+        request.run();
     }
 
     private static TargetDescription target(String id, Integer port) {

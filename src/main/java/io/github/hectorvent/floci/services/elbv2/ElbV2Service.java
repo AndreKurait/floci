@@ -1002,7 +1002,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         }
         List<TargetDescription> existing = tg.getTargets();
         for (TargetDescription t : targets) {
-            if (t.getPort() == null && tg.getPort() != null) {
+            if (!"lambda".equals(tg.getTargetType()) && t.getPort() == null && tg.getPort() != null) {
                 t.setPort(tg.getPort());
             }
             // replace if same id+port already registered

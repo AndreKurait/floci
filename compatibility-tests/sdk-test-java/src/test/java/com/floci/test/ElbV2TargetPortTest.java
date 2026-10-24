@@ -51,14 +51,8 @@ class ElbV2TargetPortTest {
     @DisplayName("Every target operation validates port ranges before resolving the group")
     void invalidTargetPort(String operation, int port) {
         List<TargetDescription> targets = List.of(TargetDescription.builder().id("10.0.0.5").port(port).build());
-        ElasticLoadBalancingV2Exception error = assertThrows(ElasticLoadBalancingV2Exception.class, () -> {
-            switch (operation) {
-                case "register" -> client.registerTargets(r -> r.targetGroupArn("missing-group").targets(targets));
-                case "deregister" -> client.deregisterTargets(r -> r.targetGroupArn("missing-group").targets(targets));
-                case "health" -> client.describeTargetHealth(r -> r.targetGroupArn("missing-group").targets(targets));
-                default -> throw new IllegalArgumentException(operation);
-            }
-        });
+        ElasticLoadBalancingV2Exception error = assertThrows(ElasticLoadBalancingV2Exception.class,
+                () -> targetOperation(operation, "missing-group", targets));
         assertThat(error.awsErrorDetails().errorCode()).isEqualTo("ValidationError");
         assertThat(error.statusCode()).isEqualTo(400);
     }
@@ -94,14 +88,8 @@ class ElbV2TargetPortTest {
         try {
             List<TargetDescription> targets = List.of(TargetDescription.builder()
                     .id("arn:aws:lambda:us-east-1:000000000000:function:absent").port(port).build());
-            ElasticLoadBalancingV2Exception error = assertThrows(ElasticLoadBalancingV2Exception.class, () -> {
-                switch (operation) {
-                    case "register" -> client.registerTargets(r -> r.targetGroupArn(arn).targets(targets));
-                    case "deregister" -> client.deregisterTargets(r -> r.targetGroupArn(arn).targets(targets));
-                    case "health" -> client.describeTargetHealth(r -> r.targetGroupArn(arn).targets(targets));
-                    default -> throw new IllegalArgumentException(operation);
-                }
-            });
+            ElasticLoadBalancingV2Exception error = assertThrows(ElasticLoadBalancingV2Exception.class,
+                    () -> targetOperation(operation, arn, targets));
             assertThat(error.awsErrorDetails().errorCode()).isEqualTo("ValidationError");
             assertThat(error.statusCode()).isEqualTo(400);
             if (port > 65535) {
@@ -114,6 +102,35 @@ class ElbV2TargetPortTest {
         } finally {
             client.deleteTargetGroup(r -> r.targetGroupArn(arn));
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 65535})
+    @DisplayName("Lambda target round trips omit a supplied group port")
+    void lambdaTargetDoesNotInheritGroupPort(int port) {
+        String arn = client.createTargetGroup(r -> r.name(TestFixtures.uniqueName("lambda-group-port"))
+                .targetType("lambda").port(port)).targetGroups().get(0).targetGroupArn();
+        try {
+            client.registerTargets(r -> r.targetGroupArn(arn).targets(TargetDescription.builder()
+                    .id("arn:aws:lambda:us-east-1:000000000000:function:absent").build()));
+            List<TargetDescription> described = client.describeTargetHealth(r -> r.targetGroupArn(arn))
+                    .targetHealthDescriptions().stream().map(t -> t.target()).toList();
+            assertThat(described).singleElement().satisfies(t -> assertThat(t.port()).isNull());
+            client.deregisterTargets(r -> r.targetGroupArn(arn).targets(described));
+            assertThat(client.describeTargetHealth(r -> r.targetGroupArn(arn)).targetHealthDescriptions()).isEmpty();
+        } finally {
+            client.deleteTargetGroup(r -> r.targetGroupArn(arn));
+        }
+    }
+
+    private void targetOperation(String operation, String arn, List<TargetDescription> targets) {
+        Runnable request = switch (operation) {
+            case "register" -> () -> client.registerTargets(r -> r.targetGroupArn(arn).targets(targets));
+            case "deregister" -> () -> client.deregisterTargets(r -> r.targetGroupArn(arn).targets(targets));
+            case "health" -> () -> client.describeTargetHealth(r -> r.targetGroupArn(arn).targets(targets));
+            default -> throw new IllegalArgumentException(operation);
+        };
+        request.run();
     }
 
 }
