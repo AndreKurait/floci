@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.elbv2;
 
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -71,8 +72,9 @@ class ElbV2IntegrationTest {
                         + "' at 'port' failed to satisfy constraint: Member must have value " + constraint));
     }
 
-    @Test
-    void gatewayListenerPortRejectionsPreservePortlessListener() {
+    @ParameterizedTest
+    @CsvSource({"Port,6081", "Protocol,GENEVE", "Protocol,TCP"})
+    void gatewayListenerRejectionsPreservePortlessListener(String field, String value) {
         String gatewayArn = given().header("Authorization", AUTH)
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", "gateway-listener-port")
@@ -83,32 +85,32 @@ class ElbV2IntegrationTest {
         try {
             given().header("Authorization", AUTH)
                     .formParam("Action", "CreateListener").formParam("LoadBalancerArn", gatewayArn)
-                    .formParam("Protocol", "GENEVE").formParam("Port", 6081)
+                    .formParam(field, value)
                     .when().post("/").then().statusCode(400)
                     .body("ErrorResponse.Error.Code", equalTo("InvalidConfigurationRequest"));
             given().header("Authorization", AUTH)
                     .formParam("Action", "DescribeListeners").formParam("LoadBalancerArn", gatewayArn)
                     .when().post("/").then().statusCode(200)
                     .body("DescribeListenersResponse.DescribeListenersResult.Listeners.member.size()", equalTo(0));
-            String gatewayListener = given().header("Authorization", AUTH)
+            Response created = given().header("Authorization", AUTH)
                     .formParam("Action", "CreateListener").formParam("LoadBalancerArn", gatewayArn)
-                    .formParam("Protocol", "GENEVE")
-                    .when().post("/").then().statusCode(200)
-                    .extract().path("CreateListenerResponse.CreateListenerResult.Listeners.member.ListenerArn");
+                    .when().post("/").then().statusCode(200).extract().response();
+            String gatewayListener = created.path("CreateListenerResponse.CreateListenerResult.Listeners.member.ListenerArn");
+            String originalProtocol = created.path("CreateListenerResponse.CreateListenerResult.Listeners.member.Protocol");
             given().header("Authorization", AUTH)
                     .formParam("Action", "ModifyListener").formParam("ListenerArn", gatewayListener)
-                    .formParam("Protocol", "TCP").formParam("Port", 6081)
+                    .formParam(field, value)
                     .when().post("/").then().statusCode(400)
                     .body("ErrorResponse.Error.Code", equalTo("InvalidConfigurationRequest"));
             given().header("Authorization", AUTH)
                     .formParam("Action", "DescribeListeners").formParam("ListenerArns.member.1", gatewayListener)
                     .when().post("/").then().statusCode(200)
-                    .body("DescribeListenersResponse.DescribeListenersResult.Listeners.member.Protocol", equalTo("GENEVE"))
+                    .body("DescribeListenersResponse.DescribeListenersResult.Listeners.member.Protocol", equalTo(originalProtocol))
                     .body("DescribeListenersResponse.DescribeListenersResult.Listeners.member.Port.size()", equalTo(0));
             given().header("Authorization", AUTH)
                     .formParam("Action", "ModifyListener").formParam("ListenerArn", gatewayListener)
                     .when().post("/").then().statusCode(200)
-                    .body("ModifyListenerResponse.ModifyListenerResult.Listeners.member.Protocol", equalTo("GENEVE"))
+                    .body("ModifyListenerResponse.ModifyListenerResult.Listeners.member.Protocol", equalTo(originalProtocol))
                     .body("ModifyListenerResponse.ModifyListenerResult.Listeners.member.Port.size()", equalTo(0));
         } finally {
             given().header("Authorization", AUTH)

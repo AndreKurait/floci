@@ -604,7 +604,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                     List<Action> defaultActions, List<String> alpnPolicy,
                                     Map<String, String> initialTags) {
         validatePort(port, "port");
-        requireGatewayListenerPort(requireLoadBalancer(region, lbArn), port);
+        requireGatewayListenerSettings(requireLoadBalancer(region, lbArn), protocol, port);
 
         Map<String, Listener> regionListeners = listeners.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
 
@@ -747,7 +747,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         while (true) {
             Listener initial = requireListener(region, listenerArn);
             LoadBalancer initialLb = requireLoadBalancer(region, initial.getLoadBalancerArn());
-            requireGatewayListenerPort(initialLb, port);
+            requireGatewayListenerSettings(initialLb, protocol, port);
             ListenerState initialState = listenerState(initial, initialLb);
             requireAvailableListenerPort(listeners.getOrDefault(region, Map.of()), initial.getLoadBalancerArn(),
                     listenerArn, port != null ? port : initialState.port());
@@ -1230,10 +1230,14 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         }
     }
 
-    private static void requireGatewayListenerPort(LoadBalancer loadBalancer, Integer port) {
+    private static void requireGatewayListenerSettings(LoadBalancer loadBalancer, String protocol, Integer port) {
         if (port != null && "gateway".equals(loadBalancer.getType())) {
             throw new AwsException("InvalidConfigurationRequest",
                     "You can't specify a port for a Gateway Load Balancer.", 400);
+        }
+        if (protocol != null && "gateway".equals(loadBalancer.getType())) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "You can't specify a protocol for a Gateway Load Balancer.", 400);
         }
     }
 

@@ -606,14 +606,49 @@ class ElbV2ServiceTest {
         assertTrue(service.describeListeners(REGION, lbArn, null).isEmpty());
         verifyNoInteractions(dataPlane);
 
-        Listener listener = service.createListener(REGION, lbArn, "GENEVE", null, null,
+        Listener listener = service.createListener(REGION, lbArn, null, null, null,
                 List.of(), List.of(), List.of(), Map.of());
+        String originalProtocol = listener.getProtocol();
         clearInvocations(dataPlane);
         AwsException modifyError = assertThrows(AwsException.class, () -> service.modifyListener(
                 REGION, listener.getListenerArn(), "TCP", port, null, null, null, null));
         assertEquals("InvalidConfigurationRequest", modifyError.getErrorCode());
         assertNull(listener.getPort());
-        assertEquals("GENEVE", listener.getProtocol());
+        assertEquals(originalProtocol, listener.getProtocol());
+        verifyNoInteractions(dataPlane);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GENEVE", "TCP", ""})
+    void gatewayListenerRejectsExplicitProtocolWithoutPublication(String protocol) {
+        String lbArn = service.createLoadBalancer(REGION, "gateway-protocol", "internal", "gateway", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        clearInvocations(dataPlane);
+
+        AwsException error = assertThrows(AwsException.class, () -> service.createListener(
+                REGION, lbArn, protocol, null, null, List.of(), List.of(), List.of(), Map.of()));
+
+        assertEquals("InvalidConfigurationRequest", error.getErrorCode());
+        assertTrue(service.describeListeners(REGION, lbArn, null).isEmpty());
+        verifyNoInteractions(dataPlane);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GENEVE", "TCP", ""})
+    void gatewayListenerRejectsProtocolUpdateWithoutMutation(String protocol) {
+        String lbArn = service.createLoadBalancer(REGION, "gateway-protocol", "internal", "gateway", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        Listener listener = service.createListener(REGION, lbArn, null, null, null,
+                List.of(), List.of(), List.of(), Map.of());
+        String originalProtocol = listener.getProtocol();
+        clearInvocations(dataPlane);
+
+        AwsException error = assertThrows(AwsException.class, () -> service.modifyListener(
+                REGION, listener.getListenerArn(), protocol, null, null, null, null, null));
+
+        assertEquals("InvalidConfigurationRequest", error.getErrorCode());
+        assertEquals(originalProtocol, listener.getProtocol());
+        assertNull(listener.getPort());
         verifyNoInteractions(dataPlane);
     }
 
@@ -623,14 +658,15 @@ class ElbV2ServiceTest {
                 ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
         String oldTarget = createTargetGroup("gateway-old");
         String newTarget = createTargetGroup("gateway-new");
-        Listener listener = service.createListener(REGION, lbArn, "GENEVE", null, null,
+        Listener listener = service.createListener(REGION, lbArn, null, null, null,
                 List.of(), List.of(forwardAction(oldTarget)), List.of(), Map.of());
+        String originalProtocol = listener.getProtocol();
 
         service.modifyListener(REGION, listener.getListenerArn(), null, null, null, null,
                 List.of(forwardAction(newTarget)), null);
 
         assertNull(listener.getPort());
-        assertEquals("GENEVE", listener.getProtocol());
+        assertEquals(originalProtocol, listener.getProtocol());
         assertEquals(newTarget, listener.getDefaultActions().getFirst().getTargetGroupArn());
         assertEquals(newTarget, service.describeRules(REGION, listener.getListenerArn(), null).getFirst()
                 .getActions().getFirst().getTargetGroupArn());
