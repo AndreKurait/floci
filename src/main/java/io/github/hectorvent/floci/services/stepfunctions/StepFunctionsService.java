@@ -176,6 +176,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     }
 
     public void clear() {
+        if (aslExecutor != null) {
+            aslExecutor.clearNestedExecutionWaits();
+        }
         historyCache.clear();
         activityQueues.clear();
         Map<String, PendingTask> pending;
