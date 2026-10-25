@@ -10,6 +10,7 @@ import io.vertx.core.http.HttpServerResponse;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
@@ -23,9 +24,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ElbV2HealthCheckerTest {
@@ -169,6 +174,77 @@ class ElbV2HealthCheckerTest {
                 assertNull(health.reason());
                 assertNull(health.description());
             });
+        } finally {
+            close(server);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"0,30,30000", "100,30,100", "5000,1,1000", "1,30,1"})
+    void optionalIntervalCeilingPreservesShorterRequestedIntervals(
+            long ceilingMillis, int requestedSeconds, long scheduledMillis) {
+        Vertx scheduler = mock(Vertx.class);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().elbv2().maxHealthCheckIntervalMillis()).thenReturn(ceilingMillis);
+        ElbV2HealthChecker checker = new ElbV2HealthChecker(scheduler, config, mock(Ec2Service.class));
+        checkers.add(checker);
+        TargetGroup group = targetGroup(8080, "200", 2, 2);
+        group.setHealthCheckIntervalSeconds(requestedSeconds);
+
+        checker.startMonitoring(group);
+
+        verify(scheduler).setPeriodic(eq(scheduledMillis), any());
+        assertEquals(requestedSeconds, group.getHealthCheckIntervalSeconds());
+    }
+
+    @Test
+    void negativeIntervalCeilingIsRejectedAtStartup() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().elbv2().maxHealthCheckIntervalMillis()).thenReturn(-1L);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> new ElbV2HealthChecker(vertx, config, mock(Ec2Service.class)));
+    }
+
+    @Test
+    void acceleratedRecoveryStillRequiresEverySuccessfulProbe() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        CompletableFuture<HttpServerResponse> firstSuccess = new CompletableFuture<>();
+        CompletableFuture<HttpServerResponse> secondSuccess = new CompletableFuture<>();
+        HttpServer server = vertx.createHttpServer().requestHandler(request -> {
+            int number = requests.incrementAndGet();
+            if (number == 1) {
+                request.response().setStatusCode(503).end();
+            } else if (number == 2) {
+                firstSuccess.complete(request.response());
+            } else {
+                secondSuccess.complete(request.response());
+            }
+        }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        try {
+            EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+            when(config.services().elbv2().maxHealthCheckIntervalMillis()).thenReturn(20L);
+            ElbV2HealthChecker checker = new ElbV2HealthChecker(vertx, config, mock(Ec2Service.class));
+            checkers.add(checker);
+            TargetGroup group = targetGroup(server.actualPort(), "200", 2, 1);
+            group.setHealthCheckIntervalSeconds(30);
+            TargetDescription target = target("127.0.0.1", server.actualPort());
+
+            checker.startMonitoring(group);
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            HttpServerResponse first = firstSuccess.get(2, TimeUnit.SECONDS);
+            assertEquals("unhealthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+            await().during(Duration.ofMillis(100)).atMost(Duration.ofSeconds(1))
+                    .untilAsserted(() -> assertEquals(2, requests.get()));
+            first.end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+
+            HttpServerResponse second = secondSuccess.get(2, TimeUnit.SECONDS);
+            assertEquals("unhealthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+            second.end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals(
+                    "healthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+            assertEquals(30, group.getHealthCheckIntervalSeconds());
+            assertEquals(2, group.getHealthyThresholdCount());
         } finally {
             close(server);
         }

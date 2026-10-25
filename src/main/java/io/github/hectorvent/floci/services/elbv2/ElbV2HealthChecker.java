@@ -30,6 +30,7 @@ public class ElbV2HealthChecker implements Resettable {
     private final Vertx vertx;
     private final EmulatorConfig config;
     private final Ec2Service ec2Service;
+    private final long maxHealthCheckIntervalMillis;
 
     // tgArn → (targetKey → TargetState)
     private final Map<String, Map<String, TargetState>> states = new ConcurrentHashMap<>();
@@ -42,6 +43,11 @@ public class ElbV2HealthChecker implements Resettable {
         this.vertx = vertx;
         this.config = config;
         this.ec2Service = ec2Service;
+        maxHealthCheckIntervalMillis = config.services().elbv2().maxHealthCheckIntervalMillis();
+        if (maxHealthCheckIntervalMillis < 0) {
+            throw new IllegalArgumentException(
+                    "floci.services.elbv2.max-health-check-interval-millis must not be negative");
+        }
     }
 
     public static int effectivePort(TargetDescription target, TargetGroup tg) {
@@ -62,6 +68,9 @@ public class ElbV2HealthChecker implements Resettable {
         states.computeIfAbsent(tgArn, k -> new ConcurrentHashMap<>());
         long intervalMs = (tg.getHealthCheckIntervalSeconds() != null
                 ? tg.getHealthCheckIntervalSeconds() : 30) * 1000L;
+        if (maxHealthCheckIntervalMillis > 0) {
+            intervalMs = Math.min(intervalMs, maxHealthCheckIntervalMillis);
+        }
         ProbeSettings settings = ProbeSettings.of(tg);
         Monitoring previous = timers.get(tgArn);
         if (previous != null && previous.intervalMillis() == intervalMs
