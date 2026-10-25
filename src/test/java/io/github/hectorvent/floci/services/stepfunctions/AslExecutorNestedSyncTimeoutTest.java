@@ -13,10 +13,13 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 
 import static org.awaitility.Awaitility.await;
@@ -28,6 +31,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -96,20 +100,18 @@ class AslExecutorNestedSyncTimeoutTest {
     @ValueSource(strings = {".sync", ".sync:2"})
     void syncWithNoTaskTimeoutCanFinishAfterFiveMinutes(String mode) throws Exception {
         AtomicLong nanos = new AtomicLong();
-        AtomicInteger polls = new AtomicInteger();
         when(sfnService.describeExecution(CHILD_ARN)).thenAnswer(invocation -> {
-            if (polls.incrementAndGet() < 3502) {
-                return child("RUNNING");
-            }
+            nanos.addAndGet(TimeUnit.SECONDS.toNanos(350));
             Execution done = child("SUCCEEDED");
             done.setOutput("{\"answer\":42}");
             return done;
         });
 
-        Execution execution = run(newExecutor(nanos::addAndGet, nanos::get), mode, 0, false, 0, true);
+        Execution execution = run(newExecutor(pause -> {
+            throw new AssertionError("Nested execution completion must not use a polling sleep");
+        }, nanos::get), mode, 0, false, 0, true);
 
         assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
-        assertEquals(3502, polls.get());
         assertTrue(nanos.get() > TimeUnit.SECONDS.toNanos(300));
         assertTrue(objectMapper.readTree(execution.getOutput()).path("Output").toString().contains("42"));
         verify(sfnService, never()).stopExecution(any(), any(), any());
@@ -118,10 +120,13 @@ class AslExecutorNestedSyncTimeoutTest {
     @Test
     void standardExecutionQuotaEndsAnUnboundedTaskAndAbortsItsChild() {
         AtomicLong nanos = new AtomicLong();
-        when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("RUNNING"));
+        when(sfnService.describeExecution(CHILD_ARN)).thenAnswer(invocation -> {
+            nanos.set(Duration.ofDays(365).toNanos());
+            return child("RUNNING");
+        });
 
         Execution execution = run(newExecutor(
-                pause -> nanos.addAndGet(Duration.ofDays(365).toNanos()), nanos::get),
+                pause -> { throw new AssertionError("Nested execution deadline must not poll"); }, nanos::get),
                 ".sync:2", 0, false, 0, true);
 
         assertEquals("TIMED_OUT", execution.getStatus());
@@ -144,23 +149,98 @@ class AslExecutorNestedSyncTimeoutTest {
 
     @Test
     void stopExecutionOnTheParentEndsTheWaitAndAbortsTheChild() {
-        AtomicInteger parentReads = new AtomicInteger();
-        when(sfnService.describeExecution(PARENT_ARN))
-                .thenAnswer(invocation -> parent(parentReads.incrementAndGet() < 3 ? "RUNNING" : "ABORTED"));
+        Execution parent = parent("RUNNING");
+        when(sfnService.describeExecution(PARENT_ARN)).thenReturn(parent);
         AtomicInteger childPolls = new AtomicInteger();
         when(sfnService.describeExecution(CHILD_ARN)).thenAnswer(invocation -> {
             childPolls.incrementAndGet();
+            parent.setStatus("ABORTED");
             return child("RUNNING");
         });
 
-        run(newExecutor(nanos -> { }), ".sync", 0, false);
+        run(newExecutor(nanos -> { throw new AssertionError("Parent cancellation must notify the wait"); }),
+                ".sync", 0, false);
 
-        assertEquals(2, childPolls.get(), "polling stops as soon as the parent reads ABORTED");
+        assertEquals(1, childPolls.get(), "the parent cancellation wakes the wait without rereading its child");
         verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
         List<String> types = history.stream().map(HistoryEvent::getType).toList();
         assertTrue(types.stream().noneMatch(type -> type.equals("TaskTimedOut")
                 || type.equals("TaskFailed") || type.startsWith("Execution")
                 && !type.equals("ExecutionStarted")), "an aborted execution gets no terminal event from the worker: " + types);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {".sync", ".sync:2"})
+    void childCompletionWakesAParkedParentWithoutPolling(String mode) throws Exception {
+        Execution live = child("RUNNING");
+        when(sfnService.startExecution(any(), any(), any(), any())).thenReturn(live);
+        CountDownLatch firstRead = new CountDownLatch(1);
+        AtomicReference<Thread> waitingThread = new AtomicReference<>();
+        when(sfnService.describeExecution(CHILD_ARN)).thenAnswer(invocation -> {
+            waitingThread.set(Thread.currentThread());
+            firstRead.countDown();
+            return live;
+        });
+        AslExecutor executor = newExecutor(nanos -> {
+            throw new AssertionError("Nested completion must not use the polling sleeper");
+        });
+        CompletableFuture<Execution> result = CompletableFuture.supplyAsync(
+                () -> run(executor, mode, 60, false));
+        try {
+            assertTrue(firstRead.await(2, TimeUnit.SECONDS));
+            await().atMost(Duration.ofSeconds(2))
+                    .until(() -> waitingThread.get().getState() == Thread.State.TIMED_WAITING);
+            verify(sfnService, times(1)).describeExecution(CHILD_ARN);
+            synchronized (live) {
+                live.setOutput("{\"answer\":42}");
+                live.setStopDate(2.0);
+                live.setStatus("SUCCEEDED");
+            }
+
+            Execution execution = result.get(2, TimeUnit.SECONDS);
+            assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
+            assertTrue(objectMapper.readTree(execution.getOutput()).path("Output").toString().contains("42"));
+            verify(sfnService, times(2)).describeExecution(CHILD_ARN);
+            verify(sfnService, never()).stopExecution(any(), any(), any());
+        } finally {
+            if (!result.isDone() && waitingThread.get() != null) {
+                waitingThread.get().interrupt();
+            }
+        }
+    }
+
+    @Test
+    void clearCancelsAnActiveNestedWaitAndAbortsItsChild() {
+        AslExecutor executor = newExecutor(nanos -> {
+            throw new AssertionError("Reset must notify the wait");
+        });
+        when(sfnService.describeExecution(CHILD_ARN)).thenAnswer(invocation -> {
+            executor.clearNestedExecutionWaits();
+            return child("RUNNING");
+        });
+
+        Execution execution = run(executor, ".sync", 0, false);
+
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("States.TaskFailed", execution.getError());
+        verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
+    }
+
+    @Test
+    void clearDuringChildStartCannotLeaveAnUnregisteredWait() {
+        AslExecutor executor = newExecutor(nanos -> {
+            throw new AssertionError("Reset during submission must not start polling");
+        });
+        when(sfnService.startExecution(any(), any(), any(), any())).thenAnswer(invocation -> {
+            executor.clearNestedExecutionWaits();
+            return child("RUNNING");
+        });
+
+        Execution execution = run(executor, ".sync:2", 0, false);
+
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("States.TaskFailed", execution.getError());
+        verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
     }
 
     private static Execution child(String status) {
