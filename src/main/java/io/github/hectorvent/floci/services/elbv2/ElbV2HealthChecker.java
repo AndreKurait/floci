@@ -222,7 +222,7 @@ public class ElbV2HealthChecker implements Resettable {
                 if (!current(work)) {
                     return;
                 }
-                applyResult(state, work.settings(), statusCode, failure);
+                applyResult(state, work.settings(), work.group(), statusCode, failure);
             }
         } finally {
             synchronized (this) {
@@ -231,11 +231,14 @@ public class ElbV2HealthChecker implements Resettable {
         }
     }
 
-    private void applyResult(TargetState state, ProbeSettings settings, int statusCode, Exception failure) {
+    private void applyResult(TargetState state, ProbeSettings settings, TargetGroup group, int statusCode, Exception failure) {
         if (failure == null && matchesStatusCode(statusCode, settings.matcher())) {
             state.consecutiveFailures = 0;
             state.consecutiveSuccesses++;
-            if (state.consecutiveSuccesses >= settings.healthyThreshold()) {
+            boolean initialApplicationTarget = "initial".equals(state.health.state())
+                    && ("HTTP".equals(group.getProtocol()) || "HTTPS".equals(group.getProtocol())
+                    || "lambda".equals(group.getTargetType()));
+            if (initialApplicationTarget || state.consecutiveSuccesses >= settings.healthyThreshold()) {
                 state.health = new TargetHealthStatus("healthy", null, null);
             } else if ("initial".equals(state.health.state())) {
                 state.health = new TargetHealthStatus("initial", "Elb.InitialHealthChecking",

@@ -447,6 +447,39 @@ class ElbV2HealthCheckerTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({"HTTP,1", "HTTPS,1", "LAMBDA,1", "TCP,2", "TLS,2", "UDP,2", "TCP_UDP,2", "GENEVE,2"})
+    void initialAdmissionRespectsTargetGroupKind(String protocol, int requiredSuccesses) throws Exception {
+        HttpServer server = startServer(200);
+        try {
+            ElbV2HealthChecker checker = healthChecker();
+            TargetGroup group = targetGroup(server.actualPort(), "200", 2, 1);
+            group.setProtocol("LAMBDA".equals(protocol) ? null : protocol);
+            group.setTargetType("LAMBDA".equals(protocol) ? "lambda" : "ip");
+            group.setHealthCheckProtocol("HTTP");
+            TargetDescription target = target("127.0.0.1", server.actualPort());
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
+                ElbV2HealthChecker.TargetHealthStatus first = checker.getHealth(
+                        group.getTargetGroupArn(), target.getId(), target.getPort());
+                assertEquals(requiredSuccesses == 1 ? "healthy" : "initial", first.state());
+                assertEquals(requiredSuccesses == 1 ? null : "Elb.InitialHealthChecking", first.reason());
+                assertEquals(requiredSuccesses == 1 ? null : "Initial health checks in progress", first.description());
+            });
+            group.setHealthCheckIntervalSeconds(1);
+            checker.startMonitoring(group);
+            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
+                ElbV2HealthChecker.TargetHealthStatus healthy = checker.getHealth(
+                        group.getTargetGroupArn(), target.getId(), target.getPort());
+                assertEquals("healthy", healthy.state());
+                assertNull(healthy.reason());
+                assertNull(healthy.description());
+            });
+        } finally {
+            close(server);
+        }
+    }
+
     private ElbV2HealthChecker healthChecker() {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().elbv2().mock()).thenReturn(false);

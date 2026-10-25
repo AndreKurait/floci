@@ -273,5 +273,7 @@ still sees the original Host and request path. For names without such records, d
 ELBv2 probes independent targets concurrently, with up to 32 probes running and one
 outstanding probe per target. Repeated target registration preserves probe cadence.
 Changing the health interval reschedules monitoring, and late results from old
-registrations or settings cannot change current health. Configured healthy and
-unhealthy thresholds still apply to real HTTP results.
+registrations or settings cannot change current health. Newly registered HTTP/HTTPS
+and Lambda target groups become healthy after one successful probe. Other target
+groups retain the initial healthy threshold, and recovery from unhealthy always
+uses the configured threshold. Failed probes use the configured unhealthy threshold.
