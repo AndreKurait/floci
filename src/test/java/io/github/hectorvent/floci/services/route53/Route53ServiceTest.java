@@ -125,6 +125,20 @@ class Route53ServiceTest {
     }
 
     @Test
+    void defaultAuthorityRecordsUseAbsoluteNamesWithOrWithoutConfiguredDot() {
+        for (String suffix : List.of("", ".")) {
+            Route53Service service = newService(suffix);
+            String zone = service.createHostedZone("authority.example", "authority-" + suffix, null, null).zone().getId();
+            List<ResourceRecordSet> records = service.listResourceRecordSets(zone, null, null, 100);
+            ResourceRecordSet soa = records.stream().filter(record -> "SOA".equals(record.getType())).findFirst().orElseThrow();
+            assertTrue(soa.getRecords().getFirst().getValue().startsWith("ns-1.awsdns-00.com. "));
+            ResourceRecordSet ns = records.stream().filter(record -> "NS".equals(record.getType())).findFirst().orElseThrow();
+            assertEquals(List.of("ns-1.awsdns-00.com.", "ns-2.awsdns-00.net.", "ns-3.awsdns-00.org.",
+                    "ns-4.awsdns-00.co.uk."), ns.getRecords().stream().map(ResourceRecord::getValue).toList());
+        }
+    }
+
+    @Test
     void publicZoneIndexAvoidsStorageScansOutsideOwnedNamesAndTracksDeletion() {
         Route53Service service = newService();
         AccountAwareStorageBackend<?> zones = stores.get("route53-zones.json");
