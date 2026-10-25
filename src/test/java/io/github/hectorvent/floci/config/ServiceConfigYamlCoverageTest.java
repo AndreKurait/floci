@@ -62,7 +62,8 @@ class ServiceConfigYamlCoverageTest {
     @Test
     void missingBareNullAndEmptyDeclarationsRemainMissing() throws IOException {
         for (String yaml : List.of("{}", "service:", "service: {}", "service: {enabled: null}",
-                "service: {enabled: ''}", "service: {enabled: '   '}")) {
+                "service: {enabled: ''}", "service: {enabled: '   '}",
+                "service: {enabled: {}}", "service: {enabled: []}")) {
             JsonNode service = new YAMLMapper().readTree(yaml).path("service");
             assertFalse(declaresEnabled(service), yaml);
         }
@@ -72,7 +73,7 @@ class ServiceConfigYamlCoverageTest {
         JsonNode enabled = service.path("enabled");
         // Config binding validates Boolean values after resolving expressions. This guard only
         // checks that the YAML declares a value instead of relying on the interface fallback.
-        return !enabled.isMissingNode() && !enabled.isNull()
+        return enabled.isValueNode() && !enabled.isNull()
                 && (!enabled.isTextual() || !enabled.textValue().isBlank());
     }
 
