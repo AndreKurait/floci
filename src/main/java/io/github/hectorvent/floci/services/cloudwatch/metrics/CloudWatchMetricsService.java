@@ -382,13 +382,11 @@ public class CloudWatchMetricsService {
             if (!previous.getClass().equals(alarm.getClass())) {
                 throw new AwsException("ValidationError", "An alarm of another type already has this name", 400);
             }
-            if (alarm instanceof CompositeAlarm) {
-                alarm.setStateValue(previous.getStateValue());
-                alarm.setStateReason(previous.getStateReason());
-                alarm.setStateReasonData(previous.getStateReasonData());
-                alarm.setStateUpdatedTimestamp(previous.getStateUpdatedTimestamp());
-                alarm.setTags(new HashMap<>(previous.getTags()));
-            }
+            alarm.setStateValue(previous.getStateValue());
+            alarm.setStateReason(previous.getStateReason());
+            alarm.setStateReasonData(previous.getStateReasonData());
+            alarm.setStateUpdatedTimestamp(previous.getStateUpdatedTimestamp());
+            alarm.setTags(new HashMap<>(previous.getTags()));
         }
         if (alarm.getAlarmArn() == null) {
             alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + name));
@@ -556,6 +554,11 @@ public class CloudWatchMetricsService {
     }
 
     public void setAlarmState(String alarmName, String stateValue, String stateReason, String stateReasonData, String region) {
+        List<String> states = List.of("OK", "ALARM", "INSUFFICIENT_DATA");
+        if (stateValue == null || !states.contains(stateValue)) {
+            throw SmithyValidationErrors.validationError(stateValue == null ? SmithyValidationErrors.notNull("stateValue")
+                    : SmithyValidationErrors.notInEnum(stateValue, "stateValue", states));
+        }
         List<AlarmSnsNotifier.Notification> notifications = List.of();
         synchronized (this) {
             String key = region + "::" + alarmName;

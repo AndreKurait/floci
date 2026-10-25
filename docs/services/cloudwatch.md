@@ -408,6 +408,13 @@ Composite alarms support boolean rules over alarm states. Request `AlarmTypes` c
 action lists are stored but not executed. Action suppression is not implemented and is
 rejected with `ValidationError`.
 
+### Metric alarm updates
+
+Updating a metric alarm preserves its current state, state reason, state timestamp and tags.
+Tags supplied to `PutMetricAlarm` apply only when creating an alarm; use `TagResource` and
+`UntagResource` to change existing tags. `SetAlarmState` rejects missing or unknown state
+values before changing the alarm.
+
 ### SNS alarm actions
 
 State transitions publish to same-account standard SNS topics in `AlarmActions`, `OKActions`, or
