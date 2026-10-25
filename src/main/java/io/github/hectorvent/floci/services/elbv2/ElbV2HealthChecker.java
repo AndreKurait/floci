@@ -226,11 +226,9 @@ public class ElbV2HealthChecker implements Resettable {
         if (failure == null && matchesStatusCode(statusCode, settings.matcher())) {
             state.consecutiveFailures = 0;
             state.consecutiveSuccesses++;
-            if (state.consecutiveSuccesses >= settings.healthyThreshold()) {
+            // The threshold applies to recovery from unhealthy, not initial registration.
+            if ("initial".equals(state.health.state()) || state.consecutiveSuccesses >= settings.healthyThreshold()) {
                 state.health = new TargetHealthStatus("healthy", null, null);
-            } else if ("initial".equals(state.health.state())) {
-                state.health = new TargetHealthStatus("initial", "Elb.InitialHealthChecking",
-                        "Initial health checks in progress");
             }
         } else {
             state.consecutiveSuccesses = 0;

@@ -109,6 +109,7 @@ HTTPS listeners require a default certificate. Supply one when creating a listen
 - HTTP listener sockets are preserved when listener actions change and are restarted only when socket-level settings such as port change.
 - Instance targets are resolved through EC2 instance private addresses so local load balancer traffic can reach containers.
 - Target health starts in `initial` state with reason `Elb.RegistrationInProgress` and is updated by Floci's health checker when monitoring is active.
+- A newly registered target becomes healthy after its first successful check. `HealthyThresholdCount` still applies when recovering from `unhealthy`.
 - Health checks probe the target group's `HealthCheckPort` when it is a port number, and each target's own port when it is `traffic-port` (the default).
 - Each `CreateListener` automatically creates an immutable default rule (`priority=default`, `isDefault=true`). This rule cannot be deleted; use `ModifyListener` to change its action.
 - Rule priorities are unique per listener: `CreateRule` and `SetRulePriorities` only reject a priority held by another rule on the same listener. `SetRulePriorities` is atomic: all priority assignments are validated before any change is committed.

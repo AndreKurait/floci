@@ -106,11 +106,11 @@ class ElbV2HealthCheckerTest {
     }
 
     @Test
-    void successfulProbeBelowThresholdReturnsInitialHealthCheckingReason() throws Exception {
+    void firstSuccessfulProbeMakesNewTargetHealthyRegardlessOfRecoveryThreshold() throws Exception {
         HttpServer server = startServer(200);
         try {
             ElbV2HealthChecker checker = healthChecker();
-            TargetGroup targetGroup = targetGroup(server.actualPort(), "200", 2, 1);
+            TargetGroup targetGroup = targetGroup(server.actualPort(), "200", 10, 2);
             TargetDescription target = target("127.0.0.1", server.actualPort());
 
             checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
@@ -118,9 +118,9 @@ class ElbV2HealthCheckerTest {
             await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
                 ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
                         targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
-                assertEquals("initial", health.state());
-                assertEquals("Elb.InitialHealthChecking", health.reason());
-                assertEquals("Initial health checks in progress", health.description());
+                assertEquals("healthy", health.state());
+                assertNull(health.reason());
+                assertNull(health.description());
             });
         } finally {
             close(server);
@@ -160,6 +160,14 @@ class ElbV2HealthCheckerTest {
                         targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
                 assertEquals("unhealthy", health.state());
                 assertEquals("Target.ResponseCodeMismatch", health.reason());
+            });
+
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
+                ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
+                        targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
+                assertEquals("healthy", health.state());
+                assertNull(health.reason());
+                assertNull(health.description());
             });
         } finally {
             close(server);
@@ -305,24 +313,27 @@ class ElbV2HealthCheckerTest {
     }
 
     @Test
-    void repeatedRegistrationsDoNotBypassConfiguredHealthThreshold() throws Exception {
+    void repeatedRegistrationsDoNotBypassRecoveryHealthThreshold() throws Exception {
         AtomicInteger requests = new AtomicInteger();
+        AtomicInteger statusCode = new AtomicInteger(503);
         HttpServer server = vertx.createHttpServer().requestHandler(request -> {
             requests.incrementAndGet();
-            request.response().end();
+            request.response().setStatusCode(statusCode.get()).end();
         }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
         try {
             ElbV2HealthChecker checker = healthChecker();
             TargetGroup group = targetGroup(server.actualPort(), "200", 3, 1);
             TargetDescription target = target("127.0.0.1", server.actualPort());
             checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
-            await().atMost(Duration.ofSeconds(2)).until(() -> requests.get() == 1);
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("unhealthy",
+                    checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+            statusCode.set(200);
             for (int i = 0; i < 100; i++) {
                 checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
             }
             await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
                 assertEquals(1, requests.get());
-                assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+                assertEquals("unhealthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
             });
         } finally {
             close(server);
@@ -330,19 +341,24 @@ class ElbV2HealthCheckerTest {
     }
 
     @Test
-    void changingIntervalPreservesCountersAndReplacesTheOldTimer() throws Exception {
-        HttpServer server = startServer(200);
+    void changingIntervalPreservesHealthAndReplacesTheOldTimer() throws Exception {
+        AtomicInteger statusCode = new AtomicInteger(200);
+        HttpServer server = vertx.createHttpServer()
+                .requestHandler(request -> request.response().setStatusCode(statusCode.get()).end())
+                .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
         try {
             ElbV2HealthChecker checker = healthChecker();
             TargetGroup group = targetGroup(server.actualPort(), "200", 2, 1);
             group.setHealthCheckIntervalSeconds(30);
             checker.startMonitoring(group);
             checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", server.actualPort())), group);
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("Elb.InitialHealthChecking",
-                    checker.getHealth(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()).reason()));
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
+                    checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort())));
+            statusCode.set(503);
             group.setHealthCheckIntervalSeconds(1);
             checker.startMonitoring(group);
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
+            assertEquals("healthy", checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()));
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("unhealthy",
                     checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort())));
         } finally {
             close(server);
