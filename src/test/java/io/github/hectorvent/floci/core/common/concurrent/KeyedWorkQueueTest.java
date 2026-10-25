@@ -3,11 +3,13 @@ package io.github.hectorvent.floci.core.common.concurrent;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
@@ -17,7 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class KeyedWorkQueueTest {
     @Test
-    void concurrentProducersConvergeToEveryLatestValueWithoutOverlappingAKey() {
+    void concurrentProducersConvergeToEveryLatestValueWithoutOverlappingAKey() throws Exception {
         AtomicIntegerArray versions = new AtomicIntegerArray(32);
         AtomicIntegerArray observed = new AtomicIntegerArray(32);
         AtomicIntegerArray active = new AtomicIntegerArray(32);
@@ -30,14 +32,18 @@ class KeyedWorkQueueTest {
             active.decrementAndGet(key);
         })) {
             try (ExecutorService producers = Executors.newVirtualThreadPerTaskExecutor()) {
+                List<Future<?>> submissions = new ArrayList<>();
                 for (int producer = 0; producer < 8; producer++) {
-                    producers.submit(() -> {
+                    submissions.add(producers.submit(() -> {
                         for (int i = 0; i < 2000; i++) {
                             int key = i % 32;
                             versions.incrementAndGet(key);
                             queue.submit(key);
                         }
-                    });
+                    }));
+                }
+                for (Future<?> submission : submissions) {
+                    submission.get();
                 }
             }
             await().atMost(Duration.ofSeconds(5)).until(() -> queue.snapshot().keys() == 0);
