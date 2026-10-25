@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.s3.PreSignedUrlGenerator;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
@@ -242,6 +243,7 @@ public class LambdaController {
     @POST
     @Path("/functions/{functionName}/invocations")
     @Consumes(MediaType.WILDCARD)
+    @RunOnVirtualThread
     public Response invoke(@Context HttpHeaders headers,
                            @Context UriInfo uriInfo,
                            @PathParam("functionName") String functionName,
