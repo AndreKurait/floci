@@ -62,6 +62,7 @@ import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService.TokenTimeout;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService.TokenWait;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
+import io.github.hectorvent.floci.services.stepfunctions.model.ExecutionStatusSubscription;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.MapRun;
 import io.github.hectorvent.floci.services.stepfunctions.model.MockedResponseStep;
@@ -284,6 +285,8 @@ public class AslExecutor {
     // The monotonic clock every execution and task deadline is measured on. Tests move it forward.
     private final LongSupplier nanoTime;
     private final Map<String, ActiveMockExecution> activeMocks = new ConcurrentHashMap<>();
+    private final Set<ExecutionStatusSubscription> nestedWaits = new HashSet<>();
+    private long nestedWaitGeneration;
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "sfn-executor");
         t.setDaemon(true);
@@ -1925,6 +1928,7 @@ public class AslExecutor {
                                               long executionDeadlineNanos, long taskDeadlineNanos,
                                               JsonNode rawParameters, Consumer<JsonNode> jobSubmitted)
             throws Exception {
+        long waitGeneration = nestedWaitGeneration();
         String smArn = input.path("StateMachineArn").asText(null);
         if (smArn == null || smArn.isBlank()) {
             throw new FailStateException("States.TaskFailed",
@@ -1951,7 +1955,7 @@ public class AslExecutor {
             childName = null;
         }
 
-        io.github.hectorvent.floci.services.stepfunctions.model.Execution exec;
+        Execution exec;
         try {
             exec = sfnService.get().startExecution(smArn, childName, childInput, region);
         } catch (AwsException e) {
@@ -1981,44 +1985,98 @@ public class AslExecutor {
             throw e;
         }
 
-        // .sync or .sync:2 polls until terminal. Whatever else ends the wait aborts the child, the way
+        // .sync or .sync:2 waits for terminal publication. Whatever else ends the wait aborts the child, the way
         // AWS does (measured: child ABORTED, no error, the cause below): the Task's own TimeoutSeconds,
         // which fails the state with States.Timeout; the parent execution's budget, which ends it
         // TIMED_OUT; a failure in a sibling Parallel branch, which interrupts this one; and a
-        // StopExecution on the parent, so a stopped execution does not keep a polling worker.
-        while (true) {
-            try {
-                sleepOrTimeOutTask(TimeUnit.MILLISECONDS.toNanos(SYNC_POLL_INTERVAL_MS),
-                        executionDeadlineNanos, taskDeadlineNanos);
-            } catch (TaskTimedOutException | ExecutionTimedOutException | InterruptedException e) {
-                abortChildExecution(execArn, executionArn);
-                throw e;
+        // StopExecution on the parent. Register before reading either execution to cover
+        // completion during registration and between a state read and parking.
+        ExecutionStatusSubscription waiting = new ExecutionStatusSubscription(exec, nestedWaitParent(executionArn));
+        registerNestedWait(waiting, waitGeneration);
+        try (waiting) {
+            while (true) {
+                if (waiting.cancelled()) {
+                    abortChildExecution(execArn, executionArn);
+                    throw new FailStateException("States.TaskFailed", "StepFunctionsService cleared");
+                }
+                long observed = waiting.version();
+                checkNestedTaskDeadline(executionDeadlineNanos, taskDeadlineNanos);
+                if (abortedByCaller(executionArn)) {
+                    abortChildExecution(execArn, executionArn);
+                    throw new ExecutionAbortedException();
+                }
+                Execution current = sfnService.get().describeExecution(execArn);
+                String status;
+                // Terminal fields are written under this monitor, status last.
+                synchronized (current) {
+                    status = current.getStatus();
+                }
+                if ("SUCCEEDED".equals(status)) {
+                    return nestedExecutionEnvelope(current, true, ".sync:2".equals(mode));
+                }
+                if (!"RUNNING".equals(status)) {
+                    throw new FailStateException("States.TaskFailed",
+                            nestedExecutionEnvelope(current, false, false).toString());
+                }
+                waiting.awaitChange(observed,
+                        Math.min(executionDeadlineNanos, taskDeadlineNanos) - nanoTime.getAsLong());
             }
-            if (abortedByCaller(executionArn)) {
-                abortChildExecution(execArn, executionArn);
-                throw new ExecutionAbortedException();
+        } catch (TaskTimedOutException | ExecutionTimedOutException | InterruptedException e) {
+            abortChildExecution(execArn, executionArn);
+            throw e;
+        } finally {
+            synchronized (nestedWaits) {
+                nestedWaits.remove(waiting);
             }
-            io.github.hectorvent.floci.services.stepfunctions.model.Execution current =
-                    sfnService.get().describeExecution(execArn);
-            String status;
-            // The child's worker and StopExecution write its terminal fields under this monitor,
-            // status last. Reading the status under it makes everything written before it visible,
-            // so a terminal status is never seen without the error, cause and stop date behind it.
-            synchronized (current) {
-                status = current.getStatus();
+        }
+    }
+
+    private long nestedWaitGeneration() {
+        synchronized (nestedWaits) {
+            return nestedWaitGeneration;
+        }
+    }
+
+    private void registerNestedWait(ExecutionStatusSubscription waiting, long generation) {
+        synchronized (nestedWaits) {
+            if (generation != nestedWaitGeneration) {
+                waiting.cancel();
+            } else {
+                nestedWaits.add(waiting);
             }
-            if ("RUNNING".equals(status)) {
-                continue;
+        }
+    }
+
+    void clearNestedExecutionWaits() {
+        synchronized (nestedWaits) {
+            nestedWaitGeneration++;
+            for (ExecutionStatusSubscription waiting : nestedWaits) {
+                waiting.cancel();
             }
-            if ("SUCCEEDED".equals(status)) {
-                // Both modes return the envelope (measured); .sync:2 differs only in carrying
-                // Input and Output as JSON values where .sync carries them as JSON strings.
-                return nestedExecutionEnvelope(current, true, ".sync:2".equals(mode));
-            }
-            // However the child ended, FAILED, TIMED_OUT or ABORTED, and whatever its own error, the
-            // parent sees States.TaskFailed (measured), so a Catch on the child's error never fires.
-            throw new FailStateException("States.TaskFailed",
-                    nestedExecutionEnvelope(current, false, false).toString());
+            nestedWaits.clear();
+        }
+    }
+
+    private Execution nestedWaitParent(String executionArn) {
+        if (executionArn == null) {
+            return null;
+        }
+        try {
+            return RequestScopes.callAs(AwsArnUtils.parse(executionArn).accountId(),
+                    () -> sfnService.get().describeExecution(executionArn));
+        } catch (AwsException e) {
+            LOG.warnv("Parent execution {0} vanished before its nested wait: {1}", executionArn, e.getMessage());
+            return null;
+        }
+    }
+
+    private void checkNestedTaskDeadline(long executionDeadlineNanos, long taskDeadlineNanos) {
+        long now = nanoTime.getAsLong();
+        if (now >= executionDeadlineNanos) {
+            throw new ExecutionTimedOutException();
+        }
+        if (now >= taskDeadlineNanos) {
+            throw new TaskTimedOutException("States.Timeout");
         }
     }
 
