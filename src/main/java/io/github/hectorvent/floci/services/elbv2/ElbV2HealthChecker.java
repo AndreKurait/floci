@@ -160,8 +160,10 @@ public class ElbV2HealthChecker implements Resettable {
                 if (success) {
                     state.consecutiveFailures = 0;
                     state.consecutiveSuccesses++;
-                    // The threshold applies to recovery from unhealthy, not initial registration.
-                    if ("initial".equals(state.status) || state.consecutiveSuccesses >= healthyThreshold) {
+                    boolean initialApplicationTarget = "initial".equals(state.status)
+                            && ("HTTP".equals(tg.getProtocol()) || "HTTPS".equals(tg.getProtocol())
+                            || "lambda".equals(tg.getTargetType()));
+                    if (initialApplicationTarget || state.consecutiveSuccesses >= healthyThreshold) {
                         state.status = "healthy";
                         state.reason = null;
                         state.description = null;
