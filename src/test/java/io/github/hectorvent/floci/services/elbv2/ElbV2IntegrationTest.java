@@ -71,6 +71,52 @@ class ElbV2IntegrationTest {
                         + "' at 'port' failed to satisfy constraint: Member must have value " + constraint));
     }
 
+    @Test
+    void gatewayListenerPortRejectionsPreservePortlessListener() {
+        String gatewayArn = given().header("Authorization", AUTH)
+                .formParam("Action", "CreateLoadBalancer")
+                .formParam("Name", "gateway-listener-port")
+                .formParam("Type", "gateway")
+                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a"))
+                .when().post("/").then().statusCode(200)
+                .extract().path("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn");
+        try {
+            given().header("Authorization", AUTH)
+                    .formParam("Action", "CreateListener").formParam("LoadBalancerArn", gatewayArn)
+                    .formParam("Protocol", "GENEVE").formParam("Port", 6081)
+                    .when().post("/").then().statusCode(400)
+                    .body("ErrorResponse.Error.Code", equalTo("InvalidConfigurationRequest"));
+            given().header("Authorization", AUTH)
+                    .formParam("Action", "DescribeListeners").formParam("LoadBalancerArn", gatewayArn)
+                    .when().post("/").then().statusCode(200)
+                    .body("DescribeListenersResponse.DescribeListenersResult.Listeners.member.size()", equalTo(0));
+            String gatewayListener = given().header("Authorization", AUTH)
+                    .formParam("Action", "CreateListener").formParam("LoadBalancerArn", gatewayArn)
+                    .formParam("Protocol", "GENEVE")
+                    .when().post("/").then().statusCode(200)
+                    .extract().path("CreateListenerResponse.CreateListenerResult.Listeners.member.ListenerArn");
+            given().header("Authorization", AUTH)
+                    .formParam("Action", "ModifyListener").formParam("ListenerArn", gatewayListener)
+                    .formParam("Protocol", "TCP").formParam("Port", 6081)
+                    .when().post("/").then().statusCode(400)
+                    .body("ErrorResponse.Error.Code", equalTo("InvalidConfigurationRequest"));
+            given().header("Authorization", AUTH)
+                    .formParam("Action", "DescribeListeners").formParam("ListenerArns.member.1", gatewayListener)
+                    .when().post("/").then().statusCode(200)
+                    .body("DescribeListenersResponse.DescribeListenersResult.Listeners.member.Protocol", equalTo("GENEVE"))
+                    .body("DescribeListenersResponse.DescribeListenersResult.Listeners.member.Port.size()", equalTo(0));
+            given().header("Authorization", AUTH)
+                    .formParam("Action", "ModifyListener").formParam("ListenerArn", gatewayListener)
+                    .when().post("/").then().statusCode(200)
+                    .body("ModifyListenerResponse.ModifyListenerResult.Listeners.member.Protocol", equalTo("GENEVE"))
+                    .body("ModifyListenerResponse.ModifyListenerResult.Listeners.member.Port.size()", equalTo(0));
+        } finally {
+            given().header("Authorization", AUTH)
+                    .formParam("Action", "DeleteLoadBalancer").formParam("LoadBalancerArn", gatewayArn)
+                    .when().post("/").then().statusCode(200);
+        }
+    }
+
     // ── Load Balancers ────────────────────────────────────────────────────────
 
     @Test

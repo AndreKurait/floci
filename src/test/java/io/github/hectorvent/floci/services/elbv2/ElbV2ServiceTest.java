@@ -593,6 +593,49 @@ class ElbV2ServiceTest {
         assertTrue(newTargetGroup.getLoadBalancerArns().contains(lbArn));
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {1, 65535})
+    void gatewayListenerRejectsExplicitPortWithoutPublication(int port) {
+        String lbArn = service.createLoadBalancer(REGION, "gateway-port", "internal", "gateway", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        clearInvocations(dataPlane);
+
+        AwsException createError = assertThrows(AwsException.class, () -> service.createListener(
+                REGION, lbArn, "GENEVE", port, null, List.of(), List.of(), List.of(), Map.of()));
+        assertEquals("InvalidConfigurationRequest", createError.getErrorCode());
+        assertTrue(service.describeListeners(REGION, lbArn, null).isEmpty());
+        verifyNoInteractions(dataPlane);
+
+        Listener listener = service.createListener(REGION, lbArn, "GENEVE", null, null,
+                List.of(), List.of(), List.of(), Map.of());
+        clearInvocations(dataPlane);
+        AwsException modifyError = assertThrows(AwsException.class, () -> service.modifyListener(
+                REGION, listener.getListenerArn(), "TCP", port, null, null, null, null));
+        assertEquals("InvalidConfigurationRequest", modifyError.getErrorCode());
+        assertNull(listener.getPort());
+        assertEquals("GENEVE", listener.getProtocol());
+        verifyNoInteractions(dataPlane);
+    }
+
+    @Test
+    void gatewayListenerOmittedPortAllowsActionUpdate() {
+        String lbArn = service.createLoadBalancer(REGION, "gateway-actions", "internal", "gateway", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        String oldTarget = createTargetGroup("gateway-old");
+        String newTarget = createTargetGroup("gateway-new");
+        Listener listener = service.createListener(REGION, lbArn, "GENEVE", null, null,
+                List.of(), List.of(forwardAction(oldTarget)), List.of(), Map.of());
+
+        service.modifyListener(REGION, listener.getListenerArn(), null, null, null, null,
+                List.of(forwardAction(newTarget)), null);
+
+        assertNull(listener.getPort());
+        assertEquals("GENEVE", listener.getProtocol());
+        assertEquals(newTarget, listener.getDefaultActions().getFirst().getTargetGroupArn());
+        assertEquals(newTarget, service.describeRules(REGION, listener.getListenerArn(), null).getFirst()
+                .getActions().getFirst().getTargetGroupArn());
+    }
+
     @Test
     void modifyListenerPortRestartsListener() {
         String lbArn = service.createLoadBalancer(

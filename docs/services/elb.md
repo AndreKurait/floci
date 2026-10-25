@@ -47,6 +47,8 @@ Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB)
 
 HTTPS listeners require a default certificate. Supply one when creating a listener or changing an HTTP listener to HTTPS; an omitted certificate list on an existing HTTPS listener keeps its default.
 
+Gateway Load Balancer listeners require an omitted `Port` on both create and modify requests. Their portless control-plane configuration does not provide GENEVE packet forwarding.
+
 | Action | Description |
 |--------|-------------|
 | CreateListener | Creates a listener and its non-deletable default rule. |

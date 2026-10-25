@@ -604,7 +604,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                     List<Action> defaultActions, List<String> alpnPolicy,
                                     Map<String, String> initialTags) {
         validatePort(port, "port");
-        requireLoadBalancer(region, lbArn);
+        requireGatewayListenerPort(requireLoadBalancer(region, lbArn), port);
 
         Map<String, Listener> regionListeners = listeners.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
 
@@ -747,6 +747,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         while (true) {
             Listener initial = requireListener(region, listenerArn);
             LoadBalancer initialLb = requireLoadBalancer(region, initial.getLoadBalancerArn());
+            requireGatewayListenerPort(initialLb, port);
             ListenerState initialState = listenerState(initial, initialLb);
             requireAvailableListenerPort(listeners.getOrDefault(region, Map.of()), initial.getLoadBalancerArn(),
                     listenerArn, port != null ? port : initialState.port());
@@ -1226,6 +1227,13 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 && !listenerArn.equals(listener.getListenerArn()) && Objects.equals(listener.getPort(), port))) {
             throw new AwsException("DuplicateListener",
                     "A listener already exists on port " + port + " for this load balancer.", 400);
+        }
+    }
+
+    private static void requireGatewayListenerPort(LoadBalancer loadBalancer, Integer port) {
+        if (port != null && "gateway".equals(loadBalancer.getType())) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "You can't specify a port for a Gateway Load Balancer.", 400);
         }
     }
 
