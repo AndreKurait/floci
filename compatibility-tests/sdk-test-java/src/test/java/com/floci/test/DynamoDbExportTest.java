@@ -13,6 +13,7 @@ import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
@@ -284,15 +285,20 @@ class DynamoDbExportTest {
 
     @Test
     @Order(11)
-    void exportTableToPointInTime_incrementalUnder15Minutes_throwsInvalidExportTimeException() {
+    void exportTableToPointInTime_incrementalUnder15Minutes_throwsInvalidExportTimeException() throws InterruptedException {
         Instant created = ddb.describeTable(r -> r.tableName(TABLE_NAME)).table().creationDateTime();
+        Instant from = created.truncatedTo(ChronoUnit.SECONDS);
+        Instant to = from.plusSeconds(1);
+        TestFixtures.await(() -> Instant.now().isAfter(to), TABLE_NAME, "one-second export period elapsed",
+                Duration.ofSeconds(5).toNanos(), 25);
 
         assertThatThrownBy(() -> ddb.exportTableToPointInTime(ExportTableToPointInTimeRequest.builder()
                 .tableArn(tableArn)
                 .s3Bucket(BUCKET_NAME)
                 .exportType(ExportType.INCREMENTAL_EXPORT)
                 .incrementalExportSpecification(IncrementalExportSpecification.builder()
-                        .exportFromTime(created.truncatedTo(ChronoUnit.SECONDS))
+                        .exportFromTime(from)
+                        .exportToTime(to)
                         .exportViewType(ExportViewType.NEW_IMAGE)
                         .build())
                 .build()))
