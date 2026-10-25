@@ -110,13 +110,17 @@ public class Instance {
     public void setImageId(String imageId) { this.imageId = imageId; }
 
     public InstanceState getState() { return state; }
-    public synchronized void setState(InstanceState state) { this.state = state; }
+    public synchronized void setState(InstanceState state) {
+        this.state = state;
+        notifyAll();
+    }
 
     public synchronized boolean compareAndSetState(InstanceState expected, InstanceState updated) {
         if (state != expected) {
             return false;
         }
         state = updated;
+        notifyAll();
         return true;
     }
 
