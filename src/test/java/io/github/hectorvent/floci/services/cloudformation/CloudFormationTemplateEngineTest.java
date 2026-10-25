@@ -608,6 +608,38 @@ class CloudFormationTemplateEngineTest {
                 e.resolveNode(json("\"{{resolve:ssm:/demo/url}}\"")).asText());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {
+        "{\"Fn::GetAtt\":[\"Custom\",\"Url\"]}",
+        "{\"Fn::GetAtt\":\"Custom.Url\"}",
+        "{\"Fn::If\":[\"Include\",{\"Fn::GetAtt\":[\"Custom\",\"Url\"]},\"unused\"]}",
+        "{\"Fn::Select\":[0,[{\"Fn::GetAtt\":[\"Custom\",\"Url\"]}]]}"
+    })
+    void getAttResolvesTextualDynamicReferencesOnce(String intrinsic) {
+        List<String> calls = new ArrayList<>();
+        CloudFormationTemplateEngine e = new CloudFormationTemplateEngine("000000000000",
+                "us-east-1", "my-stack", "stack/id", Map.of(), Map.of(),
+                Map.of("Custom", Map.of("Url", "{{resolve:ssm:/demo/url}}")),
+                Map.of("Include", true), Map.of(), mapper, name -> null, value -> {
+                    calls.add(value);
+                    return "{{resolve:ssm:/literal-result}}";
+                });
+
+        assertEquals("{{resolve:ssm:/literal-result}}", e.resolveNode(json(intrinsic)).textValue());
+        assertEquals(List.of("{{resolve:ssm:/demo/url}}"), calls);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{\"Fn::GetAtt\":[\"Custom\",\"Url\"]}", "{\"Fn::GetAtt\":\"Custom.Url\"}"})
+    void getAttWithoutDynamicReferencesLeavesTextUnchanged(String intrinsic) {
+        CloudFormationTemplateEngine e = new CloudFormationTemplateEngine("000000000000",
+                "us-east-1", "my-stack", "stack/id", Map.of(), Map.of(),
+                Map.of("Custom", Map.of("Url", "{{resolve:ssm:/demo/url}}")), Map.of(), Map.of(), mapper,
+                name -> null, value -> fail("dynamic reference must not be resolved here: " + value));
+
+        assertEquals("{{resolve:ssm:/demo/url}}", e.resolveWithoutDynamicReferences(json(intrinsic)));
+    }
+
     /**
      * CDK emits an RDS master credential as an {@code Fn::Join} whose fragments split one dynamic
      * reference: {@code ["{{resolve:secretsmanager:", {"Ref": "Secret"}, ":SecretString:password::}}"]}.

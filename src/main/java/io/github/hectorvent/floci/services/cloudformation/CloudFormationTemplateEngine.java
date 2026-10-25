@@ -320,7 +320,8 @@ public class CloudFormationTemplateEngine {
                 return objectMapper.valueToTree(resolveList(node));
             }
             if (node.has("Fn::GetAtt")) {
-                return resolveGetAttNode(node.get("Fn::GetAtt"));
+                JsonNode attribute = resolveGetAttNode(node.get("Fn::GetAtt"));
+                return attribute.isTextual() ? resolveDynamicReferences(attribute.textValue()) : attribute;
             }
             if (node.has("Fn::Select")) {
                 return resolveNode(selectedElement(node.get("Fn::Select")));
