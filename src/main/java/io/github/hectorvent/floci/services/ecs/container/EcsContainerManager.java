@@ -1231,7 +1231,7 @@ public class EcsContainerManager {
                 continue;
             }
             try {
-                lifecycleManager.removeIfExistsStrict(container.getId());
+                lifecycleManager.removeIfExistsStrict(container.getId(), true);
                 leftoverRemovalFailuresReported.remove(container.getId());
                 LOG.infov("Removed ECS container {0} ({1}) left by a previous run", container.getId(),
                         container.getNames() == null ? "" : String.join(",", container.getNames()));
@@ -1444,7 +1444,7 @@ public class EcsContainerManager {
      */
     private boolean stopAndConfirmRemoved(String dockerId) {
         try {
-            lifecycleManager.stopAndRemoveStrict(dockerId, null);
+            lifecycleManager.stopAndRemoveStrict(dockerId, null, 5, true);
             return true;
         } catch (RuntimeException e) {
             LOG.warnv("Error removing ECS container {0}: {1}", dockerId, e.getMessage());

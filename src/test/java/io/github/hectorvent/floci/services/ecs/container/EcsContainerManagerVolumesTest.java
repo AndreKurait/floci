@@ -177,13 +177,13 @@ class EcsContainerManagerVolumesTest {
                 ephemeralDefinition(new Volume("shared", null)), List.of(), "us-east-1");
         String name = handle.getTaskVolumeNames().iterator().next();
         doThrow(new IllegalStateException("remove failed")).when(lifecycleManager)
-                .stopAndRemoveStrict("docker-id", null);
+                .stopAndRemoveStrict("docker-id", null, 5, true);
 
         manager.cleanupStoppedTask(handle);
         assertTrue(handle.hasTaskVolumes());
         verify(lifecycleManager, never()).removeVolume(name);
 
-        doNothing().when(lifecycleManager).stopAndRemoveStrict("docker-id", null);
+        doNothing().when(lifecycleManager).stopAndRemoveStrict("docker-id", null, 5, true);
         when(lifecycleManager.removeVolume(name)).thenReturn(true);
         manager.cleanupStoppedTask(handle);
         assertFalse(handle.hasTaskVolumes());
@@ -196,7 +196,7 @@ class EcsContainerManagerVolumesTest {
                 .thenThrow(new IllegalStateException("launch failed"));
         if (containerRemovalFails) {
             doThrow(new IllegalStateException("remove failed")).when(lifecycleManager)
-                    .stopAndRemoveStrict("docker-id", null);
+                    .stopAndRemoveStrict("docker-id", null, 5, true);
         } else {
             when(lifecycleManager.removeVolume(anyString())).thenReturn(false);
         }
@@ -208,7 +208,7 @@ class EcsContainerManagerVolumesTest {
         assertEquals(!containerRemovalFails, handle.allContainersRemoved());
         assertEquals("launch failed", failure.getMessage());
 
-        doNothing().when(lifecycleManager).stopAndRemoveStrict("docker-id", null);
+        doNothing().when(lifecycleManager).stopAndRemoveStrict("docker-id", null, 5, true);
         when(lifecycleManager.removeVolume(anyString())).thenReturn(true);
         manager.cleanupStoppedTask(handle);
         assertTrue(handle.allContainersRemoved());
