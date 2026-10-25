@@ -1678,20 +1678,22 @@ class ElbV2HttpsDataPlaneIntegrationTest {
 
     private static HttpsResult awaitHttpsAtPort(String host, int port, Certificate... trustedCertificates) {
         HttpsResult[] result = new HttpsResult[1];
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
-            result[0] = httpsRequest(host, port, trustedCertificates);
-        });
+        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100))
+                .ignoreException(SSLHandshakeException.class).untilAsserted(() -> {
+                    result[0] = httpsRequest(host, port, trustedCertificates);
+                });
         return result[0];
     }
 
     private static void awaitHttpsMaterial(String host, int status, String body, Certificate expected,
                                           Certificate... trustedCertificates) {
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
-            HttpsResult response = httpsRequest(host, HTTPS_PORT, trustedCertificates);
-            assertEquals(status, response.statusCode());
-            assertEquals(body, response.body());
-            assertPeerCertificate(response.session(), expected, host);
-        });
+        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100))
+                .ignoreException(SSLHandshakeException.class).untilAsserted(() -> {
+                    HttpsResult response = httpsRequest(host, HTTPS_PORT, trustedCertificates);
+                    assertEquals(status, response.statusCode());
+                    assertEquals(body, response.body());
+                    assertPeerCertificate(response.session(), expected, host);
+                });
     }
 
     private static HttpsResult httpsRequest(String host, int port, Certificate... certificates) throws Exception {
