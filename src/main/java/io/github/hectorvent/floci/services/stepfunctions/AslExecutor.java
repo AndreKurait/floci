@@ -1288,7 +1288,8 @@ public class AslExecutor {
             AwsArnUtils.Arn stateMachineArn = AwsArnUtils.parse(sm.getStateMachineArn());
             LambdaArnUtils.ResolvedFunctionRef ref;
             try {
-                ref = LambdaArnUtils.resolve(functionRef);
+                ref = LambdaArnUtils.resolveWithQualifier(functionRef,
+                        optimizedLambdaInvoke ? input.path("Qualifier").asText(null) : null);
             } catch (AwsException e) {
                 throw new FailStateException("Lambda." + e.getErrorCode(), e.getMessage());
             }
@@ -1303,6 +1304,7 @@ public class AslExecutor {
             String region = ref.region() != null ? ref.region() : stateMachineArn.region();
             String accountId = ref.account() == null || ref.account().equals(stateMachineArn.accountId())
                     ? null : ref.account();
+            String invokedQualifier = ref.qualifier();
             // The task invokes the function as its role: the execution role, or the role its
             // Credentials name once the execution role has assumed it. The role's policies or the
             // function's have to allow the call, and both when the function is in another account.
@@ -1318,12 +1320,14 @@ public class AslExecutor {
                 }
                 String functionArn = LambdaArnUtils.functionArn(functionRef, stateMachineArn.partition(), region,
                         stateMachineArn.accountId());
+                if (invokedQualifier != null && extractLambdaQualifier(functionRef) == null) {
+                    functionArn += ":" + invokedQualifier;
+                }
                 Optional<String> refusal = lambdaTaskAuthorizer.refusal(invokingRoleArn, functionArn);
                 if (refusal.isPresent()) {
                     throw new FailStateException("Lambda.AccessDeniedException", refusal.get());
                 }
             }
-            String invokedQualifier = extractLambdaQualifier(functionRef);
             LambdaFunction fn = resolveLambdaFunction(accountId, region, functionName, invokedQualifier);
             if (fn == null) {
                 // A missing function is a task failure on AWS, so it must stay reachable for

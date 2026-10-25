@@ -51,8 +51,10 @@ Omitting the filter returns all statuses. Invalid filter values or types return
 `ValidationException`. Map Run execution listing and `PENDING_REDRIVE` filtering are not
 supported; `PENDING_REDRIVE` returns `ValidationException` even when a `mapRunArn` is supplied.
 
-Lambda task invocation retains the alias or version from `FunctionName` or a
-direct function ARN when acquiring execution capacity. A READY provisioned
+Lambda task invocation retains the alias or version from `FunctionName`, the
+optimized integration's `Qualifier` parameter, or a direct function ARN when
+acquiring execution capacity. Embedded and explicit qualifiers must agree.
+A READY provisioned
 concurrency pool for that qualifier can serve the task; resolving an alias to
 its version does not discard its pool identity. Unqualified invocation retains
 the normal on-demand path, and existing authorization checks still precede

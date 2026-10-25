@@ -146,6 +146,29 @@ class StepFunctionsLambdaTaskAuthorizationIntegrationTest {
     }
 
     @Test
+    void anExplicitAliasParameterUsesTheAliasGrantAndInvocationQualifier() {
+        String roleArn = createRole("sfn-exec-" + suffix(), INVOKE_ANYTHING);
+        String name = "worker-" + suffix();
+        String functionArn = createFunction(FUNCTION_ACCOUNT, name);
+        publishVersionAndAlias(name, "live");
+        addPermission(functionArn, "live", Map.of("Principal", SFN_ACCOUNT));
+
+        run(roleArn, "explicit-alias-" + suffix(), """
+                {"StartAt":"Call","States":{"Call":{"Type":"Task",
+                  "Resource":"arn:aws:states:::lambda:invoke",
+                  "Parameters":{"FunctionName":"%s","Qualifier.$":"$.alias","Payload":{}},
+                  "End":true}}}""".formatted(functionArn), "{\"alias\":\"live\"}")
+                .body("status", equalTo("SUCCEEDED"))
+                .body("output", containsString("\"ExecutedVersion\":\"1\""));
+
+        verify(executor).invoke(argThat(isFunction(functionArn + ":1")), any(), any(), eq(0), eq("live"));
+        runTask(roleArn, functionArn)
+                .body("status", equalTo("FAILED"))
+                .body("error", equalTo("Lambda.AccessDeniedException"));
+        verify(executor, never()).invoke(argThat(isFunction(functionArn)), any(), any());
+    }
+
+    @Test
     void inItsOwnAccountTheRolesPermissionIsEnough() {
         String roleArn = createRole("sfn-exec-" + suffix(), INVOKE_ANYTHING);
         String functionArn = createFunction(SFN_ACCOUNT, "own-" + suffix());
