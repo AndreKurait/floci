@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.services.cloudtrail.CloudTrailService;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.ResourcePolicyDecision;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.s3.model.Bucket;
 import io.github.hectorvent.floci.services.s3.model.ChecksumAlgorithm;
@@ -4522,8 +4523,10 @@ public class S3Controller {
         }
         String credential = iamCredential(httpHeaders, uriInfo);
         String resource = S3PublicAccessEvaluator.bucketArn(AwsRegions.partitionFor(region), bucket);
+        ResourcePolicyDecision policyDecision = s3Service.ownsBucket(bucket) ? null : ResourcePolicyDecision.NEUTRAL;
         for (String action : actions) {
-            iamEnforcementFilter.authorizeAdditionalResource(credential, action, resource);
+            iamEnforcementFilter.authorizeAdditionalResource(
+                    credential, action, resource, policyDecision);
         }
     }
 
