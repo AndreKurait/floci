@@ -369,11 +369,13 @@ public class CloudWatchMetricsService {
 
     private void putAlarm(Alarm alarm, String region) {
         String name = alarm.getAlarmName();
-        if (name == null || name.isBlank() || name.codePointCount(0, name.length()) > 255) {
-            throw SmithyValidationErrors.validationError(name == null ? SmithyValidationErrors.notNull("alarmName")
-                    : name.codePointCount(0, name.length()) > 255
-                            ? SmithyValidationErrors.lengthOutOfRange("alarmName", name, 1, 255)
-                            : SmithyValidationErrors.lengthTooShort("alarmName", name, 1));
+        String violation = name == null ? SmithyValidationErrors.notNull("alarmName")
+                : SmithyValidationErrors.lengthOutOfRange("alarmName", name, 1, 255);
+        if (violation == null && name.isBlank()) {
+            violation = SmithyValidationErrors.lengthTooShort("alarmName", name, 1);
+        }
+        if (violation != null) {
+            throw SmithyValidationErrors.validationError(violation);
         }
         Alarm previous = alarmStore.get(region + "::" + name).orElse(null);
         if (previous != null) {

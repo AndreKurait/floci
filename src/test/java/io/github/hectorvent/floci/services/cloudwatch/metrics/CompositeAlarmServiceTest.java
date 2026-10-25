@@ -269,6 +269,29 @@ class CompositeAlarmServiceTest {
         assertThrows(AwsException.class, () -> CompositeAlarmRule.parse(rule + " "));
     }
 
+    @Test
+    void blankAlarmFieldsRetainLengthErrorPrecedence() {
+        for (String name : List.of("", "   ", " ".repeat(256))) {
+            AwsException error = assertThrows(AwsException.class, () -> put(name, "TRUE"));
+            String bound = name.length() > 255 ? "less than or equal to 255" : "greater than or equal to 1";
+            assertEquals("1 validation error detected: Value '" + name
+                    + "' at 'alarmName' failed to satisfy constraint: Member must have length " + bound,
+                    error.getMessage());
+        }
+        for (String rule : List.of("", "   ", " ".repeat(10241))) {
+            AwsException error = assertThrows(AwsException.class, () -> CompositeAlarmRule.parse(rule));
+            String bound = rule.length() > 10240 ? "less than or equal to 10240" : "greater than or equal to 1";
+            assertEquals("1 validation error detected: Value '" + rule
+                    + "' at 'alarmRule' failed to satisfy constraint: Member must have length " + bound,
+                    error.getMessage());
+        }
+        assertEquals("1 validation error detected: Value null at 'alarmName' failed to satisfy constraint: "
+                + "Member must not be null", assertThrows(AwsException.class, () -> put(null, "TRUE")).getMessage());
+        assertEquals("1 validation error detected: Value null at 'alarmRule' failed to satisfy constraint: "
+                + "Member must not be null", assertThrows(AwsException.class,
+                        () -> CompositeAlarmRule.parse(null)).getMessage());
+    }
+
     private CompositeAlarm put(String name, String rule) {
         CompositeAlarm alarm = new CompositeAlarm();
         alarm.setAlarmName(name);

@@ -19,11 +19,13 @@ final class CompositeAlarmRule {
     }
 
     static Rule parse(String input) {
-        if (input == null || input.isBlank() || input.codePointCount(0, input.length()) > 10240) {
-            throw SmithyValidationErrors.validationError(input == null ? SmithyValidationErrors.notNull("alarmRule")
-                    : input.codePointCount(0, input.length()) > 10240
-                            ? SmithyValidationErrors.lengthOutOfRange("alarmRule", input, 1, 10240)
-                            : SmithyValidationErrors.lengthTooShort("alarmRule", input, 1));
+        String violation = input == null ? SmithyValidationErrors.notNull("alarmRule")
+                : SmithyValidationErrors.lengthOutOfRange("alarmRule", input, 1, 10240);
+        if (violation == null && input.isBlank()) {
+            violation = SmithyValidationErrors.lengthTooShort("alarmRule", input, 1);
+        }
+        if (violation != null) {
+            throw SmithyValidationErrors.validationError(violation);
         }
         CompositeAlarmRule parser = new CompositeAlarmRule(input);
         Expression expression = parser.or();

@@ -708,10 +708,13 @@ public class DynamoDbService {
             requireVectorIndexMember(index.getProjectionType(), memberPath + ".projection");
             requireVectorIndexMember(index.getDistanceFunction(), memberPath + ".distanceFunction");
             String indexName = index.getIndexName();
-            if (indexName == null || indexName.codePointCount(0, indexName.length()) < MIN_VECTOR_INDEX_NAME_LENGTH) {
-                throw SmithyValidationErrors.validationException(
-                        SmithyValidationErrors.lengthTooShort(
-                                memberPath + ".indexName", indexName, MIN_VECTOR_INDEX_NAME_LENGTH));
+            String nameViolation = indexName == null
+                    ? SmithyValidationErrors.lengthTooShort(
+                            memberPath + ".indexName", null, MIN_VECTOR_INDEX_NAME_LENGTH)
+                    : SmithyValidationErrors.lengthOutOfRange(
+                            memberPath + ".indexName", indexName, MIN_VECTOR_INDEX_NAME_LENGTH, Integer.MAX_VALUE);
+            if (nameViolation != null) {
+                throw SmithyValidationErrors.validationException(nameViolation);
             }
             String distanceFunction = index.getDistanceFunction();
             if (!VECTOR_DISTANCE_FUNCTIONS.contains(distanceFunction)) {
