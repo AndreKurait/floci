@@ -167,6 +167,9 @@ public class ElbV2HealthChecker implements Resettable {
                         state.status = "healthy";
                         state.reason = null;
                         state.description = null;
+                    } else if ("initial".equals(state.status)) {
+                        state.reason = "Elb.InitialHealthChecking";
+                        state.description = "Initial health checks in progress";
                     }
                 } else {
                     state.consecutiveSuccesses = 0;

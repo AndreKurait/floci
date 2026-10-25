@@ -246,10 +246,17 @@ class ElbV2HealthCheckerTest {
 
         checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
 
-        assertEquals(requiredSuccesses == 1 ? "healthy" : "initial",
-                checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+        ElbV2HealthChecker.TargetHealthStatus first = checker.getHealth(
+                group.getTargetGroupArn(), target.getId(), target.getPort());
+        assertEquals(requiredSuccesses == 1 ? "healthy" : "initial", first.state());
+        assertEquals(requiredSuccesses == 1 ? null : "Elb.InitialHealthChecking", first.reason());
+        assertEquals(requiredSuccesses == 1 ? null : "Initial health checks in progress", first.description());
         checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
-        assertEquals("healthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+        ElbV2HealthChecker.TargetHealthStatus healthy = checker.getHealth(
+                group.getTargetGroupArn(), target.getId(), target.getPort());
+        assertEquals("healthy", healthy.state());
+        assertNull(healthy.reason());
+        assertNull(healthy.description());
     }
 
     private ElbV2HealthChecker healthChecker() {
