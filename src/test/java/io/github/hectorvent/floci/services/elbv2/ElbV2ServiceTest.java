@@ -660,13 +660,13 @@ class ElbV2ServiceTest {
         String newTarget = createTargetGroup("gateway-new");
         Listener listener = service.createListener(REGION, lbArn, null, null, null,
                 List.of(), List.of(forwardAction(oldTarget)), List.of(), Map.of());
-        String originalProtocol = listener.getProtocol();
+        assertEquals("GENEVE", listener.getProtocol());
 
         service.modifyListener(REGION, listener.getListenerArn(), null, null, null, null,
                 List.of(forwardAction(newTarget)), null);
 
         assertNull(listener.getPort());
-        assertEquals(originalProtocol, listener.getProtocol());
+        assertEquals("GENEVE", listener.getProtocol());
         assertEquals(newTarget, listener.getDefaultActions().getFirst().getTargetGroupArn());
         assertEquals(newTarget, service.describeRules(REGION, listener.getListenerArn(), null).getFirst()
                 .getActions().getFirst().getTargetGroupArn());

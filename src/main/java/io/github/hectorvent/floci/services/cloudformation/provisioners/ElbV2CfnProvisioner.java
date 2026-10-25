@@ -305,14 +305,21 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
      */
     private void provisionListener(StackResource r, JsonNode props, ProvisionContext ctx) {
         String lbArn = ctx.resolveOptional(props, "LoadBalancerArn");
-        String protocol = ctx.resolveOrDefault(props, "Protocol", "HTTP");
-        int port = parseInt(ctx.resolveOptional(props, "Port"), "Port", 80);
+        Listener prior = ctx.isUpdate() ? priorListener(ctx) : null;
+        String effectiveLbArn = lbArn != null ? lbArn : prior != null ? prior.getLoadBalancerArn() : null;
+        LoadBalancer lb = effectiveLbArn == null ? null
+                : elbV2Service.describeLoadBalancers(ctx.region(), List.of(effectiveLbArn),
+                null, null, null).getFirst();
+        boolean gateway = lb != null && "gateway".equals(lb.getType());
+        String protocol = gateway ? ctx.resolveOptional(props, "Protocol")
+                : ctx.resolveOrDefault(props, "Protocol", "HTTP");
+        Integer port = gateway ? optionalInt(props, ctx, "Port")
+                : Integer.valueOf(parseInt(ctx.resolveOptional(props, "Port"), "Port", 80));
         String sslPolicy = ctx.resolveOptional(props, "SslPolicy");
         List<String> certificates = parseCertificates(props, ctx);
         List<Action> defaultActions = parseActions(props != null ? props.get("DefaultActions") : null, ctx);
 
         Listener listener;
-        Listener prior = ctx.isUpdate() ? priorListener(ctx) : null;
         if (prior != null && (lbArn == null || lbArn.equals(prior.getLoadBalancerArn()))) {
             listener = elbV2Service.modifyListener(ctx.region(), ctx.priorPhysicalId(), protocol, port, sslPolicy,
                     certificates, defaultActions, null);

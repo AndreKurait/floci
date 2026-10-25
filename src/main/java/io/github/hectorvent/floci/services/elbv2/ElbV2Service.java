@@ -632,7 +632,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         listener.setListenerArn(listenerArn);
         listener.setLoadBalancerArn(lbArn);
         listener.setPort(port);
-        listener.setProtocol(protocol != null ? protocol : "HTTP");
+        listener.setProtocol(protocol != null ? protocol : ("gateway".equals(lbType) ? "GENEVE" : "HTTP"));
         listener.setSslPolicy(sslPolicy);
         listener.setCertificates(certificates != null ? new ArrayList<>(certificates) : new ArrayList<>());
         listener.setDefaultActions(defaultActions != null ? new ArrayList<>(defaultActions) : new ArrayList<>());
