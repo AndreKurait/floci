@@ -328,8 +328,10 @@ public class EcsContainerManager {
             if (firelensRouter != null) {
                 firelensConfig = firelensConfig(task, taskDef, firelensRouter, firelensLogOptions);
                 firelensExternalConfig = s3ExternalConfig(firelensRouter);
-                firelensVolumeName = ContainerStorageHelper.dockerName(config, "ecs-firelens-" + taskId);
-                lifecycleManager.ensureVolume(firelensVolumeName);
+                firelensVolumeName = firelensVolumeName(config, task.getTaskArn());
+                Map<String, String> labels = new LinkedHashMap<>(ownerLabels());
+                labels.put(ContainerStorageHelper.SERVICE_LABEL, "ecs");
+                lifecycleManager.ensureVolume(firelensVolumeName, labels);
                 firelensSocketAddress = unixSocketAddress(firelensVolumeName);
             }
         } catch (RuntimeException e) {
@@ -339,6 +341,14 @@ public class EcsContainerManager {
             // so without this they would stay valid with nothing behind them until they expire.
             revokeTaskRoleCredentials(task.getTaskArn());
             releaseTaskLinkLocalAddresses(task.getTaskArn());
+            if (firelensVolumeName != null) {
+                EcsTaskHandle partial = new EcsTaskHandle(task.getTaskArn(), Map.of(), Map.of(),
+                        firelensVolumeName, null, region);
+                removeTaskVolumes(partial);
+                if (partial.hasTaskVolumes()) {
+                    throw new EcsTaskLaunchException(e, partial);
+                }
+            }
             throw e;
         }
 
@@ -1424,7 +1434,6 @@ public class EcsContainerManager {
         cleanupProtectedNetwork(handle);
         new ArrayList<>(handle.getLogStreamsByContainerId().keySet())
                 .forEach(dockerId -> finalizeLogStream(handle, dockerId));
-        removeFirelensVolume(handle);
         revokeTaskRoleCredentials(handle.getTaskArn());
         if (allRemoved) {
             removeTaskVolumes(handle);
@@ -1515,7 +1524,6 @@ public class EcsContainerManager {
         terminatedContainerIds.forEach(dockerId -> finalizeLogStream(handle, dockerId));
         if (handle.allContainersRemoved()) {
             cleanupProtectedNetwork(handle);
-            removeFirelensVolume(handle);
             removeTaskVolumes(handle);
             // Only now: a container that survived a failed removal still holds its address.
             releaseTaskLinkLocalAddresses(handle.getTaskArn());
@@ -1558,13 +1566,6 @@ public class EcsContainerManager {
                 return;
             }
         }
-    }
-
-    private void removeFirelensVolume(EcsTaskHandle handle) {
-        if (handle == null || handle.getFirelensVolumeName() == null) {
-            return;
-        }
-        lifecycleManager.removeVolume(handle.getFirelensVolumeName());
     }
 
     private void removeTaskVolumes(EcsTaskHandle handle) {
@@ -1715,6 +1716,13 @@ public class EcsContainerManager {
                 : FirelensConfigGenerator.fluentBitConfig(ctx);
     }
 
+    static String firelensVolumeName(EmulatorConfig config, String taskArn) {
+        // Keep the host Unix socket path bounded without shortening the ownership labels.
+        String identity = ContainerStorageHelper.ownerIdentity(config) + "\n" + taskArn;
+        return ContainerStorageHelper.dockerName(null,
+                "ecs-firelens-" + Digests.sha256Hex(identity).substring(0, 32));
+    }
+
     private String unixSocketAddress(String volumeName) {
         try {
             String mountpoint = lifecycleManager.getDockerClient()
@@ -1726,6 +1734,10 @@ public class EcsContainerManager {
             String path = mountpoint.endsWith("/")
                     ? mountpoint + "fluent.sock"
                     : mountpoint + "/fluent.sock";
+            if (path.getBytes(StandardCharsets.UTF_8).length > 107) {
+                throw new AwsException("ClientException",
+                        "FireLens socket path exceeds the Linux Unix socket limit of 107 bytes: " + path, 500);
+            }
             return "unix://" + path;
         } catch (AwsException e) {
             throw e;
