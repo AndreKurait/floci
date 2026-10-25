@@ -1337,12 +1337,15 @@ public class Ec2ContainerManager {
         String containerId;
         String containerIp;
         String imdsSourceIp;
+        String firewallEniId;
         int sshHostPort;
         synchronized (instance) {
             containerId = instance.getDockerContainerId();
             containerIp = instance.getContainerBridgeIp();
             imdsSourceIp = instance.getImdsSourceIp();
             sshHostPort = instance.getSshHostPort();
+            firewallEniId = instance.getNetworkInterfaces() == null || instance.getNetworkInterfaces().isEmpty()
+                    ? null : instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
             instance.setState(InstanceState.shuttingDown());
         }
         executor.submit(() -> {
@@ -1371,9 +1374,8 @@ public class Ec2ContainerManager {
                         Thread.currentThread().interrupt();
                     }
                 }
-                if (firewallManager != null && firewallManager.enabled()
-                        && instance.getNetworkInterfaces() != null && !instance.getNetworkInterfaces().isEmpty()) {
-                    firewallManager.unregister(instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+                if (firewallManager != null && firewallManager.enabled() && firewallEniId != null) {
+                    firewallManager.unregister(firewallEniId);
                 }
                 if (sshHostPort > 0) {
                     portAllocator.release(sshHostPort);

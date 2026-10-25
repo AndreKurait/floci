@@ -12,6 +12,7 @@ import com.github.dockerjava.api.command.InspectExecCmd;
 import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.command.PingCmd;
+import com.github.dockerjava.api.command.RemoveContainerCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
 import com.github.dockerjava.api.exception.DockerException;
@@ -99,6 +100,41 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 class Ec2ContainerManagerTest {
+
+    @Test
+    void terminationRetainsFirewallIdentityAfterInterfacesAreReleased() throws Exception {
+        DockerClient docker = mock(DockerClient.class);
+        SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
+        when(firewall.enabled()).thenReturn(true);
+        Ec2ContainerManager manager = new Ec2ContainerManager(
+                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class),
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
+                mock(DockerHostResolver.class), docker, mock(PortAllocator.class), mock(EmulatorConfig.class),
+                mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class), firewall);
+        Instance instance = instance("i-firewall-teardown");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        InstanceNetworkInterface eni = new InstanceNetworkInterface();
+        eni.setNetworkInterfaceId("eni-firewall-teardown");
+        instance.setNetworkInterfaces(new ArrayList<>(List.of(eni)));
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        when(docker.removeContainerCmd(TEST_CONTAINER_ID)).thenReturn(remove);
+        doAnswer(invocation -> {
+            // The service releases ENIs while container teardown is still in progress.
+            instance.getNetworkInterfaces().clear();
+            return null;
+        }).when(remove).exec();
+        CountDownLatch completed = new CountDownLatch(1);
+        try {
+            manager.terminate(instance, completed::countDown);
+            assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
+            assertEquals("terminated", instance.getState().getName());
+            verify(firewall).unregister("eni-firewall-teardown");
+        } finally {
+            manager.stop();
+        }
+    }
 
     private static final String TEST_USER_DATA_OUTPUT = "test-output";
     private static final String TEST_CONTAINER_ID = "container-1";
