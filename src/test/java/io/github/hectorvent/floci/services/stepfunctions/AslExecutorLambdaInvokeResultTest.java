@@ -27,8 +27,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -254,6 +256,8 @@ class AslExecutorLambdaInvokeResultTest {
 
         assertEquals("SUCCEEDED", execution.getStatus());
         assertEquals("V1", objectMapper.readTree(execution.getOutput()).path("marker").asText());
+        verify(lambdaExecutor).invoke(any(LambdaFunction.class), any(byte[].class),
+                eq(InvocationType.RequestResponse), eq(0), eq("1"));
     }
 
     @Test
@@ -283,6 +287,8 @@ class AslExecutorLambdaInvokeResultTest {
         JsonNode output = objectMapper.readTree(execution.getOutput());
         assertEquals("V2", output.path("Payload").path("marker").asText());
         assertEquals("2", output.path("ExecutedVersion").asText());
+        verify(lambdaExecutor).invoke(any(LambdaFunction.class), any(byte[].class),
+                eq(InvocationType.RequestResponse), eq(0), eq("live"));
     }
 
     private void stubVersion(String version, String marker) throws Exception {
@@ -292,6 +298,11 @@ class AslExecutorLambdaInvokeResultTest {
         function.setVersion(version);
         when(functionStore.get(REGION, FUNCTION_NAME, version)).thenReturn(Optional.of(function));
         when(lambdaExecutor.invoke(eq(function), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult(200, null,
+                        objectMapper.writeValueAsBytes(objectMapper.createObjectNode().put("marker", marker)),
+                        null, "version-request"));
+        when(lambdaExecutor.invoke(eq(function), any(byte[].class), eq(InvocationType.RequestResponse),
+                eq(0), anyString()))
                 .thenReturn(new InvokeResult(200, null,
                         objectMapper.writeValueAsBytes(objectMapper.createObjectNode().put("marker", marker)),
                         null, "version-request"));
