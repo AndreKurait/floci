@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.sqs;
 
+import io.github.hectorvent.floci.core.common.concurrent.VersionedSignal;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.sqs.model.Message;
@@ -10,6 +11,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -22,6 +24,7 @@ import java.util.stream.Collectors;
 class GuardedMessageQueue {
 
     private final ReentrantLock lock = new ReentrantLock();
+    private final VersionedSignal changes = new VersionedSignal();
     private final List<Message> messages;
     private final StorageBackend<String, List<Message>> messageStore;
     private final String storageKey;
@@ -91,6 +94,9 @@ class GuardedMessageQueue {
                                      boolean fifo, int maxReceiveCount,
                                      String deadLetterTargetArn) {
         try (Guard _ = hold()) {
+            if (closed) {
+                return new ClaimResult(List.of(), List.of());
+            }
             List<Message> claimed = new ArrayList<>();
             List<Message> dlqCandidates = new ArrayList<>();
 
@@ -103,7 +109,9 @@ class GuardedMessageQueue {
             }
 
             if (!claimed.isEmpty() || !dlqCandidates.isEmpty()) {
-                persist();
+                // A claim does not make new work available. In particular, an unresolved DLQ
+                // must not wake the same empty receiver into an immediate redrive retry loop.
+                persist(false);
             }
 
             return new ClaimResult(claimed, dlqCandidates);
@@ -366,21 +374,49 @@ class GuardedMessageQueue {
     }
 
     void close() {
-        closed = true;
+        try (Guard _ = hold()) {
+            closed = true;
+            changes.signal();
+        }
+    }
+
+    boolean isClosed() {
+        return closed;
+    }
+
+    long changeVersion() {
+        return changes.version();
+    }
+
+    void awaitChange(long observed, long timeoutNanos) throws InterruptedException {
+        long pause;
+        try (Guard _ = hold()) {
+            // Empty queues need no clock-driven scans. Nonempty queues retain recovery for
+            // visibility/retention expiry and failed redrive attempts, which may enable work.
+            pause = messages.isEmpty() ? timeoutNanos : Math.min(timeoutNanos, TimeUnit.SECONDS.toNanos(1));
+        }
+        changes.awaitChange(observed, pause);
     }
 
     private void persist() {
-        if (closed || messageStore == null || storageKey == null) {
+        persist(true);
+    }
+
+    private void persist(boolean notifyReceivers) {
+        if (closed) {
             return;
         }
-        if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware) {
+        if (messageStore != null && storageKey != null) {
             String accountId = extractAccountFromStorageKey(storageKey);
-            if (accountId != null) {
+            if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware && accountId != null) {
                 aware.putForAccount(accountId, storageKey, new ArrayList<>(messages));
-                return;
+            } else {
+                messageStore.put(storageKey, new ArrayList<>(messages));
             }
         }
-        messageStore.put(storageKey, new ArrayList<>(messages));
+        if (notifyReceivers) {
+            changes.signal();
+        }
     }
 
     /**
