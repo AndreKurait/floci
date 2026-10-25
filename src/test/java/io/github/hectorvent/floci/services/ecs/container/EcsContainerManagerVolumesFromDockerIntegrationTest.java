@@ -3,7 +3,10 @@ package io.github.hectorvent.floci.services.ecs.container;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Bind;
 import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.Volume;
 import com.github.dockerjava.core.command.BuildImageResultCallback;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.services.ecs.model.Container;
@@ -24,13 +27,16 @@ import org.junit.jupiter.api.Test;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -50,6 +56,7 @@ class EcsContainerManagerVolumesFromDockerIntegrationTest {
     DockerClient dockerClient;
 
     private String sourceImage;
+    private final List<String> ownedVolumes = new ArrayList<>();
 
     @BeforeEach
     void requireDocker() {
@@ -59,6 +66,13 @@ class EcsContainerManagerVolumesFromDockerIntegrationTest {
 
     @AfterEach
     void removeSourceImage() {
+        for (String volume : ownedVolumes) {
+            try {
+                dockerClient.removeVolumeCmd(volume).exec();
+            } catch (NotFoundException ignored) {
+                // Successful task teardown already removed its anonymous volume.
+            }
+        }
         if (sourceImage != null) {
             try {
                 dockerClient.removeImageCmd(sourceImage).withForce(true).exec();
@@ -72,8 +86,8 @@ class EcsContainerManagerVolumesFromDockerIntegrationTest {
     void appEntrypointCanComeFromSourceContainerVolume() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String sourceImageTag = "floci-ecs-volumes-from-test:" + suffix;
-        buildSourceImage(sourceImageTag);
         sourceImage = sourceImageTag;
+        buildSourceImage(sourceImageTag);
 
         ContainerDefinition app = definition("app", BUSYBOX_IMAGE);
         app.setEntryPoint(List.of("/shared/wrapper"));
@@ -93,7 +107,13 @@ class EcsContainerManagerVolumesFromDockerIntegrationTest {
         task.setTaskArn("arn:aws:ecs:us-east-1:000000000000:task/volumes-from/" + suffix);
 
         EcsTaskHandle handle = containerManager.startTask(task, taskDefinition, List.of(), "us-east-1");
+        String sharedVolume;
         try {
+            String sourceId = handle.getContainerIds().get("source");
+            sharedVolume = dockerClient.inspectContainerCmd(sourceId).exec().getMounts().stream()
+                    .filter(mount -> "/shared".equals(mount.getDestination().getPath()))
+                    .findFirst().orElseThrow().getName();
+            ownedVolumes.add(sharedVolume);
             String appId = handle.getContainerIds().get("app");
             Integer status = dockerClient.waitContainerCmd(appId)
                     .exec(new WaitContainerResultCallback())
@@ -106,6 +126,31 @@ class EcsContainerManagerVolumesFromDockerIntegrationTest {
                     task.getContainers().stream().map(Container::getName).toList());
         } finally {
             containerManager.stopTask(handle);
+        }
+        assertThrows(NotFoundException.class, () -> dockerClient.inspectVolumeCmd(sharedVolume).exec(),
+                "stopping every container must reclaim the inherited anonymous volume");
+    }
+
+    @Test
+    void stoppingTaskPreservesAnExplicitlyNamedVolume() {
+        String volume = "floci-ecs-named-volume-test-" + UUID.randomUUID();
+        ownedVolumes.add(volume);
+        dockerClient.createVolumeCmd().withName(volume).exec();
+        String containerId = dockerClient.createContainerCmd(BUSYBOX_IMAGE)
+                .withHostConfig(HostConfig.newHostConfig().withBinds(new Bind(volume, new Volume("/data"))))
+                .withCmd("true").exec().getId();
+        try {
+            dockerClient.startContainerCmd(containerId).exec();
+            containerManager.stopTask(new EcsTaskHandle("named-volume-task",
+                    Map.of("app", containerId), Map.of()));
+            assertEquals(volume, dockerClient.inspectVolumeCmd(volume).exec().getName());
+            assertThrows(NotFoundException.class, () -> dockerClient.inspectContainerCmd(containerId).exec());
+        } finally {
+            try {
+                dockerClient.removeContainerCmd(containerId).withForce(true).withRemoveVolumes(true).exec();
+            } catch (NotFoundException ignored) {
+                // Successful task teardown already removed the container.
+            }
         }
     }
 

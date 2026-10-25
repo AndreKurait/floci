@@ -5,6 +5,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.command.ListVolumesResponse;
+import com.github.dockerjava.api.command.RemoveContainerCmd;
 import com.github.dockerjava.api.command.StatsCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
@@ -1499,7 +1500,10 @@ public class EcsContainerManager {
             // Read before the removal below, which is the last moment the daemon still knows it.
             handle.recordFinishedAt(name, getFinishedAtIfStopped(dockerId));
             try {
-                lifecycleManager.getDockerClient().removeContainerCmd(dockerId).withForce(true).exec();
+                RemoveContainerCmd remove = lifecycleManager.getDockerClient()
+                        .removeContainerCmd(dockerId).withForce(true);
+                remove.withRemoveVolumes(true);
+                remove.exec();
                 terminatedContainerIds.add(dockerId);
                 handle.recordContainerRemoved(name);
             } catch (NotFoundException ignored) {
