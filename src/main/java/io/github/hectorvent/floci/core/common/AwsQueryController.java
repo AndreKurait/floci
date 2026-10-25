@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.redshift.RedshiftQueryHandler;
 import io.github.hectorvent.floci.services.ses.SesQueryHandler;
 import io.github.hectorvent.floci.services.sns.SnsQueryHandler;
 import io.github.hectorvent.floci.services.sqs.SqsQueryHandler;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.GET;
@@ -135,6 +136,7 @@ public class AwsQueryController {
     @POST
     @Consumes(MediaType.APPLICATION_FORM_URLENCODED)
     @Produces(MediaType.APPLICATION_XML)
+    @RunOnVirtualThread
     public Response dispatch(
             @HeaderParam("Authorization") String authorization,
             @Context UriInfo uriInfo,
@@ -387,6 +389,7 @@ public class AwsQueryController {
     @GET
     @Path(QUERY_GET_PATH)
     @Produces({MediaType.APPLICATION_XML, MediaType.TEXT_HTML})
+    @RunOnVirtualThread
     public Response dispatchQueryGet(@HeaderParam("Authorization") String authorization,
                                                @Context UriInfo uriInfo,
                                                @Context ContainerRequestContext request) {
