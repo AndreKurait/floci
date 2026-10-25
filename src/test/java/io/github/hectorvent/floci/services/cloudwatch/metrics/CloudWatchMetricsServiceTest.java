@@ -82,6 +82,36 @@ class CloudWatchMetricsServiceTest {
         assertEquals(timestamp, alarm.getStateUpdatedTimestamp());
     }
 
+    @Test
+    void missingManualStateReasonPreservesAlarm() {
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName("reason-required");
+        service.putMetricAlarm(alarm, REGION);
+        service.setAlarmState(alarm.getAlarmName(), "OK", "preserved", "{}", REGION);
+        long timestamp = alarm.getStateUpdatedTimestamp();
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.setAlarmState(alarm.getAlarmName(), "ALARM", null, "changed", REGION));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals("1 validation error detected: Value null at 'stateReason' failed to satisfy constraint: "
+                + "Member must not be null", error.getMessage());
+        MetricAlarm stored = service.describeAlarms(List.of(alarm.getAlarmName()), null, REGION).getFirst();
+        assertEquals("OK", stored.getStateValue());
+        assertEquals("preserved", stored.getStateReason());
+        assertEquals("{}", stored.getStateReasonData());
+        assertEquals(timestamp, stored.getStateUpdatedTimestamp());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " ", "manual reason"})
+    void suppliedManualStateReasonIsPreserved(String reason) {
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName("reason-supplied");
+        service.putMetricAlarm(alarm, REGION);
+        service.setAlarmState(alarm.getAlarmName(), "ALARM", reason, null, REGION);
+        assertEquals("ALARM", alarm.getStateValue());
+        assertEquals(reason, alarm.getStateReason());
+    }
+
     private MetricDatum datum(String name, double value) {
         MetricDatum d = new MetricDatum();
         d.setMetricName(name);

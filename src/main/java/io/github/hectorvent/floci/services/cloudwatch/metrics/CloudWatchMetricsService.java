@@ -559,6 +559,9 @@ public class CloudWatchMetricsService {
             throw SmithyValidationErrors.validationError(stateValue == null ? SmithyValidationErrors.notNull("stateValue")
                     : SmithyValidationErrors.notInEnum(stateValue, "stateValue", states));
         }
+        if (stateReason == null) {
+            throw SmithyValidationErrors.validationError(SmithyValidationErrors.notNull("stateReason"));
+        }
         List<AlarmSnsNotifier.Notification> notifications = List.of();
         synchronized (this) {
             String key = region + "::" + alarmName;

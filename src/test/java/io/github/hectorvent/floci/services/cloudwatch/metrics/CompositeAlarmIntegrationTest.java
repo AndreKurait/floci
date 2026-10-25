@@ -124,6 +124,49 @@ class CompositeAlarmIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void missingStateReasonPreservesAlarmAndDependents(boolean json) throws Exception {
+        String name = "reason-required-" + Long.toString(System.nanoTime(), 36);
+        String dependent = name + "-dependent";
+        call(json, "PutCompositeAlarm", Map.of("AlarmName", name, "AlarmRule", "FALSE"))
+                .then().statusCode(200);
+        call(json, "PutCompositeAlarm", Map.of("AlarmName", dependent, "AlarmRule", "ALARM(\"" + name + "\")"))
+                .then().statusCode(200);
+        call(json, "SetAlarmState", Map.of("AlarmName", name, "StateValue", "OK",
+                "StateReason", "preserved", "StateReasonData", "{}"))
+                .then().statusCode(200);
+        Map<String, Object> describe = Map.of("AlarmNames", List.of(name, dependent),
+                "AlarmTypes", List.of("CompositeAlarm"));
+        Response before = call(json, "DescribeAlarms", describe).then().statusCode(200).extract().response();
+        Map<String, Object> request = new LinkedHashMap<>(Map.of("AlarmName", name, "StateValue", "ALARM",
+                "StateReasonData", "changed"));
+        Response error = call(json, "SetAlarmState", request);
+        error.then().statusCode(400);
+        assertEquals("1 validation error detected: Value null at 'stateReason' failed to satisfy constraint: "
+                + "Member must not be null", errorMessage(json, error));
+        if (json) {
+            request.put("StateReason", null);
+            Response explicitNull = call(true, "SetAlarmState", request);
+            explicitNull.then().statusCode(400);
+            assertEquals(errorMessage(true, error), errorMessage(true, explicitNull));
+        }
+        Response after = call(json, "DescribeAlarms", describe).then().statusCode(200).extract().response();
+        if (json) {
+            assertEquals(before.jsonPath().getList("CompositeAlarms"), after.jsonPath().getList("CompositeAlarms"));
+        } else {
+            assertEquals(before.xmlPath().getString("DescribeAlarmsResponse.DescribeAlarmsResult.CompositeAlarms"),
+                    after.xmlPath().getString("DescribeAlarmsResponse.DescribeAlarmsResult.CompositeAlarms"));
+        }
+        request.put("StateReason", "accepted");
+        call(json, "SetAlarmState", request).then().statusCode(200);
+        Response changed = call(json, "DescribeAlarms", Map.of("AlarmNames", List.of(dependent),
+                "AlarmTypes", List.of("CompositeAlarm"))).then().statusCode(200).extract().response();
+        assertEquals("ALARM", json ? changed.jsonPath().getString("CompositeAlarms[0].StateValue")
+                : changed.xmlPath().getString(
+                        "DescribeAlarmsResponse.DescribeAlarmsResult.CompositeAlarms.member.StateValue"));
+    }
+
     private String errorMessage(boolean json, Response response) {
         return json ? response.jsonPath().getString("message") : response.xmlPath().getString("ErrorResponse.Error.Message");
     }

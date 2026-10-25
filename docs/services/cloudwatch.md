@@ -412,8 +412,8 @@ rejected with `ValidationError`.
 
 Updating a metric alarm preserves its current state, state reason, state timestamp and tags.
 Tags supplied to `PutMetricAlarm` apply only when creating an alarm; use `TagResource` and
-`UntagResource` to change existing tags. `SetAlarmState` rejects missing or unknown state
-values before changing the alarm.
+`UntagResource` to change existing tags. `SetAlarmState` requires `StateReason` and rejects
+missing or unknown state values before changing the alarm.
 
 ### SNS alarm actions
 
