@@ -603,6 +603,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                     String sslPolicy, List<String> certificates,
                                     List<Action> defaultActions, List<String> alpnPolicy,
                                     Map<String, String> initialTags) {
+        validatePort(port, "port");
         requireLoadBalancer(region, lbArn);
 
         Map<String, Listener> regionListeners = listeners.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
@@ -742,6 +743,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     public Listener modifyListener(String region, String listenerArn, String protocol, Integer port,
                                     String sslPolicy, List<String> certificates,
                                     List<Action> defaultActions, List<String> alpnPolicy) {
+        validatePort(port, "port");
         while (true) {
             Listener initial = requireListener(region, listenerArn);
             LoadBalancer initialLb = requireLoadBalancer(region, initial.getLoadBalancerArn());
@@ -1585,7 +1587,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         }
     }
 
-    private static void validatePort(Integer port, String member) {
+    static void validatePort(Integer port, String member) {
         List<String> violations = new ArrayList<>();
         addPortViolation(violations, port, member);
         if (!violations.isEmpty()) {

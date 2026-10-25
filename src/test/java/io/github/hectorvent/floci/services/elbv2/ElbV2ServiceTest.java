@@ -259,6 +259,54 @@ class ElbV2ServiceTest {
     }
 
     @ParameterizedTest
+    @ValueSource(ints = {-1, 0, 65536, Integer.MAX_VALUE})
+    void createListenerRejectsInvalidPortWithoutPublishing(int port) {
+        String lb = service.createLoadBalancer(REGION, "listener-range", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        clearInvocations(dataPlane);
+        AwsException error = assertThrows(AwsException.class, () -> service.createListener(REGION, lb,
+                "HTTP", port, null, List.of(), List.of(), List.of(), Map.of()));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertTrue(service.describeListeners(REGION, lb, List.of()).isEmpty());
+        assertTrue(service.describeRules(REGION, null, List.of()).isEmpty());
+        verifyNoInteractions(dataPlane);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 0, 65536, Integer.MAX_VALUE})
+    void modifyListenerRejectsInvalidPortWithoutMutation(int port) {
+        String lb = service.createLoadBalancer(REGION, "listener-change", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        Listener listener = service.createListener(REGION, lb, "HTTP", 8080, null,
+                List.of(), List.of(), List.of(), Map.of());
+        clearInvocations(dataPlane);
+        AwsException error = assertThrows(AwsException.class, () -> service.modifyListener(REGION,
+                listener.getListenerArn(), "HTTPS", port, "changed", List.of(HELD_CERTIFICATE), null, null));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals(8080, listener.getPort());
+        assertEquals("HTTP", listener.getProtocol());
+        assertNull(listener.getSslPolicy());
+        assertTrue(listener.getCertificates().isEmpty());
+        verifyNoInteractions(dataPlane);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 65535})
+    void listenerPortBoundariesAndOmittedUpdateAreAccepted(int port) {
+        String lb = service.createLoadBalancer(REGION, "listener-boundary", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        Listener listener = service.createListener(REGION, lb, "HTTP", port, null,
+                List.of(), List.of(), List.of(), Map.of());
+        assertEquals(port, listener.getPort());
+        int replacement = port == 1 ? 65535 : 1;
+        service.modifyListener(REGION, listener.getListenerArn(), null, replacement, null, null, null, null);
+        assertEquals(replacement, listener.getPort());
+        service.modifyListener(REGION, listener.getListenerArn(), null, null, null, null, null, null);
+        assertEquals(replacement, listener.getPort());
+    }
+
+    @ParameterizedTest
     @NullAndEmptySource
     void httpsCreateNeedsADefaultBeforeAllocatingAListener(List<String> certificates) {
         String lb = service.createLoadBalancer(REGION, "https-default", "internal", "application", "ipv4",

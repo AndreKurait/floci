@@ -55,6 +55,22 @@ class ElbV2IntegrationTest {
                         + "Member must have value less than or equal to 65535"));
     }
 
+    @ParameterizedTest
+    @CsvSource({"CreateListener,0", "CreateListener,65536", "ModifyListener,0", "ModifyListener,65536"})
+    void listenerPortValidationPrecedesLookup(String action, int port) {
+        String constraint = port == 0 ? "greater than or equal to 1" : "less than or equal to 65535";
+        given().header("Authorization", AUTH)
+                .formParam("Action", action)
+                .formParam("LoadBalancerArn", "missing-balancer")
+                .formParam("ListenerArn", "missing-listener")
+                .formParam("Protocol", "HTTP")
+                .formParam("Port", port)
+                .when().post("/").then().statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("ValidationError"))
+                .body("ErrorResponse.Error.Message", equalTo("1 validation error detected: Value '" + port
+                        + "' at 'port' failed to satisfy constraint: Member must have value " + constraint));
+    }
+
     // ── Load Balancers ────────────────────────────────────────────────────────
 
     @Test
