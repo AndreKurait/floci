@@ -870,7 +870,7 @@ public class Route53Service implements Resettable {
         if (deadline == null) {
             return false;
         }
-        if (System.nanoTime() >= deadline) {
+        if (mutationTimeNanos() >= deadline) {
             busyUntilNanos.remove(zoneId, deadline);
             return false;
         }
@@ -881,8 +881,12 @@ public class Route53Service implements Resettable {
         if (vpcAssociationControlPlaneDelayMs <= 0) {
             return;
         }
-        busyUntilNanos.put(zoneId, System.nanoTime()
+        busyUntilNanos.put(zoneId, mutationTimeNanos()
                 + TimeUnit.MILLISECONDS.toNanos(vpcAssociationControlPlaneDelayMs));
+    }
+
+    long mutationTimeNanos() {
+        return System.nanoTime();
     }
 
     public static String normalizeName(String name) {
