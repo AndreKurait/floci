@@ -98,11 +98,11 @@ class ElbV2HealthCheckerTest {
     }
 
     @Test
-    void successfulProbeBelowThresholdReturnsInitialHealthCheckingReason() throws Exception {
+    void firstSuccessfulProbeMakesNewTargetHealthyRegardlessOfRecoveryThreshold() throws Exception {
         HttpServer server = startServer(200);
         try {
             ElbV2HealthChecker checker = healthChecker();
-            TargetGroup targetGroup = targetGroup(server.actualPort(), "200", 2, 1);
+            TargetGroup targetGroup = targetGroup(server.actualPort(), "200", 10, 2);
             TargetDescription target = target("127.0.0.1", server.actualPort());
 
             checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
@@ -110,9 +110,9 @@ class ElbV2HealthCheckerTest {
             await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
                 ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
                         targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
-                assertEquals("initial", health.state());
-                assertEquals("Elb.InitialHealthChecking", health.reason());
-                assertEquals("Initial health checks in progress", health.description());
+                assertEquals("healthy", health.state());
+                assertNull(health.reason());
+                assertNull(health.description());
             });
         } finally {
             close(server);
@@ -151,6 +151,15 @@ class ElbV2HealthCheckerTest {
                         targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
                 assertEquals("unhealthy", health.state());
                 assertEquals("Target.ResponseCodeMismatch", health.reason());
+            });
+
+            checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
+                ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
+                        targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
+                assertEquals("healthy", health.state());
+                assertNull(health.reason());
+                assertNull(health.description());
             });
         } finally {
             close(server);
