@@ -233,4 +233,8 @@ nav:
     - Python: testcontainers/python.md
     - .NET: testcontainers/dotnet.md
     - Go: testcontainers/go.md
-  - Contributing: contributing.md
+  - Development:
+    - Contributing: contributing.md
+    - Local concurrency primitives: concurrency.md
+  - Performance:
+    - Event-driven reconciliation: performance/reconciliation.md
