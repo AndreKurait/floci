@@ -266,6 +266,13 @@ unparseable timestamp fails the execution with `States.Runtime`. In a JSONata st
 One deviation. Every pause is capped at `floci.services.stepfunctions.max-wait-seconds`
 (default 30) so emulated runs stay fast, where AWS sleeps the full duration.
 
+For subsecond local waits, set `floci.services.stepfunctions.max-wait-millis`, for
+example `FLOCI_SERVICES_STEPFUNCTIONS_MAX_WAIT_MILLIS=100`. A positive value overrides
+the seconds ceiling for every Wait form and Retry backoff. Its default, `0`, keeps
+the existing seconds setting. Non-positive values also use the seconds setting.
+This local acceleration does not change the host clock, execution or task deadlines,
+heartbeat timeouts, or the polling interval of an external workflow worker.
+
 ## Timeouts
 
 ASL carries two `TimeoutSeconds` fields and Floci enforces both, in the two terminal shapes

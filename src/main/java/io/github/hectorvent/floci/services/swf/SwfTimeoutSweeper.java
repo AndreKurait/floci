@@ -31,7 +31,7 @@ public class SwfTimeoutSweeper {
 
     private final SwfService swfService;
     private final boolean enabled;
-    private final long tickIntervalSeconds;
+    private final long tickIntervalMillis;
     private final ScheduledExecutorService executor;
 
     @Inject
@@ -39,7 +39,8 @@ public class SwfTimeoutSweeper {
         this.swfService = swfService;
         this.enabled = config.services().swf().enabled()
                 && config.services().swf().timeoutSweepEnabled();
-        this.tickIntervalSeconds = resolveInterval(config.services().swf().timeoutSweepIntervalSeconds());
+        this.tickIntervalMillis = resolveInterval(config.services().swf().timeoutSweepIntervalMillis(),
+                config.services().swf().timeoutSweepIntervalSeconds());
         this.executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "swf-timeout-sweeper");
             thread.setDaemon(true);
@@ -52,13 +53,16 @@ public class SwfTimeoutSweeper {
      * startup observer and stop the whole emulator becoming ready. A misconfigured value is
      * not worth failing every other service for, so it falls back with a warning.
      */
-    private static long resolveInterval(long configured) {
+    private static long resolveInterval(long millis, long configured) {
+        if (millis > 0) {
+            return millis;
+        }
         if (configured > 0) {
-            return configured;
+            return TimeUnit.SECONDS.toMillis(configured);
         }
         LOG.warnv("Ignoring SWF timeout-sweep interval {0}s: must be a positive number of "
                 + "seconds, falling back to {1}s", configured, DEFAULT_TICK_INTERVAL_SECONDS);
-        return DEFAULT_TICK_INTERVAL_SECONDS;
+        return TimeUnit.SECONDS.toMillis(DEFAULT_TICK_INTERVAL_SECONDS);
     }
 
     void onStart(@Observes StartupEvent event) {
@@ -66,8 +70,8 @@ public class SwfTimeoutSweeper {
             LOG.debug("SWF timeout sweeper disabled");
             return;
         }
-        executor.scheduleWithFixedDelay(this::tick, tickIntervalSeconds, tickIntervalSeconds, TimeUnit.SECONDS);
-        LOG.debugv("SWF timeout sweeper started, interval {0}s", tickIntervalSeconds);
+        executor.scheduleWithFixedDelay(this::tick, tickIntervalMillis, tickIntervalMillis, TimeUnit.MILLISECONDS);
+        LOG.debugv("SWF timeout sweeper started, interval {0}ms", tickIntervalMillis);
     }
 
     void onStop(@Observes ShutdownEvent event) {
