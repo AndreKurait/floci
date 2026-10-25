@@ -45,6 +45,7 @@ import java.util.regex.Pattern;
  * @param linkLocalIps Link-local IPv4 addresses assigned to the container's endpoint on the configured network
  * @param portBindingHostIps Host interface each published port binds to, keyed by container port.
  *        A port with no entry here, and not in {@code loopbackPortBindings}, binds every interface
+ * @param ulimits Explicit process resource limits by name (empty = daemon defaults)
  * @param init Whether Docker runs its init process as PID 1, forwarding signals to the command, for
  *        images whose command does not handle SIGTERM itself
  * @param linuxOptions Capabilities, devices, shared memory, tmpfs and swap
@@ -79,6 +80,7 @@ public record ContainerSpec(
         boolean readonlyRootfs,
         List<String> linkLocalIps,
         Map<Integer, String> portBindingHostIps,
+        Map<String, ResourceLimit> ulimits,
         boolean init,
         LinuxOptions linuxOptions
 ) {
@@ -87,6 +89,12 @@ public record ContainerSpec(
     private static final Set<String> NAMESPACE_NETWORK_MODES = Set.of("host", "none");
 
     public ContainerSpec {
+        ulimits = Map.copyOf(ulimits);
+        for (String limitName : ulimits.keySet()) {
+            if (!limitName.matches("[a-z][a-z0-9]*")) {
+                throw new IllegalArgumentException("Invalid container resource limit name: " + limitName);
+            }
+        }
         if (linuxOptions == null) {
             linuxOptions = LinuxOptions.NONE;
         }
@@ -96,6 +104,90 @@ public record ContainerSpec(
         }
     }
 
+    /** Soft and hard process limits; -1 means unlimited. */
+    public record ResourceLimit(long soft, long hard) {
+        public ResourceLimit {
+            if (soft < -1 || hard < -1 || (hard != -1 && (soft == -1 || soft > hard))) {
+                throw new IllegalArgumentException("Invalid container resource limit: " + soft + ":" + hard);
+            }
+        }
+    }
+
+    /** Keeps callers without explicit process resource limits on daemon defaults. */
+    public ContainerSpec(
+            String image,
+            String name,
+            List<String> env,
+            List<String> cmd,
+            List<String> entrypoint,
+            Long memoryBytes,
+            Map<Integer, Integer> portBindings,
+            List<Integer> loopbackPortBindings,
+            List<Integer> exposedPorts,
+            String networkMode,
+            List<Mount> mounts,
+            List<Bind> binds,
+            List<VolumesFrom> volumesFrom,
+            List<String> extraHosts,
+            Map<String, String> labels,
+            LogConfig logConfig,
+            boolean privileged,
+            String cgroupnsMode,
+            List<String> dnsServers,
+            String workingDir,
+            String user,
+            List<String> groupAdd,
+            List<DeviceRequest> deviceRequests,
+            Long nanoCpus,
+            Integer cpuShares,
+            boolean readonlyRootfs,
+            List<String> linkLocalIps,
+            Map<Integer, String> portBindingHostIps
+    ) {
+        this(image, name, env, cmd, entrypoint, memoryBytes, portBindings, loopbackPortBindings,
+                exposedPorts, networkMode, mounts, binds, volumesFrom, extraHosts, labels, logConfig,
+                privileged, cgroupnsMode, dnsServers, workingDir, user, groupAdd, deviceRequests,
+                nanoCpus, cpuShares, readonlyRootfs, linkLocalIps, portBindingHostIps, Map.of(), false, LinuxOptions.NONE);
+    }
+
+    /** Keeps callers with an init setting on daemon-default process resource limits. */
+    public ContainerSpec(
+            String image,
+            String name,
+            List<String> env,
+            List<String> cmd,
+            List<String> entrypoint,
+            Long memoryBytes,
+            Map<Integer, Integer> portBindings,
+            List<Integer> loopbackPortBindings,
+            List<Integer> exposedPorts,
+            String networkMode,
+            List<Mount> mounts,
+            List<Bind> binds,
+            List<VolumesFrom> volumesFrom,
+            List<String> extraHosts,
+            Map<String, String> labels,
+            LogConfig logConfig,
+            boolean privileged,
+            String cgroupnsMode,
+            List<String> dnsServers,
+            String workingDir,
+            String user,
+            List<String> groupAdd,
+            List<DeviceRequest> deviceRequests,
+            Long nanoCpus,
+            Integer cpuShares,
+            boolean readonlyRootfs,
+            List<String> linkLocalIps,
+            Map<Integer, String> portBindingHostIps,
+            boolean init
+    ) {
+        this(image, name, env, cmd, entrypoint, memoryBytes, portBindings, loopbackPortBindings,
+                exposedPorts, networkMode, mounts, binds, volumesFrom, extraHosts, labels, logConfig,
+                privileged, cgroupnsMode, dnsServers, workingDir, user, groupAdd, deviceRequests,
+                nanoCpus, cpuShares, readonlyRootfs, linkLocalIps, portBindingHostIps, Map.of(), init, LinuxOptions.NONE);
+    }
+
     /**
      * Creates a minimal spec with just the image name.
      * All other fields will be null or empty lists.
@@ -103,7 +195,7 @@ public record ContainerSpec(
     public ContainerSpec(String image) {
         this(image, null, List.of(), null, null, null, Map.of(), List.of(), List.of(), null,
                 List.of(), List.of(), List.of(), List.of(), Map.of(), null, false, null, List.of(),
-                null, null, List.of(), List.of(), null, null, false, List.of(), Map.of(), false, LinuxOptions.NONE);
+                null, null, List.of(), List.of(), null, null, false, List.of(), Map.of(), Map.of(), false, LinuxOptions.NONE);
     }
 
     /**
@@ -139,12 +231,55 @@ public record ContainerSpec(
             boolean readonlyRootfs,
             List<String> linkLocalIps,
             Map<Integer, String> portBindingHostIps,
+            Map<String, ResourceLimit> ulimits,
             boolean init
     ) {
         this(image, name, env, cmd, entrypoint, memoryBytes, portBindings, loopbackPortBindings,
                 exposedPorts, networkMode, mounts, binds, volumesFrom, extraHosts, labels, logConfig,
                 privileged, cgroupnsMode, dnsServers, workingDir, user, groupAdd, deviceRequests,
-                nanoCpus, cpuShares, readonlyRootfs, linkLocalIps, portBindingHostIps, init, LinuxOptions.NONE);
+                nanoCpus, cpuShares, readonlyRootfs, linkLocalIps, portBindingHostIps, ulimits, init, LinuxOptions.NONE);
+    }
+
+    /**
+     * Backward-compatible constructor that leaves {@code linuxOptions} to the daemon, so callers
+     * that predate the Linux process options keep their existing behaviour.
+     */
+    public ContainerSpec(
+            String image,
+            String name,
+            List<String> env,
+            List<String> cmd,
+            List<String> entrypoint,
+            Long memoryBytes,
+            Map<Integer, Integer> portBindings,
+            List<Integer> loopbackPortBindings,
+            List<Integer> exposedPorts,
+            String networkMode,
+            List<Mount> mounts,
+            List<Bind> binds,
+            List<VolumesFrom> volumesFrom,
+            List<String> extraHosts,
+            Map<String, String> labels,
+            LogConfig logConfig,
+            boolean privileged,
+            String cgroupnsMode,
+            List<String> dnsServers,
+            String workingDir,
+            String user,
+            List<String> groupAdd,
+            List<DeviceRequest> deviceRequests,
+            Long nanoCpus,
+            Integer cpuShares,
+            boolean readonlyRootfs,
+            List<String> linkLocalIps,
+            Map<Integer, String> portBindingHostIps,
+            boolean init,
+            LinuxOptions linuxOptions
+    ) {
+        this(image, name, env, cmd, entrypoint, memoryBytes, portBindings, loopbackPortBindings,
+                exposedPorts, networkMode, mounts, binds, volumesFrom, extraHosts, labels, logConfig,
+                privileged, cgroupnsMode, dnsServers, workingDir, user, groupAdd, deviceRequests,
+                nanoCpus, cpuShares, readonlyRootfs, linkLocalIps, portBindingHostIps, Map.of(), init, linuxOptions);
     }
 
     /**
@@ -176,7 +311,7 @@ public record ContainerSpec(
         this(image, name, env, cmd, entrypoint, memoryBytes, portBindings, List.of(), exposedPorts,
                 networkMode, mounts, binds, List.of(), extraHosts, labels, logConfig, privileged,
                 cgroupnsMode, dnsServers, workingDir, user, groupAdd, List.of(), null, null, false,
-                List.of(), Map.of(), false, LinuxOptions.NONE);
+                List.of(), Map.of(), Map.of(), false, LinuxOptions.NONE);
     }
 
     /**
@@ -210,7 +345,7 @@ public record ContainerSpec(
         this(image, name, env, cmd, entrypoint, memoryBytes, portBindings, loopbackPortBindings,
                 exposedPorts, networkMode, mounts, binds, List.of(), extraHosts, labels, logConfig,
                 privileged, cgroupnsMode, dnsServers, workingDir, user, groupAdd, List.of(),
-                null, null, false, List.of(), Map.of(), false, LinuxOptions.NONE);
+                null, null, false, List.of(), Map.of(), Map.of(), false, LinuxOptions.NONE);
     }
 
     /**
@@ -244,7 +379,7 @@ public record ContainerSpec(
         this(image, name, env, cmd, entrypoint, memoryBytes, portBindings, loopbackPortBindings,
                 exposedPorts, networkMode, mounts, binds, List.of(), extraHosts, labels, logConfig,
                 privileged, cgroupnsMode, dnsServers, workingDir, user, groupAdd, deviceRequests,
-                null, null, false, List.of(), Map.of(), false, LinuxOptions.NONE);
+                null, null, false, List.of(), Map.of(), Map.of(), false, LinuxOptions.NONE);
     }
 
     /**
