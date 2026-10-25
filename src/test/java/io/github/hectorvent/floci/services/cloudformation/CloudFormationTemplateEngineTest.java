@@ -572,6 +572,29 @@ class CloudFormationTemplateEngineTest {
      * reference itself, so the joined string must survive intact with the reference untouched.
      */
     @Test
+    void nestedOptOutPreservesReferencesAndRestoresResolution() {
+        List<String> inputs = new ArrayList<>();
+        CloudFormationTemplateEngine engine = new CloudFormationTemplateEngine("000000000000",
+                "us-east-1", "stack", "stack/id", Map.of(), Map.of(), Map.of(),
+                Map.of("Chosen", true), Map.of(), mapper, name -> null, value -> {
+                    inputs.add(value);
+                    return "resolved";
+                });
+        String reference = "{{resolve:ssm-secure:/password}}";
+        for (String expression : List.of(
+                "\"%s\"",
+                "{\"Fn::If\":[\"Chosen\",\"%s\",\"unused\"]}",
+                "{\"Fn::Select\":[0,[\"%s\",\"unused\"]]}",
+                "{\"Fn::Sub\":[\"${Value}\",{\"Value\":\"%s\"}]}",
+                "{\"Fn::Join\":[\"\",[{\"Fn::If\":[\"Chosen\",\"%s\",\"unused\"]}]]}")) {
+            assertEquals(reference, engine.resolveWithoutDynamicReferences(json(expression.formatted(reference))), expression);
+            assertTrue(inputs.isEmpty(), expression);
+        }
+        assertEquals("resolved", engine.resolve(json("\"" + reference + "\"")));
+        assertEquals(List.of(reference), inputs);
+    }
+
+    @Test
     void resolveWithoutDynamicReferencesKeepsJoinSplicedReferenceIntact() {
         UnaryOperator<String> resolver = value -> fail("dynamic reference must not be resolved here: " + value);
         CloudFormationTemplateEngine e = new CloudFormationTemplateEngine("000000000000",
