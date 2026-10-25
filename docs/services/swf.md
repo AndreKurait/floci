@@ -259,6 +259,9 @@ Faults use the AWS codes and messages, so SDK error handling works unchanged:
 - **Long polling.** `PollForDecisionTask` and `PollForActivityTask` hold an empty
   poll for up to 60 seconds and wake when a matching task becomes available. Decision
   history continuation requests return the next page without starting another poll.
+  Notifications are scoped by account, region, domain, task list and task type.
+  Activity heartbeats do not wake idle decision pollers, and idle notification
+  registrations are removed when their last waiter leaves.
 - **Task tokens are in-memory.** Tokens do not survive a restart even under persistent
   storage modes, matching the fact that SWF tokens are not durable handles.
 - **Retention.** `workflowExecutionRetentionPeriodInDays` is stored and returned but
