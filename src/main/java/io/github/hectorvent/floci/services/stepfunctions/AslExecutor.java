@@ -1928,6 +1928,7 @@ public class AslExecutor {
                                               long executionDeadlineNanos, long taskDeadlineNanos,
                                               JsonNode rawParameters, Consumer<JsonNode> jobSubmitted)
             throws Exception {
+        long waitGeneration = nestedWaitGeneration();
         String smArn = input.path("StateMachineArn").asText(null);
         if (smArn == null || smArn.isBlank()) {
             throw new FailStateException("States.TaskFailed",
@@ -1954,7 +1955,6 @@ public class AslExecutor {
             childName = null;
         }
 
-        long waitGeneration = nestedWaitGeneration();
         Execution exec;
         try {
             exec = sfnService.get().startExecution(smArn, childName, childInput, region);

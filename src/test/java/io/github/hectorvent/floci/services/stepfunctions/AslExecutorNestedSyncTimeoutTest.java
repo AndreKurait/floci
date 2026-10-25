@@ -29,8 +29,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -225,6 +227,31 @@ class AslExecutorNestedSyncTimeoutTest {
         verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {".sync", ".sync:2"})
+    void clearDuringInputEncodingCancelsTheNestedWait(String mode) throws Exception {
+        ObjectMapper mapper = spy(objectMapper);
+        AslExecutor executor = newExecutor(nanos -> {
+            throw new AssertionError("Reset during input encoding must not start polling");
+        }, System::nanoTime, mapper);
+        AtomicInteger resets = new AtomicInteger();
+        JsonNode childInput = objectMapper.readTree("{\"resetDuringEncoding\":true}");
+        doAnswer(invocation -> {
+            resets.incrementAndGet();
+            executor.clearNestedExecutionWaits();
+            return invocation.callRealMethod();
+        }).when(mapper).writeValueAsString(eq(childInput));
+        when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("SUCCEEDED"));
+
+        Execution execution = run(executor, mode, 0, false, 0, false,
+                ", \"Input\": {\"resetDuringEncoding\":true}");
+
+        assertEquals(1, resets.get(), "reset occurs while encoding the child's input");
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("States.TaskFailed", execution.getError());
+        verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
+    }
+
     private static Execution child(String status) {
         Execution current = new Execution();
         current.setExecutionArn(CHILD_ARN);
@@ -246,12 +273,16 @@ class AslExecutorNestedSyncTimeoutTest {
         return newExecutor(sleeper, System::nanoTime);
     }
 
-    @SuppressWarnings("unchecked")
     private AslExecutor newExecutor(AslExecutor.Sleeper sleeper, LongSupplier nanoTime) {
+        return newExecutor(sleeper, nanoTime, objectMapper);
+    }
+
+    @SuppressWarnings("unchecked")
+    private AslExecutor newExecutor(AslExecutor.Sleeper sleeper, LongSupplier nanoTime, ObjectMapper mapper) {
         Instance<StepFunctionsService> instance = mock(Instance.class);
         when(instance.get()).thenReturn(sfnService);
         return AslExecutorFixture.builder()
-                .objectMapper(objectMapper)
+                .objectMapper(mapper)
                 .sfnService(instance)
                 .customResourceLiveness(null)
                 .sleeper(sleeper)
@@ -270,6 +301,11 @@ class AslExecutorNestedSyncTimeoutTest {
 
     private Execution run(AslExecutor executor, String mode, int timeoutSeconds, boolean catchTimeout,
                           int executionTimeoutSeconds, boolean asynchronous) {
+        return run(executor, mode, timeoutSeconds, catchTimeout, executionTimeoutSeconds, asynchronous, "");
+    }
+
+    private Execution run(AslExecutor executor, String mode, int timeoutSeconds, boolean catchTimeout,
+                          int executionTimeoutSeconds, boolean asynchronous, String additionalParameters) {
         String timeout = timeoutSeconds > 0 ? "\"TimeoutSeconds\": %d,".formatted(timeoutSeconds) : "";
         String catcher = catchTimeout
                 ? "\"Catch\": [{\"ErrorEquals\": [\"States.Timeout\"], \"Next\": \"Recover\"}],"
@@ -287,13 +323,13 @@ class AslExecutorNestedSyncTimeoutTest {
                       "Resource": "arn:aws:states:::states:startExecution%s",
                       %s
                       %s
-                      "Parameters": { "StateMachineArn": "%s" },
+                      "Parameters": { "StateMachineArn": "%s"%s },
                       "End": true
                     },
                     "Recover": { "Type": "Pass", "End": true }
                   }
                 }
-                """.formatted(budget, mode, timeout, catcher, CHILD_SM_ARN);
+                """.formatted(budget, mode, timeout, catcher, CHILD_SM_ARN, additionalParameters);
 
         StateMachine stateMachine = new StateMachine();
         stateMachine.setName("parent");
