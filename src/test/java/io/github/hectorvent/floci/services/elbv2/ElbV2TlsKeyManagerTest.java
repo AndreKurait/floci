@@ -12,6 +12,9 @@ import io.vertx.core.net.JdkSSLEngineOptions;
 import io.vertx.core.net.KeyCertOptions;
 import io.vertx.core.net.PemKeyCertOptions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Isolated;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -40,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@Isolated("Temporarily configures JSSE client session tickets")
 class ElbV2TlsKeyManagerTest {
 
     private static final String HOST = "refresh.example.test";
@@ -157,8 +161,9 @@ class ElbV2TlsKeyManagerTest {
         }
     }
 
-    @Test
-    void reusedClientContextReauthenticatesAfterCertificateReplacementAndRemoval() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void reusedClientContextTracksCertificateReplacementAndRemoval(boolean sessionTickets) throws Exception {
         CertificateGenerator.GeneratedCertificate defaultCertificate = certificate("default.other.test");
         CertificateGenerator.GeneratedCertificate first = certificate(HOST);
         CertificateGenerator.GeneratedCertificate replacement = certificate(HOST);
@@ -169,7 +174,7 @@ class ElbV2TlsKeyManagerTest {
                     new ElbV2TlsKeyManager(vertx, pem(first)));
             server = server(vertx, manager);
             int port = server.actualPort();
-            SSLContext client = clientContext("TLSv1.2", defaultCertificate, first, replacement);
+            SSLContext client = clientContextWithSessionTickets(sessionTickets, defaultCertificate, first, replacement);
             SSLSession initial = handshake(port, HOST, true, client);
             assertEquals("TLSv1.2", initial.getProtocol());
             assertTrue(initial.getId().length > 0);
@@ -180,14 +185,21 @@ class ElbV2TlsKeyManagerTest {
 
             manager.reload(new ElbV2TlsKeyManager(vertx, pem(replacement)));
             SSLSession afterReplacement = handshake(port, HOST, true, client);
-            assertFalse(Arrays.equals(initial.getId(), afterReplacement.getId()));
-            assertEquals(Pem.parseCertificate(replacement.certificatePem()), afterReplacement.getPeerCertificates()[0]);
+            assertEquals(!sessionTickets, Arrays.equals(initial.getId(), afterReplacement.getId()));
+            CertificateGenerator.GeneratedCertificate expected = sessionTickets ? replacement : first;
+            assertEquals(Pem.parseCertificate(expected.certificatePem()), afterReplacement.getPeerCertificates()[0]);
             SSLSession resumedReplacement = handshake(port, HOST, true, client);
             assertArrayEquals(afterReplacement.getId(), resumedReplacement.getId());
             assertEquals(Pem.parseCertificate(replacement.certificatePem()),
                     handshake(port, HOST, defaultCertificate, first, replacement));
 
             manager.reload(new ElbV2TlsKeyManager(vertx, pem(defaultCertificate)));
+            if (!sessionTickets) {
+                SSLSession afterRemoval = handshake(port, HOST, true, client);
+                assertArrayEquals(initial.getId(), afterRemoval.getId());
+                assertEquals(Pem.parseCertificate(first.certificatePem()), afterRemoval.getPeerCertificates()[0]);
+                afterRemoval.invalidate();
+            }
             assertThrows(SSLHandshakeException.class, () -> handshake(port, HOST, true, client));
             assertEquals(Pem.parseCertificate(defaultCertificate.certificatePem()),
                     handshake(port, "default.other.test", defaultCertificate));
@@ -226,6 +238,22 @@ class ElbV2TlsKeyManagerTest {
                                              CertificateGenerator.GeneratedCertificate... trusted) throws Exception {
         SSLSession session = handshake(port, host, sni, clientContext("TLS", trusted));
         return (X509Certificate) session.getPeerCertificates()[0];
+    }
+
+    private static SSLContext clientContextWithSessionTickets(boolean enabled,
+            CertificateGenerator.GeneratedCertificate... trusted) throws Exception {
+        String property = "jdk.tls.client.enableSessionTicketExtension";
+        String previous = System.getProperty(property);
+        try {
+            System.setProperty(property, Boolean.toString(enabled));
+            return clientContext("TLSv1.2", trusted);
+        } finally {
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
+            }
+        }
     }
 
     private static SSLContext clientContext(String protocol,
