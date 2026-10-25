@@ -279,6 +279,7 @@ public class AslExecutor {
     private final CustomResourceLiveness customResourceLiveness;
     private final Clock clock;
     private final Sleeper sleeper;
+    private final NestedWaiter nestedWaiter;
     // Null in production, where the ceiling comes from the Step Functions config. Tests pin it.
     private final Integer maxWaitSecondsOverride;
     private final Duration expressMaxExecutionTime;
@@ -315,7 +316,7 @@ public class AslExecutor {
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
                 nestedTaskCredentials, lambdaTaskAuthorizer, null, null, apiGatewayTaskInvoker, emrTaskInvoker,
-                emrServerlessTaskInvoker);
+                emrServerlessTaskInvoker, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
@@ -334,7 +335,7 @@ public class AslExecutor {
                 NestedTaskCredentials nestedTaskCredentials, LambdaTaskAuthorizer lambdaTaskAuthorizer,
                 Duration expressMaxExecutionTimeOverride, LongSupplier nanoTimeOverride,
                 ApiGatewayTaskInvoker apiGatewayTaskInvoker, EmrTaskInvoker emrTaskInvoker,
-                EmrServerlessTaskInvoker emrServerlessTaskInvoker) {
+                EmrServerlessTaskInvoker emrServerlessTaskInvoker, NestedWaiter nestedWaiter) {
         this.apiGatewayTaskInvoker = apiGatewayTaskInvoker;
         this.emrTaskInvoker = emrTaskInvoker;
         this.emrServerlessTaskInvoker = emrServerlessTaskInvoker;
@@ -370,6 +371,7 @@ public class AslExecutor {
         this.config = config;
         this.clock = clock;
         this.sleeper = sleeper;
+        this.nestedWaiter = nestedWaiter != null ? nestedWaiter : ExecutionStatusSubscription::awaitChange;
         this.maxWaitSecondsOverride = maxWaitSecondsOverride;
         this.nanoTime = nanoTimeOverride != null ? nanoTimeOverride : System::nanoTime;
         this.expressMaxExecutionTime = expressMaxExecutionTimeOverride != null
@@ -401,7 +403,7 @@ public class AslExecutor {
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null, null, null, null, null, null,
-                null);
+                null, null);
     }
 
     // Kept for tests that do not exercise the Redshift Data API integration.
@@ -422,7 +424,7 @@ public class AslExecutor {
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                clock, sleeper, maxWaitSecondsOverride, null, null, null, null, null, null, null, null, null);
+                clock, sleeper, maxWaitSecondsOverride, null, null, null, null, null, null, null, null, null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
@@ -442,6 +444,13 @@ public class AslExecutor {
                 ecsService, ecsJsonHandler, eventBridgeHandler, schedulerService,
                 schedulerController, null, objectMapper, jsonataEvaluator, sfnService, config,
                 vertx, customResourceLiveness, clock, sleeper, maxWaitSecondsOverride);
+    }
+
+    /** Test seam paired with the monotonic clock for nested deadline and cut coordination. */
+    @FunctionalInterface
+    interface NestedWaiter {
+        void awaitChange(ExecutionStatusSubscription subscription, long observed, long timeoutNanos)
+                throws InterruptedException;
     }
 
     /** Test seam: lets Wait states be exercised without real time passing. */
@@ -2018,7 +2027,7 @@ public class AslExecutor {
                     throw new FailStateException("States.TaskFailed",
                             nestedExecutionEnvelope(current, false, false).toString());
                 }
-                waiting.awaitChange(observed,
+                nestedWaiter.awaitChange(waiting, observed,
                         Math.min(executionDeadlineNanos, taskDeadlineNanos) - nanoTime.getAsLong());
             }
         } catch (TaskTimedOutException | ExecutionTimedOutException | InterruptedException e) {

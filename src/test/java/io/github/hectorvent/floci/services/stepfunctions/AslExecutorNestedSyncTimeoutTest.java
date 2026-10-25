@@ -3,11 +3,13 @@ package io.github.hectorvent.floci.services.stepfunctions;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
+import io.github.hectorvent.floci.services.stepfunctions.model.ExecutionStatusSubscription;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -60,6 +62,7 @@ class AslExecutorNestedSyncTimeoutTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private StepFunctionsService sfnService;
     private List<HistoryEvent> history;
+    private AslExecutor.NestedWaiter nestedWaiter;
 
     @BeforeEach
     void setUp() {
@@ -252,6 +255,87 @@ class AslExecutorNestedSyncTimeoutTest {
         verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {".sync", ".sync:2"})
+    @Timeout(5)
+    void injectedClockReachesNestedTaskDeadline(String mode) {
+        AtomicLong nanos = new AtomicLong();
+        AtomicInteger waits = new AtomicInteger();
+        nestedWaiter = (subscription, observed, remaining) -> {
+            assertEquals(TimeUnit.SECONDS.toNanos(60), remaining);
+            waits.incrementAndGet();
+            nanos.addAndGet(remaining);
+        };
+        when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("RUNNING"));
+
+        Execution execution = run(newExecutor(pause -> {
+            throw new AssertionError("Nested waits must not poll through the sleeper");
+        }, nanos::get), mode, 60, true);
+
+        assertEquals(1, waits.get());
+        assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
+        assertTrue(history.stream().anyMatch(event -> "TaskTimedOut".equals(event.getType())));
+        verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {".sync", ".sync:2"})
+    @Timeout(5)
+    void injectedClockReachesParentDeadlineBeforeNestedTaskDeadline(String mode) {
+        AtomicLong nanos = new AtomicLong();
+        AtomicInteger waits = new AtomicInteger();
+        nestedWaiter = (subscription, observed, remaining) -> {
+            assertEquals(TimeUnit.SECONDS.toNanos(30), remaining);
+            waits.incrementAndGet();
+            nanos.addAndGet(remaining);
+        };
+        when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("RUNNING"));
+
+        Execution execution = run(newExecutor(pause -> {
+            throw new AssertionError("Nested waits must not poll through the sleeper");
+        }, nanos::get), mode, 60, false, 30);
+
+        assertEquals(1, waits.get());
+        assertEquals("TIMED_OUT", execution.getStatus());
+        assertTrue(history.stream().noneMatch(event -> "TaskTimedOut".equals(event.getType())));
+        verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {".sync", ".sync:2"})
+    void clockAdvanceOnAParkedWaitIsCheckedAfterWake(String mode) throws Exception {
+        AtomicLong nanos = new AtomicLong();
+        AtomicReference<ExecutionStatusSubscription> parked = new AtomicReference<>();
+        AtomicReference<Thread> waiter = new AtomicReference<>();
+        nestedWaiter = (subscription, observed, remaining) -> {
+            parked.set(subscription);
+            waiter.set(Thread.currentThread());
+            subscription.awaitChange(observed, remaining);
+        };
+        when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("RUNNING"));
+        AslExecutor executor = newExecutor(pause -> {
+            throw new AssertionError("Nested waits must not poll through the sleeper");
+        }, nanos::get);
+        CompletableFuture<Execution> result = CompletableFuture.supplyAsync(
+                () -> run(executor, mode, 60, true));
+        try {
+            await().atMost(Duration.ofSeconds(2)).until(() -> waiter.get() != null
+                    && waiter.get().getState() == Thread.State.TIMED_WAITING);
+            ExecutionStatusSubscription subscription = parked.get();
+            synchronized (subscription) {
+                nanos.set(TimeUnit.SECONDS.toNanos(60));
+                subscription.notifyAll();
+            }
+            Execution execution = result.get(2, TimeUnit.SECONDS);
+            assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
+            assertTrue(history.stream().anyMatch(event -> "TaskTimedOut".equals(event.getType())));
+            verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
+        } finally {
+            executor.clearNestedExecutionWaits();
+            result.get(2, TimeUnit.SECONDS);
+        }
+    }
+
     private static Execution child(String status) {
         Execution current = new Execution();
         current.setExecutionArn(CHILD_ARN);
@@ -287,6 +371,7 @@ class AslExecutorNestedSyncTimeoutTest {
                 .customResourceLiveness(null)
                 .sleeper(sleeper)
                 .nanoTime(nanoTime)
+                .nestedWaiter(nestedWaiter)
                 .build();
     }
 

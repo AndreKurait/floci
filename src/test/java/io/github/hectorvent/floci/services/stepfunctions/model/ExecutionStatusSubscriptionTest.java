@@ -10,7 +10,9 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ExecutionStatusSubscriptionTest {
@@ -91,6 +93,35 @@ class ExecutionStatusSubscriptionTest {
         }
         assertNull(registrations(child));
         assertNull(registrations(parent));
+    }
+
+    @Test
+    void wakeWithoutStatusChangeReturnsToTheExecutorsDeadlineClock() throws Exception {
+        Execution child = new Execution();
+        try (ExecutionStatusSubscription subscription = new ExecutionStatusSubscription(child, null);
+             ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            AtomicReference<Thread> waiter = new AtomicReference<>();
+            CompletableFuture<Boolean> result = CompletableFuture.supplyAsync(() -> {
+                waiter.set(Thread.currentThread());
+                try {
+                    return subscription.awaitChange(subscription.version(), TimeUnit.MINUTES.toNanos(1));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(e);
+                }
+            }, executor);
+            try {
+                await().atMost(Duration.ofSeconds(2)).until(() -> waiter.get() != null
+                        && waiter.get().getState() == Thread.State.TIMED_WAITING);
+                synchronized (subscription) {
+                    subscription.notifyAll();
+                }
+                assertFalse(result.get(1, TimeUnit.SECONDS));
+                assertEquals("RUNNING", child.getStatus());
+            } finally {
+                subscription.cancel();
+            }
+        }
     }
 
     @Test

@@ -119,6 +119,7 @@ final class AslExecutorFixture {
         private LambdaTaskAuthorizer lambdaTaskAuthorizer;
         private Duration expressMaxExecutionTime;
         private LongSupplier nanoTime;
+        private AslExecutor.NestedWaiter nestedWaiter;
         private EmrTaskInvoker emrTaskInvoker;
         private EmrServerlessTaskInvoker emrServerlessTaskInvoker;
 
@@ -270,6 +271,11 @@ final class AslExecutorFixture {
             return this;
         }
 
+        Builder nestedWaiter(AslExecutor.NestedWaiter nestedWaiter) {
+            this.nestedWaiter = nestedWaiter;
+            return this;
+        }
+
         Builder nanoTime(LongSupplier nanoTime) {
             this.nanoTime = nanoTime;
             return this;
@@ -294,7 +300,7 @@ final class AslExecutorFixture {
                     jsonataEvaluator != null ? jsonataEvaluator : new JsonataEvaluator(objectMapper),
                     sfnService, config, vertx, customResourceLiveness, clock, sleeper, maxWaitSeconds,
                     redshiftDataHandler, serviceRegistry, null, lambdaTaskAuthorizer, expressMaxExecutionTime,
-                    nanoTime, null, emrTaskInvoker, emrServerlessTaskInvoker);
+                    nanoTime, null, emrTaskInvoker, emrServerlessTaskInvoker, nestedWaiter);
         }
     }
 }

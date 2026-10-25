@@ -43,11 +43,10 @@ public final class ExecutionStatusSubscription implements AutoCloseable {
     }
 
     public synchronized boolean awaitChange(long observed, long timeoutNanos) throws InterruptedException {
-        long deadline = System.nanoTime() + timeoutNanos;
-        long remaining = timeoutNanos;
-        while (!closed && !cancelled && version == observed && remaining > 0) {
-            TimeUnit.NANOSECONDS.timedWait(this, remaining);
-            remaining = deadline - System.nanoTime();
+        // The executor owns the deadline and its clock. Recheck there after every wake,
+        // including a spurious wake, rather than creating a second real-clock deadline.
+        if (!closed && !cancelled && version == observed && timeoutNanos > 0) {
+            TimeUnit.NANOSECONDS.timedWait(this, timeoutNanos);
         }
         return closed || cancelled || version != observed;
     }
