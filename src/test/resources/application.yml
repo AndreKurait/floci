@@ -161,6 +161,8 @@ floci:
       container-drain-timeout-seconds: 15
       docker-flags: ""
       # additional-docker-networks: []
+      container-readiness-command: ""
+      container-readiness-timeout-seconds: 60
       honour-architectures: false
       zip-max-entries: 100000
       async-retry-delay-seconds: 1
