@@ -415,6 +415,10 @@ Tags supplied to `PutMetricAlarm` apply only when creating an alarm; use `TagRes
 `UntagResource` to change existing tags. `SetAlarmState` requires `StateReason` and rejects
 missing or unknown state values before changing the alarm.
 
+`SetAlarmState` enforces the modeled maximum lengths of 1023 characters for
+`StateReason` and 4000 characters for `StateReasonData` before changing alarm state.
+Length checks count Unicode code points and preserve empty and whitespace values.
+
 ### SNS alarm actions
 
 State transitions publish to same-account standard SNS topics in `AlarmActions`, `OKActions`, or

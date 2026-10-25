@@ -167,6 +167,47 @@ class CompositeAlarmIntegrationTest {
                         "DescribeAlarmsResponse.DescribeAlarmsResult.CompositeAlarms.member.StateValue"));
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void reasonLengthRejectionPreservesSourceAndDependentState(boolean json) throws Exception {
+        String source = "reason-length-" + Long.toString(System.nanoTime(), 36);
+        String dependent = source + "-dependent";
+        call(json, "PutCompositeAlarm", Map.of("AlarmName", source, "AlarmRule", "FALSE"))
+                .then().statusCode(200);
+        call(json, "PutCompositeAlarm", Map.of("AlarmName", dependent, "AlarmRule", "ALARM(\"" + source + "\")"))
+                .then().statusCode(200);
+        for (boolean data : List.of(false, true)) {
+            int maximum = data ? 4000 : 1023;
+            String field = data ? "StateReasonData" : "StateReason";
+            String path = data ? "stateReasonData" : "stateReason";
+            String boundary = data ? "{\"text\":\"" + "x".repeat(maximum - 11) + "\"}" : "x".repeat(maximum);
+            Map<String, Object> request = new LinkedHashMap<>(Map.of("AlarmName", source, "StateValue", "OK",
+                    "StateReason", "accepted", "StateReasonData", "{}"));
+            request.put(field, boundary);
+            call(json, "SetAlarmState", request).then().statusCode(200);
+            Response before = call(json, "DescribeAlarms", Map.of("AlarmNames", List.of(source, dependent),
+                    "AlarmTypes", List.of("CompositeAlarm")));
+            String rejected = boundary + " ";
+            request.put(field, rejected);
+            request.put("StateValue", "ALARM");
+            Response error = call(json, "SetAlarmState", request);
+            error.then().statusCode(400);
+            assertEquals("1 validation error detected: Value '" + rejected + "' at '" + path
+                    + "' failed to satisfy constraint: Member must have length less than or equal to " + maximum,
+                    errorMessage(json, error));
+            Response after = call(json, "DescribeAlarms", Map.of("AlarmNames", List.of(source, dependent),
+                    "AlarmTypes", List.of("CompositeAlarm")));
+            before.then().statusCode(200);
+            after.then().statusCode(200);
+            if (json) {
+                assertEquals(before.jsonPath().getList("CompositeAlarms"), after.jsonPath().getList("CompositeAlarms"));
+            } else {
+                assertEquals(before.xmlPath().getString("DescribeAlarmsResponse.DescribeAlarmsResult"),
+                        after.xmlPath().getString("DescribeAlarmsResponse.DescribeAlarmsResult"));
+            }
+        }
+    }
+
     private String errorMessage(boolean json, Response response) {
         return json ? response.jsonPath().getString("message") : response.xmlPath().getString("ErrorResponse.Error.Message");
     }

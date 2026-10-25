@@ -562,6 +562,16 @@ public class CloudWatchMetricsService {
         if (stateReason == null) {
             throw SmithyValidationErrors.validationError(SmithyValidationErrors.notNull("stateReason"));
         }
+        String reasonViolation = stateReason == null ? null
+                : SmithyValidationErrors.lengthOutOfRange("stateReason", stateReason, 0, 1023);
+        if (reasonViolation != null) {
+            throw SmithyValidationErrors.validationError(reasonViolation);
+        }
+        String dataViolation = stateReasonData == null ? null
+                : SmithyValidationErrors.lengthOutOfRange("stateReasonData", stateReasonData, 0, 4000);
+        if (dataViolation != null) {
+            throw SmithyValidationErrors.validationError(dataViolation);
+        }
         List<AlarmSnsNotifier.Notification> notifications = List.of();
         synchronized (this) {
             String key = region + "::" + alarmName;

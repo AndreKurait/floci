@@ -112,6 +112,40 @@ class CloudWatchMetricsServiceTest {
         assertEquals(reason, alarm.getStateReason());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void manualReasonLengthLimitsPreserveRejectedState(boolean data) {
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName("reason-length");
+        service.putMetricAlarm(alarm, REGION);
+        int maximum = data ? 4000 : 1023;
+        String path = data ? "stateReasonData" : "stateReason";
+        for (String unit : List.of("x", " ", "\uD83D\uDE00")) {
+            String boundary = unit.repeat(maximum);
+            service.setAlarmState("reason-length", "OK", data ? "accepted" : boundary,
+                    data ? boundary : "{}", REGION);
+            long timestamp = alarm.getStateUpdatedTimestamp();
+            String rejected = boundary + unit;
+            AwsException error = assertThrows(AwsException.class,
+                    () -> service.setAlarmState("reason-length", "ALARM", data ? "rejected" : rejected,
+                            data ? rejected : "changed", REGION));
+            assertEquals("ValidationError", error.getErrorCode());
+            assertEquals("1 validation error detected: Value '" + rejected + "' at '" + path
+                    + "' failed to satisfy constraint: Member must have length less than or equal to " + maximum,
+                    error.getMessage());
+            assertEquals("OK", alarm.getStateValue());
+            assertEquals(data ? "accepted" : boundary, alarm.getStateReason());
+            assertEquals(data ? boundary : "{}", alarm.getStateReasonData());
+            assertEquals(timestamp, alarm.getStateUpdatedTimestamp());
+        }
+        service.setAlarmState("reason-length", "OK", "", "", REGION);
+        assertEquals("", alarm.getStateReason());
+        assertEquals("", alarm.getStateReasonData());
+        service.setAlarmState("reason-length", "OK", " ", null, REGION);
+        assertEquals(" ", alarm.getStateReason());
+        assertNull(alarm.getStateReasonData());
+    }
+
     private MetricDatum datum(String name, double value) {
         MetricDatum d = new MetricDatum();
         d.setMetricName(name);
