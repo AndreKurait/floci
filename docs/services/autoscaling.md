@@ -344,3 +344,11 @@ aws autoscaling set-desired-capacity \
 Launch configurations accept an IAM instance profile name or ARN. Unknown and foreign profiles fail creation with `ValidationError`. At launch, the reconciler resolves a stored name to its ARN in the owning account. `CreateAutoScalingGroup` and `UpdateAutoScalingGroup` refuse, with `ValidationError`, a launch template that names both an instance profile name and an ARN, directly or through the mixed instances policy.
 
 Launch-configuration metadata options (`HttpTokens`, `HttpEndpoint`, and `HttpPutResponseHopLimit`) round-trip through Query and CloudFormation and reach EC2 launches. CloudFormation resolves intrinsics inside the block, so `Fn::If` and `AWS::NoValue` can select or omit the block or any of its members. When the structure is omitted it stays absent from `DescribeLaunchConfigurations`; a supplied partial structure reports defaults for unspecified fields. Launch templates, mixed-instance templates and EC2 Fleet launches likewise forward their existing metadata options.
+
+### Reconciliation scheduling
+
+Successful group mutations and completed local EC2 launches request reconciliation
+for the owning account, region and group. Notifications coalesce, each group remains
+serialized, and up to four groups can progress concurrently. A ten-second repair
+sweep covers changes without a local notification. Readiness still requires the
+actual EC2 state; a successful mutation response does not imply capacity is ready.
