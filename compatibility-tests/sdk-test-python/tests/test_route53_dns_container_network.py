@@ -87,6 +87,10 @@ def test_advertised_nameserver_uses_selected_network_and_serves_sdk_txt(selector
             "--env", "FLOCI_SERVICES_EC2_MOCK=true",
             "--env", "FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=false",
             "--env", "FLOCI_SERVICES_UI_ENABLED=false",
+            "--env", "FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER1=ns1.localhost.floci.io",
+            "--env", "FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER2=ns2.localhost.floci.io",
+            "--env", "FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER3=ns3.localhost.floci.io",
+            "--env", "FLOCI_SERVICES_ROUTE53_DEFAULT_NAMESERVER4=ns4.localhost.floci.io",
             "--env", "FLOCI_STORAGE_MODE=memory", IMAGE,
         )
         docker("network", "connect", "--ip", selected_ip, selected["Name"], container)
