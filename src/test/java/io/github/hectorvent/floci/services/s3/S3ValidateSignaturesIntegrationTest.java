@@ -157,9 +157,7 @@ class S3ValidateSignaturesIntegrationTest {
     void verifiedCallerIsNotAuthorizedAgainstTheBucketPolicy() throws Exception {
         URI endpoint = URI.create("http://localhost:" + RestAssured.port + "/");
         String userName;
-        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "validate-signatures-user-", "empty", """
-                {"Version":"2012-10-17","Statement":[]}
-                """)) {
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "validate-signatures-user-")) {
             userName = user.name();
             given()
                 .filter(LOCAL_SIGNER)

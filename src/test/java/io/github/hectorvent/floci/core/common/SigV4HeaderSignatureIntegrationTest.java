@@ -256,9 +256,7 @@ class SigV4HeaderSignatureIntegrationTest {
     void iamCreatedKeyVerifiesWithItsOwnSecretOnly() throws Exception {
         URI endpoint = URI.create("http://localhost:" + RestAssured.port + "/");
         String userName;
-        try (SignedIamUsers.User credentials = SignedIamUsers.createUser(endpoint, "validate-signatures-sqs-", "empty", """
-                {"Version":"2012-10-17","Statement":[]}
-                """)) {
+        try (SignedIamUsers.User credentials = SignedIamUsers.createUser(endpoint, "validate-signatures-sqs-")) {
             userName = credentials.name();
             AwsRequestSigner user = credentials.signer("sqs");
             given()
@@ -508,9 +506,7 @@ class SigV4HeaderSignatureIntegrationTest {
     @Order(19)
     void queryGetAuthenticatesTheIssuedKeyBeforeDispatch() throws Exception {
         URI endpoint = URI.create("http://localhost:" + RestAssured.port + "/");
-        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "validate-signatures-query-", "empty", """
-                {"Version":"2012-10-17","Statement":[]}
-                """)) {
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "validate-signatures-query-")) {
             AwsRequestSigner signer = user.signer("elasticloadbalancing");
             given().filter(signer)
                     .queryParam("Action", "DescribeLoadBalancers")
@@ -532,9 +528,7 @@ class SigV4HeaderSignatureIntegrationTest {
         URI endpoint = URI.create("http://localhost:" + RestAssured.port + "/");
         Map<String, String> query = Map.of(
                 "Action", "DescribeLoadBalancers", "Version", "2012-06-01");
-        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "validate-signatures-presigned-", "empty", """
-                {"Version":"2012-10-17","Statement":[]}
-                """); HttpClient client = HttpClient.newHttpClient()) {
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "validate-signatures-presigned-"); HttpClient client = HttpClient.newHttpClient()) {
             AwsRequestSigner signer = user.signer("elasticloadbalancing");
             URI signed = signer.presignedUri("GET", endpoint, query, new byte[0]);
             HttpResponse<String> accepted = client.send(HttpRequest.newBuilder(signed).GET().build(),
