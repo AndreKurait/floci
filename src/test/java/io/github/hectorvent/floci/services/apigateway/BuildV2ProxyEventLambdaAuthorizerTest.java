@@ -53,7 +53,7 @@ class BuildV2ProxyEventLambdaAuthorizerTest {
                 null, null, null, null,
                 regionResolver, MAPPER, null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null
-        , null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class));
+        , null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), null);
     }
 
     @Test

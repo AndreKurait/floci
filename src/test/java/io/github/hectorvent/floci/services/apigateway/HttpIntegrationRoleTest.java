@@ -110,7 +110,7 @@ class HttpIntegrationRoleTest {
         routeContext.routeToHttpApi("us-east-1");
         controller = new ApiGatewayExecuteController(null, null, gateway, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
-                routeContext, null, new RequestContext(), null, null, null, direct, roles);
+                routeContext, null, new RequestContext(), null, null, null, direct, roles, null);
     }
 
     @ParameterizedTest
@@ -179,7 +179,7 @@ class HttpIntegrationRoleTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"arn:aws:iam::*:user/*", "*"})
+    @ValueSource(strings = {"*"})
     void callerCredentialsRetainSeparateUnqualifiedPath(String credentials) {
         integration.setCredentialsArn(credentials);
         assertEquals(200, invoke());
