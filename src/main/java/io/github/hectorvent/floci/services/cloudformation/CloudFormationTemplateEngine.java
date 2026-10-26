@@ -583,21 +583,13 @@ public class CloudFormationTemplateEngine {
     }
 
     private boolean isStringAttribute(JsonNode getAtt) {
-        String logicalId;
-        String attributeName;
-        if (getAtt.isArray() && getAtt.size() == 2) {
-            logicalId = getAtt.get(0).asText();
-            attributeName = getAtt.get(1).asText();
-        } else if (getAtt.isTextual()) {
-            String[] parts = getAtt.textValue().split("\\.", 2);
-            logicalId = parts[0];
-            attributeName = parts.length > 1 ? parts[1] : "";
-        } else {
+        String[] parts = getAttParts(getAtt);
+        if (parts == null) {
             return true;
         }
-        Map<String, String> attributes = resourceAttributes.get(logicalId);
-        return attributes == null || !attributes.containsKey(attributeName) || attributeName.startsWith("__Floci")
-                || attributeValueResolver.resolve(logicalId, attributeName, attributes.get(attributeName)).isTextual();
+        Map<String, String> attributes = findAttributeSource(parts[0], parts[1]);
+        return attributes == null
+                || attributeValueResolver.resolve(parts[0], parts[1], attributes.get(parts[1])).isTextual();
     }
 
     private String resolveSelect(JsonNode select) {
@@ -900,31 +892,42 @@ public class CloudFormationTemplateEngine {
     }
 
     private JsonNode resolveGetAttNode(JsonNode getAtt) {
+        String[] parts = getAttParts(getAtt);
+        return parts == null ? TextNode.valueOf("") : resolveGetAttNodeParts(parts[0], parts[1]);
+    }
+
+    private static String[] getAttParts(JsonNode getAtt) {
         if (getAtt.isArray() && getAtt.size() == 2) {
-            return resolveGetAttNodeParts(getAtt.get(0).asText(), getAtt.get(1).asText());
+            return new String[] {getAtt.get(0).asText(), getAtt.get(1).asText()};
         }
         if (getAtt.isTextual()) {
             String[] parts = getAtt.textValue().split("\\.", 2);
-            return resolveGetAttNodeParts(parts[0], parts.length > 1 ? parts[1] : "");
+            return new String[] {parts[0], parts.length > 1 ? parts[1] : ""};
         }
-        return TextNode.valueOf("");
+        return null;
+    }
+
+    private Map<String, String> findAttributeSource(String logicalId, String attrName) {
+        Map<String, String> attributes = resourceAttributes.get(logicalId);
+        // Provisioners keep private state under __Floci keys; AWS resolves no such attribute.
+        return attributes != null && attributes.containsKey(attrName) && !attrName.startsWith("__Floci")
+                ? attributes : null;
     }
 
     private JsonNode resolveGetAttNodeParts(String logicalId, String attrName) {
         String value = resolveGetAttParts(logicalId, attrName);
-        Map<String, String> attrs = resourceAttributes.get(logicalId);
-        if (attrs != null && attrs.containsKey(attrName) && !attrName.startsWith("__Floci")) {
+        if (findAttributeSource(logicalId, attrName) != null) {
             return attributeValueResolver.resolve(logicalId, attrName, value);
         }
         return TextNode.valueOf(value);
     }
 
     private String resolveGetAttParts(String logicalId, String attrName) {
-        Map<String, String> attrs = resourceAttributes.get(logicalId);
-        // Provisioners keep private state under __Floci keys; AWS resolves no such attribute.
-        if (attrs != null && attrs.containsKey(attrName) && !attrName.startsWith("__Floci")) {
-            return attrs.get(attrName);
+        Map<String, String> attributes = findAttributeSource(logicalId, attrName);
+        if (attributes != null) {
+            return attributes.get(attrName);
         }
+        Map<String, String> attrs = resourceAttributes.get(logicalId);
         if (attrs != null && attrs.containsKey(SERVICE_DISABLED_ATTR)) {
             throw new AwsException("ValidationError", "Template error: " + logicalId
                     + " was stubbed because its service is disabled, so attribute " + attrName
