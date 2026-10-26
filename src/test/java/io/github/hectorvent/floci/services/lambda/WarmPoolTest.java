@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -1286,5 +1287,51 @@ class WarmPoolTest {
         lenient().when(lambda.warmPoolMaxPerFunction()).thenReturn(maxPerFunction);
         lenient().when(lambda.warmPoolMaxTotal()).thenReturn(maxTotal);
         return emulatorConfig;
+    }
+
+    @ParameterizedTest
+    @CsvSource({"222222222222,us-east-1", "111111111111,eu-west-1"})
+    void scopedDeletionPreservesOtherOwnersAndInvalidatesEveryOwnedVersion(String account, String region) {
+        WarmPool pool = buildPool();
+        pool.init();
+        LambdaFunction latest = scopedFunction("111111111111", "us-east-1", "$LATEST");
+        LambdaFunction version = scopedFunction("111111111111", "us-east-1", "1");
+        LambdaFunction other = scopedFunction(account, region, "$LATEST");
+        ContainerHandle idle = new ContainerHandle("owned-idle", "shared", null, ContainerState.WARM);
+        ContainerHandle busy = new ContainerHandle("owned-busy", "shared", null, ContainerState.WARM);
+        ContainerHandle foreign = new ContainerHandle("foreign", "shared", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(idle, busy, foreign);
+        when(containerLauncher.isAlive(foreign)).thenReturn(true);
+        try {
+            pool.release(pool.acquire(latest));
+            assertSame(busy, pool.acquire(version));
+            pool.release(pool.acquire(other));
+
+            pool.drainFunction(latest);
+
+            verify(containerLauncher).stop(idle);
+            verify(containerLauncher, never()).stop(busy);
+            verify(containerLauncher, never()).stop(foreign);
+            pool.release(busy);
+            verify(containerLauncher).stop(busy);
+            assertSame(foreign, pool.acquire(other));
+            pool.release(foreign);
+            verify(containerLauncher, never()).stop(foreign);
+        } finally {
+            pool.shutdown();
+        }
+        verify(containerLauncher, times(1)).stop(idle);
+        verify(containerLauncher, times(1)).stop(busy);
+        verify(containerLauncher, times(1)).stop(foreign);
+    }
+
+    private static LambdaFunction scopedFunction(String account, String region, String version) {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("shared");
+        fn.setAccountId(account);
+        fn.setVersion(version);
+        fn.setFunctionArn("arn:aws:lambda:" + region + ":" + account + ":function:shared"
+                + ("$LATEST".equals(version) ? "" : ":" + version));
+        return fn;
     }
 }
