@@ -56,6 +56,10 @@ public class CloudWatchMetricsQueryHandler {
 
     public Response handle(String action, MultivaluedMap<String, String> params, String region) {
         String normalizedAction = action.substring(0, 1).toUpperCase() + action.substring(1);
+        if ("2013-01-16".equals(params.getFirst("Version")) && "GetMetricData".equals(normalizedAction)) {
+            throw new AwsException("UnsupportedOperation",
+                    "CloudWatch GetMetricData for API version 2013-01-16 is not implemented.", 400);
+        }
         return switch (normalizedAction) {
             case "PutMetricData" -> handlePutMetricData(params, region);
             case "ListMetrics" -> handleListMetrics(params, region);
@@ -88,7 +92,7 @@ public class CloudWatchMetricsQueryHandler {
         String namespace = params.getFirst("Namespace");
         List<MetricDatum> datums = parseMetricData(params);
         metricsService.putMetricData(namespace, datums, region);
-        return Response.ok(AwsQueryResponse.envelopeNoResult("PutMetricData", null)).build();
+        return Response.ok(AwsQueryResponse.envelopeNoResult("PutMetricData", queryNamespace(params, null))).build();
     }
 
     private Response handleListMetrics(MultivaluedMap<String, String> params, String region) {
@@ -114,7 +118,7 @@ public class CloudWatchMetricsQueryHandler {
             xml.end("Dimensions").end("member");
         }
         xml.end("Metrics");
-        return Response.ok(AwsQueryResponse.envelope("ListMetrics", null, xml.build())).build();
+        return Response.ok(AwsQueryResponse.envelope("ListMetrics", queryNamespace(params, null), xml.build())).build();
     }
 
     private Response handleGetMetricStatistics(MultivaluedMap<String, String> params, String region) {
@@ -165,7 +169,7 @@ public class CloudWatchMetricsQueryHandler {
         }
         xml.end("Datapoints");
         return Response.ok(AwsQueryResponse.envelope("GetMetricStatistics",
-                AwsNamespaces.CW, xml.build())).build();
+                queryNamespace(params, AwsNamespaces.CW), xml.build())).build();
     }
 
     private Response handleGetMetricData(MultivaluedMap<String, String> params, String region) {
@@ -246,7 +250,7 @@ public class CloudWatchMetricsQueryHandler {
     private Response handlePutMetricAlarm(MultivaluedMap<String, String> params, String region) {
         MetricAlarm alarm = parseAlarm(params);
         metricsService.putMetricAlarm(alarm, region);
-        return Response.ok(AwsQueryResponse.envelopeNoResult("PutMetricAlarm", null)).build();
+        return Response.ok(AwsQueryResponse.envelopeNoResult("PutMetricAlarm", queryNamespace(params, null))).build();
     }
 
     private Response handlePutCompositeAlarm(MultivaluedMap<String, String> params, String region) {
@@ -258,7 +262,7 @@ public class CloudWatchMetricsQueryHandler {
         parseAlarmFields(params, alarm);
         alarm.setAlarmRule(params.getFirst("AlarmRule"));
         metricsService.putCompositeAlarm(alarm, region);
-        return Response.ok(AwsQueryResponse.envelopeNoResult("PutCompositeAlarm", null)).build();
+        return Response.ok(AwsQueryResponse.envelopeNoResult("PutCompositeAlarm", queryNamespace(params, null))).build();
     }
 
     private static List<String> alarmMembers(MultivaluedMap<String, String> params, String key) {
@@ -296,7 +300,7 @@ public class CloudWatchMetricsQueryHandler {
             }
         }
         xml.end("CompositeAlarms").start("LogAlarms").end("LogAlarms");
-        return Response.ok(AwsQueryResponse.envelope("DescribeAlarms", null, xml.build())).build();
+        return Response.ok(AwsQueryResponse.envelope("DescribeAlarms", queryNamespace(params, null), xml.build())).build();
     }
 
     private Response handleDeleteAlarms(MultivaluedMap<String, String> params, String region) {
@@ -307,7 +311,7 @@ public class CloudWatchMetricsQueryHandler {
             alarmNames.add(name);
         }
         metricsService.deleteAlarms(alarmNames, region);
-        return Response.ok(AwsQueryResponse.envelopeNoResult("DeleteAlarms", null)).build();
+        return Response.ok(AwsQueryResponse.envelopeNoResult("DeleteAlarms", queryNamespace(params, null))).build();
     }
 
     private Response handleSetAlarmState(MultivaluedMap<String, String> params, String region) {
@@ -316,7 +320,7 @@ public class CloudWatchMetricsQueryHandler {
         String reason = params.getFirst("StateReason");
         String reasonData = params.getFirst("StateReasonData");
         metricsService.setAlarmState(name, state, reason, reasonData, region);
-        return Response.ok(AwsQueryResponse.envelopeNoResult("SetAlarmState", null)).build();
+        return Response.ok(AwsQueryResponse.envelopeNoResult("SetAlarmState", queryNamespace(params, null))).build();
     }
 
     private Response handleListTagsForResource(MultivaluedMap<String, String> params, String region) {
@@ -393,7 +397,7 @@ public class CloudWatchMetricsQueryHandler {
         String xml = new XmlBuilder()
                 .start("DashboardValidationMessages").end("DashboardValidationMessages")
                 .build();
-        return Response.ok(AwsQueryResponse.envelope("PutDashboard", null, xml)).build();
+        return Response.ok(AwsQueryResponse.envelope("PutDashboard", queryNamespace(params, null), xml)).build();
     }
 
     private Response handleGetDashboard(MultivaluedMap<String, String> params, String region) {
@@ -403,7 +407,7 @@ public class CloudWatchMetricsQueryHandler {
                 .elem("DashboardName", dashboard.getDashboardName())
                 .elem("DashboardBody", dashboard.getDashboardBody())
                 .build();
-        return Response.ok(AwsQueryResponse.envelope("GetDashboard", null, xml)).build();
+        return Response.ok(AwsQueryResponse.envelope("GetDashboard", queryNamespace(params, null), xml)).build();
     }
 
     private Response handleListDashboards(MultivaluedMap<String, String> params, String region) {
@@ -421,7 +425,7 @@ public class CloudWatchMetricsQueryHandler {
                     .end("member");
         }
         xml.end("DashboardEntries");
-        return Response.ok(AwsQueryResponse.envelope("ListDashboards", null, xml.build())).build();
+        return Response.ok(AwsQueryResponse.envelope("ListDashboards", queryNamespace(params, null), xml.build())).build();
     }
 
     private Response handleDeleteDashboards(MultivaluedMap<String, String> params, String region) {
@@ -432,7 +436,7 @@ public class CloudWatchMetricsQueryHandler {
             names.add(name);
         }
         dashboardsService.deleteDashboards(names, region);
-        return Response.ok(AwsQueryResponse.envelopeEmptyResult("DeleteDashboards", null)).build();
+        return Response.ok(AwsQueryResponse.envelopeEmptyResult("DeleteDashboards", queryNamespace(params, null))).build();
     }
 
     // ──────────────────────────── Metric Streams ────────────────────────────
@@ -519,6 +523,10 @@ public class CloudWatchMetricsQueryHandler {
     private Response handleStopMetricStreams(MultivaluedMap<String, String> params, String region) {
         metricStreamsService.stopMetricStreams(parseNames(params), region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult("StopMetricStreams", null)).build();
+    }
+
+    private static String queryNamespace(MultivaluedMap<String, String> params, String currentNamespace) {
+        return "2013-01-16".equals(params.getFirst("Version")) ? AwsNamespaces.CW_2013 : currentNamespace;
     }
 
     private List<String> parseNames(MultivaluedMap<String, String> params) {
