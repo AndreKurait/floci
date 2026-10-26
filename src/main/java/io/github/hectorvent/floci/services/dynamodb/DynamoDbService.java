@@ -1877,6 +1877,11 @@ public class DynamoDbService {
             }
         }
 
+        long writeCount = requestItems.values().stream().mapToLong(List::size).sum();
+        if (writeCount > 25) {
+            throw new AwsException("ValidationException", "Too many items requested for the BatchWriteItem call", 400);
+        }
+
         // A store that writes single items saves each one inside its item lock, as PutItem does: a
         // pass after the locks are released could read an item, lose the race to a concurrent
         // write of the same key, and then save the stale copy over it. A whole-table store is
