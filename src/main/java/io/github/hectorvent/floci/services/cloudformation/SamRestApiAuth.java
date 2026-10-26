@@ -129,12 +129,11 @@ final class SamRestApiAuth {
             }
         }
         if (!swagger) {
-            replaceOpenApiSchemes(document, iam, keyRequired);
+            addOpenApiDefaultSchemes(document, iam, keyRequired);
         }
     }
 
-    private void replaceOpenApiSchemes(ObjectNode document, boolean iam, boolean keyRequired) {
-        // SAM replaces the whole OpenAPI map with its generated Swagger definitions.
+    private void addOpenApiDefaultSchemes(ObjectNode document, boolean iam, boolean keyRequired) {
         ObjectNode definitions = object(document, "securityDefinitions");
         if (iam) {
             addScheme(definitions, "AWS_IAM", true);
@@ -142,8 +141,6 @@ final class SamRestApiAuth {
         if (keyRequired) {
             addScheme(definitions, "api_key", false);
         }
-        object(document, "components").set("securitySchemes", definitions);
-        document.remove("securityDefinitions");
     }
 
     private void applyDefaults(ObjectNode operation, ObjectNode definitions, boolean iam, boolean keyRequired) {
