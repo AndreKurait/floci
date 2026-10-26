@@ -11,6 +11,7 @@ import jakarta.ws.rs.core.MediaType;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -124,6 +125,7 @@ final class PassedRoles {
     /** An IAM role ARN, the only resource {@code iam:PassRole} acts on. */
     private static final Pattern ROLE_ARN = Pattern.compile("^arn:[a-z0-9-]+:iam::\\d{12}:role/.+");
 
+    private static final Pattern REST_API = Pattern.compile("^/restapis/[^/]+$");
     private static final Pattern REST_INTEGRATION = Pattern.compile(
             "^/restapis/[^/]+/resources/[^/]+/methods/[^/]+/integration$");
     private static final Pattern REST_AUTHORIZERS = Pattern.compile("^/restapis/[^/]+/authorizers$");
@@ -224,6 +226,12 @@ final class PassedRoles {
     /** What a request names that holds the roles it passes, looked up in the request's account and Region. */
     interface Lookups {
 
+        /** Integration roles assigned by a REST API import in the request account and region. */
+        default List<String> importedRestApiIntegrationRoles(String document) {
+            return List.of();
+        }
+
+
         /** The ARNs of the roles an EC2 instance profile holds, looked up by its name or its ARN. */
         List<String> instanceProfileRoleArns(String profileName, String profileArn);
 
@@ -274,7 +282,7 @@ final class PassedRoles {
      */
     static List<PassedRole> byHand(String action, ContainerRequestContext ctx, Lookups lookups) {
         return switch (action) {
-            case "apigateway:POST", "apigateway:PUT", "apigateway:PATCH" -> apiGatewayRoles(action, ctx);
+            case "apigateway:POST", "apigateway:PUT", "apigateway:PATCH" -> apiGatewayRoles(action, ctx, lookups);
             case "lambda:CreateFunction", "lambda:UpdateFunctionConfiguration" -> fromJson(ctx, LAMBDA, "Role");
             case "lambda:CreateWebFunction" ->
                     fromJson(ctx, LAMBDA, "revisionConfig", "serviceConfig", "executionRoleArn");
@@ -542,8 +550,17 @@ final class PassedRoles {
     }
 
     /** Direct integration and authorizer credential assignments, as the API Gateway service references list. */
-    private static List<PassedRole> apiGatewayRoles(String action, ContainerRequestContext ctx) {
+    private static List<PassedRole> apiGatewayRoles(String action, ContainerRequestContext ctx, Lookups lookups) {
         String path = IamActionRegistry.routedPath(ctx.getUriInfo());
+        boolean importRequest = "apigateway:POST".equals(action) && "/restapis".equals(path)
+                && ctx.getUriInfo().getQueryParameters() != null
+                && "import".equals(ctx.getUriInfo().getQueryParameters().getFirst("mode"));
+        boolean replaceRequest = "apigateway:PUT".equals(action) && REST_API.matcher(path).matches();
+        if (importRequest || replaceRequest) {
+            byte[] body = IamConditionContextResolver.bufferEntity(ctx);
+            return body == null ? List.of() : passed(lookups.importedRestApiIntegrationRoles(
+                    new String(body, StandardCharsets.UTF_8)), API_GATEWAY);
+        }
         return switch (action) {
             case "apigateway:PUT" -> REST_INTEGRATION.matcher(path).matches()
                     ? fromJson(ctx, API_GATEWAY, "credentials") : List.of();
