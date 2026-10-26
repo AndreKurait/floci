@@ -1138,3 +1138,8 @@ aws cloudformation create-stack \
 !!! note "Dependency ordering"
     Use `!Ref MyFunction` (not a plain string) for `FunctionName` so CloudFormation
     provisions the function before the event source mapping.
+
+`AWS::EC2::PrefixList` `Version` remains numeric when used as another resource's property.
+Numeric attributes are rejected in string outputs and `Fn::Join`, `Fn::Sub`,
+`Fn::Split`, and `Fn::Base64`, including selected `Fn::If` and `Fn::Select` values.
+Literal numbers and Number-parameter references retain their existing string coercion.

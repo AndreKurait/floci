@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2NetworkCfnProvisioner;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -63,6 +64,72 @@ class CloudFormationTemplateEngineTest {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private CloudFormationTemplateEngine engineWithNumericAttribute() {
+        Ec2NetworkCfnProvisioner provisioner = new Ec2NetworkCfnProvisioner(null);
+        return new CloudFormationTemplateEngine("000000000000", "us-east-1", "my-stack", "stack/id",
+                Map.of(), Map.of(), Map.of("Prefix", Map.of("Version", "1", "PrefixListId", "pl-example")),
+                Map.of("Include", true), Map.of(), mapper, name -> null, null, null, Map.of(),
+                (id, attribute, value) -> provisioner.attributeValue("AWS::EC2::PrefixList", attribute, value));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+        "{\"Fn::GetAtt\":[\"Prefix\",\"Version\"]}",
+        "{\"Fn::GetAtt\":\"Prefix.Version\"}",
+        "{\"Fn::If\":[\"Include\",{\"Fn::GetAtt\":[\"Prefix\",\"Version\"]},0]}",
+        "{\"Fn::Select\":[0,[{\"Fn::GetAtt\":[\"Prefix\",\"Version\"]}]]}"
+    })
+    void getAttPreservesItsNumericType(String intrinsic) {
+        JsonNode result = engineWithNumericAttribute().resolveNode(json(intrinsic));
+        assertTrue(result.isIntegralNumber());
+        assertEquals(1, result.intValue());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+        "{\"Fn::Join\":[\"\",[{\"Fn::GetAtt\":[\"Prefix\",\"Version\"]}]]}",
+        "{\"Fn::Join\":[\"\",[{\"Fn::If\":[\"Include\",{\"Fn::GetAtt\":[\"Prefix\",\"Version\"]},\"ok\"]}]]}",
+        "{\"Fn::Sub\":\"${Prefix.Version}\"}",
+        "{\"Fn::Sub\":[\"${Version}\",{\"Version\":{\"Fn::GetAtt\":[\"Prefix\",\"Version\"]}}]}",
+        "{\"Fn::Join\":[\"\",[{\"Fn::Select\":[0,[{\"Fn::GetAtt\":[\"Prefix\",\"Version\"]}]]}]]}",
+        "{\"Fn::Select\":[0,{\"Fn::Split\":[\",\",{\"Fn::GetAtt\":[\"Prefix\",\"Version\"]}]}]}",
+        "{\"Fn::Base64\":{\"Fn::GetAtt\":[\"Prefix\",\"Version\"]}}"
+    })
+    void numericAttributesCannotBeUsedAsStringFragments(String intrinsic) {
+        AwsException error = assertThrows(AwsException.class,
+                () -> engineWithNumericAttribute().resolve(json(intrinsic)));
+        assertEquals("ValidationError", error.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+        "{\"Fn::Join\":[\"\",[{\"Fn::GetAtt\":[\"Prefix\",\"PrefixListId\"]}]]}",
+        "{\"Fn::Sub\":\"${Prefix.PrefixListId}\"}",
+        "{\"Fn::Sub\":[\"${Id}\",{\"Id\":{\"Fn::GetAtt\":[\"Prefix\",\"PrefixListId\"]}}]}",
+        "{\"Fn::Select\":[0,{\"Fn::Split\":[\",\",{\"Fn::GetAtt\":[\"Prefix\",\"PrefixListId\"]}]}]}",
+        "{\"Fn::If\":[\"Missing\",{\"Fn::GetAtt\":[\"Prefix\",\"Version\"]},\"pl-example\"]}"
+    })
+    void stringAttributesAndUnselectedNumericBranchesRemainValid(String intrinsic) {
+        assertEquals("pl-example", engineWithNumericAttribute().resolve(json(intrinsic)));
+    }
+
+    @Test
+    void literalsNumberParametersAndUnselectedNumericAttributesKeepStringCoercion() {
+        CloudFormationTemplateEngine e = new CloudFormationTemplateEngine("000000000000",
+                "us-east-1", "stack", "stack/id", Map.of("Number", "1"), Map.of(), Map.of(),
+                Map.of(), Map.of(), mapper, name -> null, null, null, Map.of("Number", "Number"));
+        assertEquals("1", e.resolveString(json("1"), "must be a string"));
+        assertEquals("1", e.resolveString(json("{\"Ref\":\"Number\"}"), "must be a string"));
+        assertEquals("1", e.resolve(json("{\"Fn::Join\":[\"\",[1]]}")));
+        assertEquals("1", e.resolve(json("{\"Fn::Join\":[\"\",[{\"Ref\":\"Number\"}]]}")));
+        assertEquals("1", e.resolve(json("{\"Fn::Select\":[0,{\"Fn::Split\":[\",\",1]}]}")));
+        assertEquals("1", e.resolve(json("{\"Fn::Select\":[0,{\"Fn::Split\":[\",\",{\"Ref\":\"Number\"}]}]}")));
+        assertEquals("1", e.resolve(json("{\"Fn::Sub\":[\"${Value}\",{\"Value\":1}]}")));
+        assertEquals("pl-example", engineWithNumericAttribute().resolve(json("""
+                {"Fn::Join":["",[{"Fn::Select":[1,[{"Fn::GetAtt":["Prefix","Version"]},"pl-example"]]}]]}
+                """)));
     }
 
     @Test
@@ -539,6 +606,38 @@ class CloudFormationTemplateEngineTest {
 
         assertEquals("https://real.example.com",
                 e.resolveNode(json("\"{{resolve:ssm:/demo/url}}\"")).asText());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+        "{\"Fn::GetAtt\":[\"Custom\",\"Url\"]}",
+        "{\"Fn::GetAtt\":\"Custom.Url\"}",
+        "{\"Fn::If\":[\"Include\",{\"Fn::GetAtt\":[\"Custom\",\"Url\"]},\"unused\"]}",
+        "{\"Fn::Select\":[0,[{\"Fn::GetAtt\":[\"Custom\",\"Url\"]}]]}"
+    })
+    void getAttResolvesTextualDynamicReferencesOnce(String intrinsic) {
+        List<String> calls = new ArrayList<>();
+        CloudFormationTemplateEngine e = new CloudFormationTemplateEngine("000000000000",
+                "us-east-1", "my-stack", "stack/id", Map.of(), Map.of(),
+                Map.of("Custom", Map.of("Url", "{{resolve:ssm:/demo/url}}")),
+                Map.of("Include", true), Map.of(), mapper, name -> null, value -> {
+                    calls.add(value);
+                    return "{{resolve:ssm:/literal-result}}";
+                });
+
+        assertEquals("{{resolve:ssm:/literal-result}}", e.resolveNode(json(intrinsic)).textValue());
+        assertEquals(List.of("{{resolve:ssm:/demo/url}}"), calls);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{\"Fn::GetAtt\":[\"Custom\",\"Url\"]}", "{\"Fn::GetAtt\":\"Custom.Url\"}"})
+    void getAttWithoutDynamicReferencesLeavesTextUnchanged(String intrinsic) {
+        CloudFormationTemplateEngine e = new CloudFormationTemplateEngine("000000000000",
+                "us-east-1", "my-stack", "stack/id", Map.of(), Map.of(),
+                Map.of("Custom", Map.of("Url", "{{resolve:ssm:/demo/url}}")), Map.of(), Map.of(), mapper,
+                name -> null, value -> fail("dynamic reference must not be resolved here: " + value));
+
+        assertEquals("{{resolve:ssm:/demo/url}}", e.resolveWithoutDynamicReferences(json(intrinsic)));
     }
 
     /**
