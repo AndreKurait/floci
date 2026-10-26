@@ -2472,6 +2472,9 @@ public class ApiGatewayController {
         node.put("name", a.getName());
         node.put("type", a.getType());
         if (a.getAuthorizerUri() != null) node.put("authorizerUri", a.getAuthorizerUri());
+        if (a.getAuthorizerCredentials() != null) {
+            node.put("authorizerCredentials", a.getAuthorizerCredentials());
+        }
         if (a.getIdentitySource() != null) node.put("identitySource", a.getIdentitySource());
         node.put("authorizerResultTtlInSeconds", Integer.parseInt(a.getAuthorizerResultTtlInSeconds()));
         if (a.getProviderARNs() != null && !a.getProviderARNs().isEmpty()) {

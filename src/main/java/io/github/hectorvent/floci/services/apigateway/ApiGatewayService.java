@@ -1183,6 +1183,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         authorizer.setName((String) request.get("name"));
         authorizer.setType((String) request.get("type"));
         authorizer.setAuthorizerUri((String) request.get("authorizerUri"));
+        authorizer.setAuthorizerCredentials((String) request.get("authorizerCredentials"));
         authorizer.setIdentitySource((String) request.get("identitySource"));
         authorizer.setAuthorizerResultTtlInSeconds(String.valueOf(request.getOrDefault("authorizerResultTtlInSeconds", "300")));
         validateRequestAuthorizerIdentitySource(authorizer.getType(), authorizer.getIdentitySource(),
@@ -1224,6 +1225,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         // only applied once the whole patch is known to be good.
         String newName = authorizer.getName();
         String newAuthorizerUri = authorizer.getAuthorizerUri();
+        String newCredentials = authorizer.getAuthorizerCredentials();
         String newIdentitySource = authorizer.getIdentitySource();
         String newTtl = authorizer.getAuthorizerResultTtlInSeconds();
         if (patchOperations != null) {
@@ -1234,6 +1236,13 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
             String path = op.get("path");
             String value = op.get("value");
             String opType = op.get("op");
+            if ("/authorizerCredentials".equals(path)) {
+                if (!"replace".equals(opType)) {
+                    throw new AwsException("BadRequestException", "Invalid operation", 400);
+                }
+                newCredentials = value;
+                continue;
+            }
             if (!"add".equals(opType) && !"replace".equals(opType)) {
                 throw new AwsException("BadRequestException", "Invalid operation", 400);
             }
@@ -1265,6 +1274,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         validateRequestAuthorizerIdentitySource(authorizer.getType(), newIdentitySource, newTtl);
         authorizer.setName(newName);
         authorizer.setAuthorizerUri(newAuthorizerUri);
+        authorizer.setAuthorizerCredentials(newCredentials);
         authorizer.setIdentitySource(newIdentitySource);
         authorizer.setAuthorizerResultTtlInSeconds(newTtl);
         authorizerStore.put(authorizerKey(region, apiId, authorizerId), authorizer);
@@ -4184,6 +4194,12 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
                         }
                     }
                     req.put("authorizerUri", authorizerUri);
+                    String credentials = importedAuthorizerString(authDef, "authorizerCredentials", schemeName);
+                    if (!authDef.containsKey("authorizerCredentials") && existing != null
+                            && ("token".equals(t) || "request".equals(t))) {
+                        credentials = existing.getAuthorizerCredentials();
+                    }
+                    req.put("authorizerCredentials", credentials);
                     req.put("authorizerResultTtlInSeconds", importedAuthorizerTtl(authDef, schemeName));
                     String identitySource = resolveImportedIdentitySource(scheme, authDef, t, schemeName);
                     if (identitySource != null) {
