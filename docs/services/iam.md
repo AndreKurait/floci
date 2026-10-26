@@ -2527,3 +2527,10 @@ aws iam create-access-key --user-name alice --endpoint-url $AWS_ENDPOINT_URL
 # List roles
 aws iam list-roles --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+
+### Service execution-role authorization sessions
+
+The shared execution-role authorizer checks service trust before registering a temporary local role credential. It resolves that credential through IAM for policy evaluation, including the full role ARN, session ARN, role ID and `aws:userid`. Conditions on session identity therefore apply to both Allow and Deny statements.
+
+The credential is revoked when authorization evaluation ends, including denied and failed evaluations. It has a 15-minute expiration as a fallback and is not injected into the Lambda workload. Its locally selected session name is not a claim about AWS service-selected session names or credential caching. Session-tag overrides and the complete service trust condition context remain separate limitations.
