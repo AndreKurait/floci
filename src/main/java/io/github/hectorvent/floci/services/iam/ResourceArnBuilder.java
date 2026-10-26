@@ -149,6 +149,7 @@ public class ResourceArnBuilder {
             case "ssm"            -> List.of(buildSsmArn(ctx, region, accountId));
             case "kms"            -> List.of(buildKmsArn(path, region, accountId));
             case "iam"            -> buildIamArns(ctx, region, accountId);
+            case "elasticloadbalancing" -> buildElbResources(operation, ctx, region, accountId, partition);
             case "resource-groups" -> List.of(buildResourceGroupArn(ctx, region, accountId));
             case "scheduler"      -> List.of(buildSchedulerArn(path, ctx, region, accountId, partition));
             case "pipes"          -> List.of(buildPipesArn(path, ctx, region, accountId, partition));
@@ -168,6 +169,21 @@ public class ResourceArnBuilder {
         List<String> named = operation == null || !operation.startsWith(credentialScope + ":") ? List.of()
                 : RequestResources.of(operation, ctx, partition, region, accountId);
         return named.isEmpty() ? List.of("*") : named;
+    }
+
+    private List<String> buildElbResources(String operation, ContainerRequestContext ctx,
+                                           String region, String accountId, String partition) {
+        boolean provisionedCapacity = "elasticloadbalancing:DescribeProvisionedCapacity".equals(operation);
+        if (operation == null) {
+            String action = AwsQueryServiceResolver.action(RequestBodyReader.formField(ctx, "Action"),
+                    RequestBodyReader.formField(ctx, "Operation"));
+            provisionedCapacity = "DescribeProvisionedCapacity".equals(action);
+        }
+        if (!provisionedCapacity) {
+            return namedResources("elasticloadbalancing", operation, ctx, region, accountId, partition);
+        }
+        String arn = RequestBodyReader.formField(ctx, "LoadBalancerArn");
+        return List.of(arn == null || arn.isBlank() ? "*" : arn);
     }
 
     private String buildResourceGroupArn(ContainerRequestContext ctx, String region, String accountId) {

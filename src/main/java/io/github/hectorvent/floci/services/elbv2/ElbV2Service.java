@@ -417,6 +417,39 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         return new CapacityReservation(null, null, null);
     }
 
+    /**
+     * Floci Query extension reporting synthetic status without reserving ALB capacity.
+     */
+    public String describeProvisionedCapacity(String region, String arn) {
+        AwsArnUtils.Arn parsed;
+        try {
+            parsed = AwsArnUtils.parse(arn);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("ValidationError", "A valid LoadBalancerArn must be specified.", 400);
+        }
+        if (!"elasticloadbalancing".equals(parsed.service())
+                || !parsed.accountId().matches("[0-9]{12}")
+                || !parsed.resource().matches("loadbalancer/app/[A-Za-z0-9-]{1,32}/[0-9a-f]{16}")
+                || !region.equals(parsed.region())
+                || !regionResolver.partitionForRegion(region).equals(parsed.partition())) {
+            throw new AwsException("ValidationError",
+                    "LoadBalancerArn must identify an application load balancer in the request region.", 400);
+        }
+        if (!regionResolver.getAccountId().equals(parsed.accountId())) {
+            throw new AwsException("LoadBalancerNotFound", "One or more load balancers not found.", 400);
+        }
+        LoadBalancer lb = requireLoadBalancer(region, arn);
+        if (!"application".equals(lb.getType())) {
+            throw new AwsException("ValidationError", "LoadBalancerArn must identify an application load balancer.", 400);
+        }
+        return switch (lb.getState()) {
+            case "active" -> "disabled";
+            case "provisioning" -> "pending";
+            case null, default -> throw new AwsException("InternalFailure",
+                    "Load balancer is not active or provisioning.", 500);
+        };
+    }
+
     public void setSecurityGroups(String region, String arn, List<String> sgIds) {
         LoadBalancer lb = requireLoadBalancer(region, arn);
         lb.setSecurityGroups(new ArrayList<>(sgIds));
