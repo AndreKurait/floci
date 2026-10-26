@@ -772,9 +772,11 @@ always lists both stages, matching AWS.
 adds the corresponding security schemes and operation requirements. API Gateway imports
 these as `authorizationType: AWS_IAM` and `apiKeyRequired: true`: invocation requires both
 a valid SigV4 signature and an enabled API key associated with the invoked stage when both
-controls are selected. Existing operation requirements and their scheme definitions are
-preserved. Defaults are selected by the SAM names `AWS_IAM` and `api_key`; an existing
-scheme with another name does not suppress either default.
+controls are selected. Existing operation requirements are preserved. When a default applies
+to OpenAPI 3, inline custom authorizer schemes are removed unless they also appear in the
+SAM `securityDefinitions` map. This matches SAM's removal of undeclared OpenAPI authorizers
+before import. Swagger 2 keeps its custom schemes. Defaults are selected by the SAM names
+`AWS_IAM` and `api_key`; an existing scheme with another name does not suppress either default.
 As in SAM, the defaults are added to each operation's own `security`, inside each branch of
 an `Fn::If` written around a path or an operation, skipping an `AWS::NoValue` branch. A
 nested `Fn::If` around an operation is left as written, without the defaults, as SAM leaves
@@ -792,9 +794,9 @@ When a default applies, so are unresolved or malformed security requirements, me
 override markers, a nested `Fn::If` around a path item, a body or security
 scheme map written as an intrinsic function, an `AWS_IAM` or `api_key` scheme that contains
 one, and a body that declares both `swagger` and `openapi`. Existing
-custom schemes remain subject to API Gateway's importer and invocation support; preserving
-them does not implement another authentication protocol. The importer rejects multiple
-authorizer or IAM requirements, including a defined custom authorizer alongside the
+custom schemes retained by the transform remain subject to API Gateway's importer and
+invocation support; preserving them does not implement another authentication protocol. The
+importer rejects multiple authorizer or IAM requirements, including a defined custom authorizer alongside the
 generated IAM default, with `BadRequestException`. API-key requirements can accompany
 one authorizer or IAM requirement. The transform
 preserves integration credentials, Lambda permissions and inline resource policies.
