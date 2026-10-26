@@ -104,6 +104,75 @@ class ElbV2ServiceTest {
         stubAlbSubnets(ec2Service);
     }
 
+    @ParameterizedTest
+    @CsvSource({"active, disabled", "provisioning, pending"})
+    void provisionedCapacityReadReturnsSyntheticStatusWithoutChangingTheLoadBalancer(String state, String status) {
+        LoadBalancer lb = service.createLoadBalancer(REGION, "capacity", null, "application", null,
+                ALB_SUBNETS, List.of(), Map.of());
+        lb.setState(state);
+        assertEquals(status, service.describeProvisionedCapacity(REGION, lb.getLoadBalancerArn()));
+        assertEquals(state, lb.getState());
+        assertEquals(1, service.describeLoadBalancers(REGION, null, null, null, null).size());
+        assertEquals(new ElbV2Service.CapacityReservation(null, null, null),
+                service.describeCapacityReservation(REGION, lb.getLoadBalancerArn()));
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {"failed", "active_impaired", "unknown"})
+    void provisionedCapacityReadRejectsUnsupportedStoredStates(String state) {
+        LoadBalancer lb = service.createLoadBalancer(REGION, "capacity", null, "application", null,
+                ALB_SUBNETS, List.of(), Map.of());
+        lb.setState(state);
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.describeProvisionedCapacity(REGION, lb.getLoadBalancerArn()));
+        assertEquals("InternalFailure", error.getErrorCode());
+        assertEquals(500, error.getHttpStatus());
+        assertEquals(state, lb.getState());
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {" ", "not-an-arn",
+            "arn:aws:s3:us-west-2:000000000000:loadbalancer/app/test/0123456789abcdef",
+            "arn:aws-cn:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/test/0123456789abcdef",
+            "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/test/0123456789abcdef",
+            "arn:aws:elasticloadbalancing:us-west-2:not-account:loadbalancer/app/test/0123456789abcdef",
+            "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/net/test/0123456789abcdef"})
+    void provisionedCapacityReadRejectsInvalidArnsWithoutAllocatingAnything(String arn) {
+        AwsException error = assertThrows(AwsException.class, () -> service.describeProvisionedCapacity(REGION, arn));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertTrue(service.describeLoadBalancers(REGION, null, null, null, null).isEmpty());
+        verifyNoInteractions(dataPlane, healthChecker);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"network", "gateway"})
+    void provisionedCapacityReadRejectsExistingNonApplicationLoadBalancers(String type) {
+        LoadBalancer lb = service.createLoadBalancer(REGION, "capacity", null, type, null,
+                ALB_SUBNETS, List.of(), Map.of());
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.describeProvisionedCapacity(REGION, lb.getLoadBalancerArn()));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertEquals("active", lb.getState());
+    }
+
+    @Test
+    void provisionedCapacityReadHidesDeletedAndForeignLoadBalancers() {
+        LoadBalancer lb = service.createLoadBalancer(REGION, "capacity", null, "application", null,
+                ALB_SUBNETS, List.of(), Map.of());
+        String arn = lb.getLoadBalancerArn();
+        service.regionResolver = new RegionResolver(REGION, "111111111111");
+        assertEquals("LoadBalancerNotFound", assertThrows(AwsException.class,
+                () -> service.describeProvisionedCapacity(REGION, arn)).getErrorCode());
+        service.regionResolver = new RegionResolver(REGION, "000000000000");
+        service.deleteLoadBalancer(REGION, arn);
+        assertEquals("LoadBalancerNotFound", assertThrows(AwsException.class,
+                () -> service.describeProvisionedCapacity(REGION, arn)).getErrorCode());
+    }
+
     /**
      * Every type takes Subnets or SubnetMappings, so a balancer with neither is refused before a
      * subnet is looked up or anything is stored. The messages are the ones AWS gives an Application
