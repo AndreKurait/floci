@@ -144,6 +144,9 @@ class HttpIntegrationCallerTest {
     @Test
     void verifiedIamRouteIdentityIsReusedWithoutSecondVerification() {
         route.setAuthorizationType("AWS_IAM");
+        String policies = "{\"Statement\":[" + ALLOW.substring(ALLOW.indexOf('{', 1), ALLOW.length() - 1)
+                + ",{\"Effect\":\"Allow\",\"Action\":\"execute-api:Invoke\",\"Resource\":\"*\"}]}";
+        when(iam.resolveCallerContext(eq(KEY), any())).thenReturn(CallerContext.of(List.of(policies)));
         assertEquals(200, invoke());
         verify(signature).authorize(anyString(), any(), any(), any(), any());
         verify(lambda).invokeTarget(eq("us-east-1"), eq(FUNCTION), any(byte[].class), any());
