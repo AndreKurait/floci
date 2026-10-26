@@ -992,3 +992,10 @@ aws apigatewayv2 create-stage \
 # Disconnect a client
 # curl -X DELETE http://localhost:4566/execute-api/$WS_API_ID/prod/@connections/$CONNECTION_ID
 ```
+
+HTTP API AWS/AWS_PROXY Lambda integrations without `credentialsArn` check Lambda
+resource policies when IAM enforcement is enabled. The check uses the API owner,
+stage, HTTP method and request path, the Lambda function region, and the exact
+qualified target passed to invocation. Missing permission returns HTTP 500 before
+invocation. Configured roles and caller passthrough retain their separate paths;
+this check does not implement role assumption.
