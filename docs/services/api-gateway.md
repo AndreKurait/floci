@@ -992,3 +992,10 @@ aws apigatewayv2 create-stage \
 # Disconnect a client
 # curl -X DELETE http://localhost:4566/execute-api/$WS_API_ID/prod/@connections/$CONNECTION_ID
 ```
+
+WebSocket REQUEST authorizers without `authorizerCredentialsArn` check the Lambda
+resource policy when IAM enforcement is enabled. The check uses the API account,
+the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
+qualified Lambda target. Missing permission returns the existing authorizer
+configuration error before invocation. Configured authorizer roles retain their
+separate execution path; this check does not implement role assumption.
