@@ -12,6 +12,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
 
 /**
  * The sweep interval reaches {@code scheduleWithFixedDelay}, which rejects a non-positive
@@ -39,6 +41,18 @@ class SwfTimeoutSweeperTest {
     }
 
     @Test
+    void millisecondIntervalReachesTheSweepBeforeTheLegacyInterval() {
+        SwfService service = mock(SwfService.class);
+        SwfTimeoutSweeper sweeper = new SwfTimeoutSweeper(service, configWithInterval(30L, 100L));
+        try {
+            sweeper.onStart(new StartupEvent());
+            verify(service, timeout(2000)).sweep();
+        } finally {
+            sweeper.onStop(new ShutdownEvent());
+        }
+    }
+
+    @Test
     void configFixtureRejectsOtherServicePaths() {
         EmulatorConfig config = configWithInterval(30L);
 
@@ -48,6 +62,10 @@ class SwfTimeoutSweeperTest {
     }
 
     private static EmulatorConfig configWithInterval(long intervalSeconds) {
+        return configWithInterval(intervalSeconds, 0L);
+    }
+
+    private static EmulatorConfig configWithInterval(long intervalSeconds, long intervalMillis) {
         EmulatorConfig config = configView(EmulatorConfig.class);
         ServicesConfig services = configView(ServicesConfig.class);
         SwfServiceConfig swf = configView(SwfServiceConfig.class);
@@ -56,6 +74,7 @@ class SwfTimeoutSweeperTest {
         doReturn(true).when(swf).enabled();
         doReturn(true).when(swf).timeoutSweepEnabled();
         doReturn(intervalSeconds).when(swf).timeoutSweepIntervalSeconds();
+        doReturn(intervalMillis).when(swf).timeoutSweepIntervalMillis();
         return config;
     }
 
