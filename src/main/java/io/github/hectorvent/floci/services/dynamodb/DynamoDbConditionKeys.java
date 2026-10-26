@@ -135,7 +135,7 @@ public final class DynamoDbConditionKeys {
         addAttributeNames(attributes, body.get("ScanFilter"));
 
         return new Result(List.copyOf(leadingKeys), List.copyOf(attributes),
-                textOrNull(body.get("Select")));
+                effectiveSelect(action, body));
     }
 
     /** Condition keys for the separately routed 2011-12-05 JSON requests. */
@@ -172,8 +172,29 @@ public final class DynamoDbConditionKeys {
             }
         }
         return new Result(List.copyOf(leadingKeys), List.copyOf(attributes),
-                "dynamodb:Query".equals(action) && body.path("Count").isBoolean()
-                        && body.path("Count").booleanValue() ? "COUNT" : null);
+                legacySelect(action, body));
+    }
+
+    private static String effectiveSelect(String action, JsonNode body) {
+        String select = textOrNull(body.get("Select"));
+        if (select != null || !("dynamodb:Query".equals(action) || "dynamodb:Scan".equals(action))) {
+            return select;
+        }
+        if (body.hasNonNull("ProjectionExpression") || body.hasNonNull("AttributesToGet")) {
+            return "SPECIFIC_ATTRIBUTES";
+        }
+        return textOrNull(body.get("IndexName")) == null ? "ALL_ATTRIBUTES" : "ALL_PROJECTED_ATTRIBUTES";
+    }
+
+    private static String legacySelect(String action, JsonNode body) {
+        if (!"dynamodb:Query".equals(action)) {
+            return null;
+        }
+        if (body.path("Count").isBoolean() && body.path("Count").booleanValue()) {
+            return "COUNT";
+        }
+        // The legacy adapter only forwards AttributesToGet, not modern selection members.
+        return body.hasNonNull("AttributesToGet") ? "SPECIFIC_ATTRIBUTES" : "ALL_ATTRIBUTES";
     }
 
     private static void addLegacyKey(List<String> leadingKeys, Set<String> attributes, JsonNode value, String name) {
@@ -191,7 +212,7 @@ public final class DynamoDbConditionKeys {
     /**
      * The extracted keys. {@code leadingKeys} holds partition-key values in request order
      * (duplicates preserved), {@code attributes} holds attribute names in first-seen order
-     * with duplicates removed, {@code select} is the raw Select value or {@code null}.
+     * with duplicates removed, {@code select} includes Query/Scan defaults, and is otherwise the raw value or {@code null}.
      */
     public record Result(List<String> leadingKeys, List<String> attributes, String select) {}
 

@@ -8,6 +8,8 @@ import io.github.hectorvent.floci.services.dynamodb.model.LocalSecondaryIndex;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.List;
 
@@ -20,6 +22,37 @@ class DynamoDbConditionKeysTest {
 
     private final ObjectMapper mapper = new ObjectMapper();
     private TableDefinition table;
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "Query | {} | ALL_ATTRIBUTES",
+            "Scan | {} | ALL_ATTRIBUTES",
+            "Query | {\"IndexName\":\"by-value\"} | ALL_PROJECTED_ATTRIBUTES",
+            "Scan | {\"IndexName\":\"by-value\"} | ALL_PROJECTED_ATTRIBUTES",
+            "Query | {\"ProjectionExpression\":\"PK\"} | SPECIFIC_ATTRIBUTES",
+            "Scan | {\"ProjectionExpression\":\"PK\"} | SPECIFIC_ATTRIBUTES",
+            "Query | {\"AttributesToGet\":[\"PK\"]} | SPECIFIC_ATTRIBUTES",
+            "Scan | {\"AttributesToGet\":[\"PK\"]} | SPECIFIC_ATTRIBUTES",
+            "Query | {\"Select\":\"COUNT\",\"ProjectionExpression\":\"PK\"} | COUNT",
+            "Scan | {\"Select\":\"ALL_ATTRIBUTES\",\"IndexName\":\"by-value\"} | ALL_ATTRIBUTES",
+            "Query | {\"Select\":\"invalid\"} | invalid"
+    })
+    void selectionDefaultsMatchTheReadShape(String action, String body, String expected) {
+        assertEquals(expected, DynamoDbConditionKeys.extract("dynamodb:" + action, json(body), table).select());
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "{} | ALL_ATTRIBUTES",
+            "{\"Count\":false} | ALL_ATTRIBUTES",
+            "{\"AttributesToGet\":[\"PK\"]} | SPECIFIC_ATTRIBUTES",
+            "{\"Count\":true} | COUNT",
+            "{\"Count\":true,\"AttributesToGet\":[\"PK\"]} | COUNT",
+            "{\"Select\":\"COUNT\",\"ProjectionExpression\":\"PK\",\"IndexName\":\"ignored\"} | ALL_ATTRIBUTES"
+    })
+    void legacySelectionUsesOnlyMembersForwardedByTheAdapter(String body, String expected) {
+        assertEquals(expected, DynamoDbConditionKeys.extractLegacy("dynamodb:Query", json(body), table).select());
+    }
 
     @BeforeEach
     void setUp() {

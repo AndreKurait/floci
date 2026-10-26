@@ -68,6 +68,18 @@ the AWS [2011-12-05 DescribeTable](https://docs.aws.amazon.com/amazondynamodb/la
 and [BatchWriteItem](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/API_BatchWriteItem_v20111205.html)
 documentation.
 
+## Query and Scan IAM selection
+
+With IAM enforcement enabled, `dynamodb:Select` includes the effective selection
+for `Query` and `Scan`: `ALL_ATTRIBUTES` for an unprojected table read,
+`ALL_PROJECTED_ATTRIBUTES` for an unprojected index read, and
+`SPECIFIC_ATTRIBUTES` when a projection is supplied. An explicit `Select` value
+is preserved. Legacy Query uses `Count` and `AttributesToGet` for the same purpose.
+
+`dynamodb:Attributes` still describes attributes named in the request, not all
+attributes returned. An attributes-only condition does not require a projection;
+use a `dynamodb:Select` condition when the policy must require specific attributes.
+
 ## Legacy conditional requests
 
 The native backend accepts `KeyConditions` together with `FilterExpression`.

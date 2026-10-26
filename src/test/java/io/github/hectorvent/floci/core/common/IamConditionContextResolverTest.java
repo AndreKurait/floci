@@ -536,7 +536,7 @@ class IamConditionContextResolverTest {
         when(request.getHeaderString("X-Amz-Target")).thenReturn("DynamoDB_20120810.Query");
         Map<String, List<String>> modern = resolver.resolve("dynamodb", "dynamodb:Query", request);
         assertEquals(List.of("USER_alice"), modern.get("dynamodb:LeadingKeys"));
-        assertFalse(modern.containsKey("dynamodb:Select"));
+        assertEquals(List.of("SPECIFIC_ATTRIBUTES"), modern.get("dynamodb:Select"));
     }
 
     @Test
