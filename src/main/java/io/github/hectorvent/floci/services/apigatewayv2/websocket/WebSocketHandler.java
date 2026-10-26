@@ -7,6 +7,8 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayExecuteApiHostFilter;
+import io.github.hectorvent.floci.services.apigateway.ExecuteApiSigV4Authorizer;
+import io.github.hectorvent.floci.services.apigateway.ExecuteApiSigV4Authorizer.CallerIdentity;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Integration;
@@ -21,6 +23,7 @@ import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.net.URI;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -41,6 +44,7 @@ import java.util.concurrent.ThreadLocalRandom;
 public class WebSocketHandler {
 
     private static final Logger LOG = Logger.getLogger(WebSocketHandler.class);
+    private static final String VERIFIED_CALLER = WebSocketHandler.class.getName() + ".caller";
 
     private final ApiGatewayV2Service apiGatewayV2Service;
     private final WebSocketConnectionManager connectionManager;
@@ -51,6 +55,7 @@ public class WebSocketHandler {
     private final RegionResolver regionResolver;
     private final String baseHostname;
     private final ObjectMapper objectMapper;
+    private final ExecuteApiSigV4Authorizer sigV4Authorizer;
     private final io.vertx.core.Vertx vertx;
 
     @Inject
@@ -63,7 +68,7 @@ public class WebSocketHandler {
                             RegionResolver regionResolver,
                             EmulatorConfig config,
                             ObjectMapper objectMapper,
-                            io.vertx.core.Vertx vertx) {
+                            io.vertx.core.Vertx vertx, ExecuteApiSigV4Authorizer sigV4Authorizer) {
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.connectionManager = connectionManager;
         this.routeSelectionEvaluator = routeSelectionEvaluator;
@@ -74,6 +79,7 @@ public class WebSocketHandler {
         this.baseHostname = config.hostname().orElse("localhost");
         this.objectMapper = objectMapper;
         this.vertx = vertx;
+        this.sigV4Authorizer = sigV4Authorizer;
     }
 
     /**
@@ -204,6 +210,17 @@ public class WebSocketHandler {
             return;
         }
 
+        ExecuteApiSigV4Authorizer.Result verified = sigV4Authorizer.authorize(ctx.request().method().name(),
+                URI.create(ctx.request().absoluteURI()),
+                name -> {
+                    List<String> values = ctx.request().headers().getAll(name);
+                    return values.isEmpty() ? null : String.join(",", values);
+                },
+                ctx.request()::getParam, new byte[0], ctx.request().path());
+        if (verified.authorized()) {
+            ctx.put(VERIFIED_CALLER, verified.identity());
+        }
+
         // Generate a unique connectionId (AWS format: base64-encoded random bytes, ~10-14 chars)
         String connectionId = generateConnectionId();
         long connectedAt = System.currentTimeMillis();
@@ -305,7 +322,8 @@ public class WebSocketHandler {
         vertx.<WebSocketIntegrationInvoker.IntegrationResult>executeBlocking(() -> {
             return integrationInvoker.invoke(region, apiId, stageName, "$connect",
                     finalIntegration, eventJson,
-                    finalStageVariables, Collections.emptyMap(), Collections.emptyMap());
+                    finalStageVariables, Collections.emptyMap(), Collections.emptyMap(),
+                    ctx.<CallerIdentity>get(VERIFIED_CALLER));
         }).onSuccess(result -> {
             // Check for function error (Lambda invocation error)
             if (result.functionError() != null) {
@@ -352,6 +370,7 @@ public class WebSocketHandler {
             ConnectionInfo connectionInfo = new ConnectionInfo(
                     connectionId, apiId, stageName, region,
                     connectedAt, connectedAt, sourceIp, userAgent);
+            connectionInfo.callerIdentity(ctx.get(VERIFIED_CALLER));
             connectionManager.register(connectionId, connectionInfo, ws);
 
             LOG.debugv("WebSocket connection {0} established for API {1}/{2}",
@@ -581,7 +600,8 @@ public class WebSocketHandler {
         vertx.executeBlocking(() -> {
             return integrationInvoker.invoke(region, apiId, stageName, finalRoute.getRouteKey(),
                     finalIntegration, eventJson,
-                    finalStageVariables, Collections.emptyMap(), Collections.emptyMap());
+                    finalStageVariables, Collections.emptyMap(), Collections.emptyMap(),
+                    connectionInfo == null ? null : connectionInfo.callerIdentity());
         }).onSuccess(result -> {
             // Route response handling (Requirements 5.1–5.3)
             if (finalRoute.getRouteResponseSelectionExpression() != null && result.body() != null) {
@@ -680,7 +700,8 @@ public class WebSocketHandler {
             vertx.executeBlocking(() -> {
                 integrationInvoker.invoke(region, apiId, stageName, "$disconnect",
                         finalIntegration, eventJson,
-                        finalStageVariables, Collections.emptyMap(), Collections.emptyMap());
+                        finalStageVariables, Collections.emptyMap(), Collections.emptyMap(),
+                        connectionInfo == null ? null : connectionInfo.callerIdentity());
                 return null;
             }).onComplete(ar -> {
                 if (ar.failed()) {
