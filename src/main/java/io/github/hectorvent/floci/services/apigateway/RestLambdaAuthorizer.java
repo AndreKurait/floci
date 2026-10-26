@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.apigateway;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.ResourcePolicyDecision;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -86,6 +87,11 @@ public class RestLambdaAuthorizer {
 
     boolean permits(Result result, String methodArn, Map<String, List<String>> conditions) {
         return policyEvaluator.permits(result.policyDocument(), methodArn, conditions);
+    }
+
+    boolean permits(Result result, String methodArn, Map<String, List<String>> conditions,
+                    ResourcePolicyDecision resourceDecision) {
+        return policyEvaluator.permits(result.policyDocument(), methodArn, conditions, resourceDecision);
     }
 
     Result get(CacheKey key) {
