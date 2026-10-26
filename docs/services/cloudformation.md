@@ -646,6 +646,13 @@ when it starts with `{` and ends with `}`, and `Template format error: YAML not 
 L, column C)` otherwise, at the position where the parser stopped. A body that reads as a scalar or
 a list is `Template format error: unsupported structure.`
 
+## Attribute types
+
+`AWS::EC2::PrefixList` `Version` remains numeric when used as another resource's property.
+Numeric attributes are rejected in string outputs and `Fn::Join`, `Fn::Sub`,
+`Fn::Split`, and `Fn::Base64`, including selected `Fn::If` and `Fn::Select` values.
+Literal numbers and Number-parameter references retain their existing string coercion.
+
 ## Null values
 
 As on AWS, a template holding a `null` anywhere (JSON `null`, YAML `~` or a key with no value) is
@@ -1138,8 +1145,3 @@ aws cloudformation create-stack \
 !!! note "Dependency ordering"
     Use `!Ref MyFunction` (not a plain string) for `FunctionName` so CloudFormation
     provisions the function before the event source mapping.
-
-`AWS::EC2::PrefixList` `Version` remains numeric when used as another resource's property.
-Numeric attributes are rejected in string outputs and `Fn::Join`, `Fn::Sub`,
-`Fn::Split`, and `Fn::Base64`, including selected `Fn::If` and `Fn::Select` values.
-Literal numbers and Number-parameter references retain their existing string coercion.

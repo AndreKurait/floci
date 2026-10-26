@@ -58,6 +58,27 @@ class CloudFormationTemplateEngineTest {
         assertEquals("Thing.Missing", e.resolve(json("{\"Fn::GetAtt\": [\"Thing\", \"Missing\"]}")));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {
+        "{\"Fn::Sub\":\"${Bucket.Missing}/*\"}",
+        "{\"Fn::Join\":[\"\",[{\"Fn::GetAtt\":[\"Bucket\",\"Missing\"]},\"/*\"]]}",
+        "{\"Fn::Sub\":[\"${Value}/*\",{\"Value\":{\"Fn::GetAtt\":\"Bucket.Missing\"}}]}",
+        "{\"Fn::Base64\":{\"Fn::GetAtt\":\"Bucket.Missing\"}}",
+        "{\"Fn::Split\":[\",\",{\"Fn::GetAtt\":\"Bucket.Missing\"}]}",
+        "{\"Fn::Join\":[\"\",[{\"Fn::If\":[\"Absent\",\"unused\",{\"Fn::GetAtt\":\"Bucket.Missing\"}]}]]}",
+        "{\"Fn::Join\":[\"\",[{\"Fn::Select\":[0,[{\"Fn::GetAtt\":\"Bucket.Missing\"}]]}]]}"
+    })
+    void stringTypeChecksRecordMissingAttributesOnce(String intrinsic) {
+        CloudFormationTemplateEngine e = engineWithAttributes(Map.of("Bucket", Map.of("Arn", "bucket-arn")));
+        JsonNode policy = mapper.createObjectNode().set("Resource", json(intrinsic));
+
+        AwsException failure = assertThrows(AwsException.class, () -> e.resolveJsonAttributeStrict(policy));
+
+        assertEquals("ValidationError", failure.getErrorCode());
+        assertEquals("Policy document contains unresolved CloudFormation intrinsics: Fn::GetAtt Bucket.Missing. "
+                + "Storing them would silently void the statements that use them.", failure.getMessage());
+    }
+
     private JsonNode json(String s) {
         try {
             return mapper.readTree(s);

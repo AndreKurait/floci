@@ -570,7 +570,7 @@ public class CloudFormationTemplateEngine {
         if (node == null) {
             return;
         }
-        if (node.has("Fn::GetAtt") && !resolveGetAttNode(node.get("Fn::GetAtt")).isTextual()) {
+        if (node.has("Fn::GetAtt") && !isStringAttribute(node.get("Fn::GetAtt"))) {
             throw new AwsException("ValidationError", message, 400);
         }
         if (node.has("Fn::If")) {
@@ -580,6 +580,24 @@ public class CloudFormationTemplateEngine {
         } else if (node.isArray()) {
             node.forEach(item -> requireStringAttribute(item, message));
         }
+    }
+
+    private boolean isStringAttribute(JsonNode getAtt) {
+        String logicalId;
+        String attributeName;
+        if (getAtt.isArray() && getAtt.size() == 2) {
+            logicalId = getAtt.get(0).asText();
+            attributeName = getAtt.get(1).asText();
+        } else if (getAtt.isTextual()) {
+            String[] parts = getAtt.textValue().split("\\.", 2);
+            logicalId = parts[0];
+            attributeName = parts.length > 1 ? parts[1] : "";
+        } else {
+            return true;
+        }
+        Map<String, String> attributes = resourceAttributes.get(logicalId);
+        return attributes == null || !attributes.containsKey(attributeName) || attributeName.startsWith("__Floci")
+                || attributeValueResolver.resolve(logicalId, attributeName, attributes.get(attributeName)).isTextual();
     }
 
     private String resolveSelect(JsonNode select) {
