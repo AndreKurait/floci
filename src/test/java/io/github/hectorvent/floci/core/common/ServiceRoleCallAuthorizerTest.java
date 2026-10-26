@@ -20,6 +20,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -173,6 +174,74 @@ class ServiceRoleCallAuthorizerTest {
                 "Null":{"aws:TokenIssueTime":"true","aws:SourceArn":"true","aws:SourceAccount":"true"}}}}
                 """.formatted(NOW);
         when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(policy)));
+        assertEquals(Decision.ALLOW, decide(FUNCTION));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"events,identity", "apigateway,identity", "events,boundary", "apigateway,boundary",
+            "events,scp", "apigateway,scp", "events,resource", "apigateway,resource"})
+    void attachedRoleTagsConstrainEveryTargetPolicy(String service, String layer) {
+        role.setAssumeRolePolicyDocument("""
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"%s.amazonaws.com"},
+                "Action":"sts:AssumeRole"}}""".formatted(service));
+        role.setTags(Map.of("team", "orders"));
+        String policy = """
+                {"Statement":{"Effect":"Allow","Action":"*","Resource":"*",
+                "Condition":{"StringEquals":{"aws:PrincipalTag/team":"orders"}}}}""";
+        String target = FUNCTION;
+        switch (layer) {
+            case "identity" -> when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(policy)));
+            case "boundary" -> {
+                role.setPermissionsBoundaryArn("arn:aws:iam::" + ACCOUNT + ":policy/tag-limit");
+                when(iam.resolvePrincipalContext(ROLE)).thenReturn(new CallerContext(List.of(ALLOW), null, policy));
+            }
+            case "scp" -> when(scps.effectiveScpLevels(ACCOUNT)).thenReturn(List.of(List.of(policy)));
+            case "resource" -> {
+                target = FUNCTION.replace(ACCOUNT, OTHER);
+                String grant = policy.replace("\"Action\"", "\"Principal\":{\"AWS\":\"" + ROLE + "\"},\"Action\"");
+                when(provider.getResourcePolicies("lambda", target))
+                        .thenReturn(List.of(new ResourcePolicyProvider.ResourcePolicy(grant, OTHER)));
+            }
+            default -> fail(layer);
+        }
+        assertEquals(Decision.ALLOW, timeDecision(service, target));
+        role.setTags(Map.of("team", "payments"));
+        assertEquals(Decision.DENY, timeDecision(service, target));
+        role.setTags(Map.of());
+        assertEquals(Decision.DENY, timeDecision(service, target));
+        role.setTags(Map.of("team", "orders"));
+        assertEquals(Decision.ALLOW, timeDecision(service, target));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"events", "apigateway"})
+    void attachedRoleTagsCannotSkipExplicitDeny(String service) {
+        role.setAssumeRolePolicyDocument("""
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"%s.amazonaws.com"},
+                "Action":"sts:AssumeRole"}}""".formatted(service));
+        role.setTags(Map.of("blocked", "yes"));
+        String deny = """
+                {"Statement":{"Effect":"Deny","Action":"*","Resource":"*",
+                "Condition":{"StringEquals":{"aws:PrincipalTag/blocked":"yes"}}}}""";
+        when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(ALLOW, deny)));
+        assertEquals(Decision.DENY, timeDecision(service, FUNCTION));
+        role.setTags(Map.of());
+        assertEquals(Decision.ALLOW, timeDecision(service, FUNCTION));
+    }
+
+    @Test
+    void targetRoleTagsAreNotServicePrincipalTrustTags() {
+        role.setTags(Map.of("team", "orders"));
+        role.setAssumeRolePolicyDocument(TRUST.replace("\"ArnEquals\"",
+                "\"StringEqualsIfExists\":{\"aws:PrincipalTag/team\":\"other\"},\"ArnEquals\""));
+        assertEquals(Decision.ALLOW, decide(FUNCTION));
+    }
+
+    @Test
+    void absentAttachedTagsDoNotInventSessionTags() {
+        when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of("""
+                {"Statement":{"Effect":"Allow","Action":"*","Resource":"*",
+                "Condition":{"Null":{"aws:PrincipalTag/team":"true","aws:TokenIssueTime":"true"}}}}""")));
         assertEquals(Decision.ALLOW, decide(FUNCTION));
     }
 

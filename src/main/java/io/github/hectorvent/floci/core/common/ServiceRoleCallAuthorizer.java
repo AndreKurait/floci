@@ -20,6 +20,7 @@ import jakarta.inject.Inject;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -117,12 +118,15 @@ public class ServiceRoleCallAuthorizer {
         CallerContext caller = iam.resolvePrincipalContext(role.getArn());
         List<List<String>> scps = scpProvider.isResolvable()
                 ? scpProvider.get().effectiveScpLevels(roleId.accountId()) : null;
-        Map<String, List<String>> context = IamConditionContextResolver.withGlobalContext(
+        Map<String, List<String>> principalContext = new HashMap<>(
                 Map.of("aws:PrincipalArn", List.of(role.getArn()),
                         "aws:PrincipalType", List.of(IamService.CallerArns.TYPE_ASSUMED_ROLE),
                         "aws:CurrentTime", List.of(now.toString()),
-                        "aws:EpochTime", List.of(Long.toString(now.getEpochSecond()))),
-                resourceArn, resource.region(), roleId.accountId(), owner);
+                        "aws:EpochTime", List.of(Long.toString(now.getEpochSecond()))));
+        Map.copyOf(role.getTags()).forEach((key, value) ->
+                principalContext.put("aws:PrincipalTag/" + key, List.of(value)));
+        Map<String, List<String>> context = IamConditionContextResolver.withGlobalContext(
+                principalContext, resourceArn, resource.region(), roleId.accountId(), owner);
         String sessionArn = AwsArnUtils.Arn.global(roleId.partition(), "sts", roleId.accountId(),
                 "assumed-role/" + roleName).toString();
         ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents.isEmpty() ? null : documents,

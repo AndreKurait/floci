@@ -18,6 +18,11 @@ identity/resource-policy evaluator, permissions boundary and account SCPs.
 Cross-account targets require a resource-policy grant as well. Each invocation
 rechecks permissions and invokes the same captured target that was authorized.
 The role's full path and boundary attachment are retained during evaluation.
+Attached execution-role tags supply `aws:PrincipalTag/<key>` to target identity,
+resource, permissions-boundary and SCP policies. Later calls read the current tags,
+so tag changes and removal affect authorization. These role tags are not added to
+the service principal's trust context; session-tag overrides are not implemented.
+
 Trust and target-policy evaluation use the same server-clock instant for
 `aws:CurrentTime` and `aws:EpochTime`. Time-conditioned grants and denies are
 reevaluated on each invocation; this request time is not `aws:TokenIssueTime`.
