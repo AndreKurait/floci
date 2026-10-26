@@ -74,7 +74,7 @@ class CognitoSignUpTriggerReentrancyTest {
         InMemoryStorageFactory storageFactory = new InMemoryStorageFactory("000000000000");
         EmulatorConfig config = new SmallRyeConfigBuilder().withMapping(EmulatorConfig.class)
                 .build().getConfigMapping(EmulatorConfig.class);
-        sns = new SnsService(storageFactory, config, regionResolver, null, null, null, MAPPER, null);
+        sns = new SnsService(storageFactory, config, regionResolver, null, null, null, MAPPER, null, null);
         codes = new VerificationCodeService(storageFactory, Clock.systemUTC());
         service = serviceWithSns(sns);
         callbackExecutor = Executors.newSingleThreadExecutor();

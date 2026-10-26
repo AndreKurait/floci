@@ -62,6 +62,18 @@ caller's request the way any [resource-based policy](iam.md#resource-based-polic
 request names the topic in a JSON-protocol body. A Query-protocol request carries the topic in its
 form body, which enforcement does not read yet, so the topic policy plays no part in it.
 
+## Lambda delivery permissions
+
+With IAM enforcement enabled, a Lambda subscription requires the target function's resource
+policy to allow `sns.amazonaws.com` to perform `lambda:InvokeFunction`. The topic ARN and its
+owning account supply `aws:SourceArn` and `aws:SourceAccount`. Permissions must cover the exact
+subscription endpoint, including a version or alias qualifier. This applies to both same-account
+and cross-account delivery, for Query and JSON publishes and batch publishes.
+
+A refused delivery is logged and does not fail the publisher or stop other subscriptions.
+With IAM enforcement disabled, delivery retains the default permissive behavior. This check
+does not add Lambda delivery retries or dead-letter handling.
+
 ## SMS sandbox and opt-out
 
 A new AWS account starts in the SMS sandbox, where it can only text verified numbers. Floci
