@@ -80,8 +80,8 @@ public class CloudFormationTemplateEngine {
     private final AttributeValueResolver attributeValueResolver;
     private final List<String> unresolvedIntrinsics = new ArrayList<>();
     /**
-     * Above zero while {@code Fn::GetStackOutput}'s arguments resolve: CloudFormation hands them on
-     * with their dynamic references unresolved.
+     * Above zero while an intrinsic-only property or {@code Fn::GetStackOutput}'s arguments resolve,
+     * including nested intrinsic calls.
      */
     private int dynamicReferencesSuspended;
 
@@ -234,7 +234,12 @@ public class CloudFormationTemplateEngine {
      * only that property is allowed.
      */
     public String resolveWithoutDynamicReferences(JsonNode node) {
-        return resolveIntrinsic(node);
+        dynamicReferencesSuspended++;
+        try {
+            return resolveIntrinsic(node);
+        } finally {
+            dynamicReferencesSuspended--;
+        }
     }
 
     private String resolveIntrinsic(JsonNode node) {
@@ -1020,12 +1025,7 @@ public class CloudFormationTemplateEngine {
         if (value == null || value.isNull()) {
             return "";
         }
-        dynamicReferencesSuspended++;
-        try {
-            return resolveIntrinsic(value);
-        } finally {
-            dynamicReferencesSuspended--;
-        }
+        return resolveWithoutDynamicReferences(value);
     }
 
     /**
