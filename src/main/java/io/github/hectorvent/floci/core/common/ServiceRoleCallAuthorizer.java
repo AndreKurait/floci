@@ -86,7 +86,8 @@ public class ServiceRoleCallAuthorizer {
         String sessionArn = AwsArnUtils.Arn.global(roleId.partition(), "sts", roleId.accountId(),
                 "assumed-role/" + roleName).toString();
         ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents.isEmpty() ? null : documents,
-                RequestPrincipal.roleSession(sessionArn, role.getArn()), action, resourceArn, context);
+                new RequestPrincipal(RequestPrincipal.Type.IAM, sessionArn, role.getArn(), null,
+                        role.getPermissionsBoundaryArn() != null), action, resourceArn, context);
         ResourceAccountRelationship relationship = roleId.accountId().equals(owner)
                 ? ResourceAccountRelationship.SAME_ACCOUNT : ResourceAccountRelationship.CROSS_ACCOUNT;
         return evaluator.evaluateResolvedResourcePolicy(caller.withScpLevels(scps), grant, relationship,

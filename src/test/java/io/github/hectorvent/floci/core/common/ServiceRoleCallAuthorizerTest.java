@@ -160,6 +160,32 @@ class ServiceRoleCallAuthorizerTest {
         assertEquals(Decision.ALLOW, decide(FUNCTION));
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void notPrincipalExclusionOnlySparesRolesWithoutBoundary(boolean attached) {
+        role.setPermissionsBoundaryArn(attached ? "arn:aws:iam::" + ACCOUNT + ":policy/limit" : null);
+        when(iam.resolvePrincipalContext(ROLE))
+                .thenReturn(new CallerContext(List.of(ALLOW), null, attached ? ALLOW : null));
+        denyExceptAccountAndRole();
+        assertEquals(attached ? Decision.DENY : Decision.ALLOW, decide(FUNCTION));
+    }
+
+    @Test
+    void boundaryAttachmentStillAppliesWhenBoundaryDocumentIsUnavailable() {
+        role.setPermissionsBoundaryArn("arn:aws:iam::" + ACCOUNT + ":policy/limit");
+        denyExceptAccountAndRole();
+        assertEquals(Decision.DENY, decide(FUNCTION));
+    }
+
+    private void denyExceptAccountAndRole() {
+        String policy = """
+                {"Statement":{"Effect":"Deny","Action":"lambda:InvokeFunction","Resource":"%s",
+                "NotPrincipal":{"AWS":["arn:aws:iam::%s:root","%s"]}}}"""
+                .formatted(FUNCTION, ACCOUNT, ROLE);
+        when(provider.getResourcePolicies("lambda", FUNCTION))
+                .thenReturn(List.of(new ResourcePolicyProvider.ResourcePolicy(policy, ACCOUNT)));
+    }
+
     private void resourceGrant(String target, String permitted, String effect) {
         String policy = """
                 {"Statement":{"Effect":"%s","Action":"lambda:InvokeFunction",

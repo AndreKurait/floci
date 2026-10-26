@@ -257,6 +257,25 @@ class EventBridgeLambdaPermissionTest {
         verifyCalls(FUNCTION + ":other", 0);
     }
 
+    @ParameterizedTest
+    @CsvSource({"true,0", "false,1"})
+    void roleBoundaryMetadataControlsNotPrincipalDenial(boolean attached, int calls) {
+        String function = FUNCTION.replace(OWNER, SOURCE) + ":live";
+        role.setPermissionsBoundaryArn(attached ? "arn:aws:iam::" + SOURCE + ":policy/limit" : null);
+        when(roleService.resolvePrincipalContext(ROLE))
+                .thenReturn(new CallerContext(List.of(ALLOW), null, attached ? ALLOW : null));
+        when(lambda.policyStatements(SOURCE, REGION, "receiver")).thenReturn(List.of(Map.of(
+                "Effect", "Deny", "NotPrincipal", Map.of("AWS", List.of("arn:aws:iam::" + SOURCE + ":root", ROLE)),
+                "Action", "lambda:InvokeFunction", "Resource", function)));
+        dispatch(roleTarget(function));
+        verifyCalls(function, calls);
+        if (attached) {
+            assertDeadLetter("0");
+        } else {
+            verifyNoInteractions(sqs);
+        }
+    }
+
     private void roleGrant(String function) {
         statements.set(List.of(Map.of("Effect", "Allow", "Principal", Map.of("AWS", ROLE),
                 "Action", "lambda:InvokeFunction", "Resource", function)));
