@@ -707,8 +707,12 @@ create retains its integration credentials. OpenAPI import maps the integration
 Integration copies and authorizer restore paths retain them too.
 
 This models credential selection; execution-role assumption and credential-based
-Lambda invocation authorization are not implemented by this change. Dedicated
-CloudFormation credential properties remain outside this support.
+Lambda invocation authorization are not implemented by this change.
+
+CloudFormation V2 integrations and authorizers retain their credential role properties.
+Updating a template replaces credentials in place; removing the property clears the role
+and selects resource-based permissions. Integration connection rollback also restores
+credentials. This models credential selection, not invocation authorization or role assumption.
 
 **Protocol:** REST JSON
 **Endpoint:** `http://localhost:4566/v2/apis/...`

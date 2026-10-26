@@ -715,6 +715,44 @@ class ApiGatewayV2CfnProvisionerTest {
         assertFalse(integration.getAttributes().containsKey("__FlociIntegrationConnectionSnapshot"));
     }
 
+    @Test
+    void integrationCredentialsAreForwardedAndRestoredOnRollback() throws Exception {
+        Integration prior = priorVpcLinkIntegration();
+        prior.setCredentialsArn("arn:aws:iam::000000000000:role/old");
+        stubIntegrationUpdate(prior);
+        StackResource integration = provisionIntegration("""
+                {"ApiId":"api-123","IntegrationType":"HTTP_PROXY","IntegrationUri":"http://backend",
+                 "CredentialsArn":"arn:aws:iam::000000000000:role/new"}
+                """);
+        verify(apiGatewayV2Service).updateIntegration(eq(REGION), eq(API_ID), eq("int-1"),
+                argThat(req -> "arn:aws:iam::000000000000:role/new".equals(req.get("credentialsArn"))));
+        assertTrue(provisioner.rollbackUpdate(integration));
+        verify(apiGatewayV2Service).replaceIntegrationCredentials(REGION, API_ID, "int-1",
+                "arn:aws:iam::000000000000:role/old");
+    }
+
+    @Test
+    void removedIntegrationCredentialsAreExplicitlyCleared() throws Exception {
+        stubIntegrationUpdate(priorVpcLinkIntegration());
+        provisionIntegration("""
+                {"ApiId":"api-123","IntegrationType":"HTTP_PROXY","IntegrationUri":"http://backend"}
+                """);
+        verify(apiGatewayV2Service).replaceIntegrationCredentials(REGION, API_ID, "int-1", null);
+    }
+
+    @Test
+    void removedAuthorizerCredentialsAreExplicitlyCleared() throws Exception {
+        Authorizer auth = new Authorizer();
+        auth.setAuthorizerId("auth-1");
+        when(apiGatewayV2Service.updateAuthorizer(eq(REGION), eq(API_ID), eq("auth-1"), anyMap())).thenReturn(auth);
+        StackResource resource = provisioner.provision("Auth", "AWS::ApiGatewayV2::Authorizer",
+                mapper.readTree("{\"ApiId\":\"api-123\",\"Name\":\"auth\",\"AuthorizerType\":\"REQUEST\"}"),
+                engine(), REGION, "000000000000", "test-stack", "auth-1", Map.of());
+        assertEquals("auth-1", resource.getPhysicalId());
+        assertEquals("auth-1", resource.getAttributes().get("AuthorizerId"));
+        verify(apiGatewayV2Service).replaceAuthorizerCredentials(REGION, API_ID, "auth-1", null);
+    }
+
     private static Integration priorVpcLinkIntegration() {
         Integration prior = new Integration();
         prior.setIntegrationId("int-1");
