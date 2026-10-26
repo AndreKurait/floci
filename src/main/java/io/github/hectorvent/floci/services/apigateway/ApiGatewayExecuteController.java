@@ -488,6 +488,14 @@ public class ApiGatewayExecuteController {
                 return restIamRejection(scope, iamResult);
             }
             iamIdentity = iamResult.identity();
+            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod, path);
+            if (callerCallAuthorizer.authorize(iamIdentity == null ? null : iamIdentity.accessKey(),
+                    iamIdentity == null ? null : iamIdentity.accountId(),
+                    iamIdentity == null ? null : iamIdentity.userArn(), "execute-api:Invoke", invokeArn,
+                    AwsArnUtils.parse(invokeArn).partition()) != Decision.ALLOW) {
+                return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
+                        "User is not authorized to access this resource");
+            }
         }
 
         scope = scope.withIdentity(resolvedApiKey, iamIdentity);
