@@ -125,6 +125,7 @@ final class PassedRoles {
     /** An IAM role ARN, the only resource {@code iam:PassRole} acts on. */
     private static final Pattern ROLE_ARN = Pattern.compile("^arn:[a-z0-9-]+:iam::\\d{12}:role/.+");
 
+    private static final Pattern V2_API = Pattern.compile("^/v2/apis/[^/]+$");
     private static final Pattern REST_API = Pattern.compile("^/restapis/[^/]+$");
     private static final Pattern REST_INTEGRATION = Pattern.compile(
             "^/restapis/[^/]+/resources/[^/]+/methods/[^/]+/integration$");
@@ -226,7 +227,11 @@ final class PassedRoles {
     /** What a request names that holds the roles it passes, looked up in the request's account and Region. */
     interface Lookups {
 
-        /** Integration roles assigned by a REST API import in the request account and region. */
+        /** Execution roles assigned by an HTTP API import in the request account and region. */
+        default List<String> importedHttpApiRoles(String document) {
+            return List.of();
+        }
+
         default List<String> importedRestApiRoles(String document) {
             return List.of();
         }
@@ -560,6 +565,19 @@ final class PassedRoles {
             byte[] body = IamConditionContextResolver.bufferEntity(ctx);
             return body == null ? List.of() : passed(lookups.importedRestApiRoles(
                     new String(body, StandardCharsets.UTF_8)), API_GATEWAY);
+        }
+        if ("apigateway:PUT".equals(action)
+                && ("/v2/apis".equals(path) || V2_API.matcher(path).matches())) {
+            byte[] body = IamConditionContextResolver.bufferEntity(ctx);
+            if (body == null) {
+                return List.of();
+            }
+            String document = new String(body, StandardCharsets.UTF_8);
+            JsonNode envelope = jsonBody(ctx);
+            if (envelope != null && envelope.path("body").isTextual()) {
+                document = envelope.path("body").asText();
+            }
+            return passed(lookups.importedHttpApiRoles(document), API_GATEWAY);
         }
         return switch (action) {
             case "apigateway:PUT" -> REST_INTEGRATION.matcher(path).matches()
