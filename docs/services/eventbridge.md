@@ -251,3 +251,9 @@ trust and invocation-policy enforcement remain unsupported by this delivery path
 This resource-policy check alone does not implement AWS cross-account targets,
 which require an execution role and a target resource policy. API Gateway Lambda
 integration authorization remains separate.
+
+### Lambda target execution roles
+
+With IAM enforcement enabled, a Lambda target's configured `RoleArn` must name an existing role in the event-bus account that trusts EventBridge. Role trust conditions receive the rule ARN and its owning account. Lambda delivery then evaluates the role's identity policies, permissions boundary, applicable SCP levels and the exact qualified function's resource policy. Cross-account calls require both sides to grant access. Permission denial follows the existing `NO_PERMISSIONS` dead-letter path, and each retry checks current permissions again.
+
+Targets without `RoleArn` retain their service-principal resource-policy path. IAM enforcement off remains permissive. This support covers Lambda targets; configured-role authorization for other target types remains separate. Local tests exercise policy evaluation and SDK management with Lambda execution stubbed, not live AWS or Lambda runtime execution.
