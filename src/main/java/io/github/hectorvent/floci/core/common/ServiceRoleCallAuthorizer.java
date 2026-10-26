@@ -61,7 +61,8 @@ public class ServiceRoleCallAuthorizer {
         AwsArnUtils.Arn source = AwsArnUtils.parse(sourceArn);
         if (!roleId.region().isEmpty() || !roleId.resource().startsWith("role/")
                 || !roleId.accountId().equals(sourceAccount) || !source.accountId().equals(sourceAccount)
-                || !roleId.partition().equals(source.partition())) {
+                || !roleId.partition().equals(source.partition())
+                || !roleId.partition().equals(AwsArnUtils.parse(resourceArn).partition())) {
             return Decision.DENY;
         }
         String roleName = roleId.resource().substring(roleId.resource().lastIndexOf('/') + 1);

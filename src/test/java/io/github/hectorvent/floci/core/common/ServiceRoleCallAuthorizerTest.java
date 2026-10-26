@@ -14,6 +14,7 @@ import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
@@ -68,6 +69,34 @@ class ServiceRoleCallAuthorizerTest {
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(new ObjectMapper());
         authorizer = new ServiceRoleCallAuthorizer(emulator, iam,
                 new AssumeRolePolicyEvaluator(new ObjectMapper(), evaluator), evaluator, providers, scpInstance);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"aws,us-east-1,aws,us-west-2", "aws,us-east-1,aws-cn,cn-north-1",
+            "aws,us-east-1,aws-us-gov,us-gov-west-1", "aws-cn,cn-north-1,aws,us-east-1",
+            "aws-cn,cn-north-1,aws-cn,cn-northwest-1", "aws-cn,cn-north-1,aws-us-gov,us-gov-west-1",
+            "aws-us-gov,us-gov-west-1,aws,us-east-1", "aws-us-gov,us-gov-west-1,aws-cn,cn-north-1",
+            "aws-us-gov,us-gov-west-1,aws-us-gov,us-gov-east-1"})
+    void sourceContextRequiresTargetInTheSamePartition(String sourcePartition, String sourceRegion,
+                                                       String targetPartition, String targetRegion) {
+        String executionRole = ROLE.replace("arn:aws:", "arn:" + sourcePartition + ":");
+        String source = RULE.replace("arn:aws:", "arn:" + sourcePartition + ":")
+                .replace("us-east-1", sourceRegion);
+        String target = FUNCTION.replace("arn:aws:", "arn:" + targetPartition + ":")
+                .replace("us-east-1", targetRegion);
+        role.setArn(executionRole);
+        role.setAssumeRolePolicyDocument(TRUST.replace(RULE, source));
+        when(iam.resolvePrincipalContext(executionRole)).thenReturn(CallerContext.of(List.of(ALLOW)));
+        assertEquals(sourcePartition.equals(targetPartition) ? Decision.ALLOW : Decision.DENY,
+                authorizer.authorize("events", executionRole, INVOKE, target, source, ACCOUNT));
+    }
+
+    @Test
+    void sourceContextPreservesCrossPartitionBypassWhenIamIsDisabled() {
+        when(config.enforcementEnabled()).thenReturn(false);
+        assertEquals(Decision.ALLOW, authorizer.authorize("events", ROLE, INVOKE,
+                FUNCTION.replace("arn:aws:", "arn:aws-cn:"), RULE, ACCOUNT));
+        verifyNoInteractions(iam);
     }
 
     private Decision decide(String target) {

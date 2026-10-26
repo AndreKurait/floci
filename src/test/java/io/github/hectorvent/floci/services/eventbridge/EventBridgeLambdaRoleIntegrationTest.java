@@ -33,6 +33,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
@@ -133,6 +134,41 @@ class EventBridgeLambdaRoleIntegrationTest {
                 .then().statusCode(204);
         publish(events, bus);
         verify(lambda, times(1)).invokeArn(eq(endpoint), any(byte[].class), eq(InvocationType.Event));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"aws", "aws-cn", "aws-us-gov"})
+    void putEventsCannotDeliverRoleTargetAcrossPartitions(String partition) {
+        EventBridgeClient events = EventBridgeClient.builder().endpointOverride(baseUri).region(Region.of(REGION))
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(SOURCE, "test")))
+                .build();
+        cleanup.register(events::close);
+        String name = "role-partition-" + UUID.randomUUID().toString().substring(0, 8);
+        String roleArn = "arn:aws:iam::" + SOURCE + ":role/" + name;
+        String targetRegion = switch (partition) {
+            case "aws-cn" -> "cn-north-1";
+            case "aws-us-gov" -> "us-gov-west-1";
+            default -> REGION;
+        };
+        String endpoint = "arn:" + partition + ":lambda:" + targetRegion + ":" + SOURCE
+                + ":function:" + name + ":live";
+        String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"Service\":"
+                + "\"events.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}}";
+        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
+        iam("CreateRole", Map.of("RoleName", name, "AssumeRolePolicyDocument", trust));
+        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+        iam("PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke", "PolicyDocument",
+                "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\"*\"}}"));
+        cleanup.register(() -> events.deleteRule(request -> request.name(name)));
+        events.putRule(request -> request.name(name).eventPattern("{\"source\":[\"permission-test\"]}"));
+        cleanup.register(() -> events.removeTargets(request -> request.rule(name).ids("receiver")));
+        assertEquals(0, events.putTargets(request -> request.rule(name).targets(
+                Target.builder().id("receiver").arn(endpoint).roleArn(roleArn).build())).failedEntryCount());
+        doReturn(new InvokeResult()).when(lambda).invokeArn(eq(endpoint), any(byte[].class),
+                eq(InvocationType.Event));
+        publish(events, "default");
+        verify(lambda, times(partition.equals("aws") ? 1 : 0)).invokeArn(eq(endpoint), any(byte[].class),
+                eq(InvocationType.Event));
     }
 
     private static void permission(String function, String qualifier, String statement, String roleArn) {

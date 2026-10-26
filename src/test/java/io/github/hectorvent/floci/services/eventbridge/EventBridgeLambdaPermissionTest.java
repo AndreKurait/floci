@@ -276,6 +276,23 @@ class EventBridgeLambdaPermissionTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({"aws,us-east-1,1", "aws-cn,cn-north-1,0", "aws-us-gov,us-gov-west-1,0"})
+    void roleTargetCannotCrossPartitionsEvenWithIdentityPermission(String partition, String region, int calls) {
+        String function = FUNCTION.replace(OWNER, SOURCE).replace("arn:aws:", "arn:" + partition + ":")
+                .replace(REGION, region) + ":live";
+        dispatch(roleTarget(function));
+        verifyCalls(function, calls);
+        if (calls == 0) {
+            assertDeadLetter("0");
+            now.updateAndGet(time -> time.plusSeconds(1));
+            dispatcher.tick();
+            verifyCalls(function, 0);
+        } else {
+            verifyNoInteractions(sqs);
+        }
+    }
+
     private void roleGrant(String function) {
         statements.set(List.of(Map.of("Effect", "Allow", "Principal", Map.of("AWS", ROLE),
                 "Action", "lambda:InvokeFunction", "Resource", function)));
