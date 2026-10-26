@@ -31,7 +31,7 @@ class SamRestApiAuthIntegrationTest {
     private final ObjectMapper mapper = new ObjectMapper();
 
     @ParameterizedTest
-    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    @CsvSource({"false,true", "true,false", "true,true"})
     void conflictingAuthorizersCannotSilentlyReplaceTheSamIamDefault(boolean swagger, boolean repeated)
             throws Exception {
         ObjectNode template = template(swagger);
@@ -55,6 +55,34 @@ class SamRestApiAuthIntegrationTest {
                 .body("message", containsString("Only one Authorizer or IAM authorization"));
         given().get("/restapis").then().statusCode(200)
                 .body("item.find { it.name == '" + title + "' }", equalTo(null));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void undeclaredOpenApiCustomAuthorizerDoesNotConflictWithIam(boolean conditional) throws Exception {
+        ObjectNode template = template(false);
+        ObjectNode body = (ObjectNode) template.at("/Resources/Api/Properties/DefinitionBody");
+        body.set("components", mapper.createObjectNode().set("securitySchemes",
+                mapper.createObjectNode().set("custom", customAuthorizer())));
+        ObjectNode operation = (ObjectNode) body.at("/paths/~1items/post");
+        operation.set("security", mapper.readTree("[{\"custom\":[\"read\"]}]"));
+        if (conditional) {
+            template.set("Conditions", mapper.readTree("{\"Enabled\":{\"Fn::Equals\":[\"on\",\"on\"]}}"));
+            ObjectNode choice = mapper.createObjectNode();
+            choice.putArray("Fn::If").add("Enabled").add(operation)
+                    .add(mapper.createObjectNode().put("Ref", "AWS::NoValue"));
+            ((ObjectNode) body.at("/paths/~1items")).set("post", choice);
+        }
+        withDeployedApi(template, "sam-pruned-authorizer-", apiId -> {
+            String resourceId = given().get("/restapis/" + apiId + "/resources")
+                    .then().statusCode(200).extract().path("item.find { it.path == '/items' }.id");
+            given().get("/restapis/" + apiId + "/resources/" + resourceId + "/methods/POST")
+                    .then().statusCode(200)
+                    .body("authorizationType", equalTo("AWS_IAM"))
+                    .body("apiKeyRequired", equalTo(true));
+            given().get("/restapis/" + apiId + "/authorizers").then().statusCode(200)
+                    .body("item.size()", equalTo(0));
+        });
     }
 
     @ParameterizedTest

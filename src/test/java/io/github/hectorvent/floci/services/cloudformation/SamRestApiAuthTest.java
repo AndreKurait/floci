@@ -77,7 +77,8 @@ class SamRestApiAuthTest {
 
     @ParameterizedTest
     @ValueSource(strings = {
-            "{\"Authorizers\":{}}", "{\"ResourcePolicy\":{}}", "{\"UsagePlan\":{}}",
+            "{\"Authorizers\":{}}", "{\"Authorizers\":{\"custom\":{\"FunctionArn\":\"example\"}}}",
+            "{\"ResourcePolicy\":{}}", "{\"UsagePlan\":{}}",
             "{\"InvokeRole\":\"CALLER_CREDENTIALS\"}", "{\"AddDefaultAuthorizerToCorsPreflight\":false}",
             "{\"DefaultAuthorizer\":\"CUSTOM\"}", "{\"DefaultAuthorizer\":null}",
             "{\"ApiKeyRequired\":\"true\"}", "\"AWS_IAM\""
@@ -92,7 +93,7 @@ class SamRestApiAuthTest {
     }
 
     @Test
-    void preservesExistingCustomSecurityAndAddsTheNamedDefault() throws Exception {
+    void dropsUndeclaredOpenApiCustomSchemeAndAddsTheNamedDefault() throws Exception {
         ObjectNode template = template(false);
         ObjectNode body = (ObjectNode) template.at("/Resources/Api/Properties/DefinitionBody");
         ((ObjectNode) body.at("/paths/~1items/get")).set("security",
@@ -104,10 +105,55 @@ class SamRestApiAuthTest {
         JsonNode original = template.deepCopy();
         JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
         assertEquals(original, template);
-        assertEquals(body.at("/components/securitySchemes/custom"),
-                expanded.at("/components/securitySchemes/custom"));
+        assertTrue(expanded.at("/components/securitySchemes/custom").isMissingNode());
         assertEquals(mapper.readTree("[{\"custom\":[\"read\"]},{\"AWS_IAM\":[]},{\"api_key\":[]}]"),
                 expanded.at("/paths/~1items/get/security"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,iam,false", "false,key,false", "false,none,true",
+            "true,iam,true", "true,key,true", "true,none,true"})
+    void customSchemePruningDependsOnDocumentAndSelectedDefault(boolean swagger, String defaults,
+                                                               boolean retained) throws Exception {
+        ObjectNode template = template(swagger);
+        ObjectNode properties = (ObjectNode) template.at("/Resources/Api/Properties");
+        properties.set("Auth", mapper.readTree(switch (defaults) {
+            case "iam" -> "{\"DefaultAuthorizer\":\"AWS_IAM\"}";
+            case "key" -> "{\"ApiKeyRequired\":true}";
+            default -> "{\"ApiKeyRequired\":false}";
+        }));
+        ObjectNode body = (ObjectNode) properties.get("DefinitionBody");
+        JsonNode custom = mapper.readTree("""
+                {"type":"apiKey","name":"Authorization","in":"header",
+                  "x-amazon-apigateway-authorizer":{"type":"request","authorizerUri":"unused"}}
+                """);
+        setSchemes(body, swagger, mapper.createObjectNode().set("custom", custom));
+        JsonNode security = mapper.readTree("[{\"custom\":[\"read\"]},{}]");
+        body.set("security", security.deepCopy());
+        ((ObjectNode) body.at("/paths/~1items/get")).set("security", security.deepCopy());
+        JsonNode original = template.deepCopy();
+        JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
+        JsonNode schemes = swagger ? expanded.path("securityDefinitions")
+                : expanded.at("/components/securitySchemes");
+        assertEquals(retained, schemes.has("custom"));
+        assertEquals(security, expanded.path("security"));
+        assertEquals(security.get(0), expanded.at("/paths/~1items/get/security/0"));
+        assertEquals(security.get(1), expanded.at("/paths/~1items/get/security/1"));
+        assertEquals(original, template);
+    }
+
+    @Test
+    void keepsCustomSchemeAlsoDeclaredInSamSecurityDefinitions() throws Exception {
+        ObjectNode template = template(false);
+        ObjectNode body = (ObjectNode) template.at("/Resources/Api/Properties/DefinitionBody");
+        JsonNode definitions = mapper.readTree("""
+                {"custom":{"type":"apiKey","name":"Authorization","in":"header",
+                  "x-amazon-apigateway-authorizer":{"type":"request","authorizerUri":"unused"}}}
+                """);
+        setSchemes(body, false, definitions.deepCopy());
+        body.set("securityDefinitions", definitions.deepCopy());
+        JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
+        assertEquals(definitions.get("custom"), expanded.at("/components/securitySchemes/custom"));
     }
 
     @ParameterizedTest
