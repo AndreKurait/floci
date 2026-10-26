@@ -95,13 +95,40 @@ class RestAuthorizerPermissionIntegrationTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"TOKEN,arn:aws:iam::121212121212:role/integration",
-            "REQUEST,arn:aws:iam::121212121212:role/integration",
-            "TOKEN,arn:aws:iam::121212121212:role/other", "REQUEST,arn:aws:iam::121212121212:role/other"})
-    void configuredCredentialsRemainOutsideServicePrincipalEvaluation(String type, String credentials) throws Exception {
-        Fixture fixture = fixture(type, OWNER, REGION, credentials);
+    @CsvSource({"TOKEN,121212121212,us-east-1", "REQUEST,121212121212,us-east-1",
+            "TOKEN,343434343434,eu-west-1", "REQUEST,343434343434,eu-west-1"})
+    void configuredRoleRequiresTrustIdentityAndQualifiedResource(String type, String owner, String region) throws Exception {
+        String roleName = "authorizer-" + UUID.randomUUID().toString().substring(0, 8);
+        String roleArn = "arn:aws:iam::" + OWNER + ":role/service-role/" + roleName;
+        Fixture fixture = fixture(type, owner, region, roleArn);
+        invoke(fixture, 500);
+        String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},"
+                + "\"Action\":\"sts:AssumeRole\"}}";
+        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", roleName)));
+        iam("CreateRole", Map.of("RoleName", roleName, "Path", "/service-role/", "AssumeRolePolicyDocument", trust));
+        invoke(fixture, 500);
+        String policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\""
+                + fixture.arn() + "\"}}";
+        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke")));
+        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke", "PolicyDocument", policy));
+        if (!OWNER.equals(owner)) {
+            invoke(fixture, 500);
+            lambdaRequest(owner, region).queryParam("Qualifier", "live")
+                    .body(Map.of("StatementId", "invoke", "Action", "lambda:InvokeFunction", "Principal", roleArn))
+                    .post("/2015-03-31/functions/" + fixture.name() + "/policy").then().statusCode(201);
+        }
         invoke(fixture, 200);
         verifyInvocations(fixture, 2);
+        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke",
+                "PolicyDocument", policy.replace("Allow", "Deny")));
+        invoke(fixture, 500);
+        verifyInvocations(fixture, 2);
+    }
+
+    private static void iam(String action, Map<String, String> parameters) {
+        given().header("Authorization", EnforcementFixtures.auth(OWNER, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", action)
+                .formParam("Version", "2010-05-08").formParams(parameters).post("/").then().statusCode(200);
     }
 
     @ParameterizedTest
