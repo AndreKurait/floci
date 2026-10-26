@@ -44,7 +44,7 @@ class BuildV2ProxyEventPathParametersTest {
                 null, null, null, null,
                 regionResolver, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null
-        , null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class));
+        , null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), null);
     }
 
     @Test
