@@ -992,3 +992,5 @@ aws apigatewayv2 create-stage \
 # Disconnect a client
 # curl -X DELETE http://localhost:4566/execute-api/$WS_API_ID/prod/@connections/$CONNECTION_ID
 ```
+
+WebSocket Lambda integrations (`AWS` and `AWS_PROXY`) without credentials check Lambda resource permissions when IAM enforcement is enabled. Grants must allow API Gateway for the qualified function and source API, stage, and selected route. Configured-role and caller-passthrough credentials retain their separate invocation behavior.
