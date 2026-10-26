@@ -5,7 +5,9 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
 import jakarta.annotation.PreDestroy;
@@ -48,6 +50,7 @@ public class TargetDispatcher implements Resettable {
     private static final Set<String> RETRYABLE_ERROR_CODES = Set.of("THROTTLING", "ERROR_FROM_TARGET", "INTERNAL_ERROR");
 
     private final EventBridgeInvoker invoker;
+    private final ServiceCallAuthorizer authorizer;
     private final SqsService sqsService;
     private final String baseUrl;
     private final Clock clock;
@@ -57,17 +60,20 @@ public class TargetDispatcher implements Resettable {
     private final AtomicLong generation = new AtomicLong();
 
     @Inject
-    public TargetDispatcher(EventBridgeInvoker invoker, SqsService sqsService, EmulatorConfig config, Clock clock) {
-        this(invoker, sqsService, config.baseUrl(), clock, Executors.newSingleThreadScheduledExecutor(runnable -> {
+    public TargetDispatcher(EventBridgeInvoker invoker, SqsService sqsService, ServiceCallAuthorizer authorizer,
+                            EmulatorConfig config, Clock clock) {
+        this(invoker, sqsService, authorizer, config.baseUrl(), clock, Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "eventbridge-target-retry");
             thread.setDaemon(true);
             return thread;
         }));
     }
 
-    TargetDispatcher(EventBridgeInvoker invoker, SqsService sqsService, String baseUrl, Clock clock,
+    TargetDispatcher(EventBridgeInvoker invoker, SqsService sqsService, ServiceCallAuthorizer authorizer,
+                     String baseUrl, Clock clock,
                      ScheduledExecutorService executor) {
         this.invoker = invoker;
+        this.authorizer = authorizer;
         this.sqsService = sqsService;
         this.baseUrl = baseUrl;
         this.clock = clock;
@@ -148,6 +154,13 @@ public class TargetDispatcher implements Resettable {
 
     private void attempt(Delivery delivery, Target target, Instant now) {
         try {
+            // A configured execution role uses identity policies rather than this service-principal path.
+            if (AwsArnUtils.isArnFor(target.getArn(), "lambda") && target.getRoleArn() == null
+                    && authorizer.authorize("events", "lambda:InvokeFunction", target.getArn(), delivery.ruleArn(),
+                            AwsArnUtils.parse(delivery.ruleArn()).accountId()) == Decision.DENY) {
+                throw new AwsException("AccessDeniedException", "EventBridge is not authorized to invoke "
+                        + target.getArn(), 403);
+            }
             invoker.invokeTarget(target, delivery.eventJson(), delivery.region());
         } catch (Exception e) {
             if (delivery.generation() != generation.get()) {
