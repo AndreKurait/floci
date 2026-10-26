@@ -97,6 +97,9 @@ public class ServiceRoleCallAuthorizer {
         if (!AwsArnUtils.isArnFor(roleArn, "iam") || !AwsArnUtils.isArn(resourceArn)) {
             return Decision.DENY;
         }
+        if (!AwsArnUtils.parse(resourceArn).partition().equals(partition)) {
+            return Decision.DENY;
+        }
         AwsArnUtils.Arn roleId = AwsArnUtils.parse(roleArn);
         if (!roleId.region().isEmpty() || !roleId.resource().startsWith("role/")
                 || !roleId.accountId().equals(ownerAccount) || !roleId.partition().equals(partition)) {
