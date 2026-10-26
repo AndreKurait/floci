@@ -773,9 +773,10 @@ adds the corresponding security schemes and operation requirements. API Gateway 
 these as `authorizationType: AWS_IAM` and `apiKeyRequired: true`: invocation requires both
 a valid SigV4 signature and an enabled API key associated with the invoked stage when both
 controls are selected. Existing operation requirements are preserved. When a default applies
-to OpenAPI 3, inline custom authorizer schemes are removed unless they also appear in the
-SAM `securityDefinitions` map. This matches SAM's removal of undeclared OpenAPI authorizers
-before import. Swagger 2 keeps its custom schemes. Defaults are selected by the SAM names
+to OpenAPI 3, SAM replaces the entire `components.securitySchemes` map with its
+`securityDefinitions` plus generated defaults, then removes `securityDefinitions`. Inline
+schemes absent from that map are dropped, including schemes without an authorizer. Other
+components are preserved. Swagger 2 keeps its custom schemes. Defaults are selected by the SAM names
 `AWS_IAM` and `api_key`; an existing scheme with another name does not suppress either default.
 As in SAM, the defaults are added to each operation's own `security`, inside each branch of
 an `Fn::If` written around a path or an operation, skipping an `AWS::NoValue` branch. A

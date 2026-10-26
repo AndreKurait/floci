@@ -108,21 +108,21 @@ final class SamRestApiAuth {
             }
         }
         if (!swagger) {
-            removeUndeclaredCustomSchemes(document, definitions);
+            replaceOpenApiSchemes(document, iam, keyRequired);
         }
     }
 
-    private void removeUndeclaredCustomSchemes(ObjectNode document, ObjectNode definitions) {
-        // SAM builds securityDefinitions first, then replaces OpenAPI securitySchemes with it.
-        // Inline OpenAPI authorizers absent from that generated map do not reach the importer.
-        Iterator<Map.Entry<String, JsonNode>> schemes = definitions.fields();
-        while (schemes.hasNext()) {
-            Map.Entry<String, JsonNode> scheme = schemes.next();
-            if (scheme.getValue().has("x-amazon-apigateway-authorizer")
-                    && !document.path("securityDefinitions").has(scheme.getKey())) {
-                schemes.remove();
-            }
+    private void replaceOpenApiSchemes(ObjectNode document, boolean iam, boolean keyRequired) {
+        // SAM replaces the whole OpenAPI map with its generated Swagger definitions.
+        ObjectNode definitions = object(document, "securityDefinitions");
+        if (iam) {
+            addScheme(definitions, "AWS_IAM", true);
         }
+        if (keyRequired) {
+            addScheme(definitions, "api_key", false);
+        }
+        object(document, "components").set("securitySchemes", definitions);
+        document.remove("securityDefinitions");
     }
 
     private void applyDefaults(ObjectNode operation, ObjectNode definitions, boolean iam, boolean keyRequired) {

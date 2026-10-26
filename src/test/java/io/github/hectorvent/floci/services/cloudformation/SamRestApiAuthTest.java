@@ -154,6 +154,63 @@ class SamRestApiAuthTest {
         body.set("securityDefinitions", definitions.deepCopy());
         JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
         assertEquals(definitions.get("custom"), expanded.at("/components/securitySchemes/custom"));
+        assertFalse(expanded.has("securityDefinitions"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,iam,false", "false,key,false", "false,none,true",
+            "true,iam,true", "true,key,true", "true,none,true"})
+    void replacesInlineSchemesOnlyForOpenApiDefaults(boolean swagger, String defaults, boolean retained)
+            throws Exception {
+        ObjectNode template = template(swagger);
+        ObjectNode properties = (ObjectNode) template.at("/Resources/Api/Properties");
+        properties.set("Auth", mapper.readTree(switch (defaults) {
+            case "iam" -> "{\"DefaultAuthorizer\":\"AWS_IAM\"}";
+            case "key" -> "{\"ApiKeyRequired\":true}";
+            default -> "{\"ApiKeyRequired\":false}";
+        }));
+        ObjectNode body = (ObjectNode) properties.get("DefinitionBody");
+        JsonNode schemes = mapper.readTree("""
+                {"inlineKey":{"type":"apiKey","name":"x-inline-key","in":"header"},
+                 "inlineOAuth":{"type":"oauth2","flows":{}}}
+                """);
+        setSchemes(body, swagger, (ObjectNode) schemes.deepCopy());
+        body.set("security", mapper.readTree("[{\"inlineOAuth\":[\"read\"]}]"));
+        ((ObjectNode) body.at("/paths/~1items/get")).set("security",
+                mapper.readTree("[{\"inlineKey\":[]}]"));
+        JsonNode original = template.deepCopy();
+        JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
+        JsonNode result = swagger ? expanded.path("securityDefinitions")
+                : expanded.at("/components/securitySchemes");
+        assertEquals(retained, result.has("inlineKey"));
+        assertEquals(retained, result.has("inlineOAuth"));
+        assertEquals(body.get("security"), expanded.get("security"));
+        assertEquals(body.at("/paths/~1items/get/security/0"), expanded.at("/paths/~1items/get/security/0"));
+        assertEquals(original, template);
+    }
+
+    @Test
+    void replacesInlineMetadataWithDeclaredDefinitionsAndPreservesOtherComponents() throws Exception {
+        ObjectNode template = template(false);
+        ObjectNode body = (ObjectNode) template.at("/Resources/Api/Properties/DefinitionBody");
+        body.set("components", mapper.readTree("""
+                {"schemas":{"Example":{"type":"string"}},
+                 "securitySchemes":{"declared":{"type":"apiKey","name":"old","in":"header"}}}
+                """));
+        JsonNode declared = mapper.readTree("""
+                {"declared":{"type":"apiKey","name":"new","in":"header"},
+                 "onlyDeclared":{"type":"oauth2","flows":{}}}
+                """);
+        body.set("securityDefinitions", declared.deepCopy());
+        JsonNode original = template.deepCopy();
+        JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
+        assertEquals(declared.get("declared"), expanded.at("/components/securitySchemes/declared"));
+        assertEquals(declared.get("onlyDeclared"), expanded.at("/components/securitySchemes/onlyDeclared"));
+        assertEquals(body.at("/components/schemas"), expanded.at("/components/schemas"));
+        assertFalse(expanded.has("securityDefinitions"));
+        assertTrue(expanded.at("/components/securitySchemes/AWS_IAM").isObject());
+        assertTrue(expanded.at("/components/securitySchemes/api_key").isObject());
+        assertEquals(original, template);
     }
 
     @ParameterizedTest
@@ -171,7 +228,7 @@ class SamRestApiAuthTest {
         JsonNode original = template.deepCopy();
         JsonNode expanded = processor.expandSamTemplate(template).at("/Resources/Api/Properties/Body");
         assertEquals(original, template);
-        assertEquals(scheme, expanded.at("/components/securitySchemes/existing"));
+        assertTrue(expanded.at("/components/securitySchemes/existing").isMissingNode());
         assertEquals(mapper.readTree("[{\"existing\":[]},{\"AWS_IAM\":[]},{\"api_key\":[]}]"),
                 expanded.at("/paths/~1items/get/security"));
     }
