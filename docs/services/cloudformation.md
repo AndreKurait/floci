@@ -785,7 +785,10 @@ nested `Fn::If` around an operation is left as written, without the defaults, as
 it.
 Root-level `security` stays in the document as written and is not copied into operations,
 and an `Auth` that selects no default, such as `ApiKeyRequired: false` alone, leaves the
-document unchanged. floci's REST importer still applies root-level `security` to an
+operation requirements unchanged. For inline OpenAPI 3 documents, non-empty
+`securityDefinitions` replace `components.securitySchemes` and are removed even when
+`Auth` is absent, empty, or selects no default. Empty or absent definitions do not replace
+existing schemes. Swagger documents retain their definitions. floci's REST importer still applies root-level `security` to an
 operation that has none of its own, which API Gateway does not. As in SAM, any non-empty
 `Auth`, even one that selects no default, needs a Swagger or OpenAPI 3 `DefinitionBody`
 whose `paths` entries, and the branches of an `Fn::If` around one, are objects, so a body or
