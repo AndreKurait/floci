@@ -567,10 +567,6 @@ class CloudFormationTemplateEngineTest {
                 + "secret:creds-AbC123:SecretString:password::}}"), resolverInputs);
     }
 
-    /**
-     * The RDS credential path opts out of the general dynamic-reference stage and resolves the
-     * reference itself, so the joined string must survive intact with the reference untouched.
-     */
     @Test
     void nestedOptOutPreservesReferencesAndRestoresResolution() {
         List<String> inputs = new ArrayList<>();
@@ -594,6 +590,10 @@ class CloudFormationTemplateEngineTest {
         assertEquals(List.of(reference), inputs);
     }
 
+    /**
+     * The RDS credential path opts out of the general dynamic-reference stage and resolves the
+     * reference itself, so the joined string must survive intact with the reference untouched.
+     */
     @Test
     void resolveWithoutDynamicReferencesKeepsJoinSplicedReferenceIntact() {
         UnaryOperator<String> resolver = value -> fail("dynamic reference must not be resolved here: " + value);
