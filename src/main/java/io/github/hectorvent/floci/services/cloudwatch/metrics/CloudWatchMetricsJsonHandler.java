@@ -54,6 +54,14 @@ public class CloudWatchMetricsJsonHandler {
         this.objectMapper = objectMapper;
     }
 
+    public Response handleLegacy(String action, JsonNode request, String region) {
+        if ("GetMetricData".equalsIgnoreCase(action)) {
+            throw new AwsException("UnsupportedOperation",
+                    "CloudWatch GetMetricData for API version 2013-01-16 is not implemented.", 400);
+        }
+        return handle(action, request, region);
+    }
+
     public Response handle(String action, JsonNode request, String region) {
         String normalizedAction = action.substring(0, 1).toUpperCase() + action.substring(1);
         return switch (normalizedAction) {
