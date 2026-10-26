@@ -328,6 +328,8 @@ floci:
       # Optional complete catalog override for locally built guest images.
       image-catalog-path: ${FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH:}
       managed-prefix-list-catalog-path: ${FLOCI_SERVICES_EC2_MANAGED_PREFIX_LIST_CATALOG_PATH:}
+      extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
+      ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
       enabled: true
       imds-port: 9169
       ssh-port-range-start: 2200
@@ -341,6 +343,7 @@ floci:
       volume-helper-image: alpine:3.21
       mock: true
       mock-public-addresses: none
+      mock-public-address-pool:
       instance-resource-limits: true
       aws-faithful-private-ip: false
       # container-ips-routable: true  # see src/main/resources/application.yml
