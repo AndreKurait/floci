@@ -13009,6 +13009,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 case "vpc-id" -> matchesValue(values, subnet.getVpcId());
                 case "state" -> matchesValue(values, subnet.getState());
                 case "availabilityZone", "availability-zone" -> matchesValue(values, subnet.getAvailabilityZone());
+                case "default-for-az", "defaultForAz" -> matchesValue(values, String.valueOf(subnet.isDefaultForAz()));
                 case "cidr-block", "cidrBlock", "cidr" -> matchesValue(values, subnet.getCidrBlock());
                 default -> true;
             };

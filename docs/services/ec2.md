@@ -321,7 +321,7 @@ private gateway lifecycles are not modelled.
 | Action | Description |
 |--------|-------------|
 | CreateSubnet | Creates a subnet in a VPC. |
-| DescribeSubnets | Lists or returns stored subnets. |
+| DescribeSubnets | Lists or returns stored subnets. The `default-for-az` filter and its `defaultForAz` alias select default or non-default subnets; values are ORed and separate filters are ANDed. |
 | DeleteSubnet | Deletes a subnet from the local EC2 store. Fails with `DependencyViolation` while the subnet still has a transit gateway attachment, an Elastic Load Balancing v2 load balancer, or anything holding a network interface in it: an instance that is not terminated, a NAT gateway that is not deleted or failed, a standalone network interface, or an interface endpoint. |
 | ModifySubnetAttribute | Updates supported subnet attributes. |
 
