@@ -12,6 +12,7 @@ import java.util.zip.ZipOutputStream;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 /**
  * Issue #2821: GetFunction and GetFunctionConfiguration ignored Qualifier and answered with
@@ -37,13 +38,19 @@ class LambdaQualifiedReadIntegrationTest {
         try {
             String arn = given().when().get("/2015-03-31/functions/" + fn)
                     .then().statusCode(200).extract().path("Configuration.FunctionArn");
-            given().contentType("application/json").body("{}")
+            String publishedHash = given().contentType("application/json").body("{}")
                     .when().post("/2015-03-31/functions/" + fn + "/versions")
-                    .then().statusCode(201).body("Version", equalTo("1"));
+                    .then().statusCode(201).body("Version", equalTo("1"))
+                    .extract().path("CodeSha256");
             String aliasArn = given().contentType("application/json")
                     .body("{\"Name\":\"stable\",\"FunctionVersion\":\"1\"}")
                     .when().post("/2015-03-31/functions/" + fn + "/aliases")
                     .then().statusCode(anyOf200Or201()).extract().path("AliasArn");
+            String latestHash = given().contentType("application/json")
+                    .body("{\"ZipFile\": \"%s\"}".formatted(zipB64("latest")))
+                    .when().put("/2015-03-31/functions/" + fn + "/code")
+                    .then().statusCode(200).extract().path("CodeSha256");
+            assertNotEquals(publishedHash, latestHash);
             String reference = switch (form) {
                 case "arn" -> arn;
                 case "partial" -> "000000000000:function:" + fn;
@@ -53,16 +60,22 @@ class LambdaQualifiedReadIntegrationTest {
             String suffix = query ? "?Qualifier=stable" : "";
             given().when().get(path + suffix).then().statusCode(200)
                     .body("Configuration.FunctionArn", equalTo(aliasArn))
-                    .body("Configuration.Version", equalTo("1"));
+                    .body("Configuration.Version", equalTo("1"))
+                    .body("Configuration.CodeSha256", equalTo(publishedHash));
             given().when().get(path + "/configuration" + suffix).then().statusCode(200)
                     .body("FunctionArn", equalTo(aliasArn))
-                    .body("Version", equalTo("1"));
+                    .body("Version", equalTo("1"))
+                    .body("CodeSha256", equalTo(publishedHash));
             given().when().get("/2015-03-31/functions/" + fn + ":1").then().statusCode(200)
                     .body("Configuration.FunctionArn", equalTo(arn + ":1"))
-                    .body("Configuration.Version", equalTo("1"));
+                    .body("Configuration.Version", equalTo("1"))
+                    .body("Configuration.CodeSha256", equalTo(publishedHash));
             given().when().get("/2015-03-31/functions/" + fn).then().statusCode(200)
                     .body("Configuration.FunctionArn", equalTo(arn))
-                    .body("Configuration.Version", equalTo("$LATEST"));
+                    .body("Configuration.Version", equalTo("$LATEST"))
+                    .body("Configuration.CodeSha256", equalTo(latestHash));
+            given().when().get("/2015-03-31/functions/" + fn + "/configuration")
+                    .then().statusCode(200).body("CodeSha256", equalTo(latestHash));
         } finally {
             given().when().delete("/2015-03-31/functions/" + fn).then().statusCode(204);
         }
@@ -102,30 +115,35 @@ class LambdaQualifiedReadIntegrationTest {
         String fn = "qual-read-" + Long.toString(System.nanoTime(), 36);
         createFunction(fn, "v1");
 
-        given().contentType("application/json").body("{}")
+        String publishedHash = given().contentType("application/json").body("{}")
         .when().post("/2015-03-31/functions/" + fn + "/versions")
-        .then().statusCode(201).body("Version", equalTo("1"));
+        .then().statusCode(201).body("Version", equalTo("1")).extract().path("CodeSha256");
 
         // $LATEST moves on past version 1.
-        given()
+        String latestHash = given()
             .contentType("application/json")
             .body("{\"ZipFile\": \"%s\"}".formatted(zipB64("v2")))
         .when()
             .put("/2015-03-31/functions/" + fn + "/code")
         .then()
-            .statusCode(200);
+            .statusCode(200).extract().path("CodeSha256");
+        assertNotEquals(publishedHash, latestHash);
 
         given().when().get("/2015-03-31/functions/" + fn + "?Qualifier=1")
-            .then().statusCode(200).body("Configuration.Version", equalTo("1"));
+            .then().statusCode(200).body("Configuration.Version", equalTo("1"))
+            .body("Configuration.CodeSha256", equalTo(publishedHash));
 
         given().when().get("/2015-03-31/functions/" + fn + "/configuration?Qualifier=1")
-            .then().statusCode(200).body("Version", equalTo("1"));
+            .then().statusCode(200).body("Version", equalTo("1"))
+            .body("CodeSha256", equalTo(publishedHash));
 
         // Unqualified and an explicit $LATEST both still mean $LATEST.
         given().when().get("/2015-03-31/functions/" + fn)
-            .then().statusCode(200).body("Configuration.Version", equalTo("$LATEST"));
+            .then().statusCode(200).body("Configuration.Version", equalTo("$LATEST"))
+            .body("Configuration.CodeSha256", equalTo(latestHash));
         given().when().get("/2015-03-31/functions/" + fn + "?Qualifier=$LATEST")
-            .then().statusCode(200).body("Configuration.Version", equalTo("$LATEST"));
+            .then().statusCode(200).body("Configuration.Version", equalTo("$LATEST"))
+            .body("Configuration.CodeSha256", equalTo(latestHash));
     }
 
     @Test

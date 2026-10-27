@@ -1,5 +1,8 @@
 """Alias reads preserve the requested ARN while returning the primary version."""
 
+import io
+import zipfile
+
 import pytest
 
 
@@ -16,6 +19,13 @@ def test_alias_read_identity(lambda_client, minimal_lambda_zip, unique_name, for
         alias = lambda_client.create_alias(
             FunctionName=unique_name, Name="stable", FunctionVersion=version
         )
+        changed_zip = io.BytesIO()
+        with zipfile.ZipFile(changed_zip, "w") as archive:
+            archive.writestr("index.js", "exports.handler = async () => 'changed latest';")
+        changed = lambda_client.update_function_code(
+            FunctionName=unique_name, ZipFile=changed_zip.getvalue()
+        )
+        assert changed["CodeSha256"] != created["CodeSha256"]
         arn = created["FunctionArn"]
         reference = {"name": unique_name, "arn": arn, "partial": arn.split(":", 4)[4]}[form]
         request = (
@@ -33,6 +43,10 @@ def test_alias_read_identity(lambda_client, minimal_lambda_zip, unique_name, for
         )["Configuration"]
         latest = lambda_client.get_function(FunctionName=unique_name)["Configuration"]
         assert (numeric["FunctionArn"], numeric["Version"]) == (arn + ":" + version, version)
+        assert numeric["CodeSha256"] == created["CodeSha256"]
         assert (latest["FunctionArn"], latest["Version"]) == (arn, "$LATEST")
+        assert latest["CodeSha256"] == changed["CodeSha256"]
+        latest_configuration = lambda_client.get_function_configuration(FunctionName=unique_name)
+        assert latest_configuration["CodeSha256"] == changed["CodeSha256"]
     finally:
         lambda_client.delete_function(FunctionName=unique_name)
