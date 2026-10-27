@@ -8,6 +8,7 @@ import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
@@ -22,6 +23,7 @@ import software.amazon.awssdk.services.apigatewayv2.ApiGatewayV2Client;
 import software.amazon.awssdk.services.apigatewayv2.model.ApiGatewayV2Exception;
 import software.amazon.awssdk.services.iam.IamClient;
 import software.amazon.awssdk.services.iam.model.AccessKey;
+import software.amazon.awssdk.services.iam.model.IamException;
 import software.amazon.awssdk.services.sts.StsClient;
 import software.amazon.awssdk.services.sts.model.Credentials;
 
@@ -30,6 +32,8 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /** Signed management requests use the shared IAM check before changing stored credentials. */
 @QuarkusTest
@@ -717,8 +721,53 @@ class ApiGatewayPassRoleIntegrationTest {
                         credentials.accessKeyId(), credentials.secretAccessKey(), credentials.sessionToken()))).build();
     }
 
+    @Test
+    void rejectedFixtureRoleCreationDoesNotDeleteAnExistingRole() {
+        UUID fixed = UUID.fromString("4a832f42-0101-4a01-8101-000000000001");
+        String name = "apigw-passrole-" + fixed.toString().substring(0, 8);
+        try (IamClient admin = IamClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
+                .build()) {
+            String arn = admin.createRole(b -> b.roleName(name).assumeRolePolicyDocument(
+                    "{\"Version\":\"2012-10-17\",\"Statement\":[]}")).role().arn();
+            try {
+                assertEquals(409, assertThrows(IamException.class, () -> new Fixture(name)).statusCode());
+                drainFixtureCleanup();
+                assertEquals(arn, admin.getRole(b -> b.roleName(name)).role().arn());
+            } finally {
+                try {
+                    admin.deleteRole(b -> b.roleName(name));
+                } catch (IamException expected) {
+                    // The old-source control may have already deleted this test-owned role.
+                    assertEquals(404, expected.statusCode());
+                }
+            }
+        }
+    }
+
+    @Test
+    void successfulFixtureCreationStillDeletesItsOwnedRole() {
+        String name;
+        try (Fixture fixture = new Fixture()) {
+            name = fixture.name;
+        }
+        drainFixtureCleanup();
+        try (IamClient admin = IamClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
+                .build()) {
+            assertEquals(404, assertThrows(IamException.class,
+                    () -> admin.getRole(b -> b.roleName(name))).statusCode());
+        }
+    }
+
+    private void drainFixtureCleanup() {
+        ExtensionContext context = mock(ExtensionContext.class);
+        when(context.getDisplayName()).thenReturn("PassRole fixture ownership regression");
+        cleanup.afterEach(context);
+    }
+
     private final class Fixture implements AutoCloseable {
-        private final String name = "apigw-passrole-" + UUID.randomUUID().toString().substring(0, 8);
+        private final String name;
         private final IamClient iam = IamClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"))).build();
         private final ApiGatewayClient rest;
@@ -726,6 +775,15 @@ class ApiGatewayPassRoleIntegrationTest {
         private final String role;
 
         private Fixture() {
+            this("apigw-passrole-" + UUID.randomUUID().toString().substring(0, 8));
+        }
+
+        private Fixture(String name) {
+            this.name = name;
+            role = iam.createRole(b -> b.roleName(name).path("/teams/api/")
+                    .assumeRolePolicyDocument("{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                            + "\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"))
+                    .role().arn();
             cleanup.register(() -> {
                 try (IamClient admin = IamClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
                         .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
@@ -733,10 +791,6 @@ class ApiGatewayPassRoleIntegrationTest {
                     admin.deleteRole(b -> b.roleName(name));
                 }
             });
-            role = iam.createRole(b -> b.roleName(name).path("/teams/api/")
-                    .assumeRolePolicyDocument("{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
-                            + "\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"))
-                    .role().arn();
             iam.createUser(b -> b.userName(name));
             cleanup.register(() -> {
                 try (IamClient admin = IamClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
