@@ -647,6 +647,7 @@ public class NativeDynamoDbJsonHandler {
                 ? request.get("ExpressionAttributeNames") : null;
         JsonNode attributesToGet = request.has("AttributesToGet") ? request.get("AttributesToGet") : null;
 
+        DynamoDbAccessPathValidator.validateAttributesToGet(attributesToGet);
         if (attributesToGet != null && projectionExpression != null) {
             throw new AwsException("ValidationException",
                     "Can not use both expression and non-expression parameters in the same request: "
@@ -1147,7 +1148,8 @@ public class NativeDynamoDbJsonHandler {
         }
 
         boolean hasAttributesToGet = attributesToGet != null && attributesToGet.size() > 0;
-        if ("SPECIFIC_ATTRIBUTES".equals(select) && projectionExpression == null && !hasAttributesToGet) {
+        if ("SPECIFIC_ATTRIBUTES".equals(select) && !ProjectionEvaluator.hasProjection(projectionExpression)
+                && !hasAttributesToGet) {
             throw SmithyValidationErrors.validationException(
                     SELECT_NEEDS_PROJECTION);
         }
@@ -1185,7 +1187,7 @@ public class NativeDynamoDbJsonHandler {
                     .toList();
         }
         // Apply index projection (KEYS_ONLY / INCLUDE) when querying a secondary index
-        if (indexName != null && projectionExpression == null && attributesToGet == null) {
+        if (indexName != null && !ProjectionEvaluator.hasProjection(projectionExpression) && attributesToGet == null) {
             queryItems = applyIndexProjection(queryItems, queryTable, queryAccessPath, select);
         }
         if (projectionExpression != null) {
@@ -1296,7 +1298,7 @@ public class NativeDynamoDbJsonHandler {
         }
         boolean hasAttributesToGetScan = attributesToGetScan != null && attributesToGetScan.size() > 0;
         if ("SPECIFIC_ATTRIBUTES".equals(select)
-                && projectionExpressionScan == null && !hasAttributesToGetScan) {
+                && !ProjectionEvaluator.hasProjection(projectionExpressionScan) && !hasAttributesToGetScan) {
             throw SmithyValidationErrors.validationException(
                     SELECT_NEEDS_PROJECTION);
         }
@@ -1331,7 +1333,7 @@ public class NativeDynamoDbJsonHandler {
 
         List<JsonNode> scanItems = result.items();
         // Apply index projection (KEYS_ONLY / INCLUDE) when scanning a secondary index
-        if (indexNameScan != null && projectionExpressionScan == null && attributesToGetScan == null) {
+        if (indexNameScan != null && !ProjectionEvaluator.hasProjection(projectionExpressionScan) && attributesToGetScan == null) {
             scanItems = applyIndexProjection(scanItems, scanTable, scanAccessPath, select);
         }
         if (projectionExpressionScan != null) {
@@ -1584,6 +1586,7 @@ public class NativeDynamoDbJsonHandler {
         boolean usesAttributesToGet = false;
         boolean usesProjectionExpression = false;
         for (JsonNode tableRequest : items.values()) {
+            DynamoDbAccessPathValidator.validateAttributesToGet(tableRequest.get("AttributesToGet"));
             usesAttributesToGet |= tableRequest.hasNonNull("AttributesToGet");
             usesProjectionExpression |= tableRequest.hasNonNull("ProjectionExpression");
         }

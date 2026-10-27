@@ -1168,19 +1168,26 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                     ? ResourceAccountRelationship.SAME_ACCOUNT
                     : ResourceAccountRelationship.CROSS_ACCOUNT;
 
-            for (Map<String, List<String>> targetContext : targetContexts) {
-                Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
-                        targetContext, resource, region, accountId, resourceOwnerAccountId);
-                if ("dynamodb".equals(credentialScope)) {
-                    Map<String, List<String>> batchContext =
-                            conditionContextResolver.dynamoDbBatchConditionContext(action, ctx, resource);
-                    if (batchContext != null) {
-                        effectiveContext.remove("dynamodb:LeadingKeys");
-                        effectiveContext.remove("dynamodb:Attributes");
-                        effectiveContext.remove("dynamodb:Select");
-                        effectiveContext.putAll(batchContext);
+            List<Map<String, List<String>>> batchContexts = "dynamodb".equals(credentialScope)
+                    ? conditionContextResolver.dynamoDbBatchConditionContexts(action, ctx, resource) : null;
+            List<Map<String, List<String>>> resourceContexts = targetContexts;
+            if (batchContexts != null && !batchContexts.isEmpty()) {
+                resourceContexts = new ArrayList<>();
+                for (Map<String, List<String>> targetContext : targetContexts) {
+                    for (Map<String, List<String>> batchContext : batchContexts) {
+                        Map<String, List<String>> entryContext = targetContext == null
+                                ? new HashMap<>() : new HashMap<>(targetContext);
+                        entryContext.remove("dynamodb:LeadingKeys");
+                        entryContext.remove("dynamodb:Attributes");
+                        entryContext.remove("dynamodb:Select");
+                        entryContext.putAll(batchContext);
+                        resourceContexts.add(entryContext);
                     }
                 }
+            }
+            for (Map<String, List<String>> targetContext : resourceContexts) {
+                Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
+                        targetContext, resource, region, accountId, resourceOwnerAccountId);
                 ResourcePolicyDecision resourcePolicyDecision = evaluator.evaluateResourcePolicyFor(
                         effectiveResourcePolicies, principal, action, resource, effectiveContext);
                 Decision decision = evaluator.evaluateResolvedResourcePolicy(

@@ -419,7 +419,7 @@ class IamConditionContextResolverTest {
 
         assertEquals(List.of("USER_alice"), conditions.get("dynamodb:LeadingKeys"));
         assertEquals(List.of("PK"), conditions.get("dynamodb:Attributes"));
-        assertFalse(conditions.containsKey("dynamodb:Select"));
+        assertEquals(List.of("ALL_ATTRIBUTES"), conditions.get("dynamodb:Select"));
     }
 
     @Test
@@ -536,7 +536,7 @@ class IamConditionContextResolverTest {
         when(request.getHeaderString("X-Amz-Target")).thenReturn("DynamoDB_20120810.Query");
         Map<String, List<String>> modern = resolver.resolve("dynamodb", "dynamodb:Query", request);
         assertEquals(List.of("USER_alice"), modern.get("dynamodb:LeadingKeys"));
-        assertFalse(modern.containsKey("dynamodb:Select"));
+        assertEquals(List.of("SPECIFIC_ATTRIBUTES"), modern.get("dynamodb:Select"));
     }
 
     @Test
@@ -576,6 +576,26 @@ class IamConditionContextResolverTest {
                 resolver.resolve("dynamodb", "dynamodb:BatchGetItem", containerRequest);
 
         assertEquals(List.of("USER_alice", "USER_bob"), conditions.get("dynamodb:LeadingKeys"));
+    }
+
+    @Test
+    void batchAliasesRetainIndependentSelections() {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        String arn = "arn:aws:dynamodb:us-east-1:000000000000:table/FgacTable";
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json("""
+                {"RequestItems":{
+                  "FgacTable":{"Keys":[{"PK":{"S":"USER_alice"}}],"ProjectionExpression":"PK"},
+                  "%s":{"Keys":[{"PK":{"S":"USER_bob"}}]}}}
+                """.formatted(arn)));
+        when(dynamoDbService.findTable("FgacTable", "us-east-1")).thenReturn(Optional.of(fgacTable()));
+        when(dynamoDbService.findTable(arn, "us-east-1")).thenReturn(Optional.of(fgacTable()));
+        List<Map<String, List<String>>> contexts = resolver.dynamoDbBatchConditionContexts(
+                "dynamodb:BatchGetItem", request, arn);
+        assertEquals(2, contexts.size());
+        assertEquals(List.of("SPECIFIC_ATTRIBUTES"), contexts.get(0).get("dynamodb:Select"));
+        assertEquals(List.of("ALL_ATTRIBUTES"), contexts.get(1).get("dynamodb:Select"));
+        assertEquals(List.of("USER_alice"), contexts.get(0).get("dynamodb:LeadingKeys"));
+        assertEquals(List.of("USER_bob"), contexts.get(1).get("dynamodb:LeadingKeys"));
     }
 
     @Test
