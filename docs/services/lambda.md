@@ -109,6 +109,14 @@ part in authorizing calls to the function:
 - `aws:PrincipalOrgID` is not part of the request context, so a grant added with `PrincipalOrgID`
   admits no caller.
 
+### Qualified reads
+
+`GetFunction` and `GetFunctionConfiguration` preserve an alias in the returned
+`FunctionArn`, while `Version` identifies that alias's primary published version.
+This applies to a `Qualifier` parameter and aliases embedded in a name, full ARN
+or partial ARN. Reading an alias does not change the stored version or the
+identities returned by subsequent unqualified and numeric-version reads.
+
 ### Reserved Concurrency
 
 Unqualified `GetFunction` reads include `Concurrency.ReservedConcurrentExecutions` when a reservation

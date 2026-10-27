@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.lambda;
 
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.ByteArrayOutputStream;
 import java.util.Base64;
@@ -22,6 +24,49 @@ import static org.hamcrest.Matchers.equalTo;
  */
 @QuarkusTest
 class LambdaQualifiedReadIntegrationTest {
+
+    @ParameterizedTest
+    @CsvSource({
+            "name, true", "name, false",
+            "arn, true", "arn, false",
+            "partial, true", "partial, false"
+    })
+    void aliasReadsKeepTheRequestedArnAndResolvedVersion(String form, boolean query) throws Exception {
+        String fn = "alias-identity-" + Long.toString(System.nanoTime(), 36);
+        createFunction(fn, "published");
+        try {
+            String arn = given().when().get("/2015-03-31/functions/" + fn)
+                    .then().statusCode(200).extract().path("Configuration.FunctionArn");
+            given().contentType("application/json").body("{}")
+                    .when().post("/2015-03-31/functions/" + fn + "/versions")
+                    .then().statusCode(201).body("Version", equalTo("1"));
+            String aliasArn = given().contentType("application/json")
+                    .body("{\"Name\":\"stable\",\"FunctionVersion\":\"1\"}")
+                    .when().post("/2015-03-31/functions/" + fn + "/aliases")
+                    .then().statusCode(anyOf200Or201()).extract().path("AliasArn");
+            String reference = switch (form) {
+                case "arn" -> arn;
+                case "partial" -> "000000000000:function:" + fn;
+                default -> fn;
+            };
+            String path = "/2015-03-31/functions/" + reference + (query ? "" : ":stable");
+            String suffix = query ? "?Qualifier=stable" : "";
+            given().when().get(path + suffix).then().statusCode(200)
+                    .body("Configuration.FunctionArn", equalTo(aliasArn))
+                    .body("Configuration.Version", equalTo("1"));
+            given().when().get(path + "/configuration" + suffix).then().statusCode(200)
+                    .body("FunctionArn", equalTo(aliasArn))
+                    .body("Version", equalTo("1"));
+            given().when().get("/2015-03-31/functions/" + fn + ":1").then().statusCode(200)
+                    .body("Configuration.FunctionArn", equalTo(arn + ":1"))
+                    .body("Configuration.Version", equalTo("1"));
+            given().when().get("/2015-03-31/functions/" + fn).then().statusCode(200)
+                    .body("Configuration.FunctionArn", equalTo(arn))
+                    .body("Configuration.Version", equalTo("$LATEST"));
+        } finally {
+            given().when().delete("/2015-03-31/functions/" + fn).then().statusCode(204);
+        }
+    }
 
     private static String zipB64(String body) throws Exception {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
