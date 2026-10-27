@@ -15,6 +15,7 @@ import java.util.List;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.nullValue;
 
 @QuarkusTest
 class LambdaProvisionedConcurrencyNotFoundIntegrationTest {
@@ -75,6 +76,32 @@ class LambdaProvisionedConcurrencyNotFoundIntegrationTest {
                     .body("message", equalTo("No Provisioned Concurrency Config found for this function"));
             given().queryParam("Qualifier", qualifier).delete(path).then().statusCode(204).body(equalTo(""));
         }
+    }
+
+    @Test
+    void listWithoutQualifierReturnsAnEmptyConfigurationPage() {
+        for (String reference : List.of(NAME, functionArn(NAME), resolver.getAccountId() + ":function:" + NAME)) {
+            given().queryParam("List", "ALL").pathParam("function", reference)
+                    .get("/2019-09-30/functions/{function}/provisioned-concurrency")
+                    .then().statusCode(200)
+                    .body("ProvisionedConcurrencyConfigs", equalTo(List.of()))
+                    .body("NextMarker", nullValue());
+        }
+    }
+
+    @Test
+    void listMissingFunctionUsesTheFunctionNotFoundError() {
+        given().queryParam("List", "ALL")
+                .get("/2019-09-30/functions/pc-absent-function-control/provisioned-concurrency")
+                .then().statusCode(404)
+                .body("__type", equalTo("ResourceNotFoundException"));
+    }
+
+    @Test
+    void getWithoutQualifierStillRejectsTheRequest() {
+        given().get("/2019-09-30/functions/" + NAME + "/provisioned-concurrency")
+                .then().statusCode(400)
+                .body("__type", equalTo("InvalidParameterValueException"));
     }
 
     private String functionArn(String name) {
