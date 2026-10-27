@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
@@ -64,6 +65,33 @@ class LambdaProvisionedConcurrencyNotFoundIntegrationTest {
                         .body("__type", equalTo("ResourceNotFoundException"))
                         .body("message", equalTo(message));
             }
+        }
+    }
+
+    @Test
+    void listRejectsAnotherRegionWithTheSharedLambdaError() {
+        String arn = AwsArnUtils.Arn.of("lambda", "us-west-2", resolver.getAccountId(),
+                "function:" + NAME).toString();
+        given().queryParam("List", "ALL").pathParam("function", arn)
+                .get("/2019-09-30/functions/{function}/provisioned-concurrency")
+                .then().statusCode(400)
+                .body("__type", equalTo("InvalidParameterValueException"))
+                .body("message", equalTo("Region 'us-west-2' in ARN does not match request region '"
+                        + resolver.getRegion() + "'"));
+    }
+
+    @Test
+    void targetOperationsRejectAnotherRegionWithTheSharedLambdaError() {
+        String arn = AwsArnUtils.Arn.of("lambda", "us-west-2", resolver.getAccountId(),
+                "function:" + NAME + ":live").toString();
+        for (String method : List.of("GET", "PUT", "DELETE")) {
+            given().contentType("application/json").queryParam("Qualifier", "live")
+                    .pathParam("function", arn).body("{\"ProvisionedConcurrentExecutions\":1}")
+                    .request(method, "/2019-09-30/functions/{function}/provisioned-concurrency")
+                    .then().statusCode(400)
+                    .body("__type", equalTo("InvalidParameterValueException"))
+                    .body("message", equalTo("Region 'us-west-2' in ARN does not match request region '"
+                            + resolver.getRegion() + "'"));
         }
     }
 

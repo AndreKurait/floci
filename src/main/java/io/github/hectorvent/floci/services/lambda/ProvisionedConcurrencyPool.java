@@ -248,10 +248,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
         if (!errors.isEmpty()) {
             throw SmithyValidationErrors.validationException(errors);
         }
-        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(name);
-        if (ref.region() != null && !region.equals(ref.region())) {
-            throw invalid("Function ARN region must match the request region");
-        }
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolveWithRegion(region, name, null);
         String owner = ref.account() == null ? account : ref.account();
         String functionArn = AwsArnUtils.Arn.of("lambda", region, owner, "function:" + ref.name()).toString();
         functions.getForAccount(owner, region, ref.name())
@@ -762,10 +759,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
         if ("$LATEST".equals(qualifier)) {
             throw invalid("The function resource provided must be an alias or a published version.");
         }
-        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolveWithQualifier(name, qualifier);
-        if (ref.region() != null && !region.equals(ref.region())) {
-            throw invalid("Function ARN region must match the request region");
-        }
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolveWithRegion(region, name, qualifier);
         account = ref.account() != null ? ref.account() : account;
         boolean publishedVersion = qualifier.matches("[0-9]+");
         String qualifiedArn = AwsArnUtils.Arn.of("lambda", region, account,
