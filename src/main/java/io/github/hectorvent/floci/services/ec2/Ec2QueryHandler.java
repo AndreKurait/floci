@@ -4448,10 +4448,6 @@ public class Ec2QueryHandler {
     // ─── Capacity Reservation handlers ────────────────────────────────────────
 
     private Response handleCreateCapacityReservation(MultivaluedMap<String, String> p, String region) {
-        if (p.containsKey("StartDate")) {
-            throw new AwsException("Unsupported",
-                    "Future-dated Capacity Reservations are not supported.", 400);
-        }
         List<Tag> resourceTags = parseTagsForResource(p, "capacity-reservation");
         CapacityReservation reservation = service.createCapacityReservation(
                 region,
@@ -4467,7 +4463,9 @@ public class Ec2QueryHandler {
                 instantOrNull(p, "EndDate"),
                 p.getFirst("InstanceMatchCriteria"),
                 p.getFirst("OutpostArn"),
-                p.getFirst("PlacementGroupArn"));
+                p.getFirst("PlacementGroupArn"),
+                instantOrNull(p, "StartDate"), longOrNull(p, "CommitmentDuration"),
+                p.getFirst("DeliveryPreference"), p.getFirst("ClientToken"));
         applyResourceTags(resourceTags, region, reservation.getCapacityReservationId());
         if (!resourceTags.isEmpty()) {
             reservation = service.describeCapacityReservations(
@@ -4527,6 +4525,7 @@ public class Ec2QueryHandler {
                 .elem("ebsOptimized", reservation.isEbsOptimized())
                 .elem("ephemeralStorage", reservation.isEphemeralStorage())
                 .elem("state", reservation.getState())
+                .elem("deliveryPreference", reservation.getDeliveryPreference())
                 .elem("startDate", reservation.getStartDate() != null ? ISO_FMT.format(reservation.getStartDate()) : null)
                 .elem("endDate", reservation.getEndDate() != null ? ISO_FMT.format(reservation.getEndDate()) : null)
                 .elem("endDateType", reservation.getEndDateType())
@@ -4535,6 +4534,13 @@ public class Ec2QueryHandler {
                 .elem("outpostArn", reservation.getOutpostArn())
                 .elem("placementGroupArn", reservation.getPlacementGroupArn())
                 .raw(tagSetXml(reservation.getTags()));
+        if (reservation.getCommitmentDuration() != null) {
+            xml.start("commitmentInfo")
+                    .elem("commitmentDuration", reservation.getCommitmentDuration())
+                    .elem("commitmentEndDate", ISO_FMT.format(reservation.getCommitmentEndDate()))
+                    .elem("committedInstanceCount", reservation.getCommittedInstanceCount())
+                    .end("commitmentInfo");
+        }
         return xml.build();
     }
 
