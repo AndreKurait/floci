@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.lambda.launcher.kubernetes;
 
+import io.github.hectorvent.floci.services.lambda.launcher.BootstrapProcess;
+import io.github.hectorvent.floci.services.lambda.launcher.BootstrapProcess.Result;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -10,7 +12,6 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -134,21 +135,8 @@ class LambdaPodBootstrapTest {
     }
 
     private Result run(List<String> command) throws Exception {
-        ProcessBuilder builder = new ProcessBuilder(new ArrayList<>(command)).redirectErrorStream(true);
+        ProcessBuilder builder = new ProcessBuilder(new ArrayList<>(command));
         builder.environment().put("PATH", bin + ":" + builder.environment().get("PATH"));
-        Process process = builder.start();
-        try {
-            assertTrue(process.waitFor(5, TimeUnit.SECONDS), "bootstrap process must terminate");
-            return new Result(process.exitValue(),
-                    new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
-        } finally {
-            if (process.isAlive()) {
-                process.destroyForcibly();
-                assertTrue(process.waitFor(5, TimeUnit.SECONDS), "bootstrap process must be reaped");
-            }
-        }
-    }
-
-    private record Result(int exit, String output) {
+        return BootstrapProcess.run(builder);
     }
 }
