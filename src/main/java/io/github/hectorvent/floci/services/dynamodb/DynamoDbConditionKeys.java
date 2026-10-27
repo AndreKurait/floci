@@ -181,6 +181,12 @@ public final class DynamoDbConditionKeys {
                         ? List.copyOf(attributes) : List.of(), select);
     }
 
+    /** Transaction Get uses its modeled member paths while IAM authorizes the GetItem action. */
+    public static Result extractTransactionGet(JsonNode body, TableDefinition table) {
+        return extract("dynamodb:GetItem", DynamoDbConditionKeyMembers.itemBody(
+                "TransactGetItems", "TransactItems.*.Get.", body), table);
+    }
+
     private static String effectiveSelect(String action, JsonNode body) {
         if (!DynamoDbConditionKeyMembers.supports(action, "dynamodb:Select")) {
             return null;

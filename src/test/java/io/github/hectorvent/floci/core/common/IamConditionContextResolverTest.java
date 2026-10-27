@@ -456,6 +456,26 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void transactionGetContextUsesOnlySupportedMembersWithoutChangingTheRequest() {
+        when(dynamoDbService.findTable("FgacTable", "us-east-1")).thenReturn(Optional.of(fgacTable()));
+        for (String extra : List.of("\"AttributesToGet\":[\"ignored\"]", "\"Select\":\"SPECIFIC_ATTRIBUTES\"",
+                "\"IndexName\":\"ignored\"")) {
+            ContainerRequestContext request = mock(ContainerRequestContext.class);
+            JsonNode body = json("{\"TransactItems\":[{\"Get\":{\"TableName\":\"FgacTable\","
+                    + "\"Key\":{\"PK\":{\"S\":\"USER_alice\"}}," + extra + "}}]}");
+            JsonNode original = body.deepCopy();
+            when(request.getProperty("floci.bufferedJsonBody")).thenReturn(body);
+            Map<String, List<String>> context = resolver.dynamoDbTransactionItems("dynamodb:TransactGetItems",
+                    request, "us-east-1", "000000000000").getFirst().context();
+            assertEquals(List.of("ALL_ATTRIBUTES"), context.get("dynamodb:Select"));
+            assertEquals(List.of("PK"), context.get("dynamodb:Attributes"));
+            assertEquals(List.of("USER_alice"), context.get("dynamodb:LeadingKeys"));
+            assertEquals(List.of("TransactGetItems"), context.get("dynamodb:EnclosingOperation"));
+            assertEquals(original, body);
+        }
+    }
+
+    @Test
     void singleItemWritesUseTheirReturnValuesAndExecutionDefault() {
         for (String action : List.of("PutItem", "UpdateItem", "DeleteItem")) {
             for (String value : List.of("NONE", "ALL_OLD", "UPDATED_OLD", "ALL_NEW", "UPDATED_NEW", "")) {

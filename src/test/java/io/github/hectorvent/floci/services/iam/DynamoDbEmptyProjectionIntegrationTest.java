@@ -339,6 +339,45 @@ class DynamoDbEmptyProjectionIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"json", "cbor"})
+    void transactionSelectionIgnoresUnsupportedGetMembers(String protocol) throws Exception {
+        String table = "transaction-projection-" + UUID.randomUUID();
+        AwsRequestSigner root = AwsRequestSigner.signedAs("test", "test", "dynamodb");
+        createTable(table, root);
+        String policy = POLICY.replace("\"dynamodb:Query\",\"dynamodb:Scan\"", "\"dynamodb:GetItem\"");
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "transaction-projection-", "read", policy);
+             DynamoDbClient client = DynamoDbClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                     .credentialsProvider(StaticCredentialsProvider.create(
+                             AwsBasicCredentials.create(user.accessKeyId(), user.secretAccessKey()))).build()) {
+            ObjectNode request = JSON.createObjectNode();
+            ObjectNode get = request.putArray("TransactItems").addObject().putObject("Get").put("TableName", table);
+            get.set("Key", JSON.readTree("{\"pk\":{\"S\":\"one\"},\"sk\":{\"S\":\"sort\"}}"));
+            get.putArray("AttributesToGet").add("pk");
+            JsonNode full = response(send(root, "TransactGetItems", protocol, request), protocol, 200)
+                    .path("Responses").get(0).path("Item");
+            assertEquals("protected", full.path("payload").path("S").asText());
+            JsonNode denied = response(send(user.signer("dynamodb"), "TransactGetItems", protocol, request),
+                    protocol, "cbor".equals(protocol) ? 403 : 400);
+            assertTrue(denied.path("__type").asText().contains("AccessDeniedException"));
+            get.put("ProjectionExpression", "#key");
+            get.putObject("ExpressionAttributeNames").put("#key", "pk");
+            JsonNode projected = response(send(user.signer("dynamodb"), "TransactGetItems", protocol, request),
+                    protocol, 200).path("Responses").get(0).path("Item");
+            assertEquals(JSON.readTree("{\"pk\":{\"S\":\"one\"}}"), projected);
+            Map<String, AttributeValue> key = Map.of("pk", AttributeValue.fromS("one"),
+                    "sk", AttributeValue.fromS("sort"));
+            DynamoDbException error = assertThrows(DynamoDbException.class, () -> client.transactGetItems(b ->
+                    b.transactItems(t -> t.get(g -> g.tableName(table).key(key)))));
+            assertEquals("AccessDeniedException", error.awsErrorDetails().errorCode());
+            assertEquals(Map.of("pk", AttributeValue.fromS("one")), client.transactGetItems(b ->
+                    b.transactItems(t -> t.get(g -> g.tableName(table).key(key).projectionExpression("pk"))))
+                    .responses().getFirst().item());
+        } finally {
+            response(send(root, "DeleteTable", "json", JSON.createObjectNode().put("TableName", table)), "json", 200);
+        }
+    }
+
     private void createTable(String table, AwsRequestSigner root) throws Exception {
         createTable(table, root, null, null);
     }

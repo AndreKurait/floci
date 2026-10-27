@@ -2,10 +2,13 @@ package io.github.hectorvent.floci.services.dynamodb;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.VendoredResources;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /** Action coverage from AWS Service Reference and request member paths from pinned botocore. */
 final class DynamoDbConditionKeyMembers {
@@ -45,6 +48,23 @@ final class DynamoDbConditionKeyMembers {
             }
         }
         return values;
+    }
+
+    static JsonNode itemBody(String operation, String prefix, JsonNode body) {
+        if (body == null || !body.isObject()) {
+            return body;
+        }
+        Set<String> members = new LinkedHashSet<>();
+        for (JsonNode paths : TABLE.path("members").path(operation)) {
+            for (JsonNode path : paths) {
+                String value = path.asText();
+                if (value.startsWith(prefix)) {
+                    members.add(value.substring(prefix.length()).split("\\.", 2)[0]);
+                }
+            }
+        }
+        ObjectNode item = body.deepCopy();
+        return item.retain(members);
     }
 
     private static void collect(JsonNode node, String[] steps, int position, List<JsonNode> values) {

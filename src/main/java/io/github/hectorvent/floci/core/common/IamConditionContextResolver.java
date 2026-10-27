@@ -821,8 +821,10 @@ public class IamConditionContextResolver {
                 // Execution resolves ARN inputs within the request account; authorize that same table.
                 String executionTable = DynamoDbTableNames.resolveWithRegion(tableName, region).name();
                 String itemAction = "dynamodb:" + operation + "Item";
-                DynamoDbConditionKeys.Result keys = DynamoDbConditionKeys.extract(
-                        itemAction, request, describeTargetTable(executionTable));
+                TableDefinition table = describeTargetTable(executionTable);
+                DynamoDbConditionKeys.Result keys = read
+                        ? DynamoDbConditionKeys.extractTransactionGet(request, table)
+                        : DynamoDbConditionKeys.extract(itemAction, request, table);
                 Map<String, List<String>> context = new LinkedHashMap<>();
                 context.put("dynamodb:EnclosingOperation", List.of(read ? "TransactGetItems" : "TransactWriteItems"));
                 if (!keys.leadingKeys().isEmpty()) {
