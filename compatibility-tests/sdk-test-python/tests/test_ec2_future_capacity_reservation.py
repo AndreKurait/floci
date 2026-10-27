@@ -28,6 +28,9 @@ def test_future_reservation_is_scheduled_and_replayed(ec2_client, unique_name):
             "CommitmentDuration": 86400, "CommitmentEndDate": start + timedelta(days=1),
             "CommittedInstanceCount": 2,
         }
+        assert ec2_client.describe_tags(Filters=[{"Name": "resource-id", "Values": [identifier]}])["Tags"] == [
+            {"ResourceId": identifier, "ResourceType": "capacity-reservation", "Key": "Name", "Value": unique_name}
+        ]
         replay = ec2_client.create_capacity_reservation(**request)["CapacityReservation"]
         assert replay == created
         with pytest.raises(ClientError) as error:
@@ -37,6 +40,17 @@ def test_future_reservation_is_scheduled_and_replayed(ec2_client, unique_name):
             Filters=[{"Name": "tag:Name", "Values": [unique_name]}]
         )["CapacityReservations"]
         assert described == [created]
+        ec2_client.create_tags(Resources=[identifier], Tags=[{"Key": "Name", "Value": unique_name + "-edited"}])
+        replay = ec2_client.create_capacity_reservation(**request)["CapacityReservation"]
+        assert replay["Tags"] == [{"Key": "Name", "Value": unique_name + "-edited"}]
+        with pytest.raises(ClientError) as tag_error:
+            ec2_client.create_capacity_reservation(**{
+                **request, "TagSpecifications": [{"ResourceType": "capacity-reservation",
+                                                  "Tags": [{"Key": "Name", "Value": "different"}]}],
+            })
+        assert tag_error.value.response["Error"]["Code"] == "IdempotentParameterMismatch"
+        after = ec2_client.describe_capacity_reservations(CapacityReservationIds=[identifier])["CapacityReservations"]
+        assert after == [replay]
     finally:
         ec2_client.cancel_capacity_reservation(CapacityReservationId=identifier)
 

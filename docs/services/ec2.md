@@ -773,7 +773,13 @@ Future-dated requests store a `scheduled` reservation with `StartDate`,
 days ahead and requires `CommitmentDuration` (1 to 200000000 seconds). Scheduled
 capacity cannot satisfy instance launches. The existing capacity reconciliation
 activates it when its start time is reached. Repeating a `ClientToken` returns the
-same reservation; changed reservation parameters are rejected.
+same reservation; changed reservation parameters, including creation tags, are rejected.
+Creation tags are persisted with the reservation and are not reapplied on replay, so
+later `CreateTags` edits survive a retry. Tag order does not change request identity.
+For stored open reservations, activation attaches eligible existing running instances
+using the same matching rules as immediate creation, without double assignment.
+AWS documents future-dated reservations as targeted-only; Floci currently also accepts
+open future reservations. This compatibility gap is not an AWS parity claim.
 
 Assessment and incremental delivery are modeled synchronously, without AWS capacity
 assessment or billing. Cancellation retains Floci's immediate cancellation behavior;

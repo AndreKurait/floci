@@ -5,7 +5,9 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * A reservation of EC2 instance capacity in a specific Availability Zone, created ahead of
@@ -41,6 +43,7 @@ public class CapacityReservation {
     private String deliveryPreference;
     private String clientToken;
     private List<String> requestParameters = new ArrayList<>();
+    private Map<String, String> requestTags = new LinkedHashMap<>();
     private Instant endDate;
     private String endDateType = "unlimited";
     private String instanceMatchCriteria = "open";
@@ -74,6 +77,7 @@ public class CapacityReservation {
         deliveryPreference = other.deliveryPreference;
         clientToken = other.clientToken;
         requestParameters = new ArrayList<>(other.requestParameters);
+        requestTags = new LinkedHashMap<>(other.requestTags);
         endDate = other.endDate;
         endDateType = other.endDateType;
         instanceMatchCriteria = other.instanceMatchCriteria;
@@ -84,6 +88,9 @@ public class CapacityReservation {
         tags = new ArrayList<>(other.tags);
         instanceIds = new ArrayList<>(other.instanceIds);
     }
+
+    public Map<String, String> getRequestTags() { return requestTags; }
+    public void setRequestTags(Map<String, String> requestTags) { this.requestTags = requestTags; }
 
     public String getCapacityReservationId() { return capacityReservationId; }
     public void setCapacityReservationId(String capacityReservationId) { this.capacityReservationId = capacityReservationId; }

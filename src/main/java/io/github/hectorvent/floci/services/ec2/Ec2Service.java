@@ -10674,6 +10674,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private void reconcileCapacityMembership(String region) {
         Instant now = capacityReservationNow();
         List<CapacityReservation> reconciled = new ArrayList<>();
+        List<CapacityReservation> activatedReservations = new ArrayList<>();
         Map<String, CapacityReservation> changed = new LinkedHashMap<>();
         for (CapacityReservation stored : capacityReservations.scan(k -> k.startsWith(region + "::"))) {
             CapacityReservation updated = new CapacityReservation(stored);
@@ -10681,6 +10682,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             boolean activated = "scheduled".equals(updated.getState()) && updated.getStartDate() != null
                     && !updated.getStartDate().isAfter(now);
             if (activated) {
+                activatedReservations.add(updated);
                 updated.setState("active");
                 updated.setAvailableInstanceCount(updated.getTotalInstanceCount());
             }
@@ -10707,6 +10709,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             for (CapacityReservation reservation : reconciled) {
                 associated.addAll(reservation.getInstanceIds());
             }
+            for (CapacityReservation reservation : activatedReservations) {
+                matchOpenCapacityInstances(region, reservation, associated);
+            }
             Map<String, Set<String>> membersByGroup = new HashMap<>();
             for (Instance instance : groupInstances) {
                 if (instance.getState() == null || !"running".equals(instance.getState().getName())
@@ -10732,6 +10737,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         if (!changed.isEmpty()) {
             persistCapacityMembership(changed);
+        }
+    }
+
+    private void matchOpenCapacityInstances(String region, CapacityReservation reservation,
+            Set<String> associated) {
+        if (!"active".equals(reservation.getState()) || !"open".equals(reservation.getInstanceMatchCriteria())
+                || reservation.getAvailableInstanceCount() == 0) {
+            return;
+        }
+        for (Instance instance : instances.scan(k -> k.startsWith(region + "::"))) {
+            if (reservation.getAvailableInstanceCount() == 0) {
+                break;
+            }
+            if (instance.getState() != null && "running".equals(instance.getState().getName()) && !instance.isSpot()
+                    && "open".equals(instance.getCapacityReservationPreference())
+                    && instance.getCapacityReservationTarget() == null
+                    && instance.getCapacityReservationGroupArn() == null
+                    && !associated.contains(instance.getInstanceId())
+                    && matchesCapacityReservation(instance, reservation)) {
+                reservation.getInstanceIds().add(instance.getInstanceId());
+                reservation.setAvailableInstanceCount(reservation.getAvailableInstanceCount() - 1);
+                associated.add(instance.getInstanceId());
+            }
         }
     }
 
@@ -10889,6 +10917,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             String tenancy, Boolean ebsOptimized, Boolean ephemeralStorage, String endDateType,
             Instant endDate, String instanceMatchCriteria, String outpostArn, String placementGroupArn,
             Instant startDate, Long commitmentDuration, String deliveryPreference, String clientToken) {
+        return createCapacityReservation(region, instanceType, instancePlatform, availabilityZone,
+                availabilityZoneId, instanceCount, tenancy, ebsOptimized, ephemeralStorage, endDateType,
+                endDate, instanceMatchCriteria, outpostArn, placementGroupArn, startDate, commitmentDuration,
+                deliveryPreference, clientToken, List.of());
+    }
+
+    public CapacityReservation createCapacityReservation(String region, String instanceType,
+            String instancePlatform, String availabilityZone, String availabilityZoneId, Integer instanceCount,
+            String tenancy, Boolean ebsOptimized, Boolean ephemeralStorage, String endDateType,
+            Instant endDate, String instanceMatchCriteria, String outpostArn, String placementGroupArn,
+            Instant startDate, Long commitmentDuration, String deliveryPreference, String clientToken,
+            List<Tag> resourceTags) {
+        validateNewResourceTags(resourceTags);
+        Map<String, String> requestTags = new LinkedHashMap<>();
+        for (Tag tag : resourceTags) {
+            requestTags.put(tag.getKey(), tag.getValue());
+        }
         synchronized (capacityReservationLock) {
             List<String> parameters = Arrays.asList(instanceType, instancePlatform, availabilityZone,
                     availabilityZoneId, String.valueOf(instanceCount), tenancy, String.valueOf(ebsOptimized),
@@ -10898,7 +10943,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if (isSet(clientToken)) {
                 for (CapacityReservation existing : capacityReservations.scan(k -> k.startsWith(region + "::"))) {
                     if (clientToken.equals(existing.getClientToken()) && callerAccountId().equals(existing.getOwnerId())) {
-                        if (!parameters.equals(existing.getRequestParameters())) {
+                        if (!parameters.equals(existing.getRequestParameters())
+                                || !requestTags.equals(existing.getRequestTags())) {
                             throw new AwsException("IdempotentParameterMismatch",
                                     "Parameters differ from the previous request with this ClientToken.", 400);
                         }
@@ -10953,6 +10999,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             reservation.setCreateDate(now);
             reservation.setClientToken(clientToken);
             reservation.setRequestParameters(parameters);
+            reservation.setRequestTags(new LinkedHashMap<>(requestTags));
+            reservation.setTags(requestTags.entrySet().stream()
+                    .map(tag -> new Tag(tag.getKey(), tag.getValue())).collect(Collectors.toCollection(ArrayList::new)));
             reservation.setDeliveryPreference(deliveryPreference);
             if (startDate != null) {
                 reservation.setCommitmentDuration(commitmentDuration);
@@ -10965,25 +11014,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             reservation.setOutpostArn(outpostArn);
             reservation.setPlacementGroupArn(placementGroupArn);
             reconcileCapacityMembership(region);
-            if ("open".equals(reservation.getInstanceMatchCriteria())) {
-                Set<String> associated = capacityReservations.scan(k -> k.startsWith(region + "::")).stream()
-                        .flatMap(existing -> existing.getInstanceIds().stream()).collect(Collectors.toSet());
-                for (Instance instance : instances.scan(k -> k.startsWith(region + "::"))) {
-                    if (reservation.getAvailableInstanceCount() == 0) {
-                        break;
-                    }
-                    if ("running".equals(instance.getState().getName()) && !instance.isSpot()
-                            && "open".equals(instance.getCapacityReservationPreference())
-                            && instance.getCapacityReservationTarget() == null
-                            && instance.getCapacityReservationGroupArn() == null
-                            && !associated.contains(instance.getInstanceId())
-                            && matchesCapacityReservation(instance, reservation)) {
-                        reservation.getInstanceIds().add(instance.getInstanceId());
-                        reservation.setAvailableInstanceCount(reservation.getAvailableInstanceCount() - 1);
-                    }
-                }
+            Set<String> associated = capacityReservations.scan(k -> k.startsWith(region + "::")).stream()
+                    .flatMap(existing -> existing.getInstanceIds().stream()).collect(Collectors.toSet());
+            matchOpenCapacityInstances(region, reservation, associated);
+            if (!reservation.getTags().isEmpty()) {
+                putTags(region, reservation.getCapacityReservationId(), new ArrayList<>(reservation.getTags()));
             }
-            capacityReservations.put(key(region, reservation.getCapacityReservationId()), reservation);
+            try {
+                capacityReservations.put(key(region, reservation.getCapacityReservationId()), reservation);
+            } catch (RuntimeException failure) {
+                try {
+                    removeTags(region, reservation.getCapacityReservationId());
+                } catch (RuntimeException cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                    LOG.warnv(cleanupFailure, "Could not remove creation tags for failed Capacity Reservation {0}",
+                            reservation.getCapacityReservationId());
+                }
+                throw failure;
+            }
             return new CapacityReservation(reservation);
         }
     }
