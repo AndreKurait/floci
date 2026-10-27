@@ -51,6 +51,7 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `DeleteFunctionConcurrency` | Clear reserved concurrent executions |
 | `PutProvisionedConcurrencyConfig` | Initialize Docker environments for a published version or simple alias |
 | `GetProvisionedConcurrencyConfig` | Read the allocation's actual initialization status and capacity |
+| `ListProvisionedConcurrencyConfigs` | List configured versions and aliases with their current capacity |
 | `DeleteProvisionedConcurrencyConfig` | Remove an allocation and stop its environments |
 | `GetAccountSettings` | Account limits plus usage derived from the caller's stored functions |
 | `PutFunctionEventInvokeConfig` | Set the asynchronous invocation settings of a function, version or alias (retries, event age, destinations) |
@@ -492,6 +493,12 @@ with a required `Qualifier` query parameter. Put accepts a positive integer
 function without a configuration returns `ProvisionedConcurrencyConfigNotFoundException`
 from Get.
 
+List uses the same route with `List=ALL` and no qualifier. It returns the function's
+configured versions and aliases, their qualified `FunctionArn` and current allocation status.
+An existing function without configurations returns an empty list. `MaxItems` accepts 1
+through 50; `NextMarker` resumes with `Marker`. Markers are scoped to the function, account
+and region. Name, full ARN and partial ARN references use the same configuration inventory.
+
 An alias and its resolved published version cannot both have configurations. Different
 aliases of the same provisioned version also conflict; other versions remain independent.
 `LastModified` uses Lambda's UTC `+0000` form.
@@ -563,7 +570,6 @@ For a longer drain, explicitly stop with the larger timeout and then start Floci
 These AWS Lambda operations have no handler in Floci. Calls will return `404` or an error:
 
 - Layer permissions (`AddLayerVersionPermission`, `RemoveLayerVersionPermission`, `GetLayerVersionPolicy`)
-- Listing provisioned concurrency (`ListProvisionedConcurrencyConfigs`)
 - `InvokeWithResponseStream`
 - Code signing enforcement. A configuration is created, read, updated, deleted and listed, and
   nothing verifies a signature against it, so it never gates a deployment. Attaching one to a
