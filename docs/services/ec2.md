@@ -768,6 +768,8 @@ through `payment-pending`/`assessing`. `DescribeCapacityReservations` supports t
 `availability-zone`, `end-date-type`, `instance-match-criteria`, `instance-platform`,
 `instance-type`, `state` and `tenancy` filters alongside the shared `tag:`, `tag-key` and
 `tag-value` filters.
+Future-dated reservations are not modeled. A request containing `StartDate` returns
+`Unsupported` before creating or changing capacity, including a repeated client token.
 
 On-demand launches consume matching open reservation capacity unless their preference is
 `none`. RunInstances also honors an explicit reservation target, including one supplied by

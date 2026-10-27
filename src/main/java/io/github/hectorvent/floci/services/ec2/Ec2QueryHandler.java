@@ -4448,6 +4448,10 @@ public class Ec2QueryHandler {
     // ─── Capacity Reservation handlers ────────────────────────────────────────
 
     private Response handleCreateCapacityReservation(MultivaluedMap<String, String> p, String region) {
+        if (p.containsKey("StartDate")) {
+            throw new AwsException("Unsupported",
+                    "Future-dated Capacity Reservations are not supported.", 400);
+        }
         List<Tag> resourceTags = parseTagsForResource(p, "capacity-reservation");
         CapacityReservation reservation = service.createCapacityReservation(
                 region,
