@@ -5,7 +5,9 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * A reservation of EC2 instance capacity in a specific Availability Zone, created ahead of
@@ -44,6 +46,9 @@ public class CapacityReservation {
     private String region;
     private List<Tag> tags = new ArrayList<>();
     private List<String> instanceIds = new ArrayList<>();
+    private String clientToken;
+    // Mutable reservation state must not change which original request a token identifies.
+    private Map<String, String> creationParameters = new LinkedHashMap<>();
 
     public CapacityReservation() {}
 
@@ -71,6 +76,8 @@ public class CapacityReservation {
         region = other.region;
         tags = new ArrayList<>(other.tags);
         instanceIds = new ArrayList<>(other.instanceIds);
+        clientToken = other.clientToken;
+        creationParameters = new LinkedHashMap<>(other.creationParameters);
     }
 
     public String getCapacityReservationId() { return capacityReservationId; }
@@ -140,5 +147,13 @@ public class CapacityReservation {
 
     public List<String> getInstanceIds() { return instanceIds; }
     public void setInstanceIds(List<String> instanceIds) { this.instanceIds = instanceIds; }
+
+    public String getClientToken() { return clientToken; }
+    public void setClientToken(String clientToken) { this.clientToken = clientToken; }
+
+    public Map<String, String> getCreationParameters() { return creationParameters; }
+    public void setCreationParameters(Map<String, String> creationParameters) {
+        this.creationParameters = new LinkedHashMap<>(creationParameters);
+    }
 
 }
