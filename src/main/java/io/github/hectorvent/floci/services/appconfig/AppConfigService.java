@@ -175,7 +175,8 @@ public class AppConfigService {
         profile.setName((String) request.get("Name"));
         profile.setDescription((String) request.get("Description"));
         profile.setLocationUri((String) request.get("LocationUri"));
-        profile.setType((String) request.get("Type"));
+        String type = (String) request.get("Type");
+        profile.setType(type == null ? "AWS.Freeform" : type);
         profileStore.put(profile.getId(), profile);
         return profile;
     }
