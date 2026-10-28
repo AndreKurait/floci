@@ -4795,6 +4795,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             }
         }
         session.setMultiFactorAuthPresent(authenticated);
+        session.setMultiFactorAuthenticatedAt(authenticated ? authenticationTime : null);
         putNewSession(sessionAccessKeyId, session);
     }
 
@@ -5507,7 +5508,14 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     public record CallerArns(String callerArn, String principalArn, String principalType,
                              String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
-                             Map<String, String> principalTags, Boolean multiFactorAuthPresent) {
+                             Map<String, String> principalTags, Boolean multiFactorAuthPresent, Long multiFactorAuthAge) {
+
+        public CallerArns(String callerArn, String principalArn, String principalType,
+                          String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
+                          Map<String, String> principalTags, Boolean multiFactorAuthPresent) {
+            this(callerArn, principalArn, principalType, userId, userName, permissionsBoundary,
+                    tokenIssueTime, principalTags, multiFactorAuthPresent, null);
+        }
 
         public CallerArns {
             principalTags = principalTags == null ? Map.of() : Map.copyOf(principalTags);
@@ -5522,7 +5530,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         public CallerArns withMultiFactorAuthPresent(Boolean present) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, tokenIssueTime, principalTags, present);
+                    permissionsBoundary, tokenIssueTime, principalTags, present,
+                    Boolean.TRUE.equals(present) ? multiFactorAuthAge : null);
         }
 
         public CallerArns(String callerArn, String principalArn, String principalType, String userId,
@@ -5533,7 +5542,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         public CallerArns withPrincipalTags(Map<String, String> tags) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, tokenIssueTime, tags, multiFactorAuthPresent);
+                    permissionsBoundary, tokenIssueTime, tags, multiFactorAuthPresent, multiFactorAuthAge);
         }
 
         /**
@@ -5571,7 +5580,12 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         public CallerArns withTokenIssueTime(Instant issuedAt) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, issuedAt, principalTags, multiFactorAuthPresent);
+                    permissionsBoundary, issuedAt, principalTags, multiFactorAuthPresent, multiFactorAuthAge);
+        }
+
+        public CallerArns withMultiFactorAuthAge(Long age) {
+            return new CallerArns(callerArn, principalArn, principalType, userId, userName,
+                    permissionsBoundary, tokenIssueTime, principalTags, multiFactorAuthPresent, age);
         }
 
         /** A caller with no permissions boundary attached. */
@@ -5600,6 +5614,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             principalTags.forEach((key, value) -> context.put("aws:PrincipalTag/" + key, List.of(value)));
             if (multiFactorAuthPresent != null) {
                 context.put("aws:MultiFactorAuthPresent", List.of(multiFactorAuthPresent.toString()));
+            }
+            if (Boolean.TRUE.equals(multiFactorAuthPresent) && multiFactorAuthAge != null) {
+                context.put("aws:MultiFactorAuthAge", List.of(multiFactorAuthAge.toString()));
             }
             if (tokenIssueTime != null) {
                 context.put("aws:TokenIssueTime", List.of(tokenIssueTime.toString()));
@@ -5674,12 +5691,16 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         Optional<SessionCredential> sessionOpt = findSessionForCallerContext(accessKeyId);
         if (sessionOpt.isPresent()) {
             SessionCredential session = sessionOpt.get();
-            if (isExpired(session, clock.instant())) {
+            Instant now = clock.instant();
+            if (isExpired(session, now)) {
                 deleteSession(accessKeyId, session);
                 return Optional.empty();
             }
             return sessionCallerArns(session).map(arns -> arns.withTokenIssueTime(session.getIssuedAt())
-                    .withMultiFactorAuthPresent(session.getMultiFactorAuthPresent()));
+                    .withMultiFactorAuthPresent(session.getMultiFactorAuthPresent())
+                    .withMultiFactorAuthAge(Boolean.TRUE.equals(session.getMultiFactorAuthPresent())
+                            && session.getMultiFactorAuthenticatedAt() != null
+                            ? Math.max(0, Duration.between(session.getMultiFactorAuthenticatedAt(), now).getSeconds()) : null));
         }
 
         return Optional.empty();
