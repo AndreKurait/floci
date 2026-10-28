@@ -18,8 +18,12 @@ import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 
 @QuarkusTest
 @TestProfile(IamEnforcementProfile.class)
@@ -95,12 +99,34 @@ class EnforcementFixturesIntegrationTest {
         String name = "fixture-policy-failure-" + UUID.randomUUID();
         PartitionCleanup owned = new PartitionCleanup();
         doThrow(new AwsException("ServiceFailure", "Injected policy setup failure", 500))
-                .when(iamService).putRolePolicy(name, "p", allow());
+                .when(iamService).putRolePolicy(eq(name), eq("p"), anyString());
         try {
             assertThrows(AssertionError.class, () -> EnforcementFixtures.createRole(
                     owned, baseUri.getPort(), "000000000000", "/", name, trust(), allow()));
+            verify(iamService).putRolePolicy(eq(name), eq("p"), anyString());
             iam("GetRole", "RoleName", name).statusCode(200);
             owned.afterEach(mock(ExtensionContext.class));
+            iam("GetRole", "RoleName", name).statusCode(404);
+        } finally {
+            EnforcementFixtures.removeRole(baseUri.getPort(), auth("test", "iam"), name);
+        }
+    }
+
+    @Test
+    void partiallyWrittenPolicyIsRemovedWithOwnedRole() {
+        String name = "fixture-partial-policy-" + UUID.randomUUID();
+        PartitionCleanup owned = new PartitionCleanup();
+        doAnswer(invocation -> {
+            invocation.callRealMethod();
+            throw new AwsException("ServiceFailure", "Injected failure after policy write", 500);
+        }).when(iamService).putRolePolicy(eq(name), eq("p"), anyString());
+        try {
+            assertThrows(AssertionError.class, () -> EnforcementFixtures.createRole(
+                    owned, baseUri.getPort(), "000000000000", "/", name, trust(), allow()));
+            verify(iamService).putRolePolicy(eq(name), eq("p"), anyString());
+            iam("GetRolePolicy", "RoleName", name, "PolicyName", "p").statusCode(200);
+            owned.afterEach(mock(ExtensionContext.class));
+            verify(iamService).deleteRolePolicy(name, "p");
             iam("GetRole", "RoleName", name).statusCode(404);
         } finally {
             EnforcementFixtures.removeRole(baseUri.getPort(), auth("test", "iam"), name);
