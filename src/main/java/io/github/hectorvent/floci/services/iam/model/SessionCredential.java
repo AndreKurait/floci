@@ -18,6 +18,7 @@ public class SessionCredential {
     private Instant expiration;
     private Instant issuedAt;
     private Boolean multiFactorAuthPresent;
+    private Instant multiFactorAuthenticatedAt;
     /** Inline session policy passed to AssumeRole/GetFederationToken — further restricts role policies. */
     private String sessionPolicyDocument;
     /**
@@ -123,6 +124,11 @@ public class SessionCredential {
     public Boolean getMultiFactorAuthPresent() { return multiFactorAuthPresent; }
     public void setMultiFactorAuthPresent(Boolean multiFactorAuthPresent) {
         this.multiFactorAuthPresent = multiFactorAuthPresent;
+    }
+
+    public Instant getMultiFactorAuthenticatedAt() { return multiFactorAuthenticatedAt; }
+    public void setMultiFactorAuthenticatedAt(Instant authenticatedAt) {
+        this.multiFactorAuthenticatedAt = authenticatedAt;
     }
 
     public Instant getExpiration() { return expiration; }
