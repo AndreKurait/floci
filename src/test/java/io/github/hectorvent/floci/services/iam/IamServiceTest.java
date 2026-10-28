@@ -94,6 +94,25 @@ class IamServiceTest {
     }
 
     @Test
+    void inheritedTagsRequireTheIssuedTokenAndFollowTheSessionClock() {
+        MutableClock clock = new MutableClock();
+        IamService service = new IamService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver("us-east-1", "000000000000"), false, clock);
+        IamRole role = service.createRole("ChainRole", "/teams/chain/", "{}", null, 3600, null);
+        Map<String, String> transitive = new LinkedHashMap<>(Map.of("Project", "session"));
+        service.registerSession("ASIACHAIN", "secret", "token", role.getArn(), clock.instant().plusSeconds(60),
+                null, "000000000000", "chain", role.getRoleId() + ":chain",
+                Map.of("Project", "session", "Local", "not-transitive"), transitive);
+        transitive.put("Project", "mutated");
+        assertEquals(Map.of("Project", "session"), service.findTransitiveSessionTags("ASIACHAIN", "token"));
+        assertEquals(Map.of(), service.findTransitiveSessionTags("ASIACHAIN", "wrong"));
+        assertEquals(Map.of(), service.findTransitiveSessionTags("ASIACHAIN", null));
+        clock.advance(Duration.ofSeconds(60));
+        assertEquals(Map.of(), service.findTransitiveSessionTags("ASIACHAIN", "token"));
+    }
+
+    @Test
     void sessionTagPersistenceIsolationRolePathExpiryAndRevocation() throws Exception {
         AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
                 new InMemoryStorage<>(), null, "000000000000");

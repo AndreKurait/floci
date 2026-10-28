@@ -17,6 +17,7 @@ public class SessionCredential {
     private String roleSessionName;
     private String assumedRoleId;
     private Map<String, String> sessionTags = Map.of();
+    private Map<String, String> transitiveSessionTags = Map.of();
     private Instant expiration;
     private Instant issuedAt;
     /** True only for credentials issued by GetSessionToken, never inferred from their key or token. */
@@ -121,6 +122,11 @@ public class SessionCredential {
 
     public String getAssumedRoleId() { return assumedRoleId; }
     public void setAssumedRoleId(String assumedRoleId) { this.assumedRoleId = assumedRoleId; }
+
+    public Map<String, String> getTransitiveSessionTags() { return transitiveSessionTags; }
+    public void setTransitiveSessionTags(Map<String, String> tags) {
+        transitiveSessionTags = tags == null ? Map.of() : Map.copyOf(tags);
+    }
 
     public Map<String, String> getSessionTags() { return sessionTags; }
     public void setSessionTags(Map<String, String> tags) { sessionTags = tags == null ? Map.of() : Map.copyOf(tags); }

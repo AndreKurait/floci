@@ -509,6 +509,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             Map<String, String> parameters = IamConditionContextResolver.formParameters(ctx);
             try {
                 StsSessionTags.readForm(parameters);
+                List<String> transitiveKeys = StsSessionTags.transitiveKeys(parameters);
+                if (!transitiveKeys.isEmpty()) {
+                    conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
+                    conditionContext.put("sts:TransitiveTagKeys", transitiveKeys);
+                }
             } catch (AwsException invalidTags) {
                 ctx.abortWith(queryXmlError(invalidTags.getErrorCode(), invalidTags.getMessage(), invalidTags.getHttpStatus()));
                 return;

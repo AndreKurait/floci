@@ -315,7 +315,19 @@ case-insensitively for `aws:PrincipalTag` conditions without changing the role o
 Stored session tags survive credential serialization; expiry and revocation keep their existing behavior.
 IAM-disabled requests still validate tag shapes and retain the tags, without checking policy permissions.
 
-This covers direct AssumeRole tag input and local credential authorization. Transitive tag inheritance
-and collisions, SAML/web-identity/federation tagging, packed session-token size limits and full request
-condition context remain separate limitations. Local JVM and signed SDK tests do not establish managed
+This covers direct AssumeRole tag input and local credential authorization. SAML/web-identity/federation
+tagging, packed session-token size limits and full request condition context remain separate limitations. Local JVM and signed SDK tests do not establish managed
 AWS, native-image or workload credential-delivery parity.
+
+### Direct AssumeRole tag chaining
+
+`AssumeRole` retains explicitly selected `TransitiveTagKeys` as session-owned metadata.
+Subsequent role assumptions inherit those tags, including across multiple hops, and reject
+explicit tags that collide with inherited keys. Unmarked session tags and attached role tags
+are not inherited. Requested transitive keys are available to identity and trust policy
+conditions; inherited tags do not become new request tags. Each receiving role must permit
+`sts:TagSession` when IAM enforcement is enabled.
+
+This applies to direct `AssumeRole` sessions. SAML and web-identity tag issuance, packed-token
+size accounting, and full role-chaining duration behavior are separate limitations. Local
+signature-enforcing SDK tests do not establish managed AWS error-message or runtime parity.

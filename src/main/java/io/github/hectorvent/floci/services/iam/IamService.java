@@ -4545,6 +4545,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 .filter(token -> !token.isBlank());
     }
 
+    /** Inherited tags come only from a live session whose issued token matches this request. */
+    public Map<String, String> findTransitiveSessionTags(String accessKeyId, String sessionToken) {
+        return currentSession(accessKeyId)
+                .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .map(SessionCredential::getTransitiveSessionTags).orElse(Map.of());
+    }
+
     /**
      * When the session a temporary access key belongs to expires, for callers that must not hand
      * out something outliving it. Empty for a long-term key, which names no session, and for a
@@ -4750,11 +4757,21 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                                 String roleArn, Instant expiration, String sessionPolicyDocument,
                                 String originAccountId, String roleSessionName, String assumedRoleId,
                                 Map<String, String> sessionTags) {
+        registerSession(sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, expiration,
+                sessionPolicyDocument, originAccountId, roleSessionName, assumedRoleId, sessionTags, Map.of());
+    }
+
+    /** Registers effective tags and their independently retained transitive subset in one storage write. */
+    public void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                                String roleArn, Instant expiration, String sessionPolicyDocument,
+                                String originAccountId, String roleSessionName, String assumedRoleId,
+                                Map<String, String> sessionTags, Map<String, String> transitiveTags) {
         SessionCredential session = new SessionCredential(sessionAccessKeyId, secretAccessKey, sessionToken,
                 roleArn, expiration, sessionPolicyDocument, originAccountId);
         session.setRoleSessionName(roleSessionName);
         session.setAssumedRoleId(assumedRoleId);
         session.setSessionTags(sessionTags);
+        session.setTransitiveSessionTags(transitiveTags);
         putNewSession(sessionAccessKeyId, session);
     }
 

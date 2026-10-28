@@ -8,6 +8,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -42,6 +43,49 @@ class StsSessionTagsTest {
         }
         AwsException error = assertThrows(AwsException.class, () -> StsSessionTags.readForm(form));
         assertEquals("ValidationError", error.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"empty", "long", "invalid", "too-many"})
+    void transitiveKeyConstraintsAreValidated(String scenario) {
+        Map<String, String> form = new HashMap<>();
+        form.put("TransitiveTagKeys.member.1", switch (scenario) {
+            case "empty" -> "";
+            case "long" -> "k".repeat(129);
+            case "invalid" -> "bad*";
+            default -> "Project";
+        });
+        if ("too-many".equals(scenario)) {
+            for (int index = 2; index <= 51; index++) {
+                form.put("TransitiveTagKeys.member." + index, "key" + index);
+            }
+        }
+        assertThrows(AwsException.class, () -> StsSessionTags.transitiveKeys(form));
+    }
+
+    @Test
+    void transitiveKeysUseOnlyConsumedMembersAndRetainAnImmutableSubset() throws Exception {
+        List<String> keys = StsSessionTags.transitiveKeys(Map.of("TransitiveTagKeys.member.3", "Project",
+                "TransitiveTagKeys.9", "部署", "Unrelated.TransitiveTagKeys.member.1", "ignored"));
+        assertEquals(List.of("Project", "部署"), keys);
+        Map<String, String> inherited = Map.of("Earlier", "retained");
+        Map<String, String> requested = Map.of("Project", "session", "Local", "not-transitive");
+        Map<String, String> transitive = StsSessionTags.transitive(requested, keys, inherited);
+        assertEquals(Map.of("Earlier", "retained", "Project", "session"), transitive);
+        assertEquals(Map.of("Earlier", "retained", "Project", "session", "Local", "not-transitive"),
+                StsSessionTags.inherit(requested, inherited));
+        assertThrows(AwsException.class, () -> StsSessionTags.inherit(Map.of("earlier", "replacement"), inherited));
+        assertThrows(UnsupportedOperationException.class, () -> transitive.put("new", "value"));
+        SessionCredential session = new SessionCredential();
+        session.setTransitiveSessionTags(transitive);
+        ObjectMapper mapper = new ObjectMapper();
+        SessionCredential restored = mapper.readValue(mapper.writeValueAsBytes(session), SessionCredential.class);
+        assertEquals(transitive, restored.getTransitiveSessionTags());
+        assertThrows(UnsupportedOperationException.class,
+                () -> restored.getTransitiveSessionTags().put("new", "value"));
+        assertEquals(Map.of(), mapper.readValue("{}", SessionCredential.class).getTransitiveSessionTags());
+        assertEquals(Map.of(), mapper.readValue("{\"transitiveSessionTags\":null}",
+                SessionCredential.class).getTransitiveSessionTags());
     }
 
     @Test
