@@ -1197,3 +1197,8 @@ boundary and SCP evaluators. Forwarded IP/protocol headers do not supply these v
 the default server configuration. The downstream Lambda caller-permission check remains a
 separate service call and does not inherit these inbound transport keys. Other inbound
 condition keys and transport-context propagation for HTTP/WebSocket routes remain separate work.
+
+WebSocket `AWS_IAM` connection authorization evaluates `aws:SourceIp` and
+`aws:SecureTransport` from the upgrade connection through the shared caller policy
+evaluator. Forwarded headers do not replace these connection facts. This applies
+to connection authorization, separately from downstream integration permissions.
