@@ -504,6 +504,18 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         Optional<CallerArns> callerArns = accountRootPrincipal
                 ? Optional.of(accountRootArns(accountId))
                 : iamService.resolveCallerArns(akid);
+        if ("sts:AssumeRole".equals(action) && callerArns.isPresent()) {
+            Map<String, String> parameters = IamConditionContextResolver.formParameters(ctx);
+            if (parameters.containsKey("SerialNumber") || parameters.containsKey("TokenCode")) {
+                try {
+                    callerArns = Optional.of(iamService.authenticateRequestMfa(callerArns.get(),
+                            parameters.get("SerialNumber"), parameters.get("TokenCode"), now));
+                } catch (AwsException denied) {
+                    ctx.abortWith(queryXmlError(denied.getErrorCode(), denied.getMessage(), denied.getHttpStatus()));
+                    return;
+                }
+            }
+        }
         if (callerArns.isPresent()) {
             caller = caller.withPrincipalArn(callerArns.get().callerArn());
             conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
