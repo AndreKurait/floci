@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.services.autoscaling;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.concurrent.KeyedWorkQueue;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.autoscaling.model.CapacityReservationSpecification;
@@ -40,7 +42,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -50,6 +55,7 @@ public class AutoScalingReconciler {
 
     private static final Logger LOG = Logger.getLogger(AutoScalingReconciler.class);
     private static final String SCALE_OUT_CAUSE = "An instance was started in response to a desired capacity change.";
+    static final int MAX_PENDING_CHANGES = 4096;
 
     /** The codes DescribeLaunchTemplates raises for an explicit name or id that does not exist. */
     private static final Set<String> LAUNCH_TEMPLATE_NOT_FOUND_CODES =
@@ -73,18 +79,34 @@ public class AutoScalingReconciler {
     private final ElbV2Service elbV2Service;
     private final ElbClassicService elbClassicService;
     private final SsmCommandService ssmCommandService;
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
-            r -> new Thread(r, "asg-reconciler"));
+    private final ScheduledExecutorService scheduler;
+    private final KeyedWorkQueue<AutoScalingGroupChanged> changes;
+    private int repairCursor;
+    private final ExecutorService launchWaiters = Executors.newVirtualThreadPerTaskExecutor();
+    private final Set<PendingLaunch> pendingLaunches = ConcurrentHashMap.newKeySet();
+
+    private record PendingLaunch(AutoScalingGroupChanged group, String instanceId) {}
 
     @Inject
     AutoScalingReconciler(AutoScalingService asgService, Ec2Service ec2Service,
                           ElbV2Service elbV2Service, ElbClassicService elbClassicService,
                           SsmCommandService ssmCommandService) {
+        this(asgService, ec2Service, elbV2Service, elbClassicService, ssmCommandService,
+                Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "asg-reconciler")));
+    }
+
+    AutoScalingReconciler(AutoScalingService asgService, Ec2Service ec2Service,
+                          ElbV2Service elbV2Service, ElbClassicService elbClassicService,
+                          SsmCommandService ssmCommandService, ScheduledExecutorService scheduler) {
         this.asgService = asgService;
         this.ec2Service = ec2Service;
         this.elbV2Service = elbV2Service;
         this.elbClassicService = elbClassicService;
         this.ssmCommandService = ssmCommandService;
+        this.scheduler = scheduler;
+        this.changes = new KeyedWorkQueue<>("asg-work", 4, MAX_PENDING_CHANGES,
+                change -> RequestScopes.runAs(change.accountId(), change.region(),
+                        () -> reconcileChangedGroup(change)));
     }
 
     AutoScalingReconciler(AutoScalingService asgService, Ec2Service ec2Service,
@@ -94,16 +116,69 @@ public class AutoScalingReconciler {
 
     @PostConstruct
     void start() {
-        scheduler.scheduleAtFixedRate(this::reconcileAll, 5, 10, TimeUnit.SECONDS);
+        scheduler.scheduleWithFixedDelay(this::requestAll, 5, 10, TimeUnit.SECONDS);
     }
 
     @PreDestroy
     void stop() {
         scheduler.shutdownNow();
+        launchWaiters.shutdownNow();
+        changes.close();
     }
 
     void onStart(@Observes StartupEvent event) {
         LOG.debug("Auto Scaling reconciler initialized");
+    }
+
+    void onGroupChanged(@Observes AutoScalingGroupChanged change) {
+        changes.submit(change);
+    }
+
+    private void requestAll() {
+        List<AutoScalingGroupChanged> groups = new ArrayList<>();
+        try {
+            for (String accountId : asgService.autoScalingGroupAccountIds()) {
+                try {
+                    RequestScopes.runAs(accountId, () -> {
+                        for (AutoScalingGroup group : asgService.describeAutoScalingGroups(null, null)) {
+                            groups.add(new AutoScalingGroupChanged(accountId,
+                                    group.getRegion(), group.getAutoScalingGroupName()));
+                        }
+                    });
+                } catch (RuntimeException failure) {
+                    LOG.warnv(failure, "Could not enumerate Auto Scaling repair for account {0}", accountId);
+                }
+            }
+            groups.sort(Comparator.comparing(AutoScalingGroupChanged::accountId)
+                    .thenComparing(AutoScalingGroupChanged::region).thenComparing(AutoScalingGroupChanged::name));
+            if (groups.isEmpty()) {
+                return;
+            }
+            int start = Math.floorMod(repairCursor, groups.size());
+            for (int offset = 0; offset < groups.size(); offset++) {
+                int index = (start + offset) % groups.size();
+                if (!changes.submit(groups.get(index))) {
+                    // Resume at the rejected resource so a large inventory does not starve its tail.
+                    repairCursor = index;
+                    return;
+                }
+            }
+            repairCursor = 0;
+        } catch (RuntimeException failure) {
+            LOG.warnv(failure, "Could not schedule Auto Scaling repair; the next sweep will retry");
+        }
+    }
+
+    private void reconcileChangedGroup(AutoScalingGroupChanged change) {
+        try {
+            for (AutoScalingGroup group : asgService.describeAutoScalingGroups(
+                    change.region(), List.of(change.name()))) {
+                reconcile(group);
+            }
+        } catch (Exception error) {
+            LOG.warnv(error, "Reconcile failed for changed ASG {0} in account {1}",
+                    change.name(), change.accountId());
+        }
     }
 
     void reconcileAll() {
@@ -149,6 +224,9 @@ public class AutoScalingReconciler {
                 if (!scaleOut(asg, (int) (desired - activeCapacity - reservedCapacity))) {
                     return;
                 }
+                // A synchronous EC2 launch can already be running. Observe that state
+                // now instead of imposing another periodic-reconciliation interval.
+                promoteReadyInstances(asg);
             } else if (activeCapacity > desired && !asg.getSuspendedProcesses().contains("Terminate")) {
                 scaleIn(asg, (int) (activeCapacity - desired));
             }
@@ -251,6 +329,9 @@ public class AutoScalingReconciler {
                     continue;
                 }
                 String ec2State = ec2Instances.get(0).getState().getName();
+                if ("pending".equals(ec2State)) {
+                    watchPendingLaunch(asg, ec2Instances.getFirst());
+                }
                 if ("running".equals(ec2State)) {
                     asgInst.setLifecycleState("InService");
                     asgInst.setHealthStatus("Healthy");
@@ -271,6 +352,49 @@ public class AutoScalingReconciler {
         }
         if (changed) {
             asgService.saveAutoScalingGroupIfPresent(asg);
+        }
+    }
+
+    void watchPendingLaunch(AutoScalingGroup asg, Instance instance) {
+        String account = AwsArnUtils.accountOrDefault(asg.getAutoScalingGroupArn(), instance.getOwnerId());
+        if (account == null || account.isBlank()) {
+            return;
+        }
+        PendingLaunch launch = new PendingLaunch(
+                new AutoScalingGroupChanged(account, asg.getRegion(), asg.getAutoScalingGroupName()),
+                instance.getInstanceId());
+        synchronized (pendingLaunches) {
+            if (launchWaiters.isShutdown() || pendingLaunches.size() >= MAX_PENDING_CHANGES
+                    || !pendingLaunches.add(launch)) {
+                return;
+            }
+        }
+        try {
+            launchWaiters.execute(() -> {
+                try {
+                    long deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(5);
+                    synchronized (instance) {
+                        while (instance.getState() != null
+                                && "pending".equals(instance.getState().getName())) {
+                            long remaining = deadline - System.nanoTime();
+                            if (remaining <= 0) {
+                                return;
+                            }
+                            TimeUnit.NANOSECONDS.timedWait(instance, remaining);
+                        }
+                    }
+                    onGroupChanged(launch.group());
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    pendingLaunches.remove(launch);
+                }
+            });
+        } catch (RejectedExecutionException rejected) {
+            pendingLaunches.remove(launch);
+            if (!launchWaiters.isShutdown()) {
+                LOG.warn("Could not watch pending EC2 launch; periodic reconciliation will retry", rejected);
+            }
         }
     }
 
@@ -663,6 +787,9 @@ public class AutoScalingReconciler {
                 }
             }
             asg.getInstances().add(asgInst);
+            if (ec2Inst.getState() != null && "pending".equals(ec2Inst.getState().getName())) {
+                watchPendingLaunch(asg, ec2Inst);
+            }
             LOG.infov("ASG {0}: launched instance {1} (Pending)", asg.getAutoScalingGroupName(), ec2Inst.getInstanceId());
         }
         return instances;
