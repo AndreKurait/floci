@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -62,6 +63,54 @@ class Ec2CapacityReservationAssociationServiceTest {
 
     @TempDir
     Path directory;
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void clientTokenReplaySurvivesChangesAndRestartWithinItsAccountAndRegion(String mode) {
+        String originalId;
+        try (Fixture fixture = new Fixture(mode, directory)) {
+            originalId = fixture.createWithToken(REGION).getCapacityReservationId();
+            fixture.service.modifyCapacityReservation(REGION, originalId, 3, null, null, null);
+            fixture.service.createTags(REGION, List.of(originalId), List.of(new Tag("purpose", "updated")));
+        }
+        try (Fixture otherAccount = new Fixture(mode, directory, "222222222222")) {
+            CapacityReservation other = otherAccount.createWithToken(REGION);
+            assertNotEquals(originalId, other.getCapacityReservationId());
+            assertEquals("222222222222", other.getOwnerId());
+        }
+        try (Fixture recovered = new Fixture(mode, directory)) {
+            CapacityReservation replay = recovered.createWithToken(REGION);
+            assertEquals(originalId, replay.getCapacityReservationId());
+            assertEquals(3, replay.getTotalInstanceCount());
+            assertEquals(List.of("updated"), replay.getTags().stream().map(Tag::getValue).toList());
+            assertNotEquals(originalId, recovered.createWithToken("eu-west-1").getCapacityReservationId());
+        }
+    }
+
+    @Test
+    void priorCreationSnapshotReplaysWithExplicitDefaultsAfterMutation() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            CapacityReservation original = fixture.createWithToken(REGION);
+            CapacityReservation stored = fixture.store.get(REGION + "::" + original.getCapacityReservationId()).orElseThrow();
+            stored.setRequestParameters(List.of());
+            stored.setRequestTags(Map.of());
+            fixture.store.put(REGION + "::" + original.getCapacityReservationId(), stored);
+            fixture.service.modifyCapacityReservation(REGION, original.getCapacityReservationId(), 3, null, null, null);
+            fixture.service.createTags(REGION, List.of(original.getCapacityReservationId()),
+                    List.of(new Tag("purpose", "updated")));
+            CapacityReservation replay = fixture.service.createCapacityReservation(REGION, "t3.micro", "Linux/UNIX",
+                    REGION + "a", null, 2, "default", false, false, "unlimited", null, "targeted", null, null,
+                    "retry-token", List.of(new Tag("purpose", "original")));
+            assertEquals(original.getCapacityReservationId(), replay.getCapacityReservationId());
+            assertEquals(3, replay.getTotalInstanceCount());
+            assertEquals("updated", replay.getTags().getFirst().getValue());
+            assertEquals("IdempotentParameterMismatch", assertThrows(AwsException.class,
+                    () -> fixture.service.createCapacityReservation(REGION, "t3.micro", "Linux/UNIX", REGION + "a",
+                            null, 2, null, null, null, null, null, "targeted", null, null,
+                            Instant.parse("2026-10-08T00:00:00Z"), null, null, "retry-token",
+                            List.of(new Tag("purpose", "original")))).getErrorCode());
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(strings = {"default", "open", "targeted"})
@@ -113,6 +162,28 @@ class Ec2CapacityReservationAssociationServiceTest {
     void futureSupportedFamiliesUseCatalogIncludingAcceleratedAndHighMemory(String type) {
         try (Fixture fixture = new Fixture("memory", directory)) {
             assertEquals("scheduled", fixture.future(type, 32, "targeted").getState());
+        }
+    }
+
+    @Test
+    void priorScheduledRawSnapshotReplaysAfterActivation() {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            Instant now = Instant.parse("2026-10-01T00:00:00Z");
+            Instant start = now.plus(Duration.ofDays(7));
+            doReturn(now).when(fixture.service).capacityReservationNow();
+            CapacityReservation scheduled = fixture.scheduleWithTags(start, List.of(new Tag("Name", "original")));
+            CapacityReservation stored = fixture.store.get(REGION + "::" + scheduled.getCapacityReservationId()).orElseThrow();
+            stored.setCreationParameters(Map.of());
+            fixture.store.put(REGION + "::" + scheduled.getCapacityReservationId(), stored);
+            fixture.service.createTags(REGION, List.of(scheduled.getCapacityReservationId()),
+                    List.of(new Tag("Name", "updated")));
+            doReturn(start).when(fixture.service).capacityReservationNow();
+            CapacityReservation replay = fixture.scheduleWithTags(start, List.of(new Tag("Name", "original")));
+            assertEquals(scheduled.getCapacityReservationId(), replay.getCapacityReservationId());
+            assertEquals("active", replay.getState());
+            assertEquals("updated", replay.getTags().getFirst().getValue());
+            assertEquals("IdempotentParameterMismatch", assertThrows(AwsException.class,
+                    () -> fixture.scheduleWithTags(start, List.of(new Tag("Name", "changed")))).getErrorCode());
         }
     }
 
@@ -1003,8 +1074,12 @@ class Ec2CapacityReservationAssociationServiceTest {
         private final ResourceGroupsService groups;
 
         private Fixture(String mode, Path path) {
+            this(mode, path, ACCOUNT);
+        }
+
+        private Fixture(String mode, Path path, String account) {
             config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-            when(config.defaultAccountId()).thenReturn(ACCOUNT);
+            when(config.defaultAccountId()).thenReturn(account);
             when(config.services().ec2().mock()).thenReturn(true);
             when(config.services().ec2().mockPublicAddresses())
                     .thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.NONE);
@@ -1104,6 +1179,12 @@ class Ec2CapacityReservationAssociationServiceTest {
         private CapacityReservation create(int count) {
             return service.createCapacityReservation(REGION, "t3.micro", "Linux/UNIX", REGION + "a",
                     null, count, null, null, null, null, null, null, null, null);
+        }
+
+        private CapacityReservation createWithToken(String region) {
+            return service.createCapacityReservation(region, "t3.micro", "Linux/UNIX", region + "a",
+                    null, 2, null, null, null, null, null, "targeted", null, null,
+                    "retry-token", List.of(new Tag("purpose", "original")));
         }
 
         private CapacityReservation describe(CapacityReservation reservation) {

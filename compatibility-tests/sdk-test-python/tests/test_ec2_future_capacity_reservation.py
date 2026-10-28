@@ -74,6 +74,32 @@ def test_invalid_schedule_does_not_create_capacity(ec2_client, unique_name):
     )["CapacityReservations"] == []
 
 
+def test_immediate_replay_preserves_normalized_defaults_and_later_edits(ec2_client, unique_name):
+    request = {
+        "InstanceType": "t3.micro", "InstancePlatform": "Linux/UNIX", "InstanceCount": 2,
+        "AvailabilityZone": ec2_client.describe_availability_zones()["AvailabilityZones"][0]["ZoneName"],
+        "InstanceMatchCriteria": "targeted", "ClientToken": unique_name,
+        "TagSpecifications": [{"ResourceType": "capacity-reservation",
+                               "Tags": [{"Key": "Name", "Value": unique_name}]}],
+    }
+    created = ec2_client.create_capacity_reservation(**request)["CapacityReservation"]
+    identifier = created["CapacityReservationId"]
+    try:
+        ec2_client.modify_capacity_reservation(CapacityReservationId=identifier, InstanceCount=3)
+        ec2_client.create_tags(Resources=[identifier], Tags=[{"Key": "Name", "Value": unique_name + "-edited"}])
+        replay = ec2_client.create_capacity_reservation(
+            **request, Tenancy="default", EbsOptimized=False, EphemeralStorage=False, EndDateType="unlimited"
+        )["CapacityReservation"]
+        assert replay["CapacityReservationId"] == identifier
+        assert replay["TotalInstanceCount"] == 3
+        assert replay["Tags"] == [{"Key": "Name", "Value": unique_name + "-edited"}]
+        with pytest.raises(ClientError) as mismatch:
+            ec2_client.create_capacity_reservation(**request, StartDate=datetime.now(timezone.utc) + timedelta(days=7))
+        assert mismatch.value.response["Error"]["Code"] == "IdempotentParameterMismatch"
+    finally:
+        ec2_client.cancel_capacity_reservation(CapacityReservationId=identifier)
+
+
 @pytest.mark.parametrize("overrides", [
     {}, {"InstanceMatchCriteria": "open"},
     {"InstanceMatchCriteria": "targeted", "InstanceCount": 7},
