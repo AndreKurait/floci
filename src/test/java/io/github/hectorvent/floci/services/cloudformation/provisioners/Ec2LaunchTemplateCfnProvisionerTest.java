@@ -58,6 +58,7 @@ class Ec2LaunchTemplateCfnProvisionerTest {
         });
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
         when(engine.omitNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(engine.resolveNodeOmittingNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
         return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
     }
 
@@ -239,6 +240,60 @@ class Ec2LaunchTemplateCfnProvisionerTest {
                 captor.getValue().getIamInstanceProfile().getArn());
         assertNull(captor.getValue().getIamInstanceProfile().getName());
         assertEquals(List.of("sg-1", "sg-2"), captor.getValue().getSecurityGroupIds());
+    }
+
+    @Test
+    void nestedLaunchFieldsPreserveFalseAndOmittedInterfaceOptions() throws Exception {
+        when(ec2.createLaunchTemplate(any(), any(), any(), any())).thenReturn(template("lt-nested"));
+        JsonNode props = mapper.readTree("""
+                {
+                  "LaunchTemplateData": {
+                    "ImageId": "ami-12345678",
+                    "InstanceType": "t3.micro",
+                    "NetworkInterfaces": [
+                      {"DeviceIndex": 0, "AssociatePublicIpAddress": false, "SubnetId": "subnet-primary",
+                       "Groups": ["sg-primary"], "DeleteOnTermination": false},
+                      {"DeviceIndex": 1, "SubnetId": "subnet-secondary"}
+                    ],
+                    "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 2},
+                    "BlockDeviceMappings": [
+                      {"DeviceName": "/dev/xvda", "Ebs": {"VolumeType": "gp3", "VolumeSize": 20,
+                       "Iops": 3000, "Throughput": 125, "Encrypted": true, "DeleteOnTermination": false}}
+                    ],
+                    "TagSpecifications": [
+                      {"ResourceType": "instance", "Tags": [{"Key": "Purpose", "Value": "nested-launch"}]}
+                    ],
+                    "Monitoring": {"Enabled": false}
+                  }
+                }
+                """);
+
+        provisioner.provision(resource("Lt"), props, ctx());
+
+        ArgumentCaptor<LaunchTemplateData> captor = ArgumentCaptor.forClass(LaunchTemplateData.class);
+        verify(ec2).createLaunchTemplate(eq("us-east-1"), anyString(), captor.capture(), isNull());
+        LaunchTemplateData data = captor.getValue();
+        assertEquals(2, data.getNetworkInterfaces().size());
+        LaunchTemplateData.NetworkInterface primary = data.primaryNetworkInterface();
+        assertEquals(Boolean.FALSE, data.effectiveAssociatePublicIpAddress());
+        assertEquals("subnet-primary", primary.getSubnetId());
+        assertEquals(List.of("sg-primary"), primary.getGroups());
+        assertEquals(Boolean.FALSE, primary.getDeleteOnTermination());
+        assertNull(data.getNetworkInterfaces().get(1).getAssociatePublicIpAddress());
+        assertEquals("required", data.getMetadataOptions().getHttpTokens());
+        assertEquals(2, data.getMetadataOptions().getHttpPutResponseHopLimit());
+        LaunchTemplateData.BlockDeviceMapping mapping = data.getBlockDeviceMappings().getFirst();
+        assertEquals("/dev/xvda", mapping.getDeviceName());
+        assertEquals("gp3", mapping.getEbs().getVolumeType());
+        assertEquals(20, mapping.getEbs().getVolumeSize());
+        assertEquals(3000, mapping.getEbs().getIops());
+        assertEquals(125, mapping.getEbs().getThroughput());
+        assertEquals(Boolean.TRUE, mapping.getEbs().getEncrypted());
+        assertEquals(Boolean.FALSE, mapping.getEbs().getDeleteOnTermination());
+        assertEquals("instance", data.getTagSpecifications().getFirst().getResourceType());
+        assertEquals("Purpose", data.getInstanceTags().getFirst().getKey());
+        assertEquals("nested-launch", data.getInstanceTags().getFirst().getValue());
+        assertEquals(Boolean.FALSE, data.getMonitoring().getEnabled());
     }
 
     @Test

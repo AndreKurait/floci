@@ -92,6 +92,7 @@ import io.github.hectorvent.floci.services.ec2.model.TransitGatewayVpcAttachment
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
+import io.github.hectorvent.floci.services.ec2.model.VolumeListResult;
 import io.github.hectorvent.floci.services.ec2.model.VolumeModification;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.ec2.model.VpcCidrBlockAssociation;
@@ -197,6 +198,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private static final String SYNTHETIC_FALLBACK_CIDR = "172.31.0.0/24";
     private static final String DEFAULT_ROOT_VOLUME_TYPE = "gp3";
     private static final String DOCUMENTATION_PREFIX = "203.0.113.";
+    private static final long MAX_MOCK_PUBLIC_ADDRESS_POOL_SIZE = 256;
     private static final Set<String> VALID_VOLUME_TYPES =
             Set.of("standard", "io1", "io2", "gp2", "sc1", "st1", "gp3");
     /** The volume types whose IOPS are provisioned, and so the only ones a launch keeps Iops for. */
@@ -349,6 +351,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final Object privateIpAllocationLock = new Object();
     /** Host part (1-254) of the last 203.0.113.0/24 address handed out; guarded by the allocation lock. */
     private int documentationHost;
+    private final Cidr4 mockPublicAddressPool;
+    /** Next configured pool offset to try; persisted holders, not this cursor, retain leases. */
+    private long mockPublicAddressOffset;
 
     /**
      * Null in the hermetic unit tests, which reach the constructors that do not take it; CDI always
@@ -1033,6 +1038,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                StorageBackend<String, DhcpOptions> dhcpOptions,
                Ec2RunInstancesReplay runInstancesReplay) {
         this.runInstancesReplay = runInstancesReplay;
+        this.mockPublicAddressPool = configuredMockPublicAddressPool(config);
         this.hosts = hosts;
         this.egressOnlyInternetGateways = egressOnlyInternetGateways;
         this.transitGatewayPeeringAttachments = transitGatewayPeeringAttachments;
@@ -1184,18 +1190,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (volumeBlockDeviceManager == null || inst == null) {
             return;
         }
-        Map<String, Volume> allVolumes;
-        if (volumes instanceof AccountAwareStorageBackend<?> rawAccountAware) {
-            @SuppressWarnings("unchecked")
-            AccountAwareStorageBackend<Volume> accountAware = (AccountAwareStorageBackend<Volume>) rawAccountAware;
-            allVolumes = accountAware.scanAllAccountsAsMap();
-        } else {
-            allVolumes = new LinkedHashMap<>();
-            for (String k : volumes.keys()) {
-                volumes.get(k).ifPresent(v -> allVolumes.put(k, v));
-            }
-        }
-        for (Volume vol : allVolumes.values()) {
+        for (Volume vol : volumes.scan(k -> k.startsWith(region + "::"))) {
             if (vol == null || !region.equals(vol.getRegion()) || vol.getAttachments().isEmpty()) {
                 continue;
             }
@@ -3955,6 +3950,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                     int networkInterfaceDeviceIndex, String availabilityZone,
                                     LaunchTemplateData.MetadataOptions metadataOptions,
                                     String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
+                                    String hostId, String tenancy) {
+        return runInstances(region, imageId, instanceType, minCount, maxCount, keyName,
+                securityGroupIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone,
+                metadataOptions, creditSpecificationCpuCredits, encodedUserData, dryRun, hostId, tenancy, List.of());
+    }
+
+    public Reservation runInstances(String region, String imageId, String instanceType,
+                                    int minCount, int maxCount, String keyName,
+                                    List<String> securityGroupIds, String subnetId,
+                                    String clientToken, List<Tag> instanceTags,
+                                    String userData, String iamInstanceProfileArn,
+                                    Boolean associatePublicIp, String networkInterfaceId,
+                                    int networkInterfaceDeviceIndex, String availabilityZone,
+                                    LaunchTemplateData.MetadataOptions metadataOptions,
+                                    String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
                                     String hostId, String tenancy,
                                     List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings) {
         return runInstances(region, imageId, instanceType, minCount, maxCount, keyName,
@@ -4091,6 +4102,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (privateIpAddress != null && privateIpAddress.isBlank()) {
             privateIpAddress = null;
         }
+        if (blockDeviceMappings == null) {
+            blockDeviceMappings = List.of();
+        }
         if (hostId != null && !hostId.isBlank()) {
             Host host = getRequiredAvailableHost(region, hostId);
             if ((availabilityZone == null || availabilityZone.isBlank())
@@ -4161,25 +4175,18 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         String az = subnet != null ? subnet.getAvailabilityZone()
                 : availabilityZone != null && !availabilityZone.isBlank() ? availabilityZone : region + "a";
         String finalSubnetId = subnet != null ? subnet.getSubnetId() : null;
+        boolean automaticPublicIp = suppliedEni == null && (associatePublicIp != null
+                ? associatePublicIp : subnet != null && subnet.isMapPublicIpOnLaunch());
 
         // Resolve security groups
-        List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
+        List<GroupIdentifier> sgIdentifiers;
         if (suppliedEni != null) {
             // AWS ignores instance-level SecurityGroupId when a network interface is supplied;
             // the interface's own groups win (module main.tf sets vpc_security_group_ids = null
             // in this case, so there is nothing to conflict with in practice).
-            sgIdentifiers.addAll(suppliedEni.getGroups());
-        } else if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
-            for (String sgId : securityGroupIds) {
-                SecurityGroup sg = getRequiredSecurityGroup(region, sgId);
-                sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
-            }
+            sgIdentifiers = new ArrayList<>(suppliedEni.getGroups());
         } else {
-            // Use default SG
-            SecurityGroup defaultSg = securityGroups.get(key(region, resolveDefaultSecurityGroupId(region))).orElse(null);
-            if (defaultSg != null) {
-                sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
-            }
+            sgIdentifiers = resolveSecurityGroups(region, vpcId, securityGroupIds, finalSubnetId);
         }
 
         String reservationId = "r-" + randomHex(17);
@@ -4261,7 +4268,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             requireNotDeregistered(region, imageId);
             // Planned under the lock DeregisterImage deletes snapshots under, so a snapshot a
             // mapping names is still there when its volume is stored.
-            Image image = findImageForCapture(region, imageId);
+            Image image = imageForCaller(region, imageId).orElseGet(() -> sharedImageForCaller(region, imageId)
+                    .orElseGet(() -> imageCatalog.findByIdOrAlias(imageId)
+                            .map(Ec2ImageCatalog.CatalogImage::toImage).orElse(null)));
             String rootDeviceName = image != null && image.getRootDeviceName() != null
                     ? image.getRootDeviceName() : new Instance().getRootDeviceName();
             List<LaunchVolume> launchVolumes = planLaunchVolumes(region, image, rootDeviceName, launchMappings);
@@ -4296,6 +4305,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             suppliedEni = REPLAY_MAPPER.convertValue(current, NetworkInterface.class);
                         }
                     }
+                    List<String> publicIps = allocateMockPublicAddresses(automaticPublicIp, admitted);
                     List<String> privateIps = allocateLaunchAddresses(region, finalSubnetId, suppliedEni,
                             privateIpAddress, admitted);
                     List<Allocation> allocations = new ArrayList<>(admitted);
@@ -4349,9 +4359,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         // override wins in both directions; the subnet's MapPublicIpOnLaunch
                         // attribute is only the default when the launch does not specify it. An
                         // interface the caller created never takes an automatic address.
-                        inst.setAssociatePublicIp(suppliedEni == null && (associatePublicIp != null
-                                ? associatePublicIp
-                                : subnet != null && subnet.isMapPublicIpOnLaunch()));
+                        inst.setAssociatePublicIp(automaticPublicIp);
+                        if (!publicIps.isEmpty()) {
+                            setPublicAddress(inst, publicIps.get(i));
+                        }
                         inst.setPrivateIpAddress(privateIp);
                         inst.setPrivateDnsName(AwsRegions.ec2PrivateIpDnsName(privateIp, region));
                         inst.setKeyName(keyName);
@@ -4387,7 +4398,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         eni.setVpcId(vpcId);
                         eni.setOwnerId(callerAccountId());
                         eni.setDescription(suppliedEni != null ? suppliedEni.getDescription() : null);
-                        eni.setMacAddress(suppliedEni != null ? suppliedEni.getMacAddress() : null);
+                        eni.setMacAddress(suppliedEni != null ? suppliedEni.getMacAddress() : randomMac());
                         eni.setPrivateIpAddress(privateIp);
                         eni.setPrivateDnsName(inst.getPrivateDnsName());
                         eni.setGroups(new ArrayList<>(sgIdentifiers));
@@ -4482,8 +4493,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         .map(group -> securityGroups.get(key(region, group.getGroupId()))
                                 .orElseThrow(() -> new IllegalStateException("Missing security group " + group.getGroupId())))
                         .toList();
+                String accountId = callerAccountId();
                 containerManager.launch(inst, dockerImage, publicKey, region, desiredPublishedPorts(region, inst),
-                        policyGroups, policyPrefixLists(region, policyGroups));
+                        policyGroups, policyPrefixLists(region, policyGroups), () ->
+                                RequestScopes.runAs(accountId, region, () -> restoreAttachedVolumesForInstance(region, inst)));
             }
         }
 
@@ -4826,7 +4839,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private void validateArchitectureCompatibility(String region, String imageId, String instanceType) {
-        Optional<String> imageArchitecture = registeredImages.get(key(region, imageId))
+        Optional<String> imageArchitecture = imageForCaller(region, imageId)
+                .or(() -> sharedImageForCaller(region, imageId))
                 .map(Image::getArchitecture)
                 .or(() -> imageCatalog.findByIdOrAlias(imageId).map(image -> image.architecture))
                 .filter(value -> !value.isBlank());
@@ -4846,7 +4860,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private String architectureFor(String region, String imageId, String instanceType) {
-        Optional<String> registeredArchitecture = registeredImages.get(key(region, imageId))
+        Optional<String> registeredArchitecture = imageForCaller(region, imageId)
+                .or(() -> sharedImageForCaller(region, imageId))
                 .map(Image::getArchitecture);
         return registeredArchitecture
                 .filter(value -> !value.isBlank())
@@ -5297,7 +5312,56 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             case NONE -> null;
             case FIXED -> fixedMockPublicAddress();
             case DOCUMENTATION -> documentationPublicAddress();
+            case POOL -> pooledPublicAddress();
         };
+    }
+
+    private static Cidr4 configuredMockPublicAddressPool(EmulatorConfig config) {
+        EmulatorConfig.Ec2ServiceConfig ec2 = config.services().ec2();
+        if (ec2.mockPublicAddresses() != EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.POOL) {
+            return null;
+        }
+        String configured = ec2.mockPublicAddressPool().map(String::strip).orElse("");
+        Cidr4 pool = Cidr4.parse(configured).orElseThrow(() -> new IllegalArgumentException(
+                "floci.services.ec2.mock-public-address-pool requires a network-aligned IPv4 CIDR"));
+        if (!pool.toString().equals(configured) || pool.size() > MAX_MOCK_PUBLIC_ADDRESS_POOL_SIZE) {
+            throw new IllegalArgumentException(
+                    "floci.services.ec2.mock-public-address-pool requires a network-aligned /24 to /32 CIDR");
+        }
+        return pool;
+    }
+
+    /** Reserve the whole launch before private addresses, tags or volumes are written. */
+    private List<String> allocateMockPublicAddresses(boolean publicIpDue, int count) {
+        if (!config.services().ec2().mock() || mockPublicAddressPool == null || !publicIpDue) {
+            return List.of();
+        }
+        if (count > mockPublicAddressPool.size()) {
+            throw exhaustedMockPublicAddressPool();
+        }
+        Set<String> taken = publicAddressesInUse();
+        List<String> allocated = new ArrayList<>(count);
+        for (long step = 0; step < mockPublicAddressPool.size() && allocated.size() < count; step++) {
+            long offset = mockPublicAddressOffset;
+            mockPublicAddressOffset = (offset + 1) % mockPublicAddressPool.size();
+            String candidate = mockPublicAddressPool.addressAt(offset).orElseThrow();
+            if (taken.add(candidate)) {
+                allocated.add(candidate);
+            }
+        }
+        if (allocated.size() < count) {
+            throw exhaustedMockPublicAddressPool();
+        }
+        return allocated;
+    }
+
+    /** Callers hold the allocation lock until the chosen identity is stored on its instance. */
+    private String pooledPublicAddress() {
+        return allocateMockPublicAddresses(true, 1).get(0);
+    }
+
+    private static AwsException exhaustedMockPublicAddressPool() {
+        return new AwsException("AddressLimitExceeded", "The configured mock public address pool is exhausted.", 400);
     }
 
     /**
@@ -5315,21 +5379,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * The next address from 203.0.113.0/24 (TEST-NET-3, reserved for documentation and routed
-     * nowhere) after the last one handed out, skipping any the caller's account already holds as an
-     * instance's public address or an Elastic IP, so a restarted instance gets a different address
-     * as on AWS. Callers hold the allocation lock, so two requests do not pick the same one.
+     * nowhere) after the last one handed out, skipping instance public addresses and Elastic IPs
+     * held in any account or region, including restored records after a service restart.
+     * Callers hold the allocation lock, so two requests do not pick the same one.
      *
      * @return the address, or null once all 254 are taken
      */
     private String documentationPublicAddress() {
-        Set<String> taken = new HashSet<>();
-        for (Instance other : instances.scan(k -> true)) {
-            taken.add(other.getPublicIpAddress());
-        }
-        for (Address other : addresses.scan(k -> true)) {
-            taken.add(other.getPublicIp());
-            taken.add(other.getAllocatedPublicIp());
-        }
+        Set<String> taken = publicAddressesInUse();
         for (int i = 0; i < 254; i++) {
             documentationHost = documentationHost % 254 + 1;
             String candidate = DOCUMENTATION_PREFIX + documentationHost;
@@ -5338,6 +5395,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
         }
         return null;
+    }
+
+    private Set<String> publicAddressesInUse() {
+        Set<String> taken = new HashSet<>();
+        for (Instance other : instances instanceof AccountAwareStorageBackend<Instance> aware
+                ? aware.scanAllAccounts() : instances.scan(k -> true)) {
+            taken.add(other.getPublicIpAddress());
+        }
+        for (Address other : addresses instanceof AccountAwareStorageBackend<Address> aware
+                ? aware.scanAllAccounts() : addresses.scan(k -> true)) {
+            taken.add(other.getPublicIp());
+            taken.add(other.getAllocatedPublicIp());
+        }
+        return taken;
     }
 
     private static String primaryInterfaceId(Instance instance) {
@@ -5404,8 +5475,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * the primary interface it was associated through, or null.
      */
     private Address primaryElasticAddress(String region, Instance instance) {
+        return primaryElasticAddress(region, instance, null);
+    }
+
+    private Address primaryElasticAddress(String region, Instance instance, String excludedAllocationId) {
         String primaryInterfaceId = primaryInterfaceId(instance);
         for (Address address : addresses.scan(k -> k.startsWith(region + "::"))) {
+            if (excludedAllocationId != null && excludedAllocationId.equals(address.getAllocationId())) {
+                continue;
+            }
             boolean onInstance = instance.getInstanceId().equals(address.getInstanceId())
                     || primaryInterfaceId != null && primaryInterfaceId.equals(address.getNetworkInterfaceId());
             if (onInstance && address.getAssociationId() != null
@@ -5420,6 +5498,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         Image image = findImageForCapture(instance.getRegion(), instance.getImageId());
         return image != null && "windows".equalsIgnoreCase(image.getPlatform())
                 ? "Windows" : "Linux/UNIX";
+    }
+
+    public List<VolumeAttachment> instanceVolumeAttachments(String region, String instanceId) {
+        return volumes.scan(k -> true).stream().filter(v -> region.equals(v.getRegion()))
+                .flatMap(v -> v.getAttachments().stream())
+                .filter(a -> instanceId.equals(a.getInstanceId())).toList();
     }
 
     public List<Map<String, String>> terminateInstances(String region, List<String> instanceIds) {
@@ -5674,7 +5758,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 restoreInstanceFirewall(inst);
                 String accountId = callerAccountId();
                 containerManager.start(inst, () ->
-                        RequestScopes.runAs(accountId, () -> restoreAttachedVolumesForInstance(region, inst)));
+                        RequestScopes.runAs(accountId, region, () -> restoreAttachedVolumesForInstance(region, inst)));
             }
             instances.put(key(region, id), inst);
             Map<String, String> entry = new LinkedHashMap<>();
@@ -5777,6 +5861,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     && "terminated".equals(inst.getState().getName())
                     && inst.getTerminatedAt() > 0
                     && inst.getTerminatedAt() < cutoff) {
+                tags.delete(inst.getInstanceId());
                 instances.delete(storeKey);
                 if (inst.getRegion() != null) {
                     removeTags(inst.getRegion(), inst.getInstanceId());
@@ -6504,12 +6589,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Vpc createVpc(String region, String cidrBlock, boolean isDefault) {
         return createVpc(region, cidrBlock, isDefault, false);
-    }
-
-    private static void requireNotDryRun(boolean dryRun) {
-        if (dryRun) {
-            throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
-        }
     }
 
     public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
@@ -8878,6 +8957,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .collect(Collectors.toList());
         List<Image> images = new ArrayList<>(catalogImages);
         images.addAll(createdImages);
+        if (registeredImages instanceof AccountAwareStorageBackend<Image> aware) {
+            aware.scanAllAccountEntries(k -> k.startsWith(region + "::")).stream()
+                    .filter(entry -> !callerAccountId().equals(entry.accountId()))
+                    .map(entry -> entry.value().getImageId()).distinct()
+                    .map(id -> sharedImageForCaller(region, id)).flatMap(Optional::stream)
+                    .map(this::sharedImageView)
+                    .filter(img -> matchesImageIds(img, imageIds))
+                    .filter(img -> matchesImageOwners(img, owners))
+                    .filter(img -> matchesRegisteredImageFilters(img, filters))
+                    .forEach(images::add);
+        }
         addFallbackLaunchableImages(region, images, imageIds, owners, filters);
         return images;
     }
@@ -8896,8 +8986,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         for (String imageId : imageIds) {
             if (imageId == null || !imageId.startsWith("ami-") || present.contains(imageId)
                     || imageCatalog.findByIdOrAlias(imageId).isPresent()
-                    || registeredImages.get(key(region, imageId)).isPresent()) {
+                    || imageForCaller(region, imageId).isPresent()) {
                 continue;
+            }
+            if (!foreignImageEntries(region, imageId).isEmpty()) {
+                if (sharedImageForCaller(region, imageId).isPresent()) {
+                    continue; // A visible image excluded by the requested owners or filters is not a fallback.
+                }
+                throw new AwsException("InvalidAMIID.NotFound", "The image is not available: " + imageId, 400);
             }
             Image fallback = fallbackLaunchableImage(imageId);
             if (matchesImageOwners(fallback, owners) && matchesRegisteredImageFilters(fallback, filters)) {
@@ -8939,7 +9035,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         Image image = registerImage(region, name, description,
                 sourceImage != null ? sourceImage.getArchitecture() : null,
                 sourceImage != null ? sourceImage.getRootDeviceName() : null,
-                captureBlockDeviceMappings(region, source, sourceImage));
+                captureBlockDeviceMappings(region, source, sourceImage), false);
 
         // Carry the launchable ancestor so RunInstances on this AMI starts the same guest instead
         // of falling through to the catalog default. This is also the fallback when the file
@@ -9018,7 +9114,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             mappings.stream()
                     .filter(m -> m.getEbs() != null
                             && Objects.equals(m.getDeviceName(), sourceImage.getRootDeviceName()))
-                    .forEach(m -> m.getEbs().setVolumeType(rootVolume.getVolumeType()));
+                    .forEach(m -> setVolumePerformance(m.getEbs(), rootVolume));
         }
         Set<String> devices = mappings.stream()
                 .map(BlockDeviceMapping::getDeviceName)
@@ -9045,13 +9141,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         EbsBlockDevice ebs = new EbsBlockDevice();
         ebs.setSnapshotId("snap-" + randomHex(17));
         ebs.setVolumeSize(volume.getSize());
-        ebs.setVolumeType(volume.getVolumeType());
+        setVolumePerformance(ebs, volume);
         ebs.setDeleteOnTermination(attachment.isDeleteOnTermination());
         ebs.setEncrypted(volume.isEncrypted());
         BlockDeviceMapping mapping = new BlockDeviceMapping();
         mapping.setDeviceName(attachment.getDevice());
         mapping.setEbs(ebs);
         return mapping;
+    }
+
+    private static void setVolumePerformance(EbsBlockDevice ebs, Volume volume) {
+        String type = volume.getVolumeType();
+        ebs.setVolumeType(type);
+        ebs.setIops(type != null && Set.of("gp3", "io1", "io2").contains(type) && volume.getIops() > 0
+                ? volume.getIops() : null);
+        ebs.setThroughput("gp3".equals(type) ? volume.getThroughput() : null);
     }
 
     /**
@@ -9100,6 +9204,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // it), but the root of a copy or capture is always a snapshot.
         ebs.setSnapshotId(sourceEbs.getSnapshotId() != null || root ? "snap-" + randomHex(17) : null);
         ebs.setVolumeSize(sourceEbs.getVolumeSize());
+        ebs.setIops(sourceEbs.getIops());
+        ebs.setThroughput(sourceEbs.getThroughput());
         ebs.setVolumeType(sourceEbs.getVolumeType());
         ebs.setDeleteOnTermination(sourceEbs.getDeleteOnTermination());
         ebs.setEncrypted(sourceEbs.getEncrypted());
@@ -9134,6 +9240,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                                  List<LaunchTemplateData.BlockDeviceMapping> launchMappings) {
         requireValidLaunchDevices(launchMappings);
         List<LaunchTemplateData.BlockDeviceMapping> amiMappings = new ArrayList<>();
+        Set<String> inheritedSnapshots = new HashSet<>();
         if (image != null && image.getBlockDeviceMappings() != null) {
             for (BlockDeviceMapping declared : image.getBlockDeviceMappings()) {
                 LaunchTemplateData.BlockDeviceMapping mapping = launchMapping(declared);
@@ -9142,6 +9249,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     mapping.setDeviceName(rootDeviceName);
                 }
                 amiMappings.add(mapping);
+                if (mapping.getEbs() != null && mapping.getEbs().getSnapshotId() != null) {
+                    inheritedSnapshots.add(mapping.getEbs().getSnapshotId());
+                }
             }
         }
         if (amiMappings.stream().noneMatch(m -> rootDeviceName.equals(m.getDeviceName()))) {
@@ -9168,7 +9278,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         List<LaunchVolume> planned = new ArrayList<>();
         for (LaunchTemplateData.BlockDeviceMapping mapping
-                : LaunchTemplateData.BlockDeviceMapping.merge(amiMappings, overrides)) {
+                : Ec2BlockDevices.merge(amiMappings, overrides)) {
             boolean root = rootDeviceName.equals(mapping.getDeviceName());
             LaunchTemplateData.Ebs ebs = mapping.getEbs();
             if (!root && (mapping.getNoDevice() != null || mapping.namesInstanceStore() || ebs == null)) {
@@ -9179,14 +9289,44 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             String snapshotId = ebs.getSnapshotId() == null || ebs.getSnapshotId().isBlank()
                     ? null : ebs.getSnapshotId();
-            Snapshot snapshot = snapshotId == null ? null : snapshots.get(key(region, snapshotId))
-                    .orElseThrow(() -> new AwsException("InvalidSnapshot.NotFound",
-                            "The snapshot '" + snapshotId + "' does not exist.", 400));
+            Snapshot snapshot = null;
+            if (snapshotId != null) {
+                // Launch permission includes the AMI's backing snapshots, but only here. Direct
+                // CreateVolume and CopyImage retain their independent snapshot permission checks.
+                if (image != null && inheritedSnapshots.contains(snapshotId)
+                        && !callerAccountId().equals(image.getOwnerId())
+                        && snapshots instanceof AccountAwareStorageBackend<Snapshot> aware) {
+                    snapshot = aware.getForAccount(image.getOwnerId(), key(region, snapshotId)).orElse(null);
+                    if (snapshot == null || !image.getOwnerId().equals(snapshot.getOwnerId())
+                            || !snapshotId.equals(snapshot.getSnapshotId()) || !region.equals(snapshot.getRegion())) {
+                        throw new AwsException("InvalidSnapshot.NotFound", "AMI backing snapshot is unavailable.", 400);
+                    }
+                    if (snapshot.isEncrypted()) {
+                        throw new AwsException("UnsupportedOperation", "Encrypted shared launch requires KMS authorization.", 400);
+                    }
+                    if (!"completed".equals(snapshot.getState())) {
+                        throw new AwsException("IncorrectState", "AMI backing snapshot is not completed.", 400);
+                    }
+                } else {
+                    try {
+                        snapshot = volumeSnapshot(region, snapshotId);
+                    } catch (AwsException failure) {
+                        if ("InvalidSnapshot.NotFound".equals(failure.getErrorCode())) {
+                            throw new AwsException("InvalidSnapshot.NotFound",
+                                    "The snapshot '" + snapshotId + "' does not exist.", 400);
+                        }
+                        throw failure;
+                    }
+                }
+            }
             Integer snapshotSize = snapshot == null ? null : snapshot.getVolumeSize();
+            if (snapshot != null && (snapshotSize == null || snapshotSize <= 0)) {
+                throw new AwsException("InvalidBlockDeviceMapping", "Invalid EBS size, type or performance settings.", 400);
+            }
             // With neither a size nor a sized snapshot, the root gets the default root size and
-            // any other device 0, which leaves the size to CreateVolume's default.
+            // any other device the existing default volume size.
             int size = ebs.getVolumeSize() != null ? ebs.getVolumeSize()
-                    : snapshotSize != null ? snapshotSize : root ? DEFAULT_ROOT_VOLUME_SIZE_GIB : 0;
+                    : snapshotSize != null ? snapshotSize : root ? DEFAULT_ROOT_VOLUME_SIZE_GIB : 8;
             if (snapshotSize != null && size < snapshotSize) {
                 throw new AwsException("InvalidBlockDeviceMapping", "Volume of size " + size
                         + "GB is smaller than snapshot '" + snapshotId + "', expect size>= " + snapshotSize + "GB", 400);
@@ -9196,6 +9336,18 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             boolean takesIops = volumeType != null && PROVISIONED_IOPS_VOLUME_TYPES.contains(volumeType);
             int iops = takesIops && ebs.getIops() != null ? ebs.getIops() : 0;
             Integer throughput = "gp3".equals(volumeType) ? ebs.getThroughput() : null;
+            if (ebs.getKmsKeyId() != null) {
+                throw new AwsException("UnsupportedOperation", "Launch-time KMS key selection is not supported.", 400);
+            }
+            if (snapshot != null && snapshot.isEncrypted() && Boolean.FALSE.equals(ebs.getEncrypted())) {
+                throw new AwsException("InvalidBlockDeviceMapping", "An encrypted snapshot cannot be decrypted at launch.", 400);
+            }
+            String effectiveType = volumeType == null ? "gp2" : volumeType;
+            if (Set.of("io1", "io2").contains(effectiveType) && ebs.getIops() == null) {
+                throw new AwsException("InvalidParameterCombination",
+                        "The parameter iops must be specified for " + effectiveType + " volumes.", 400);
+            }
+            validatedVolumeIops(effectiveType, size, iops, throughput);
             planned.add(new LaunchVolume(mapping.getDeviceName(), snapshotId, size, volumeType, iops, throughput,
                     Boolean.TRUE.equals(ebs.getEncrypted()) || snapshot != null && snapshot.isEncrypted(),
                     !Boolean.FALSE.equals(ebs.getDeleteOnTermination())));
@@ -9275,6 +9427,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             ebs.setSnapshotId(declaredEbs.getSnapshotId());
             ebs.setVolumeSize(declaredEbs.getVolumeSize());
             ebs.setVolumeType(declaredEbs.getVolumeType());
+            ebs.setIops(declaredEbs.getIops());
+            ebs.setThroughput(declaredEbs.getThroughput());
             ebs.setDeleteOnTermination(declaredEbs.getDeleteOnTermination());
             ebs.setEncrypted(declaredEbs.getEncrypted());
             mapping.setEbs(ebs);
@@ -9288,7 +9442,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     private static boolean describesVolume(EbsBlockDevice ebs) {
         return ebs != null && (ebs.getSnapshotId() != null || ebs.getVolumeSize() != null
-                || ebs.getVolumeType() != null || ebs.getDeleteOnTermination() != null || ebs.getEncrypted() != null);
+                || ebs.getVolumeType() != null || ebs.getDeleteOnTermination() != null || ebs.getEncrypted() != null
+                || ebs.getIops() != null || ebs.getThroughput() != null);
     }
 
     /** The image a CreateImage source was launched from, whether catalog-backed or registered. */
@@ -9328,7 +9483,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * Follows CreateImage ancestry back to an id the AMI resolver can map to a guest image.
-     * Images from RegisterImage have no source and stop the walk, as does a catalog id.
+     * Unbound RegisterImage images stop the walk, as does a catalog id.
      */
     private String resolveLaunchableImageId(String region, String imageId) {
         String current = imageId;
@@ -9344,6 +9499,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Image registerImage(String region, String name, String description, String architecture,
                                String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings) {
+        return registerImage(region, name, description, architecture, rootDeviceName, blockDeviceMappings, true);
+    }
+
+    private Image registerImage(String region, String name, String description, String architecture,
+                                String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings,
+                                boolean bindRegistrationName) {
         if (name == null || name.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter Name", 400);
         }
@@ -9353,13 +9514,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // DeregisterImage scans before deleting a snapshot; both run under the registry lock so
         // a registration cannot slip between that scan and the delete.
         synchronized (imageRegistryLock) {
-            return registerImageLocked(region, name, description, architecture, rootDeviceName,
-                    blockDeviceMappings);
+            Ec2ImageCatalog.CatalogImage source = bindRegistrationName
+                    ? imageCatalog.findByRegistrationName(name).orElse(null) : null;
+            if (source != null && architecture != null && !source.architecture.equals(architecture)) {
+                throw new AwsException("InvalidParameterValue",
+                        "Architecture '" + architecture + "' does not match the catalog image bound to Name '"
+                                + name + "' (" + source.architecture + ").", 400);
+            }
+            return registerImageLocked(region, name, description,
+                    source != null ? source.architecture : architecture, rootDeviceName,
+                    blockDeviceMappings, source != null ? source.imageId : null);
         }
     }
 
     private Image registerImageLocked(String region, String name, String description, String architecture,
-                                      String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings) {
+                                      String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings,
+                                      String sourceImageId) {
         boolean duplicateName = registeredImages.scan(k -> true).stream()
                 .filter(img -> region.equals(img.getRegion()))
                 // A deregistered AMI no longer holds its name: "If you have recently deregistered
@@ -9386,6 +9556,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         image.setHypervisor("xen");
         image.setCreationDate(ISO_FMT.format(Instant.now()));
         image.setRegion(region);
+        image.setSourceImageId(sourceImageId);
         image.setBlockDeviceMappings(blockDeviceMappings != null ? new ArrayList<>(blockDeviceMappings) : List.of());
         registeredImages.put(key(region, image.getImageId()), image);
         for (BlockDeviceMapping mapping : image.getBlockDeviceMappings()) {
@@ -9582,6 +9753,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public Image copyImage(String destinationRegion, String sourceRegion, String sourceImageId,
                            String name, String description) {
+        return copyImage(destinationRegion, sourceRegion, sourceImageId, name, description, false);
+    }
+
+    public Image copyImage(String destinationRegion, String sourceRegion, String sourceImageId,
+                           String name, String description, boolean dryRun) {
         if (sourceImageId == null || sourceImageId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter SourceImageId", 400);
         }
@@ -9599,7 +9775,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // Registered AMIs are keyed by (region, id) and are visible only in their own region,
             // so the source is resolved against SourceRegion rather than the request's region.
             // Catalog AMIs are region-independent in Floci and so resolve from either side.
-            Image source = registeredImages.get(key(sourceRegion, sourceImageId)).orElse(null);
+            Image source = imageForCaller(sourceRegion, sourceImageId).orElse(null);
+            if (source != null && (!callerAccountId().equals(source.getOwnerId())
+                    || !sourceRegion.equals(source.getRegion()) || !sourceImageId.equals(source.getImageId()))) {
+                throw new AwsException("AuthFailure", "The source image ownership does not match its stored key.", 400);
+            }
             if (source != null && DEREGISTERED_STATE.equals(source.getState())) {
                 throw new AwsException("InvalidAMIID.Unavailable",
                         "The image id '[" + sourceImageId + "]' has been deregistered and is no longer available", 400);
@@ -9609,6 +9789,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         .map(Ec2ImageCatalog.CatalogImage::toImage)
                         .orElse(null);
             }
+            boolean foreign = false;
+            if (source == null) {
+                source = sharedCopySource(sourceRegion, sourceImageId);
+                foreign = source != null;
+            }
             if (source == null) {
                 throw new AwsException("InvalidAMIID.NotFound",
                         "The image id '[" + sourceImageId + "]' does not exist in region " + sourceRegion, 400);
@@ -9617,16 +9802,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // Fresh snapshot ids: two AMIs sharing one snapshot would make deleting either appear
             // to take the other's backing with it, and the copy's snapshots live in the
             // destination region anyway.
+            List<BlockDeviceMapping> mappings = foreign
+                    ? sharedCopyMappings(sourceRegion, source) : sourceImageMappings(source);
+            String ancestor = foreign ? sharedCopyAncestor(sourceRegion, source)
+                    : resolveLaunchableImageId(sourceRegion, sourceImageId);
+            requireNotDryRun(dryRun);
             Image copy = registerImage(destinationRegion, name, description, source.getArchitecture(),
-                    source.getRootDeviceName(), sourceImageMappings(source));
+                    source.getRootDeviceName(), mappings, false);
             copy.setVirtualizationType(source.getVirtualizationType());
             copy.setRootDeviceType(source.getRootDeviceType());
             copy.setPlatform(source.getPlatform());
             // The launchable ancestor is resolved in the SOURCE region, since that is where the
             // chain of CreateImage parents lives; it bottoms out at a catalog id, which is
             // region-agnostic.
-            copy.setSourceImageId(resolveLaunchableImageId(sourceRegion, sourceImageId));
-            // The resolved id rather than the request's: a catalog image may be named by an alias.
+            copy.setSourceImageId(ancestor);
             copy.setCreationSourceImageId(source.getImageId());
             copy.setCreationSourceImageRegion(sourceRegion);
             // The captured file system is the point of a CreateImage AMI, and the ancestry the
@@ -9635,18 +9824,343 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // it. Without this the copy launches the base image, which is the same silent
             // emptiness CreateImage itself used to produce. The layer is shared rather than
             // duplicated; reclamation accounts for that.
-            copy.setDockerImage(capturedImageFor(sourceRegion, sourceImageId));
+            copy.setDockerImage(foreign ? null : capturedImageFor(sourceRegion, sourceImageId));
             registeredImages.put(key(destinationRegion, copy.getImageId()), copy);
             return copy;
         }
     }
 
+    public List<String> describeImageLaunchPermissions(String region, String imageId, boolean dryRun) {
+        synchronized (imageRegistryLock) {
+            Image image = requiredOwnedImage(region, imageId);
+            requireNotDryRun(dryRun);
+            return image.getLaunchPermissionUserIds().stream().sorted().toList();
+        }
+    }
+
+    public List<String> describeSnapshotCreateVolumePermissions(String region, String snapshotId, boolean dryRun) {
+        synchronized (imageRegistryLock) {
+            Snapshot snapshot = requiredOwnedSnapshot(region, snapshotId);
+            requireNotDryRun(dryRun);
+            return snapshot.getCreateVolumePermissionUserIds().stream().sorted().toList();
+        }
+    }
+
+    public void modifyImageLaunchPermissions(String region, String imageId, List<String> add,
+                                              List<String> remove, boolean dryRun) {
+        synchronized (imageRegistryLock) {
+            Image image = requiredOwnedImage(region, imageId);
+            validatePermissionChanges(add, remove, false);
+            requireNotDryRun(dryRun);
+            Set<String> updated = new LinkedHashSet<>(image.getLaunchPermissionUserIds());
+            updated.addAll(add);
+            updated.removeAll(remove);
+            image.setLaunchPermissionUserIds(updated);
+            registeredImages.put(key(region, imageId), image);
+        }
+    }
+
+    public void modifySnapshotCreateVolumePermissions(String region, String snapshotId, List<String> add,
+                                                       List<String> remove, boolean dryRun) {
+        synchronized (imageRegistryLock) {
+            Snapshot snapshot = requiredOwnedSnapshot(region, snapshotId);
+            validatePermissionChanges(add, remove, true);
+            if (!add.isEmpty() && snapshot.isEncrypted()) {
+                throw new AwsException("UnsupportedOperation", "Encrypted snapshot sharing is not supported.", 400);
+            }
+            requireNotDryRun(dryRun);
+            Set<String> updated = new LinkedHashSet<>(snapshot.getCreateVolumePermissionUserIds());
+            updated.addAll(add);
+            updated.removeAll(remove);
+            snapshot.setCreateVolumePermissionUserIds(updated);
+            snapshots.put(key(region, snapshotId), snapshot);
+        }
+    }
+
+    private Image requiredOwnedImage(String region, String imageId) {
+        requirePermissionResourceId(imageId, "ImageId", "ami", "InvalidAMIID.Malformed");
+        Image image = imageForCaller(region, imageId).orElse(null);
+        if (image == null || !callerAccountId().equals(image.getOwnerId())
+                || !region.equals(image.getRegion()) || !imageId.equals(image.getImageId())) {
+            throw new AwsException("InvalidAMIID.NotFound", "The image '" + imageId + "' does not exist.", 400);
+        }
+        if (!"available".equals(image.getState())) {
+            throw new AwsException("InvalidAMIID.Unavailable", "The image '" + imageId + "' is not available.", 400);
+        }
+        return image;
+    }
+
+    private Snapshot requiredOwnedSnapshot(String region, String snapshotId) {
+        requirePermissionResourceId(snapshotId, "SnapshotId", "snap", "InvalidSnapshotID.Malformed");
+        Snapshot snapshot = snapshots instanceof AccountAwareStorageBackend<Snapshot> aware
+                ? aware.getForAccountMigratingLegacy(callerAccountId(), key(region, snapshotId),
+                        value -> callerAccountId().equals(value.getOwnerId())
+                                && region.equals(value.getRegion()) && snapshotId.equals(value.getSnapshotId()))
+                        .orElse(null)
+                : snapshots.get(key(region, snapshotId)).orElse(null);
+        if (snapshot == null || !callerAccountId().equals(snapshot.getOwnerId())
+                || !region.equals(snapshot.getRegion()) || !snapshotId.equals(snapshot.getSnapshotId())) {
+            throw new AwsException("InvalidSnapshot.NotFound",
+                    "The snapshot '" + snapshotId + "' does not exist.", 400);
+        }
+        return snapshot;
+    }
+
+    private static void requirePermissionResourceId(String id, String parameter, String prefix, String error) {
+        if (id == null || id.isBlank()) {
+            throw new AwsException("MissingParameter", "The parameter " + parameter + " is missing.", 400);
+        }
+        if (!id.matches(prefix + "-(?:[0-9a-f]{8}|[0-9a-f]{17})")) {
+            throw new AwsException(error, "Invalid " + parameter + ": " + id, 400);
+        }
+    }
+
+    private static void validatePermissionChanges(List<String> add, List<String> remove, boolean snapshot) {
+        if (add.isEmpty() && remove.isEmpty()) {
+            throw new AwsException("MissingParameter", "A nested permission Add or Remove is required.", 400);
+        }
+        if ((snapshot && !add.isEmpty() && !remove.isEmpty())
+                || add.stream().anyMatch(remove::contains)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "The requested permission additions and removals cannot be combined.", 400);
+        }
+        if (snapshot && (long) add.size() + remove.size() > 500) {
+            throw new AwsException("InvalidParameterValue", "At most 500 snapshot permissions may be modified.", 400);
+        }
+        for (List<String> values : List.of(add, remove)) {
+            for (String userId : values) {
+                if (userId == null || !userId.matches("[0-9]{12}")) {
+                    throw new AwsException("InvalidParameterValue", "UserId must be a 12-digit account ID.", 400);
+                }
+            }
+        }
+    }
+
+    private static void requireNotDryRun(boolean dryRun) {
+        if (dryRun) {
+            throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
+        }
+    }
+
+    private List<AccountAwareStorageBackend.AccountEntry<Image>> foreignImageEntries(String region, String imageId) {
+        if (registeredImages instanceof AccountAwareStorageBackend<Image> aware) {
+            return aware.scanAllAccountEntries(key(region, imageId)::equals).stream()
+                    .filter(entry -> !callerAccountId().equals(entry.accountId())).toList();
+        }
+        return List.of();
+    }
+
+    private Optional<Image> imageForCaller(String region, String imageId) {
+        if (registeredImages instanceof AccountAwareStorageBackend<Image> aware) {
+            return aware.getForAccountMigratingLegacy(callerAccountId(), key(region, imageId),
+                    image -> callerAccountId().equals(image.getOwnerId())
+                            && region.equals(image.getRegion()) && imageId.equals(image.getImageId()));
+        }
+        return registeredImages.get(key(region, imageId));
+    }
+
+    private Optional<Image> sharedImageForCaller(String region, String imageId) {
+        List<AccountAwareStorageBackend.AccountEntry<Image>> entries = foreignImageEntries(region, imageId);
+        if (entries.size() != 1) {
+            return Optional.empty();
+        }
+        AccountAwareStorageBackend.AccountEntry<Image> entry = entries.getFirst();
+        Image image = entry.value();
+        return entry.accountId().equals(image.getOwnerId()) && region.equals(image.getRegion())
+                && imageId.equals(image.getImageId()) && !DEREGISTERED_STATE.equals(image.getState())
+                && (image.isPublic() || image.getLaunchPermissionUserIds().contains(callerAccountId()))
+                ? Optional.of(image) : Optional.empty();
+    }
+
+    private Image sharedImageView(Image source) {
+        Image view = new Image(source);
+        view.setTags(getTagsForAccount(source.getOwnerId(), source.getRegion(), source.getImageId(), source.getTags()).stream()
+                .filter(tag -> tag.getKey() != null && tag.getKey().startsWith("ec2:SharedTag/"))
+                .map(tag -> new Tag(tag.getKey(), tag.getValue())).collect(Collectors.toCollection(ArrayList::new)));
+        view.setLaunchPermissionUserIds(Set.of());
+        return view;
+    }
+
+    private Image sharedCopySource(String region, String imageId) {
+        List<AccountAwareStorageBackend.AccountEntry<Image>> entries = foreignImageEntries(region, imageId);
+        if (entries.isEmpty()) {
+            return null;
+        }
+        if (entries.size() != 1) {
+            throw new AwsException("AuthFailure", "The source image owner is ambiguous.", 400);
+        }
+        AccountAwareStorageBackend.AccountEntry<Image> entry = entries.getFirst();
+        Image source = entry.value();
+        if (sharedImageForCaller(region, imageId).isEmpty()) {
+            throw new AwsException("AuthFailure", "Not authorized to copy image: " + imageId, 400);
+        }
+        if (!"available".equals(source.getState())) {
+            throw new AwsException("InvalidAMIID.Unavailable", "The source image is not available.", 400);
+        }
+        List<Tag> sourceTags = getTagsForAccount(entry.accountId(), region, imageId, source.getTags());
+        if (sourceTags != null && sourceTags.stream().anyMatch(tag -> tag.getKey() != null
+                && tag.getKey().startsWith("ec2:SharedTag/"))) {
+            throw new AwsException("UnsupportedOperation", "Copying shared AMI tags is not supported.", 400);
+        }
+        return source;
+    }
+
+    private List<BlockDeviceMapping> sharedCopyMappings(String region, Image source) {
+        List<BlockDeviceMapping> declared = source.getBlockDeviceMappings();
+        if (!"ebs".equals(source.getRootDeviceType()) || declared == null
+                || declared.stream().noneMatch(mapping -> mapping.getEbs() != null)) {
+            throw new AwsException("UnsupportedOperation", "Shared copies require EBS snapshot mappings.", 400);
+        }
+        List<BlockDeviceMapping> result = new ArrayList<>();
+        for (BlockDeviceMapping mapping : declared) {
+            EbsBlockDevice ebs = mapping.getEbs();
+            BlockDeviceMapping copied = recapture(mapping, Objects.equals(mapping.getDeviceName(), source.getRootDeviceName()));
+            if (ebs != null) {
+                Snapshot snapshot = snapshots instanceof AccountAwareStorageBackend<Snapshot> aware
+                        ? aware.getForAccount(source.getOwnerId(), key(region, ebs.getSnapshotId())).orElse(null)
+                        : null;
+                if (snapshot == null || !source.getOwnerId().equals(snapshot.getOwnerId())
+                        || !region.equals(snapshot.getRegion())
+                        || !Objects.equals(ebs.getSnapshotId(), snapshot.getSnapshotId())
+                        || !snapshot.getCreateVolumePermissionUserIds().contains(callerAccountId())) {
+                    throw new AwsException("AuthFailure", "Not authorized to copy a backing snapshot.", 400);
+                }
+                if (!"completed".equals(snapshot.getState())) {
+                    throw new AwsException("IncorrectState", "A backing snapshot is not completed.", 400);
+                }
+                if (snapshot.isEncrypted() || Boolean.TRUE.equals(ebs.getEncrypted())) {
+                    throw new AwsException("UnsupportedOperation",
+                            "Encrypted shared snapshot copies are not supported.", 400);
+                }
+                if (snapshot.getVolumeSize() == null || snapshot.getVolumeSize() <= 0) {
+                    throw new AwsException("InvalidParameterValue",
+                            "A backing snapshot has no valid volume size.", 400);
+                }
+                copied.getEbs().setVolumeSize(snapshot.getVolumeSize());
+                copied.getEbs().setEncrypted(false);
+            }
+            result.add(copied);
+        }
+        return result;
+    }
+
+    private String sharedCopyAncestor(String region, Image source) {
+        Set<String> visited = new HashSet<>();
+        Image current = source;
+        while (visited.size() < 16 && visited.add(current.getImageId())) {
+            if (current.getDockerImage() != null) {
+                throw new AwsException("UnsupportedOperation",
+                        "Shared copies of captured Docker images are not supported.", 400);
+            }
+            String ancestor = current.getSourceImageId();
+            if (ancestor == null) {
+                if (config.services().ec2().mock()) {
+                    return null;
+                }
+                throw new AwsException("UnsupportedOperation",
+                        "Container-backed shared copies require a catalog-bound source image.", 400);
+            }
+            if (imageCatalog.findByIdOrAlias(ancestor).isPresent()) {
+                return ancestor;
+            }
+            current = registeredImages instanceof AccountAwareStorageBackend<Image> aware
+                    ? aware.getForAccount(source.getOwnerId(), key(region, ancestor)).orElse(null) : null;
+            if (current == null || !source.getOwnerId().equals(current.getOwnerId())
+                    || !region.equals(current.getRegion()) || !ancestor.equals(current.getImageId())) {
+                throw new AwsException("InvalidAMIID.NotFound", "The source image ancestry is unavailable.", 400);
+            }
+        }
+        throw new AwsException("InvalidAMIID.Unavailable", "The source image ancestry cannot be resolved.", 400);
+    }
+
     /** Rejects an AMI id that has been deregistered; unknown ids fall through to the resolver. */
     private void requireNotDeregistered(String region, String imageId) {
-        Image image = registeredImages.get(key(region, imageId)).orElse(null);
+        Image image = imageForCaller(region, imageId).orElse(null);
+        if (image == null && !foreignImageEntries(region, imageId).isEmpty()) {
+            image = sharedImageForCaller(region, imageId).orElseThrow(() ->
+                    new AwsException("InvalidAMIID.NotFound", "The image is not available: " + imageId, 400));
+            if (!config.services().ec2().mock()) {
+                throw new AwsException("UnsupportedOperation",
+                        "Container-backed shared image launch requires a caller-owned copy.", 400);
+            }
+        }
         if (image != null && DEREGISTERED_STATE.equals(image.getState())) {
             throw new AwsException("InvalidAMIID.Unavailable",
                     "The image id '[" + imageId + "]' has been deregistered and is no longer available", 400);
+        }
+    }
+
+    public Snapshot createSnapshot(String region, String volumeId, String description,
+                                   List<Tag> snapshotTags, boolean dryRun) {
+        if (volumeId == null || volumeId.isBlank()) {
+            throw new AwsException("MissingParameter", "The parameter VolumeId is missing", 400);
+        }
+        if (!volumeId.matches("vol-(?:[0-9a-f]{8}|[0-9a-f]{17})")) {
+            throw new AwsException("InvalidVolumeID.Malformed",
+                    "Invalid id: '" + volumeId + "' (expecting 'vol-...')", 400);
+        }
+        return withVolumeLock(volumeId, () -> {
+            Volume volume = getRequiredVolume(region, volumeId);
+            if (!"available".equals(volume.getState()) && !"in-use".equals(volume.getState())) {
+                throw new AwsException("IncorrectState",
+                        "The volume '" + volumeId + "' is not available or in-use.", 400);
+            }
+            if (dryRun) {
+                throw new AwsException("DryRunOperation",
+                        "Request would have succeeded, but DryRun flag is set.", 412);
+            }
+
+            Snapshot snapshot = new Snapshot();
+            snapshot.setSnapshotId("snap-" + randomHex(17));
+            snapshot.setVolumeId(volumeId);
+            snapshot.setVolumeSize(volume.getSize());
+            snapshot.setOwnerId(callerAccountId());
+            snapshot.setRegion(region);
+            snapshot.setEncrypted(volume.isEncrypted());
+            snapshot.setDescription(description == null ? "" : description);
+            snapshot.setStartTime(Instant.now());
+            snapshot.setState("completed");
+            snapshot.setProgress("100%");
+            if (snapshotTags != null) {
+                for (Tag tag : snapshotTags) {
+                    snapshot.getTags().add(new Tag(tag.getKey(), tag.getValue()));
+                }
+            }
+            snapshots.put(key(region, snapshot.getSnapshotId()), snapshot);
+            putTags(region, snapshot.getSnapshotId(), new ArrayList<>(snapshot.getTags()));
+            return snapshot;
+        });
+    }
+
+    public void deleteSnapshot(String region, String snapshotId, boolean dryRun) {
+        if (snapshotId == null || snapshotId.isBlank()) {
+            throw new AwsException("MissingParameter", "The parameter SnapshotId is missing.", 400);
+        }
+        if (!snapshotId.matches("snap-(?:[0-9a-f]{8}|[0-9a-f]{17})")) {
+            throw new AwsException("InvalidSnapshotID.Malformed", "Invalid snapshot id: " + snapshotId, 400);
+        }
+        synchronized (imageRegistryLock) {
+            if (snapshots.get(key(region, snapshotId)).isEmpty()) {
+                throw new AwsException("InvalidSnapshot.NotFound",
+                        "The snapshot '" + snapshotId + "' does not exist.", 400);
+            }
+            if (registeredImages.scan(k -> true).stream()
+                    .filter(image -> region.equals(image.getRegion()))
+                    .filter(image -> !DEREGISTERED_STATE.equals(image.getState()))
+                    .anyMatch(image -> image.getBlockDeviceMappings().stream()
+                            .filter(mapping -> Objects.equals(image.getRootDeviceName(), mapping.getDeviceName()))
+                            .map(BlockDeviceMapping::getEbs)
+                            .filter(Objects::nonNull)
+                            .anyMatch(ebs -> snapshotId.equals(ebs.getSnapshotId())))) {
+                throw new AwsException("InvalidSnapshot.InUse",
+                        "The snapshot '" + snapshotId + "' is used by a registered image.", 400);
+            }
+            if (dryRun) {
+                throw new AwsException("DryRunOperation",
+                        "Request would have succeeded, but DryRun flag is set.", 412);
+            }
+            snapshots.delete(key(region, snapshotId));
+            removeTags(region, snapshotId);
         }
     }
 
@@ -10367,6 +10881,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private boolean matchesSnapshotFilter(Snapshot snapshot, String name, List<String> values) {
+        if (name != null && (name.startsWith("tag:") || "tag-key".equals(name))) {
+            return matchesTagFilter(snapshot.getTags(), name, values, Ec2Service::matchesFilterValue);
+        }
         return switch (name) {
             case "description" -> matchesFilterValue(values, snapshot.getDescription());
             case "owner-id" -> matchesFilterValue(values, snapshot.getOwnerId());
@@ -13172,8 +13689,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         + " is not assigned to the primary network interface of instance " + instanceId + ".", 400);
             }
 
+            boolean replaceOldPublicAddress = mockPublicAddressPool == null || !config.services().ec2().mock()
+                    || target == null || secondary != null
+                    || !instanceId.equals(addressHolder(region, addr));
+            String oldReplacement = addr.getAssociationId() != null && replaceOldPublicAddress
+                    ? pooledReplacementAddress(region, addr) : null;
             if (addr.getAssociationId() != null) {
-                disassociateAddress(region, addr.getAssociationId());
+                disassociateAddress(region, addr.getAssociationId(), replaceOldPublicAddress, oldReplacement);
             }
             // An Elastic IP already on the same private address of the instance is disassociated and
             // stays allocated, as on AWS. That includes one a retained interface carried onto this
@@ -13186,7 +13708,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     if (onInstance && existing.getAssociationId() != null
                             && !allocationId.equals(existing.getAllocationId())
                             && Objects.equals(secondary, secondaryPrivateIpOf(region, target, existing.getPrivateIpAddress()))) {
-                        disassociateAddress(region, existing.getAssociationId());
+                        // The incoming EIP replaces this exact private-address association.
+                        boolean replaceTemporary = mockPublicAddressPool == null || !config.services().ec2().mock();
+                        disassociateAddress(region, existing.getAssociationId(), replaceTemporary, null);
                     }
                 }
             }
@@ -13323,6 +13847,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public void disassociateAddress(String region, String associationId) {
+        disassociateAddress(region, associationId, true, null);
+    }
+
+    private void disassociateAddress(String region, String associationId, boolean replacePublicAddress,
+                                    String reservedPublicAddress) {
         ensureDefaultResources(region);
         // Under the lock NAT create and delete take, so the gateway check and the clear see the
         // same association.
@@ -13348,6 +13877,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             && (addr.getInstanceId() != null
                                     || Objects.equals(addr.getNetworkInterfaceId(), primaryInterfaceId(holder)))
                             && secondaryPrivateIpOf(region, holder, addr.getPrivateIpAddress()) == null;
+                    String replacement = reservedPublicAddress != null ? reservedPublicAddress
+                            : onPrimary && replacePublicAddress ? pooledReplacementAddress(region, addr) : null;
                     addr.setInstanceId(null);
                     addr.setAssociationId(null);
                     updateStoredAddressAssociation(addr);
@@ -13359,8 +13890,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         addr.setPublicIp(addr.getAllocatedPublicIp());
                     }
                     addresses.put(key(region, addr.getAllocationId()), addr);
-                    if (onPrimary) {
-                        releaseElasticAddress(region, holder);
+                    if (onPrimary && replacePublicAddress) {
+                        releaseElasticAddress(region, holder, replacement);
                     }
                     return;
                 }
@@ -13374,7 +13905,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * {@link AutomaticPublicAddress} says it is due, as on AWS; otherwise none. A terminated
      * instance is left as it is.
      */
-    private void releaseElasticAddress(String region, Instance inst) {
+    private String pooledReplacementAddress(String region, Address releasing) {
+        if (!config.services().ec2().mock() || mockPublicAddressPool == null) {
+            return null;
+        }
+        String instanceId = addressHolder(region, releasing);
+        Instance holder = instanceId == null ? null : instances.get(key(region, instanceId)).orElse(null);
+        if (holder == null || holder.getState() == null || !"running".equals(holder.getState().getName())
+                || secondaryPrivateIpOf(region, holder, releasing.getPrivateIpAddress()) != null
+                || !AutomaticPublicAddress.isDue(holder, true)
+                || primaryElasticAddress(region, holder, releasing.getAllocationId()) != null) {
+            return null;
+        }
+        return pooledPublicAddress();
+    }
+
+    private void releaseElasticAddress(String region, Instance inst, String reservedPublicAddress) {
         writePublicAddress(inst, () -> {
             String state = inst.getState() == null ? null : inst.getState().getName();
             if ("terminated".equals(state) || "shutting-down".equals(state)) {
@@ -13387,7 +13933,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             clearPublicAddress(inst);
             if ("running".equals(state)) {
-                assignAutomaticAddress(inst, true);
+                if (reservedPublicAddress != null) {
+                    setPublicAddress(inst, reservedPublicAddress);
+                } else {
+                    assignAutomaticAddress(inst, true);
+                }
             }
         });
         instances.put(key(region, inst.getInstanceId()), inst);
@@ -13981,6 +14531,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (resource instanceof Instance inst) {
             return switch (filterName) {
                 case "instance-id" -> matchesValue(values, inst.getInstanceId());
+                case "client-token" -> matchesValue(values, inst.getClientToken());
                 case "instance-state-name" -> matchesValue(values, inst.getState().getName());
                 case "instance-type" -> matchesValue(values, inst.getInstanceType());
                 case "vpc-id" -> matchesValue(values, inst.getVpcId());
@@ -14235,6 +14786,32 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     // ─── Volumes ───────────────────────────────────────────────────────────────
 
+    private Snapshot volumeSnapshot(String region, String snapshotId) {
+        Snapshot snapshot = snapshots.get(key(region, snapshotId)).orElse(null);
+        if (snapshot == null && snapshots instanceof AccountAwareStorageBackend<Snapshot> aware) {
+            List<AccountAwareStorageBackend.AccountEntry<Snapshot>> entries =
+                    aware.scanAllAccountEntries(key(region, snapshotId)::equals);
+            if (entries.size() == 1) {
+                AccountAwareStorageBackend.AccountEntry<Snapshot> entry = entries.getFirst();
+                Snapshot candidate = entry.value();
+                if (entry.accountId().equals(candidate.getOwnerId())
+                        && candidate.getCreateVolumePermissionUserIds().contains(callerAccountId())) {
+                    snapshot = candidate;
+                }
+            }
+        }
+        if (snapshot == null || !region.equals(snapshot.getRegion()) || !snapshotId.equals(snapshot.getSnapshotId())) {
+            throw new AwsException("InvalidSnapshot.NotFound", "The snapshot is not available: " + snapshotId, 400);
+        }
+        if (!"completed".equals(snapshot.getState())) {
+            throw new AwsException("IncorrectState", "The snapshot is not completed: " + snapshotId, 400);
+        }
+        if (!callerAccountId().equals(snapshot.getOwnerId()) && snapshot.isEncrypted()) {
+            throw new AwsException("UnsupportedOperation", "Encrypted shared snapshots require KMS authorization.", 400);
+        }
+        return snapshot;
+    }
+
     private boolean ebsEncryptionByDefault(String region) {
         return ebsEncryptionService != null && ebsEncryptionService.getEbsEncryptionByDefault(region);
     }
@@ -14242,6 +14819,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public Volume createVolume(String region, String availabilityZone, String volumeType,
                                int size, boolean encrypted, int iops, Integer throughput,
                                String snapshotId, List<Tag> volumeTags) {
+        String effectiveType = volumeType != null ? volumeType : "gp2";
+        requireValidVolumeType(effectiveType);
+        if (snapshotId != null && !snapshotId.isBlank()) {
+            Snapshot snapshot = volumeSnapshot(region, snapshotId);
+            if (snapshot.getVolumeSize() == null || snapshot.getVolumeSize() <= 0) {
+                throw new AwsException("InvalidParameterValue", "Snapshot has no valid size.", 400);
+            }
+            if (size > 0 && size < snapshot.getVolumeSize()) {
+                throw new AwsException("InvalidParameterValue", "Volume size must be at least the snapshot size.", 400);
+            }
+            size = size > 0 ? size : snapshot.getVolumeSize();
+            encrypted |= snapshot.isEncrypted();
+        }
+        validatedVolumeIops(effectiveType, size, iops, throughput);
         ensureDefaultResources(region);
         Volume vol = newVolume(region, availabilityZone, volumeType, size, encrypted, iops, throughput, snapshotId);
         String volumeId = vol.getVolumeId();
@@ -14264,18 +14855,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private Volume newVolume(String region, String availabilityZone, String volumeType, int size,
                              boolean encrypted, int iops, Integer throughput, String snapshotId) {
         String effectiveType = volumeType != null ? volumeType : "gp2";
+        int effectiveIops = validatedVolumeIops(effectiveType, size, iops, throughput);
         Volume vol = new Volume();
         vol.setVolumeId("vol-" + randomHex(17));
         vol.setAvailabilityZone(availabilityZone != null ? availabilityZone : region + "a");
         vol.setVolumeType(effectiveType);
-        vol.setSize(size > 0 ? size : 8);
+        vol.setSize(size);
         // With encryption by default on, AWS encrypts every new volume and the Encrypted parameter
         // cannot opt out of it.
         vol.setEncrypted(encrypted || ebsEncryptionByDefault(region));
-        vol.setIops(iops > 0 ? iops : (volumeType != null && volumeType.startsWith("io") ? iops : 0));
+        vol.setIops(effectiveIops);
         // Throughput is a gp3-only attribute; AWS reports 125 MiB/s by default for gp3.
         if ("gp3".equals(effectiveType)) {
-            vol.setThroughput(throughput != null && throughput > 0 ? throughput : 125);
+            vol.setThroughput(throughput != null ? Math.max(125, throughput) : 125);
         } else {
             vol.setThroughput(throughput);
         }
@@ -14286,6 +14878,51 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return vol;
     }
 
+    private static int validatedVolumeIops(String type, int size, int iops, Integer throughput) {
+        int minimumSize = switch (type) {
+            case "io1", "io2" -> 4;
+            case "st1", "sc1" -> 125;
+            default -> 1;
+        };
+        int maximumSize = switch (type) {
+            case "gp3", "io2" -> 65536;
+            case "standard" -> 1024;
+            default -> 16384;
+        };
+        if (size < minimumSize || size > maximumSize) {
+            throw new AwsException("InvalidParameterValue", "Size is outside the supported range for " + type, 400);
+        }
+        if (throughput != null && !"gp3".equals(type)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "The parameter Throughput is not supported for " + type + " volumes", 400);
+        }
+        if (!Set.of("gp3", "io1", "io2").contains(type)) {
+            if (iops != 0) {
+                throw new AwsException("InvalidParameterCombination",
+                        "The parameter Iops is not supported for " + type + " volumes", 400);
+            }
+            return "gp2".equals(type) ? Math.min(16000, Math.max(100, 3 * size)) : 0;
+        }
+        int effectiveIops = "gp3".equals(type) && iops == 0 ? 3000 : iops;
+        int minimumIops = 100;
+        long maximumIops = switch (type) {
+            case "gp3" -> Math.min(80000, effectiveIops == 3000 ? Math.max(3000L, 500L * size) : 500L * size);
+            case "io1" -> Math.min(64000, 50L * size);
+            default -> Math.min(256000, 1000L * size);
+        };
+        if (effectiveIops < minimumIops || effectiveIops > maximumIops) {
+            throw new AwsException("InvalidParameterValue", "Iops is outside the supported range for " + type, 400);
+        }
+        if ("gp3".equals(type)) {
+            effectiveIops = Math.max(3000, effectiveIops);
+        }
+        if (throughput != null && (throughput < 0 || throughput > 2000
+                || 4L * Math.max(125, throughput) > effectiveIops)) {
+            throw new AwsException("InvalidParameterValue", "Throughput exceeds the supported gp3 performance", 400);
+        }
+        return effectiveIops;
+    }
+
     public List<Volume> describeVolumes(String region, List<String> volumeIds,
                                         Map<String, List<String>> filters) {
         return describeVolumes(region, volumeIds, filterList(filters));
@@ -14293,6 +14930,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     List<Volume> describeVolumes(String region, List<String> volumeIds,
                                  List<Map.Entry<String, List<String>>> filters) {
+        return describeVolumes(region, volumeIds, filters, null, null).volumes();
+    }
+
+    public VolumeListResult describeVolumes(String region, List<String> volumeIds,
+                                            Map<String, List<String>> filters, Integer maxResults,
+                                            String nextToken) {
+        return describeVolumes(region, volumeIds, filterList(filters), maxResults, nextToken);
+    }
+
+    VolumeListResult describeVolumes(String region, List<String> volumeIds,
+                                     List<Map.Entry<String, List<String>>> filters, Integer maxResults,
+                                     String nextToken) {
+        if (maxResults != null && maxResults < 5) {
+            throw new AwsException("InvalidParameterValue", "Value ( " + maxResults
+                    + " ) for parameter maxResults is invalid. Expecting a value greater than 5.", 400);
+        }
+        int offset = decodeToken(nextToken);
         if (volumeIds != null && !volumeIds.isEmpty()) {
             for (String id : volumeIds) {
                 if (volumes.get(key(region, id)).flatMap(v -> settleEndedHolders(region, v)).isEmpty()) {
@@ -14301,13 +14955,18 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
         }
-        return volumes.scan(k -> true).stream()
+        List<Volume> matching = volumes.scan(k -> k.startsWith(region + "::")).stream()
                 .filter(v -> v.getRegion().equals(region))
                 .filter(v -> volumeIds == null || volumeIds.isEmpty() || volumeIds.contains(v.getVolumeId()))
                 .map(v -> settleEndedHolders(region, v))
                 .flatMap(Optional::stream)
                 .filter(v -> matchesFilters(v, filters, region))
+                .sorted(Comparator.comparing(Volume::getVolumeId))
                 .collect(Collectors.toList());
+        int pageSize = maxResults != null ? maxResults : matching.size();
+        int end = (int) Math.min((long) offset + pageSize, matching.size());
+        List<Volume> page = offset < matching.size() ? matching.subList(offset, end) : List.of();
+        return new VolumeListResult(new ArrayList<>(page), end < matching.size() ? encodeToken(end) : null);
     }
 
     public void deleteVolume(String region, String volumeId) {
@@ -14428,6 +15087,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (volumeId == null || volumeId.isBlank()) {
             throw new AwsException("MissingParameter", "The parameter VolumeId is missing", 400);
         }
+        if (dryRun) {
+            throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
+        }
+        Integer requestedIops = iops != null && iops == 0 ? null : iops;
+        Integer requestedThroughput = throughput != null && throughput == 0 ? null : throughput;
         return withVolumeLock(volumeId, () -> {
             ensureDefaultResources(region);
             Volume volume = getRequiredVolume(region, volumeId);
@@ -14446,23 +15110,25 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 requireValidVolumeType(volumeType);
             }
 
-            if (throughput != null && !"gp3".equals(targetVolumeType)) {
+            if (requestedThroughput != null && !"gp3".equals(targetVolumeType)) {
                 throw new AwsException("InvalidParameterCombination",
                         "The parameter Throughput is not supported for " + targetVolumeType + " volumes", 400);
             }
 
-            if (iops != null && !"gp3".equals(targetVolumeType) && !"io1".equals(targetVolumeType) && !"io2".equals(targetVolumeType)) {
+            if (requestedIops != null && !"gp3".equals(targetVolumeType)
+                    && !"io1".equals(targetVolumeType) && !"io2".equals(targetVolumeType)) {
                 throw new AwsException("InvalidParameterCombination",
                         "The parameter iops is not supported for " + targetVolumeType + " volumes", 400);
+            }
+
+            if (requestedIops != null && requestedIops < 0) {
+                throw new AwsException("InvalidParameterValue",
+                        "Iops is outside the supported range for " + targetVolumeType, 400);
             }
 
             if (multiAttachEnabled != null && multiAttachEnabled && !"io1".equals(targetVolumeType) && !"io2".equals(targetVolumeType)) {
                 throw new AwsException("InvalidParameterCombination",
                         "The parameter MultiAttachEnabled is not supported for " + targetVolumeType + " volumes", 400);
-            }
-
-            if (dryRun) {
-                throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
             }
 
             Integer originalSize = volume.getSize();
@@ -14472,26 +15138,25 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             Boolean originalMultiAttachEnabled = volume.getMultiAttachEnabled();
 
             int targetSize = size != null ? size : volume.getSize();
-            Integer targetIops = iops != null ? iops : (volume.getIops() > 0 ? volume.getIops() : null);
-            Integer targetThroughput = throughput != null ? throughput : volume.getThroughput();
+            boolean sameVolumeType = targetVolumeType.equals(originalVolumeType);
+            int targetIops = requestedIops != null ? requestedIops : (sameVolumeType ? volume.getIops() : 3000);
+            Integer targetThroughput = null;
             Boolean targetMultiAttach = multiAttachEnabled != null ? multiAttachEnabled : volume.getMultiAttachEnabled();
 
             if ("gp3".equals(targetVolumeType)) {
-                if (targetIops == null) {
-                    targetIops = 3000;
+                targetThroughput = requestedThroughput != null ? requestedThroughput
+                        : (sameVolumeType && originalThroughput != null ? originalThroughput : 125);
+                if ("gp2".equals(originalVolumeType) && requestedIops == null && requestedThroughput == null) {
+                    targetIops = Math.max(3000, Math.min(16000, Math.max(100, 3 * originalSize)));
+                    targetThroughput = originalSize <= 170 ? 128 : 250;
                 }
-                if (targetThroughput == null) {
-                    targetThroughput = 125;
-                }
-            } else if ("io1".equals(targetVolumeType) || "io2".equals(targetVolumeType)) {
-                if (targetIops == null) {
-                    targetIops = 3000;
-                }
-                targetThroughput = null;
-            } else {
-                targetIops = null;
-                targetThroughput = null;
+            } else if (!"io1".equals(targetVolumeType) && !"io2".equals(targetVolumeType)) {
+                targetIops = 0;
                 targetMultiAttach = false;
+            }
+            targetIops = validatedVolumeIops(targetVolumeType, targetSize, targetIops, targetThroughput);
+            if (targetThroughput != null) {
+                targetThroughput = Math.max(125, targetThroughput);
             }
 
             boolean resizeSuccess = true;
@@ -14505,7 +15170,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             mod.setVolumeId(volumeId);
             mod.setTargetSize(targetSize);
             mod.setTargetVolumeType(targetVolumeType);
-            mod.setTargetIops(targetIops);
+            mod.setTargetIops(targetIops > 0 ? targetIops : null);
             mod.setTargetThroughput(targetThroughput);
             mod.setTargetMultiAttachEnabled(targetMultiAttach);
             mod.setOriginalSize(originalSize);
@@ -14527,7 +15192,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
             volume.setSize(targetSize);
             volume.setVolumeType(targetVolumeType);
-            volume.setIops(targetIops != null ? targetIops : 0);
+            volume.setIops(targetIops);
             volume.setThroughput(targetThroughput);
             volume.setMultiAttachEnabled(targetMultiAttach);
             volumes.put(key(region, volumeId), volume);
@@ -14990,6 +15655,38 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return new NetworkInterfaceListResult(result, null);
     }
 
+    private List<GroupIdentifier> resolveSecurityGroups(String region, String vpcId, List<String> securityGroupIds,
+                                                        String launchSubnetId) {
+        List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
+        if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
+            for (String sgId : securityGroupIds) {
+                SecurityGroup sg = launchSubnetId == null
+                        ? securityGroups.get(key(region, sgId)).orElseThrow(() ->
+                                new AwsException("InvalidSecurityGroupID.NotFound",
+                                        "The securityGroup ID '" + sgId + "' does not exist", 400))
+                        : getRequiredSecurityGroup(region, sgId);
+                if (!vpcId.equals(sg.getVpcId())) {
+                    if (launchSubnetId != null) {
+                        throw new AwsException("InvalidParameter", "Security group " + sgId + " and subnet "
+                                + launchSubnetId + " belong to different networks.", 400);
+                    }
+                    throw new AwsException("InvalidGroup.NotFound",
+                            "Security group " + sgId + " does not belong to the subnet VPC", 400);
+                }
+                sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
+            }
+        } else {
+            SecurityGroup defaultSg = securityGroups.scan(k -> k.startsWith(region + "::")).stream()
+                    .filter(group -> vpcId.equals(group.getVpcId())
+                            && "default".equals(group.getGroupName()))
+                    .findFirst().orElse(null);
+            if (defaultSg != null) {
+                sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
+            }
+        }
+        return sgIdentifiers;
+    }
+
     /**
      * Creates a standalone (not-yet-attached) elastic network interface, floci-kt9. Covers the
      * {@code aws_network_interface} resource: an ENI created independently of an instance and
@@ -15005,28 +15702,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         ensureDefaultResources(region);
         Subnet subnet = requireSubnet(region, subnetId);
-
-        List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
-        if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
-            for (String sgId : securityGroupIds) {
-                SecurityGroup sg = securityGroups.get(key(region, sgId)).orElseThrow(() ->
-                        new AwsException("InvalidSecurityGroupID.NotFound",
-                                "The securityGroup ID '" + sgId + "' does not exist", 400));
-                if (!subnet.getVpcId().equals(sg.getVpcId())) {
-                    throw new AwsException("InvalidGroup.NotFound",
-                            "Security group " + sgId + " does not belong to the subnet VPC", 400);
-                }
-                sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
-            }
-        } else {
-            SecurityGroup defaultSg = securityGroups.scan(k -> k.startsWith(region + "::")).stream()
-                    .filter(group -> subnet.getVpcId().equals(group.getVpcId())
-                            && "default".equals(group.getGroupName()))
-                    .findFirst().orElse(null);
-            if (defaultSg != null) {
-                sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
-            }
-        }
+        List<GroupIdentifier> sgIdentifiers = resolveSecurityGroups(region, subnet.getVpcId(), securityGroupIds, null);
 
         synchronized (privateIpAllocationLock) {
             String eniId = "eni-" + randomHex(17);

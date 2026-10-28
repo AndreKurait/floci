@@ -2,7 +2,11 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -13,7 +17,6 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -25,7 +28,9 @@ import java.util.Set;
 public class Ec2LaunchTemplateCfnProvisioner implements CfnResourceProvisioner {
 
     private static final Logger LOG = Logger.getLogger(Ec2LaunchTemplateCfnProvisioner.class);
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper MAPPER = JsonMapper.builder()
+            .enable(MapperFeature.ACCEPT_CASE_INSENSITIVE_PROPERTIES)
+            .build();
 
     private final Ec2Service ec2Service;
 
@@ -54,36 +59,7 @@ public class Ec2LaunchTemplateCfnProvisioner implements CfnResourceProvisioner {
         } else {
             name = ctx.generatePhysicalName(r.getLogicalId(), 128, false);
         }
-        LaunchTemplateData data = new LaunchTemplateData();
-        if (props != null && props.has("LaunchTemplateData")) {
-            JsonNode node = ctx.engine().resolveNode(props.get("LaunchTemplateData"));
-            data.setImageId(node.path("ImageId").asText(null));
-            data.setInstanceType(node.path("InstanceType").asText(null));
-            data.setKeyName(node.path("KeyName").asText(null));
-            // CFN carries UserData already base64-encoded.
-            String encodedUserData = node.path("UserData").asText(null);
-            data.setEncodedUserData(encodedUserData);
-            data.setUserData(Ec2UserDataDecoder.decode(encodedUserData));
-            data.setIamInstanceProfile(iamInstanceProfile(node.path("IamInstanceProfile")));
-            // MetadataOptions is read as the template writes it: resolving turns AWS::NoValue into ""
-            // first, which the typed read would refuse for the block or the hop limit. A
-            // LaunchTemplateData that is absent or an intrinsic call carries no MetadataOptions member.
-            JsonNode written = ctx.engine().omitNoValue(props.get("LaunchTemplateData"));
-            JsonNode metadataOptions = written.isObject() && !CloudFormationTemplateEngine.callsIntrinsic(written)
-                    ? written.get("MetadataOptions") : null;
-            data.setMetadataOptions(Ec2CfnMetadataOptions.read("LaunchTemplateData/MetadataOptions",
-                    metadataOptions, Ec2CfnMetadataOptions.LAUNCH_TEMPLATE_SHAPE, ctx.engine()));
-            JsonNode capacity = written.isObject() && !CloudFormationTemplateEngine.callsIntrinsic(written)
-                    ? written.get("CapacityReservationSpecification") : null;
-            data.setCapacityReservationSpecification(capacityReservationSpecification(capacity, ctx.engine()));
-            if (node.has("SecurityGroupIds")) {
-                List<String> securityGroupIds = new ArrayList<>();
-                for (JsonNode securityGroup : node.get("SecurityGroupIds")) {
-                    securityGroupIds.add(securityGroup.asText());
-                }
-                data.setSecurityGroupIds(securityGroupIds);
-            }
-        }
+        LaunchTemplateData data = launchTemplateData(props, ctx);
         // UpdateStack re-provisions every resource. Creating unconditionally meant an explicit
         // LaunchTemplateName hit InvalidLaunchTemplateName.AlreadyExistsException, while an
         // omitted one minted a second randomly named template and orphaned the first. A template
@@ -194,19 +170,36 @@ public class Ec2LaunchTemplateCfnProvisioner implements CfnResourceProvisioner {
         return specification;
     }
 
-    /**
-     * Keeps the form CloudFormation supplied. EC2 stores {@code Arn} and {@code Name} as given and
-     * derives the ARN only at launch time, so normalizing {@code Name} into an ARN here would put
-     * back the drift this provisioner's template data is read back through.
-     */
-    private LaunchTemplateData.IamInstanceProfile iamInstanceProfile(JsonNode profile) {
-        String arn = profile.path("Arn").asText(null);
-        String profileName = profile.path("Name").asText(null);
-        boolean hasArn = arn != null && !arn.isBlank();
-        boolean hasName = profileName != null && !profileName.isBlank();
-        if (!hasArn && !hasName) {
-            return null;
+    private LaunchTemplateData launchTemplateData(JsonNode props, ProvisionContext ctx) {
+        JsonNode node = props == null ? null : ctx.engine().resolveNodeOmittingNoValue(props.get("LaunchTemplateData"));
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return new LaunchTemplateData();
         }
-        return new LaunchTemplateData.IamInstanceProfile(hasArn ? arn : null, hasName ? profileName : null);
+        try {
+            JsonNode written = ctx.engine().omitNoValue(props.get("LaunchTemplateData"));
+            JsonNode metadataOptions = written != null && written.isObject()
+                    && !CloudFormationTemplateEngine.callsIntrinsic(written) ? written.get("MetadataOptions") : null;
+            LaunchTemplateData.MetadataOptions metadata = Ec2CfnMetadataOptions.read(
+                    "LaunchTemplateData/MetadataOptions", metadataOptions,
+                    Ec2CfnMetadataOptions.LAUNCH_TEMPLATE_SHAPE, ctx.engine());
+            JsonNode dataNode = node.deepCopy();
+            if (dataNode instanceof ObjectNode object) {
+                object.remove("MetadataOptions");
+                object.remove("CapacityReservationSpecification");
+            }
+            LaunchTemplateData data = MAPPER.treeToValue(dataNode, LaunchTemplateData.class);
+            data.setMetadataOptions(metadata);
+            JsonNode capacity = written != null && written.isObject()
+                    && !CloudFormationTemplateEngine.callsIntrinsic(written)
+                    ? written.get("CapacityReservationSpecification") : null;
+            data.setCapacityReservationSpecification(capacityReservationSpecification(capacity, ctx.engine()));
+            String encodedUserData = node.path("UserData").asText(null);
+            data.setEncodedUserData(encodedUserData);
+            data.setUserData(Ec2UserDataDecoder.decode(encodedUserData));
+            return data;
+        } catch (JsonProcessingException e) {
+            throw new AwsException("ValidationError", "LaunchTemplateData has invalid properties: "
+                    + e.getOriginalMessage(), 400);
+        }
     }
 }

@@ -6,12 +6,15 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
 import io.github.hectorvent.floci.services.ec2.model.Image;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.NetworkAcl;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ec2.model.Volume;
+import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -26,9 +29,11 @@ import org.mockito.Answers;
 import org.mockito.ArgumentCaptor;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
@@ -43,6 +48,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -89,6 +95,72 @@ class Ec2QueryHandlerTest {
         assertEquals(expectedZone, forwarded.get());
     }
 
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void describeInstanceBlockDeviceOmitsMissingAttachmentTime(boolean timestamp) {
+        Ec2Service service = mock(Ec2Service.class);
+        Instance instance = new Instance();
+        instance.setInstanceId("i-test");
+        instance.setRegion("us-east-1");
+        instance.setLaunchTime(Instant.parse("2026-10-20T00:00:00Z"));
+        Reservation reservation = new Reservation();
+        reservation.getInstances().add(instance);
+        VolumeAttachment attachment = new VolumeAttachment();
+        attachment.setDevice("/dev/xvdf");
+        attachment.setVolumeId("vol-test");
+        attachment.setState("attached");
+        if (timestamp) {
+            attachment.setAttachTime(instance.getLaunchTime());
+        }
+        when(service.describeInstances("us-east-1", List.of(), List.of())).thenReturn(List.of(reservation));
+        when(service.instanceVolumeAttachments(List.of(instance))).thenReturn(Map.of("i-test", List.of(attachment)));
+
+        Response response = handler(service).handle("DescribeInstances", new MultivaluedHashMap<>(), "us-east-1");
+
+        assertEquals(200, response.getStatus());
+        String xml = response.getEntity().toString();
+        assertTrue(xml.contains("<volumeId>vol-test</volumeId>"));
+        assertEquals(timestamp, xml.contains("<attachTime>"));
+        if (timestamp) {
+            assertTrue(xml.contains("<attachTime>2026-10-20T00:00:00.000Z</attachTime>"));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"LaunchTemplateVersion", "Versions"})
+    void describeLaunchTemplateVersionsReadsIndexedSelectors(String prefix) {
+        Ec2Service service = mock(Ec2Service.class);
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("LaunchTemplateId", "lt-test");
+        params.putSingle(prefix + ".1", "$Default");
+        params.putSingle(prefix + ".2", "1");
+        params.putSingle(prefix + ".3", "$Latest");
+
+        Response response = handler(service).handle("DescribeLaunchTemplateVersions", params, "eu-west-1");
+
+        assertEquals(200, response.getStatus());
+        verify(service).describeLaunchTemplateVersions(
+                "eu-west-1", "lt-test", null, List.of("$Default", "1", "$Latest"), null, null);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "-1", "invalid"})
+    void explicitlyInvalidVolumeIopsIsRefusedBeforeServiceMutation(String iops) {
+        Ec2Service service = mock(Ec2Service.class);
+        Volume volume = new Volume();
+        volume.setVolumeId("vol-test");
+        when(service.createVolume(any(), any(), any(), anyInt(), anyBoolean(), anyInt(), any(), any(), anyList()))
+                .thenReturn(volume);
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("AvailabilityZone", "us-east-1a");
+        params.putSingle("Size", "10");
+        params.putSingle("VolumeType", "gp3");
+        params.putSingle("Iops", iops);
+        Response response = handler(service).handle("CreateVolume", params, "us-east-1");
+        assertInvalidParameterValue(response, "Iops");
+        verifyNoInteractions(service);
+    }
 
     @ParameterizedTest
     @CsvSource({
@@ -448,7 +520,7 @@ class Ec2QueryHandlerTest {
         Image image = new Image();
         image.setImageId("ami-0123456789abcdef2");
         image.setBlockDeviceMappings(List.of(deviceMapping("/dev/sda1", "snap-0123456789abcdef3")));
-        when(service.copyImage("us-east-1", "us-west-2", "ami-source", "name", null)).thenReturn(image);
+        when(service.copyImage("us-east-1", "us-west-2", "ami-source", "name", null, false, false)).thenReturn(image);
         MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
         params.putSingle("SourceRegion", "us-west-2");
         params.putSingle("SourceImageId", "ami-source");
