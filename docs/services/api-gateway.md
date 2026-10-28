@@ -1058,3 +1058,8 @@ identity, session, boundary, SCP and resource-policy conditions. REST anonymous
 and custom-authorizer resource-policy checks also receive these time keys.
 These values do not come from client-supplied date headers. This does not add
 other global condition keys or issue STS sessions for service execution roles.
+
+REST resource-policy evaluation for callers without verified AWS credentials leaves
+`aws:PrincipalIsAWSService` absent. `Bool` matching `false` does not match an
+absent key; `Null` and `BoolIfExists` retain their IAM condition semantics.
+A Cognito token or custom authorizer principal does not become an AWS credential.

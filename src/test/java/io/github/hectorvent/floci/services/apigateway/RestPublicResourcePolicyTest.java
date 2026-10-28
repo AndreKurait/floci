@@ -113,6 +113,33 @@ class RestPublicResourcePolicyTest {
                 new ApiGatewayExecuteRouteContext(), null, new RequestContext(), signature, null, null, direct, roles, callers);
     }
 
+    @Test
+    void boolIfExistsStillMatchesAnAbsentSignedPrincipalFlag() {
+        policy(document("Allow", "*", INVOKE,
+                ",\"Condition\":{\"BoolIfExists\":{\"aws:PrincipalIsAWSService\":\"false\"}}"));
+        assertEquals(200, invoke());
+        policy(document("Deny", "*", INVOKE,
+                ",\"Condition\":{\"BoolIfExists\":{\"aws:PrincipalIsAWSService\":\"false\"}}"));
+        assertEquals(403, invoke());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"NONE", "COGNITO_USER_POOLS"})
+    void nonIamCallerHasNoSignedPrincipalServiceFlag(String auth) {
+        method.setAuthorizationType(auth);
+        policy(document("Allow", "*", INVOKE,
+                ",\"Condition\":{\"Bool\":{\"aws:PrincipalIsAWSService\":\"false\"}}"));
+        assertEquals(403, invoke());
+        policy(document("Allow", "*", INVOKE,
+                ",\"Condition\":{\"Null\":{\"aws:PrincipalIsAWSService\":\"true\"}}"));
+        assertEquals(200, invoke());
+        policy(document("Deny", "*", INVOKE,
+                ",\"Condition\":{\"Null\":{\"aws:PrincipalIsAWSService\":\"true\"}}"));
+        assertEquals(403, invoke());
+        verify(lambda, times(1)).invokeTarget(anyString(), anyString(), any(byte[].class), any());
+        verifyNoInteractions(signature, iam, scps);
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"NONE", "COGNITO_USER_POOLS"})
     void attachedPolicyRequiresExplicitAnonymousGrant(String auth) {
@@ -161,7 +188,8 @@ class RestPublicResourcePolicyTest {
     void transportAndAnonymousContextAllowWithoutIamIdentity() {
         policy(document("Allow", "*", INVOKE, ",\"Condition\":{"
                 + "\"IpAddress\":{\"aws:SourceIp\":\"127.0.0.0/8\"},"
-                + "\"Bool\":{\"aws:SecureTransport\":\"false\",\"aws:PrincipalIsAWSService\":\"false\"},"
+                + "\"Bool\":{\"aws:SecureTransport\":\"false\"},"
+                + "\"Null\":{\"aws:PrincipalIsAWSService\":\"true\"},"
                 + "\"StringEquals\":{\"aws:PrincipalAccount\":\"anonymous\","
                 + "\"aws:ResourceAccount\":\"" + OWNER + "\",\"aws:RequestedRegion\":\"us-east-1\"}}"));
         assertEquals(200, invoke());
