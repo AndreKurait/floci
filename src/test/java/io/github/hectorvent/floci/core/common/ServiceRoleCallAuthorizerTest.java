@@ -20,6 +20,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -132,6 +133,34 @@ class ServiceRoleCallAuthorizerTest {
                 authorizer.authorizeWithoutSourceContext("apigateway", requestedRole, INVOKE, FUNCTION, ACCOUNT, "aws"));
     }
 
+    @ParameterizedTest
+    @CsvSource({"aws,us-east-1,aws,us-west-2", "aws,us-east-1,aws-cn,cn-north-1",
+            "aws,us-east-1,aws-us-gov,us-gov-west-1", "aws-cn,cn-north-1,aws,us-east-1",
+            "aws-cn,cn-north-1,aws-cn,cn-northwest-1", "aws-cn,cn-north-1,aws-us-gov,us-gov-west-1",
+            "aws-us-gov,us-gov-west-1,aws,us-east-1", "aws-us-gov,us-gov-west-1,aws-cn,cn-north-1",
+            "aws-us-gov,us-gov-west-1,aws-us-gov,us-gov-east-1"})
+    void sourceContextRequiresTargetInTheSamePartition(String sourcePartition, String sourceRegion,
+                                                       String targetPartition, String targetRegion) {
+        String executionRole = ROLE.replace("arn:aws:", "arn:" + sourcePartition + ":");
+        String source = RULE.replace("arn:aws:", "arn:" + sourcePartition + ":")
+                .replace("us-east-1", sourceRegion);
+        String target = FUNCTION.replace("arn:aws:", "arn:" + targetPartition + ":")
+                .replace("us-east-1", targetRegion);
+        role.setArn(executionRole);
+        role.setAssumeRolePolicyDocument(TRUST.replace(RULE, source));
+        when(iam.resolvePrincipalContext(executionRole)).thenReturn(CallerContext.of(List.of(ALLOW)));
+        assertEquals(sourcePartition.equals(targetPartition) ? Decision.ALLOW : Decision.DENY,
+                authorizer.authorize("events", executionRole, INVOKE, target, source, ACCOUNT));
+    }
+
+    @Test
+    void sourceContextPreservesCrossPartitionBypassWhenIamIsDisabled() {
+        when(config.enforcementEnabled()).thenReturn(false);
+        assertEquals(Decision.ALLOW, authorizer.authorize("events", ROLE, INVOKE,
+                FUNCTION.replace("arn:aws:", "arn:aws-cn:"), RULE, ACCOUNT));
+        verifyNoInteractions(iam);
+    }
+
     @Test
     void noSourceContextRejectsCrossPartitionTargets() {
         assertEquals(Decision.DENY, authorizer.authorizeWithoutSourceContext("apigateway", ROLE, INVOKE,
@@ -200,6 +229,74 @@ class ServiceRoleCallAuthorizerTest {
                 "Null":{"aws:TokenIssueTime":"true","aws:SourceArn":"true","aws:SourceAccount":"true"}}}}
                 """.formatted(NOW);
         when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(policy)));
+        assertEquals(Decision.ALLOW, decide(FUNCTION));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"events,identity", "apigateway,identity", "events,boundary", "apigateway,boundary",
+            "events,scp", "apigateway,scp", "events,resource", "apigateway,resource"})
+    void attachedRoleTagsConstrainEveryTargetPolicy(String service, String layer) {
+        role.setAssumeRolePolicyDocument("""
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"%s.amazonaws.com"},
+                "Action":"sts:AssumeRole"}}""".formatted(service));
+        role.setTags(Map.of("team", "orders"));
+        String policy = """
+                {"Statement":{"Effect":"Allow","Action":"*","Resource":"*",
+                "Condition":{"StringEquals":{"aws:PrincipalTag/team":"orders"}}}}""";
+        String target = FUNCTION;
+        switch (layer) {
+            case "identity" -> when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(policy)));
+            case "boundary" -> {
+                role.setPermissionsBoundaryArn("arn:aws:iam::" + ACCOUNT + ":policy/tag-limit");
+                when(iam.resolvePrincipalContext(ROLE)).thenReturn(new CallerContext(List.of(ALLOW), null, policy));
+            }
+            case "scp" -> when(scps.effectiveScpLevels(ACCOUNT)).thenReturn(List.of(List.of(policy)));
+            case "resource" -> {
+                target = FUNCTION.replace(ACCOUNT, OTHER);
+                String grant = policy.replace("\"Action\"", "\"Principal\":{\"AWS\":\"" + ROLE + "\"},\"Action\"");
+                when(provider.getResourcePolicies("lambda", target))
+                        .thenReturn(List.of(new ResourcePolicyProvider.ResourcePolicy(grant, OTHER)));
+            }
+            default -> fail(layer);
+        }
+        assertEquals(Decision.ALLOW, timeDecision(service, target));
+        role.setTags(Map.of("team", "payments"));
+        assertEquals(Decision.DENY, timeDecision(service, target));
+        role.setTags(Map.of());
+        assertEquals(Decision.DENY, timeDecision(service, target));
+        role.setTags(Map.of("team", "orders"));
+        assertEquals(Decision.ALLOW, timeDecision(service, target));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"events", "apigateway"})
+    void attachedRoleTagsCannotSkipExplicitDeny(String service) {
+        role.setAssumeRolePolicyDocument("""
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"%s.amazonaws.com"},
+                "Action":"sts:AssumeRole"}}""".formatted(service));
+        role.setTags(Map.of("blocked", "yes"));
+        String deny = """
+                {"Statement":{"Effect":"Deny","Action":"*","Resource":"*",
+                "Condition":{"StringEquals":{"aws:PrincipalTag/blocked":"yes"}}}}""";
+        when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(ALLOW, deny)));
+        assertEquals(Decision.DENY, timeDecision(service, FUNCTION));
+        role.setTags(Map.of());
+        assertEquals(Decision.ALLOW, timeDecision(service, FUNCTION));
+    }
+
+    @Test
+    void targetRoleTagsAreNotServicePrincipalTrustTags() {
+        role.setTags(Map.of("team", "orders"));
+        role.setAssumeRolePolicyDocument(TRUST.replace("\"ArnEquals\"",
+                "\"StringEqualsIfExists\":{\"aws:PrincipalTag/team\":\"other\"},\"ArnEquals\""));
+        assertEquals(Decision.ALLOW, decide(FUNCTION));
+    }
+
+    @Test
+    void absentAttachedTagsDoNotInventSessionTags() {
+        when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of("""
+                {"Statement":{"Effect":"Allow","Action":"*","Resource":"*",
+                "Condition":{"Null":{"aws:PrincipalTag/team":"true","aws:TokenIssueTime":"true"}}}}""")));
         assertEquals(Decision.ALLOW, decide(FUNCTION));
     }
 
