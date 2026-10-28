@@ -196,7 +196,7 @@ class Ec2QueryHandlerTest {
         Ec2Service service = mock(Ec2Service.class);
         Subnet subnet = new Subnet();
         subnet.setSubnetId("subnet-test");
-        when(service.createSubnet("us-east-1", "vpc-test", "10.38.1.0/24", null, null, null))
+        when(service.createSubnet("us-east-1", "vpc-test", "10.38.1.0/24", null, null, null, false))
                 .thenReturn(subnet);
         MultivaluedMap<String, String> params = createSubnetParams("10.38.1.0/24");
         params.putSingle(prefix + ".1.ResourceType", "subnet");
@@ -258,7 +258,7 @@ class Ec2QueryHandlerTest {
         Ec2Service service = mock(Ec2Service.class);
         Vpc vpc = new Vpc();
         vpc.setVpcId("vpc-test");
-        when(service.createVpc("us-east-1", "10.38.0.0/16", false, false, null)).thenReturn(vpc);
+        when(service.createVpc("us-east-1", "10.38.0.0/16", false, false, null, false)).thenReturn(vpc);
         MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
         params.putSingle("CidrBlock", "10.38.0.0/16");
         params.putSingle("TagSpecification.1.ResourceType", "vpc");
@@ -500,7 +500,7 @@ class Ec2QueryHandlerTest {
         Ec2Service service = mock(Ec2Service.class);
         Subnet subnet = new Subnet();
         subnet.setSubnetId("subnet-test");
-        when(service.createSubnet("us-east-1", "vpc-test", "10.42.1.0/24", null, null, null))
+        when(service.createSubnet("us-east-1", "vpc-test", "10.42.1.0/24", null, null, null, false))
                 .thenReturn(subnet);
         IllegalStateException taggingFailure = new IllegalStateException("tag storage failed");
         doThrow(taggingFailure).when(service).createTags(eq("us-east-1"), eq(List.of("subnet-test")),
