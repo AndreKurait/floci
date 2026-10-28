@@ -23,6 +23,19 @@ import static org.mockito.Mockito.when;
 class TagOnCreateTest {
 
     @Test
+    void assumeRoleUsesOnlyConsumedSessionTagsAndRetainsGeneratedAuthorization() {
+        Tagging tags = TagOnCreate.of("sts:AssumeRole", form("Action=AssumeRole"
+                + "&Tags.member.3.Key=Project&Tags.member.3.Value=session"
+                + "&tags.member.1.Key=Other&tags.member.1.Value=unused")).orElseThrow();
+        assertEquals("sts:TagSession", tags.action());
+        assertEquals(List.of(set(Map.of("Project", "session"))), tags.checked());
+        assertEquals(List.of(Map.of("aws:RequestTag/Project", List.of("session"),
+                "aws:TagKeys", List.of("Project"))), TagOnCreate.requestTagContexts(tags));
+        assertEquals(Optional.empty(), TagOnCreate.of("sts:AssumeRole", form("Action=AssumeRole"
+                + "&tags.member.1.Key=Project&tags.member.1.Value=unused")));
+    }
+
+    @Test
     void aFormsTagsAreReadFromOneToTheFirstNumberWithNoKey() {
         assertEquals(List.of(set(Map.of("a", "1", "b", "2"))), sets("sns:CreateTopic", form("Name=t"
                 + "&Tags.member.2.Key=b&Tags.member.2.Value=2&Tags.member.1.Key=a&Tags.member.1.Value=1"
