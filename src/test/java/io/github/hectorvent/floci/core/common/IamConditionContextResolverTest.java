@@ -103,6 +103,17 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void anonymousGlobalContextOmitsSignedPrincipalFlag() {
+        Map<String, List<String>> context = IamConditionContextResolver.withGlobalContext(
+                Map.of("aws:PrincipalIsAWSService", List.of("false")),
+                "arn:aws:execute-api:us-east-1:111122223333:api/prod/GET/items",
+                "us-east-1", "anonymous", "111122223333");
+        assertFalse(context.containsKey("aws:PrincipalIsAWSService"));
+        assertEquals(List.of("anonymous"), context.get("aws:PrincipalAccount"));
+        assertEquals(List.of("111122223333"), context.get("aws:ResourceAccount"));
+    }
+
+    @Test
     void logStreamTagsUseRawParentNameAndRequestRegion() throws Exception {
         ContainerRequestContext request = mock(ContainerRequestContext.class);
         when(request.getProperty("floci.bufferedJsonBody"))
