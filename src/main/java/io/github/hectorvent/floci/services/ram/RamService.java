@@ -662,6 +662,30 @@ public class RamService {
         }
     }
 
+    /** Resource use requires acceptance; pending invitations expose only discovery metadata. */
+    public boolean canUseResource(String resourceArn, String ownerAccountId, String callerAccountId, String region) {
+        return sharesIn(region).stream()
+                .filter(share -> "ACTIVE".equals(share.getStatus()))
+                .filter(share -> ownerAccountId.equals(share.getOwningAccountId()))
+                .filter(share -> share.getResourceArns().contains(resourceArn))
+                .anyMatch(share -> share.getPrincipals().stream().anyMatch(principal -> {
+                    if (!ACCOUNT_ID_PRINCIPAL.matcher(principal).matches()) {
+                        return isSharingWithOrganizationEnabled(ownerAccountId)
+                                && isMemberOfSameOrganization(ownerAccountId, callerAccountId)
+                                && isOrganizationPrincipalVisible(principal, callerAccountId);
+                    }
+                    if (!principal.equals(callerAccountId)) {
+                        return false;
+                    }
+                    return allInvitations().stream().anyMatch(invitation ->
+                            invitation.resourceShareArn().equals(share.getResourceShareArn())
+                                    && callerAccountId.equals(invitation.receiverAccountId())
+                                    && "ACCEPTED".equals(invitation.status()))
+                            || isSharingWithOrganizationEnabled(ownerAccountId)
+                                    && isMemberOfSameOrganization(ownerAccountId, callerAccountId);
+                }));
+    }
+
     private boolean isVisible(ResourceShare share, String callerAccountId, String resourceOwner) {
         boolean owned = share.getOwningAccountId().equals(callerAccountId);
         if ("SELF".equals(resourceOwner)) {

@@ -365,7 +365,7 @@ class AutoScalingPlacementTest {
                             throw launchFailure;
                         }
                         String subnet = call.getArgument(7);
-                        String zone = null;
+                        String zone = call.getArgument(15);
                         if (subnet != null) {
                             if (!ipv6Only.contains(subnet) && availableIps.getOrDefault(subnet, 251) == 0) {
                                 throw new AwsException("InsufficientFreeAddressesInSubnet",

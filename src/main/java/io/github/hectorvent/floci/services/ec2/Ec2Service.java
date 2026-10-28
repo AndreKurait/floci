@@ -106,6 +106,7 @@ import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
+import io.github.hectorvent.floci.services.ram.RamService;
 import io.github.hectorvent.floci.services.resourcegroups.ResourceGroupsService;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -326,6 +327,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final Map<String, Set<String>> capacityGroupInstanceIds = new HashMap<>();
     // CDI Instance clashes with the EC2 Instance model imported above.
     jakarta.enterprise.inject.Instance<ResourceGroupsService> resourceGroupsServices;
+    // CDI Instance clashes with the EC2 Instance model imported above.
+    @Inject
+    jakarta.enterprise.inject.Instance<RamService> ramServices;
     private final StorageBackend<String, Host> hosts;
     private final StorageBackend<String, EgressOnlyInternetGateway> egressOnlyInternetGateways;
     // Serialises a launch onto a host against ModifyHosts/ReleaseHosts, so a host cannot be
@@ -4033,7 +4037,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             synchronized (capacityReservationLock) {
                 reconcileCapacityMembership(region);
                 CapacityReservation target = capacityTargetId == null ? null
-                        : getRequiredCapacityReservation(region, capacityTargetId);
+                        : getRequiredUsableCapacityReservation(region, capacityTargetId);
                 Instance requested = new Instance();
                 requested.setOwnerId(callerAccountId());
                 requested.setRegion(region);
@@ -4049,7 +4053,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             "The targeted Capacity Reservation has no matching available capacity.", 400);
                 }
                 long available = target == null
-                        ? capacityReservations.scan(k -> k.startsWith(region + "::")).stream()
+                        ? allCapacityReservations(region).stream()
                                 .filter(candidate -> capacityGroupMembers == null
                                         ? "open".equals(candidate.getInstanceMatchCriteria())
                                         : capacityGroupMembers.contains(candidate.getCapacityReservationArn()))
@@ -5046,54 +5050,61 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // teardown executor where no request context is active and every account-aware store
         // would silently fall back to the default account.
         String owner = callerAccountId();
-        for (String id : instanceIds) {
-            Instance inst = getRequiredInstance(region, id);
-            if (isExternalInstance(region, id)) {
-                throw new AwsException("OperationNotPermitted",
-                        "The instance '" + id + "' is a cluster node and cannot be terminated through EC2", 400);
-            }
+        boolean reconcileCapacity = false;
+        try {
+            for (String id : instanceIds) {
+                Instance inst = getRequiredInstance(region, id);
+                if (isExternalInstance(region, id)) {
+                    throw new AwsException("OperationNotPermitted",
+                            "The instance '" + id + "' is a cluster node and cannot be terminated through EC2", 400);
+                }
 
-            if (config.services().ec2().mock() && "pending".equals(inst.getState().getName())) {
-                inst.setState(InstanceState.running());
-            }
-            InstanceState prev = inst.getState();
-            if (config.services().ec2().mock()) {
-                // Under the instance's lock, so a concurrent Elastic IP write sees the new state.
-                synchronized (inst) {
-                    inst.setState(InstanceState.terminated());
-                    // Termination also disassociates an Elastic IP, so nothing public is left.
-                    clearPublicAddress(inst);
+                if (config.services().ec2().mock() && "pending".equals(inst.getState().getName())) {
+                    inst.setState(InstanceState.running());
                 }
-                inst.setTerminatedAt(System.currentTimeMillis());
-            } else {
-                // Also attempt the reclaim once this container is really gone. The synchronous
-                // attempt below runs while teardown is still scheduled, so for a batch whose
-                // containers all tear down slowly every in-loop attempt can be refused by the
-                // daemon and, without this, nothing would try again.
-                containerManager.terminate(inst, () ->
-                        RequestScopes.runAs(owner, () -> reclaimCapturesPinnedBy(region, inst, terminating)));
-                // Termination releases the public address with a container too, under the lock a
-                // DescribeAddresses re-point holds, so one already under way cannot write it back.
-                synchronized (privateIpAllocationLock) {
-                    writePublicAddress(inst, () -> clearPublicAddress(inst));
+                InstanceState prev = inst.getState();
+                reconcileCapacity = true;
+                if (config.services().ec2().mock()) {
+                    // Under the instance's lock, so a concurrent Elastic IP write sees the new state.
+                    synchronized (inst) {
+                        inst.setState(InstanceState.terminated());
+                        // Termination also disassociates an Elastic IP, so nothing public is left.
+                        clearPublicAddress(inst);
+                    }
+                    inst.setTerminatedAt(System.currentTimeMillis());
+                } else {
+                    // Also attempt the reclaim once this container is really gone. The synchronous
+                    // attempt below runs while teardown is still scheduled, so for a batch whose
+                    // containers all tear down slowly every in-loop attempt can be refused by the
+                    // daemon and, without this, nothing would try again.
+                    containerManager.terminate(inst, () ->
+                            RequestScopes.runAs(owner, () -> reclaimCapturesPinnedBy(region, inst, terminating)));
+                    // Termination releases the public address with a container too, under the lock a
+                    // DescribeAddresses re-point holds, so one already under way cannot write it back.
+                    synchronized (privateIpAllocationLock) {
+                        writePublicAddress(inst, () -> clearPublicAddress(inst));
+                    }
+                }
+                detachAttachedVolumesOnTermination(region, inst);
+                releaseStandaloneInterfacesOnTermination(region, inst);
+                instances.put(key(region, id), inst);
+                // The last instance depending on a deregistered AMI's capture has just gone away.
+                // Cheap and usually sufficient: by here the container is often already removed.
+                reclaimCapturesPinnedBy(region, inst, terminating);
+                Map<String, String> entry = new LinkedHashMap<>();
+                entry.put("instanceId", id);
+                entry.put("previousState", prev.getName());
+                entry.put("previousCode", String.valueOf(prev.getCode()));
+                entry.put("currentState", "shutting-down");
+                entry.put("currentCode", "32");
+                result.add(entry);
+            }
+        } finally {
+            if (reconcileCapacity) {
+                synchronized (capacityReservationLock) {
+                    reconcileCapacityMembership(region);
                 }
             }
-            detachAttachedVolumesOnTermination(region, inst);
-            releaseStandaloneInterfacesOnTermination(region, inst);
-            instances.put(key(region, id), inst);
-            synchronized (capacityReservationLock) {
-                reconcileCapacityMembership(region);
-            }
-            // The last instance depending on a deregistered AMI's capture has just gone away.
-            // Cheap and usually sufficient: by here the container is often already removed.
-            reclaimCapturesPinnedBy(region, inst, terminating);
-            Map<String, String> entry = new LinkedHashMap<>();
-            entry.put("instanceId", id);
-            entry.put("previousState", prev.getName());
-            entry.put("previousCode", String.valueOf(prev.getCode()));
-            entry.put("currentState", "shutting-down");
-            entry.put("currentCode", "32");
-            result.add(entry);
         }
         return result;
     }
@@ -5157,49 +5168,56 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public List<Map<String, String>> stopInstances(String region, List<String> instanceIds) {
         ensureDefaultResources(region);
         List<Map<String, String>> result = new ArrayList<>();
-        for (String id : instanceIds) {
-            Instance inst = getRequiredInstance(region, id);
-            if (isExternalInstance(region, id)) {
-                throw new AwsException("OperationNotPermitted",
-                        "The instance '" + id + "' is a cluster node and cannot be stopped through EC2", 400);
-            }
+        boolean reconcileCapacity = false;
+        try {
+            for (String id : instanceIds) {
+                Instance inst = getRequiredInstance(region, id);
+                if (isExternalInstance(region, id)) {
+                    throw new AwsException("OperationNotPermitted",
+                            "The instance '" + id + "' is a cluster node and cannot be stopped through EC2", 400);
+                }
 
-            if (config.services().ec2().mock() && "pending".equals(inst.getState().getName())) {
-                inst.setState(InstanceState.running());
-            }
-            InstanceState prev = inst.getState();
-            if (config.services().ec2().mock()) {
-                // The allocation lock first, as in completeMockLaunch. A terminated or terminating
-                // instance stays so: stopping it must not bring it back to be started again.
-                synchronized (privateIpAllocationLock) {
-                    synchronized (inst) {
-                        String state = inst.getState() == null ? null : inst.getState().getName();
-                        if (!"terminated".equals(state) && !"shutting-down".equals(state)) {
-                            inst.setState(InstanceState.stopped());
-                            releaseAutomaticAddress(region, inst);
+                if (config.services().ec2().mock() && "pending".equals(inst.getState().getName())) {
+                    inst.setState(InstanceState.running());
+                }
+                InstanceState prev = inst.getState();
+                reconcileCapacity = true;
+                if (config.services().ec2().mock()) {
+                    // The allocation lock first, as in completeMockLaunch. A terminated or terminating
+                    // instance stays so: stopping it must not bring it back to be started again.
+                    synchronized (privateIpAllocationLock) {
+                        synchronized (inst) {
+                            String state = inst.getState() == null ? null : inst.getState().getName();
+                            if (!"terminated".equals(state) && !"shutting-down".equals(state)) {
+                                inst.setState(InstanceState.stopped());
+                                releaseAutomaticAddress(region, inst);
+                            }
                         }
                     }
+                } else if (!"terminated".equals(prev.getName()) && !"shutting-down".equals(prev.getName())) {
+                    // As in mock mode, a terminated or terminating instance stays so.
+                    containerManager.stop(inst);
+                    // A stop releases the automatic address with a container too; the next start
+                    // decides on a replacement, and re-points an Elastic IP kept here.
+                    synchronized (privateIpAllocationLock) {
+                        writePublicAddress(inst, () -> releaseAutomaticAddress(region, inst));
+                    }
                 }
-            } else if (!"terminated".equals(prev.getName()) && !"shutting-down".equals(prev.getName())) {
-                // As in mock mode, a terminated or terminating instance stays so.
-                containerManager.stop(inst);
-                // A stop releases the automatic address with a container too; the next start
-                // decides on a replacement, and re-points an Elastic IP kept here.
-                synchronized (privateIpAllocationLock) {
-                    writePublicAddress(inst, () -> releaseAutomaticAddress(region, inst));
+                instances.put(key(region, id), inst);
+                Map<String, String> entry = new LinkedHashMap<>();
+                entry.put("instanceId", id);
+                entry.put("previousState", prev.getName());
+                entry.put("previousCode", String.valueOf(prev.getCode()));
+                entry.put("currentState", "stopping");
+                entry.put("currentCode", "64");
+                result.add(entry);
+            }
+        } finally {
+            if (reconcileCapacity) {
+                synchronized (capacityReservationLock) {
+                    reconcileCapacityMembership(region);
                 }
             }
-            instances.put(key(region, id), inst);
-            synchronized (capacityReservationLock) {
-                reconcileCapacityMembership(region);
-            }
-            Map<String, String> entry = new LinkedHashMap<>();
-            entry.put("instanceId", id);
-            entry.put("previousState", prev.getName());
-            entry.put("previousCode", String.valueOf(prev.getCode()));
-            entry.put("currentState", "stopping");
-            entry.put("currentCode", "64");
-            result.add(entry);
         }
         return result;
     }
@@ -10664,9 +10682,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         synchronized (capacityReservationLock) {
             reconcileCapacityMembership(region);
             Map<String, String> associations = new HashMap<>();
-            for (CapacityReservation reservation : capacityReservations.scan(k -> k.startsWith(region + "::"))) {
+            for (CapacityReservation reservation : allCapacityReservations(region)) {
                 for (String instanceId : reservation.getInstanceIds()) {
-                    associations.put(instanceId, reservation.getCapacityReservationId());
+                    if (callerAccountId().equals(capacityMemberOwner(reservation, instanceId))) {
+                        associations.put(instanceId, reservation.getCapacityReservationId());
+                    }
                 }
             }
             return associations;
@@ -10730,7 +10750,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         List<CapacityReservation> reconciled = new ArrayList<>();
         List<CapacityReservation> activatedReservations = new ArrayList<>();
         Map<String, CapacityReservation> changed = new LinkedHashMap<>();
-        for (CapacityReservation stored : capacityReservations.scan(k -> k.startsWith(region + "::"))) {
+        for (CapacityReservation stored : allCapacityReservations(region)) {
             CapacityReservation updated = new CapacityReservation(stored);
             reconciled.add(updated);
             boolean activated = "scheduled".equals(updated.getState()) && updated.getStartDate() != null
@@ -10746,12 +10766,47 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 updated.setState("expired");
             }
             updated.getInstanceIds().removeIf(id -> !"active".equals(updated.getState())
-                    || instances.get(key(region, id)).map(instance -> !holdsCapacity(instance)).orElse(true));
+                    || capacityMemberInstance(updated, id).map(instance -> !holdsCapacity(instance)).orElse(true));
+            updated.getInstanceOwners().keySet().retainAll(updated.getInstanceIds());
             int released = stored.getInstanceIds().size() - updated.getInstanceIds().size();
             if (activated || expired || released > 0) {
                 updated.setAvailableInstanceCount("active".equals(updated.getState())
                         ? updated.getAvailableInstanceCount() + released : 0);
-                changed.put(key(region, updated.getCapacityReservationId()), updated);
+                changed.put(updated.getOwnerId() + "/" + key(region, updated.getCapacityReservationId()), updated);
+            }
+        }
+        List<CapacityReservation> open = reconciled.stream()
+                .filter(reservation -> "active".equals(reservation.getState())
+                        && "open".equals(reservation.getInstanceMatchCriteria())
+                        && reservation.getAvailableInstanceCount() > 0).toList();
+        if (!open.isEmpty() && ramServices != null && ramServices.isResolvable()) {
+            Set<String> associated = new HashSet<>();
+            for (CapacityReservation reservation : reconciled) {
+                reservation.getInstanceIds().forEach(id -> associated.add(capacityMemberOwner(reservation, id) + "/" + id));
+            }
+            for (AccountAwareStorageBackend.AccountEntry<Instance> entry : entriesOfEveryAccount(instances)) {
+                Instance instance = entry.value();
+                if (!region.equals(instance.getRegion()) || instance.getState() == null
+                        || !"running".equals(instance.getState().getName()) || instance.isSpot()
+                        || !"open".equals(instance.getCapacityReservationPreference())
+                        || instance.getCapacityReservationTarget() != null
+                        || instance.getCapacityReservationGroupArn() != null
+                        || instance.getOwnerId() == null
+                        || entry.accountId() != null && !entry.accountId().equals(instance.getOwnerId())
+                        || associated.contains(instance.getOwnerId() + "/" + instance.getInstanceId())) {
+                    continue;
+                }
+                CapacityReservation selected = open.stream()
+                        .filter(reservation -> !instance.getOwnerId().equals(reservation.getOwnerId()))
+                        .filter(reservation -> reservation.getAvailableInstanceCount() > 0)
+                        .filter(reservation -> matchesCapacityReservation(instance, reservation)).findFirst().orElse(null);
+                if (selected != null) {
+                    selected.getInstanceIds().add(instance.getInstanceId());
+                    selected.getInstanceOwners().put(instance.getInstanceId(), instance.getOwnerId());
+                    selected.setAvailableInstanceCount(selected.getAvailableInstanceCount() - 1);
+                    associated.add(instance.getOwnerId() + "/" + instance.getInstanceId());
+                    changed.put(selected.getOwnerId() + "/" + key(region, selected.getCapacityReservationId()), selected);
+                }
             }
         }
         List<CapacityReservation> available = reconciled.stream()
@@ -10811,6 +10866,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     && !associated.contains(instance.getInstanceId())
                     && matchesCapacityReservation(instance, reservation)) {
                 reservation.getInstanceIds().add(instance.getInstanceId());
+                reservation.getInstanceOwners().put(instance.getInstanceId(), instance.getOwnerId());
                 reservation.setAvailableInstanceCount(reservation.getAvailableInstanceCount() - 1);
                 associated.add(instance.getInstanceId());
             }
@@ -10858,15 +10914,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
             reconcileCapacityMembership(region);
-            List<CapacityReservation> candidates = capacityReservations.scan(k -> k.startsWith(region + "::"))
-                    .stream().map(CapacityReservation::new).toList();
+            List<CapacityReservation> candidates = allCapacityReservations(region).stream()
+                    .map(CapacityReservation::new).toList();
             Map<String, CapacityReservation> changed = new LinkedHashMap<>();
             for (Instance instance : admitted) {
                 if (!holdsCapacity(instance) || instance.isSpot()
                         || "none".equals(instance.getCapacityReservationPreference())) {
                     continue;
                 }
-                if (candidates.stream().anyMatch(r -> r.getInstanceIds().contains(instance.getInstanceId()))) {
+                if (candidates.stream().anyMatch(r -> r.getInstanceIds().contains(instance.getInstanceId())
+                        && Objects.equals(instance.getOwnerId(), capacityMemberOwner(r, instance.getInstanceId())))) {
                     continue;
                 }
                 String target = instance.getCapacityReservationTarget();
@@ -10881,7 +10938,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         .filter(r -> r.getAvailableInstanceCount() > 0).findFirst().orElse(null);
                 if (selected == null) {
                     if (target != null) {
-                        CapacityReservation reservation = getRequiredCapacityReservation(region, target);
+                        CapacityReservation reservation = getRequiredUsableCapacityReservation(region, target);
                         if (matchesCapacityReservation(instance, reservation)
                                 && reservation.getAvailableInstanceCount() <= 0) {
                             throw new AwsException("ReservationCapacityExceeded",
@@ -10897,8 +10954,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     continue;
                 }
                 selected.getInstanceIds().add(instance.getInstanceId());
+                selected.getInstanceOwners().put(instance.getInstanceId(), instance.getOwnerId());
                 selected.setAvailableInstanceCount(selected.getAvailableInstanceCount() - 1);
-                changed.put(key(region, selected.getCapacityReservationId()), selected);
+                changed.put(selected.getOwnerId() + "/" + key(region, selected.getCapacityReservationId()), selected);
             }
             if (!changed.isEmpty()) {
                 persistCapacityMembership(changed);
@@ -10908,7 +10966,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private void persistCapacityMembership(Map<String, CapacityReservation> changed) {
         try {
-            capacityReservations.putAllAtomically(changed);
+            boolean callerOwned = changed.values().stream()
+                    .allMatch(reservation -> callerAccountId().equals(reservation.getOwnerId()));
+            if (callerOwned) {
+                Map<String, CapacityReservation> local = new LinkedHashMap<>();
+                changed.values().forEach(reservation -> local.put(
+                        key(reservation.getRegion(), reservation.getCapacityReservationId()), reservation));
+                capacityReservations.putAllAtomically(local);
+            } else if (capacityReservations instanceof AccountAwareStorageBackend<CapacityReservation> accountAware) {
+                accountAware.putAllAccountsAtomically(changed.values().stream().map(reservation ->
+                        new AccountAwareStorageBackend.AccountEntry<>(reservation.getOwnerId(),
+                                key(reservation.getRegion(), reservation.getCapacityReservationId()), reservation)).toList());
+            } else {
+                throw new IllegalStateException("Shared capacity requires account-aware storage");
+            }
         } catch (RuntimeException failure) {
             LOG.errorv(failure, "Failed to persist Capacity Reservation membership for {0}", changed.keySet());
             AwsException error = new AwsException("InternalError", "Could not persist capacity membership.", 500);
@@ -10925,7 +10996,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private boolean matchesCapacityReservation(Instance instance, CapacityReservation reservation) {
         return "active".equals(reservation.getState())
-                && Objects.equals(instance.getOwnerId(), reservation.getOwnerId())
+                && canUseCapacityReservation(reservation, instance.getOwnerId())
+                && Objects.equals(instance.getRegion(), reservation.getRegion())
                 && Objects.equals(instance.getInstanceType(), reservation.getInstanceType())
                 && instance.getPlacement() != null
                 && Objects.equals(instance.getPlacement().getAvailabilityZone(),
@@ -11104,9 +11176,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             ensureDefaultResources(region);
             reconcileCapacityMembership(region);
             for (String id : ids) {
-                getRequiredCapacityReservation(region, id);
+                getRequiredUsableCapacityReservation(region, id);
             }
-            return capacityReservations.scan(k -> true).stream()
+            return allCapacityReservations(region).stream()
+                    .filter(reservation -> canUseCapacityReservation(reservation, callerAccountId()))
                     .filter(r -> r.getRegion().equals(region))
                     .filter(r -> ids.isEmpty() || ids.contains(r.getCapacityReservationId()))
                     .filter(r -> matchesFilters(r, filters, region))
@@ -11177,6 +11250,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     getRequiredCapacityReservation(region, capacityReservationId));
             reservation.setState("cancelled");
             reservation.getInstanceIds().clear();
+            reservation.getInstanceOwners().clear();
             reservation.setAvailableInstanceCount(0);
             capacityReservations.put(key(region, capacityReservationId), reservation);
         }
@@ -11266,10 +11340,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         "There is insufficient available capacity in the source Capacity Reservation.", 400);
             }
             validateCapacityMoveAttributes(region, source, destination);
+            CapacityReservation currentSource = source;
+            CapacityReservation currentDestination = destination;
             List<String> eligibleInstances = source.getInstanceIds().stream()
-                    .filter(id -> instances.get(key(region, id))
+                    .filter(id -> capacityMemberInstance(currentSource, id)
                             .map(instance -> instance.getCapacityReservationTarget() == null
-                                    && "open".equals(instance.getCapacityReservationPreference()))
+                                    && "open".equals(instance.getCapacityReservationPreference())
+                                    && canUseCapacityReservation(currentDestination, instance.getOwnerId()))
                             .orElse(false))
                     .toList();
             if (eligibleInstances.size() < consumed) {
@@ -11287,6 +11364,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             List<String> transferred = new ArrayList<>(eligibleInstances.subList(0, consumed));
             source.getInstanceIds().removeAll(transferred);
             destination.getInstanceIds().addAll(transferred);
+            for (String id : transferred) {
+                destination.getInstanceOwners().put(id, capacityMemberOwner(source, id));
+                source.getInstanceOwners().remove(id);
+            }
             source.setAvailableInstanceCount(source.getAvailableInstanceCount() - count + consumed);
             destination.setTotalInstanceCount(destination.getTotalInstanceCount() + count);
             destination.setAvailableInstanceCount(destination.getAvailableInstanceCount() + count - consumed);
@@ -11370,6 +11451,44 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         int index = AvailabilityZoneIds.indexOf(region, reservation.getAvailabilityZoneId());
         return index >= 1 && index <= MODELLED_ZONE_SUFFIXES.length
                 ? region + MODELLED_ZONE_SUFFIXES[index - 1] : null;
+    }
+
+    private List<CapacityReservation> allCapacityReservations(String region) {
+        if (capacityReservations instanceof AccountAwareStorageBackend<CapacityReservation> accountAware) {
+            return accountAware.scanAllAccountEntries(k -> k.startsWith(region + "::")).stream()
+                    .filter(entry -> entry.accountId().equals(entry.value().getOwnerId()))
+                    .map(AccountAwareStorageBackend.AccountEntry::value)
+                    .filter(reservation -> region.equals(reservation.getRegion())).toList();
+        }
+        return capacityReservations.scan(k -> k.startsWith(region + "::"));
+    }
+
+    private String capacityMemberOwner(CapacityReservation reservation, String instanceId) {
+        return reservation.getInstanceOwners().getOrDefault(instanceId, reservation.getOwnerId());
+    }
+
+    private Optional<Instance> capacityMemberInstance(CapacityReservation reservation, String instanceId) {
+        String owner = capacityMemberOwner(reservation, instanceId);
+        String instanceKey = key(reservation.getRegion(), instanceId);
+        Optional<Instance> member = instances instanceof AccountAwareStorageBackend<Instance> accountAware
+                ? accountAware.getForAccount(owner, instanceKey) : instances.get(instanceKey);
+        return member.filter(instance -> owner.equals(instance.getOwnerId())
+                && reservation.getRegion().equals(instance.getRegion()));
+    }
+
+    private boolean canUseCapacityReservation(CapacityReservation reservation, String accountId) {
+        return accountId != null && (accountId.equals(reservation.getOwnerId()) || "default".equals(reservation.getTenancy())
+                && ramServices != null && ramServices.isResolvable()
+                && ramServices.get().canUseResource(reservation.getCapacityReservationArn(),
+                        reservation.getOwnerId(), accountId, reservation.getRegion()));
+    }
+
+    private CapacityReservation getRequiredUsableCapacityReservation(String region, String id) {
+        return allCapacityReservations(region).stream()
+                .filter(reservation -> id.equals(reservation.getCapacityReservationId()))
+                .filter(reservation -> canUseCapacityReservation(reservation, callerAccountId()))
+                .findFirst().orElseThrow(() -> new AwsException("InvalidCapacityReservationId.NotFound",
+                        "The Capacity Reservation '" + id + "' does not exist.", 400));
     }
 
     private CapacityReservation getRequiredCapacityReservation(String region, String capacityReservationId) {
