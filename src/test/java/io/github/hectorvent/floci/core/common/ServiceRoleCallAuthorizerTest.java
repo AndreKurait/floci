@@ -17,6 +17,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -39,6 +41,9 @@ class ServiceRoleCallAuthorizerTest {
             "Condition":{"ArnEquals":{"aws:SourceArn":"%s"},
             "StringEquals":{"aws:SourceAccount":"%s"}}}}""".formatted(RULE, ACCOUNT);
 
+    private static final Instant NOW = Instant.parse("2026-10-26T16:00:00Z");
+
+    private Clock clock;
     private IamService iam;
     private IamRole role;
     private EmulatorConfig.IamServiceConfig config;
@@ -67,8 +72,10 @@ class ServiceRoleCallAuthorizerTest {
         when(scpInstance.isResolvable()).thenReturn(true);
         when(scpInstance.get()).thenReturn(scps);
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(new ObjectMapper());
+        clock = mock(Clock.class);
+        when(clock.instant()).thenReturn(NOW);
         authorizer = new ServiceRoleCallAuthorizer(emulator, iam,
-                new AssumeRolePolicyEvaluator(new ObjectMapper(), evaluator), evaluator, providers, scpInstance);
+                new AssumeRolePolicyEvaluator(new ObjectMapper(), evaluator), evaluator, providers, scpInstance, clock);
     }
 
     @ParameterizedTest
@@ -130,6 +137,75 @@ class ServiceRoleCallAuthorizerTest {
         assertEquals(Decision.DENY, authorizer.authorizeWithoutSourceContext("apigateway", ROLE, INVOKE,
                 FUNCTION.replace("arn:aws:", "arn:aws-cn:"), ACCOUNT, "aws"));
         verifyNoInteractions(iam);
+    }
+
+
+    @ParameterizedTest
+    @CsvSource({"events,trust", "apigateway,trust", "events,identity", "apigateway,identity",
+            "events,boundary", "apigateway,boundary", "events,scp", "apigateway,scp",
+            "events,resource", "apigateway,resource"})
+    void requestTimeConstrainsEveryRolePolicy(String service, String layer) {
+        String principal = service + ".amazonaws.com";
+        String trustPolicy = """
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"%s"},
+                "Action":"sts:AssumeRole"}}""".formatted(principal);
+        String condition = """
+                "Condition":{"DateEquals":{"aws:CurrentTime":"%s"},
+                "NumericEquals":{"aws:EpochTime":"%s"}}"""
+                .formatted(NOW, NOW.getEpochSecond());
+        String policy = """
+                {"Statement":{"Effect":"Allow","Action":"*","Resource":"*",%s}}""".formatted(condition);
+        role.setAssumeRolePolicyDocument(trustPolicy);
+        String target = FUNCTION;
+        switch (layer) {
+            case "trust" -> role.setAssumeRolePolicyDocument(trustPolicy.replace("}}", "," + condition + "}}"));
+            case "identity" -> when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(policy)));
+            case "boundary" -> {
+                role.setPermissionsBoundaryArn("arn:aws:iam::" + ACCOUNT + ":policy/time-limit");
+                when(iam.resolvePrincipalContext(ROLE)).thenReturn(new CallerContext(List.of(ALLOW), null, policy));
+            }
+            case "scp" -> when(scps.effectiveScpLevels(ACCOUNT)).thenReturn(List.of(List.of(policy)));
+            case "resource" -> {
+                target = FUNCTION.replace(ACCOUNT, OTHER);
+                String grant = policy.replace("\"Action\"", "\"Principal\":{\"AWS\":\"" + ROLE + "\"},\"Action\"");
+                when(provider.getResourcePolicies("lambda", target))
+                        .thenReturn(List.of(new ResourcePolicyProvider.ResourcePolicy(grant, OTHER)));
+            }
+            default -> fail(layer);
+        }
+        assertEquals(Decision.ALLOW, timeDecision(service, target));
+        verify(clock, times(1)).instant();
+        when(clock.instant()).thenReturn(NOW.plusSeconds(1));
+        assertEquals(Decision.DENY, timeDecision(service, target));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"events", "apigateway"})
+    void currentTimeExplicitDenyCannotBeSkipped(String service) {
+        role.setAssumeRolePolicyDocument("""
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"%s.amazonaws.com"},
+                "Action":"sts:AssumeRole"}}""".formatted(service));
+        String deny = """
+                {"Statement":{"Effect":"Deny","Action":"*","Resource":"*",
+                "Condition":{"DateGreaterThanEquals":{"aws:CurrentTime":"%s"}}}}""".formatted(NOW);
+        when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(ALLOW, deny)));
+        assertEquals(Decision.DENY, timeDecision(service, FUNCTION));
+    }
+
+    @Test
+    void requestTimeDoesNotInventSessionIssuanceOrServiceSourceContext() {
+        String policy = """
+                {"Statement":{"Effect":"Allow","Action":"*","Resource":"*","Condition":{
+                "DateEquals":{"aws:CurrentTime":"%s"},
+                "Null":{"aws:TokenIssueTime":"true","aws:SourceArn":"true","aws:SourceAccount":"true"}}}}
+                """.formatted(NOW);
+        when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(policy)));
+        assertEquals(Decision.ALLOW, decide(FUNCTION));
+    }
+
+    private Decision timeDecision(String service, String target) {
+        return "events".equals(service) ? decide(target)
+                : authorizer.authorizeWithoutSourceContext(service, ROLE, INVOKE, target, ACCOUNT, "aws");
     }
 
     private Decision decide(String target) {

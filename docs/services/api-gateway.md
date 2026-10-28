@@ -18,6 +18,9 @@ identity/resource-policy evaluator, permissions boundary and account SCPs.
 Cross-account targets require a resource-policy grant as well. Each invocation
 rechecks permissions and invokes the same captured target that was authorized.
 The role's full path and boundary attachment are retained during evaluation.
+Trust and target-policy evaluation use the same server-clock instant for
+`aws:CurrentTime` and `aws:EpochTime`. Time-conditioned grants and denies are
+reevaluated on each invocation; this request time is not `aws:TokenIssueTime`.
 
 Role trust evaluation does not synthesize API Gateway source condition keys:
 service-specific source context and actual issued STS session identities are not
