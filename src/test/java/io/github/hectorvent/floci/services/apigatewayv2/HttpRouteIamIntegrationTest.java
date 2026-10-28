@@ -13,6 +13,7 @@ import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.jboss.logging.Logger;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -29,13 +30,18 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.mock;
 
 @QuarkusTest
 @TestProfile(SignedIamEnforcementProfile.class)
 class HttpRouteIamIntegrationTest {
+
+    Function<String, String> roleNames = prefix -> prefix + UUID.randomUUID();
 
     private static final Logger LOG = Logger.getLogger(HttpRouteIamIntegrationTest.class);
 
@@ -77,13 +83,13 @@ class HttpRouteIamIntegrationTest {
     @Test
     void issuedRoleSessionsRetainPolicyTokenAndRevocationChecks() throws Exception {
         Fixture fixture = fixture("GET /items");
-        String name = "http-route-role-" + UUID.randomUUID();
+        String name = roleNames.apply("http-route-role-");
         String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
                 + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
-        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
                 "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
                 .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
         SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
                 "PolicyDocument", policy(fixture.arn()))).then().statusCode(200);
@@ -105,6 +111,40 @@ class HttpRouteIamIntegrationTest {
         Fixture fixture = fixture("GET /items");
         invoke(fixture, new Key("test", "test", null), 200);
         assertEquals(1, fixture.hits().get());
+    }
+
+    @Test
+    void rejectedRoleCreationPreservesPreexistingRole() throws Exception {
+        String name = "http-existing-" + UUID.randomUUID();
+        SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
+                "AssumeRolePolicyDocument", "{\"Statement\":[]}")).then().statusCode(200);
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        HttpRouteIamIntegrationTest nested = nestedFixture(name);
+        try {
+            assertThrows(AssertionError.class, () -> nested.issuedRoleSessionsRetainPolicyTokenAndRevocationChecks());
+        } finally {
+            nested.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(200);
+    }
+
+    @Test
+    void successfulRoleScenarioRemovesOwnedRoleAndPolicy() throws Exception {
+        String name = "http-owned-" + UUID.randomUUID();
+        HttpRouteIamIntegrationTest nested = nestedFixture(name);
+        try {
+            nested.issuedRoleSessionsRetainPolicyTokenAndRevocationChecks();
+        } finally {
+            nested.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(404);
+    }
+
+    private HttpRouteIamIntegrationTest nestedFixture(String name) {
+        HttpRouteIamIntegrationTest nested = new HttpRouteIamIntegrationTest();
+        nested.endpoint = endpoint;
+        nested.roleNames = prefix -> name;
+        return nested;
     }
 
     private void cleanupIam(String action, Map<String, String> parameters) {
