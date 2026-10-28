@@ -27,6 +27,7 @@ import io.github.hectorvent.floci.core.common.CookieHeaders;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
 import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.ApiKey;
@@ -129,6 +130,7 @@ public class ApiGatewayExecuteController {
     private final ApiGatewayV2Service apiGatewayV2Service;
     private final LambdaService lambdaService;
     private final ServiceCallAuthorizer serviceCallAuthorizer;
+    private final ServiceRoleCallAuthorizer serviceRoleCallAuthorizer;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
     private final Configuration jsonPathConfiguration;
@@ -160,12 +162,14 @@ public class ApiGatewayExecuteController {
                                        ExecuteApiSigV4Authorizer sigV4Authorizer, RestLambdaAuthorizer restLambdaAuthorizer,
                                        AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
                                        ServiceCallAuthorizer serviceCallAuthorizer,
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
                                        CloudMapInstanceResolver cloudMapInstanceResolver) {
         this.apiGatewayService = apiGatewayService;
         this.cognitoAuthorizer = cognitoAuthorizer;
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.lambdaService = lambdaService;
         this.serviceCallAuthorizer = serviceCallAuthorizer;
+        this.serviceRoleCallAuthorizer = serviceRoleCallAuthorizer;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
         this.jsonPathConfiguration = Configuration.builder()
@@ -585,6 +589,7 @@ public class ApiGatewayExecuteController {
                 resource.getId(), stageName, stage, headers, uriInfo, body, requestId,
                 authorizerResult.principalId(), authorizerResult.context(), resolvedApiKey, iamIdentity);
 
+        functionName = resolvedLambdaIntegrationTarget(scope, functionName);
         Response permissionError = lambdaIntegrationPermission(scope, integration, functionName, httpMethod, path);
         if (permissionError != null) {
             return permissionError;
@@ -610,22 +615,45 @@ public class ApiGatewayExecuteController {
         }
     }
 
-    private Response lambdaIntegrationPermission(GatewayResponseScope scope, Integration integration,
-                                                  String functionReference, String httpMethod, String path) {
-        if (integration.getCredentials() != null && !integration.getCredentials().isBlank()) {
-            return null;
-        }
-        String functionArn = LambdaArnUtils.functionArn(functionReference, regionResolver.getPartition(),
+    private String resolvedLambdaIntegrationTarget(GatewayResponseScope scope, String reference) {
+        return LambdaArnUtils.functionArn(reference, regionResolver.getPartition(),
                 scope.region(), regionResolver.getAccountId());
-        // Lambda's API Gateway guide uses the function's region in a cross-region source ARN.
-        String sourceArn = buildMethodArn(AwsArnUtils.parse(functionArn).region(), scope.apiId(),
-                scope.stageName(), httpMethod, path);
-        if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
-                sourceArn, regionResolver.getAccountId()) == Decision.DENY) {
+    }
+
+    private Response lambdaIntegrationPermission(GatewayResponseScope scope, Integration integration,
+                                                  String functionArn, String httpMethod, String path) {
+        String credentials = integration.getCredentials();
+        Decision decision;
+        if (credentials != null && !credentials.isBlank()) {
+            if (callerCredentialsPassthrough(credentials)) {
+                return null;
+            }
+            decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                    "lambda:InvokeFunction", functionArn, regionResolver.getAccountId(), regionResolver.getPartition());
+        } else {
+            // Lambda's API Gateway guide uses the function's region in a cross-region source ARN.
+            String sourceArn = buildMethodArn(AwsArnUtils.parse(functionArn).region(), scope.apiId(),
+                    scope.stageName(), httpMethod, path);
+            decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                    sourceArn, regionResolver.getAccountId());
+        }
+        if (decision == Decision.DENY) {
             return gatewayResponse(scope, GatewayResponseType.API_CONFIGURATION_ERROR, 500,
                     "Internal server error");
         }
         return null;
+    }
+
+    private boolean callerCredentialsPassthrough(String credentials) {
+        if ("*".equals(credentials)) {
+            return true;
+        }
+        if (!AwsArnUtils.isArnFor(credentials, "iam")) {
+            return false;
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(credentials);
+        return arn.partition().equals(regionResolver.getPartition()) && arn.region().isEmpty()
+                && "*".equals(arn.accountId()) && "user/*".equals(arn.resource());
     }
 
     // ──────────────────────────── HTTP_PROXY ────────────────────────────
@@ -1955,6 +1983,7 @@ public class ApiGatewayExecuteController {
                     throw new AwsException("InvalidParameterValueException",
                             "Cannot resolve Lambda function name from URI: " + integration.getUri(), 400);
                 }
+                functionName = resolvedLambdaIntegrationTarget(scope, functionName);
                 Response permissionError = lambdaIntegrationPermission(scope, integration, functionName, httpMethod, path);
                 if (permissionError != null) {
                     return permissionError;
