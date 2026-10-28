@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.apigateway;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.AuthorizerPolicyFixtures;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
@@ -182,7 +183,7 @@ class HttpApiAuthorizerPolicyTest {
         routeContext.routeToHttpApi("us-east-1");
         return new ApiGatewayExecuteController(null, null, gateway, lambda,
                 new RegionResolver("us-east-1", "000000000000"), mapper, null, null, null, null, null,
-                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), null);
+                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), mock(ServiceCallAuthorizer.class), null);
     }
 
     private InvokeResult result(String payload) {
