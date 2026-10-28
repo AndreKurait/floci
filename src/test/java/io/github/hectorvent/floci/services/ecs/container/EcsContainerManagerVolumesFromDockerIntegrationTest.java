@@ -32,6 +32,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -135,9 +136,11 @@ class EcsContainerManagerVolumesFromDockerIntegrationTest {
                     .findFirst().orElseThrow().getName();
             ownedVolumes.add(sharedVolume);
             String appId = handle.getContainerIds().get("app");
-            Integer status = dockerClient.waitContainerCmd(appId)
-                    .exec(new WaitContainerResultCallback())
-                    .awaitStatusCode(60, TimeUnit.SECONDS);
+            Integer status;
+            try (WaitContainerResultCallback callback = new WaitContainerResultCallback()) {
+                status = dockerClient.waitContainerCmd(appId).exec(callback)
+                        .awaitStatusCode(60, TimeUnit.SECONDS);
+            }
             String output = logs(appId);
 
             assertEquals(0, status, output);
@@ -293,6 +296,67 @@ class EcsContainerManagerVolumesFromDockerIntegrationTest {
         }
     }
 
+    @Test
+    void rejectedContainerStartReclaimsItsAnonymousVolume() throws Exception {
+        String suffix = UUID.randomUUID().toString();
+        sourceImage = "floci-ecs-volumes-from-test:" + suffix;
+        buildSourceImage(sourceImage);
+        ContainerDefinition app = definition("app", sourceImage);
+        app.setEntryPoint(List.of("/missing-entrypoint-" + suffix));
+        TaskDefinition definition = new TaskDefinition();
+        definition.setFamily("rejected-start-" + suffix);
+        definition.setContainerDefinitions(List.of(app));
+        EcsTask task = new EcsTask();
+        task.setTaskArn("arn:aws:ecs:us-east-1:000000000000:task/rejected-start/" + suffix);
+        String containerName = ContainerStorageHelper.dockerName(config, "ecs-" + suffix + "-app");
+        AtomicReference<String> observedContainer = new AtomicReference<>();
+        AtomicReference<String> observedVolume = new AtomicReference<>();
+        CountDownLatch mounted = new CountDownLatch(1);
+        try (ResultCallback.Adapter<Event> events = dockerClient.eventsCmd()
+                .withSince(String.valueOf(Instant.now().getEpochSecond()))
+                .exec(new ResultCallback.Adapter<Event>() {
+                    @Override
+                    public void onNext(Event event) {
+                        if (event.getActor() == null) {
+                            return;
+                        }
+                        Map<String, String> attributes = event.getActor().getAttributes();
+                        if (event.getType() == EventType.CONTAINER
+                                && "create".equals(event.getAction())
+                                && containerName.equals(attributes.get("name"))) {
+                            observedContainer.set(event.getActor().getId());
+                        }
+                        if (event.getType() == EventType.VOLUME
+                                && "mount".equals(event.getAction())
+                                && attributes.get("container") != null
+                                && attributes.get("container").equals(observedContainer.get())) {
+                            observedVolume.set(event.getActor().getId());
+                            mounted.countDown();
+                        }
+                    }
+                })) {
+            RuntimeException failure = assertThrows(RuntimeException.class,
+                    () -> containerManager.startTask(task, definition, List.of(), "us-east-1"));
+            assertTrue(failure.getMessage().contains("missing-entrypoint-" + suffix), failure.getMessage());
+            assertTrue(mounted.await(30, TimeUnit.SECONDS), "observe the owned rejected container's volume mount");
+            String anonymousVolume = observedVolume.get();
+            ownedVolumes.add(anonymousVolume);
+            assertThrows(NotFoundException.class,
+                    () -> dockerClient.inspectContainerCmd(observedContainer.get()).exec());
+            assertThrows(NotFoundException.class, () -> dockerClient.inspectVolumeCmd(anonymousVolume).exec(),
+                    "rejected start must remove its anonymous volume before ECS has a task handle");
+        } finally {
+            String containerId = observedContainer.get();
+            if (containerId != null) {
+                try {
+                    dockerClient.removeContainerCmd(containerId).withForce(true).withRemoveVolumes(true).exec();
+                } catch (NotFoundException ignored) {
+                    // Failed-start cleanup already removed this owned container.
+                }
+            }
+        }
+    }
+
     private void buildSourceImage(String tag) throws Exception {
         String dockerfile = """
                 FROM %s
@@ -321,18 +385,20 @@ class EcsContainerManagerVolumesFromDockerIntegrationTest {
         }
     }
 
-    private String logs(String containerId) throws InterruptedException {
+    private String logs(String containerId) throws InterruptedException, IOException {
         StringBuilder output = new StringBuilder();
-        dockerClient.logContainerCmd(containerId)
-                .withStdOut(true)
-                .withStdErr(true)
-                .exec(new ResultCallback.Adapter<Frame>() {
-                    @Override
-                    public void onNext(Frame frame) {
-                        output.append(new String(frame.getPayload(), StandardCharsets.UTF_8));
-                    }
-                })
-                .awaitCompletion(10, TimeUnit.SECONDS);
+        try (ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<>() {
+            @Override
+            public void onNext(Frame frame) {
+                output.append(new String(frame.getPayload(), StandardCharsets.UTF_8));
+            }
+        }) {
+            dockerClient.logContainerCmd(containerId)
+                    .withStdOut(true)
+                    .withStdErr(true)
+                    .exec(callback)
+                    .awaitCompletion(10, TimeUnit.SECONDS);
+        }
         return output.toString();
     }
 

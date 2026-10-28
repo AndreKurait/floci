@@ -568,7 +568,7 @@ public class EcsContainerManager {
                     }
                     fluentHost = inspectContainerIp(dockerId);
                 } else {
-                    ContainerInfo info = lifecycleManager.createAndStart(spec);
+                    ContainerInfo info = lifecycleManager.createAndStartEphemeral(spec);
                     dockerId = info.containerId();
                 }
 
