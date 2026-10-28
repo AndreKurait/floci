@@ -11,6 +11,7 @@ import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
 import software.amazon.awssdk.services.autoscaling.model.AutoScalingException;
 import software.amazon.awssdk.services.autoscaling.model.AutoScalingGroup;
 import software.amazon.awssdk.services.autoscaling.model.EnterStandbyResponse;
+import software.amazon.awssdk.services.autoscaling.model.ExitStandbyResponse;
 import software.amazon.awssdk.services.autoscaling.model.LifecycleState;
 
 import java.net.URI;
@@ -50,7 +51,7 @@ class AutoScalingStandbyIntegrationTest {
                 EnterStandbyResponse response = client.enterStandby(r -> r.autoScalingGroupName(name)
                         .instanceIds(id).shouldDecrementDesiredCapacity(true));
                 assertEquals(1, response.activities().size());
-                assertEquals("Successful", response.activities().getFirst().statusCodeAsString());
+                assertEquals("InProgress", response.activities().getFirst().statusCodeAsString());
                 reconciler.reconcileAll();
                 assertEquals(0, group(client, name).desiredCapacity());
                 assertEquals(1, group(client, name).instances().size());
@@ -59,7 +60,9 @@ class AutoScalingStandbyIntegrationTest {
                         .autoScalingInstances().getFirst().lifecycleState());
                 assertThrows(AutoScalingException.class, () -> client.enterStandby(r -> r.autoScalingGroupName(name)
                         .instanceIds(id).shouldDecrementDesiredCapacity(true)));
-                assertEquals(1, client.exitStandby(r -> r.autoScalingGroupName(name).instanceIds(id)).activities().size());
+                ExitStandbyResponse exiting = client.exitStandby(r -> r.autoScalingGroupName(name).instanceIds(id));
+                assertEquals(1, exiting.activities().size());
+                assertEquals("PreInService", exiting.activities().getFirst().statusCodeAsString());
                 reconciler.reconcileAll();
                 assertEquals(1, group(client, name).desiredCapacity());
                 assertEquals(id, group(client, name).instances().getFirst().instanceId());

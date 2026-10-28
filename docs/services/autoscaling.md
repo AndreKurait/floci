@@ -94,7 +94,7 @@ described below.
 
 | Operation | Notes |
 |---|---|
-| `DescribeAutoScalingInstances` | Returns all ASG-tracked instances with lifecycle state and health status |
+| `DescribeAutoScalingInstances` | Returns ASG-tracked instances with their group name, lifecycle state and uppercase health status |
 | `SetInstanceHealth` | Updates an instance's health status immediately; accepts but does not enforce the grace-period flag |
 | `SetInstanceProtection` | Enables or disables scale-in protection for named instances in a group |
 | `SetDesiredCapacity` | Updates desired count; reconciler handles scale-out / scale-in within 10 s |
@@ -106,11 +106,8 @@ described below.
 | `SuspendProcesses` | Records suspended scaling processes (empty list suspends all); reported back by `DescribeAutoScalingGroups` |
 | `ResumeProcesses` | Clears suspended processes (empty list resumes all) |
 
-Standby transitions complete synchronously in Floci. Entering standby preserves the
-EC2 instance and its group tags, and removes it from attached load balancers. With
-`ShouldDecrementDesiredCapacity=false`, the reconciler launches replacement capacity.
-Exiting standby restores traffic and increases desired capacity. Connection draining
-delays are not simulated.
+Standby transitions complete asynchronously through the reconciler. Entering standby
+preserves the EC2 instance and its group tags. See the lifecycle and capacity rules below.
 
 Member instances carry the tags the
 [EC2 instance tagging lifecycle](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-tagging.html#tag-lifecycle)
@@ -132,6 +129,43 @@ Missing members, Pending or Detaching members, and a decremented desired capacit
 the minimum are rejected. Selected refresh originals remain detachable while their EC2
 instances are still running. Floci completes attachment and detachment synchronously;
 it does not reproduce AWS's asynchronous Pending and Detaching transitions.
+
+### Standby
+
+`DescribeAutoScalingInstances` includes the required `AutoScalingGroupName` and reports
+`HEALTHY` or `UNHEALTHY`. Group instance descriptions and `SetInstanceHealth` keep
+`Healthy` and `Unhealthy`, matching the operation-specific AWS examples.
+
+`EnterStandby` accepts up to 20 instances belonging to the named group, all in
+`InService`. It starts one `InProgress` activity per instance and moves each through
+`EnteringStandby` to `Standby`. The reconciler deregisters each instance from the
+group's target groups and Classic Load Balancers before completing its transition.
+With `ShouldDecrementDesiredCapacity=true`, desired capacity decreases by the number
+of selected instances. Otherwise, desired capacity stays unchanged and replacement
+capacity is launched.
+
+`ExitStandby` accepts only `Standby` members and rejects requests while `Launch`
+is suspended. It increments desired capacity and starts a `PreInService` activity
+for each returning instance. Instances wait in
+`Pending` until EC2 is running and load-balancer registration succeeds, then return
+to `InService`. Both operations validate the entire batch and the resulting minimum
+and maximum capacity bounds before changing group state.
+
+Standby members remain in the group without health checks or automatic replacement.
+Their health status remains the same while on standby. A stopped or terminated
+instance is checked when it exits standby and replaced; a stopped instance is
+terminated before its membership is removed. Transitions and their activities
+survive storage reloads. Registration failures are retried, while references to
+deleted load balancers or target groups are ignored. Superseding termination,
+group deletion or instance refresh completes the pending activity as `Cancelled`.
+As in AWS, suspending `Terminate` protects `InService` instances, not instances
+that fail to resume from standby. See the AWS
+[suspension considerations](https://docs.aws.amazon.com/autoscaling/ec2/userguide/suspend-resume-considerations.html).
+
+Floci removes target registrations immediately. It does not simulate AWS's
+connection-draining delay. See the AWS
+[standby guide](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-enter-exit-standby.html)
+for the lifecycle and capacity rules.
 
 ### Instance Refresh
 
@@ -160,6 +194,11 @@ This does not implement rolling health-percentage limits, checkpoints, rollback,
 or cancellation. Refreshes saved by older versions without replacement ownership
 retain the previous reconciliation behavior. Storage reload coverage does not
 imply an atomic transaction spanning Auto Scaling and EC2 after a process crash.
+
+`Preferences.StandbyInstances` is stored and reported but not applied: refresh
+always excludes `Standby` members, including when `Wait` (the AWS default) or
+`Terminate` is requested. See AWS's
+[refresh preferences](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_RefreshPreferences.html).
 
 ### Load Balancer Attachment
 

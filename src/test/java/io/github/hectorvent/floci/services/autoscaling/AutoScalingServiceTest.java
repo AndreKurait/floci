@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefresh;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfigurationBlockDeviceMapping;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
+import io.github.hectorvent.floci.services.autoscaling.model.ScalingActivity;
 import io.github.hectorvent.floci.services.autoscaling.model.ScheduledAction;
 import io.github.hectorvent.floci.services.autoscaling.model.WarmPoolConfiguration;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -80,10 +81,20 @@ class AutoScalingServiceTest {
         AutoScalingService selected = new AutoScalingService(null, elb);
         selected.regionResolver = service.regionResolver;
         selected.groups = service.groups;
+        selected.ec2Service = mock(Ec2Service.class);
+        when(selected.ec2Service.isInstanceContainerRunning("i-owned")).thenReturn(true);
+        Instance running = new Instance();
+        running.setInstanceId("i-owned");
+        running.setState(new InstanceState(16, "running"));
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(running));
+        when(selected.ec2Service.describeInstances(REGION, List.of("i-owned"), null))
+                .thenReturn(List.of(reservation));
         AutoScalingGroup group = service.requireGroup(REGION, "test-asg");
         AsgInstance owned = new AsgInstance();
         owned.setInstanceId("i-owned");
         owned.setLifecycleState("InService");
+        owned.setHealthStatus("Healthy");
         group.getInstances().add(owned);
         group.setTargetGroupARNs(List.of("shared-target-group"));
 
@@ -92,19 +103,33 @@ class AutoScalingServiceTest {
         verifyNoInteractions(elb);
         assertEquals("InService", owned.getLifecycleState());
         assertEquals(1, group.getDesiredCapacity());
-        selected.changeStandby(REGION, "test-asg", List.of("i-owned"), true, true);
-        ArgumentCaptor<List<TargetDescription>> removed = ArgumentCaptor.captor();
-        verify(elb).deregisterTargets(eq(REGION), eq("shared-target-group"), removed.capture());
-        assertEquals(List.of("i-owned"), removed.getValue().stream().map(TargetDescription::getId).toList());
-        assertEquals("Standby", owned.getLifecycleState());
-        assertEquals(0, group.getDesiredCapacity());
-        assertEquals(1, group.getInstances().size());
-        selected.changeStandby(REGION, "test-asg", List.of("i-owned"), false, false);
-        ArgumentCaptor<List<TargetDescription>> restored = ArgumentCaptor.captor();
-        verify(elb).registerTargets(eq(REGION), eq("shared-target-group"), restored.capture());
-        assertEquals(List.of("i-owned"), restored.getValue().stream().map(TargetDescription::getId).toList());
-        assertEquals("InService", owned.getLifecycleState());
-        assertEquals(1, group.getDesiredCapacity());
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(selected, selected.ec2Service, elb);
+        try {
+            ScalingActivity entering = selected.changeStandby(REGION, "test-asg",
+                    List.of("i-owned"), true, true).getFirst();
+            assertEquals("InProgress", entering.getStatusCode());
+            assertEquals("EnteringStandby", owned.getLifecycleState());
+            verifyNoInteractions(elb);
+            reconciler.reconcile(group);
+            ArgumentCaptor<List<TargetDescription>> removed = ArgumentCaptor.captor();
+            verify(elb).deregisterTargets(eq(REGION), eq("shared-target-group"), removed.capture());
+            assertEquals(List.of("i-owned"), removed.getValue().stream().map(TargetDescription::getId).toList());
+            assertEquals("Standby", owned.getLifecycleState());
+            assertEquals(0, group.getDesiredCapacity());
+            assertEquals(1, group.getInstances().size());
+            ScalingActivity exiting = selected.changeStandby(REGION, "test-asg",
+                    List.of("i-owned"), false, false).getFirst();
+            assertEquals("PreInService", exiting.getStatusCode());
+            assertEquals("Pending", owned.getLifecycleState());
+            reconciler.reconcile(group);
+            ArgumentCaptor<List<TargetDescription>> restored = ArgumentCaptor.captor();
+            verify(elb).registerTargets(eq(REGION), eq("shared-target-group"), restored.capture());
+            assertEquals(List.of("i-owned"), restored.getValue().stream().map(TargetDescription::getId).toList());
+            assertEquals("InService", owned.getLifecycleState());
+            assertEquals(1, group.getDesiredCapacity());
+        } finally {
+            reconciler.stop();
+        }
     }
 
     @Test
@@ -1598,7 +1623,7 @@ class AutoScalingServiceTest {
 
         assertDoesNotThrow(() -> service.setInstanceHealth(REGION, "i-health", "Unhealthy", true));
         assertEquals("Unhealthy", service.describeAutoScalingInstances(REGION, List.of("i-health"))
-                .getFirst().getHealthStatus());
+                .getFirst().instance().getHealthStatus());
     }
 
     @Test

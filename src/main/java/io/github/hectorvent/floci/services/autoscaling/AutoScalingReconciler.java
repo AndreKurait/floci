@@ -211,6 +211,7 @@ public class AutoScalingReconciler {
 
     public void reconcile(AutoScalingGroup asg) {
         asgService.reconcileIfPresent(asg, () -> {
+            completeEnteringStandby(asg);
             removeTerminatingInstances(asg);
             removeStaleInstances(asg);
             promoteReadyInstances(asg);
@@ -314,6 +315,61 @@ public class AutoScalingReconciler {
                 .count();
     }
 
+    private void completeEnteringStandby(AutoScalingGroup asg) {
+        for (AsgInstance instance : asg.getInstances()) {
+            if (!"EnteringStandby".equals(instance.getLifecycleState())) {
+                continue;
+            }
+            try {
+                updateStandbyRegistrations(asg, instance, false);
+                instance.setLifecycleState("Standby");
+                asgService.completeStandbyActivity(instance, "Successful", null);
+                asgService.saveAutoScalingGroupIfPresent(asg);
+            } catch (Exception failure) {
+                LOG.debugv("ASG {0}: could not place instance {1} in standby: {2}",
+                        asg.getAutoScalingGroupName(), instance.getInstanceId(), failure.getMessage());
+            }
+        }
+    }
+
+    private void updateStandbyRegistrations(AutoScalingGroup asg, AsgInstance instance, boolean register) {
+        for (String targetGroup : asg.getTargetGroupARNs()) {
+            TargetDescription target = new TargetDescription();
+            target.setId(instance.getInstanceId());
+            try {
+                if (register) {
+                    elbV2Service.registerTargets(asg.getRegion(), targetGroup, List.of(target));
+                } else {
+                    elbV2Service.deregisterTargets(asg.getRegion(), targetGroup, List.of(target));
+                }
+            } catch (AwsException failure) {
+                if (!"TargetGroupNotFound".equals(failure.getErrorCode())) {
+                    throw failure;
+                }
+                LOG.debugv("ASG {0}: target group {1} no longer exists during standby transition",
+                        asg.getAutoScalingGroupName(), targetGroup);
+            }
+        }
+        if (elbClassicService != null) {
+            for (String loadBalancer : asg.getLoadBalancerNames()) {
+                try {
+                    if (register) {
+                        elbClassicService.registerInstances(asg.getRegion(), loadBalancer, List.of(instance.getInstanceId()));
+                    } else {
+                        elbClassicService.deregisterInstances(asg.getRegion(), loadBalancer,
+                                List.of(instance.getInstanceId()));
+                    }
+                } catch (AwsException failure) {
+                    if (!"LoadBalancerNotFound".equals(failure.getErrorCode())) {
+                        throw failure;
+                    }
+                    LOG.debugv("ASG {0}: load balancer {1} no longer exists during standby transition",
+                            asg.getAutoScalingGroupName(), loadBalancer);
+                }
+            }
+        }
+    }
+
     private void promoteReadyInstances(AutoScalingGroup asg) {
         boolean changed = false;
         for (AsgInstance asgInst : asg.getInstances()) {
@@ -332,15 +388,23 @@ public class AutoScalingReconciler {
                     watchPendingLaunch(asg, ec2Instances.getFirst());
                 }
                 if ("running".equals(ec2State)) {
+                    boolean returningFromStandby = asgInst.getStandbyActivityId() != null;
+                    if (returningFromStandby) {
+                        updateStandbyRegistrations(asg, asgInst, true);
+                    }
                     asgInst.setLifecycleState("InService");
-                    asgInst.setHealthStatus("Healthy");
-                    registerWithTargetGroups(asg, asgInst);
-                    registerWithClassicLoadBalancers(asg, asgInst);
+                    if (returningFromStandby) {
+                        asgService.completeStandbyActivity(asgInst, "Successful", null);
+                    } else {
+                        asgInst.setHealthStatus("Healthy");
+                        registerWithTargetGroups(asg, asgInst);
+                        registerWithClassicLoadBalancers(asg, asgInst);
+                        asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+                                "Launching a new EC2 instance: " + asgInst.getInstanceId(),
+                                SCALE_OUT_CAUSE,
+                                "Successful");
+                    }
                     changed = true;
-                    asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
-                            "Launching a new EC2 instance: " + asgInst.getInstanceId(),
-                            SCALE_OUT_CAUSE,
-                            "Successful");
                     LOG.infov("ASG {0}: instance {1} is now InService",
                             asg.getAutoScalingGroupName(), asgInst.getInstanceId());
                 }
@@ -411,6 +475,8 @@ public class AutoScalingReconciler {
         failActiveSsmInvocations(asg, instanceIds);
         deregisterFromTargetGroups(asg, instanceIds);
         deregisterFromClassicLoadBalancers(asg, instanceIds);
+        staleInstances.forEach(instance -> asgService.completeStandbyActivity(instance, "Failed",
+                "The EC2 instance is no longer running."));
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
         asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
@@ -441,12 +507,44 @@ public class AutoScalingReconciler {
             return !ec2Service.isInstanceContainerRunning(instance.getInstanceId());
         }
         if ("Pending".equals(lifecycleState)) {
+            if (instance.getStandbyActivityId() != null) {
+                return isFailedStandbyReturn(asg, instance.getInstanceId());
+            }
             return isMissingOrTerminalEc2Instance(asg, instance.getInstanceId(), ABANDONED_LAUNCH_STATES);
         }
         if ("Terminating".equals(lifecycleState)) {
             return isMissingOrTerminalEc2Instance(asg, instance.getInstanceId(), TERMINATED_STATES);
         }
         return false;
+    }
+
+    private boolean isFailedStandbyReturn(AutoScalingGroup asg, String instanceId) {
+        // Terminate suspension protects InService members, not instances that fail to resume from standby.
+        try {
+            List<Instance> instances = ec2Service.describeInstances(asg.getRegion(), List.of(instanceId), null)
+                    .stream().flatMap(reservation -> reservation.getInstances().stream()).toList();
+            if (instances.isEmpty()) {
+                return true;
+            }
+            Instance instance = instances.getFirst();
+            String state = instance.getState() == null ? null : instance.getState().getName();
+            if ("stopping".equals(state) || "stopped".equals(state)) {
+                ec2Service.terminateInstances(asg.getRegion(), List.of(instanceId));
+                return true;
+            }
+            return state != null && TERMINATED_STATES.contains(state);
+        } catch (AwsException failure) {
+            if ("InvalidInstanceID.NotFound".equals(failure.getErrorCode())) {
+                return true;
+            }
+            LOG.debugv("ASG {0}: keeping returning standby instance {1} for retry: {2}",
+                    asg.getAutoScalingGroupName(), instanceId, failure.getMessage());
+            return false;
+        } catch (Exception failure) {
+            LOG.debugv("ASG {0}: keeping returning standby instance {1} for retry: {2}",
+                    asg.getAutoScalingGroupName(), instanceId, failure.getMessage());
+            return false;
+        }
     }
 
     private boolean isMissingOrTerminalEc2Instance(AutoScalingGroup asg, String instanceId,
