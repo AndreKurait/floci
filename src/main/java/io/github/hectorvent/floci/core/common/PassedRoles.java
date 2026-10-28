@@ -548,6 +548,14 @@ final class PassedRoles {
             case "apigateway:PUT" -> REST_INTEGRATION.matcher(path).matches()
                     ? fromJson(ctx, API_GATEWAY, "credentials") : List.of();
             case "apigateway:POST" -> {
+                if ("/v2/apis".equals(path)) {
+                    JsonNode body = jsonBody(ctx);
+                    if (body != null && (!body.has("protocolType") || "HTTP".equals(body.path("protocolType").asText()))
+                            && body.path("target").asText().startsWith("arn:")) { // partition-literal: match quick-create's legacy ARN prefix.
+                        yield passed(values(body, "credentialsArn"), API_GATEWAY);
+                    }
+                    yield List.of();
+                }
                 if (REST_AUTHORIZERS.matcher(path).matches()) {
                     yield fromJson(ctx, API_GATEWAY, "authorizerCredentials");
                 }
