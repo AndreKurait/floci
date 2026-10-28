@@ -234,6 +234,10 @@ public class ElbClassicHealthChecker implements Resettable {
         if (instance == null) {
             return instanceId;
         }
+        return instanceHost(instance, instanceId);
+    }
+
+    static String instanceHost(Instance instance, String instanceId) {
         String bridgeIp = instance.getContainerBridgeIp();
         return bridgeIp != null && !bridgeIp.isBlank() ? bridgeIp : instanceId;
     }
