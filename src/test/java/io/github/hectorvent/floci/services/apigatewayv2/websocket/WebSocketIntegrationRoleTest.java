@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.apigatewayv2.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
@@ -26,6 +27,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -67,6 +69,12 @@ class WebSocketIntegrationRoleTest {
         role.setAssumeRolePolicyDocument(TRUST);
         when(iam.findRole(OWNER, "integration")).thenReturn(Optional.of(role));
         when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(ALLOW)));
+        when(iam.resolveCallerArns(anyString())).thenAnswer(invocation -> Optional.of(new IamService.CallerArns(
+                "arn:aws:sts::" + OWNER + ":assumed-role/integration/test-session", ROLE,
+                IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROAEXAMPLE:test-session", null,
+                role.getPermissionsBoundaryArn() != null)));
+        when(iam.resolveCallerContext(anyString(), any(Instant.class)))
+                .thenAnswer(invocation -> iam.resolvePrincipalContext(ROLE));
         provider = mock(ResourcePolicyProvider.class);
         Instance<ResourcePolicyProvider> providers = mock(Instance.class);
         when(providers.iterator()).thenAnswer(invocation -> List.of(provider).iterator());
@@ -87,7 +95,7 @@ class WebSocketIntegrationRoleTest {
         when(lambda.invokeTarget(anyString(), anyString(), any(byte[].class), any())).thenReturn(
                 new InvokeResult(200, null, "{\"statusCode\":200,\"body\":\"ok\"}".getBytes(StandardCharsets.UTF_8), null, "request"));
         service = new WebSocketIntegrationInvoker(lambda, mock(AwsServiceRouter.class), mapper,
-                mock(VtlTemplateEngine.class), direct, new RegionResolver("us-east-1", OWNER), roles);
+                mock(VtlTemplateEngine.class), direct, new RegionResolver("us-east-1", OWNER), roles, mock(CallerCallAuthorizer.class));
 
     }
 

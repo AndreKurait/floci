@@ -3,11 +3,13 @@ package io.github.hectorvent.floci.services.apigatewayv2.websocket;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
 import io.github.hectorvent.floci.services.apigateway.AwsServiceRouter;
+import io.github.hectorvent.floci.services.apigateway.ExecuteApiSigV4Authorizer.CallerIdentity;
 import io.github.hectorvent.floci.services.apigateway.VtlTemplateEngine;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Integration;
 import io.github.hectorvent.floci.services.apigatewayv2.proxy.PinnedHttpClient;
@@ -65,20 +67,23 @@ public class WebSocketIntegrationInvoker {
     private final ServiceCallAuthorizer serviceCallAuthorizer;
     private final ServiceRoleCallAuthorizer serviceRoleCallAuthorizer;
     private final RegionResolver regionResolver;
+    private final CallerCallAuthorizer callerCallAuthorizer;
 
     @Inject
     public WebSocketIntegrationInvoker(LambdaService lambdaService, AwsServiceRouter serviceRouter,
                                        ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
                                        ServiceCallAuthorizer serviceCallAuthorizer, RegionResolver regionResolver,
-                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer) {
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
+                                       CallerCallAuthorizer callerCallAuthorizer) {
         this(lambdaService, serviceRouter, objectMapper, vtlEngine, serviceCallAuthorizer, regionResolver,
-                serviceRoleCallAuthorizer, InetAddress::getAllByName);
+                serviceRoleCallAuthorizer, callerCallAuthorizer, InetAddress::getAllByName);
     }
 
     WebSocketIntegrationInvoker(LambdaService lambdaService, AwsServiceRouter serviceRouter,
                                 ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
                                 ServiceCallAuthorizer serviceCallAuthorizer, RegionResolver regionResolver,
-                                ServiceRoleCallAuthorizer serviceRoleCallAuthorizer, AddressResolver addressResolver) {
+                                ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
+                                CallerCallAuthorizer callerCallAuthorizer, AddressResolver addressResolver) {
         this.lambdaService = lambdaService;
         this.serviceRouter = serviceRouter;
         this.objectMapper = objectMapper;
@@ -88,6 +93,7 @@ public class WebSocketIntegrationInvoker {
         this.serviceCallAuthorizer = serviceCallAuthorizer;
         this.regionResolver = regionResolver;
         this.serviceRoleCallAuthorizer = serviceRoleCallAuthorizer;
+        this.callerCallAuthorizer = callerCallAuthorizer;
     }
 
     @FunctionalInterface
@@ -145,6 +151,15 @@ public class WebSocketIntegrationInvoker {
                                     Map<String, String> stageVariables,
                                     Map<String, String> requestTemplates,
                                     Map<String, String> responseTemplates) {
+        return invoke(region, apiId, stageName, routeKey, integration, eventJson, stageVariables,
+                requestTemplates, responseTemplates, null);
+    }
+
+    public IntegrationResult invoke(String region, String apiId, String stageName, String routeKey,
+                                    Integration integration, String eventJson,
+                                    Map<String, String> stageVariables,
+                                    Map<String, String> requestTemplates,
+                                    Map<String, String> responseTemplates, CallerIdentity caller) {
         String integrationType = integration.getIntegrationType();
         if (integrationType == null) {
             integrationType = "AWS_PROXY";
@@ -168,8 +183,12 @@ public class WebSocketIntegrationInvoker {
                         apiId + "/" + stageName + "/" + routeKey).toString();
                 decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
                         sourceArn, accountId);
-            } else if (!"*".equals(credentials) && !credentials.equals(AwsArnUtils.Arn.global(
+            } else if (credentials.equals(AwsArnUtils.Arn.global(
                     regionResolver.getPartition(), "iam", "*", "user/*").toString())) {
+                decision = callerCallAuthorizer.authorize(caller == null ? null : caller.accessKey(),
+                        caller == null ? null : caller.accountId(), caller == null ? null : caller.userArn(),
+                        "lambda:InvokeFunction", functionArn, regionResolver.getPartition());
+            } else if (!"*".equals(credentials)) {
                 decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
                         "lambda:InvokeFunction", functionArn, accountId, regionResolver.getPartition());
             }
