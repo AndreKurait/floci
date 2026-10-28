@@ -94,6 +94,40 @@ class IamServiceTest {
     }
 
     @Test
+    void sessionTagPersistenceIsolationRolePathExpiryAndRevocation() throws Exception {
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        IamRole role = service.createRole("tag-role", "/team/", "{}", null, 3600, null);
+        service.tagRole("tag-role", Map.of("Project", "role", "Team", "attached"));
+        Instant expiration = Instant.now().plusSeconds(3600);
+        Map<String, String> mutableTags = new LinkedHashMap<>(Map.of("project", "session"));
+        service.registerSession("ASIATAGGED", "secret", "token", role.getArn(), expiration, null,
+                "000000000000", "tagged", role.getRoleId() + ":tagged", mutableTags);
+        mutableTags.put("project", "mutated");
+        service.registerSession("ASIAUNTAGGED", "secret", "token", role.getArn(), expiration, null,
+                "000000000000", "untagged", role.getRoleId() + ":untagged");
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        SessionCredential stored = sessions.getForAccount("000000000000", "ASIATAGGED").orElseThrow();
+        sessions.putForAccount("000000000000", "ASIATAGGED",
+                mapper.readValue(mapper.writeValueAsBytes(stored), SessionCredential.class));
+        IamService.CallerArns tagged = service.resolveCallerArns("ASIATAGGED").orElseThrow();
+        assertEquals(role.getArn(), tagged.principalArn());
+        assertEquals(Map.of("project", "session", "Team", "attached"), tagged.principalTags());
+        assertEquals(Map.of("Project", "role", "Team", "attached"),
+                service.resolveCallerArns("ASIAUNTAGGED").orElseThrow().principalTags());
+        service.tagRole("tag-role", Map.of("Project", "new-role", "Team", "changed"));
+        assertEquals(Map.of("project", "session", "Team", "changed"),
+                service.resolveCallerArns("ASIATAGGED").orElseThrow().principalTags());
+        assertTrue(service.isExpiredSession("ASIATAGGED", expiration.plusSeconds(1)));
+        assertNull(service.resolveCallerContext("ASIATAGGED", expiration.plusSeconds(1)));
+        assertTrue(service.resolveCallerArns("ASIATAGGED").isEmpty());
+        service.unregisterSession("000000000000", "ASIAUNTAGGED");
+        assertTrue(service.resolveCallerArns("ASIAUNTAGGED").isEmpty());
+        assertEquals("new-role", service.getRole("tag-role").getTags().get("Project"));
+    }
+
+    @Test
     void updateRoleDescriptionAnswersTheRoleAndMovesNothingElse() {
         // "This operation performs the same function as the Description parameter in the UpdateRole
         // operation", and UpdateRole answers no shape at all, so the role comes back from here.
