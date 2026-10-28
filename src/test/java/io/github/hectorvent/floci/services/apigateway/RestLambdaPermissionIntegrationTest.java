@@ -6,10 +6,12 @@ import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.testing.EnforcementFixtures;
 import io.github.hectorvent.floci.testing.IamEnforcementProfile;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
+import io.github.hectorvent.floci.testutil.ExecuteApiRequestSigner;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.quarkus.test.junit.mockito.InjectSpy;
+import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -23,6 +25,7 @@ import software.amazon.awssdk.services.apigateway.model.IntegrationType;
 import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -96,10 +99,11 @@ class RestLambdaPermissionIntegrationTest {
     @ParameterizedTest
     @CsvSource({"AWS_PROXY,arn:aws:iam::*:user/*", "AWS,arn:aws:iam::*:user/*",
             "AWS_PROXY,*", "AWS,*"})
-    void callerCredentialsRemainOutsideServicePrincipalEvaluation(String type, String credentials) throws Exception {
+    void unsignedDocumentedCallerRequiresIdentityButLegacyStarIsRetained(String type, String credentials) throws Exception {
         Fixture fixture = fixture(type, OWNER, REGION, credentials);
-        invoke(fixture, 200);
-        verifyInvocations(fixture, 2);
+        boolean legacy = "*".equals(credentials);
+        invoke(fixture, legacy ? 200 : 500);
+        verifyInvocations(fixture, legacy ? 2 : 0);
     }
 
     @ParameterizedTest
@@ -158,6 +162,110 @@ class RestLambdaPermissionIntegrationTest {
                 "PolicyDocument", trust.replace("Allow", "Deny")));
         invoke(fixture, 500);
         verifyInvocations(fixture, 2);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"AWS_PROXY,121212121212,121212121212,us-east-1", "AWS,121212121212,121212121212,us-east-1",
+            "AWS_PROXY,565656565656,343434343434,eu-west-1", "AWS,565656565656,343434343434,eu-west-1"})
+    void verifiedCallerPoliciesControlQualifiedLambda(String type, String callerAccount, String targetOwner,
+                                                      String targetRegion) throws Exception {
+        Fixture fixture = fixture(type, targetOwner, targetRegion, "arn:aws:iam::*:user/*");
+        String user = "rest-caller-permission-" + UUID.randomUUID().toString().substring(0, 8);
+        cleanup.register(() -> callerIam(callerAccount, "DeleteUser", Map.of("UserName", user)));
+        String principal = callerIam(callerAccount, "CreateUser", Map.of("UserName", user))
+                .xmlPath().getString("CreateUserResponse.CreateUserResult.User.Arn");
+        Response created = callerIam(callerAccount, "CreateAccessKey", Map.of("UserName", user));
+        CallerKey key = new CallerKey(created.xmlPath().getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId"),
+                created.xmlPath().getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.SecretAccessKey"), null);
+        cleanup.register(() -> callerIam(callerAccount, "DeleteAccessKey", Map.of("UserName", user, "AccessKeyId", key.accessKeyId())));
+        signedInvoke(fixture, key, key.secretAccessKey(), 500);
+        String policy = """
+                {"Statement":{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":"%s"}}"""
+                .formatted(fixture.arn());
+        cleanup.register(() -> callerIam(callerAccount, "DeleteUserPolicy", Map.of("UserName", user, "PolicyName", "invoke")));
+        callerIam(callerAccount, "PutUserPolicy", Map.of("UserName", user, "PolicyName", "invoke", "PolicyDocument", policy));
+        if (!callerAccount.equals(targetOwner)) {
+            signedInvoke(fixture, key, key.secretAccessKey(), 500);
+            lambdaRequest(targetOwner, targetRegion).queryParam("Qualifier", "live")
+                    .body(Map.of("StatementId", "caller", "Action", "lambda:InvokeFunction", "Principal", principal))
+                    .post("/2015-03-31/functions/" + fixture.name() + "/policy").then().statusCode(201);
+        }
+        signedInvoke(fixture, key, "invalid-secret", 500);
+        verifyInvocations(fixture, 0);
+        signedInvoke(fixture, key, key.secretAccessKey(), 200);
+        verifyInvocations(fixture, 2);
+        callerIam(callerAccount, "PutUserPolicy", Map.of("UserName", user, "PolicyName", "invoke",
+                "PolicyDocument", policy.replace("Allow", "Deny")));
+        signedInvoke(fixture, key, key.secretAccessKey(), 500);
+        verifyInvocations(fixture, 2);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"AWS_PROXY", "AWS"})
+    void issuedSessionTokenAndSessionPolicyRemainEffective(String type) throws Exception {
+        Fixture fixture = fixture(type, OWNER, REGION, "arn:aws:iam::*:user/*");
+        String name = "rest-caller-role-" + UUID.randomUUID().toString().substring(0, 8);
+        String trust = """
+                {"Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::%s:root"},
+                "Action":"sts:AssumeRole"}}""".formatted(OWNER);
+        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
+        String role = callerIam(OWNER, "CreateRole", Map.of("RoleName", name, "Path", "/caller-path/",
+                "AssumeRolePolicyDocument", trust)).xmlPath().getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        String policy = """
+                {"Statement":{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":"%s"}}"""
+                .formatted(fixture.arn());
+        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+        iam("PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke", "PolicyDocument", policy));
+        CallerKey denied = assume(role, policy.replace("Allow", "Deny"));
+        signedInvoke(fixture, denied, denied.secretAccessKey(), 500);
+        CallerKey allowed = assume(role, null);
+        signedInvoke(fixture, new CallerKey(allowed.accessKeyId(), allowed.secretAccessKey(), null),
+                allowed.secretAccessKey(), 500);
+        verifyInvocations(fixture, 0);
+        signedInvoke(fixture, allowed, allowed.secretAccessKey(), 200);
+        verifyInvocations(fixture, 2);
+        iam("PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
+                "PolicyDocument", policy.replace("Allow", "Deny")));
+        signedInvoke(fixture, allowed, allowed.secretAccessKey(), 500);
+        verifyInvocations(fixture, 2);
+    }
+
+    private static CallerKey assume(String role, String policy) {
+        RequestSpecification request = given().header("Authorization", EnforcementFixtures.auth(OWNER, "sts"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", "AssumeRole")
+                .formParam("RoleArn", role).formParam("RoleSessionName", "caller-session");
+        if (policy != null) {
+            request.formParam("Policy", policy);
+        }
+        Response response = request.post("/").then().statusCode(200).extract().response();
+        String prefix = "AssumeRoleResponse.AssumeRoleResult.Credentials.";
+        return new CallerKey(response.xmlPath().getString(prefix + "AccessKeyId"),
+                response.xmlPath().getString(prefix + "SecretAccessKey"),
+                response.xmlPath().getString(prefix + "SessionToken"));
+    }
+
+    private static Response callerIam(String account, String action, Map<String, String> parameters) {
+        return given().header("Authorization", EnforcementFixtures.auth(account, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", action)
+                .formParams(parameters).post("/").then().statusCode(200).extract().response();
+    }
+
+    private record CallerKey(String accessKeyId, String secretAccessKey, String sessionToken) { }
+
+    private void signedInvoke(Fixture fixture, CallerKey key, String secret, int status) throws Exception {
+        byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
+        String host = baseUri.getHost() + ":" + baseUri.getPort();
+        for (String path : List.of("/execute-api/" + fixture.apiId() + "/prod/",
+                "/restapis/" + fixture.apiId() + "/prod/_user_request_/")) {
+            Map<String, String> signed = ExecuteApiRequestSigner.signedHeaders("POST", path, Map.of(), host,
+                    body, key.accessKeyId(), secret, REGION, Instant.now());
+            RequestSpecification request = given().header("Host", host).headers(signed)
+                    .contentType("application/json").body(body);
+            if (key.sessionToken() != null) {
+                request.header("X-Amz-Security-Token", key.sessionToken());
+            }
+            request.post(path).then().statusCode(status);
+        }
     }
 
     private static void iam(String action, Map<String, String> parameters) {
