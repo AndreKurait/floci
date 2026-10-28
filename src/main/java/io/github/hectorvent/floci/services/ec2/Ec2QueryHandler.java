@@ -791,6 +791,7 @@ public class Ec2QueryHandler {
         }
         String keyName = p.getFirst("KeyName");
         String subnetId = p.getFirst("SubnetId");
+        String availabilityZone = p.getFirst("Placement.AvailabilityZone");
         // The launch-time public-IP override arrives either on the primary
         // network interface spec (the shape Terraform's
         // associate_public_ip_address sends) or as the legacy top-level
@@ -861,6 +862,10 @@ public class Ec2QueryHandler {
                     "Network interfaces and an instance-level private IP address may not be specified on the same request", 400);
         }
         if (launchTemplateData != null) {
+            if (launchTemplateData.getPlacement() != null) {
+                availabilityZone = firstNonBlank(availabilityZone,
+                        launchTemplateData.getPlacement().getAvailabilityZone());
+            }
             if (marketType == null && launchTemplateData.getInstanceMarketOptions() != null) {
                 marketType = launchTemplateData.getInstanceMarketOptions().getMarketType();
             }
@@ -936,7 +941,7 @@ public class Ec2QueryHandler {
 
         Reservation res = service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
-                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, null, metadataOptions,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, Boolean.parseBoolean(p.getFirst("DryRun")),
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
                 "spot".equals(marketType), privateIpAddress, capacitySpecification);
