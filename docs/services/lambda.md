@@ -402,15 +402,18 @@ disabled fails with Lambda's error as the resource status reason.
     Reserved concurrency is enforced function-wide: invocations of every
     version and alias count against the function's reservation, and
     invocations beyond the reserved value return `TooManyRequestsException`
-    (HTTP 429). Functions without a reserved value share a **per-region**
+    (HTTP 429). Functions without a reserved value share a **per-account-per-region**
     pool. AWS Lambda's "account-level" limit is in fact a
     per-account-per-region quota, and Floci mirrors that by partitioning
-    counters on the ARN's region segment. The pool size (default 1000) is
+    counters on the ARN's account and region segments. The pool size (default 1000) is
     configurable via `floci.services.lambda.region-concurrency-limit` and
-    applies independently to each region. `PutFunctionConcurrency` validates
+    applies independently to each account and region. `PutFunctionConcurrency` validates
     that the requested value leaves at least
     `floci.services.lambda.unreserved-concurrency-min` (default 100) available
-    for unreserved functions in that region.
+    for unreserved functions in that account and region.
+
+    Deleting a function drains only its account and region across all published versions.
+    Same-named functions in another account or region retain their warm environments.
 
     Reducing or clearing a function's reserved value does not kill
     invocations that are already in flight. This matches AWS, which
@@ -688,9 +691,9 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
     ```
 
     This bounds idle containers only, emulator-wide. Busy containers do not count toward it;
-    their ceiling is `region-concurrency-limit`, which applies independently in each region, so
+    their ceiling is `region-concurrency-limit`, which applies independently in each account and region, so
     peak container count is `warm-pool-max-total` plus the in-flight invocations across every
-    active region. A cap that is smaller than the number of functions invoked in a tight loop
+    active account and region. A cap that is smaller than the number of functions invoked in a tight loop
     trades some warm hits for the memory bound. A negative value is ignored with a warning and
     leaves the total unbounded, like `0`.
 
