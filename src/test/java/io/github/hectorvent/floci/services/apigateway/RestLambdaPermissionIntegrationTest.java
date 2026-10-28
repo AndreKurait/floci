@@ -56,6 +56,8 @@ class RestLambdaPermissionIntegrationTest {
     private static final String CALLER = "565656565656";
     private static final String REGION = "us-east-1";
 
+    private Supplier<String> userNames = () -> "rest-caller-permission-" + UUID.randomUUID().toString().substring(0, 8);
+
     private Supplier<String> roleNames = () -> "rest-caller-role-" + UUID.randomUUID().toString().substring(0, 8);
 
     @InjectSpy
@@ -177,10 +179,10 @@ class RestLambdaPermissionIntegrationTest {
     void verifiedCallerPoliciesControlQualifiedLambda(String type, String callerAccount, String targetOwner,
                                                       String targetRegion) throws Exception {
         Fixture fixture = fixture(type, targetOwner, targetRegion, "arn:aws:iam::*:user/*");
-        String user = "rest-caller-permission-" + UUID.randomUUID().toString().substring(0, 8);
-        cleanup.register(() -> callerIam(callerAccount, "DeleteUser", Map.of("UserName", user)));
+        String user = userNames.get();
         String principal = callerIam(callerAccount, "CreateUser", Map.of("UserName", user))
                 .xmlPath().getString("CreateUserResponse.CreateUserResult.User.Arn");
+        cleanup.register(() -> callerIam(callerAccount, "DeleteUser", Map.of("UserName", user)));
         Response created = callerIam(callerAccount, "CreateAccessKey", Map.of("UserName", user));
         CallerKey key = new CallerKey(created.xmlPath().getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId"),
                 created.xmlPath().getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.SecretAccessKey"), null);
@@ -263,6 +265,43 @@ class RestLambdaPermissionIntegrationTest {
         given().header("Authorization", EnforcementFixtures.auth(OWNER, "iam"))
                 .contentType("application/x-www-form-urlencoded").formParam("Action", "GetRole")
                 .formParam("RoleName", name).post("/").then().statusCode(404);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"AWS_PROXY,121212121212,121212121212,us-east-1", "AWS,121212121212,121212121212,us-east-1",
+            "AWS_PROXY,565656565656,343434343434,eu-west-1", "AWS,565656565656,343434343434,eu-west-1"})
+    void rejectedCallerCreationPreservesPreexistingUser(String type, String callerAccount, String targetOwner,
+                                                       String targetRegion) throws Exception {
+        String name = "rest-existing-user-" + UUID.randomUUID();
+        callerIam(callerAccount, "CreateUser", Map.of("UserName", name));
+        cleanup.register(() -> callerIam(callerAccount, "DeleteUser", Map.of("UserName", name)));
+        RestLambdaPermissionIntegrationTest fixture = nestedFixture("unused-role");
+        fixture.userNames = () -> name;
+        try {
+            assertThrows(AssertionError.class, () -> fixture.verifiedCallerPoliciesControlQualifiedLambda(
+                    type, callerAccount, targetOwner, targetRegion));
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        callerIam(callerAccount, "GetUser", Map.of("UserName", name));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"AWS_PROXY,121212121212,121212121212,us-east-1", "AWS,121212121212,121212121212,us-east-1",
+            "AWS_PROXY,565656565656,343434343434,eu-west-1", "AWS,565656565656,343434343434,eu-west-1"})
+    void successfulCallerScenarioRemovesOwnedUserKeyAndPolicy(String type, String callerAccount, String targetOwner,
+                                                              String targetRegion) throws Exception {
+        String name = "rest-owned-user-" + UUID.randomUUID();
+        RestLambdaPermissionIntegrationTest fixture = nestedFixture("unused-role");
+        fixture.userNames = () -> name;
+        try {
+            fixture.verifiedCallerPoliciesControlQualifiedLambda(type, callerAccount, targetOwner, targetRegion);
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        given().header("Authorization", EnforcementFixtures.auth(callerAccount, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", "GetUser")
+                .formParam("UserName", name).post("/").then().statusCode(404);
     }
 
     private RestLambdaPermissionIntegrationTest nestedFixture(String name) {
