@@ -704,6 +704,9 @@ floci:
       # Optional complete catalog override for locally built guest images.
       image-catalog-path: ${FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH:}
       managed-prefix-list-catalog-path: ${FLOCI_SERVICES_EC2_MANAGED_PREFIX_LIST_CATALOG_PATH:}
+      # Explicit workload-only options; helper containers retain their own settings.
+      extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
+      ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
       enabled: true
       imds-port: 9169
       # Sweep EC2 containers left on the daemon by a previous run that died mid-launch or
@@ -721,10 +724,12 @@ floci:
       volume-helper-image: alpine:3.21
       mock: false
       # Automatic public IPv4 address of a mock instance: none, documentation (203.0.113.0/24,
-      # routed nowhere) or fixed (mock-public-address, default 127.0.0.1). Instances with
+      # routed nowhere), fixed (mock-public-address, default 127.0.0.1), or pool (configured
+      # model identities requiring caller-owned local delivery). Instances with
       # containers report the container's reachable address. FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES
       mock-public-addresses: none
       # mock-public-address: 127.0.0.1  # FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS
+      mock-public-address-pool: ${FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS_POOL:}
       # Bound instance containers to their instance type's CPU and memory limits from the catalog.
       # FLOCI_SERVICES_EC2_INSTANCE_RESOURCE_LIMITS
       instance-resource-limits: true

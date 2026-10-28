@@ -6,6 +6,9 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.util.List;
+import java.util.Map;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
@@ -182,5 +185,96 @@ class Ec2ModifyVolumeIntegrationTest {
             .when().post("/")
             .then().statusCode(412)
                 .body("Response.Errors.Error.Code", equalTo("DryRunOperation"));
+    }
+
+    @Test
+    @Order(10)
+    void gp2MigrationAndGp3PerformanceUpdatesRoundTrip() {
+        String id = createVolume("gp2", 32);
+        given().header("Authorization", AUTH_HEADER)
+                .formParam("Action", "ModifyVolume").formParam("VolumeId", id)
+                .formParam("VolumeType", "gp3")
+            .when().post("/")
+            .then().statusCode(200)
+                .body("ModifyVolumeResponse.volumeModification.targetIops", equalTo("3000"))
+                .body("ModifyVolumeResponse.volumeModification.targetThroughput", equalTo("128"));
+
+        given().header("Authorization", AUTH_HEADER)
+                .formParam("Action", "ModifyVolume").formParam("VolumeId", id)
+                .formParam("Size", "160").formParam("Iops", "80000").formParam("Throughput", "2000")
+            .when().post("/")
+            .then().statusCode(200)
+                .body("ModifyVolumeResponse.volumeModification.originalSize", equalTo("32"))
+                .body("ModifyVolumeResponse.volumeModification.originalIops", equalTo("3000"))
+                .body("ModifyVolumeResponse.volumeModification.targetSize", equalTo("160"));
+        given().header("Authorization", AUTH_HEADER)
+                .formParam("Action", "DescribeVolumes").formParam("VolumeId.1", id)
+            .when().post("/")
+            .then().statusCode(200)
+                .body("DescribeVolumesResponse.volumeSet.item.volumeType", equalTo("gp3"))
+                .body("DescribeVolumesResponse.volumeSet.item.size", equalTo("160"))
+                .body("DescribeVolumesResponse.volumeSet.item.iops", equalTo("80000"))
+                .body("DescribeVolumesResponse.volumeSet.item.throughput", equalTo("2000"));
+    }
+
+    @Test
+    @Order(11)
+    void invalidPerformanceUpdatesLeaveTheVolumeAndModificationHistoryUnchanged() {
+        String id = createVolume("gp3", 10);
+        for (Map<String, String> invalid : List.of(
+                Map.of("Size", "65537"), Map.of("Iops", "1"), Map.of("Iops", "80001"),
+                Map.of("Throughput", "2001"), Map.of("Size", "20", "Iops", "3000", "Throughput", "751"))) {
+            given().header("Authorization", AUTH_HEADER)
+                    .formParam("Action", "ModifyVolume").formParam("VolumeId", id).formParams(invalid)
+                .when().post("/")
+                .then().statusCode(400)
+                    .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
+        }
+        given().header("Authorization", AUTH_HEADER)
+                .formParam("Action", "DescribeVolumes").formParam("VolumeId.1", id)
+            .when().post("/")
+            .then().statusCode(200)
+                .body("DescribeVolumesResponse.volumeSet.item.size", equalTo("10"))
+                .body("DescribeVolumesResponse.volumeSet.item.iops", equalTo("3000"))
+                .body("DescribeVolumesResponse.volumeSet.item.throughput", equalTo("125"));
+        given().header("Authorization", AUTH_HEADER)
+                .formParam("Action", "DescribeVolumesModifications").formParam("VolumeId.1", id)
+            .when().post("/")
+            .then().statusCode(400)
+                .body("Response.Errors.Error.Code", equalTo("InvalidVolumeModification.NotFound"));
+    }
+
+    @Test
+    @Order(12)
+    void modificationsRemainAccountAndRegionScoped() {
+        String owner = AUTH_HEADER.replace("Credential=test/", "Credential=444444444444/");
+        String id = given().header("Authorization", owner)
+                .formParam("Action", "CreateVolume").formParam("AvailabilityZone", "us-east-1a")
+                .formParam("VolumeType", "gp3").formParam("Size", "10")
+            .when().post("/")
+            .then().statusCode(200).extract().path("CreateVolumeResponse.volumeId");
+        for (String other : new String[]{owner.replace("444444444444", "555555555555"),
+                owner.replace("us-east-1", "eu-west-1")}) {
+            given().header("Authorization", other)
+                    .formParam("Action", "ModifyVolume").formParam("VolumeId", id).formParam("Size", "20")
+                .when().post("/")
+                .then().statusCode(400)
+                    .body("Response.Errors.Error.Code", equalTo("InvalidVolume.NotFound"));
+            given().header("Authorization", other)
+                    .formParam("Action", "DescribeVolumesModifications").formParam("VolumeId.1", id)
+                .when().post("/")
+                .then().statusCode(400)
+                    .body("Response.Errors.Error.Code", equalTo("InvalidVolumeModification.NotFound"));
+        }
+        given().header("Authorization", owner)
+                .formParam("Action", "DescribeVolumes").formParam("VolumeId.1", id)
+            .when().post("/")
+            .then().statusCode(200)
+                .body("DescribeVolumesResponse.volumeSet.item.size", equalTo("10"));
+        given().header("Authorization", owner)
+                .formParam("Action", "ModifyVolume").formParam("VolumeId", id).formParam("Size", "20")
+            .when().post("/")
+            .then().statusCode(200)
+                .body("ModifyVolumeResponse.volumeModification.targetSize", equalTo("20"));
     }
 }

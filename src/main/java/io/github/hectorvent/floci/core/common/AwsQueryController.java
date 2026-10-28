@@ -488,6 +488,8 @@ public class AwsQueryController {
             Map.entry("DescribeEventCategories", "redshift"),
             Map.entry("DescribeAccountAttributes", "ec2"),
             Map.entry("DescribeSnapshots", "ec2"),
+            Map.entry("CreateSnapshot", "ec2"),
+            Map.entry("DeleteSnapshot", "ec2"),
             Map.entry("DescribeAccountLimits", "elasticloadbalancing"),
             Map.entry("CreateIntegration", "redshift"),
             Map.entry("DeleteIntegration", "redshift"),

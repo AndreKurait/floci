@@ -217,6 +217,12 @@ public class Ec2QueryHandler {
                 case "RegisterImage" -> handleRegisterImage(params, region);
                 case "DeregisterImage" -> handleDeregisterImage(params, region);
                 case "CopyImage" -> handleCopyImage(params, region);
+                case "DescribeImageAttribute" -> handleDescribeImageAttribute(params, region);
+                case "ModifyImageAttribute" -> handleModifyImageAttribute(params, region);
+                case "DescribeSnapshotAttribute" -> handleDescribeSnapshotAttribute(params, region);
+                case "ModifySnapshotAttribute" -> handleModifySnapshotAttribute(params, region);
+                case "CreateSnapshot" -> handleCreateSnapshot(params, region);
+                case "DeleteSnapshot" -> handleDeleteSnapshot(params, region);
                 case "DescribeSnapshots" -> handleDescribeSnapshots(params, region);
                 // Tags
                 case "CreateTags" -> handleCreateTags(params, region);
@@ -448,6 +454,8 @@ public class Ec2QueryHandler {
             mapping.setDeviceName(deviceName);
             EbsBlockDevice ebs = new EbsBlockDevice();
             ebs.setSnapshotId(snapshotId);
+            ebs.setIops(parseOptionalInt(p.getFirst(prefix + ".Ebs.Iops"), prefix + ".Ebs.Iops"));
+            ebs.setThroughput(parseOptionalInt(p.getFirst(prefix + ".Ebs.Throughput"), prefix + ".Ebs.Throughput"));
             ebs.setVolumeSize(parseOptionalInt(volumeSize, prefix + ".Ebs.VolumeSize"));
             ebs.setVolumeType(volumeType);
             ebs.setDeleteOnTermination(parseOptionalBoolean(deleteOnTermination,
@@ -843,9 +851,7 @@ public class Ec2QueryHandler {
         String creditSpecificationCpuCredits = p.getFirst("CreditSpecification.CpuCredits");
         String marketType = p.getFirst("InstanceMarketOptions.MarketType");
 
-        List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings =
-                parseLaunchTemplateBlockDeviceMappings(p, "");
-
+        List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings = parseLaunchTemplateBlockDeviceMappings(p, "");
         LaunchTemplateData launchTemplateData = resolveRunInstancesLaunchTemplateData(
                 p, region, userDataEncoded == null || userDataEncoded.isBlank());
         boolean suppliedInterfaces = p.keySet().stream().anyMatch(name -> name.startsWith("NetworkInterface."));
@@ -863,7 +869,7 @@ public class Ec2QueryHandler {
             if (marketType == null && launchTemplateData.getInstanceMarketOptions() != null) {
                 marketType = launchTemplateData.getInstanceMarketOptions().getMarketType();
             }
-            blockDeviceMappings = LaunchTemplateData.BlockDeviceMapping.merge(
+            blockDeviceMappings = Ec2BlockDevices.merge(
                     launchTemplateData.getBlockDeviceMappings(), blockDeviceMappings);
             if (!suppliedInterfaces) {
                 // With neither request interfaces nor, after the checks above, a request SubnetId
@@ -3952,6 +3958,13 @@ public class Ec2QueryHandler {
      * @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CopyImage.html">CopyImage</a>
      */
     private Response handleCopyImage(MultivaluedMap<String, String> p, String region) {
+        if (p.containsKey("KmsKeyId") || Boolean.parseBoolean(p.getFirst("Encrypted"))
+                || Boolean.parseBoolean(p.getFirst("CopyImageTags"))
+                || p.keySet().stream().anyMatch(name -> name.startsWith("Destination")
+                        || name.equals("SnapshotCopyCompletionDurationMinutes"))) {
+            throw new AwsException("UnsupportedOperation",
+                    "CopyImage supports regional copies without encryption, copied tags or placement options.", 400);
+        }
         List<Tag> imageTags = parseTagsForResource(p, "image", IMAGE_TAG_RESOURCE_TYPES);
         List<Tag> snapshotTags = parseTagsForResource(p, "snapshot", IMAGE_TAG_RESOURCE_TYPES);
         Image image = service.copyImage(
@@ -3959,7 +3972,8 @@ public class Ec2QueryHandler {
                 p.getFirst("SourceRegion"),
                 p.getFirst("SourceImageId"),
                 p.getFirst("Name"),
-                p.getFirst("Description"));
+                p.getFirst("Description"),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
         applyResourceTags(imageTags, region, image.getImageId());
         applyImageSnapshotTags(snapshotTags, region, image);
         XmlBuilder xml = new XmlBuilder()
@@ -3968,6 +3982,136 @@ public class Ec2QueryHandler {
                 .elem("imageId", image.getImageId())
                 .end("CopyImageResponse");
         return xmlResponse(xml.build());
+    }
+
+    private Response handleDescribeImageAttribute(MultivaluedMap<String, String> p, String region) {
+        requirePermissionAttribute(p, "launchPermission");
+        List<String> users = service.describeImageLaunchPermissions(region, p.getFirst("ImageId"),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return permissionResponse("DescribeImageAttribute", "imageId", p.getFirst("ImageId"),
+                "launchPermission", users);
+    }
+
+    private Response handleDescribeSnapshotAttribute(MultivaluedMap<String, String> p, String region) {
+        requirePermissionAttribute(p, "createVolumePermission");
+        List<String> users = service.describeSnapshotCreateVolumePermissions(region, p.getFirst("SnapshotId"),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return permissionResponse("DescribeSnapshotAttribute", "snapshotId", p.getFirst("SnapshotId"),
+                "createVolumePermission", users);
+    }
+
+    private void requirePermissionAttribute(MultivaluedMap<String, String> p, String expected) {
+        if (p.getFirst("Attribute") == null) {
+            throw new AwsException("MissingParameter", "The parameter Attribute is missing", 400);
+        }
+        if (!expected.equals(p.getFirst("Attribute"))) {
+            throw new AwsException("UnsupportedOperation", "Only the " + expected + " attribute is supported.", 400);
+        }
+    }
+
+    private Response permissionResponse(String action, String idName, String id, String permission,
+                                        List<String> users) {
+        XmlBuilder xml = new XmlBuilder().start(action + "Response", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString()).elem(idName, id).start(permission);
+        for (String user : users) {
+            xml.start("item").elem("userId", user).end("item");
+        }
+        return xmlResponse(xml.end(permission).end(action + "Response").build());
+    }
+
+    private Response handleModifyImageAttribute(MultivaluedMap<String, String> p, String region) {
+        PermissionChanges changes = permissionChanges(p, "ImageId", "LaunchPermission", "launchPermission");
+        service.modifyImageLaunchPermissions(region, p.getFirst("ImageId"), changes.add(), changes.remove(),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return booleanResponse("ModifyImageAttribute");
+    }
+
+    private Response handleModifySnapshotAttribute(MultivaluedMap<String, String> p, String region) {
+        PermissionChanges changes = permissionChanges(p, "SnapshotId",
+                "CreateVolumePermission", "createVolumePermission");
+        service.modifySnapshotCreateVolumePermissions(region, p.getFirst("SnapshotId"),
+                changes.add(), changes.remove(), Boolean.parseBoolean(p.getFirst("DryRun")));
+        return booleanResponse("ModifySnapshotAttribute");
+    }
+
+    private record PermissionChanges(List<String> add, List<String> remove) {}
+
+    private PermissionChanges permissionChanges(MultivaluedMap<String, String> p, String idName,
+                                                 String field, String attribute) {
+        if (p.containsKey("Attribute") && !attribute.equals(p.getFirst("Attribute"))) {
+            throw new AwsException("UnsupportedOperation", "Only the " + attribute + " attribute is supported.", 400);
+        }
+        Map<Integer, String> add = new TreeMap<>();
+        Map<Integer, String> remove = new TreeMap<>();
+        Set<String> common = Set.of("Action", "Version", idName, "Attribute", "DryRun");
+        for (String key : p.keySet()) {
+            if (common.contains(key)) {
+                continue;
+            }
+            if (!key.startsWith(field + ".")) {
+                throw new AwsException("UnsupportedOperation",
+                        "Only nested " + field + " Add/Remove UserId changes are supported.", 400);
+            }
+            String[] parts = key.substring(field.length() + 1).split("\\.", -1);
+            if (parts.length != 3 || !Set.of("Add", "Remove").contains(parts[0])
+                    || !parts[1].matches("[1-9][0-9]*") || !"UserId".equals(parts[2])) {
+                throw new AwsException("UnsupportedOperation",
+                        "Only nested " + field + " Add/Remove UserId changes are supported.", 400);
+            }
+            int index;
+            try {
+                index = Integer.parseInt(parts[1]);
+            } catch (NumberFormatException invalid) {
+                throw new AwsException("InvalidParameterValue", "Invalid permission index.", 400);
+            }
+            if (p.get(key).size() != 1) {
+                throw new AwsException("InvalidParameterValue", "Permission UserId must have one value.", 400);
+            }
+            ("Add".equals(parts[0]) ? add : remove).put(index, p.getFirst(key));
+        }
+        for (Map<Integer, String> changes : List.of(add, remove)) {
+            int expected = 1;
+            for (int index : changes.keySet()) {
+                if (index != expected++) {
+                    throw new AwsException("InvalidParameterValue", "Permission indexes must start at 1 without gaps.", 400);
+                }
+            }
+        }
+        return new PermissionChanges(new ArrayList<>(add.values()), new ArrayList<>(remove.values()));
+    }
+
+    private Response handleCreateSnapshot(MultivaluedMap<String, String> p, String region) {
+        String location = p.getFirst("Location");
+        if (p.getFirst("OutpostArn") != null || location != null && !"regional".equals(location)) {
+            throw new AwsException("UnsupportedOperation",
+                    "CreateSnapshot supports regional snapshots without an OutpostArn.", 400);
+        }
+        for (String prefix : new String[] {"TagSpecification", "TagSpecifications"}) {
+            for (int i = 1; ; i++) {
+                String resourceType = p.getFirst(prefix + "." + i + ".ResourceType");
+                if (resourceType == null) {
+                    break;
+                }
+                if (!"snapshot".equals(resourceType)) {
+                    throw new AwsException("InvalidParameterValue",
+                            "CreateSnapshot supports tags for the snapshot resource type only.", 400);
+                }
+            }
+        }
+        Snapshot snapshot = service.createSnapshot(region, p.getFirst("VolumeId"),
+                p.getFirst("Description"), parseTagsForResource(p, "snapshot"),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return xmlResponse(new XmlBuilder()
+                .start("CreateSnapshotResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .raw(snapshotXml(snapshot))
+                .end("CreateSnapshotResponse")
+                .build());
+    }
+
+    private Response handleDeleteSnapshot(MultivaluedMap<String, String> p, String region) {
+        service.deleteSnapshot(region, p.getFirst("SnapshotId"), Boolean.parseBoolean(p.getFirst("DryRun")));
+        return booleanResponse("DeleteSnapshot");
     }
 
     private Response handleDescribeSnapshots(MultivaluedMap<String, String> p, String region) {
@@ -5264,19 +5408,17 @@ public class Ec2QueryHandler {
         if (capacityReservationId != null) {
             xml.elem("capacityReservationId", capacityReservationId);
         }
-        if (inst.getRootVolumeId() != null) {
-            xml.start("blockDeviceMapping")
-                    .start("item")
-                    .elem("deviceName", inst.getRootDeviceName())
-                    .start("ebs")
-                    .elem("volumeId", inst.getRootVolumeId())
-                    .elem("status", "attached")
-                    .elem("deleteOnTermination", "true")
-                    .elem("attachTime", inst.getLaunchTime() != null ? ISO_FMT.format(inst.getLaunchTime()) : "")
-                    .end("ebs")
-                    .end("item")
-                    .end("blockDeviceMapping");
+        xml.start("blockDeviceMapping");
+        for (VolumeAttachment attachment : service.instanceVolumeAttachments(inst.getRegion(), inst.getInstanceId())) {
+            xml.start("item").elem("deviceName", attachment.getDevice()).start("ebs")
+                    .elem("volumeId", attachment.getVolumeId()).elem("status", attachment.getState())
+                    .elem("deleteOnTermination", String.valueOf(attachment.isDeleteOnTermination()));
+            if (attachment.getAttachTime() != null) {
+                xml.elem("attachTime", ISO_FMT.format(attachment.getAttachTime()));
+            }
+            xml.end("ebs").end("item");
         }
+        xml.end("blockDeviceMapping");
         if (inst.getIamInstanceProfileArn() != null) {
             xml.start("iamInstanceProfile")
                     .elem("arn", inst.getIamInstanceProfileArn())
@@ -6114,7 +6256,6 @@ public class Ec2QueryHandler {
             MultivaluedMap<String, String> p, String prefix) {
         List<LaunchTemplateData.BlockDeviceMapping> mappings = new ArrayList<>();
         for (int i = 1; ; i++) {
-            // An empty prefix reads RunInstances' own top-level BlockDeviceMapping.N members.
             String base = (prefix.isEmpty() ? "" : prefix + ".") + "BlockDeviceMapping." + i;
             if (!anyParamStartsWith(p, base + ".")) {
                 break;
@@ -6363,6 +6504,12 @@ public class Ec2QueryHandler {
                 if (ebs.getEncrypted() != null) {
                     xml.elem("encrypted", String.valueOf(ebs.getEncrypted()));
                 }
+                if (ebs.getIops() != null) {
+                    xml.elem("iops", String.valueOf(ebs.getIops()));
+                }
+                if (ebs.getThroughput() != null) {
+                    xml.elem("throughput", String.valueOf(ebs.getThroughput()));
+                }
                 xml.end("ebs");
             }
             xml.end("item");
@@ -6397,21 +6544,19 @@ public class Ec2QueryHandler {
     private Response handleCreateVolume(MultivaluedMap<String, String> p, String region) {
         String availabilityZone = p.getFirst("AvailabilityZone");
         String volumeType = p.getFirst("VolumeType");
-        String sizeStr = p.getFirst("Size");
-        int size = sizeStr != null ? Integer.parseInt(sizeStr) : 8;
+        Integer suppliedSize = parseOptionalInt(p.getFirst("Size"), "Size");
+        int size = suppliedSize != null ? suppliedSize : 0;
+        if (suppliedSize != null && suppliedSize <= 0) {
+            throw new AwsException("InvalidParameterValue", "Size must be greater than zero.", 400);
+        }
         String encryptedStr = p.getFirst("Encrypted");
         boolean encrypted = "true".equalsIgnoreCase(encryptedStr);
-        String iopsStr = p.getFirst("Iops");
-        int iops = iopsStr != null ? Integer.parseInt(iopsStr) : 0;
-        String throughputStr = p.getFirst("Throughput");
-        Integer throughput = null;
-        if (throughputStr != null) {
-            try {
-                throughput = Integer.parseInt(throughputStr);
-            } catch (NumberFormatException e) {
-                throw new AwsException("ValidationException", "Invalid Throughput value: " + throughputStr, 400);
-            }
+        Integer suppliedIops = parseOptionalInt(p.getFirst("Iops"), "Iops");
+        int iops = suppliedIops != null ? suppliedIops : 0;
+        if (suppliedIops != null && suppliedIops <= 0) {
+            throw new AwsException("InvalidParameterValue", "Iops must be greater than zero.", 400);
         }
+        Integer throughput = parseOptionalInt(p.getFirst("Throughput"), "Throughput");
 
         String snapshotId = p.getFirst("SnapshotId");
 
@@ -6430,17 +6575,20 @@ public class Ec2QueryHandler {
     private Response handleDescribeVolumes(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "VolumeId");
         List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
-        List<Volume> volList = service.describeVolumes(region, ids, filters);
+        Integer maxResults = parseOptionalInt(p.getFirst("MaxResults"), "MaxResults");
+        VolumeListResult result = service.describeVolumes(region, ids, filters, maxResults, p.getFirst("NextToken"));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeVolumesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
                 .start("volumeSet");
-        for (Volume vol : volList) {
+        for (Volume vol : result.volumes()) {
             xml.start("item").raw(volumeXml(vol)).end("item");
         }
-        xml.end("volumeSet")
-                .elem("nextToken", "")
-                .end("DescribeVolumesResponse");
+        xml.end("volumeSet");
+        if (result.nextToken() != null) {
+            xml.elem("nextToken", result.nextToken());
+        }
+        xml.end("DescribeVolumesResponse");
         return xmlResponse(xml.build());
     }
 

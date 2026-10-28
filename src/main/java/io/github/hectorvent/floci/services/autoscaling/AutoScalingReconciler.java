@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefresh;
 import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefreshLaunch;
 import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefreshReplacement;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
+import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfigurationBlockDeviceMapping;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import io.github.hectorvent.floci.services.autoscaling.model.ScalingActivity;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -858,7 +859,7 @@ public class AutoScalingReconciler {
                     // subnet's MapPublicIpOnLaunch, and only null means
                     // "fall back to the subnet default".
                     lc.getAssociatePublicIpAddress(),
-                    null, lc.getMetadataOptions(), null);
+                    launchConfigurationBlockDevices(lc), lc.getMetadataOptions(), null);
         }
 
         LaunchTemplate launchTemplate = resolveLaunchTemplate(asg);
@@ -1020,6 +1021,30 @@ public class AutoScalingReconciler {
             }
         }
         return version.getData().getInstanceType();
+    }
+
+    private static List<LaunchTemplateData.BlockDeviceMapping>
+            launchConfigurationBlockDevices(LaunchConfiguration configuration) {
+        List<LaunchTemplateData.BlockDeviceMapping> result = new ArrayList<>();
+        for (LaunchConfigurationBlockDeviceMapping source : configuration.getBlockDeviceMappings()) {
+            LaunchTemplateData.BlockDeviceMapping mapping = new LaunchTemplateData.BlockDeviceMapping();
+            mapping.setDeviceName(source.getDeviceName());
+            mapping.setVirtualName(source.getVirtualName());
+            mapping.setNoDevice(Boolean.TRUE.equals(source.getNoDevice()) ? "" : null);
+            if (source.getEbs() != null) {
+                LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
+                ebs.setSnapshotId(source.getEbs().getSnapshotId());
+                ebs.setVolumeSize(source.getEbs().getVolumeSize());
+                ebs.setVolumeType(source.getEbs().getVolumeType());
+                ebs.setIops(source.getEbs().getIops());
+                ebs.setThroughput(source.getEbs().getThroughput());
+                ebs.setDeleteOnTermination(source.getEbs().getDeleteOnTermination());
+                ebs.setEncrypted(source.getEbs().getEncrypted());
+                mapping.setEbs(ebs);
+            }
+            result.add(mapping);
+        }
+        return result;
     }
 
     private record LaunchSource(
