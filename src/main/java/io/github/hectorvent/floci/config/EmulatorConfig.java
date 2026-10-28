@@ -3608,6 +3608,10 @@ public interface EmulatorConfig {
 
         @WithDefault("false")
         boolean mock();
+
+        /** Optional local probe interval ceiling; zero preserves each target group's interval. */
+        @WithDefault("0")
+        long maxHealthCheckIntervalMillis();
     }
 
     interface EksServiceConfig {
