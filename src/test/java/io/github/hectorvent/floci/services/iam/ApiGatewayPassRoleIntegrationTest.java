@@ -417,6 +417,154 @@ class ApiGatewayPassRoleIntegrationTest {
         }
     }
 
+    @Test
+    void importedLambdaAuthorizersRequirePassRoleBeforeCreation() {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            for (String type : new String[] {"token", "request"}) {
+                String spec = authorizerDocument(f, f.role, type, false);
+                int initial = f.rest.getRestApis().items().size();
+                f.policy(null);
+                assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                        .body(SdkBytes.fromUtf8String(spec)))).statusCode());
+                assertEquals(initial, f.rest.getRestApis().items().size());
+                f.policy("lambda.amazonaws.com");
+                assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                        .body(SdkBytes.fromUtf8String(spec)))).statusCode());
+                f.policy("apigateway.amazonaws.com");
+                String api = f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(spec))).id();
+                assertEquals(f.role, f.rest.getAuthorizers(b -> b.restApiId(api)).items().getFirst()
+                        .authorizerCredentials());
+            }
+        }
+    }
+
+    @Test
+    void swaggerAuthorizerAssignmentsUseNormalizedSecurityDefinitions() {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            String spec = authorizerDocument(f, f.role, "token", true);
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                    .body(SdkBytes.fromUtf8String(spec)))).statusCode());
+            f.policy("apigateway.amazonaws.com");
+            String api = f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(spec))).id();
+            assertEquals(f.role, f.rest.getAuthorizers(b -> b.restApiId(api)).items().getFirst()
+                    .authorizerCredentials());
+        }
+    }
+
+    @Test
+    void yamlAuthorizerAssignmentResolvesAwsVariables() {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            String spec = """
+                    openapi: 3.0.1
+                    info:
+                      title: %s
+                      version: '1'
+                    paths: {}
+                    components:
+                      securitySchemes:
+                        guard:
+                          type: apiKey
+                          name: Authorization
+                          in: header
+                          x-amazon-apigateway-authorizer:
+                            type: token
+                            authorizerUri: '%s'
+                            authorizerCredentials: '%s'
+                    """.formatted(f.name, f.uri(), f.role.replace("arn:aws:iam::000000000000:",
+                            "arn:${AWS::Partition}:iam::${AWS::AccountId}:"));
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                    .body(SdkBytes.fromUtf8String(spec)))).statusCode());
+            f.policy("apigateway.amazonaws.com");
+            String api = f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(spec))).id();
+            assertEquals(f.role, f.rest.getAuthorizers(b -> b.restApiId(api)).items().getFirst()
+                    .authorizerCredentials());
+        }
+    }
+
+    @Test
+    void deniedAuthorizerMergeAndOverwritePreserveCredentialsAndClearNeedsNoPassRole() {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            f.policy("apigateway.amazonaws.com");
+            String spec = authorizerDocument(f, f.role, "request", false);
+            String api = f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(spec))).id();
+            String id = f.rest.getAuthorizers(b -> b.restApiId(api)).items().getFirst().id();
+            f.policy(null);
+            for (String mode : new String[] {"merge", "overwrite"}) {
+                assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.putRestApi(b -> b
+                        .restApiId(api).mode(mode).body(SdkBytes.fromUtf8String(spec)))).statusCode());
+                assertEquals(id, f.rest.getAuthorizers(b -> b.restApiId(api)).items().getFirst().id());
+                assertEquals(f.role, f.rest.getAuthorizer(b -> b.restApiId(api).authorizerId(id))
+                        .authorizerCredentials());
+            }
+            String omitted = spec.replace("\"authorizerCredentials\":\"" + f.role + "\",", "");
+            f.rest.putRestApi(b -> b.restApiId(api).mode("merge").body(SdkBytes.fromUtf8String(omitted)));
+            assertEquals(f.role, f.rest.getAuthorizer(b -> b.restApiId(api).authorizerId(id)).authorizerCredentials());
+            String cleared = spec.replace("\"authorizerCredentials\":\"" + f.role + "\"",
+                    "\"authorizerCredentials\":null");
+            f.rest.putRestApi(b -> b.restApiId(api).mode("merge").body(SdkBytes.fromUtf8String(cleared)));
+            assertEquals(null, f.rest.getAuthorizer(b -> b.restApiId(api).authorizerId(id)).authorizerCredentials());
+        }
+    }
+
+    @Test
+    void everyImportedAuthorizerRoleIsCheckedBeforeAnyMutation() throws Exception {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            f.policy("apigateway.amazonaws.com");
+            String spec = authorizerDocument(f, f.role, "token", false);
+            ObjectMapper mapper = new ObjectMapper();
+            ObjectNode document = (ObjectNode) mapper.readTree(spec);
+            ObjectNode schemes = (ObjectNode) document.get("components").get("securitySchemes");
+            ObjectNode rejected = schemes.get("guard").deepCopy();
+            ((ObjectNode) rejected.get("x-amazon-apigateway-authorizer"))
+                    .put("authorizerCredentials", f.role + "other");
+            schemes.set("rejected", rejected);
+            String multiple = mapper.writeValueAsString(document);
+            int initial = f.rest.getRestApis().items().size();
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                    .body(SdkBytes.fromUtf8String(multiple)))).statusCode());
+            assertEquals(initial, f.rest.getRestApis().items().size());
+            String api = f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(spec))).id();
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.putRestApi(b -> b
+                    .restApiId(api).mode("overwrite").body(SdkBytes.fromUtf8String(multiple)))).statusCode());
+            assertEquals(1, f.rest.getAuthorizers(b -> b.restApiId(api)).items().size());
+            assertEquals(f.role, f.rest.getAuthorizers(b -> b.restApiId(api)).items().getFirst().authorizerCredentials());
+        }
+    }
+
+    @Test
+    void authorizerImportIgnoresUnusedFieldsAndRejectsMalformedCredentialsWithoutMutation() {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            String plain = authorizerDocument(f, f.role, "token", false)
+                    .replace("authorizerCredentials", "unusedCredentials");
+            String api = f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(plain))).id();
+            assertEquals(null, f.rest.getAuthorizers(b -> b.restApiId(api)).items().getFirst().authorizerCredentials());
+            String malformed = authorizerDocument(f, f.role, "token", false)
+                    .replace("\"authorizerCredentials\":\"" + f.role + "\"", "\"authorizerCredentials\":42");
+            int initial = f.rest.getRestApis().items().size();
+            assertEquals(400, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                    .body(SdkBytes.fromUtf8String(malformed)))).statusCode());
+            assertEquals(initial, f.rest.getRestApis().items().size());
+        }
+    }
+
+    private static String authorizerDocument(Fixture f, String role, String type, boolean swagger) {
+        String schemes = """
+                {"guard":{"type":"apiKey","name":"Authorization","in":"header",
+                  "x-amazon-apigateway-authorizer":{"type":"%s","authorizerCredentials":"%s",
+                    "identitySource":"method.request.header.Authorization","authorizerUri":"%s"}}}
+                """.formatted(type, role, f.uri());
+        String definitions = swagger ? "\"securityDefinitions\":" + schemes
+                : "\"components\":{\"securitySchemes\":" + schemes + "}";
+        return "{\"" + (swagger ? "swagger\":\"2.0" : "openapi\":\"3.0.1")
+                + "\",\"info\":{\"title\":\"" + f.name + "\",\"version\":\"1\"},\"paths\":{}," + definitions + "}";
+    }
+
     private void registerImportedApis(Fixture f) {
         cleanup.register(() -> {
             try (ApiGatewayClient admin = f.adminRest()) {
