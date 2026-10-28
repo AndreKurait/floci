@@ -1576,6 +1576,14 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean enforcementEnabled();
 
+        /** Enables bounded metadata lookup and proof verification for current AssumeRole sessions. */
+        @WithDefault("false")
+        boolean issuedSessionVerificationEnabled();
+
+        /** Enables issuer-owned current Lambda execution identity observations and proof verification. */
+        @WithDefault("false")
+        boolean lambdaIdentityVerificationEnabled();
+
         @WithDefault("false")
         boolean seedDeployerPrincipal();
 
