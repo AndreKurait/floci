@@ -42,6 +42,10 @@ and zero capacity. Both groups had identical configuration except for name, ARN
 and creation time. The SDK regression is
 `compatibility-tests/sdk-test-python/tests/test_autoscaling_subnet_whitespace.py`.
 
+When `AvailabilityZones` is omitted, group creation and subnet updates derive the
+distinct zones from `VPCZoneIdentifier`. Updates without placement fields retain
+the group's current subnet and zone selection.
+
 Scale-out follows the [AWS placement rules](https://docs.aws.amazon.com/autoscaling/ec2/userguide/auto-scaling-benefits.html):
 choose the zone with the fewest active instances, then its subnet with the most
 free IPv4 addresses. Declared subnets and actual EC2 placement take precedence
