@@ -53,6 +53,22 @@ class RestCustomResourcePolicyIntegrationTest {
     @RegisterExtension
     final PartitionCleanup cleanup = new PartitionCleanup();
 
+    @Test
+    void absentPrincipalFlagDenyPrecedesAuthorizerAndIsRecheckedOnCacheHit() throws Exception {
+        Fixture f = fixture("GET");
+        authorizer("Allow", f.arn() + "other");
+        String condition = ",\"Condition\":{\"Null\":{\"aws:PrincipalIsAWSService\":\"true\"}}";
+        policy(f, resourcePolicy("Deny", f.arn(), condition));
+        invoke(f, Map.of(), 403);
+        verifyNoInteractions(lambda);
+        policy(f, resourcePolicy("Allow", f.arn(), condition));
+        invoke(f, Map.of("Authorization", "token"), 200);
+        policy(f, resourcePolicy("Deny", f.arn(), condition));
+        invoke(f, Map.of("Authorization", "token"), 403);
+        verify(lambda, times(1)).invokeTarget(anyString(), anyString(), any(byte[].class), any());
+        assertEquals(1, f.hits().get());
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"GET", "ANY"})
     void preDenyThenCachedUnionAndRevocation(String routeKey) throws Exception {

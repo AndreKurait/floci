@@ -127,6 +127,25 @@ class RestCustomResourcePolicyTest {
                 new ApiGatewayExecuteRouteContext(), null, new RequestContext(), signature, cache, new AuthorizerPolicyEvaluator(evaluator), direct, roles, callers);
     }
 
+    @Test
+    void absentSignedPrincipalFlagDenyStopsAuthorizerBeforeMissingIdentity() {
+        when(headers.getHeaderString("Authorization")).thenReturn(null);
+        policy(document("Deny", "*", INVOKE,
+                ",\"Condition\":{\"Null\":{\"aws:PrincipalIsAWSService\":\"true\"}}"));
+        assertEquals(403, invoke());
+        verifyNoInteractions(lambda);
+    }
+
+    @Test
+    void absentSignedPrincipalFlagGrantStillRequiresCustomIdentity() {
+        authorizerPolicy("Allow", INVOKE + "other");
+        policy(document("Allow", "*", INVOKE,
+                ",\"Condition\":{\"Null\":{\"aws:PrincipalIsAWSService\":\"true\"}}"));
+        assertEquals(200, invoke());
+        when(headers.getHeaderString("Authorization")).thenReturn(null);
+        assertEquals(401, invoke());
+    }
+
     @ParameterizedTest
     @CsvSource({"Allow,Allow,200", "Allow,Neutral,200", "Allow,Deny,403",
             "Neutral,Allow,200", "Neutral,Neutral,403", "Neutral,Deny,403",
