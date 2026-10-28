@@ -298,10 +298,12 @@ floci:
       allow-plaintext-http: true
       mock-config-file: ${SFN_MOCK_CONFIG:src/test/resources/fixtures/sfn-mock-config.json}
       max-wait-seconds: 30
+      max-wait-millis: 0
     swf:
       enabled: true
       timeout-sweep-enabled: true
       timeout-sweep-interval-seconds: 1
+      timeout-sweep-interval-millis: 0
     cloudformation:
       enabled: true
       # Pinned to the shipped default: the retention tests advance the test clock past this

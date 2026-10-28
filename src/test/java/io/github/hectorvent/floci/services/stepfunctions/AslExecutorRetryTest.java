@@ -79,6 +79,16 @@ class AslExecutorRetryTest {
     }
 
     @Test
+    void subsecondCeilingCapsBackoffBeforeJitter() throws Exception {
+        assertEquals(0.1, AslExecutor.retryDelaySeconds(objectMapper.readTree("""
+                {"IntervalSeconds":5,"BackoffRate":2,"MaxDelaySeconds":3}
+                """), 3, 0.5, 0.1));
+        assertEquals(0.05, AslExecutor.retryDelaySeconds(objectMapper.readTree("""
+                {"IntervalSeconds":5,"BackoffRate":2,"MaxDelaySeconds":3,"JitterStrategy":"FULL"}
+                """), 3, 0.5, 0.1));
+    }
+
+    @Test
     void retriesUntilTheTaskSucceeds() throws Exception {
         when(lambdaExecutor.invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, "Handled",
