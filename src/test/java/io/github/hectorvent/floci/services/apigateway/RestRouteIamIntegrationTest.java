@@ -61,6 +61,51 @@ class RestRouteIamIntegrationTest {
     final PartitionCleanup cleanup = new PartitionCleanup();
 
     @Test
+    void attachedUserTagControlsIdentityAndResourceDeniesBeforeBackend() throws Exception {
+        Fixture fixture = fixture("GET");
+        String document = conditionedPolicy(fixture.arn(),
+                "\"StringEquals\":{\"aws:PrincipalTag/department\":\"engineering\"}");
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "rest-tags-", "invoke", document)) {
+            Key key = new Key(user.accessKeyId(), user.secretAccessKey(), null);
+            invoke(fixture, key, 403);
+            SignedIamUsers.iam(endpoint, "TagUser", Map.of("UserName", user.name(),
+                    "Tags.member.1.Key", "department", "Tags.member.1.Value", "engineering")).then().statusCode(200);
+            invoke(fixture, key, 200);
+            String deny = document.replace("\"Effect\":\"Allow\"", "\"Effect\":\"Deny\",\"Principal\":\"*\"");
+            fixture.api().updateRestApi(request -> request.restApiId(fixture.apiId()).patchOperations(patch ->
+                    patch.op("replace").path("/policy").value(deny)));
+            invoke(fixture, key, 403);
+            assertEquals(1, fixture.hits().get());
+        }
+    }
+
+    @Test
+    void issuedRoleSessionRechecksAttachedTagsWithItsSessionPolicy() throws Exception {
+        Fixture fixture = fixture("GET");
+        String name = fixtureNames.apply("rest-tag-role-");
+        String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
+                + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
+        String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/team/",
+                "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
+                .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
+                "PolicyDocument", policy(fixture.arn()))).then().statusCode(200);
+        cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+        String sessionPolicy = conditionedPolicy(fixture.arn(),
+                "\"StringEquals\":{\"aws:PrincipalTag/department\":\"engineering\"}");
+        Key key = assume(role, sessionPolicy);
+        invoke(fixture, key, 403);
+        SignedIamUsers.iam(endpoint, "TagRole", Map.of("RoleName", name,
+                "Tags.member.1.Key", "department", "Tags.member.1.Value", "engineering")).then().statusCode(200);
+        invoke(fixture, key, 200);
+        SignedIamUsers.iam(endpoint, "UntagRole", Map.of("RoleName", name,
+                "TagKeys.member.1", "department")).then().statusCode(200);
+        invoke(fixture, key, 403);
+        assertEquals(1, fixture.hits().get());
+    }
+
+    @Test
     void signedUserRetainsFalsePrincipalServiceFlag() throws Exception {
         Fixture fixture = fixture("GET");
         String document = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"execute-api:Invoke\","
@@ -284,7 +329,7 @@ class RestRouteIamIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"policy", "transport", "token-time", "time"})
+    @ValueSource(strings = {"tags", "policy", "transport", "token-time", "time"})
     void rejectedRoleCreationPreservesPreexistingRole(String scenario) throws Exception {
         String name = "rest-existing-role-" + UUID.randomUUID();
         SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
@@ -292,6 +337,7 @@ class RestRouteIamIntegrationTest {
         cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         RestRouteIamIntegrationTest fixture = nestedFixture(name);
         Executable call = switch (scenario) {
+            case "tags" -> fixture::issuedRoleSessionRechecksAttachedTagsWithItsSessionPolicy;
             case "policy" -> fixture::issuedRoleSessionsRetainPolicyTokenAndRevocationChecks;
             case "transport" -> fixture::issuedSessionEvaluatesTransportConditionsAlongsideRolePolicy;
             case "token-time" -> fixture::issuedSessionTokenIssueTimeIsEvaluatedAlongsideRolePolicy;
