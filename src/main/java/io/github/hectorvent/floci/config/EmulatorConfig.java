@@ -3170,6 +3170,17 @@ public interface EmulatorConfig {
         Optional<String> dockerFlags();
 
         /**
+         * Optional command executed inside each new Lambda container before it can receive invocations.
+         * Exit zero admits the container; nonzero retries within container-readiness-timeout-seconds.
+         * Arguments use Docker flag quoting rules; no shell is implicitly invoked.
+         */
+        Optional<String> containerReadinessCommand();
+
+        /** Overall budget for the optional container readiness command, in seconds. */
+        @WithDefault("60")
+        int containerReadinessTimeoutSeconds();
+
+        /**
          * Base name prefix for the containers and code volumes Lambda spawns, replacing the
          * default {@code floci} (e.g. prefix {@code acme} names containers
          * {@code acme-<function>-<id>} and code volumes {@code acme-code-<function>-<hash>}).
