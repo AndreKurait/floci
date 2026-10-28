@@ -50,6 +50,26 @@ class RuntimeApiServerTest {
     private HttpClient httpClient;
     private ScheduledExecutorService scheduler;
 
+    @Test
+    void runtimeFailureNotifiesEarlyAndLateListenersOnlyOnce() {
+        AtomicInteger calls = new AtomicInteger();
+        server.onRuntimeFailure(calls::incrementAndGet);
+        server.handleRuntimeProcessExited(1);
+        server.handleRuntimeProcessExited(2);
+        assertEquals(1, calls.get());
+        server.onRuntimeFailure(calls::incrementAndGet);
+        assertEquals(2, calls.get());
+    }
+
+    @Test
+    void intentionalShutdownDoesNotSignalRuntimeFailure() {
+        AtomicInteger calls = new AtomicInteger();
+        server.onRuntimeFailure(calls::incrementAndGet);
+        server.quiesce();
+        server.handleRuntimeProcessExited(0);
+        assertEquals(0, calls.get());
+    }
+
     @BeforeEach
     void setUp() throws Exception {
         vertx = Vertx.vertx();
@@ -372,6 +392,8 @@ class RuntimeApiServerTest {
     @Test
     @Timeout(15)
     void initErrorEndpoint_failsThePendingInvocationAndCondemnsTheEnvironment() throws Exception {
+        AtomicInteger failures = new AtomicInteger();
+        server.onRuntimeFailure(failures::incrementAndGet);
         CompletableFuture<InvokeResult> resultFuture = new CompletableFuture<>();
         PendingInvocation invocation = new PendingInvocation(
                 "req-init-error", "{}".getBytes(), System.currentTimeMillis() + 60_000,
@@ -389,6 +411,7 @@ class RuntimeApiServerTest {
                         .build(),
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(202, initErrorResponse.statusCode());
+        assertEquals(1, failures.get());
 
         InvokeResult result = resultFuture.get(2, TimeUnit.SECONDS);
         assertEquals("Unhandled", result.getFunctionError());
@@ -1536,6 +1559,8 @@ class RuntimeApiServerTest {
     @Test
     @Timeout(10)
     void extensionInitError_returns202AndUnregistersExtension() throws Exception {
+        AtomicInteger failures = new AtomicInteger();
+        server.onRuntimeFailure(failures::incrementAndGet);
         String extensionId = registerExtension("failing-extension", "INVOKE");
 
         HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder()
@@ -1548,6 +1573,7 @@ class RuntimeApiServerTest {
                 HttpResponse.BodyHandlers.ofString());
 
         assertEquals(202, response.statusCode());
+        assertEquals(1, failures.get());
         assertEquals("OK", new JsonObject(response.body()).getString("status"));
 
         // The unregistered extension is no longer a valid target for /event/next.
