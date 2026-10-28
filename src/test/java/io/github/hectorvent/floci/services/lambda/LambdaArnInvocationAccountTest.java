@@ -263,7 +263,8 @@ class LambdaArnInvocationAccountTest {
         List<String> steps = new ArrayList<>();
         doAnswer(invocation -> steps.add(service.isLive(invocation.getArgument(0)) ? "drop stored" : "drop gone"))
                 .when(executor).dropPending(any());
-        doAnswer(invocation -> steps.add("drain")).when(warmPool).drainFunction(functionName);
+        doAnswer(invocation -> steps.add("drain")).when(warmPool)
+                .drainFunction(functionStore.get(region, functionName).orElseThrow());
 
         service.deleteFunction(region, functionName);
 
