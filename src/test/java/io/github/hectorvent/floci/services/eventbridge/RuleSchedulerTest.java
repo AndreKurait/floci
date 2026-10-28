@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.eventbridge;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.eventbridge.model.Rule;
 import io.github.hectorvent.floci.services.eventbridge.model.RuleState;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
@@ -200,6 +201,7 @@ class RuleSchedulerTest {
 
     private static RuleScheduler newScheduler(Vertx vertx, EventBridgeInvoker invoker) {
         TargetDispatcher dispatcher = new TargetDispatcher(invoker, null, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class),
                 "http://localhost:4566", Clock.systemUTC(), null);
         return new RuleScheduler(vertx, testConfig(), new ObjectMapper(), dispatcher,
                 Clock.fixed(JUST_BEFORE_MINUTE_BOUNDARY, ZoneOffset.UTC));
@@ -220,7 +222,7 @@ class RuleSchedulerTest {
         }
 
         @Override
-        public void invokeTarget(Target target, String eventJson, String region) {
+        void invokeTarget(Target target, String eventJson, String region, String targetArn) {
             invocationCount.incrementAndGet();
             onDelivery.run();
         }

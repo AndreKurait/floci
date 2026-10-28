@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -59,7 +60,8 @@ class TargetDispatcherTest {
         clockNow = new AtomicReference<>(T0);
         clock = mock(Clock.class);
         when(clock.instant()).thenAnswer(invocation -> clockNow.get());
-        dispatcher = new TargetDispatcher(invoker, sqsService, mock(ServiceCallAuthorizer.class), BASE_URL, clock, null);
+        dispatcher = new TargetDispatcher(invoker, sqsService, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class), BASE_URL, clock, null);
     }
 
     @ParameterizedTest
@@ -97,6 +99,7 @@ class TargetDispatcherTest {
                 lambdaService, sqsService, mock(SnsService.class), new ObjectMapper(), config);
         ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
         TargetDispatcher scheduled = new TargetDispatcher(invoker, sqsService, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class),
                 BASE_URL, Clock.systemUTC(), executor);
         Target target = sqsTarget(null, DLQ_ARN);
         try {
@@ -112,7 +115,8 @@ class TargetDispatcherTest {
     @Test
     void retriesRunFromOnePeriodicTickRatherThanATimerEach() {
         ScheduledExecutorService executor = mock(ScheduledExecutorService.class);
-        TargetDispatcher scheduled = new TargetDispatcher(invoker, sqsService, mock(ServiceCallAuthorizer.class), BASE_URL, clock, executor);
+        TargetDispatcher scheduled = new TargetDispatcher(invoker, sqsService, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class), BASE_URL, clock, executor);
         when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
         Target target = sqsTarget(null, DLQ_ARN);
 
