@@ -6104,6 +6104,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return createVpc(region, cidrBlock, isDefault, false);
     }
 
+    private static void requireNotDryRun(boolean dryRun) {
+        if (dryRun) {
+            throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
+        }
+    }
+
     public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
                          boolean amazonProvidedIpv6CidrBlock) {
         return createVpc(region, requestedCidrBlock, isDefault, amazonProvidedIpv6CidrBlock, null);
@@ -6126,10 +6132,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
                          boolean amazonProvidedIpv6CidrBlock, String instanceTenancy) {
+        return createVpc(region, requestedCidrBlock, isDefault, amazonProvidedIpv6CidrBlock, instanceTenancy, false);
+    }
+
+    public Vpc createVpc(String region, String requestedCidrBlock, boolean isDefault,
+                         boolean amazonProvidedIpv6CidrBlock, String instanceTenancy, boolean dryRun) {
+        requireNotDryRun(dryRun);
         // AWS stores the CIDR in canonical form: "100.68.0.18/18" becomes "100.68.0.0/18".
         String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
         rejectOutOfRangePrefix(cidrBlock, "InvalidVpc.Range");
         rejectReservedVpcRange(cidrBlock);
+        String tenancy = requireVpcTenancy(instanceTenancy);
         ensureDefaultResources(region);
         ensureDefaultDhcpOptions(region, callerAccountId());
         String vpcId = "vpc-" + randomHex(8);
@@ -6138,7 +6151,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         vpc.setCidrBlock(cidrBlock);
         vpc.setState("available");
         vpc.setDefault(isDefault);
-        vpc.setInstanceTenancy(requireVpcTenancy(instanceTenancy));
+        vpc.setInstanceTenancy(tenancy);
         vpc.setOwnerId(callerAccountId());
         vpc.setRegion(region);
         vpc.getCidrBlockAssociationSet().add(
@@ -7383,6 +7396,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Subnet createSubnet(String region, String vpcId, String requestedCidrBlock, String availabilityZone,
                                String availabilityZoneId, String ipv6CidrBlock) {
+        return createSubnet(region, vpcId, requestedCidrBlock, availabilityZone, availabilityZoneId, ipv6CidrBlock, false);
+    }
+
+    public Subnet createSubnet(String region, String vpcId, String requestedCidrBlock, String availabilityZone,
+                               String availabilityZoneId, String ipv6CidrBlock, boolean dryRun) {
+        requireNotDryRun(dryRun);
         // Canonical form, as AWS stores it; null (an IPv6-only subnet) stays null.
         String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
         if (vpcId == null || vpcId.isBlank()) {
@@ -7625,6 +7644,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // ─── Security Groups ───────────────────────────────────────────────────────
 
     public SecurityGroup createSecurityGroup(String region, String groupName, String description, String vpcId) {
+        return createSecurityGroup(region, groupName, description, vpcId, false);
+    }
+
+    public SecurityGroup createSecurityGroup(String region, String groupName, String description, String vpcId,
+                                             boolean dryRun) {
+        requireNotDryRun(dryRun);
         ensureDefaultResources(region);
         if (vpcId != null && !vpcId.isEmpty()) {
             getRequiredVpc(region, vpcId);
