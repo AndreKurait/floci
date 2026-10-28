@@ -36,6 +36,9 @@ on:
       image-digest-ref:
         description: Immutable default JVM image reference
         value: ${{ jobs.publish.outputs.jvm-digest-ref }}
+      network-helper-digest-ref:
+        description: Immutable stock network helper used by the published images
+        value: ${{ jobs.publish.outputs.network-helper-digest-ref }}
       jvm-ref:
         description: Commit-tagged JVM image reference
         value: ${{ jobs.publish.outputs.jvm-ref }}
@@ -263,6 +266,7 @@ jobs:
       jvm-digest-ref: ${{ steps.provenance.outputs.jvm-digest-ref }}
       native-ref: ${{ steps.provenance.outputs.native-ref }}
       native-digest-ref: ${{ steps.provenance.outputs.native-digest-ref }}
+      network-helper-digest-ref: ${{ steps.provenance.outputs.network-helper-digest-ref }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -315,6 +319,11 @@ jobs:
         run: |
           echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
           echo "source-date-epoch=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+          echo "helper-recipe=$(sha256sum src/main/resources/docker/network-helper.Dockerfile | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64,amd64
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -334,6 +343,24 @@ jobs:
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_TOKEN }}
 
+      - name: Build and publish stock network helper
+        id: network-helper
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.metadata.outputs.source-date-epoch }}
+        with:
+          context: src/main/resources/docker
+          file: src/main/resources/docker/network-helper.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.prepare.outputs.image }}:network-helper.${{ needs.prepare.outputs.image-tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.source-sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            io.floci.helper.recipe-sha256=${{ steps.metadata.outputs.helper-recipe }}
+          cache-from: type=gha,scope=floci-network-helper
+          cache-to: type=gha,scope=floci-network-helper,mode=max
+
       - name: Build and publish JVM image
         id: jvm
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -347,6 +374,7 @@ jobs:
           tags: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.image-tag }}
           build-args: |
             VERSION=${{ needs.prepare.outputs.product-version }}
+            NETWORK_HELPER_IMAGE=${{ needs.prepare.outputs.image }}@${{ steps.network-helper.outputs.digest }}
           labels: |
             org.opencontainers.image.version=${{ needs.prepare.outputs.product-version }}
             org.opencontainers.image.revision=${{ needs.prepare.outputs.source-sha }}
@@ -373,6 +401,7 @@ jobs:
           tags: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.image-tag }}-native
           build-args: |
             VERSION=${{ needs.prepare.outputs.product-version }}
+            NETWORK_HELPER_IMAGE=${{ needs.prepare.outputs.image }}@${{ steps.network-helper.outputs.digest }}
           labels: |
             org.opencontainers.image.version=${{ needs.prepare.outputs.product-version }}
             org.opencontainers.image.revision=${{ needs.prepare.outputs.source-sha }}
@@ -420,6 +449,7 @@ jobs:
           IMAGE: ${{ needs.prepare.outputs.image }}
           IMAGE_TAG: ${{ needs.prepare.outputs.image-tag }}
           JVM_DIGEST: ${{ steps.jvm.outputs.digest }}
+          NETWORK_HELPER_DIGEST: ${{ steps.network-helper.outputs.digest }}
           NATIVE_DIGEST: ${{ steps.native.outputs.digest }}
           PRODUCT_VERSION: ${{ needs.prepare.outputs.product-version }}
           PUBLISH_NATIVE: ${{ inputs.publish-native }}
@@ -433,6 +463,8 @@ jobs:
         run: |
           jvm_ref="$IMAGE:$IMAGE_TAG"
           jvm_digest_ref="$IMAGE@$JVM_DIGEST"
+          helper_ref="$IMAGE:network-helper.$IMAGE_TAG"
+          helper_digest_ref="$IMAGE@$NETWORK_HELPER_DIGEST"
           native_ref="$IMAGE:$IMAGE_TAG-native"
           compat_ref="$IMAGE:$IMAGE_TAG-native-compat"
           native_digest_ref="$IMAGE@$NATIVE_DIGEST"
@@ -452,7 +484,10 @@ jobs:
             --arg jvmRef "$jvm_ref" \
             --arg jvmDigest "$JVM_DIGEST" \
             --arg jvmDigestRef "$jvm_digest_ref" \
-            '{source: {sha: $sourceSha, requestedRef: $requestedSourceRef, repository: $repository}, workflow: {runId: $runId, attempt: $runAttempt, url: $runUrl}, created: $created, imageTag: $imageTag, productVersion: $productVersion, images: {jvm: {ref: $jvmRef, digest: $jvmDigest, digestRef: $jvmDigestRef, dockerfile: "docker/Dockerfile.jvm-package"}}, platforms: ["linux/amd64", "linux/arm64"]}' \
+            --arg helperRef "$helper_ref" \
+            --arg helperDigest "$NETWORK_HELPER_DIGEST" \
+            --arg helperDigestRef "$helper_digest_ref" \
+            '{source: {sha: $sourceSha, requestedRef: $requestedSourceRef, repository: $repository}, workflow: {runId: $runId, attempt: $runAttempt, url: $runUrl}, created: $created, imageTag: $imageTag, productVersion: $productVersion, images: {jvm: {ref: $jvmRef, digest: $jvmDigest, digestRef: $jvmDigestRef, dockerfile: "docker/Dockerfile.jvm-package"}, networkHelper: {ref: $helperRef, digest: $helperDigest, digestRef: $helperDigestRef, dockerfile: "src/main/resources/docker/network-helper.Dockerfile"}}, platforms: ["linux/amd64", "linux/arm64"]}' \
             > floci-image-provenance.json
 
           if [[ "$PUBLISH_NATIVE" == "true" ]]; then
@@ -472,6 +507,7 @@ jobs:
           {
             echo "jvm-ref=$jvm_ref"
             echo "jvm-digest-ref=$jvm_digest_ref"
+            echo "network-helper-digest-ref=$helper_digest_ref"
             if [[ "$PUBLISH_NATIVE" == "true" ]]; then
               echo "native-ref=$native_ref"
               echo "native-digest-ref=$native_digest_ref"
@@ -489,6 +525,7 @@ jobs:
             echo "| Image tag | Immutable digest reference |"
             echo "| --- | --- |"
             echo "| \`$jvm_ref\` | \`$jvm_digest_ref\` |"
+            echo "| \`$helper_ref\` | \`$helper_digest_ref\` |"
             if [[ "$PUBLISH_NATIVE" == "true" ]]; then
               echo "| \`$native_ref\` | \`$native_digest_ref\` |"
               echo "| \`$compat_ref\` | \`$compat_digest_ref\` |"

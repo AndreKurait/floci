@@ -381,8 +381,11 @@ attachment. Stop/start keeps the namespace; termination removes both containers.
 The helper image is configured by `floci.services.ec2.metadata-helper-image`
 (`FLOCI_SERVICES_EC2_METADATA_HELPER_IMAGE`). The default `floci/network-helper:local` is
 built from Floci's bundled Dockerfile when absent. A custom value must identify an
-available image with a shell, `ip`, `iptables`, and `curl`. With security-group enforcement
+available image with a shell, `ip`, `iptables`, `getent ahostsv4`, and `curl`. With security-group enforcement
 enabled, Floci prepares metadata in the existing firewall helper instead.
+Images from the [reusable publishing workflow](../configuration/docker-images.md)
+configure a published helper digest for both paths, so their first EC2 launch
+pulls a matching helper without running a Docker build.
 
 Inside this namespace, the link-local address `169.254.169.254` routes to Floci's metadata
 server. Routing is ready once an IMDSv2 token request with a 60-second TTL succeeds and that token reads the
