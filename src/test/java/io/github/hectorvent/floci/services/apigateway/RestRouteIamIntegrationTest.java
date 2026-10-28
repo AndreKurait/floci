@@ -162,8 +162,57 @@ class RestRouteIamIntegrationTest {
         assertEquals(1, fixture.hits().get());
     }
 
+    @Test
+    void signedCallerTransportConditionsUseConnectionInsteadOfForwardedHeaders() throws Exception {
+        Fixture fixture = fixture("GET");
+        String conditions = "\"IpAddress\":{\"aws:SourceIp\":\"127.0.0.0/8\"},"
+                + "\"Bool\":{\"aws:SecureTransport\":\"false\"}";
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "rest-transport-", "invoke",
+                conditionedPolicy(fixture.arn(), conditions))) {
+            Key key = new Key(user.accessKeyId(), user.secretAccessKey(), null);
+            invoke(fixture, key, 200, Map.of("X-Forwarded-For", "192.0.2.1", "X-Forwarded-Proto", "https"));
+            putPolicy(user, conditionedPolicy(fixture.arn(), conditions.replace("127.0.0.0/8", "192.0.2.0/24")));
+            invoke(fixture, key, 403, Map.of("X-Forwarded-For", "192.0.2.1"));
+            assertEquals(1, fixture.hits().get());
+        }
+    }
+
+    @Test
+    void signedCallerResourcePolicyTransportDenyStopsBackend() throws Exception {
+        Fixture fixture = fixture("GET");
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "rest-transport-deny-", "invoke",
+                policy(fixture.arn()))) {
+            String deny = conditionedPolicy(fixture.arn(), "\"Bool\":{\"aws:SecureTransport\":\"false\"}")
+                    .replace("\"Effect\":\"Allow\"", "\"Effect\":\"Deny\",\"Principal\":\"*\"");
+            fixture.api().updateRestApi(request -> request.restApiId(fixture.apiId()).patchOperations(patch ->
+                    patch.op("replace").path("/policy").value(deny)));
+            invoke(fixture, new Key(user.accessKeyId(), user.secretAccessKey(), null), 403,
+                    Map.of("X-Forwarded-Proto", "https"));
+            assertEquals(0, fixture.hits().get());
+        }
+    }
+
+    @Test
+    void issuedSessionEvaluatesTransportConditionsAlongsideRolePolicy() throws Exception {
+        Fixture fixture = fixture("GET");
+        String name = fixtureNames.apply("rest-transport-session-");
+        String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
+                + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
+        String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
+                "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
+                .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
+                "PolicyDocument", policy(fixture.arn()))).then().statusCode(200);
+        cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+        String sessionPolicy = conditionedPolicy(fixture.arn(), "\"IpAddress\":{\"aws:SourceIp\":\"127.0.0.0/8\"}");
+        invoke(fixture, assume(role, sessionPolicy), 200);
+        invoke(fixture, assume(role, sessionPolicy.replace("127.0.0.0/8", "192.0.2.0/24")), 403);
+        assertEquals(1, fixture.hits().get());
+    }
+
     @ParameterizedTest
-    @ValueSource(strings = {"policy"})
+    @ValueSource(strings = {"policy", "transport"})
     void rejectedRoleCreationPreservesPreexistingRole(String scenario) throws Exception {
         String name = "rest-existing-role-" + UUID.randomUUID();
         SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
@@ -172,6 +221,7 @@ class RestRouteIamIntegrationTest {
         RestRouteIamIntegrationTest fixture = nestedFixture(name);
         Executable call = switch (scenario) {
             case "policy" -> fixture::issuedRoleSessionsRetainPolicyTokenAndRevocationChecks;
+            case "transport" -> fixture::issuedSessionEvaluatesTransportConditionsAlongsideRolePolicy;
             default -> throw new IllegalArgumentException(scenario);
         };
         try {
@@ -216,6 +266,10 @@ class RestRouteIamIntegrationTest {
         fixture.endpoint = endpoint;
         fixture.fixtureNames = prefix -> name;
         return fixture;
+    }
+
+    private static String conditionedPolicy(String arn, String conditions) {
+        return policy(arn).replace("}}", ",\"Condition\":{" + conditions + "}}}");
     }
 
     private void cleanupIam(String action, Map<String, String> parameters) {
@@ -283,11 +337,15 @@ class RestRouteIamIntegrationTest {
     }
 
     private void invoke(Fixture fixture, Key key, int status) throws Exception {
+        invoke(fixture, key, status, Map.of());
+    }
+
+    private void invoke(Fixture fixture, Key key, int status, Map<String, String> extraHeaders) throws Exception {
         String path = "/execute-api/" + fixture.apiId() + "/prod/items";
         String host = endpoint.getHost() + ":" + endpoint.getPort();
         Map<String, String> headers = ExecuteApiRequestSigner.signedHeaders("GET", path, Map.of(), host,
                 new byte[0], key.accessKey(), key.secret(), "us-east-1", Instant.now());
-        RequestSpecification request = given().headers(headers);
+        RequestSpecification request = given().headers(headers).headers(extraHeaders);
         if (key.token() != null) {
             request.header("X-Amz-Security-Token", key.token());
         }
