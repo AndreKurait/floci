@@ -36,11 +36,9 @@ import java.util.function.Function;
  *
  * <h2>Deliberate deviations from real AWS</h2>
  * <ul>
- *   <li><strong>No authorization, only authentication.</strong> A valid signature from any known
- *       access key is accepted; {@code execute-api:Invoke} is not evaluated against the caller's
- *       IAM policies or a resource policy. Floci's IAM policy evaluation is opt-in and off by
- *       default, so gating the data plane on it would make the common case unusable.</li>
- *   <li><strong>The credential scope's region is not pinned</strong> to the API's region. Floci
+ *   <li>This component authenticates signatures only. Data-plane callers perform their own
+ *       policy checks through the shared IAM evaluator when enforcement is enabled.</li>
+ *    <li><strong>The credential scope's region is not pinned</strong> to the API's region. Floci
  *       resolves a request's region <em>from</em> that scope, so pinning it would be circular.</li>
  *   <li>The well-known local-dev {@code test}/{@code test} credential pair is honoured, mirroring
  *       the identical fallback in {@code S3Service}, {@code PreSignedUrlFilter} and the
