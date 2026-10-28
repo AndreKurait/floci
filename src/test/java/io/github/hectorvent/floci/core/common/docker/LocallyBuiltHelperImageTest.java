@@ -3,11 +3,15 @@ package io.github.hectorvent.floci.core.common.docker;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.BuildImageCmd;
 import com.github.dockerjava.api.command.BuildImageResultCallback;
+import com.github.dockerjava.api.command.InfoCmd;
 import com.github.dockerjava.api.command.InspectImageCmd;
 import com.github.dockerjava.api.command.InspectImageResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Info;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.InputStream;
 
@@ -23,7 +27,7 @@ import static org.mockito.Mockito.when;
 /**
  * Covers the decisions this helper makes before it ever touches a Dockerfile: that a caller pointed
  * at something other than Floci's own default is left to pull that image itself, that an image
- * already in the daemon is not rebuilt, and that a build which produces no image id fails instead
+ * already matching the daemon platform is not rebuilt, and that a build which produces no image id fails instead
  * of reporting success. All are branches the callers depend on and none needs a real daemon, so
  * they are pinned here rather than only through the EC2 security-group path, which uses the default
  * image and is skipped without Docker.
@@ -35,11 +39,16 @@ class LocallyBuiltHelperImageTest {
 
     private DockerClient dockerClient;
     private ContainerBuilder containerBuilder;
+    private Info daemon;
 
     @BeforeEach
     void setUp() {
         dockerClient = mock(DockerClient.class);
         containerBuilder = mock(ContainerBuilder.class);
+        daemon = new Info().withArchitecture("x86_64").withOsType("linux");
+        InfoCmd info = mock(InfoCmd.class);
+        when(info.exec()).thenReturn(daemon);
+        when(dockerClient.infoCmd()).thenReturn(info);
     }
 
     @Test
@@ -58,7 +67,10 @@ class LocallyBuiltHelperImageTest {
         stubResolvedImage();
         InspectImageCmd inspectCmd = mock(InspectImageCmd.class);
         when(dockerClient.inspectImageCmd(DEFAULT_IMAGE)).thenReturn(inspectCmd);
-        when(inspectCmd.exec()).thenReturn(mock(InspectImageResponse.class));
+        InspectImageResponse image = mock(InspectImageResponse.class);
+        when(image.getOs()).thenReturn("linux");
+        when(image.getArch()).thenReturn("amd64");
+        when(inspectCmd.exec()).thenReturn(image);
 
         LocallyBuiltHelperImage.ensureBuilt(dockerClient, containerBuilder,
                 DEFAULT_IMAGE, DEFAULT_IMAGE, DOCKERFILE);
@@ -69,12 +81,32 @@ class LocallyBuiltHelperImageTest {
     @Test
     void buildsFromTheDockerfileWhenTheImageIsMissing() {
         stubMissingImage();
-        stubBuildReturning("sha256:built");
+        BuildImageCmd build = stubBuildReturning("sha256:built");
 
         LocallyBuiltHelperImage.ensureBuilt(dockerClient, containerBuilder,
                 DEFAULT_IMAGE, DEFAULT_IMAGE, DOCKERFILE);
 
         verify(dockerClient).buildImageCmd(any(InputStream.class));
+        verify(build).withPlatform("linux/amd64");
+    }
+
+    @ParameterizedTest
+    @CsvSource({"x86_64,arm64,linux/amd64", "aarch64,amd64,linux/arm64"})
+    void replacesForeignCachedHelperWithTheDaemonPlatform(String host, String cached, String expected) {
+        daemon.withArchitecture(host);
+        stubResolvedImage();
+        InspectImageResponse image = mock(InspectImageResponse.class);
+        when(image.getOs()).thenReturn("linux");
+        when(image.getArch()).thenReturn(cached);
+        InspectImageCmd inspect = mock(InspectImageCmd.class);
+        when(inspect.exec()).thenReturn(image);
+        when(dockerClient.inspectImageCmd(DEFAULT_IMAGE)).thenReturn(inspect);
+        BuildImageCmd build = stubBuildReturning("sha256:rebuilt");
+
+        LocallyBuiltHelperImage.ensureBuilt(dockerClient, containerBuilder,
+                DEFAULT_IMAGE, DEFAULT_IMAGE, DOCKERFILE);
+
+        verify(build).withPlatform(expected);
     }
 
     @Test
@@ -116,11 +148,12 @@ class LocallyBuiltHelperImageTest {
      * Returns a stub callback rather than the one the helper passes in: awaiting the real
      * {@link BuildImageResultCallback} would block, since no daemon ever feeds it events.
      */
-    private void stubBuildReturning(String imageId) {
+    private BuildImageCmd stubBuildReturning(String imageId) {
         BuildImageCmd buildCmd = mock(BuildImageCmd.class, RETURNS_SELF);
         when(dockerClient.buildImageCmd(any(InputStream.class))).thenReturn(buildCmd);
         BuildImageResultCallback result = mock(BuildImageResultCallback.class);
         when(result.awaitImageId()).thenReturn(imageId);
         when(buildCmd.exec(any())).thenReturn(result);
+        return buildCmd;
     }
 }

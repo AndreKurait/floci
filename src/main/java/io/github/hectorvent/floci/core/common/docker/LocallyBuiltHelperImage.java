@@ -13,7 +13,7 @@ import java.io.InputStream;
 import java.util.Set;
 
 /**
- * Builds a Floci-recipe helper image in the workload daemon the first time something needs it,
+ * Builds a Floci-recipe helper image for the workload daemon's platform when needed,
  * instead of trying to pull an image that only exists as a Dockerfile checked into Floci itself.
  * Security-group enforcement is the caller today; this exists as a shared utility because a second
  * one is coming (an ECS task-role credentials proxy needs the same image), and the alternative was
@@ -39,9 +39,11 @@ public final class LocallyBuiltHelperImage {
             return;
         }
         String image = containerBuilder.resolveImage(configuredImage);
+        String platform = DockerPlatform.daemon(dockerClient);
         try {
-            dockerClient.inspectImageCmd(image).exec();
-            return;
+            if (DockerPlatform.matches(dockerClient.inspectImageCmd(image).exec(), platform)) {
+                return;
+            }
         } catch (NotFoundException missing) {
             // Build the versioned Floci recipe in the daemon used for workloads.
         }
@@ -60,7 +62,7 @@ public final class LocallyBuiltHelperImage {
             }
             try (BuildImageResultCallback callback = new BuildImageResultCallback()) {
                 String built = dockerClient.buildImageCmd(new ByteArrayInputStream(archive.toByteArray()))
-                        .withTags(Set.of(image)).exec(callback).awaitImageId();
+                        .withTags(Set.of(image)).withPlatform(platform).exec(callback).awaitImageId();
                 if (built == null || built.isBlank()) {
                     throw new IllegalStateException("Docker did not build the Floci helper image: " + image);
                 }
