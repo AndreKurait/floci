@@ -1023,3 +1023,20 @@ bare `*` is not the documented AWS sentinel. This check is distinct from `execut
 route authorization. Issued session identities are read from IAM, not synthesized; full forwarded
 request condition context, other service integrations and HTTP/WebSocket caller modes remain
 outside this implementation.
+
+
+### REST IAM route authorization
+
+With IAM enforcement enabled, REST methods configured with `AWS_IAM` require both a verified
+SigV4 caller and authorization for `execute-api:Invoke` on the API owner, region, stage, concrete
+HTTP method and requested resource path. The shared IAM evaluator combines identity, session,
+permissions-boundary, SCP and stored REST resource policies. Cross-account access requires both
+identity and resource grants. Explicit denials take precedence. Lambda integration permissions
+remain a separate check against the same qualified function that is invoked.
+
+Stored policy resources using `execute-api:/stage/METHOD/path` are expanded for evaluation against
+the owning API without changing stored readback. AWS expands this shorthand when saving the policy.
+This uses the existing live API policy storage; deployment-snapshot policy activation is not modeled
+here. Resource-policy workflows for unsigned, CUSTOM and Cognito routes, full inbound condition
+context and actual service execution-role STS sessions remain separate work. IAM-disabled routes
+retain signature validation without requiring policy grants.
