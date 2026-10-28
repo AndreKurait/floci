@@ -224,6 +224,41 @@ public class ApiGatewayExecuteController {
         return apiGatewayV2Service.hasWebSocketApi(apiId);
     }
 
+    private Response authorizeConnectionRequest(String method, String apiId, String stageName, String proxy,
+                                                HttpHeaders headers, UriInfo uriInfo, byte[] body) {
+        Optional<ApiGatewayV2Service.ApiOwner> owner = apiGatewayV2Service.findApiOwner(apiId);
+        if (owner.isPresent()) {
+            ApiGatewayV2Service.ApiOwner apiOwner = owner.get();
+            String resource = AwsArnUtils.Arn.of("execute-api", apiOwner.region(), apiOwner.accountId(),
+                    apiId + "/" + stageName + "/" + method + "/@connections").toString();
+            ExecuteApiSigV4Authorizer.Result result = sigV4Authorizer.authorize(
+                    method, headers, uriInfo, body, routeContext.signedRequestPath());
+            ExecuteApiSigV4Authorizer.CallerIdentity caller = result.authorized() ? result.identity() : null;
+            if (callerCallAuthorizer.authorizeRequest(caller == null ? null : caller.accessKey(),
+                    caller == null ? null : caller.accountId(), caller == null ? null : caller.userArn(),
+                    "execute-api:ManageConnections", resource, AwsArnUtils.parse(resource).partition(),
+                    routeContext.sourceIp(), isSecureTransport(uriInfo)) == Decision.ALLOW) {
+                if ("POST".equals(method) && body != null && body.length > MAX_CONNECTIONS_PAYLOAD_BYTES) {
+                    return Response.status(413)
+                            .entity(new AwsErrorResponse("PayloadTooLargeException", "Payload too large"))
+                            .type(MediaType.APPLICATION_JSON)
+                            .build();
+                }
+                String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
+                ConnectionInfo connection = webSocketConnectionManager.getConnectionInfo(connectionId);
+                if (connection == null || !apiId.equals(connection.getApiId())
+                        || !stageName.equals(connection.getStageName()) || !apiOwner.region().equals(connection.getRegion())) {
+                    return Response.status(410).entity(new AwsErrorResponse("GoneException", "GoneException"))
+                            .type(MediaType.APPLICATION_JSON).build();
+                }
+                return null;
+            }
+        }
+        return Response.status(403).header("x-amzn-ErrorType", "ForbiddenException")
+                .entity(new AwsErrorResponse("ForbiddenException", "Forbidden"))
+                .type(MediaType.APPLICATION_JSON).build();
+    }
+
     private String decodeConnectionId(String rawConnectionId) {
         return URLDecoder.decode(rawConnectionId, StandardCharsets.UTF_8);
     }
@@ -232,12 +267,6 @@ public class ApiGatewayExecuteController {
     private static final int MAX_CONNECTIONS_PAYLOAD_BYTES = 128 * 1024;
 
     private Response handlePostToConnection(String connectionId, byte[] body) {
-        if (body != null && body.length > MAX_CONNECTIONS_PAYLOAD_BYTES) {
-            return Response.status(413)
-                    .entity(new AwsErrorResponse("PayloadTooLargeException", "Payload too large"))
-                    .type(MediaType.APPLICATION_JSON)
-                    .build();
-        }
         try {
             webSocketConnectionManager.sendMessage(connectionId, new String(body, StandardCharsets.UTF_8));
             return Response.ok().build();
@@ -287,6 +316,10 @@ public class ApiGatewayExecuteController {
                               @PathParam("stageName") String stageName,
                               @PathParam("proxy") String proxy) {
         if (isWebSocketConnectionRequest(apiId, proxy)) {
+            Response denied = authorizeConnectionRequest("GET", apiId, stageName, proxy, headers, uriInfo, null);
+            if (denied != null) {
+                return denied;
+            }
             String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
             return handleGetConnectionInfo(connectionId);
         }
@@ -302,6 +335,10 @@ public class ApiGatewayExecuteController {
                                @PathParam("proxy") String proxy,
                                byte[] body) {
         if (isWebSocketConnectionRequest(apiId, proxy)) {
+            Response denied = authorizeConnectionRequest("POST", apiId, stageName, proxy, headers, uriInfo, body);
+            if (denied != null) {
+                return denied;
+            }
             String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
             return handlePostToConnection(connectionId, body);
         }
@@ -327,6 +364,10 @@ public class ApiGatewayExecuteController {
                                  @PathParam("stageName") String stageName,
                                  @PathParam("proxy") String proxy) {
         if (isWebSocketConnectionRequest(apiId, proxy)) {
+            Response denied = authorizeConnectionRequest("DELETE", apiId, stageName, proxy, headers, uriInfo, null);
+            if (denied != null) {
+                return denied;
+            }
             String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
             return handleDeleteConnection(connectionId);
         }

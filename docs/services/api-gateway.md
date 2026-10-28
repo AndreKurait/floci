@@ -1058,3 +1058,13 @@ identity, session, boundary, SCP and resource-policy conditions. REST anonymous
 and custom-authorizer resource-policy checks also receive these time keys.
 These values do not come from client-supplied date headers. This does not add
 other global condition keys or issue STS sessions for service execution roles.
+
+### WebSocket connection management permissions
+
+With IAM enforcement enabled, GET, POST and DELETE on `@connections` require a verified
+SigV4 caller and `execute-api:ManageConnections` permission. The resource uses the API
+owner, region, stage and HTTP method, ending in `/<method>/@connections`. An `execute-api:Invoke`
+grant alone does not authorize connection management. Current identity, session, boundary
+and SCP policies are evaluated before connection metadata is read or messages and closes
+are sent. Connections must belong to the requested API, stage and region. IAM-disabled
+local requests retain their unsigned access.
