@@ -4720,7 +4720,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * Stores an assumed-role session so the enforcement filter can resolve its policies.
      */
     public void registerSession(String sessionAccessKeyId, String roleArn, Instant expiration) {
-        sessions.put(sessionAccessKeyId, new SessionCredential(sessionAccessKeyId, roleArn, expiration));
+        putNewSession(sessionAccessKeyId, new SessionCredential(sessionAccessKeyId, roleArn, expiration));
     }
 
     /**
@@ -4728,7 +4728,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     public void registerSession(String sessionAccessKeyId, String roleArn, Instant expiration,
                                 String sessionPolicyDocument) {
-        sessions.put(sessionAccessKeyId,
+        putNewSession(sessionAccessKeyId,
                 new SessionCredential(sessionAccessKeyId, roleArn, expiration, sessionPolicyDocument));
     }
 
@@ -4744,7 +4744,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     /** Stores a temporary credential including the session token required for authentication. */
     public void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
                                 String roleArn, Instant expiration, String sessionPolicyDocument) {
-        sessions.put(sessionAccessKeyId,
+        putNewSession(sessionAccessKeyId,
                 new SessionCredential(sessionAccessKeyId, secretAccessKey, sessionToken, roleArn,
                         expiration, sessionPolicyDocument));
     }
@@ -4777,7 +4777,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 roleArn, expiration, sessionPolicyDocument, originAccountId);
         session.setRoleSessionName(roleSessionName);
         session.setAssumedRoleId(assumedRoleId);
-        sessions.put(sessionAccessKeyId, session);
+        putNewSession(sessionAccessKeyId, session);
     }
 
     /**
@@ -4807,7 +4807,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         } else if (issuingAccessKeyId == null || !holdsKey(issuingAccessKeyId)) {
             session.setIssuerArn(regionResolver.buildGlobalArn("iam", originAccountId, "root"));
         }
-        sessions.put(sessionAccessKeyId, session);
+        putNewSession(sessionAccessKeyId, session);
     }
 
     /**
@@ -4833,7 +4833,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         SessionCredential session = new SessionCredential(sessionAccessKeyId, secretAccessKey, sessionToken,
                 null, expiration, sessionPolicyDocument, ownerAccountId);
         session.setDelegatedApproverArn(delegatedApproverArn);
-        sessions.put(sessionAccessKeyId, session);
+        putNewSession(sessionAccessKeyId, session);
     }
 
     /** Stores a temporary session in an explicit account namespace. */
@@ -4872,10 +4872,22 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     private void putSessionForAccount(String accountId, String sessionAccessKeyId, SessionCredential session) {
+        recordSessionIssueTime(session);
         if (sessions instanceof AccountAwareStorageBackend<SessionCredential> aware) {
             aware.putForAccount(accountId, sessionAccessKeyId, session);
         } else {
-            sessions.put(sessionAccessKeyId, session);
+            putNewSession(sessionAccessKeyId, session);
+        }
+    }
+
+    private void putNewSession(String accessKeyId, SessionCredential session) {
+        recordSessionIssueTime(session);
+        sessions.put(accessKeyId, session);
+    }
+
+    private void recordSessionIssueTime(SessionCredential session) {
+        if (session.getIssuedAt() == null) {
+            session.setIssuedAt(clock.instant());
         }
     }
 
@@ -4918,10 +4930,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         session.setLambdaExecutionRole(true);
         session.setRoleSessionName(roleSessionName);
         session.setAssumedRoleId(assumedRoleId);
+        recordSessionIssueTime(session);
         if (sessions instanceof AccountAwareStorageBackend<SessionCredential> aware) {
             aware.putForAccount(accountId, sessionAccessKeyId, session);
         } else {
-            sessions.put(sessionAccessKeyId, session);
+            putNewSession(sessionAccessKeyId, session);
         }
         LOG.debugv("Registered Lambda execution-role session {0} under account {1} for {2}",
                 sessionAccessKeyId, accountId, roleArn);
@@ -4933,6 +4946,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 || session.getEc2InstanceId() == null || session.getEc2InstanceId().isBlank()) {
             throw new IllegalArgumentException("EC2 session account and instance ID must not be blank");
         }
+        recordSessionIssueTime(session);
         if (sessions instanceof AccountAwareStorageBackend<SessionCredential> aware) {
             aware.putForAccount(session.getOriginAccountId(), session.getAccessKeyId(), session);
         } else {
@@ -4960,6 +4974,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 || session.getEcsTaskArn() == null || session.getEcsTaskArn().isBlank()) {
             throw new IllegalArgumentException("ECS task session account and task ARN must not be blank");
         }
+        recordSessionIssueTime(session);
         if (sessions instanceof AccountAwareStorageBackend<SessionCredential> aware) {
             aware.putForAccount(session.getOriginAccountId(), session.getAccessKeyId(), session);
         } else {
@@ -5480,11 +5495,12 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * @param userId        the request's {@code aws:userid}, in the shape the guide gives for this
      *                      kind of principal, or null when it publishes none
      * @param userName      the request's {@code aws:username}, which only an IAM user has
+     * @param tokenIssueTime recorded issuance time for temporary credentials, absent for legacy records
      * @param permissionsBoundary whether a permissions boundary is attached to the user, or to the
      *                      role a session assumed, which a Deny's {@code NotPrincipal} never spares
      */
     public record CallerArns(String callerArn, String principalArn, String principalType,
-                             String userId, String userName, boolean permissionsBoundary) {
+                             String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime) {
 
         /**
          * The {@code aws:PrincipalType} values, from the IAM User Guide's principal key values
@@ -5513,6 +5529,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             return new CallerArns(rootArn, rootArn, TYPE_ACCOUNT, accountId, null);
         }
 
+        /** Principal metadata without a recorded temporary-credential issuance time. */
+        public CallerArns(String callerArn, String principalArn, String principalType, String userId,
+                          String userName, boolean permissionsBoundary) {
+            this(callerArn, principalArn, principalType, userId, userName, permissionsBoundary, null);
+        }
+
+        public CallerArns withTokenIssueTime(Instant issuedAt) {
+            return new CallerArns(callerArn, principalArn, principalType, userId, userName,
+                    permissionsBoundary, issuedAt);
+        }
+
         /** A caller with no permissions boundary attached. */
         public CallerArns(String callerArn, String principalArn, String principalType, String userId,
                           String userName) {
@@ -5536,6 +5563,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
          */
         public void putPrincipalKeys(Map<String, List<String>> context) {
             context.put("aws:PrincipalArn", List.of(principalArn));
+            if (tokenIssueTime != null) {
+                context.put("aws:TokenIssueTime", List.of(tokenIssueTime.toString()));
+            }
             if (principalType != null) {
                 context.put("aws:PrincipalType", List.of(principalType));
             }
@@ -5608,55 +5638,59 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 deleteSession(accessKeyId, session);
                 return Optional.empty();
             }
-            if (session.getDelegatedApproverArn() != null) {
-                return delegatedApproverArns(session);
-            }
-            if (isFederatedUserSession(session)) {
-                // A federated user has no aws:username at all, only the account:name userid.
-                String federatedArn = session.getRoleArn();
-                return Optional.of(new CallerArns(federatedArn, federatedArn,
-                        CallerArns.TYPE_FEDERATED_USER,
-                        sessionUserId(session).orElse(null), null));
-            }
-            String roleArn = session.getRoleArn();
-            if (roleArn == null) {
-                // GetSessionToken credentials act as the identity that minted them.
-                if (issuedByRoot(session)) {
-                    // The account root's aws:userid is the account id, and it has no
-                    // aws:username: the guide lists it as not present for this principal.
-                    String issuerArn = session.getIssuerArn();
-                    return Optional.of(new CallerArns(issuerArn, issuerArn,
-                            CallerArns.TYPE_ACCOUNT,
-                            AwsArnUtils.accountOrDefault(issuerArn, regionResolver.getAccountId()),
-                            null));
-                }
-                return issuingUser(session).map(IamService::callerForUser);
-            }
-            if (isAccountRootArn(roleArn)) {
-                // A privileged session (AssumeRoot) is the member account's root user, not an
-                // assumed role: the ARN it reports is the root ARN it was minted for, and its
-                // aws:userid is the account id, as the account root's always is.
-                return Optional.of(new CallerArns(roleArn, roleArn, CallerArns.TYPE_ACCOUNT,
-                        AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId()), null));
-            }
-            String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
-            String accountId = AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId());
-            String sessionName = session.getRoleSessionName();
-            if (sessionName == null) {
-                sessionName = session.getEc2InstanceId() != null
-                        ? session.getEc2InstanceId() : "floci-session";
-            }
-            // The session lives in its role's partition, as AssumeRole issued it, whatever region
-            // a later call is signed for.
-            String partition = AwsArnUtils.partitionOrDefault(roleArn, regionResolver.getPartition());
-            String sessionArn = AwsArnUtils.Arn.global(partition, "sts", accountId,
-                    "assumed-role/" + roleName + "/" + sessionName).toString();
-            return Optional.of(new CallerArns(sessionArn, roleArn, CallerArns.TYPE_ASSUMED_ROLE,
-                    sessionUserId(session).orElse(null), null,
-                    roleFromArnOrName(roleArn).map(IamRole::getPermissionsBoundaryArn).isPresent()));
+            return sessionCallerArns(session).map(arns -> arns.withTokenIssueTime(session.getIssuedAt()));
         }
 
         return Optional.empty();
+    }
+
+    private Optional<CallerArns> sessionCallerArns(SessionCredential session) {
+        if (session.getDelegatedApproverArn() != null) {
+            return delegatedApproverArns(session);
+        }
+        if (isFederatedUserSession(session)) {
+            // A federated user has no aws:username at all, only the account:name userid.
+            String federatedArn = session.getRoleArn();
+            return Optional.of(new CallerArns(federatedArn, federatedArn,
+                    CallerArns.TYPE_FEDERATED_USER,
+                    sessionUserId(session).orElse(null), null));
+        }
+        String roleArn = session.getRoleArn();
+        if (roleArn == null) {
+            // GetSessionToken credentials act as the identity that minted them.
+            if (issuedByRoot(session)) {
+                // The account root's aws:userid is the account id, and it has no
+                // aws:username: the guide lists it as not present for this principal.
+                String issuerArn = session.getIssuerArn();
+                return Optional.of(new CallerArns(issuerArn, issuerArn,
+                        CallerArns.TYPE_ACCOUNT,
+                        AwsArnUtils.accountOrDefault(issuerArn, regionResolver.getAccountId()),
+                        null));
+            }
+            return issuingUser(session).map(IamService::callerForUser);
+        }
+        if (isAccountRootArn(roleArn)) {
+            // A privileged session (AssumeRoot) is the member account's root user, not an
+            // assumed role: the ARN it reports is the root ARN it was minted for, and its
+            // aws:userid is the account id, as the account root's always is.
+            return Optional.of(new CallerArns(roleArn, roleArn, CallerArns.TYPE_ACCOUNT,
+                    AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId()), null));
+        }
+        String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
+        String accountId = AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId());
+        String sessionName = session.getRoleSessionName();
+        if (sessionName == null) {
+            sessionName = session.getEc2InstanceId() != null
+                    ? session.getEc2InstanceId() : "floci-session";
+        }
+        // The session lives in its role's partition, as AssumeRole issued it, whatever region
+        // a later call is signed for.
+        String partition = AwsArnUtils.partitionOrDefault(roleArn, regionResolver.getPartition());
+        String sessionArn = AwsArnUtils.Arn.global(partition, "sts", accountId,
+                "assumed-role/" + roleName + "/" + sessionName).toString();
+        return Optional.of(new CallerArns(sessionArn, roleArn, CallerArns.TYPE_ASSUMED_ROLE,
+                sessionUserId(session).orElse(null), null,
+                roleFromArnOrName(roleArn).map(IamRole::getPermissionsBoundaryArn).isPresent()));
     }
 
     /**
