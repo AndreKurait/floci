@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.SignedMarkers;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.common.concurrent.KeyedWorkQueue;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -71,6 +72,8 @@ public class ProvisionedConcurrencyPool implements Resettable {
     private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
             Thread.ofPlatform().daemon().name("lambda-provisioned-concurrency").factory());
+    private final KeyedWorkQueue<String> reconciliation = new KeyedWorkQueue<>(
+            "lambda-capacity-work", 1, 1, ignored -> reconcileSafely());
     private boolean stopped;
     private int activeLaunches;
     private long shutdownDeadlineNanos;
@@ -141,13 +144,12 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 allocations.put(configuration.key(), new Allocation(configuration));
             }
         }
-        scheduler.scheduleWithFixedDelay(() -> {
-            try {
-                reconcileSafely();
-            } catch (RuntimeException failure) {
-                LOG.errorv(failure, "Provisioned concurrency reconciliation failed");
-            }
-        }, 0, 1, TimeUnit.SECONDS);
+        scheduler.scheduleWithFixedDelay(this::requestReconciliation, 0, 10, TimeUnit.SECONDS);
+    }
+
+    /** Local transitions wake one serial reconciler; periodic repair covers missed external changes. */
+    void requestReconciliation() {
+        reconciliation.submit("capacity");
     }
 
     public Status put(String region, String name, String qualifier, int count, String account) {
@@ -305,6 +307,9 @@ public class ProvisionedConcurrencyPool implements Resettable {
             }
         }
         stop(discarded);
+        if (!discarded.isEmpty()) {
+            requestReconciliation();
+        }
         return selected;
     }
 
@@ -334,6 +339,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                         ? shutdownDeadlineNanos : now + drainTimeoutNanos;
             }
             stop(List.of(handle), shutdownDrain, deadline);
+            requestReconciliation();
         }
         return true;
     }
@@ -462,7 +468,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
     }
 
     private String pointedVersion(Configuration configuration) {
-        if (configuration.qualifier().matches("[0-9]+")) {
+        if (isPublishedVersion(configuration.qualifier())) {
             return configuration.version();
         }
         return aliases.getForAccount(configuration.account(), configuration.region(),
@@ -472,14 +478,14 @@ public class ProvisionedConcurrencyPool implements Resettable {
 
     private Allocation refreshAlias(Allocation previous, List<ContainerHandle> retired) {
         Configuration value = previous.configuration;
-        if (value.qualifier().matches("[0-9]+")) {
+        if (isPublishedVersion(value.qualifier())) {
             return previous;
         }
         LambdaAlias alias = aliases.getForAccount(value.account(), value.region(), value.name(), value.qualifier())
                 .orElse(null);
         if (alias == null || Objects.equals(value.version(), alias.getFunctionVersion())
                 || (alias.getRoutingConfig() != null && !alias.getRoutingConfig().isEmpty())
-                || alias.getFunctionVersion() == null || !alias.getFunctionVersion().matches("[0-9]+")) {
+                || alias.getFunctionVersion() == null || !isPublishedVersion(alias.getFunctionVersion())) {
             return previous;
         }
         if (functions.getForAccount(value.account(), value.region(), value.name()).isEmpty()) {
@@ -510,12 +516,12 @@ public class ProvisionedConcurrencyPool implements Resettable {
             if ("$LATEST".equals(version)) {
                 throw invalid("Provisioned Concurrency Configs cannot be applied to unpublished function versions.");
             }
-            if (version != null && version.matches("[0-9]+")) {
+            if (version != null && isPublishedVersion(version)) {
                 AwsArnUtils.Arn arn = AwsArnUtils.parse(functionArn);
                 functions.getForAccount(arn.accountId(), arn.region(), fn.getFunctionName(), version)
                         .ifPresent(ProvisionedConcurrencyPool::validateSupportedTarget);
             }
-            if (version != null && version.matches("[0-9]+") && allocations.values().stream()
+            if (version != null && isPublishedVersion(version) && allocations.values().stream()
                     .anyMatch(entry -> functionArn.equals(entry.configuration.functionArn())
                             && !qualifier.equals(entry.configuration.qualifier())
                             && version.equals(pointedVersion(entry.configuration)))) {
@@ -571,6 +577,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 allocation.handles.add(handle);
             }
             long timeoutMs = Math.max(130, fn.getTimeout()) * 1000L;
+            handle.getRuntimeApiServer().onRuntimeFailure(this::requestReconciliation);
             handle.getRuntimeApiServer().awaitInitialization(timeoutMs);
             synchronized (lock) {
                 currentFunction(allocation.configuration);
@@ -715,6 +722,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 pendingTeardown.remove(handle);
                 owned.remove(handle);
             }
+            requestReconciliation();
         } catch (RuntimeException failure) {
             LOG.warnv(failure, "Could not stop provisioned Lambda environment {0}", handle.getContainerId());
         } finally {
@@ -743,7 +751,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             throw invalid("Weighted aliases are not supported for provisioned concurrency");
         }
         String version = alias == null ? qualifier : alias.getFunctionVersion();
-        if (version == null || !version.matches("[0-9]+")) {
+        if (version == null || !isPublishedVersion(version)) {
             throw invalid("Provisioned concurrency requires an immutable published version");
         }
         LambdaFunction fn = functions.getForAccount(target.account(), region, target.name(), version)
@@ -761,7 +769,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
         }
         LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolveWithRegion(region, name, qualifier);
         account = ref.account() != null ? ref.account() : account;
-        boolean publishedVersion = qualifier.matches("[0-9]+");
+        boolean publishedVersion = isPublishedVersion(qualifier);
         String qualifiedArn = AwsArnUtils.Arn.of("lambda", region, account,
                 "function:" + ref.name() + ":" + qualifier).toString();
         String notFoundMessage = (publishedVersion ? "Function not found: " : "Cannot find alias arn: ")
@@ -779,10 +787,24 @@ public class ProvisionedConcurrencyPool implements Resettable {
         return new Target(account, region, ref.name(), baseArn(latest), qualifier, alias);
     }
 
+    /** Published versions contain one or more ASCII digits; avoid compiling a regex per reconciliation. */
+    static boolean isPublishedVersion(String value) {
+        if (value == null || value.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char digit = value.charAt(i);
+            if (digit < '0' || digit > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private LambdaFunction currentFunction(Configuration configuration) {
         functions.getForAccount(configuration.account(), configuration.region(), configuration.name())
                 .orElseThrow(TargetUnavailableException::new);
-        if (!configuration.qualifier().matches("[0-9]+")) {
+        if (!isPublishedVersion(configuration.qualifier())) {
             LambdaAlias alias = aliases.getForAccount(configuration.account(), configuration.region(),
                     configuration.name(), configuration.qualifier()).orElseThrow(TargetUnavailableException::new);
             if (!configuration.version().equals(alias.getFunctionVersion())
@@ -880,6 +902,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
 
     void closeExecutors() {
         scheduler.shutdownNow();
+        reconciliation.close();
         workers.shutdownNow();
     }
 
