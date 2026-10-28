@@ -461,32 +461,28 @@ class AutoScalingReconcilerTest {
     }
 
     @Test
-    void reconcileDeregistersTargetsThatAreNotActiveAsgInstances() {
+    void reconcilePreservesOtherGroupsAndManuallyRegisteredTargets() {
         AutoScalingService asgService = scalingService();
         Ec2Service ec2Service = mock(Ec2Service.class);
         ElbV2Service elbV2Service = mock(ElbV2Service.class);
         AutoScalingReconciler reconciler = new AutoScalingReconciler(asgService, ec2Service, elbV2Service);
-        AutoScalingGroup asg = new AutoScalingGroup();
-        asg.setRegion("us-east-1");
-        asg.setAutoScalingGroupName("app-asg");
-        asg.setDesiredCapacity(1);
-        asg.setTargetGroupARNs(List.of("arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/app/123"));
-        asg.getInstances().add(instance("i-active", "InService"));
-        when(ec2Service.isInstanceContainerRunning("i-active")).thenReturn(true);
-        when(elbV2Service.describeTargetHealth(asg.getRegion(), asg.getTargetGroupARNs().getFirst(), List.of()))
-                .thenReturn(List.of(targetHealth("i-active"), targetHealth("i-stale")));
+        String targetGroup = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/shared/123";
+        when(elbV2Service.describeTargetHealth("us-east-1", targetGroup, List.of()))
+                .thenReturn(List.of(targetHealth("i-blue"), targetHealth("i-green"), targetHealth("i-manual")));
+        for (String id : List.of("i-blue", "i-green")) {
+            AutoScalingGroup asg = new AutoScalingGroup();
+            asg.setRegion("us-east-1");
+            asg.setAutoScalingGroupName(id);
+            asg.setDesiredCapacity(1);
+            asg.setTargetGroupARNs(List.of(targetGroup));
+            asg.getInstances().add(instance(id, "InService"));
+            when(ec2Service.isInstanceContainerRunning(id)).thenReturn(true);
 
-        reconciler.reconcile(asg);
+            reconciler.reconcile(asg);
 
-        ArgumentCaptor<List<TargetDescription>> targets = ArgumentCaptor.captor();
-        verify(elbV2Service).deregisterTargets(
-                eq(asg.getRegion()),
-                eq(asg.getTargetGroupARNs().getFirst()),
-                targets.capture());
-        assertEquals(1, targets.getValue().size());
-        assertEquals("i-stale", targets.getValue().getFirst().getId());
-        verify(asgService).saveAutoScalingGroupIfPresent(asg);
-        verify(ec2Service, never()).terminateInstances(asg.getRegion(), List.of("i-active"));
+            assertEquals(List.of(id), asg.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        }
+        verify(elbV2Service, never()).deregisterTargets(anyString(), anyString(), anyList());
     }
 
     @Test
@@ -546,6 +542,7 @@ class AutoScalingReconcilerTest {
         asg.setAutoScalingGroupName("app-asg");
         asg.setDesiredCapacity(0);
         asg.getInstances().add(instance("i-dead", "Pending"));
+        asg.setTargetGroupARNs(List.of("arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/shared/123"));
 
         Instance ec2Instance = new Instance();
         ec2Instance.setInstanceId("i-dead");
@@ -557,6 +554,10 @@ class AutoScalingReconcilerTest {
 
         reconciler.reconcile(asg);
 
+        ArgumentCaptor<List<TargetDescription>> targets = ArgumentCaptor.captor();
+        verify(elbV2Service).deregisterTargets(eq("us-east-1"),
+                eq(asg.getTargetGroupARNs().getFirst()), targets.capture());
+        assertEquals(List.of("i-dead"), targets.getValue().stream().map(TargetDescription::getId).toList());
         assertEquals(0, asg.getInstances().size());
         verify(asgService).recordActivity(
                 eq("us-east-1"),
