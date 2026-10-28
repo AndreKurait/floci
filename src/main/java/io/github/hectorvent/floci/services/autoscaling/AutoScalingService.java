@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
+import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.iam.PassedRoleLookup;
 import jakarta.annotation.PostConstruct;
@@ -423,7 +424,7 @@ public class AutoScalingService implements PassedRoleLookup {
             asg.setMaxSize(maxSize);
             asg.setDesiredCapacity(desiredCapacity);
             asg.setDefaultCooldown(defaultCooldown > 0 ? defaultCooldown : 300);
-            asg.setAvailabilityZones(availabilityZones != null ? new ArrayList<>(availabilityZones) : new ArrayList<>());
+            asg.setAvailabilityZones(new ArrayList<>(resolveAvailabilityZones(region, availabilityZones, subnetIds)));
             asg.setSubnetIds(subnetIds != null ? new ArrayList<>(subnetIds) : new ArrayList<>());
             asg.setTargetGroupARNs(targetGroupArns != null ? new ArrayList<>(targetGroupArns) : new ArrayList<>());
             asg.setLoadBalancerNames(lbNames != null ? new ArrayList<>(lbNames) : new ArrayList<>());
@@ -478,6 +479,10 @@ public class AutoScalingService implements PassedRoleLookup {
             validateDesiredCapacityType(
                     effectiveDesiredCapacityType(asg, optionalFields),
                     effectiveIdentity.mixedInstancesPolicy());
+            List<String> updatedZones = availabilityZones;
+            if (subnetIds != null && !subnetIds.isEmpty()) {
+                updatedZones = resolveAvailabilityZones(region, availabilityZones, subnetIds);
+            }
             if (launchConfigName != null) {
                 asg.setLaunchConfigurationName(launchConfigName);
                 asg.setLaunchTemplateId(null);
@@ -503,7 +508,7 @@ public class AutoScalingService implements PassedRoleLookup {
             if (maxSize != null) { asg.setMaxSize(maxSize); }
             if (desiredCapacity != null) { asg.setDesiredCapacity(desiredCapacity); }
             if (defaultCooldown != null) { asg.setDefaultCooldown(defaultCooldown); }
-            if (availabilityZones != null) { asg.setAvailabilityZones(new ArrayList<>(availabilityZones)); }
+            if (updatedZones != null) { asg.setAvailabilityZones(new ArrayList<>(updatedZones)); }
             if (subnetIds != null) { asg.setSubnetIds(new ArrayList<>(subnetIds)); }
             if (healthCheckType != null) { asg.setHealthCheckType(healthCheckType); }
             if (healthCheckGracePeriod != null) { asg.setHealthCheckGracePeriod(healthCheckGracePeriod); }
@@ -513,6 +518,15 @@ public class AutoScalingService implements PassedRoleLookup {
             }
         });
     }
+
+    private List<String> resolveAvailabilityZones(String region, List<String> availabilityZones, List<String> subnetIds) {
+        if ((availabilityZones == null || availabilityZones.isEmpty()) && subnetIds != null && !subnetIds.isEmpty()) {
+            return ec2Service.describeSubnets(region, subnetIds, null).stream()
+                    .map(Subnet::getAvailabilityZone).distinct().toList();
+        }
+        return availabilityZones != null ? availabilityZones : List.of();
+    }
+
 
     /**
      * EnableMetricsCollection: {@code Granularity} is required and 1Minute is its only valid value.
