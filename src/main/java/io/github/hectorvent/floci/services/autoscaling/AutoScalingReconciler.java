@@ -738,6 +738,8 @@ public class AutoScalingReconciler {
         List<Instance> instances = existing;
         if (instances.isEmpty()) {
             Reservation reservation;
+            String launchZone = Ec2Service.isModelledAvailabilityZone(asg.getRegion(), placement.availabilityZone())
+                    ? placement.availabilityZone() : null;
             try {
                 reservation = launchWithGroupCapacity(asg, launchSource, placement, clientToken);
             } catch (RuntimeException launchFailure) {
