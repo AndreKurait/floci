@@ -188,6 +188,11 @@ public class StsQueryHandler {
             return durationValidation;
         }
         Map<String, String> sessionTags = StsSessionTags.read(params);
+        Map<String, String> form = new LinkedHashMap<>();
+        params.keySet().forEach(key -> form.put(key, params.getFirst(key)));
+        List<String> transitiveKeys = StsSessionTags.transitiveKeys(form);
+        Map<String, String> inheritedTags = iamService.findTransitiveSessionTags(
+                callerAccessKeyId(), callerSessionToken(params));
         String roleArn = getParam(params, "RoleArn");
         String sessionName = getParam(params, "RoleSessionName");
         int durationSeconds = getIntParam(params, "DurationSeconds", 3600);
@@ -204,11 +209,13 @@ public class StsQueryHandler {
         String accountId = AwsArnUtils.accountOrDefault(roleArn, callerAccountId);
 
         IamRole role = iamService.findRole(accountId, roleName).orElse(null);
-        Response trustDenied = enforceTrustPolicy(roleArn, role, accountId, params, sessionTags);
+        Response trustDenied = enforceTrustPolicy(roleArn, role, accountId, params, sessionTags,
+                transitiveKeys, !inheritedTags.isEmpty());
         if (trustDenied != null) {
             return trustDenied;
         }
 
+        Map<String, String> effectiveTags = StsSessionTags.inherit(sessionTags, inheritedTags);
         String sessionRoleArn = canonicalRoleArn(role, accountId, roleName);
         String assumedRoleArn = assumedRoleArn(sessionRoleArn, accountId, roleName, sessionName);
         String roleId = (role != null && role.getRoleId() != null) ? role.getRoleId() : ("AROA" + randomId(16));
@@ -222,7 +229,8 @@ public class StsQueryHandler {
         String sessionPolicy = getParam(params, "Policy");
         iamService.registerSession(
                 accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy, callerAccountId,
-                sessionName, assumedRoleId, sessionTags);
+                sessionName, assumedRoleId, effectiveTags,
+                StsSessionTags.transitive(sessionTags, transitiveKeys, inheritedTags));
 
         String result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
@@ -252,7 +260,8 @@ public class StsQueryHandler {
      * principal does wherever else Floci builds it.
      */
     private Response enforceTrustPolicy(String roleArn, IamRole role, String roleAccountId,
-                                        MultivaluedMap<String, String> params, Map<String, String> sessionTags) {
+                                        MultivaluedMap<String, String> params, Map<String, String> sessionTags,
+                                        List<String> transitiveKeys, boolean hasInheritedTags) {
         String callerAccount = regionResolver.getAccountId();
         IamService.CallerArns caller = iamService.resolveCallerArns(callerAccessKeyId())
                 .orElseGet(() -> IamService.CallerArns.accountRoot(
@@ -275,6 +284,9 @@ public class StsQueryHandler {
         Map<String, List<String>> requestContext = IamConditionContextResolver.withGlobalContext(
                 null, roleArn, regionResolver.getRegion(), callerAccount, roleAccountId);
         requestContext.putAll(StsSessionTags.context(sessionTags));
+        if (!transitiveKeys.isEmpty()) {
+            requestContext.put("sts:TransitiveTagKeys", transitiveKeys);
+        }
         requestContext.put("sts:RoleSessionName", List.of(getParam(params, "RoleSessionName")));
         String externalId = getParam(params, "ExternalId");
         if (externalId != null) {
@@ -282,7 +294,7 @@ public class StsQueryHandler {
         }
         if (trustPolicyEvaluator.allows(role.getAssumeRolePolicyDocument(), caller, callerAccount,
                 requestContext)) {
-            if (!sessionTags.isEmpty() && !sessionTagAuthorizer.allows(callerAccessKeyId(), caller,
+            if ((!sessionTags.isEmpty() || hasInheritedTags) && !sessionTagAuthorizer.allows(callerAccessKeyId(), caller,
                     callerAccount, role, requestContext)) {
                 return AwsQueryResponse.error("AccessDenied",
                         "User: " + callerArn + " is not authorized to perform: sts:TagSession on resource: " + roleArn,
@@ -303,16 +315,21 @@ public class StsQueryHandler {
                 "role" + IamService.normalizePath(role.getPath()) + roleName);
     }
 
+    private String callerSessionToken(MultivaluedMap<String, String> params) {
+        String token = headers == null ? null : headers.getHeaderString("X-Amz-Security-Token");
+        if (token == null && params != null) {
+            token = getParam(params, "X-Amz-Security-Token");
+        }
+        if (token == null && uriInfo != null) {
+            token = uriInfo.getQueryParameters().getFirst("X-Amz-Security-Token");
+        }
+        return token;
+    }
+
     private Response handleGetCallerIdentity(MultivaluedMap<String, String> params) {
         String accountId = regionResolver.getAccountId();
         String accessKeyId = callerAccessKeyId();
-        String sessionToken = headers == null ? null : headers.getHeaderString("X-Amz-Security-Token");
-        if (sessionToken == null && params != null) {
-            sessionToken = getParam(params, "X-Amz-Security-Token");
-        }
-        if (sessionToken == null && uriInfo != null) {
-            sessionToken = uriInfo.getQueryParameters().getFirst("X-Amz-Security-Token");
-        }
+        String sessionToken = callerSessionToken(params);
         String arn = iamService.resolveCallerArn(accessKeyId)
                 .orElse(regionResolver.buildGlobalArn("iam", accountId, "root"));
         String userId = iamService.resolveCallerUserId(accessKeyId, sessionToken).orElse(accountId);
