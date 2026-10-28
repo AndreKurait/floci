@@ -1096,3 +1096,10 @@ missing identity still returns HTTP 401 first. Configured authorizer roles retai
 their separate execution path. This check does not implement role assumption.
 
 WebSocket Lambda integrations (`AWS` and `AWS_PROXY`) without credentials check Lambda resource permissions when IAM enforcement is enabled. Grants must allow API Gateway for the qualified function and source API, stage, and selected route. Configured-role and caller-passthrough credentials retain their separate invocation behavior.
+
+HTTP API AWS/AWS_PROXY Lambda integrations without `credentialsArn` check Lambda
+resource policies when IAM enforcement is enabled. The check uses the API owner,
+stage, HTTP method and request path, the Lambda function region, and the exact
+qualified target passed to invocation. Missing permission returns HTTP 500 before
+invocation. Configured roles and caller passthrough retain their separate paths;
+this check does not implement role assumption.
