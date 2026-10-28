@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.apigateway.AuthorizerPolicyEvaluator;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Authorizer;
@@ -65,7 +66,7 @@ class WebSocketAuthorizerPermissionTest {
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(mapper);
         service = new WebSocketAuthorizerService(gateway, lambda, builder, mapper,
                 new AuthorizerPolicyEvaluator(evaluator), new ServiceCallAuthorizer(config, evaluator, providers),
-                builder.regionResolver);
+                builder.regionResolver, mock(ServiceRoleCallAuthorizer.class));
         when(lambda.invokeTarget(eq(REGION), eq(TARGET), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, null, """
                         {"principalId":"user","policyDocument":{"Version":"2012-10-17",

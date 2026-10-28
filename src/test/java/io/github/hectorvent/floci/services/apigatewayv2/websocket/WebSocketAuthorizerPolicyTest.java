@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.apigateway.AuthorizerPolicyEvaluator;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.AuthorizerPolicyFixtures;
@@ -94,7 +95,7 @@ class WebSocketAuthorizerPolicyTest {
                 });
         WebSocketAuthorizerService service = new WebSocketAuthorizerService(gateway, lambda, builder, mapper,
                 new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)),
-                mock(ServiceCallAuthorizer.class), builder.regionResolver);
+                mock(ServiceCallAuthorizer.class), builder.regionResolver, mock(ServiceRoleCallAuthorizer.class));
         WebSocketAuthorizerService.AuthorizerResult result = service.invokeAndEvaluate("us-east-1", "api", "test", "auth",
                 "connection", 0, Map.of(), Map.of(), sourceIp, secureTransport, "agent", Map.of());
         assertEquals(expectedStatus, result.statusCode());
