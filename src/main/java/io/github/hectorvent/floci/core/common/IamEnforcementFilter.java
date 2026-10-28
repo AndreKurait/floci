@@ -1052,6 +1052,15 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     private PassedRoles.Lookups lookupsFor(String accountId, String region) {
         return new PassedRoles.Lookups() {
             @Override
+            public List<String> importedRestApiIntegrationRoles(String document) {
+                List<String> roles = new ArrayList<>();
+                for (PassedRoleLookup lookup : roleLookups()) {
+                    roles.addAll(lookup.importedRestApiIntegrationRoles(document, region));
+                }
+                return roles;
+            }
+
+            @Override
             public List<String> instanceProfileRoleArns(String profileName, String profileArn) {
                 return IamEnforcementFilter.this.instanceProfileRoleArns(accountId, profileName, profileArn);
             }
