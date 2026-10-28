@@ -3745,6 +3745,7 @@ class IamServiceTest {
             sessions.putForAccount("000000000000", sessionKey, reloaded);
             assertEquals("ASIAWITHMFA".equals(sessionKey),
                     service.resolveCallerArns(sessionKey).orElseThrow().multiFactorAuthPresent());
+            assertEquals("ASIAWITHMFA".equals(sessionKey) ? now : null, reloaded.getMultiFactorAuthenticatedAt());
         }
     }
 
@@ -3776,6 +3777,63 @@ class IamServiceTest {
         assertEquals(user.getUserId(), caller.userId());
         assertEquals(Boolean.TRUE, caller.multiFactorAuthPresent());
         assertTrue(keys.get(key.getAccessKeyId()).isEmpty());
+    }
+
+    @Test
+    void mfaAgeUsesAuthenticationTimeAndAdvancesAtResolution() throws Exception {
+        Instant authenticated = Instant.parse("2026-10-26T12:00:00Z");
+        Clock clock = Mockito.mock(Clock.class);
+        Mockito.when(clock.instant()).thenReturn(authenticated);
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = new IamService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), sessions,
+                new RegionResolver("us-east-1", "000000000000"), false, clock);
+        service.registerIssuedSession("ASIAMFAAGE", "secret", "token", null,
+                authenticated.plusSeconds(3600), null, "000000000000", "test");
+        SessionCredential stored = sessions.getForAccount("000000000000", "ASIAMFAAGE").orElseThrow();
+        stored.setMultiFactorAuthPresent(true);
+        stored.setMultiFactorAuthenticatedAt(authenticated.minusSeconds(5));
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        sessions.putForAccount("000000000000", "ASIAMFAAGE",
+                mapper.readValue(mapper.writeValueAsBytes(stored), SessionCredential.class));
+        for (long seconds : List.of(0L, 54L, 55L, 56L)) {
+            Mockito.when(clock.instant()).thenReturn(authenticated.plusSeconds(seconds).plusMillis(999));
+            IamService.CallerArns caller = service.resolveCallerArns("ASIAMFAAGE").orElseThrow();
+            Map<String, List<String>> context = new LinkedHashMap<>();
+            caller.withPrincipalTags(Map.of("team", "test")).withTokenIssueTime(authenticated)
+                    .withMultiFactorAuthPresent(true).putPrincipalKeys(context);
+            assertEquals(List.of(Long.toString(seconds + 5)), context.get("aws:MultiFactorAuthAge"));
+        }
+        Mockito.when(clock.instant()).thenReturn(authenticated.minusSeconds(10));
+        Map<String, List<String>> context = new LinkedHashMap<>();
+        service.resolveCallerArns("ASIAMFAAGE").orElseThrow().putPrincipalKeys(context);
+        assertEquals(List.of("0"), context.get("aws:MultiFactorAuthAge"));
+        Mockito.when(clock.instant()).thenReturn(authenticated.plusSeconds(3601));
+        assertTrue(service.resolveCallerArns("ASIAMFAAGE").isEmpty());
+    }
+
+    @Test
+    void mfaAgeRequiresVerifiedProvenanceAndAuthenticationInstant() {
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        int index = 0;
+        for (Boolean present : new Boolean[] {null, false, true}) {
+            for (Instant authenticated : new Instant[] {null, Instant.now().minusSeconds(30)}) {
+                String key = "ASIAAGEABSENT" + index++;
+                service.registerIssuedSession(key, "secret", "token", null,
+                        Instant.now().plusSeconds(3600), null, "000000000000", "test");
+                SessionCredential stored = sessions.getForAccount("000000000000", key).orElseThrow();
+                stored.setMultiFactorAuthPresent(present);
+                stored.setMultiFactorAuthenticatedAt(authenticated);
+                sessions.putForAccount("000000000000", key, stored);
+                Map<String, List<String>> context = new LinkedHashMap<>();
+                service.resolveCallerArns(key).orElseThrow().putPrincipalKeys(context);
+                assertEquals(Boolean.TRUE.equals(present) && authenticated != null,
+                        context.containsKey("aws:MultiFactorAuthAge"));
+            }
+        }
     }
 }
 
