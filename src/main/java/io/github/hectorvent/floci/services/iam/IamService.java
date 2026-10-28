@@ -4794,9 +4794,26 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 authenticated = true;
             }
         }
+        session.setSessionTokenCredential(true);
         session.setMultiFactorAuthPresent(authenticated);
         session.setMultiFactorAuthenticatedAt(authenticated ? authenticationTime : null);
         putNewSession(sessionAccessKeyId, session);
+    }
+
+    /** GetSessionToken credentials have API restrictions in addition to the issuer's policies. */
+    public boolean sessionTokenDeniesOperation(String accessKeyId, String service, String operation) {
+        if (!"iam".equals(service) && !"sts".equals(service)) {
+            return false;
+        }
+        SessionCredential session = currentSession(accessKeyId).orElse(null);
+        if (session == null || !session.isSessionTokenCredential()) {
+            return false;
+        }
+        return switch (service) {
+            case "iam" -> !Boolean.TRUE.equals(session.getMultiFactorAuthPresent());
+            case "sts" -> !"sts:AssumeRole".equals(operation) && !"sts:GetCallerIdentity".equals(operation);
+            default -> false;
+        };
     }
 
     private SessionCredential issuedSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
