@@ -73,6 +73,12 @@ python3.9 -m venv .venv-legacy
 FLOCI_ENDPOINT=http://localhost:4566 .venv-legacy/bin/python -m pytest legacy/test_elb_query_get.py
 ```
 
+## Classic load balancer public aliases
+
+`tests/test_elb_classic_public_alias.py` creates a Classic load balancer and
+weighted public alias through Boto 3, checking account ownership, missing-target
+responses and alias/load-balancer deletion through the shared HTTP edge.
+
 ## Configuration
 
 | Variable         | Default                 | Description             |

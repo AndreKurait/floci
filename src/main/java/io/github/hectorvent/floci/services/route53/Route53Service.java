@@ -26,11 +26,14 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -711,6 +714,71 @@ public class Route53Service implements Resettable {
                             findRecordsForName(normalized, List.of(records)), records);
                 })
                 .toList();
+    }
+
+    public record PublicAlias(String dnsName, String hostedZoneId) {}
+
+    /**
+     * Follows an unambiguous public alias/CNAME chain without making an upstream DNS request.
+     * Returns null for unresolved or ambiguous names. A zone alone does not identify the service
+     * that owns a hostname; the consumer must match the result to its own resource before routing.
+     */
+    public PublicAlias lookupPublicAlias(String name) {
+        String normalized = normalizeName(name).toLowerCase(Locale.ROOT);
+        if (publicZoneNameCounts.keySet().stream().noneMatch(zone -> DomainNames.isWithin(normalized, zone))) {
+            return null;
+        }
+        String current = normalized;
+        Set<String> visited = new HashSet<>();
+        String targetZoneId = null;
+        for (int depth = 0; depth < 8; depth++) {
+            if (!visited.add(current)) {
+                break;
+            }
+            List<OwnedZone> zones = mostSpecificZones(current, false);
+            if (zones.isEmpty()) {
+                return new PublicAlias(current, targetZoneId);
+            }
+            if (zones.size() != 1) {
+                break;
+            }
+            OwnedZone owned = zones.getFirst();
+            if (targetZoneId != null && !owned.zone().getId().equals(targetZoneId)) {
+                break;
+            }
+            List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId());
+            String currentName = current;
+            boolean delegated = records.stream().anyMatch(record -> "NS".equals(record.getType())
+                    && !record.getName().equalsIgnoreCase(owned.zone().getName())
+                    && DomainNames.isWithin(currentName, normalizeName(record.getName()).toLowerCase(Locale.ROOT)));
+            List<ResourceRecordSet> matches = findRecordsForName(current, List.of(records)).stream()
+                    .filter(record -> "A".equals(record.getType()) || "CNAME".equals(record.getType()))
+                    .toList();
+            if (delegated || matches.size() != 1) {
+                break;
+            }
+            ResourceRecordSet record = matches.getFirst();
+            if (record.getRegion() != null || record.getFailover() != null || record.getHealthCheckId() != null) {
+                break;
+            }
+            AliasTarget alias = record.getAliasTarget();
+            String next;
+            if ("A".equals(record.getType()) && alias != null) {
+                next = alias.getDnsName();
+                targetZoneId = alias.getHostedZoneId();
+            } else if ("CNAME".equals(record.getType())
+                    && record.getRecords() != null && record.getRecords().size() == 1) {
+                next = record.getRecords().getFirst().getValue();
+                targetZoneId = null;
+            } else {
+                break;
+            }
+            if (next == null || next.isBlank()) {
+                break;
+            }
+            current = normalizeName(next).toLowerCase(Locale.ROOT);
+        }
+        return null;
     }
 
     private Map<String, Integer> zoneNameCounts(boolean privateZone) {
