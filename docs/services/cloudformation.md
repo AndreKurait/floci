@@ -3,6 +3,17 @@
 **Protocol:** Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 **Endpoint:** `POST http://localhost:4566/`
 
+## EC2 instance network placement
+
+`AWS::EC2::Instance` uses the resolved `NetworkInterfaces` entry with `DeviceIndex`
+`0` for its subnet and launch-time `AssociatePublicIpAddress` setting. Changing
+that subnet replaces the instance. As specified by the
+[CloudFormation instance contract](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-ec2-instance.html#cfn-ec2-instance-subnetid),
+declare `SubnetId` inside the interface when using `NetworkInterfaces`; combining
+interfaces with an instance-level `SubnetId` is rejected. Existing ENI attachment,
+secondary-interface provisioning and replacement for other interface settings
+remain outside this implementation.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
