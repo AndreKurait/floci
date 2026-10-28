@@ -4034,6 +4034,27 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                     List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings, boolean spot,
                                     String privateIpAddress,
                                     LaunchTemplateData.CapacityReservationSpecification capacitySpecification) {
+        return runInstances(region, imageId, instanceType, minCount, maxCount, keyName,
+                securityGroupIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone,
+                metadataOptions, creditSpecificationCpuCredits, encodedUserData, dryRun, hostId, tenancy,
+                blockDeviceMappings, spot, privateIpAddress, capacitySpecification, null);
+    }
+
+    public Reservation runInstances(String region, String imageId, String instanceType,
+                                    int minCount, int maxCount, String keyName,
+                                    List<String> securityGroupIds, String subnetId,
+                                    String clientToken, List<Tag> instanceTags,
+                                    String userData, String iamInstanceProfileArn,
+                                    Boolean associatePublicIp, String networkInterfaceId,
+                                    int networkInterfaceDeviceIndex, String availabilityZone,
+                                    LaunchTemplateData.MetadataOptions metadataOptions,
+                                    String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
+                                    String hostId, String tenancy,
+                                    List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings, boolean spot,
+                                    String privateIpAddress,
+                                    LaunchTemplateData.CapacityReservationSpecification capacitySpecification,
+                                    Boolean networkInterfaceDeleteOnTermination) {
         Map<String, List<String>> parameters = new LinkedHashMap<>();
         replayParameter(parameters, "imageId", imageId);
         replayParameter(parameters, "instanceType", instanceType);
@@ -4059,13 +4080,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         replayParameter(parameters, "spot", spot);
         replayParameter(parameters, "privateIpAddress", privateIpAddress);
         replayParameter(parameters, "capacitySpecification", capacitySpecification);
+        replayParameter(parameters, "networkInterfaceDeleteOnTermination", networkInterfaceDeleteOnTermination);
         return replayRunInstances(region, clientToken, dryRun, parameters, networkInterfaceId,
                 () -> runInstancesScope(region, subnetId, networkInterfaceId, availabilityZone, hostId),
                 attempt -> launchInstances(region, imageId, instanceType, minCount, maxCount, keyName,
                         securityGroupIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
                         associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone,
                         metadataOptions, creditSpecificationCpuCredits, encodedUserData, dryRun, hostId, tenancy,
-                        blockDeviceMappings, spot, privateIpAddress, capacitySpecification, attempt));
+                        blockDeviceMappings, spot, privateIpAddress, capacitySpecification,
+                        networkInterfaceDeleteOnTermination, attempt));
     }
 
     Reservation launchInstances(String region, String imageId, String instanceType,
@@ -4081,6 +4104,28 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                     List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings, boolean spot,
                                     String privateIpAddress,
                                     LaunchTemplateData.CapacityReservationSpecification capacitySpecification,
+                                    Ec2RunInstancesReplay.Attempt attempt) {
+        return launchInstances(region, imageId, instanceType, minCount, maxCount, keyName,
+                securityGroupIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone,
+                metadataOptions, creditSpecificationCpuCredits, encodedUserData, dryRun, hostId, tenancy,
+                blockDeviceMappings, spot, privateIpAddress, capacitySpecification, null, attempt);
+    }
+
+    Reservation launchInstances(String region, String imageId, String instanceType,
+                                    int minCount, int maxCount, String keyName,
+                                    List<String> securityGroupIds, String subnetId,
+                                    String clientToken, List<Tag> instanceTags,
+                                    String userData, String iamInstanceProfileArn,
+                                    Boolean associatePublicIp, String networkInterfaceId,
+                                    int networkInterfaceDeviceIndex, String availabilityZone,
+                                    LaunchTemplateData.MetadataOptions metadataOptions,
+                                    String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
+                                    String hostId, String tenancy,
+                                    List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings, boolean spot,
+                                    String privateIpAddress,
+                                    LaunchTemplateData.CapacityReservationSpecification capacitySpecification,
+                                    Boolean networkInterfaceDeleteOnTermination,
                                     Ec2RunInstancesReplay.Attempt attempt) {
         String capacityPreference = capacitySpecification == null
                 || capacitySpecification.getCapacityReservationPreference() == null ? "open"
@@ -4138,6 +4183,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // subnet/VPC/security-groups and can only ever back a single instance.
         NetworkInterface suppliedEni = null;
         if (networkInterfaceId != null && !networkInterfaceId.isBlank()) {
+            if (Boolean.TRUE.equals(networkInterfaceDeleteOnTermination)) {
+                throw new AwsException("InvalidParameterCombination",
+                        "DeleteOnTermination can only be true for a new network interface.", 400);
+            }
             if (Math.max(minCount, 1) > 1) {
                 throw new AwsException("InvalidParameterCombination",
                         "Network interfaces may only be specified for a single instance.", 400);
@@ -4410,6 +4459,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             eni.setGroups(new ArrayList<>(sgIdentifiers));
                             eni.setAttachmentId("eni-attach-" + randomHex(17));
                             eni.setDeviceIndex(suppliedEni != null ? networkInterfaceDeviceIndex : 0);
+                            eni.setDeleteOnTermination(networkInterfaceDeleteOnTermination != null
+                                    ? networkInterfaceDeleteOnTermination : suppliedEni == null);
                             if (inst.getLaunchTime() != null) {
                                 eni.setAttachTime(ISO_FMT.format(inst.getLaunchTime()));
                             }
@@ -4428,7 +4479,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                 launchAttachment.setInstanceId(instanceId);
                                 launchAttachment.setInstanceOwnerId(callerAccountId());
                                 launchAttachment.setAttachTime(eni.getAttachTime());
-                                launchAttachment.setDeleteOnTermination(false);
+                                launchAttachment.setDeleteOnTermination(eni.isDeleteOnTermination());
                                 suppliedEni.setAttachment(launchAttachment);
                                 suppliedEni.setStatus("in-use");
                                 persistLaunchResource(networkInterfaces, key(region, suppliedEni.getNetworkInterfaceId()), suppliedEni, attempt);
@@ -4465,6 +4516,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             }
 
                             persistLaunchResource(instances, key(region, instanceId), inst, attempt);
+                            if (suppliedEni == null && !eni.isDeleteOnTermination()) {
+                                persistLaunchResource(networkInterfaces, key(region, eni.getNetworkInterfaceId()),
+                                        instanceNetworkInterface(callerAccountId(), region, inst, eni), attempt);
+                            }
                             launched.add(inst);
                             reservation.getInstances().add(inst);
                         }
@@ -4677,7 +4732,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             networkInterfaces.putAllAtomically(Map.of(eniKey, released));
                         }
                     } else {
-                        if (vpcNetworkManager != null && instance == null
+                        if (allocation.generatedNetworkInterfaceId() != null) {
+                            String eniKey = key(region, allocation.generatedNetworkInterfaceId());
+                            NetworkInterface eni = networkInterfaces.get(eniKey).orElse(null);
+                            if (eni != null && eni.getAttachment() == null && "available".equals(eni.getStatus())) {
+                                networkInterfaces.delete(eniKey);
+                            }
+                        }
+                        if (vpcNetworkManager != null
                                 && !privateIpsHeldOnVpcNetwork(region, allocation.subnetId())
                                         .contains(allocation.privateIpAddress())) {
                             vpcNetworkManager.releasePrivateIp(region, allocation.subnetId(), allocation.privateIpAddress());
@@ -6198,7 +6260,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
             inst.setSecurityGroups(new ArrayList<>(identifiers));
             if (inst.getNetworkInterfaces() != null) {
-                inst.getNetworkInterfaces().forEach(eni -> eni.setGroups(new ArrayList<>(identifiers)));
+                inst.getNetworkInterfaces().forEach(eni -> {
+                    eni.setGroups(new ArrayList<>(identifiers));
+                    networkInterfaces.get(key(region, eni.getNetworkInterfaceId())).ifPresent(standalone -> {
+                        standalone.setGroups(new ArrayList<>(identifiers));
+                        networkInterfaces.put(key(region, standalone.getNetworkInterfaceId()), standalone);
+                    });
+                });
             }
             instances.put(key(region, instanceId), inst);
 
@@ -11443,6 +11511,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (findExternalInstance(callerAccountId(), region, resourceId).isPresent()) {
             return;
         }
+        if (resourceId.startsWith("eni-")) {
+            synchronized (privateIpAllocationLock) {
+                NetworkInterface networkInterface = networkInterfaces.get(storeKey).orElse(null);
+                if (networkInterface != null) {
+                    networkInterface.setTagSet(new ArrayList<>(tagList));
+                    networkInterfaces.put(storeKey, networkInterface);
+                    return;
+                }
+            }
+        }
         Vpc vpc = vpcs.get(storeKey).orElse(null);
         if (vpc != null) { vpc.setTags(new ArrayList<>(tagList)); vpcs.put(storeKey, vpc); return; }
         if (resourceId.startsWith("cr-")) {
@@ -15740,56 +15818,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     continue;
                 }
                 foundIds.add(eni.getNetworkInterfaceId());
-                NetworkInterface ni = new NetworkInterface();
-                ni.setNetworkInterfaceId(eni.getNetworkInterfaceId());
-                ni.setSubnetId(eni.getSubnetId());
-                ni.setVpcId(eni.getVpcId());
-                ni.setDescription(eni.getDescription());
-                ni.setOwnerId(eni.getOwnerId());
-                ni.setStatus(eni.getStatus());
-                ni.setMacAddress(eni.getMacAddress());
-                ni.setPrivateIpAddress(eni.getPrivateIpAddress());
-                ni.setPrivateDnsName(eni.getPrivateDnsName());
-                ni.setSourceDestCheck(eni.isSourceDestCheck());
-                ni.setGroups(new ArrayList<>(eni.getGroups()));
-                // Phase 3: availability zone, tags, interface type
-                if (inst.getPlacement() != null) {
-                    ni.setAvailabilityZone(inst.getPlacement().getAvailabilityZone());
-                }
-                // A network interface's tags are its OWN, never the instance's. AWS tags
-                // exactly the resource types a RunInstances TagSpecification names, so an
-                // interface created for an instance whose specification said
-                // ResourceType=instance carries no tags until something tags the eni- id
-                // itself - and DescribeTags never listed these copied tags either, so
-                // DescribeNetworkInterfaces disagreed with DescribeTags about the same
-                // resource. Read the interface's own entry in the tag store instead:
-                // CreateTags on the eni- id writes it, and so does a RunInstances
-                // TagSpecification with ResourceType=network-interface.
-                Optional<List<Tag>> tagList = tagsOf(safeAccount, region, eni.getNetworkInterfaceId());
-                ni.getTagSet().addAll(tagList.orElse(List.of()));
-
-                NetworkInterfaceAttachment att = new NetworkInterfaceAttachment();
-                att.setAttachmentId(eni.getAttachmentId());
-                att.setDeviceIndex(eni.getDeviceIndex());
-                att.setStatus("attached");
-                att.setInstanceId(inst.getInstanceId());
-                att.setInstanceOwnerId(eni.getOwnerId());
-                // Phase 3: attachTime from instance launchTime, deleteOnTermination
-                if (inst.getLaunchTime() != null) {
-                    att.setAttachTime(ISO_FMT.format(inst.getLaunchTime()));
-                }
-                att.setDeleteOnTermination(true);
-                ni.setAttachment(att);
-
-                // Phase 3: privateIpAddressesSet - primary IP
-                NetworkInterfacePrivateIpAddress primaryIp = new NetworkInterfacePrivateIpAddress();
-                primaryIp.setPrivateIpAddress(eni.getPrivateIpAddress());
-                primaryIp.setPrivateDnsName(eni.getPrivateDnsName());
-                primaryIp.setPrimary(true);
-                // Look up EIP association for this instance
-                addressForInstance(inst.getInstanceId()).ifPresent(addr ->
-                        primaryIp.setAssociation(networkInterfaceAssociation(addr, eni.getOwnerId())));
-                ni.getPrivateIpAddresses().add(primaryIp);
+                NetworkInterface ni = instanceNetworkInterface(safeAccount, region, inst, eni);
 
                 // Phase 4: apply filters
                 if (!matchesFilters(ni, filters, region)) {
@@ -15920,6 +15949,61 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
 
         return new NetworkInterfaceListResult(result, null);
+    }
+
+    private NetworkInterface instanceNetworkInterface(String safeAccount, String region,
+                                                       Instance inst, InstanceNetworkInterface eni) {
+        NetworkInterface ni = new NetworkInterface();
+        ni.setNetworkInterfaceId(eni.getNetworkInterfaceId());
+        ni.setSubnetId(eni.getSubnetId());
+        ni.setVpcId(eni.getVpcId());
+        ni.setDescription(eni.getDescription());
+        ni.setOwnerId(eni.getOwnerId());
+        ni.setStatus(eni.getStatus());
+        ni.setMacAddress(eni.getMacAddress());
+        ni.setPrivateIpAddress(eni.getPrivateIpAddress());
+        ni.setPrivateDnsName(eni.getPrivateDnsName());
+        ni.setSourceDestCheck(eni.isSourceDestCheck());
+        ni.setGroups(new ArrayList<>(eni.getGroups()));
+        // Phase 3: availability zone, tags, interface type
+        if (inst.getPlacement() != null) {
+            ni.setAvailabilityZone(inst.getPlacement().getAvailabilityZone());
+        }
+        // A network interface's tags are its OWN, never the instance's. AWS tags
+        // exactly the resource types a RunInstances TagSpecification names, so an
+        // interface created for an instance whose specification said
+        // ResourceType=instance carries no tags until something tags the eni- id
+        // itself - and DescribeTags never listed these copied tags either, so
+        // DescribeNetworkInterfaces disagreed with DescribeTags about the same
+        // resource. Read the interface's own entry in the tag store instead:
+        // CreateTags on the eni- id writes it, and so does a RunInstances
+        // TagSpecification with ResourceType=network-interface.
+        Optional<List<Tag>> tagList = tagsOf(safeAccount, region, eni.getNetworkInterfaceId());
+        ni.getTagSet().addAll(tagList.orElse(List.of()));
+
+        NetworkInterfaceAttachment att = new NetworkInterfaceAttachment();
+        att.setAttachmentId(eni.getAttachmentId());
+        att.setDeviceIndex(eni.getDeviceIndex());
+        att.setStatus("attached");
+        att.setInstanceId(inst.getInstanceId());
+        att.setInstanceOwnerId(eni.getOwnerId());
+        // Phase 3: attachTime from instance launchTime, deleteOnTermination
+        if (inst.getLaunchTime() != null) {
+            att.setAttachTime(ISO_FMT.format(inst.getLaunchTime()));
+        }
+        att.setDeleteOnTermination(eni.isDeleteOnTermination());
+        ni.setAttachment(att);
+
+        // Phase 3: privateIpAddressesSet - primary IP
+        NetworkInterfacePrivateIpAddress primaryIp = new NetworkInterfacePrivateIpAddress();
+        primaryIp.setPrivateIpAddress(eni.getPrivateIpAddress());
+        primaryIp.setPrivateDnsName(eni.getPrivateDnsName());
+        primaryIp.setPrimary(true);
+        // Look up EIP association for this instance
+        addressForInstance(inst.getInstanceId()).ifPresent(addr ->
+                primaryIp.setAssociation(networkInterfaceAssociation(addr, eni.getOwnerId())));
+        ni.getPrivateIpAddresses().add(primaryIp);
+        return ni;
     }
 
     private List<GroupIdentifier> resolveSecurityGroups(String region, String vpcId, List<String> securityGroupIds,
@@ -16126,6 +16210,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         attached.setAttachmentId(attachment.getAttachmentId());
         attached.setDeviceIndex(deviceIndex);
         attached.setAttachTime(attachment.getAttachTime());
+        attached.setDeleteOnTermination(attachment.isDeleteOnTermination());
         inst.getNetworkInterfaces().add(attached);
         instances.put(key(region, instanceId), inst);
         return attachment;
@@ -16176,10 +16261,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     /**
-     * Releases the standalone ENIs an instance holds when it is terminated. An interface the
-     * caller created is not the instance's to destroy unless it was attached with
-     * deleteOnTermination, AWS returns it to "available", and only a launch-created interface
-     * dies with its instance.
+     * Releases the standalone ENIs an instance holds when it is terminated. Interfaces with
+     * deleteOnTermination are deleted; retained interfaces return to "available".
      */
     private void releaseStandaloneInterfacesOnTermination(String region, Instance inst) {
         for (InstanceNetworkInterface e : List.copyOf(inst.getNetworkInterfaces())) {

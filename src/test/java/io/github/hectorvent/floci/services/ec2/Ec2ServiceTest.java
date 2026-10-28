@@ -142,12 +142,12 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
-import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
@@ -194,6 +194,43 @@ class Ec2ServiceTest {
         assertTrue(service.describeVpcs("eu-west-1", List.of(), Map.of()).stream().anyMatch(Vpc::isDefault));
     }
 
+
+    @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false"})
+    void changedInstanceGroupsReachRetainedInterfaceSnapshots(boolean supplied, boolean deleteOnTermination) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        SecurityGroup next = service.createSecurityGroup(region, "replacement-groups",
+                "replacement groups", subnet.getVpcId());
+        String suppliedId = supplied ? service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of(), List.of(), List.of()).getNetworkInterfaceId() : null;
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), supplied ? null : subnet.getSubnetId(), null, List.of(), null, null,
+                null, suppliedId, 0, null, null, null, null, false, null, null, List.of(), false,
+                null, null, deleteOnTermination).getInstances().getFirst();
+        String interfaceId = instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        List<String> groups = List.of(next.getGroupId());
+
+        service.modifyInstanceGroups(region, instance.getInstanceId(), groups);
+
+        assertEquals(groups, service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of())
+                .networkInterfaces().getFirst().getGroups().stream().map(GroupIdentifier::getGroupId).toList());
+        assertEquals(groups, service.describeInstances(region, List.of(instance.getInstanceId()), Map.of())
+                .getFirst().getInstances().getFirst().getSecurityGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+        assertThrows(AwsException.class, () -> service.modifyInstanceGroups(region, instance.getInstanceId(),
+                List.of("sg-missing")));
+        assertEquals(groups, service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of())
+                .networkInterfaces().getFirst().getGroups().stream().map(GroupIdentifier::getGroupId).toList());
+        service.terminateInstances(region, List.of(instance.getInstanceId()));
+        if (!deleteOnTermination) {
+            NetworkInterface retained = service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of())
+                    .networkInterfaces().getFirst();
+            assertEquals(groups, retained.getGroups().stream().map(GroupIdentifier::getGroupId).toList());
+            assertEquals("available", retained.getStatus());
+        }
+    }
 
     @ParameterizedTest
     @CsvSource({
@@ -367,24 +404,25 @@ class Ec2ServiceTest {
     }
 
     @Test
-    void describeInstancesReadsTheVolumeAttachmentsOnceWhateverTheInstanceCount() {
-        Ec2Service service = spy(new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+    void describeInstancesScansTheVolumeStoreOnceWhateverTheInstanceCount() {
+        InMemoryStorage<String, Volume> volumeStore = spy(new InMemoryStorage<String, Volume>());
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
-                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory()));
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-volumes.json",
+                        new AccountAwareStorageBackend<>(volumeStore, null, "000000000000"))));
         service.runInstances("us-east-1", "ami-test", "t3.micro", 3, 3, null, List.of(), null, null,
                 List.of(), null, null);
         Ec2QueryHandler handler = new Ec2QueryHandler(service, mock(EmulatorConfig.class),
                 mock(FlowLogService.class), mock(Ec2EbsEncryptionService.class),
                 mock(Ec2SnapshotBlockPublicAccessService.class), mock(Ec2IpamService.class),
                 new RegionResolver("us-east-1", "000000000000"));
+        clearInvocations(volumeStore);
 
         Response response = handler.handle("DescribeInstances", new MultivaluedHashMap<>(), "us-east-1");
 
         assertEquals(200, response.getStatus());
         assertEquals(3, response.getEntity().toString().split("<volumeId>", -1).length - 1);
-        assertEquals(1, mockingDetails(service).getInvocations().stream()
-                .filter(invocation -> invocation.getMethod().getName().equals("instanceVolumeAttachments"))
-                .count());
+        verify(volumeStore, times(1)).scan(any());
     }
 
     @Test
