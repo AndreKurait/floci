@@ -53,6 +53,7 @@ import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.ResourcePolicyDecision;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -505,6 +506,14 @@ public class ApiGatewayExecuteController {
                 return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
                         "User is not authorized to access this resource");
             }
+        }
+
+        if ("CUSTOM".equals(method.getAuthorizationType())
+                && callerCallAuthorizer.evaluateAnonymousResourcePolicy("execute-api:Invoke",
+                        buildMethodArn(region, apiId, stageName, httpMethod, path), routeContext.sourceIp(),
+                        isSecureTransport(uriInfo)) == ResourcePolicyDecision.EXPLICIT_DENY) {
+            return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
+                    "User is not authorized to access this resource");
         }
 
         scope = scope.withIdentity(resolvedApiKey, iamIdentity);
@@ -1220,7 +1229,9 @@ public class ApiGatewayExecuteController {
             String methodArn = buildMethodArn(region, apiId, stageName, httpMethod, requestPath);
             Map<String, List<String>> conditions = AuthorizerPolicyEvaluator.requestConditions(
                     routeContext.sourceIp(), isSecureTransport(uriInfo));
-            if (!restLambdaAuthorizer.permits(verified, methodArn, conditions)) {
+            ResourcePolicyDecision resourceDecision = callerCallAuthorizer.evaluateAnonymousResourcePolicy(
+                    "execute-api:Invoke", methodArn, routeContext.sourceIp(), isSecureTransport(uriInfo));
+            if (!restLambdaAuthorizer.permits(verified, methodArn, conditions, resourceDecision)) {
                 return authorizerError(scope, GatewayResponseType.ACCESS_DENIED, 403);
             }
             return new AuthorizerResult(null, verified.principalId(), verified.context());
