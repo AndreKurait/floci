@@ -123,7 +123,22 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
         if (instanceType == null || instanceType.isBlank()) {
             instanceType = "t3.micro";
         }
-        String subnetId = ctx.resolveOptional(props, "SubnetId");
+        String subnetId = ctx.resolveOptional(engine.omitNoValue(props), "SubnetId");
+        JsonNode primaryInterface = primaryNetworkInterface(props, engine);
+        if (primaryInterface != null && subnetId != null) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Network interfaces and an instance-level subnet ID may not be specified on the same request", 400);
+        }
+        Boolean associatePublicIp = null;
+        if (primaryInterface != null) {
+            // The primary interface places the launch. Resolve it before the update check so a
+            // changed interface subnet replaces the instance just as an instance-level subnet does.
+            subnetId = ctx.resolveOptional(primaryInterface, "SubnetId");
+            String assocRaw = ctx.resolveOptional(primaryInterface, "AssociatePublicIpAddress");
+            if (assocRaw != null && !assocRaw.isBlank()) {
+                associatePublicIp = Boolean.parseBoolean(assocRaw);
+            }
+        }
         List<String> securityGroupIds = resolveSecurityGroupIds(props, engine);
         String privateIpAddress = ctx.resolveOptional(props, "PrivateIpAddress");
         String availabilityZone = ctx.resolveOptional(props, "AvailabilityZone");
@@ -174,19 +189,6 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
             putOrRemove(r, DECLARED_METADATA_OPTIONS_ATTR, Ec2CfnMetadataOptions.declaredMembers(metadataOptions));
             ReplacementCleanup.record(r, ctx, attributesBefore);
             return;
-        }
-
-        // The launch-time public-IP override rides on the primary network
-        // interface spec; absent means the subnet's MapPublicIpOnLaunch default.
-        Boolean associatePublicIp = null;
-        if (props != null) {
-            JsonNode networkInterfaces = props.path("NetworkInterfaces");
-            if (networkInterfaces.isArray() && !networkInterfaces.isEmpty()) {
-                String assocRaw = engine.resolve(networkInterfaces.get(0).path("AssociatePublicIpAddress"));
-                if (assocRaw != null && !assocRaw.isBlank()) {
-                    associatePublicIp = Boolean.parseBoolean(assocRaw);
-                }
-            }
         }
 
         r.getAttributes().remove(PRIOR_IN_PLACE_ATTR);
@@ -258,6 +260,34 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
     /** A property forces replacement only when the template declares a value that differs. */
     private static boolean changed(String declared, String actual) {
         return declared != null && !declared.equals(actual);
+    }
+
+    private static JsonNode primaryNetworkInterface(JsonNode props, CloudFormationTemplateEngine engine) {
+        JsonNode interfaces = props != null ? engine.resolveNodeOmittingNoValue(props.get("NetworkInterfaces")) : null;
+        if (interfaces == null || interfaces.isNull() || interfaces.isMissingNode()) {
+            return null;
+        }
+        if (!interfaces.isArray()) {
+            throw new AwsException("InvalidParameterValue", "NetworkInterfaces must be a list", 400);
+        }
+        if (interfaces.isEmpty()) {
+            return null;
+        }
+        JsonNode primary = null;
+        for (JsonNode networkInterface : interfaces) {
+            if ("0".equals(networkInterface.path("DeviceIndex").asText())) {
+                if (primary != null) {
+                    throw new AwsException("InvalidParameterValue",
+                            "Network interfaces must have unique device indices", 400);
+                }
+                primary = networkInterface;
+            }
+        }
+        if (primary == null) {
+            throw new AwsException("InvalidParameterValue",
+                    "Network interfaces must include a primary interface with device index 0", 400);
+        }
+        return primary;
     }
 
     private List<String> resolveSecurityGroupIds(JsonNode props, CloudFormationTemplateEngine engine) {

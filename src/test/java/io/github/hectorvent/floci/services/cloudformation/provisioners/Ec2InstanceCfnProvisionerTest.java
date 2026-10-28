@@ -14,6 +14,8 @@ import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
@@ -61,6 +63,80 @@ class Ec2InstanceCfnProvisionerTest {
     private final Ec2Service ec2 = mock(Ec2Service.class);
     private final Ec2InstanceCfnProvisioner provisioner = new Ec2InstanceCfnProvisioner(ec2);
     private final ObjectMapper mapper = new ObjectMapper();
+
+    @Test
+    void primaryInterfacePlacementUsesDeviceIndexRatherThanListOrder() throws Exception {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-1");
+        stubLaunch(instance);
+
+        provisioner.provision(resource("Server"), props("""
+                {"ImageId": "ami-1", "NetworkInterfaces": [
+                  {"DeviceIndex": 1, "SubnetId": "subnet-secondary", "AssociatePublicIpAddress": true},
+                  {"DeviceIndex": 0, "SubnetId": "subnet-primary", "AssociatePublicIpAddress": false}
+                ]}
+                """), ctx());
+
+        verify(ec2).runInstances(eq("us-east-1"), eq("ami-1"), eq("t3.micro"), eq(1), eq(1), isNull(),
+                anyList(), eq("subnet-primary"), isNull(), anyList(), isNull(), isNull(), eq(false), isNull(),
+                eq(0), isNull(), isNull(), isNull(), isNull(), eq(false), isNull(), isNull(), isNull(),
+                eq(false), isNull());
+    }
+
+    @Test
+    void changingThePrimaryInterfaceSubnetReplacesTheInstance() throws Exception {
+        Instance previous = reusable("i-before");
+        previous.setSubnetId("subnet-before");
+        Instance replacement = new Instance();
+        replacement.setInstanceId("i-after");
+        replacement.setImageId("ami-1");
+        replacement.setSubnetId("subnet-after");
+        stubLaunch(replacement);
+        StackResource resource = resource("Server");
+
+        provisioner.provision(resource, props("""
+                {"ImageId": "ami-1", "NetworkInterfaces": [
+                  {"DeviceIndex": 0, "SubnetId": "subnet-after"}
+                ]}
+                """), ctx("i-before"));
+
+        assertEquals("i-after", resource.getPhysicalId());
+        assertTrue(provisioner.hasReplacementUpdate(resource));
+        assertEquals("i-before", provisioner.updateCleanupPhysicalId(resource));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "{}",
+            "[{\"DeviceIndex\":1,\"SubnetId\":\"subnet-1\"}]",
+            "[{\"DeviceIndex\":0,\"SubnetId\":\"subnet-1\"},{\"DeviceIndex\":0,\"SubnetId\":\"subnet-2\"}]"
+    })
+    void invalidPrimaryInterfaceDeclarationsFailBeforeEc2Calls(String interfaces) throws Exception {
+        StackResource resource = resource("Server");
+        resource.getAttributes().put("existing", "preserved");
+
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(resource,
+                props("{\"ImageId\":\"ami-1\",\"NetworkInterfaces\":" + interfaces + "}"), ctx()));
+
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+        assertEquals(Map.of("existing", "preserved"), resource.getAttributes());
+        assertNull(resource.getPhysicalId());
+        verifyNoInteractions(ec2);
+    }
+
+    @Test
+    void instanceSubnetAndPrimaryInterfaceAreRejectedBeforeEc2Calls() throws Exception {
+        StackResource resource = resource("Server");
+
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(resource, props("""
+                {"ImageId":"ami-1","SubnetId":"subnet-1",
+                 "NetworkInterfaces":[{"DeviceIndex":0,"SubnetId":"subnet-1"}]}
+                """), ctx()));
+
+        assertEquals("InvalidParameterCombination", error.getErrorCode());
+        verifyNoInteractions(ec2);
+        assertTrue(resource.getAttributes().isEmpty());
+    }
 
     @Test
     void launchPublishesTheInstanceAttributes() throws Exception {
@@ -1305,6 +1381,7 @@ class Ec2InstanceCfnProvisionerTest {
         });
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
         when(engine.omitNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(engine.resolveNodeOmittingNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
         return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", priorPhysicalId);
     }
 
