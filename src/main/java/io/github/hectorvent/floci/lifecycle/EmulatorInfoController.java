@@ -77,6 +77,7 @@ public class EmulatorInfoController {
                 "services", serviceRegistry.getServices(),
                 "edition", "community",
                 "original_edition", "floci-always-free",
+                "features", Map.of("lambda_container_readiness", 1),
                 "version", version)).build();
     }
 

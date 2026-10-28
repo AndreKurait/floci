@@ -12,6 +12,7 @@ import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectExecCmd;
 import com.github.dockerjava.api.command.InspectNetworkCmd;
 import com.github.dockerjava.api.command.RemoveContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
@@ -459,6 +460,50 @@ class ContainerLauncherTest {
         verify(lifecycleManager, never()).startCreated(any(), any());
         verify(lifecycleManager).stopAndRemove("container-123", null);
         verify(runtimeApiServer, never()).handleRuntimeProcessExited(anyInt());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failedNamespaceReadinessStopsBothColdAndProvisionedContainersBeforePoolAdmission(boolean provisioned) {
+        when(config.services().lambda().containerReadinessCommand()).thenReturn(Optional.of("probe"));
+        when(config.services().lambda().containerReadinessTimeoutSeconds()).thenReturn(10);
+        LambdaFunction function = imageFunction();
+        when(config.services().iam().lambdaIdentityVerificationEnabled()).thenReturn(true);
+        when(executionRoleCredentials.forFunction(function)).thenReturn(
+                Optional.of(new SessionCreds("ASIAEXAMPLE", "example-secret", "example-token")));
+        InspectContainerCmd container = mock(InspectContainerCmd.class, RETURNS_DEEP_STUBS);
+        when(dockerClient.inspectContainerCmd("container-123")).thenReturn(container);
+        when(container.exec().getState().getStartedAt()).thenReturn("current-start");
+        ExecCreateCmd create = mock(ExecCreateCmd.class, RETURNS_SELF);
+        ExecCreateCmdResponse created = mock(ExecCreateCmdResponse.class);
+        when(dockerClient.execCreateCmd("container-123")).thenReturn(create);
+        when(create.exec()).thenReturn(created);
+        when(created.getId()).thenReturn("probe-exec");
+        ExecStartCmd start = mock(ExecStartCmd.class, RETURNS_SELF);
+        when(dockerClient.execStartCmd("probe-exec")).thenReturn(start);
+        when(start.exec(any())).thenAnswer(call -> {
+            verify(lifecycleManager).startCreated(eq("container-123"), any());
+            verify(executionRoleCredentials).bindStartedContainer(
+                    function, "ASIAEXAMPLE", "container-123", "current-start");
+            ResultCallback<Frame> callback = call.getArgument(0);
+            callback.onStart(mock(Closeable.class));
+            callback.onComplete();
+            return callback;
+        });
+        InspectExecCmd inspect = mock(InspectExecCmd.class, RETURNS_DEEP_STUBS);
+        when(dockerClient.inspectExecCmd("probe-exec")).thenReturn(inspect);
+        when(inspect.exec().getExitCodeLong()).thenReturn(127L);
+        assertThrows(IllegalStateException.class, () -> {
+            if (provisioned) {
+                launcher.launchProvisioned(function);
+            } else {
+                launcher.launch(function);
+            }
+        });
+        verify(lifecycleManager).stopAndRemove(eq("container-123"), any());
+        verify(runtimeApiServer).quiesce();
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+        verify(dockerClient, never()).copyArchiveFromContainerCmd("container-123", "/opt/extensions");
     }
 
     @Test

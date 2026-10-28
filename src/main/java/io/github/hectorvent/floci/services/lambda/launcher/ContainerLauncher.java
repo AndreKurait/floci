@@ -507,6 +507,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 LOG.debug("Could not seal Lambda execution start time");
             }
         }
+        // Initialization may make authenticated calls while invocation admission waits on the probe.
+        LambdaContainerReadiness.await(dockerClient, containerId,
+                config.services().lambda().containerReadinessCommand(),
+                config.services().lambda().containerReadinessTimeoutSeconds());
         // Real AWS's runtime interface client discovers and launches every binary under
         // /opt/extensions/ as a sibling process to the main entrypoint before the runtime is
         // considered ready; Floci only runs the image's own ENTRYPOINT/CMD, so extensions
