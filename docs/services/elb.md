@@ -92,7 +92,7 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - ACM certificates must be issued before attaching them. Reimporting an attached ACM certificate refreshes subsequent full TLS handshakes; existing connections keep their negotiated certificate. Reload does not invalidate TLS session caches: a resumed session can retain its previously authenticated certificate after replacement or removal until the session expires or is invalidated. ACM deletion and revocation are refused while a listener still references the certificate.
 - Certificate replacement keeps the previous key material available to new handshakes while the replacement loads. A failed reload leaves the previous certificate active.
 - Unusable saved listeners are retained for correction and logged individually so other saved listeners can start.
-- Listeners sharing a local port must use the same protocol. Requests select a load balancer by its DNS name, a hostname declared by its rules, or a certificate hostname; ambiguous hostnames return 502.
+- Listeners sharing a local port must use the same protocol. Requests select a load balancer by its DNS name, a public Route 53 alias, a hostname declared by its rules, or a certificate hostname; ambiguous hostnames return 502.
 - Load balancer, target group, listener, rule, and tag state is persisted through Floci storage and rebuilt on service startup.
 - Load balancers are created in `active` state.
 - `CreateLoadBalancer` takes `Subnets` or `SubnetMappings` for every load balancer type, and both together are refused with `ValidationError`. An Application Load Balancer takes at least two: with one or none it returns `ValidationError` `At least two subnets in two different Availability Zones must be specified` and creates nothing. The count comes before any subnet is looked up, as on AWS, so one subnet that does not exist gets that error too. A Network or Gateway Load Balancer with neither returns `ValidationError` `At least one subnet must be specified`. CloudFormation refuses such an `AWS::ElasticLoadBalancingV2::LoadBalancer` the same way when it creates or replaces the balancer; an update that keeps the balancer and names no subnets leaves it on its subnets.
@@ -216,6 +216,15 @@ aws elbv2 delete-target-group \
 
 Listener sockets bind on the Floci host. Expose any listener ports you need in Docker Compose when Floci itself runs in a container, similar to RDS and ElastiCache proxy ports.
 
+The shared HTTP API endpoint also forwards requests whose Host names an existing load balancer
+or a public Route 53 alias/CNAME chain to one. An explicit Host port selects that listener;
+otherwise HTTP selects port 80 and HTTPS selects port 443. This supports an external TLS
+front door forwarding to the HTTP listener. The shared endpoint does not use the single-listener
+fallback for unrelated hosts, so ordinary AWS API requests retain their existing handlers.
+After selecting a listener, target groups and load-balancer attributes are read in that
+listener's owning account. Unsigned data requests therefore work for load balancers created
+outside the emulator's default account.
+
 ### Two load balancers on the same port
 
 In AWS each load balancer has its own DNS name and addresses, so two of them can both listen on
@@ -227,23 +236,28 @@ on port 80 is correct for AWS and stays accepted here, but the request has to na
 A listener is chosen in this order:
 
 1. The Host header equals a load balancer's own DNS name (`{name}-{id}.elb.localhost.floci.io`).
-2. Exactly one listener on the port has a rule whose `host-header` condition matches the Host
+2. A public Route 53 alias/CNAME chain resolves the Host to a load balancer on the port.
+   Alias target hosted-zone IDs must match that load balancer's canonical zone.
+   Fully qualified targets and the `dualstack.` DNS prefix are supported.
+   An alias to a removed or different load balancer cannot fall back to another listener.
+3. Exactly one listener on the port has a rule whose `host-header` condition matches the Host
    header. This uses the same matching as the rule evaluation that follows, so it is
    case-insensitive, ignores the port, and applies AWS's wildcards: `*` matches 0 or more
    characters and `?` matches exactly 1, which means `*.example.com` claims `test.example.com`
    but not `example.com`. `HostHeaderConfig.RegexValues` is not supported, by rule evaluation or
    by selection, so a load balancer that names itself only through a regex cannot be selected
    this way.
-3. Only one listener is on the port, in which case it answers any Host header.
+4. Exactly one listener has a certificate hostname matching the Host header.
+5. Only one listener is on the port, in which case it answers any Host header.
 
 If none of those resolve, and in particular when two load balancers declare the same hostname or
 neither declares any, the request answers `502 No listener for host`. Floci logs a warning naming
 both load balancers the first time a second one takes a port, because the targets behind them stay
 healthy and nothing else reports the collision.
 
-Giving each load balancer a `host-header` rule for the hostname it serves is usually enough, and it
-is the same configuration AWS needs. Moving one load balancer to a different listener port also
-works, at the cost of a Floci-only difference from the deployed template.
+Public Route 53 records select their actual load balancer before its rules run. Rule evaluation
+still sees the original Host and request path. For names without such records, distinct
+`host-header` rules or distinct listener ports can disambiguate the shared local socket.
 
 ### Target health scheduling
 
