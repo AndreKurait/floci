@@ -523,6 +523,23 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         return findAnyAccountEntry(key).map(OwnedEntry::value);
     }
 
+    /** Resolves an exact key across accounts without choosing an owner when the key is ambiguous. */
+    public List<AccountEntry<V>> findAllAccountEntries(String key) {
+        if (!ownersComplete) {
+            startTrackingOwners();
+        }
+        List<AccountEntry<V>> result = new ArrayList<>();
+        for (String account : ownerAccounts) {
+            if (hasAccountPrefix(account + "/" + key)) {
+                delegate.get(account + "/" + key).ifPresent(value ->
+                        result.add(new AccountEntry<>(account, key, value)));
+            }
+        }
+        delegate.get(key).ifPresent(value ->
+                result.add(new AccountEntry<>(defaultAccountId, key, value)));
+        return result;
+    }
+
     /**
      * Like {@link #findAnyAccount}, but also reports the owning account so a cross-account
      * <em>mutation</em> can write the value back to its owner's partition (via
