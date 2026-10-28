@@ -30,6 +30,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -524,7 +525,7 @@ public class StepFunctionsJsonHandler {
 
     private Response handleGetExecutionHistory(JsonNode request) {
         String arn = request.path("executionArn").asText();
-        boolean includeExecutionData = request.path("includeExecutionData").asBoolean(true);
+        boolean includeExecutionData = parseOptionalBoolean(request, "includeExecutionData", true);
         boolean reverseOrder = parseOptionalBoolean(request, "reverseOrder", false);
         Integer maxResults = parseOptionalInt(request, "maxResults");
         String nextToken = optionalText(request, "nextToken");
