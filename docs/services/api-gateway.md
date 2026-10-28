@@ -1151,3 +1151,5 @@ SCPs use the shared IAM evaluator. Missing or invalid caller credentials return 
 500 before invocation when IAM enforcement is enabled. The historical bare `*`
 compatibility spelling is preserved separately. Full forwarded condition context and
 issuance of execution-role STS sessions remain outside this behavior.
+
+HTTP API REQUEST Lambda authorizers with configured execution roles check API-owner role trust and Lambda invocation permissions when IAM enforcement is enabled. Role identity policies, resource policies, permissions boundaries and SCPs are evaluated against the same qualified target used for invocation. Absent credentials retain service-principal resource-policy authorization. Authorizer credentials support role ARNs, not the integration caller-credentials sentinel. Actual execution-role STS session issuance and full condition-context forwarding are not modeled by this check.
