@@ -301,3 +301,21 @@ The resulting assumed-role credentials do not inherit these MFA condition keys. 
 AssumeRole request authentication from GetSessionToken credentials, which retain MFA information
 for later API calls. Hardware/root devices, MFA supplied by temporary callers and exact precedence
 between multiple invalid request fields are not qualified here.
+
+### Direct AssumeRole session tags
+
+AssumeRole validates the supplied session tags before registration. With IAM enforcement enabled,
+`sts:TagSession` must be permitted by the target trust policy and the shared caller-policy evaluation,
+including identity, session-policy, permissions-boundary and SCP restrictions. Request-tag and tag-key
+conditions use only tag members the STS handler consumes. A same-account trust grant naming the caller
+is distinct from a grant delegating to the caller's account.
+
+Issued credentials retain immutable session-owned tags. These override matching attached role tags
+case-insensitively for `aws:PrincipalTag` conditions without changing the role or another session.
+Stored session tags survive credential serialization; expiry and revocation keep their existing behavior.
+IAM-disabled requests still validate tag shapes and retain the tags, without checking policy permissions.
+
+This covers direct AssumeRole tag input and local credential authorization. Transitive tag inheritance
+and collisions, SAML/web-identity/federation tagging, packed session-token size limits and full request
+condition context remain separate limitations. Local JVM and signed SDK tests do not establish managed
+AWS, native-image or workload credential-delivery parity.
