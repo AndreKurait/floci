@@ -1139,3 +1139,10 @@ bare `*` is not the documented AWS sentinel. This check is distinct from `execut
 route authorization. Issued session identities are read from IAM, not synthesized; full forwarded
 request condition context, other service integrations and HTTP/WebSocket caller modes remain
 outside this implementation.
+
+When IAM enforcement is enabled, HTTP API Lambda integrations with an execution role
+require API Gateway role trust and invocation permission through the shared identity,
+resource-policy, permissions-boundary and SCP evaluators. Cross-account targets also
+require a resource-policy grant. Authorization and invocation use one qualified target.
+Caller-identity passthrough remains a separate path; this does not qualify forwarding
+its permissions, full condition context, or issuance of execution-role STS sessions.
