@@ -99,30 +99,76 @@ class WebSocketRouteIamIntegrationTest {
     }
 
     @Test
-    void rejectedRoleCreationPreservesPreexistingRole() throws Exception {
+    void signedConnectionUsesPeerAddressAndTransportRatherThanForwardedHeaders() throws Exception {
+        Fixture fixture = fixture(true, "AWS_IAM");
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "ws-transport-", "invoke",
+                transportPolicy(fixture.arn(), "Allow"))) {
+            Key key = new Key(user.accessKeyId(), user.secretAccessKey(), null);
+            invoke(fixture, key, 101);
+            putPolicy(user, transportPolicy(fixture.arn(), "Deny"));
+            invoke(fixture, key, 403);
+        }
+    }
+
+    @Test
+    void issuedSessionEvaluatesConnectionTransportConditions() throws Exception {
+        Fixture fixture = fixture(false, "AWS_IAM");
+        String name = roleNames.get();
+        String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
+                + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
+        String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
+                "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
+                .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+        SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
+                "PolicyDocument", policy(fixture.arn()))).then().statusCode(200);
+        invoke(fixture, assume(role, transportPolicy(fixture.arn(), "Allow")), 101);
+        invoke(fixture, assume(role, transportPolicy(fixture.arn(), "Deny")), 403);
+    }
+
+    private static String transportPolicy(String arn, String effect) {
+        return "{\"Statement\":{\"Effect\":\"" + effect
+                + "\",\"Action\":\"execute-api:Invoke\",\"Resource\":\"" + arn + "\",\"Condition\":{"
+                + "\"IpAddress\":{\"aws:SourceIp\":[\"127.0.0.0/8\",\"::1/128\"]},"
+                + "\"Bool\":{\"aws:SecureTransport\":\"false\"}}}}";
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rejectedRoleCreationPreservesPreexistingRole(boolean transport) throws Exception {
         String name = "ws-route-existing-" + UUID.randomUUID();
         SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
                 "AssumeRolePolicyDocument", "{\"Statement\":[]}")).then().statusCode(200);
         cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         WebSocketRouteIamIntegrationTest fixture = nestedFixture(name);
         try {
-            assertThrows(AssertionError.class, fixture::issuedRoleSessionsRetainPolicyTokenAndRevocationChecks);
+            assertThrows(AssertionError.class, () -> fixture.runRoleScenario(transport));
         } finally {
             fixture.cleanup.afterEach(mock(ExtensionContext.class));
         }
         SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(200);
     }
 
-    @Test
-    void successfulRoleScenarioRemovesOwnedRoleAndPolicy() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void successfulRoleScenarioRemovesOwnedRoleAndPolicy(boolean transport) throws Exception {
         String name = "ws-route-owned-" + UUID.randomUUID();
         WebSocketRouteIamIntegrationTest fixture = nestedFixture(name);
         try {
-            fixture.issuedRoleSessionsRetainPolicyTokenAndRevocationChecks();
+            fixture.runRoleScenario(transport);
         } finally {
             fixture.cleanup.afterEach(mock(ExtensionContext.class));
         }
         SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(404);
+    }
+
+    private void runRoleScenario(boolean transport) throws Exception {
+        if (transport) {
+            issuedSessionEvaluatesConnectionTransportConditions();
+        } else {
+            issuedRoleSessionsRetainPolicyTokenAndRevocationChecks();
+        }
     }
 
     private WebSocketRouteIamIntegrationTest nestedFixture(String name) {
@@ -183,7 +229,8 @@ class WebSocketRouteIamIntegrationTest {
     private void invoke(Fixture fixture, Key key, int status) throws Exception {
         String path = "/ws/" + fixture.apiId() + "/prod";
         try (HttpClient client = HttpClient.newHttpClient()) {
-            WebSocket.Builder builder = client.newWebSocketBuilder();
+            WebSocket.Builder builder = client.newWebSocketBuilder()
+                    .header("X-Forwarded-For", "192.0.2.5").header("X-Forwarded-Proto", "https");
             if (key != null) {
                 ExecuteApiRequestSigner.signedHeaders("GET", path, Map.of("tag", "a b"),
                         endpoint.getHost() + ":" + endpoint.getPort(), new byte[0], key.accessKey(), key.secret(),
