@@ -144,20 +144,20 @@ class AppConfigResourceFieldsIntegrationTest {
     }
 
     @Test
-    void profileCreatedWithoutTypeReturnsNoType() {
+    void profileCreatedWithoutTypeDefaultsToFreeform() {
         String applicationId = createApplication("untyped-profile-app");
         String profileId = given()
                 .contentType(ContentType.JSON)
                 .body("{\"Name\":\"untyped\",\"LocationUri\":\"hosted\"}")
                 .when().post("/applications/" + applicationId + "/configurationprofiles")
                 .then().statusCode(201)
-                .body("Type", nullValue())
+                .body("Type", equalTo("AWS.Freeform"))
                 .extract().path("Id");
 
         given()
                 .when().get("/applications/" + applicationId + "/configurationprofiles/" + profileId)
                 .then().statusCode(200)
-                .body("Type", nullValue());
+                .body("Type", equalTo("AWS.Freeform"));
     }
 
     private static String createApplication(String name) {
