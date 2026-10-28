@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsQueryResponse;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
+import io.github.hectorvent.floci.services.autoscaling.AutoScalingService.AutoScalingInstanceDetails;
 import io.github.hectorvent.floci.services.autoscaling.model.*;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -604,18 +605,21 @@ public class AutoScalingQueryHandler {
     // ── Instances ─────────────────────────────────────────────────────────────
 
     private Response handleDescribeAutoScalingInstances(MultivaluedMap<String, String> p, String region) {
-        List<AsgInstance> instances = service.describeAutoScalingInstances(
+        List<AutoScalingInstanceDetails> instances = service.describeAutoScalingInstances(
                 region, memberList(p, "InstanceIds"));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeAutoScalingInstancesResponse", NS)
                   .start("DescribeAutoScalingInstancesResult")
                     .start("AutoScalingInstances");
-        for (AsgInstance inst : instances) {
+        for (AutoScalingInstanceDetails details : instances) {
+            AsgInstance inst = details.instance();
+            String healthStatus = inst.getHealthStatus();
             xml.start("member")
                .elem("InstanceId", inst.getInstanceId())
+               .elem("AutoScalingGroupName", details.autoScalingGroupName())
                .elem("AvailabilityZone", inst.getAvailabilityZone())
                .elem("LifecycleState", inst.getLifecycleState())
-               .elem("HealthStatus", inst.getHealthStatus())
+               .elem("HealthStatus", healthStatus != null ? healthStatus.toUpperCase(Locale.ROOT) : null)
                .elem("ProtectedFromScaleIn", String.valueOf(inst.isProtectedFromScaleIn()));
             if (inst.getLaunchConfigurationName() != null) {
                 xml.elem("LaunchConfigurationName", inst.getLaunchConfigurationName());
@@ -1364,7 +1368,7 @@ public class AutoScalingQueryHandler {
     private Response handleStandby(MultivaluedMap<String, String> p, String region, boolean enter) {
         boolean decrement = enter && requiredBoolParam(p, "ShouldDecrementDesiredCapacity");
         List<ScalingActivity> activities = service.changeStandby(region, p.getFirst("AutoScalingGroupName"),
-                memberList(p, "InstanceIds"), enter, decrement);
+                indexedMembers(p, "InstanceIds"), enter, decrement);
         String action = enter ? "EnterStandby" : "ExitStandby";
         XmlBuilder xml = new XmlBuilder().start(action + "Response", NS)
                 .start(action + "Result").start("Activities");
@@ -1684,17 +1688,20 @@ public class AutoScalingQueryHandler {
         CapacityReservationSpecification specification = new CapacityReservationSpecification();
         specification.setCapacityReservationPreference(p.getFirst(prefix + "CapacityReservationPreference"));
         specification.setCapacityReservationIds(
-                capacityTargetMembers(p, prefix + "CapacityReservationTarget.CapacityReservationIds"));
+                indexedMembers(p, prefix + "CapacityReservationTarget.CapacityReservationIds"));
         specification.setCapacityReservationResourceGroupArns(
-                capacityTargetMembers(p, prefix + "CapacityReservationTarget.CapacityReservationResourceGroupArns"));
+                indexedMembers(p, prefix + "CapacityReservationTarget.CapacityReservationResourceGroupArns"));
         return specification;
     }
 
-    private List<String> capacityTargetMembers(MultivaluedMap<String, String> params, String prefix) {
+    private List<String> indexedMembers(MultivaluedMap<String, String> params, String prefix) {
         String memberPrefix = prefix + ".member.";
         return params.entrySet().stream()
                 .filter(entry -> entry.getKey().startsWith(memberPrefix))
                 .filter(entry -> entry.getKey().substring(memberPrefix.length()).matches("[1-9][0-9]*"))
+                // Positive indexes have no leading zeros: length then text preserves numeric order without overflow.
+                .sorted(Comparator.comparingInt((Map.Entry<String, List<String>> entry) -> entry.getKey().length())
+                        .thenComparing(Map.Entry::getKey))
                 .flatMap(entry -> entry.getValue().stream())
                 .toList();
     }
