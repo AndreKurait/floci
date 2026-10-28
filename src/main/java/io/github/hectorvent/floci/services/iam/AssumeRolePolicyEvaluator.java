@@ -9,6 +9,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -246,6 +247,12 @@ public class AssumeRolePolicyEvaluator {
      */
     public boolean allowsService(String trustPolicyDocument, String servicePrincipal,
                                  String sourceArn, String sourceAccount) {
+        return allowsService(trustPolicyDocument, servicePrincipal, sourceArn, sourceAccount, null);
+    }
+
+    /** Evaluates configured service-role trust using the same server time as the target call. */
+    public boolean allowsService(String trustPolicyDocument, String servicePrincipal,
+                                 String sourceArn, String sourceAccount, Instant requestTime) {
         if (trustPolicyDocument == null || trustPolicyDocument.isBlank()) {
             return false;
         }
@@ -263,6 +270,10 @@ public class AssumeRolePolicyEvaluator {
         String version = root.path("Version").asText(null);
         Map<String, List<String>> context = IamConditionContextResolver.serviceCallContext(
                 servicePrincipal, null, null, sourceArn, sourceAccount);
+        if (requestTime != null) {
+            context.put("aws:CurrentTime", List.of(requestTime.toString()));
+            context.put("aws:EpochTime", List.of(Long.toString(requestTime.getEpochSecond())));
+        }
         boolean allow = false;
         if (statements.isArray()) {
             for (JsonNode statement : statements) {
