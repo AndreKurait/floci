@@ -124,7 +124,26 @@ class RestCustomResourcePolicyTest {
         authorizerPolicy("Allow", INVOKE);
         controller = new ApiGatewayExecuteController(gateway, cognito, null, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
-                new ApiGatewayExecuteRouteContext(), null, new RequestContext(), signature, cache, new AuthorizerPolicyEvaluator(evaluator), direct, roles, callers);
+                new ApiGatewayExecuteRouteContext(), null, new RequestContext(), signature, cache, new AuthorizerPolicyEvaluator(evaluator), direct, roles, callers, null);
+    }
+
+    @Test
+    void absentSignedPrincipalFlagDenyStopsAuthorizerBeforeMissingIdentity() {
+        when(headers.getHeaderString("Authorization")).thenReturn(null);
+        policy(document("Deny", "*", INVOKE,
+                ",\"Condition\":{\"Null\":{\"aws:PrincipalIsAWSService\":\"true\"}}"));
+        assertEquals(403, invoke());
+        verifyNoInteractions(lambda);
+    }
+
+    @Test
+    void absentSignedPrincipalFlagGrantStillRequiresCustomIdentity() {
+        authorizerPolicy("Allow", INVOKE + "other");
+        policy(document("Allow", "*", INVOKE,
+                ",\"Condition\":{\"Null\":{\"aws:PrincipalIsAWSService\":\"true\"}}"));
+        assertEquals(200, invoke());
+        when(headers.getHeaderString("Authorization")).thenReturn(null);
+        assertEquals(401, invoke());
     }
 
     @ParameterizedTest
