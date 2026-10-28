@@ -112,7 +112,7 @@ class RestIntegrationCallerTest {
         CallerCallAuthorizer callers = new CallerCallAuthorizer(config, iam, evaluator, providers, scpInstance);
         controller = new ApiGatewayExecuteController(gateway, null, null, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
-                new ApiGatewayExecuteRouteContext(), null, new RequestContext(), signature, null, null, direct, roles, callers);
+                new ApiGatewayExecuteRouteContext(), null, new RequestContext(), signature, null, null, direct, roles, callers, null);
     }
 
     @ParameterizedTest
@@ -147,6 +147,8 @@ class RestIntegrationCallerTest {
     @Test
     void verifiedIamRouteIdentityIsReusedWithoutSecondVerification() {
         method.setAuthorizationType("AWS_IAM");
+        when(iam.resolveCallerContext(eq(KEY), any())).thenReturn(CallerContext.of(List.of(ALLOW,
+                "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"execute-api:Invoke\",\"Resource\":\"*\"}}")));
         assertEquals(200, invoke());
         verify(signature).authorize(anyString(), any(), any(), any(), any());
         verify(lambda).invokeTarget(eq("us-east-1"), eq(FUNCTION), any(byte[].class), any());
