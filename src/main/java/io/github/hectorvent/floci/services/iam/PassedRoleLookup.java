@@ -18,8 +18,8 @@ import java.util.Optional;
  */
 public interface PassedRoleLookup {
 
-    /** Integration credentials assigned by a REST API import, using its owning service's parser. */
-    default List<String> importedRestApiIntegrationRoles(String document, String region) {
+    /** Integration and Lambda authorizer credentials assigned by a REST API import, using its owning service's parser. */
+    default List<String> importedRestApiRoles(String document, String region) {
         return List.of();
     }
 

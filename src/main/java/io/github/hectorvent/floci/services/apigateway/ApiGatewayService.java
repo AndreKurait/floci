@@ -3706,16 +3706,26 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
 
     /** Reads only integration assignments, before the shared IAM filter permits any import mutation. */
     @Override
-    public List<String> importedRestApiIntegrationRoles(String document, String region) {
+    public List<String> importedRestApiRoles(String document, String region) {
         OpenAPI openAPI;
         try {
             openAPI = parseOpenApiSpec(region, document, false).openAPI();
         } catch (AwsException expected) {
             // The normal import path reports invalid documents; they cannot assign credentials.
-            LOG.debugv(expected, "Invalid REST API import has no integration role assignments");
+            LOG.debugv(expected, "Invalid REST API import has no role assignments");
             return List.of();
         }
         List<String> roles = new ArrayList<>();
+        if (openAPI.getComponents() != null && openAPI.getComponents().getSecuritySchemes() != null) {
+            for (Map.Entry<String, SecurityScheme> entry : openAPI.getComponents().getSecuritySchemes().entrySet()) {
+                Map<String, Object> authorizer = importedAuthorizerDefinition(entry.getValue(), entry.getKey());
+                if (authorizer != null
+                        && !"cognito_user_pools".equals(importedAuthorizerType(authorizer, entry.getKey()))
+                        && authorizer.get("authorizerCredentials") instanceof String credentials) {
+                    roles.add(credentials);
+                }
+            }
+        }
         if (openAPI.getPaths() == null) {
             return roles;
         }
