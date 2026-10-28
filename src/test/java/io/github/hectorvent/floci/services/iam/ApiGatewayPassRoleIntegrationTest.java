@@ -229,6 +229,56 @@ class ApiGatewayPassRoleIntegrationTest {
         }
     }
 
+    @Test
+    void quickCreateLambdaRequiresPassRoleBeforeCreatingAnyApi() {
+        try (Fixture f = new Fixture()) {
+            cleanup.register(() -> {
+                try (ApiGatewayV2Client admin = f.adminV2()) {
+                    admin.getApis().items().stream().filter(api -> f.name.equals(api.name()))
+                            .forEach(api -> admin.deleteApi(b -> b.apiId(api.apiId())));
+                }
+            });
+            String target = "arn:aws:lambda:us-east-1:000000000000:function:management-only";
+            int initial = f.v2.getApis().items().size();
+            for (String requestedTarget : new String[] {target, "arn:incomplete"}) {
+                assertEquals(403, assertThrows(ApiGatewayV2Exception.class, () -> f.v2.createApi(b -> b
+                        .name(f.name).protocolType("HTTP").target(requestedTarget).credentialsArn(f.role))).statusCode());
+                assertEquals(initial, f.v2.getApis().items().size());
+            }
+            f.policy("lambda.amazonaws.com");
+            assertEquals(403, assertThrows(ApiGatewayV2Exception.class, () -> f.v2.createApi(b -> b
+                    .name(f.name).protocolType("HTTP").target(target).credentialsArn(f.role))).statusCode());
+            assertEquals(initial, f.v2.getApis().items().size());
+            f.policy("apigateway.amazonaws.com");
+            String api = f.v2.createApi(b -> b.name(f.name).protocolType("HTTP").target(target)
+                    .credentialsArn(f.role)).apiId();
+            assertEquals(target, f.v2.getIntegrations(b -> b.apiId(api)).items().getFirst().integrationUri());
+            assertEquals(1, f.v2.getRoutes(b -> b.apiId(api)).items().size());
+            assertEquals(1, f.v2.getStages(b -> b.apiId(api)).items().size());
+            f.policy(null);
+            assertEquals(403, assertThrows(ApiGatewayV2Exception.class, () -> f.v2.createApi(b -> b
+                    .name(f.name).protocolType("HTTP").target(target).credentialsArn(f.role))).statusCode());
+            assertEquals(initial + 1, f.v2.getApis().items().size());
+        }
+    }
+
+    @Test
+    void quickCreateUnusedCredentialsDoNotRequirePassRole() {
+        try (Fixture f = new Fixture()) {
+            cleanup.register(() -> {
+                try (ApiGatewayV2Client admin = f.adminV2()) {
+                    admin.getApis().items().stream().filter(api -> f.name.equals(api.name()))
+                            .forEach(api -> admin.deleteApi(b -> b.apiId(api.apiId())));
+                }
+            });
+            String plain = f.v2.createApi(b -> b.name(f.name).protocolType("HTTP").credentialsArn(f.role)).apiId();
+            assertEquals(0, f.v2.getIntegrations(b -> b.apiId(plain)).items().size());
+            String proxy = f.v2.createApi(b -> b.name(f.name).protocolType("HTTP")
+                    .target("https://example.com").credentialsArn(f.role)).apiId();
+            assertEquals("HTTP_PROXY", f.v2.getIntegrations(b -> b.apiId(proxy)).items().getFirst().integrationTypeAsString());
+        }
+    }
+
     private ApiGatewayClient sessionClient(Credentials credentials) {
         return ApiGatewayClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
                 .credentialsProvider(StaticCredentialsProvider.create(AwsSessionCredentials.create(
