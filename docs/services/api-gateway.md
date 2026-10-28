@@ -1166,3 +1166,20 @@ WebSocket Lambda integrations with a configured execution role check API Gateway
 WebSocket Lambda integrations using the documented `arn:<partition>:iam::*:user/*` caller credential require a verified SigV4 handshake identity when IAM enforcement is enabled. The private connection identity is retained for message and disconnect invocations, but permissions are evaluated again for every invocation against current caller/session, identity, resource, boundary and SCP policies. Signature headers and caller metadata are not read from message payloads. The legacy bare `*` credential remains a local compatibility bypass. This forwarding check does not enforce `execute-api:Invoke` route permissions or issue execution-role STS sessions.
 
 WebSocket `$connect` routes configured with `AWS_IAM` require a verified SigV4 handshake and `execute-api:Invoke` on the API owner, region, stage and `$connect` route when IAM enforcement is enabled. Authorization runs before the upgrade, including when no integration is configured. It uses current caller/session policies, permissions boundaries and SCPs. New connections observe revocation; route authorization is performed at connection time. This is separate from the Lambda caller-permission check on each message or disconnect invocation. IAM-disabled local connections and non-IAM routes retain their existing behavior. REST route authorization, full forwarded condition context and issued execution-role STS sessions remain separate work.
+
+
+### REST IAM route authorization
+
+With IAM enforcement enabled, REST methods configured with `AWS_IAM` require both a verified
+SigV4 caller and authorization for `execute-api:Invoke` on the API owner, region, stage, concrete
+HTTP method and requested resource path. The shared IAM evaluator combines identity, session,
+permissions-boundary, SCP and stored REST resource policies. Cross-account access requires both
+identity and resource grants. Explicit denials take precedence. Lambda integration permissions
+remain a separate check against the same qualified function that is invoked.
+
+Stored policy resources using `execute-api:/stage/METHOD/path` are expanded for evaluation against
+the owning API without changing stored readback. AWS expands this shorthand when saving the policy.
+This uses the existing live API policy storage; deployment-snapshot policy activation is not modeled
+here. Resource-policy workflows for unsigned, CUSTOM and Cognito routes, full inbound condition
+context and actual service execution-role STS sessions remain separate work. IAM-disabled routes
+retain signature validation without requiring policy grants.
