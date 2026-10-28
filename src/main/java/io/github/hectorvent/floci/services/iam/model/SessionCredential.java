@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.Map;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -15,6 +16,7 @@ public class SessionCredential {
     private String roleArn;
     private String roleSessionName;
     private String assumedRoleId;
+    private Map<String, String> sessionTags = Map.of();
     private Instant expiration;
     private Instant issuedAt;
     /** True only for credentials issued by GetSessionToken, never inferred from their key or token. */
@@ -119,6 +121,9 @@ public class SessionCredential {
 
     public String getAssumedRoleId() { return assumedRoleId; }
     public void setAssumedRoleId(String assumedRoleId) { this.assumedRoleId = assumedRoleId; }
+
+    public Map<String, String> getSessionTags() { return sessionTags; }
+    public void setSessionTags(Map<String, String> tags) { sessionTags = tags == null ? Map.of() : Map.copyOf(tags); }
 
     public Instant getIssuedAt() { return issuedAt; }
     public void setIssuedAt(Instant issuedAt) { this.issuedAt = issuedAt; }
