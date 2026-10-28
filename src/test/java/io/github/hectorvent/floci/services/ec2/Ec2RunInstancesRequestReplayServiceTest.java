@@ -463,6 +463,39 @@ class Ec2RunInstancesRequestReplayServiceTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
+    void queryLaunchReclaimsRootAndDataVolumesBeforeRetry(String mode) {
+        try (Fixture fixture = new Fixture(mode, directory)) {
+            AccountAwareStorageBackend<Volume> volumes = fixture.factory.store("ec2-volumes.json");
+            AccountAwareStorageBackend<Instance> instances = fixture.factory.store("ec2-instances.json");
+            AtomicInteger volumeWrites = new AtomicInteger();
+            doAnswer(call -> {
+                volumeWrites.incrementAndGet();
+                return call.callRealMethod();
+            }).when(volumes).putAllAtomically(anyMap());
+            IllegalStateException failure = new IllegalStateException("instance publication failed");
+            doThrow(failure).when(instances).putAllAtomically(anyMap());
+            MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
+            Map.of("ImageId", "ami-test", "InstanceType", "t3.micro", "ClientToken", "volume-token",
+                    "BlockDeviceMapping.1.DeviceName", "/dev/sdf", "BlockDeviceMapping.1.Ebs.VolumeSize", "3",
+                    "BlockDeviceMapping.1.Ebs.DeleteOnTermination", "false")
+                    .forEach(parameters::putSingle);
+            Ec2QueryHandler handler = new Ec2QueryHandler(fixture.service,
+                    mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), null, null, null, null, null);
+
+            assertSame(failure, assertThrows(IllegalStateException.class,
+                    () -> handler.handle("RunInstances", parameters, "us-east-1")));
+            assertEquals(2, volumeWrites.get(), "Both planned volumes must exist before the injected failure");
+            assertTrue(volumes.scan(key -> true).isEmpty(), "Failed publication must reclaim root and data volumes");
+            reset(instances);
+            assertEquals(200, handler.handle("RunInstances", parameters, "us-east-1").getStatus());
+            assertEquals(2, volumes.scan(key -> true).size());
+            assertEquals(200, handler.handle("RunInstances", parameters, "us-east-1").getStatus());
+            assertEquals(4, volumeWrites.get(), "Exact replay must not allocate another volume");
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         private final FaultFactory factory;
         private final Ec2Service service;
