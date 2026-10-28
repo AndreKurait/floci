@@ -246,7 +246,7 @@ public class WebSocketHandler {
         // Look up the $connect route
         Route connectRoute = apiGatewayV2Service.findRouteByKey(region, apiId, "$connect");
 
-        if (!permitsConnect(connectRoute, verified, region, apiId, stageName)) {
+        if (!permitsConnect(connectRoute, verified, region, apiId, stageName, sourceIp, secureTransport)) {
             ctx.response().setStatusCode(403).end();
             return;
         }
@@ -302,7 +302,7 @@ public class WebSocketHandler {
     }
 
     boolean permitsConnect(Route route, ExecuteApiSigV4Authorizer.Result verified,
-                           String region, String apiId, String stage) {
+                           String region, String apiId, String stage, String sourceIp, boolean secureTransport) {
         if (route == null || !"AWS_IAM".equalsIgnoreCase(route.getAuthorizationType())
                 || !config.services().iam().enforcementEnabled()) {
             return true;
@@ -313,8 +313,8 @@ public class WebSocketHandler {
         CallerIdentity caller = verified.identity();
         String resource = AwsArnUtils.Arn.of("execute-api", region, regionResolver.getAccountId(),
                 apiId + "/" + stage + "/$connect").toString();
-        return callerCallAuthorizer.authorize(caller.accessKey(), caller.accountId(), caller.userArn(),
-                "execute-api:Invoke", resource, regionResolver.getPartition()) == Decision.ALLOW;
+        return callerCallAuthorizer.authorizeRequest(caller.accessKey(), caller.accountId(), caller.userArn(),
+                "execute-api:Invoke", resource, regionResolver.getPartition(), sourceIp, secureTransport) == Decision.ALLOW;
     }
 
     /**
