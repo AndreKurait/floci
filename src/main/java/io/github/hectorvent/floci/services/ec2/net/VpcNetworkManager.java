@@ -542,13 +542,11 @@ public class VpcNetworkManager {
      * Creates the VPC's Docker network if it does not exist yet, and attaches the container to
      * it at {@code address}.
      *
-     * <p>The container keeps its default bridge attachment as well. That is deliberate: EC2
-     * containers publish SSH on a host port, and on macOS Docker Desktop setting a network mode
-     * alongside port bindings suppresses publishing entirely (see ContainerLifecycleManager).
-     * Attaching as a second network keeps published ports working while making the VPC address
-     * the one Floci reports, and the one instances in the same VPC use to reach each other.
+     * <p>The container keeps its declared primary network attachment for reaching Floci.
+     * The VPC address is the one Floci reports and instances in the same VPC use to reach
+     * each other. This method does not add a default bridge attachment.
      *
-     * @return the network name on success, empty when the instance stays on the bridge only
+     * @return the network name on success, empty when the instance stays on its primary network only
      */
     public Optional<String> attach(String region, String vpcId, String subnetId,
                                    String containerId, String address) {
@@ -679,6 +677,11 @@ public class VpcNetworkManager {
                 LOG.debugv("Could not inspect VPC network {0}: {1}", vpc.networkName, e.getMessage());
             }
             if (existing != null) {
+                if (Boolean.TRUE.equals(existing.getInternal())
+                        != config.services().ec2().vpcNetworks().internal()) {
+                    throw new IllegalStateException("Existing VPC network " + vpc.networkName
+                            + " has a different internal setting; preserve it and select a fresh deployment");
+                }
                 List<Cidr4> actual = ipamSubnets(existing);
                 if (actual.contains(vpc.effective)) {
                     vpc.created = true;
@@ -711,6 +714,7 @@ public class VpcNetworkManager {
                 dockerClient.createNetworkCmd()
                         .withName(vpc.networkName)
                         .withDriver(config.services().ec2().vpcNetworks().driver())
+                        .withInternal(config.services().ec2().vpcNetworks().internal())
                         .withIpam(new Network.Ipam().withConfig(
                                 new Network.Ipam.Config().withSubnet(vpc.effective.toString())))
                         .withLabels(networkLabels(vpc))

@@ -1641,6 +1641,7 @@ State is reported settled rather than transitional, as elsewhere in this service
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_FALLBACK_PREFIX_LENGTH` | `16` | Prefix length of each block handed out of that pool |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP` | `true` | Remove VPC networks left behind by a previous run of this same emulator |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_DRIVER` | `bridge` | Docker network driver used for VPC networks |
+| `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL` | `false` | Create internal Docker VPC networks without external connectivity through that network |
 
 ## VPC Docker networks
 
@@ -1655,6 +1656,16 @@ network attachment. This keeps management calls responsive even when the Docker 
 For overlapping VPC CIDRs, the first VPC whose addresses are needed keeps the declared range;
 later VPCs use the fallback pool. Within one emulator run, allocated addresses remain on the
 same effective range.
+
+Set `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL=true` to create internal Docker VPC
+bridges. This deployment setting does not change EC2 request or response fields.
+A retained VPC network with a different internal setting refuses attachment and
+is preserved; use a fresh deployment when changing this option.
+Other guest network attachments retain their own connectivity, so this option
+alone does not isolate a guest attached to an external bridge. Configure the
+guest's primary network accordingly. Docker host access and explicit forwarding
+also remain separate from this network setting.
+Publishing the guest's SSH port does not add Docker's default bridge.
 
 When Floci runs in Docker, use Docker Engine 28 or newer for VPC networking.
 Floci joins each VPC with gateway priority `-1`, keeping its default gateway and
