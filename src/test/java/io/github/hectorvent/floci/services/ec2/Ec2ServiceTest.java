@@ -6265,6 +6265,65 @@ class Ec2ServiceTest {
         assertNotNull(attached.getEbs().getSnapshotId());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void startupRestoresWorkloadsOnlyWhenEc2IsEnabled(boolean enabled) {
+        EmulatorConfig config = mockConfig(false);
+        when(config.services().ec2().enabled()).thenReturn(enabled);
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance instance = persistedInstance("i-other", "10.20.1.10", InstanceState.running());
+        instance.setDockerContainerId("container-other");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-other", instance);
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        when(containers.restoreMetadataRegistration(any())).thenReturn(true);
+        Ec2PortForwardManager forwarding = mock(Ec2PortForwardManager.class);
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        when(networks.enabled()).thenReturn(true);
+        Ec2Service service = new Ec2Service(config, containers, forwarding,
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), networks);
+
+        service.restoreMetadataRegistrations();
+
+        verify(forwarding).setPersister(any());
+        if (enabled) {
+            verify(containers).restoreMetadataRegistration(instance);
+            verify(containers).reconcileOrphanedContainers(any());
+            verify(networks).reconcileOrphans(any());
+            verify(forwarding).restore(instance);
+        } else {
+            verifyNoInteractions(containers, networks);
+            verify(forwarding, never()).restore(any());
+        }
+        assertEquals("running", instanceStore.getForAccount("111122223333", "us-east-1::i-other")
+                .orElseThrow().getState().getName());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shutdownStopsWorkloadsOnlyWhenEc2IsEnabled(boolean enabled) {
+        EmulatorConfig config = mockConfig(false);
+        when(config.services().ec2().enabled()).thenReturn(enabled);
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance instance = persistedInstance("i-other", "10.20.1.10", InstanceState.running());
+        instance.setDockerContainerId("container-other");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-other", instance);
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), mock(VpcNetworkManager.class));
+
+        service.stopManagedContainers();
+
+        if (enabled) {
+            verify(containers).stopForShutdown(instance);
+        } else {
+            verifyNoInteractions(containers);
+        }
+        assertEquals(enabled ? "stopped" : "running", instanceStore.getForAccount("111122223333", "us-east-1::i-other")
+                .orElseThrow().getState().getName());
+    }
+
     @Test
     void restoreReReservesThePrivateAddressesOfInstancesThatSurvivedTheRestart() {
         // The lease table is in-memory, so a restart rebuilds it empty while the containers of
@@ -9081,6 +9140,7 @@ class Ec2ServiceTest {
         when(config.defaultAccountId()).thenReturn("000000000000");
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
+        when(ec2.enabled()).thenReturn(true);
         when(ec2.mock()).thenReturn(ec2Mock);
         when(ec2.mockPublicAddresses()).thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.DOCUMENTATION);
         when(ec2.mockPublicAddress()).thenReturn(Optional.empty());
