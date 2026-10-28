@@ -246,5 +246,20 @@ aws events put-targets \
 - A `PutEvents` entry for an event bus that does not exist is answered as AWS answers it: with an event id, not counted in `FailedEntryCount`, and dropped, as no rule matches it. Floci logs the drop at `INFO`. Floci's own deliveries to a bus, for a rule, a pipe or a schedule, are unchanged: an entry for a bus that does not exist fails there.
 - A `Detail` forwarded to an event bus must be a JSON object, as in AWS; anything else is dropped, including an `InputPath` selecting a scalar such as `$.detail.orderId` or an envelope carrying `"detail": null`.
 - A bus ARN naming another account is forwarded under that account, so the target bus and its rules resolve there.
-- Onward delivery from that bus follows each target type: SQS and Step Functions resolve cross-account, while Lambda, SNS, Batch and Firehose resolve in the caller's account.
+- Onward delivery from that bus follows each target type: SQS, Lambda and Step Functions resolve cross-account, while SNS, Batch and Firehose resolve in the caller's account.
 - An event is forwarded between buses only once, matching AWS: a bus that received an event from another bus does not forward it on to a third. The second hop is dropped with only a `WARN` rather than reported to the caller.
+
+### Lambda target permissions
+
+With IAM enforcement enabled, Lambda targets without `RoleArn` are checked against
+the function resource policy before each delivery attempt. The policy must allow
+`events.amazonaws.com` to invoke the exact function, version or alias named by the
+target. Source conditions use the rule ARN and its owning account, including rules
+on custom event buses. Permission refusal uses the existing `NO_PERMISSIONS`
+dead-letter path without scheduling a retry.
+
+Targets with an execution `RoleArn` retain their existing behavior; execution-role
+trust and invocation-policy enforcement remain unsupported by this delivery path.
+This resource-policy check alone does not implement AWS cross-account targets,
+which require an execution role and a target resource policy. API Gateway Lambda
+integration authorization remains separate.
