@@ -2553,6 +2553,53 @@ class IamServiceTest {
     }
 
     @Test
+    void explicitRoleSessionRetainsIdentityPartitionTokenAndCleanupOwnership() {
+        String accountId = "222233334444";
+        String accessKeyId = "ASIASERVICEROLETEST";
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions,
+                new RegionResolver("us-gov-west-1", accountId));
+        IamRole role = service.createRole("worker", "/service-role/", "{}", null, 3600, null);
+        Instant expires = Instant.now().plusSeconds(900);
+        service.registerSessionForAccount(accountId, accessKeyId, "secret", "token", role.getArn(), expires,
+                null, "service-call", role.getRoleId() + ":service-call");
+        SessionCredential stored = sessions.getForAccount(accountId, accessKeyId).orElseThrow();
+        assertEquals(expires, stored.getExpiration());
+        assertEquals(accountId, stored.getOriginAccountId());
+        assertEquals("service-call", stored.getRoleSessionName());
+        assertFalse(stored.isLambdaExecutionRole());
+        assertTrue(sessions.getForAccount("000000000000", accessKeyId).isEmpty());
+        IamService.CallerArns principal = service.resolveCallerArns(accessKeyId).orElseThrow();
+        assertEquals(role.getArn(), principal.principalArn());
+        assertEquals("arn:aws-us-gov:sts::" + accountId + ":assumed-role/worker/service-call", principal.callerArn());
+        assertEquals(role.getRoleId() + ":service-call", principal.userId());
+        assertEquals("secret", service.findSecretKey(accessKeyId, "token").orElseThrow());
+        assertTrue(service.findSecretKey(accessKeyId, "wrong-token").isEmpty());
+        assertTrue(service.findSecretKey(accessKeyId, null).isEmpty());
+        service.unregisterSession(accountId, accessKeyId);
+        assertTrue(service.resolveCallerArns(accessKeyId).isEmpty());
+        assertTrue(service.findSecretKey(accessKeyId, "token").isEmpty());
+        assertTrue(sessions.getForAccount(accountId, accessKeyId).isEmpty());
+    }
+
+    @Test
+    void explicitRoleSessionExpiryRemovesOnlyTheOwnedCredential() {
+        String accountId = "222233334444";
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        String roleArn = "arn:aws:iam::" + accountId + ":role/service-role/worker";
+        service.registerSessionForAccount(accountId, "ASIAEXPIREDSERVICE", "secret", "token", roleArn,
+                Instant.now().minusSeconds(1), null, "expired", "AROAEXAMPLE:expired");
+        service.registerSessionForAccount("333344445555", "ASIAOTHERSERVICE", "secret", "other-token", roleArn,
+                Instant.now().plusSeconds(900), null, "other", "AROAEXAMPLE:other");
+        assertTrue(service.resolveCallerArns("ASIAEXPIREDSERVICE").isEmpty());
+        assertTrue(sessions.getForAccount(accountId, "ASIAEXPIREDSERVICE").isEmpty());
+        assertTrue(sessions.getForAccount("333344445555", "ASIAOTHERSERVICE").isPresent());
+    }
+
+    @Test
     void temporarySessionUsesExplicitAccountNamespace() {
         String accountId = "222233334444";
         String accessKeyId = "ASIASIGNINEXPLICIT";
