@@ -996,6 +996,23 @@ through `payment-pending`/`assessing`. `DescribeCapacityReservations` supports t
 `availability-zone`, `end-date-type`, `instance-match-criteria`, `instance-platform`,
 `instance-type`, `state` and `tenancy` filters alongside the shared `tag:`, `tag-key` and
 `tag-value` filters.
+Future-dated requests store a `scheduled` reservation with `StartDate`,
+`DeliveryPreference: incremental` and `CommitmentInfo`. `StartDate` must be 5 to 120
+days ahead and requires `CommitmentDuration` (1 to 200000000 seconds). Scheduled
+capacity cannot satisfy instance launches. The existing capacity reconciliation
+activates it when its start time is reached. Repeating a `ClientToken` returns the
+same reservation; changed reservation parameters, including creation tags, are rejected.
+Creation tags are persisted with the reservation and are not reapplied on replay, so
+later `CreateTags` edits survive a retry. Tag order does not change request identity.
+Future-dated requests require explicit `InstanceMatchCriteria: targeted`, at least
+32 vCPUs in total using the instance-type catalog, and an instance type in the C, G,
+I, M, R, T, U or X families. Omitted or `open` matching is rejected before publication.
+Activation does not adopt existing running instances; launches must explicitly target
+the reservation. Immediate reservations retain their existing open-matching behavior.
+
+Assessment and incremental delivery are modeled synchronously, without AWS capacity
+assessment or billing. Cancellation retains Floci's immediate cancellation behavior;
+cancellation quotes and charges are not modeled.
 
 Capacity moves require different, active reservations in the caller's account and region
 with matching instance type, platform, Availability Zone, tenancy, placement group and

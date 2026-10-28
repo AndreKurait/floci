@@ -17,7 +17,7 @@ import java.util.Map;
  *
  * <p>Real AWS transitions a Capacity Reservation through {@code payment-pending}/
  * {@code assessing} before {@code active}; nothing about creating one is slow here, so it is
- * {@code active} on the create response and on the first describe, the same synchronous-create
+ * {@code active} for immediate requests and {@code scheduled} for future requests, using the same
  * simplification the other regional EC2 resources make.
  */
 @RegisterForReflection
@@ -38,6 +38,13 @@ public class CapacityReservation {
     private boolean ephemeralStorage;
     private String state = "active";
     private Instant startDate;
+    private Long commitmentDuration;
+    private Instant commitmentEndDate;
+    private Integer committedInstanceCount;
+    private String deliveryPreference;
+    private String clientToken;
+    private List<String> requestParameters = new ArrayList<>();
+    private Map<String, String> requestTags = new LinkedHashMap<>();
     private Instant endDate;
     private String endDateType = "unlimited";
     private String instanceMatchCriteria = "open";
@@ -49,7 +56,6 @@ public class CapacityReservation {
     private List<String> instanceIds = new ArrayList<>();
     private Map<String, String> instanceOwners = new LinkedHashMap<>();
     private Map<String, CapacityReservationMove> completedMoves = new HashMap<>();
-    private String clientToken;
     // Mutable reservation state must not change which original request a token identifies.
     private Map<String, String> creationParameters = new LinkedHashMap<>();
 
@@ -70,6 +76,13 @@ public class CapacityReservation {
         ephemeralStorage = other.ephemeralStorage;
         state = other.state;
         startDate = other.startDate;
+        commitmentDuration = other.commitmentDuration;
+        commitmentEndDate = other.commitmentEndDate;
+        committedInstanceCount = other.committedInstanceCount;
+        deliveryPreference = other.deliveryPreference;
+        clientToken = other.clientToken;
+        requestParameters = new ArrayList<>(other.requestParameters);
+        requestTags = new LinkedHashMap<>(other.requestTags);
         endDate = other.endDate;
         endDateType = other.endDateType;
         instanceMatchCriteria = other.instanceMatchCriteria;
@@ -81,9 +94,11 @@ public class CapacityReservation {
         completedMoves = new HashMap<>(other.completedMoves);
         instanceIds = new ArrayList<>(other.instanceIds);
         instanceOwners = new LinkedHashMap<>(other.instanceOwners);
-        clientToken = other.clientToken;
         creationParameters = new LinkedHashMap<>(other.creationParameters);
     }
+
+    public Map<String, String> getRequestTags() { return requestTags; }
+    public void setRequestTags(Map<String, String> requestTags) { this.requestTags = requestTags; }
 
     public String getCapacityReservationId() { return capacityReservationId; }
     public void setCapacityReservationId(String capacityReservationId) { this.capacityReservationId = capacityReservationId; }
@@ -126,6 +141,19 @@ public class CapacityReservation {
     public Instant getStartDate() { return startDate; }
     public void setStartDate(Instant startDate) { this.startDate = startDate; }
 
+    public Long getCommitmentDuration() { return commitmentDuration; }
+    public void setCommitmentDuration(Long value) { commitmentDuration = value; }
+    public Instant getCommitmentEndDate() { return commitmentEndDate; }
+    public void setCommitmentEndDate(Instant value) { commitmentEndDate = value; }
+    public Integer getCommittedInstanceCount() { return committedInstanceCount; }
+    public void setCommittedInstanceCount(Integer value) { committedInstanceCount = value; }
+    public String getDeliveryPreference() { return deliveryPreference; }
+    public void setDeliveryPreference(String value) { deliveryPreference = value; }
+    public String getClientToken() { return clientToken; }
+    public void setClientToken(String value) { clientToken = value; }
+    public List<String> getRequestParameters() { return requestParameters; }
+    public void setRequestParameters(List<String> value) { requestParameters = new ArrayList<>(value); }
+
     public Instant getEndDate() { return endDate; }
     public void setEndDate(Instant endDate) { this.endDate = endDate; }
 
@@ -160,8 +188,6 @@ public class CapacityReservation {
     public void setCompletedMoves(Map<String, CapacityReservationMove> completedMoves) {
         this.completedMoves = completedMoves;
     }
-    public String getClientToken() { return clientToken; }
-    public void setClientToken(String clientToken) { this.clientToken = clientToken; }
 
     public Map<String, String> getCreationParameters() { return creationParameters; }
     public void setCreationParameters(Map<String, String> creationParameters) {
