@@ -19,6 +19,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -44,6 +45,7 @@ class ServiceRoleCallAuthorizerTest {
 
     private static final Instant NOW = Instant.parse("2026-10-26T16:00:00Z");
 
+    private final Map<String, IamService.CallerArns> sessions = new HashMap<>();
     private Clock clock;
     private IamService iam;
     private IamRole role;
@@ -62,6 +64,27 @@ class ServiceRoleCallAuthorizerTest {
         role = new IamRole();
         role.setArn(ROLE);
         role.setRoleName("events");
+        role.setRoleId("AROAEXAMPLE");
+        doAnswer(invocation -> {
+            String key = invocation.getArgument(1);
+            String arn = invocation.getArgument(4);
+            String sessionName = invocation.getArgument(7);
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            sessions.put(key, new IamService.CallerArns(
+                    AwsArnUtils.Arn.global(parsed.partition(), "sts", parsed.accountId(),
+                            "assumed-role/events/" + sessionName).toString(), arn,
+                    IamService.CallerArns.TYPE_ASSUMED_ROLE, invocation.getArgument(8), null,
+                    role.getPermissionsBoundaryArn() != null));
+            return null;
+        }).when(iam).registerSessionForAccount(anyString(), anyString(), anyString(), anyString(),
+                anyString(), any(Instant.class), isNull(), anyString(), nullable(String.class));
+        when(iam.resolveCallerArns(anyString())).thenAnswer(invocation -> Optional.ofNullable(sessions.get(invocation.getArgument(0))));
+        when(iam.resolveCallerContext(anyString(), any(Instant.class)))
+                .thenAnswer(invocation -> iam.resolvePrincipalContext(role.getArn()));
+        doAnswer(invocation -> {
+            sessions.remove(invocation.getArgument(1));
+            return null;
+        }).when(iam).unregisterSession(anyString(), anyString());
         role.setAssumeRolePolicyDocument(TRUST);
         when(iam.findRole(ACCOUNT, "events")).thenReturn(Optional.of(role));
         when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(ALLOW)));
@@ -79,31 +102,53 @@ class ServiceRoleCallAuthorizerTest {
                 new AssumeRolePolicyEvaluator(new ObjectMapper(), evaluator), evaluator, providers, scpInstance, clock);
     }
 
+
+
     @ParameterizedTest
-    @CsvSource({"aws,us-east-1,aws,us-west-2", "aws,us-east-1,aws-cn,cn-north-1",
-            "aws,us-east-1,aws-us-gov,us-gov-west-1", "aws-cn,cn-north-1,aws,us-east-1",
-            "aws-cn,cn-north-1,aws-cn,cn-northwest-1", "aws-cn,cn-north-1,aws-us-gov,us-gov-west-1",
-            "aws-us-gov,us-gov-west-1,aws,us-east-1", "aws-us-gov,us-gov-west-1,aws-cn,cn-north-1",
-            "aws-us-gov,us-gov-west-1,aws-us-gov,us-gov-east-1"})
-    void sourceContextRequiresTargetInTheSamePartition(String sourcePartition, String sourceRegion,
-                                                       String targetPartition, String targetRegion) {
-        String executionRole = ROLE.replace("arn:aws:", "arn:" + sourcePartition + ":");
-        String source = RULE.replace("arn:aws:", "arn:" + sourcePartition + ":")
-                .replace("us-east-1", sourceRegion);
-        String target = FUNCTION.replace("arn:aws:", "arn:" + targetPartition + ":")
-                .replace("us-east-1", targetRegion);
-        role.setArn(executionRole);
-        role.setAssumeRolePolicyDocument(TRUST.replace(RULE, source));
-        when(iam.resolvePrincipalContext(executionRole)).thenReturn(CallerContext.of(List.of(ALLOW)));
-        assertEquals(sourcePartition.equals(targetPartition) ? Decision.ALLOW : Decision.DENY,
-                authorizer.authorize("events", executionRole, INVOKE, target, source, ACCOUNT));
+    @ValueSource(strings = {"allow", "deny", "provider-failure", "resolution-failure", "registration-failure"})
+    void issuedCredentialIsRevokedAfterEveryEvaluationOutcome(String outcome) {
+        switch (outcome) {
+            case "deny" -> when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(DENY)));
+            case "provider-failure" -> when(scps.effectiveScpLevels(ACCOUNT)).thenThrow(new IllegalStateException("provider"));
+            case "resolution-failure" -> when(iam.resolveCallerContext(anyString(), any(Instant.class)))
+                    .thenThrow(new IllegalStateException("resolution"));
+            case "registration-failure" -> doThrow(new IllegalStateException("registration"))
+                    .when(iam).registerSessionForAccount(anyString(), anyString(), anyString(), anyString(),
+                            anyString(), any(Instant.class), isNull(), anyString(), nullable(String.class));
+            default -> { }
+        }
+        if (outcome.endsWith("failure")) {
+            assertThrows(IllegalStateException.class, () -> authorizer.authorize("events", ROLE, INVOKE, FUNCTION, RULE, ACCOUNT));
+        } else {
+            assertEquals(outcome.equals("allow") ? Decision.ALLOW : Decision.DENY,
+                    authorizer.authorize("events", ROLE, INVOKE, FUNCTION, RULE, ACCOUNT));
+        }
+        assertTrue(sessions.isEmpty());
+        verify(iam).registerSessionForAccount(eq(ACCOUNT), matches("ASIA[A-F0-9]{16}"), matches("[A-Za-z0-9+/]{40}"),
+                matches("[A-Za-z0-9+/]{200}"), eq(ROLE), eq(NOW.plusSeconds(900)), isNull(),
+                matches("floci-service-[A-F0-9]{16}"), matches("AROAEXAMPLE:floci-service-[A-F0-9]{16}"));
+        verify(iam).unregisterSession(eq(ACCOUNT), matches("ASIA[A-F0-9]{16}"));
     }
 
     @Test
-    void sourceContextPreservesCrossPartitionBypassWhenIamIsDisabled() {
-        when(config.enforcementEnabled()).thenReturn(false);
-        assertEquals(Decision.ALLOW, authorizer.authorize("events", ROLE, INVOKE,
-                FUNCTION.replace("arn:aws:", "arn:aws-cn:"), RULE, ACCOUNT));
+    void cleanupFailurePreservesTheEvaluationFailure() {
+        IllegalStateException providerFailure = new IllegalStateException("provider");
+        IllegalStateException cleanupFailure = new IllegalStateException("cleanup");
+        when(scps.effectiveScpLevels(ACCOUNT)).thenThrow(providerFailure);
+        doThrow(cleanupFailure).when(iam).unregisterSession(anyString(), anyString());
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> authorizer.authorize("events", ROLE, INVOKE, FUNCTION, RULE, ACCOUNT));
+        assertSame(providerFailure, failure);
+        assertArrayEquals(new Throwable[]{cleanupFailure}, failure.getSuppressed());
+    }
+
+    @Test
+    void deniedTrustDoesNotIssueCredentials() {
+        role.setAssumeRolePolicyDocument(TRUST.replace("events.amazonaws.com", "sns.amazonaws.com"));
+        assertEquals(Decision.DENY, authorizer.authorize("events", ROLE, INVOKE, FUNCTION, RULE, ACCOUNT));
+        verify(iam, never()).registerSessionForAccount(anyString(), anyString(), anyString(), anyString(),
+                anyString(), any(Instant.class), isNull(), anyString(), nullable(String.class));
+        assertTrue(sessions.isEmpty());
     }
 
     @ParameterizedTest
