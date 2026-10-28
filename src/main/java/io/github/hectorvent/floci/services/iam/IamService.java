@@ -4773,10 +4773,20 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
                                 String roleArn, Instant expiration, String sessionPolicyDocument,
                                 String originAccountId, String roleSessionName, String assumedRoleId) {
+        registerSession(sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, expiration,
+                sessionPolicyDocument, originAccountId, roleSessionName, assumedRoleId, Map.of());
+    }
+
+    /** Stores immutable session-owned tags without changing the issuing role's tags. */
+    public void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                                String roleArn, Instant expiration, String sessionPolicyDocument,
+                                String originAccountId, String roleSessionName, String assumedRoleId,
+                                Map<String, String> sessionTags) {
         SessionCredential session = new SessionCredential(sessionAccessKeyId, secretAccessKey, sessionToken,
                 roleArn, expiration, sessionPolicyDocument, originAccountId);
         session.setRoleSessionName(roleSessionName);
         session.setAssumedRoleId(assumedRoleId);
+        session.setSessionTags(sessionTags);
         putNewSession(sessionAccessKeyId, session);
     }
 
@@ -5827,7 +5837,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return Optional.of(new CallerArns(sessionArn, roleArn, CallerArns.TYPE_ASSUMED_ROLE,
                 sessionUserId(session).orElse(null), null,
                 role != null && role.getPermissionsBoundaryArn() != null)
-                .withPrincipalTags(role == null || !roleArnMatches(roleArn, role) ? Map.of() : role.getTags()));
+                .withPrincipalTags(StsSessionTags.effective(
+                        role == null || !roleArnMatches(roleArn, role) ? Map.of() : role.getTags(),
+                        session.getSessionTags())));
     }
 
     /**
