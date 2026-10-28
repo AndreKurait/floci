@@ -1026,6 +1026,10 @@ class Ec2IntegrationTest {
             .formParam("BlockDeviceMapping.1.Ebs.SnapshotId", "snap-1234567890abcdef0")
             .formParam("BlockDeviceMapping.1.Ebs.VolumeSize", "8")
             .formParam("BlockDeviceMapping.1.Ebs.VolumeType", "gp3")
+            .formParam("TagSpecification.1.ResourceType", "image")
+            .formParam("TagSpecification.1.Tag.1.Key", "Build")
+            .formParam("TagSpecification.1.Tag.1.Value", "example")
+            .formParam("TagSpecification.1.Tag.2.Key", "empty-value")
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -1037,8 +1041,11 @@ class Ec2IntegrationTest {
 
         given()
             .formParam("Action", "DescribeImages")
+            .formParam("Owner.1", "self")
             .formParam("Filter.1.Name", "name")
             .formParam("Filter.1.Value.1", imageName)
+            .formParam("Filter.2.Name", "tag:Build")
+            .formParam("Filter.2.Value.1", "example")
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -1046,6 +1053,10 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .contentType("application/xml")
             .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo(registeredImageId))
+            .body("DescribeImagesResponse.imagesSet.item.tagSet.item.find { it.key == 'Build' }.value",
+                    equalTo("example"))
+            .body("DescribeImagesResponse.imagesSet.item.tagSet.item.find { it.key == 'empty-value' }.value",
+                    equalTo(""))
             .body("DescribeImagesResponse.imagesSet.item.blockDeviceMapping.item.ebs.snapshotId",
                     equalTo("snap-1234567890abcdef0"));
     }
