@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -31,6 +32,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -68,6 +70,8 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
     // The store behind loadBalancers, for the startup passes that must reach every account; null
     // without a StorageFactory, when loadBalancers is a plain in-memory map
     private final AccountAwareStorageBackend<Map<String, ClassicLoadBalancer>> loadBalancerStore;
+    private final Map<String, Integer> dnsNameCounts = new ConcurrentHashMap<>();
+    private final Object dnsIndexLock = new Object();
 
     /** Serializes listener writes against each other; see {@link #createLoadBalancerListeners}. */
     private final Object listenerLock = new Object();
@@ -130,6 +134,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
      * reachable from {@link #initializeStorage()} may touch an injected collaborator.
      */
     public void restorePersistedRuntime() {
+        dnsNameCounts.clear();
         for (StoredRegion stored : storedRegions()) {
             for (ClassicLoadBalancer lb : stored.regionLbs().values()) {
                 // A balancer stored before balancers recorded their account belongs to the account
@@ -141,6 +146,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
                 // fixed zone every balancer used to report; take the region's zone again.
                 lb.setCanonicalHostedZoneNameId(
                         AwsRegionFacts.classicElbHostedZoneId(stored.region()).orElse(null));
+                indexDnsName(lb);
                 healthChecker.startMonitoring(lb);
                 healthChecker.registerInstances(lb, lb.getInstanceIds());
             }
@@ -252,10 +258,13 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             // putIfAbsent settles on its own, lock or no lock: checked and then written as two
             // steps, two creates of one name both pass and only the second survives.
             requireCertificates(region, listeners);
-            if (regionLbs.putIfAbsent(name, lb) != null) {
-                throw duplicateLoadBalancerName(name);
+            synchronized (dnsIndexLock) {
+                if (regionLbs.putIfAbsent(name, lb) != null) {
+                    throw duplicateLoadBalancerName(name);
+                }
+                loadBalancers.put(region, regionLbs);
+                indexDnsName(lb);
             }
-            loadBalancers.put(region, regionLbs);
         });
         healthChecker.startMonitoring(lb);
         return lb;
@@ -276,6 +285,35 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             result.add(lb);
         }
         return result;
+    }
+
+    /** Public load-balancer names select the owner independently of an API caller's credentials. */
+    List<ClassicLoadBalancer> findByDnsName(String dnsName) {
+        String normalized = normalizedDnsName(dnsName);
+        if (normalized == null || !dnsNameCounts.containsKey(normalized)) {
+            return List.of();
+        }
+        Collection<Map<String, ClassicLoadBalancer>> regions =
+                loadBalancerStore instanceof AccountAwareStorageBackend<Map<String, ClassicLoadBalancer>> aware
+                        ? aware.scanAllAccounts() : loadBalancers.values();
+        return regions.stream().flatMap(region -> region.values().stream())
+                .filter(lb -> normalized.equals(normalizedDnsName(lb.getDnsName())))
+                .toList();
+    }
+
+    private void indexDnsName(ClassicLoadBalancer lb) {
+        String name = normalizedDnsName(lb.getDnsName());
+        if (name != null) {
+            dnsNameCounts.merge(name, 1, Integer::sum);
+        }
+    }
+
+    private static String normalizedDnsName(String name) {
+        if (name == null) {
+            return null;
+        }
+        String lower = name.toLowerCase(Locale.ROOT);
+        return lower.endsWith(".") ? lower : lower + ".";
     }
 
     private void populateSourceSecurityGroup(String region, ClassicLoadBalancer lb) {
@@ -302,14 +340,23 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
 
     /** Deletes a load balancer. Deleting one that does not exist succeeds, as it does on AWS. */
     public void deleteLoadBalancer(String region, String name) {
-        Map<String, ClassicLoadBalancer> regionLbs = loadBalancers.get(region);
-        if (regionLbs == null) {
-            return;
+        ClassicLoadBalancer removed;
+        synchronized (dnsIndexLock) {
+            Map<String, ClassicLoadBalancer> regionLbs = loadBalancers.get(region);
+            if (regionLbs == null) {
+                return;
+            }
+            removed = regionLbs.remove(name);
+            if (removed != null) {
+                loadBalancers.put(region, regionLbs);
+                String dnsName = normalizedDnsName(removed.getDnsName());
+                if (dnsName != null) {
+                    dnsNameCounts.computeIfPresent(dnsName, (key, count) -> count == 1 ? null : count - 1);
+                }
+            }
         }
-        ClassicLoadBalancer removed = regionLbs.remove(name);
         if (removed != null) {
             healthChecker.stopMonitoring(removed);
-            loadBalancers.put(region, regionLbs);
         }
     }
 
