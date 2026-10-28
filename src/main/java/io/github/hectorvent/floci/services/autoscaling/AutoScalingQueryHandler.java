@@ -1707,8 +1707,7 @@ public class AutoScalingQueryHandler {
             if (key == null) { break; }
             String value = p.getFirst("Tags.member." + i + ".Value");
             tags.put(key, value != null ? value : "");
-            String propagate = p.getFirst("Tags.member." + i + ".PropagateAtLaunch");
-            propagateAtLaunch.put(key, propagate == null || Boolean.parseBoolean(propagate));
+            propagateAtLaunch.put(key, tagPropagateAtLaunch(p, i));
         }
         return new ParsedTags(tags, propagateAtLaunch);
     }
@@ -1721,10 +1720,15 @@ public class AutoScalingQueryHandler {
             String resourceId = p.getFirst("Tags.member." + i + ".ResourceId");
             String resourceType = p.getFirst("Tags.member." + i + ".ResourceType");
             String value = p.getFirst("Tags.member." + i + ".Value");
-            boolean propagateAtLaunch = Boolean.parseBoolean(p.getFirst("Tags.member." + i + ".PropagateAtLaunch"));
+            boolean propagateAtLaunch = tagPropagateAtLaunch(p, i);
             result.add(new TagRequest(resourceId, resourceType, key, value != null ? value : "", propagateAtLaunch));
         }
         return result;
+    }
+
+    private static boolean tagPropagateAtLaunch(MultivaluedMap<String, String> params, int index) {
+        String propagate = params.getFirst("Tags.member." + index + ".PropagateAtLaunch");
+        return propagate == null || Boolean.parseBoolean(propagate);
     }
 
     private record TagRequest(String resourceId, String resourceType, String key, String value, boolean propagateAtLaunch) {}
