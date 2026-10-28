@@ -21,7 +21,6 @@ import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
-import io.github.hectorvent.floci.services.elbv2.model.TargetHealth;
 import io.github.hectorvent.floci.services.ssm.SsmCommandService;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
@@ -137,7 +136,6 @@ public class AutoScalingReconciler {
         asgService.reconcileIfPresent(asg, () -> {
             removeTerminatingInstances(asg);
             removeStaleInstances(asg);
-            removeOrphanedTargetRegistrations(asg);
             promoteReadyInstances(asg);
             reconcileRefreshReplacements(asg);
 
@@ -345,39 +343,6 @@ public class AutoScalingReconciler {
             LOG.debugv("ASG {0}: keeping instance {1} during stale check: {2}",
                     asg.getAutoScalingGroupName(), instanceId, e.getMessage());
             return false;
-        }
-    }
-
-    private void removeOrphanedTargetRegistrations(AutoScalingGroup asg) {
-        if (asg.getTargetGroupARNs().isEmpty()) {
-            return;
-        }
-
-        Set<String> activeInstanceIds = asg.getInstances().stream()
-                .filter(instance -> isActiveLifecycleState(instance.getLifecycleState())
-                        || pausedRefreshOwns(asg, instance.getInstanceId()))
-                .map(AsgInstance::getInstanceId)
-                .collect(Collectors.toSet());
-
-        for (String tgArn : asg.getTargetGroupARNs()) {
-            try {
-                List<TargetDescription> orphanedTargets = elbV2Service.describeTargetHealth(
-                                asg.getRegion(), tgArn, List.of()).stream()
-                        .map(TargetHealth::getTarget)
-                        .filter(target -> target != null && target.getId() != null)
-                        .filter(target -> !activeInstanceIds.contains(target.getId()))
-                        .collect(Collectors.toList());
-                if (!orphanedTargets.isEmpty()) {
-                    elbV2Service.deregisterTargets(asg.getRegion(), tgArn, orphanedTargets);
-                    LOG.infov("ASG {0}: deregistered orphaned target(s) {1} from TG {2}",
-                            asg.getAutoScalingGroupName(),
-                            orphanedTargets.stream().map(TargetDescription::getId).collect(Collectors.toList()),
-                            tgArn);
-                }
-            } catch (Exception e) {
-                LOG.debugv("ASG {0}: could not reconcile TG {1}: {2}",
-                        asg.getAutoScalingGroupName(), tgArn, e.getMessage());
-            }
         }
     }
 
