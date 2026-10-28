@@ -45,6 +45,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
 
     private final Route53Service route53Service;
     private final DnsLookupHelper dnsLookupHelper;
+    private final EmbeddedDnsServer dnsServer;
     private final Set<String> flociSuffixes = new LinkedHashSet<>();
 
     public Route53DnsRecordSource(Route53Service route53Service) {
@@ -55,10 +56,16 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         this(route53Service, config, new DnsLookupHelper(config));
     }
 
-    @Inject
     public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config, DnsLookupHelper dnsLookupHelper) {
+        this(route53Service, config, dnsLookupHelper, null);
+    }
+
+    @Inject
+    public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config,
+                                  DnsLookupHelper dnsLookupHelper, EmbeddedDnsServer dnsServer) {
         this.route53Service = route53Service;
         this.dnsLookupHelper = dnsLookupHelper != null ? dnsLookupHelper : new DnsLookupHelper(config);
+        this.dnsServer = dnsServer;
         this.flociSuffixes.addAll(BUILTIN_SUFFIXES);
         if (config != null) {
             config.hostname().ifPresent(this.flociSuffixes::add);
@@ -284,6 +291,9 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     }
 
     private Optional<String> getLocalFlociAddress() {
+        if (dnsServer != null && dnsServer.getServerIp().isPresent()) {
+            return dnsServer.getServerIp();
+        }
         try {
             return Optional.of(InetAddress.getLocalHost().getHostAddress());
         } catch (Exception e) {
