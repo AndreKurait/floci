@@ -1087,9 +1087,17 @@ owner, the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exa
 qualified Lambda target. Missing permission returns an authorizer configuration
 error before invoking Lambda. Cached authorizer results do not invoke Lambda; a
 cache miss or stage cache flush makes the next invocation check permission again.
-Configured authorizer roles retain their existing execution path; this check does
-not implement role assumption, HTTP/WebSocket authorizer permissions, or prove
-live AWS or native-image parity.
+Configured REST Lambda authorizer roles are checked when IAM enforcement is enabled.
+The role must belong to the API owner, trust API Gateway, and permit invocation of
+the qualified target through identity/resource policies, permissions boundaries
+and SCPs. Cached authorizer results do not invoke Lambda; the next invocation after
+cache expiry or flush checks current permissions. Missing credentials continue to
+use Lambda resource-based permissions.
+
+This local role evaluation does not issue STS credentials or establish all
+service-specific trust condition keys. Integration caller-passthrough credentials
+are not an authorizer credential mode. HTTP/WebSocket role enforcement and live
+AWS or native-image parity remain outside this support.
 
 WebSocket REQUEST authorizers without `authorizerCredentialsArn` check the Lambda
 resource policy when IAM enforcement is enabled. The check uses the API account,
