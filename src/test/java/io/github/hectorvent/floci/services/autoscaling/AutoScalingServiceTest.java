@@ -23,6 +23,8 @@ import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
+import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -59,6 +61,50 @@ class AutoScalingServiceTest {
 
     private static final String REGION = "us-east-1";
     private AutoScalingService service;
+
+    @Test
+    void detachDeregistersOnlyActualMembersBeforeRemovingOwnership() {
+        ElbV2Service elb = mock(ElbV2Service.class);
+        AutoScalingService selected = new AutoScalingService(elb);
+        selected.ec2Service = mock(Ec2Service.class);
+        selected.regionResolver = new RegionResolver(REGION, "000000000000");
+        AutoScalingGroup group = service.requireGroup(REGION, "test-asg");
+        selected.groups = service.groups;
+        AsgInstance owned = new AsgInstance();
+        owned.setInstanceId("i-owned");
+        owned.setLifecycleState("InService");
+        group.getInstances().add(owned);
+        group.setTargetGroupARNs(List.of("shared-target-group"));
+
+        selected.detachInstances(REGION, "test-asg", List.of("i-owned", "i-other-group"), false);
+
+        ArgumentCaptor<List<TargetDescription>> targets = ArgumentCaptor.captor();
+        verify(elb).deregisterTargets(eq(REGION), eq("shared-target-group"), targets.capture());
+        assertEquals(List.of("i-owned"), targets.getValue().stream().map(TargetDescription::getId).toList());
+        assertTrue(group.getInstances().isEmpty());
+    }
+
+    @Test
+    void detachDeregistrationFailurePreservesMembershipForRetry() {
+        ElbV2Service elb = mock(ElbV2Service.class);
+        AutoScalingService selected = new AutoScalingService(elb);
+        selected.ec2Service = mock(Ec2Service.class);
+        selected.regionResolver = new RegionResolver(REGION, "000000000000");
+        selected.groups = service.groups;
+        AutoScalingGroup group = service.requireGroup(REGION, "test-asg");
+        AsgInstance owned = new AsgInstance();
+        owned.setInstanceId("i-owned");
+        owned.setLifecycleState("InService");
+        group.getInstances().add(owned);
+        group.setTargetGroupARNs(List.of("shared-target-group"));
+        doThrow(new AwsException("Throttling", "retry", 503)).when(elb)
+                .deregisterTargets(eq(REGION), eq("shared-target-group"), anyList());
+
+        assertThrows(AwsException.class,
+                () -> selected.detachInstances(REGION, "test-asg", List.of("i-owned"), false));
+
+        assertEquals(List.of(owned), group.getInstances());
+    }
 
     @BeforeEach
     void setUp() {
