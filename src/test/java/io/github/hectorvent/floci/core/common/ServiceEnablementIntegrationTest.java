@@ -9,6 +9,8 @@ import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Map;
 
@@ -26,6 +28,15 @@ class ServiceEnablementIntegrationTest {
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/2016-08-19/account-settings", "/2018-10-31/layers",
+            "/2020-04-22/code-signing-configs", "/2021-10-31/functions/absent/url"})
+    void separateLambdaManagementControllersHonorServiceDisablement(String path) {
+        given().get(path).then().statusCode(400)
+                .body("__type", equalTo("ServiceNotAvailableException"))
+                .body("message", equalTo("Service lambda is not enabled."));
     }
 
     @Test
