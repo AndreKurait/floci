@@ -183,7 +183,7 @@ class Ec2LaunchBlockDeviceMappingsIntegrationTest {
         assertEquals("gp2", gp2.getString("DescribeVolumesResponse.volumeSet.item.volumeType"));
         assertEquals("12", gp2.getString("DescribeVolumesResponse.volumeSet.item.size"));
         assertEquals("true", gp2.getString("DescribeVolumesResponse.volumeSet.item.encrypted"));
-        assertEquals("", gp2.getString("DescribeVolumesResponse.volumeSet.item.iops"));
+        assertEquals("100", gp2.getString("DescribeVolumesResponse.volumeSet.item.iops"));
         assertEquals("", gp2.getString("DescribeVolumesResponse.volumeSet.item.throughput"));
     }
 

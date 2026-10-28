@@ -46,6 +46,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -88,6 +89,15 @@ public class Ec2ContainerManager {
     private static final int LAUNCH_MAX_THREADS = 8;
     private static final int LAUNCH_QUEUE_CAPACITY = 64;
     private static final long USER_DATA_EXECUTION_TIMEOUT_MINUTES = 30;
+    private static final Pattern ENVIRONMENT_KEY = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
+    private static final Pattern PROCESS_LIMIT = Pattern.compile("([a-z][a-z0-9]*)=(-1|[0-9]+)(?::(-1|[0-9]+))?");
+    private static final Set<String> RESERVED_GUEST_ENVIRONMENT = Set.of(
+            "AWS_EC2_INSTANCE_ID", "AWS_ACCOUNT_ID", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ENDPOINT_URL",
+            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN",
+            "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS");
     // Wait for capacity so accepted launches are not dropped, but never run launch work on callers.
     static final RejectedExecutionHandler BLOCKING_BACKPRESSURE = (runnable, executor) -> {
         if (executor.isShutdown()) {
@@ -418,6 +428,12 @@ public class Ec2ContainerManager {
     public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region,
                        Set<Integer> appPorts, List<SecurityGroup> groups,
                        Map<String, List<String>> prefixLists) {
+        launch(instance, image, publicKey, region, appPorts, groups, prefixLists, null);
+    }
+
+    public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region,
+                       Set<Integer> appPorts, List<SecurityGroup> groups,
+                       Map<String, List<String>> prefixLists, Runnable postLaunch) {
         instance.setState(InstanceState.pending());
 
         // An instance record is metadata: id, addresses, tags and lifecycle state are all
@@ -529,6 +545,9 @@ public class Ec2ContainerManager {
                     failLaunch(instance, leasedPrivateIp);
                     return;
                 }
+                if (postLaunch != null) {
+                    postLaunch.run();
+                }
 
                 // Set public-facing addresses only for instances due one, by the rule mock instances
                 // follow too, or holding an Elastic IP their interface carries, which RunInstances
@@ -597,6 +616,7 @@ public class Ec2ContainerManager {
         String containerName = ContainerStorageHelper.resourceName(config, "ec2", null, instanceId);
         String imdsEndpoint = "http://" + flociHost + ":" + imdsPort;
         String serviceEndpoint = reachableEndpoint.baseUrl();
+        GuestOptions options = guestOptions(config.services().ec2());
 
         return portAllocator.allocateAndStart(
                 config.services().ec2().sshPortRangeStart(),
@@ -628,7 +648,7 @@ public class Ec2ContainerManager {
                 }
                 ContainerSpec spec = buildContainerSpec(containerName, image, region, serviceEndpoint, imdsEndpoint,
                         instanceId, sshHostPort, namespace, instance.getIamInstanceProfileArn() != null,
-                        instance.getInstanceType());
+                        instance.getInstanceType(), options);
                 containerId = image.dockerPlatform() == null
                         ? lifecycleManager.create(spec)
                         : lifecycleManager.create(spec, image.dockerPlatform());
@@ -674,8 +694,8 @@ public class Ec2ContainerManager {
     private ContainerSpec buildContainerSpec(String containerName, ResolvedAmiImage image, String region,
                                              String serviceEndpoint, String imdsEndpoint, String instanceId,
                                              int sshHostPort, SecurityGroupFirewallManager.Namespace namespace,
-                                             boolean hasInstanceProfile, String instanceType) {
-        // Minimal images keep the historic tail command, while cloud-image AMI guests can boot their init.
+                                             boolean hasInstanceProfile, String instanceType, GuestOptions options) {
+        // Image runtime keeps the image's startup contract; minimal and systemd retain their commands.
         ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image.dockerImage())
                 .withName(containerName)
                 .withEmbeddedDns()
@@ -683,6 +703,7 @@ public class Ec2ContainerManager {
                 .withEnv(localAwsEnvironment(region, serviceEndpoint, imdsEndpoint,
                         hasInstanceProfile))
                 .withEnv("AWS_EC2_INSTANCE_ID", instanceId)
+                .withEnv(options.environment())
                 .withHostDockerInternalOnLinux()
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
@@ -692,8 +713,11 @@ public class Ec2ContainerManager {
                 .withLabels(Map.of(LABEL_OWNER, ownerIdentity()))
                 // EC2 instances expose IMDS on 169.254.169.254. Floci needs network administration
                 // privileges in the local container to attach that link-local address.
-                .withPrivileged(namespace == null)
-                .withCmd(image.systemd() ? List.of("/sbin/init") : List.of("tail", "-f", "/dev/null"));
+                .withPrivileged(namespace == null);
+        options.ulimits().forEach((name, limit) -> specBuilder.withUlimit(name, limit.soft(), limit.hard()));
+        if (!image.imageRuntime()) {
+            specBuilder.withCmd(image.systemd() ? List.of("/sbin/init") : List.of("tail", "-f", "/dev/null"));
+        }
         if (config.services().ec2().instanceResourceLimits() && instanceType != null && !instanceType.isBlank()) {
             Optional<CatalogInstanceType> catalogType = instanceTypeCatalog.find(instanceType);
             if (catalogType.isPresent()) {
@@ -719,6 +743,47 @@ public class Ec2ContainerManager {
                     .withBind("/sys/fs/cgroup", "/sys/fs/cgroup");
         }
         return specBuilder.build();
+    }
+
+    private record GuestOptions(List<String> environment, Map<String, ContainerSpec.ResourceLimit> ulimits) {}
+
+    private static GuestOptions guestOptions(EmulatorConfig.Ec2ServiceConfig ec2) {
+        Map<String, String> environment = new LinkedHashMap<>();
+        for (String entry : ec2.extraEnv().orElse(List.of())) {
+            int split = entry == null ? -1 : entry.indexOf('=');
+            if (split <= 0 || !ENVIRONMENT_KEY.matcher(entry.substring(0, split)).matches()
+                    || entry.indexOf('\0') >= 0) {
+                throw new IllegalArgumentException("EC2 extra-env requires explicit KEY=VALUE entries");
+            }
+            String key = entry.substring(0, split);
+            if (RESERVED_GUEST_ENVIRONMENT.contains(key) || key.startsWith("AWS_ENDPOINT_URL_")
+                    || key.startsWith("AWS_EC2_METADATA_") || key.startsWith("AWS_CONTAINER_CREDENTIALS_")) {
+                throw new IllegalArgumentException("EC2 extra-env cannot override a reserved guest setting: " + key);
+            }
+            if (environment.putIfAbsent(key, entry.substring(split + 1)) != null) {
+                throw new IllegalArgumentException("EC2 extra-env contains a duplicate key: " + key);
+            }
+        }
+        Map<String, ContainerSpec.ResourceLimit> limits = new LinkedHashMap<>();
+        for (String entry : ec2.ulimits().orElse(List.of())) {
+            Matcher matcher = PROCESS_LIMIT.matcher(entry == null ? "" : entry);
+            if (!matcher.matches()) {
+                throw new IllegalArgumentException("EC2 ulimits requires name=soft[:hard] entries");
+            }
+            long soft;
+            long hard;
+            try {
+                soft = Long.parseLong(matcher.group(2));
+                hard = matcher.group(3) == null ? soft : Long.parseLong(matcher.group(3));
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("EC2 process limit exceeds the supported integer range", e);
+            }
+            if (limits.putIfAbsent(matcher.group(1), new ContainerSpec.ResourceLimit(soft, hard)) != null) {
+                throw new IllegalArgumentException("EC2 ulimits contains a duplicate name: " + matcher.group(1));
+            }
+        }
+        return new GuestOptions(environment.entrySet().stream()
+                .map(entry -> entry.getKey() + "=" + entry.getValue()).toList(), Map.copyOf(limits));
     }
 
     private void failLaunch(Instance instance) {
@@ -1366,6 +1431,7 @@ public class Ec2ContainerManager {
                         containerGone = true;
                     } catch (Exception e) {
                         LOG.warnv("Error removing EC2 container {0}: {1}", containerId, e.getMessage());
+                        return;
                     }
                     try {
                         // iptables/veth teardown lags behind container removal; prevents port-reuse conflicts.
@@ -1654,11 +1720,11 @@ public class Ec2ContainerManager {
     }
 
     static String[] metadataProxyInstallCommand() {
-        return Ec2MetadataProxy.installCommand();
+        return Ec2MetadataProxy.ec2InstallCommand();
     }
 
     static String[] metadataProxyStartCommand(String flociHost, int imdsPort) {
-        return Ec2MetadataProxy.startCommand(flociHost, imdsPort);
+        return Ec2MetadataProxy.ec2RoutingCommand(flociHost, imdsPort);
     }
 
 

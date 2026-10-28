@@ -3374,6 +3374,20 @@ public interface EmulatorConfig {
         /** Optional JSON file of additional regional AWS-managed prefix lists. */
         Optional<String> managedPrefixListCatalogPath();
 
+        /**
+         * Explicit guest environment entries, each {@code KEY=VALUE}. Duplicate keys and
+         * Floci-owned identity, credential, region, endpoint and IMDS settings are rejected.
+         * Env: {@code FLOCI_SERVICES_EC2_EXTRA_ENV}, comma-separated; escape a comma as {@code \,}.
+         */
+        Optional<List<String>> extraEnv();
+
+        /**
+         * Guest process limits, each {@code name=soft[:hard]}; omitted hard equals soft and
+         * {@code -1} means unlimited. Unset keeps Docker's defaults.
+         * Env: {@code FLOCI_SERVICES_EC2_ULIMITS}, comma-separated.
+         */
+        Optional<List<String>> ulimits();
+
         @WithDefault("true")
         boolean enabled();
 
@@ -3487,6 +3501,8 @@ public interface EmulatorConfig {
          * {@link #mockPublicAddress()}, which an Elastic IP on its primary private address then
          * shows too. Elastic IPs are allocated from 203.0.113.0/24 whatever this says, and
          * instances with containers always report the container's reachable address.
+         * {@code pool} allocates model identities from {@link #mockPublicAddressPool()};
+         * the caller must provide their local routing.
          *
          * Env var: FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES
          */
@@ -3502,13 +3518,24 @@ public interface EmulatorConfig {
          */
         Optional<String> mockPublicAddress();
 
+        /**
+         * Network-aligned IPv4 CIDR of at most 256 model identities, required when
+         * {@link #mockPublicAddresses()} is {@code pool}. This does not allocate Internet
+         * addresses or install routing: the caller owns delivery to each modeled instance.
+         *
+         * Env var: FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS_POOL
+         */
+        Optional<String> mockPublicAddressPool();
+
         enum MockPublicAddresses {
             /** No automatic public address. */
             NONE,
             /** An address from 203.0.113.0/24, distinct from other live instances while one is free. */
             DOCUMENTATION,
             /** The configured {@code mock-public-address}. */
-            FIXED
+            FIXED,
+            /** Distinct identities from the configured pool, with caller-owned local delivery. */
+            POOL
         }
 
         /**
