@@ -274,5 +274,11 @@ session registration. Virtual codes use the shared TOTP implementation with one 
 30-second window on either side. Existing credentials without recorded MFA provenance and
 GetFederationToken credentials leave the condition key absent.
 
-Hardware and account-root MFA devices are not supported. MFA for AssumeRole, MFA age context,
+Hardware and account-root MFA devices are not supported. MFA for AssumeRole
 and GetSessionToken's separate IAM/STS API restrictions remain outside this implementation.
+
+Verified GetSessionToken MFA sessions retain their authentication instant. Shared caller policy
+context computes `aws:MultiFactorAuthAge` in whole elapsed seconds when resolving the session.
+Non-MFA, federated and legacy records without verified authentication time leave age absent.
+A server clock moving before the authentication instant yields zero elapsed seconds. This does
+not establish AssumeRole MFA propagation, hardware MFA or live AWS clock-drift parity.
