@@ -4763,6 +4763,44 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void registerIssuedSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
                                       String federatedUserArn, Instant expiration, String sessionPolicyDocument,
                                       String originAccountId, String issuingAccessKeyId) {
+        putNewSession(sessionAccessKeyId, issuedSession(sessionAccessKeyId, secretAccessKey, sessionToken,
+                federatedUserArn, expiration, sessionPolicyDocument, originAccountId, issuingAccessKeyId));
+    }
+
+    /** Records explicit authentication provenance only for the GetSessionToken issuance path. */
+    public void registerSessionToken(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                                     Instant expiration, String originAccountId, String issuingAccessKeyId,
+                                     String serialNumber, String tokenCode, Instant authenticationTime) {
+        SessionCredential session = issuedSession(sessionAccessKeyId, secretAccessKey, sessionToken, null,
+                expiration, null, originAccountId, issuingAccessKeyId);
+        boolean authenticated = false;
+        if (serialNumber != null || tokenCode != null) {
+            if (serialNumber != null) {
+                validateSerialNumber(serialNumber);
+            }
+            if (tokenCode != null && !Totp.isSixDigits(tokenCode)) {
+                throw new AwsException("ValidationError", "TokenCode must contain six digits.", 400);
+            }
+            synchronized (mfaDeviceLock) {
+                VirtualMfaDevice device = serialNumber == null ? null
+                        : virtualMfaDevices.get(serialNumber).orElse(null);
+                IamUser user = device == null || device.getUserName() == null ? null
+                        : users.get(device.getUserName()).orElse(null);
+                if (user == null || !user.getArn().equals(session.getIssuerArn())
+                        || !user.getUserId().equals(session.getIssuerUserId())
+                        || !Totp.matchesCode(device.getBase32Seed(), tokenCode, 1, authenticationTime)) {
+                    throw new AwsException("AccessDenied", "MultiFactorAuthentication failed.", 403);
+                }
+                authenticated = true;
+            }
+        }
+        session.setMultiFactorAuthPresent(authenticated);
+        putNewSession(sessionAccessKeyId, session);
+    }
+
+    private SessionCredential issuedSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                                            String federatedUserArn, Instant expiration, String sessionPolicyDocument,
+                                            String originAccountId, String issuingAccessKeyId) {
         SessionCredential session = new SessionCredential(sessionAccessKeyId, secretAccessKey, sessionToken,
                 federatedUserArn, expiration, sessionPolicyDocument, originAccountId);
         Optional<IamUser> issuingUser = issuingAccessKeyId == null ? Optional.empty()
@@ -4775,7 +4813,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         } else if (issuingAccessKeyId == null || !holdsKey(issuingAccessKeyId)) {
             session.setIssuerArn(regionResolver.buildGlobalArn("iam", originAccountId, "root"));
         }
-        putNewSession(sessionAccessKeyId, session);
+        return session;
     }
 
     /**
@@ -5469,10 +5507,22 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     public record CallerArns(String callerArn, String principalArn, String principalType,
                              String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
-                             Map<String, String> principalTags) {
+                             Map<String, String> principalTags, Boolean multiFactorAuthPresent) {
 
         public CallerArns {
             principalTags = principalTags == null ? Map.of() : Map.copyOf(principalTags);
+        }
+
+        public CallerArns(String callerArn, String principalArn, String principalType, String userId,
+                          String userName, boolean permissionsBoundary, Instant tokenIssueTime,
+                          Map<String, String> principalTags) {
+            this(callerArn, principalArn, principalType, userId, userName, permissionsBoundary,
+                    tokenIssueTime, principalTags, null);
+        }
+
+        public CallerArns withMultiFactorAuthPresent(Boolean present) {
+            return new CallerArns(callerArn, principalArn, principalType, userId, userName,
+                    permissionsBoundary, tokenIssueTime, principalTags, present);
         }
 
         public CallerArns(String callerArn, String principalArn, String principalType, String userId,
@@ -5483,7 +5533,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         public CallerArns withPrincipalTags(Map<String, String> tags) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, tokenIssueTime, tags);
+                    permissionsBoundary, tokenIssueTime, tags, multiFactorAuthPresent);
         }
 
         /**
@@ -5521,7 +5571,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         public CallerArns withTokenIssueTime(Instant issuedAt) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, issuedAt, principalTags);
+                    permissionsBoundary, issuedAt, principalTags, multiFactorAuthPresent);
         }
 
         /** A caller with no permissions boundary attached. */
@@ -5548,6 +5598,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         public void putPrincipalKeys(Map<String, List<String>> context) {
             context.put("aws:PrincipalArn", List.of(principalArn));
             principalTags.forEach((key, value) -> context.put("aws:PrincipalTag/" + key, List.of(value)));
+            if (multiFactorAuthPresent != null) {
+                context.put("aws:MultiFactorAuthPresent", List.of(multiFactorAuthPresent.toString()));
+            }
             if (tokenIssueTime != null) {
                 context.put("aws:TokenIssueTime", List.of(tokenIssueTime.toString()));
             }
@@ -5625,7 +5678,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 deleteSession(accessKeyId, session);
                 return Optional.empty();
             }
-            return sessionCallerArns(session).map(arns -> arns.withTokenIssueTime(session.getIssuedAt()));
+            return sessionCallerArns(session).map(arns -> arns.withTokenIssueTime(session.getIssuedAt())
+                    .withMultiFactorAuthPresent(session.getMultiFactorAuthPresent()));
         }
 
         return Optional.empty();
