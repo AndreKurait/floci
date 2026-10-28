@@ -391,6 +391,7 @@ floci:
     elbv2:
       enabled: true
       mock: true
+      max-health-check-interval-millis: 0
     codebuild:
       enabled: true
       # docker-network: floci-network
