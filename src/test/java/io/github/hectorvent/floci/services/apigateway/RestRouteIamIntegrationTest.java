@@ -205,6 +205,44 @@ class RestRouteIamIntegrationTest {
         assertEquals(1, fixture.hits().get());
     }
 
+    @Test
+    void signedCallerTimeWindowAndResourceDenyUseServerTime() throws Exception {
+        Fixture fixture = fixture("GET");
+        String conditions = "\"DateGreaterThan\":{\"aws:CurrentTime\":\"2000-01-01T00:00:00Z\"},"
+                + "\"NumericLessThan\":{\"aws:EpochTime\":\"4102444800\"}";
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "rest-time-", "invoke",
+                conditionedPolicy(fixture.arn(), conditions))) {
+            Key key = new Key(user.accessKeyId(), user.secretAccessKey(), null);
+            invoke(fixture, key, 200);
+            String deny = conditionedPolicy(fixture.arn(), conditions)
+                    .replace("\"Effect\":\"Allow\"", "\"Effect\":\"Deny\",\"Principal\":\"*\"");
+            fixture.api().updateRestApi(request -> request.restApiId(fixture.apiId()).patchOperations(patch ->
+                    patch.op("replace").path("/policy").value(deny)));
+            invoke(fixture, key, 403);
+            assertEquals(1, fixture.hits().get());
+        }
+    }
+
+    @Test
+    void issuedSessionTimeWindowIsEvaluatedAlongsideRolePolicy() throws Exception {
+        Fixture fixture = fixture("GET");
+        String name = "rest-time-session-" + UUID.randomUUID();
+        String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
+                + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
+                "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
+                .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+        SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
+                "PolicyDocument", policy(fixture.arn()))).then().statusCode(200);
+        String sessionPolicy = conditionedPolicy(fixture.arn(),
+                "\"DateLessThan\":{\"aws:CurrentTime\":\"2100-01-01T00:00:00Z\"}");
+        invoke(fixture, assume(role, sessionPolicy), 200);
+        invoke(fixture, assume(role, sessionPolicy.replace("2100-01-01", "2000-01-01")), 403);
+        assertEquals(1, fixture.hits().get());
+    }
+
     private static String conditionedPolicy(String arn, String conditions) {
         return policy(arn).replace("}}", ",\"Condition\":{" + conditions + "}}}");
     }
