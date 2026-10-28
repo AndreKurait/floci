@@ -18,6 +18,8 @@ import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
+import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.iam.PassedRoleLookup;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -45,14 +47,20 @@ public class AutoScalingService implements PassedRoleLookup {
             "Terminating:Retained", "Warmed:Pending:Retained", "Warmed:Terminating:Retained");
 
     private final Event<AutoScalingGroupChanged> groupChanges;
+    private final ElbV2Service elbV2Service;
 
     public AutoScalingService() {
-        this(null);
+        this(null, null);
+    }
+
+    AutoScalingService(Event<AutoScalingGroupChanged> groupChanges) {
+        this(groupChanges, null);
     }
 
     @Inject
-    AutoScalingService(Event<AutoScalingGroupChanged> groupChanges) {
+    AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service) {
         this.groupChanges = groupChanges;
+        this.elbV2Service = elbV2Service;
     }
 
     private void requestReconciliation(AutoScalingGroup group) {
@@ -1060,6 +1068,14 @@ public class AutoScalingService implements PassedRoleLookup {
                 throw capacityChangeError(asg, detached.size(), "detach");
             }
             if (!detached.isEmpty()) {
+                List<TargetDescription> targets = detached.stream().map(id -> {
+                    TargetDescription target = new TargetDescription();
+                    target.setId(id);
+                    return target;
+                }).toList();
+                for (String targetGroup : asg.getTargetGroupARNs()) {
+                    elbV2Service.deregisterTargets(region, targetGroup, targets);
+                }
                 ec2Service.deleteSystemTag(region, detached, GROUP_NAME_TAG, name);
             }
             releaseRefreshOwnership(asg, detached);
