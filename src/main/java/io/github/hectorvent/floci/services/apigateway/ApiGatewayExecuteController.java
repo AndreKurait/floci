@@ -2802,6 +2802,16 @@ public class ApiGatewayExecuteController {
                 return httpApiIamRejection(iamResult);
             }
             iamIdentity = iamResult.identity();
+            String routeResource = "$default".equals(route.getRouteKey()) ? "$default" : httpMethod + path;
+            String invokeArn = AwsArnUtils.Arn.of("execute-api", region, regionResolver.getAccountId(),
+                    apiId + "/" + stageName + "/" + routeResource).toString();
+            if (callerCallAuthorizer.authorize(iamIdentity == null ? null : iamIdentity.accessKey(),
+                    iamIdentity == null ? null : iamIdentity.accountId(),
+                    iamIdentity == null ? null : iamIdentity.userArn(), "execute-api:Invoke", invokeArn,
+                    regionResolver.getPartition()) != Decision.ALLOW) {
+                return Response.status(403).entity(jsonMessage("Forbidden"))
+                        .type(MediaType.APPLICATION_JSON).build();
+            }
         }
 
         Map<String, String> jwtClaims = null;
