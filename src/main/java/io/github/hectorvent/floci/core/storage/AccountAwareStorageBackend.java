@@ -94,6 +94,16 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         trackOwner(accountId);
     }
 
+    /** Publishes one batch across account partitions, without changing request identity. */
+    public void putAllAccountsAtomically(List<AccountEntry<V>> entries) {
+        Map<String, V> prefixedEntries = new LinkedHashMap<>();
+        for (AccountEntry<V> entry : entries) {
+            prefixedEntries.put(entry.accountId() + "/" + entry.key(), entry.value());
+        }
+        delegate.putAllAtomically(prefixedEntries);
+        entries.forEach(entry -> trackOwner(entry.accountId()));
+    }
+
     @Override
     public Optional<V> get(String key) {
         String prefixedKey = prefixed(key);

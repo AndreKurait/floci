@@ -10,6 +10,7 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -75,6 +76,35 @@ class AtomicStorageBatchTest {
             assertEquals("333333333333", store.findAnyAccountEntry("unique").orElseThrow().account());
         } finally {
             close(backend);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void crossAccountBatchPreservesSameLogicalKeysAndRecoversTogether(String mode) {
+        StorageBackend<String, Integer> backend = backend(mode);
+        backend.load();
+        AccountAwareStorageBackend<Integer> store =
+                new AccountAwareStorageBackend<>(backend, null, "111111111111");
+        try {
+            assertTrue(store.findAnyAccount("capacity").isEmpty());
+            store.putAllAccountsAtomically(List.of(
+                    new AccountAwareStorageBackend.AccountEntry<>("111111111111", "capacity", 2),
+                    new AccountAwareStorageBackend.AccountEntry<>("222222222222", "capacity", 3)));
+            assertEquals(2, store.get("capacity").orElseThrow());
+            assertEquals(3, store.getForAccount("222222222222", "capacity").orElseThrow());
+        } finally {
+            close(backend);
+        }
+        StorageBackend<String, Integer> recoveredBackend = backend(mode);
+        recoveredBackend.load();
+        try {
+            AccountAwareStorageBackend<Integer> recovered =
+                    new AccountAwareStorageBackend<>(recoveredBackend, null, "111111111111");
+            assertEquals(2, recovered.get("capacity").orElseThrow());
+            assertEquals(3, recovered.getForAccount("222222222222", "capacity").orElseThrow());
+        } finally {
+            close(recoveredBackend);
         }
     }
 

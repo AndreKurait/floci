@@ -830,6 +830,9 @@ cancellation and expiration release membership; a restart acquires capacity usin
 instance's retained launch preference and target. A failed membership write reports an error;
 subsequent access reconciles released membership from persisted instance state.
 
+Membership and available counts publish in one atomic storage batch. Older snapshots without
+membership remain readable.
+
 `CapacityReservationResourceGroupArn` targets the members of an existing capacity pool
 in the caller's account and region. Only members with matching instance type, platform,
 Availability Zone and tenancy are eligible. Both open and targeted member reservations
@@ -851,7 +854,17 @@ reservations, while a recipient cannot move it even when Describe exposes the re
 A move to a foreign-owned destination returns `InvalidCapacityReservationId.NotFound`
 when it only needs unused capacity, but `InvalidParameterValue` when it needs consumed
 capacity. Rejected moves preserve membership, counts and retry tokens.
-Shared used capacity, future-dated commitment periods and Capacity Blocks are not modeled.
+Shared reservations admit recipients only through an active RAM share with an accepted
+account invitation or an authorized organization principal. Pending invitations provide
+RAM discovery metadata, not EC2 admission. Reservation mutation remains owner-only.
+Accepted open shares also adopt matching, unassociated running recipient instances with
+an `open` preference when capacity membership is reconciled.
+Membership records retain the instance account across storage recovery. Removing a share
+prevents new admissions; existing membership remains until the instance stops or terminates,
+or the reservation is cancelled or expires. Restart checks current sharing authorization.
+Consumed capacity moves retain member ownership and require the recipient to be authorized
+to use the destination. Capacity updates across owners publish in one atomic storage batch.
+Future-dated commitment periods and Capacity Blocks are not modeled.
 The consumed-sharing and inflight compatibility matrix remains incomplete.
 
 Capacity reservation zone IDs must be among those returned by `DescribeAvailabilityZones`.

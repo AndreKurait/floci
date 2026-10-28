@@ -71,6 +71,44 @@ class RamServiceTest {
     }
 
     @Test
+    void organizationPrincipalRequiresOwnerOrganizationSharingBeforeResourceUse() {
+        service.createResourceShare("organization", List.of(OU_ARN), List.of(TGW_ARN), false, "us-east-1", OWNER);
+        assertFalse(service.canUseResource(TGW_ARN, OWNER, ACCEPTER, "us-east-1"));
+        service.enableSharingWithAwsOrganization(OWNER);
+        assertTrue(service.canUseResource(TGW_ARN, OWNER, ACCEPTER, "us-east-1"));
+    }
+
+    @Test
+    void resourceUseRequiresAcceptanceAndCurrentOwnerRegionAndAssociation() {
+        ResourceShare share = service.createResourceShare("capacity", List.of(ACCEPTER),
+                List.of(TGW_ARN), true, "us-east-1", OWNER);
+        assertFalse(service.canUseResource(TGW_ARN, OWNER, ACCEPTER, "us-east-1"));
+        ResourceShareInvitation invitation = service.getResourceShareInvitations(ACCEPTER,
+                List.of(share.getResourceShareArn()), List.of(), "us-east-1").getFirst();
+        service.acceptResourceShareInvitation(invitation.resourceShareInvitationArn(), ACCEPTER, "us-east-1");
+        assertTrue(service.canUseResource(TGW_ARN, OWNER, ACCEPTER, "us-east-1"));
+        assertFalse(service.canUseResource(TGW_ARN, OWNER, ACCEPTER, "us-west-2"));
+        assertFalse(service.canUseResource(TGW_ARN, "333333333333", ACCEPTER, "us-east-1"));
+        assertFalse(service.canUseResource(TGW_ARN, OWNER, "333333333333", "us-east-1"));
+        service.disassociateResourceShare(share.getResourceShareArn(), List.of(TGW_ARN), List.of(),
+                OWNER, "us-east-1");
+        assertFalse(service.canUseResource(TGW_ARN, OWNER, ACCEPTER, "us-east-1"));
+        service.associateResourceShare(share.getResourceShareArn(), List.of(TGW_ARN), List.of(),
+                OWNER, "us-east-1");
+        assertTrue(service.canUseResource(TGW_ARN, OWNER, ACCEPTER, "us-east-1"));
+        service.deleteResourceShare(share.getResourceShareArn(), OWNER, "us-east-1");
+        assertFalse(service.canUseResource(TGW_ARN, OWNER, ACCEPTER, "us-east-1"));
+    }
+
+    @Test
+    void organizationResourceUseRequiresMembershipAndAccountAutoAcceptanceRequiresOptIn() {
+        service.createResourceShare("account", List.of(ACCEPTER), List.of(TGW_ARN), false, "us-east-1", OWNER);
+        assertFalse(service.canUseResource(TGW_ARN, OWNER, ACCEPTER, "us-east-1"));
+        service.enableSharingWithAwsOrganization(OWNER);
+        assertTrue(service.canUseResource(TGW_ARN, OWNER, ACCEPTER, "us-east-1"));
+    }
+
+    @Test
     void deletedShareStopsExposingItsResourcesAndPrincipals() {
         // Real RAM keeps a deleted share visible (status DELETED) for a retention
         // window, but its resources and principals stop being consumable: a
