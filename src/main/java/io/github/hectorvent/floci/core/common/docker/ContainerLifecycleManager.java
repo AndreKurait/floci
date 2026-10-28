@@ -589,10 +589,17 @@ public class ContainerLifecycleManager {
     }
 
     public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds) {
-        stopAndRemoveStrictAdmitted(containerId, logStream, stopTimeoutSeconds);
+        stopAndRemoveStrict(containerId, logStream, stopTimeoutSeconds, false);
     }
 
-    private void stopAndRemoveStrictAdmitted(String containerId, Closeable logStream, int stopTimeoutSeconds) {
+    /** Strict teardown that can also reclaim the container's anonymous volumes. */
+    public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds,
+                                     boolean removeAnonymousVolumes) {
+        stopAndRemoveStrictAdmitted(containerId, logStream, stopTimeoutSeconds, removeAnonymousVolumes);
+    }
+
+    private void stopAndRemoveStrictAdmitted(String containerId, Closeable logStream, int stopTimeoutSeconds,
+                                             boolean removeAnonymousVolumes) {
         LOG.infov("Stopping container {0}", containerId);
 
         Exception stopFailure = null;
@@ -611,7 +618,11 @@ public class ContainerLifecycleManager {
         }
 
         try {
-            dockerClient.removeContainerCmd(containerId).withForce(true).exec();
+            RemoveContainerCmd remove = dockerClient.removeContainerCmd(containerId).withForce(true);
+            if (removeAnonymousVolumes) {
+                remove.withRemoveVolumes(true);
+            }
+            remove.exec();
             LOG.debugv("Removed container {0}", containerId);
         } catch (NotFoundException e) {
             // Already gone, so cleanup succeeded.
