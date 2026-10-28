@@ -46,6 +46,7 @@ public class Instance {
     private Instant launchTime;
     private int amiLaunchIndex;
     private String clientToken;
+    private boolean replayProtected;
     private String monitoring = "disabled";
     private boolean sourceDestCheck = true;
     private boolean ebsOptimized = false;
@@ -198,6 +199,9 @@ public class Instance {
 
     public int getAmiLaunchIndex() { return amiLaunchIndex; }
     public void setAmiLaunchIndex(int amiLaunchIndex) { this.amiLaunchIndex = amiLaunchIndex; }
+
+    public boolean isReplayProtected() { return replayProtected; }
+    public void setReplayProtected(boolean replayProtected) { this.replayProtected = replayProtected; }
 
     public String getClientToken() { return clientToken; }
     public void setClientToken(String clientToken) { this.clientToken = clientToken; }
