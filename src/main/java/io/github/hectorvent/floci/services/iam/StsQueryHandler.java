@@ -261,6 +261,10 @@ public class StsQueryHandler {
                     "User: " + callerArn + " is not authorized to perform: sts:AssumeRole on resource: " + roleArn,
                     AwsNamespaces.STS, 403);
         }
+        if (params.containsKey("SerialNumber") || params.containsKey("TokenCode")) {
+            caller = iamService.authenticateRequestMfa(caller, params.getFirst("SerialNumber"),
+                    params.getFirst("TokenCode"), clock.instant());
+        }
         if (!config.services().iam().enforcementEnabled()) {
             return null;
         }
