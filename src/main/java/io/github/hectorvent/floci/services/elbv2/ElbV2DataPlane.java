@@ -4,9 +4,12 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.TlsProxyServer;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver.CertificateMaterial;
 import io.github.hectorvent.floci.core.common.Pem;
+import io.github.hectorvent.floci.core.common.RequestHost;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.tls.ReloadingKeyManager;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elbv2.model.Action;
@@ -19,6 +22,7 @@ import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
+import io.github.hectorvent.floci.services.route53.Route53Service;
 import io.vertx.core.Future;
 import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
@@ -36,9 +40,12 @@ import io.vertx.core.net.JdkSSLEngineOptions;
 import io.vertx.core.net.KeyCertOptions;
 import io.vertx.core.net.NetSocket;
 import io.vertx.core.net.PemKeyCertOptions;
+import io.vertx.ext.web.Router;
+import io.vertx.ext.web.RoutingContext;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -49,6 +56,7 @@ import javax.naming.ldap.Rdn;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
@@ -186,6 +194,7 @@ public class ElbV2DataPlane {
             new AtomicBoolean();
     private final Map<Integer, Map<String, String>> listenersByHostAndPort = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ListenerBinding> listenerBindings;
+    private final Route53Service route53;
     private final Map<String, AtomicReference<List<CompiledRule>>> ruleChains = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> rrCounters = new ConcurrentHashMap<>();
     private final Map<String, String> listenerRegions = new ConcurrentHashMap<>();
@@ -194,14 +203,24 @@ public class ElbV2DataPlane {
     private HttpClient proxyClient;
 
     public ElbV2DataPlane() {
-        this(new ConcurrentHashMap<>());
+        this(new ConcurrentHashMap<>(), null);
+    }
+
+    @Inject
+    public ElbV2DataPlane(Route53Service route53) {
+        this(new ConcurrentHashMap<>(), route53);
     }
 
     ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings) {
-        this.listenerBindings = listenerBindings;
+        this(listenerBindings, null);
     }
 
-    record ListenerBinding(int port, String host, String loadBalancerArn,
+    ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings, Route53Service route53) {
+        this.listenerBindings = listenerBindings;
+        this.route53 = route53;
+    }
+
+    record ListenerBinding(int port, String host, String loadBalancerArn, String canonicalHostedZoneId,
                                    boolean secure, Set<String> certificateHosts, List<CertificateMaterial> certificates) {}
 
     @PostConstruct
@@ -581,7 +600,7 @@ public class ElbV2DataPlane {
                 material.add(replacement);
                 addCertificateHosts(hosts, replacement);
             }
-            return new ListenerBinding(peer.port(), peer.host(), peer.loadBalancerArn(), true,
+            return new ListenerBinding(peer.port(), peer.host(), peer.loadBalancerArn(), peer.canonicalHostedZoneId(), true,
                     Set.copyOf(hosts), List.copyOf(material));
         });
     }
@@ -612,6 +631,7 @@ public class ElbV2DataPlane {
             }
         }
         return new ListenerBinding(listener.getPort(), host, listener.getLoadBalancerArn(),
+                loadBalancer == null ? null : loadBalancer.getCanonicalHostedZoneId(),
                 secure, Set.copyOf(hosts), List.copyOf(certificates));
     }
 
@@ -775,7 +795,8 @@ public class ElbV2DataPlane {
         }
     }
 
-    private record RoutedListener(String arn, String region, List<CompiledRule> chain, Set<String> certificateHosts) {}
+    private record RoutedListener(String arn, String region, String canonicalHostedZoneId,
+                                  List<CompiledRule> chain, Set<String> certificateHosts) {}
 
     private record RoutingView(Map<String, String> hosts, Map<String, RoutedListener> listeners) {}
 
@@ -788,7 +809,8 @@ public class ElbV2DataPlane {
             AtomicReference<List<CompiledRule>> chain = ruleChains.get(arn);
             String region = listenerRegions.get(arn);
             if (binding != null && binding.port() == port && chain != null && region != null) {
-                routes.put(arn, new RoutedListener(arn, region, chain.get(), binding.certificateHosts()));
+                routes.put(arn, new RoutedListener(arn, region, binding.canonicalHostedZoneId(),
+                        chain.get(), binding.certificateHosts()));
             }
         }
         state.routing = new RoutingView(Map.copyOf(hosts), Map.copyOf(routes));
@@ -802,6 +824,15 @@ public class ElbV2DataPlane {
             req.response().setStatusCode(502).end("No listener for host");
             return;
         }
+        handleListener(req, listener);
+    }
+
+    private void handleListener(HttpServerRequest req, RoutedListener listener) {
+        RequestScopes.runAs(AwsArnUtils.parse(listener.arn()).accountId(), listener.region(),
+                () -> dispatchListener(req, listener));
+    }
+
+    private void dispatchListener(HttpServerRequest req, RoutedListener listener) {
         for (CompiledRule compiled : listener.chain()) {
             if (compiled.matches(req)) {
                 executeAction(req, compiled.action, listener.region(), listener.arn());
@@ -811,12 +842,76 @@ public class ElbV2DataPlane {
         req.response().setStatusCode(502).end("No matching rule");
     }
 
-    /** Floci's shared socket first uses load-balancer DNS, then unique rule or certificate hosts. */
+    void register(@Observes Router router) {
+        router.route().order(-99).handler(this::handleSharedEdge);
+    }
+
+    private void handleSharedEdge(RoutingContext context) {
+        if (!config.services().elbv2().enabled() || config.services().elbv2().mock()) {
+            context.next();
+            return;
+        }
+        URI authority;
+        try {
+            authority = URI.create("http://" + RequestHost.of(context.request()));
+        } catch (IllegalArgumentException ignored) {
+            // Leave malformed authorities to the ordinary HTTP validation.
+            context.next();
+            return;
+        }
+        if (authority.getHost() == null || authority.getUserInfo() != null
+                || !authority.getRawPath().isEmpty() || authority.getRawQuery() != null
+                || authority.getRawFragment() != null) {
+            context.next();
+            return;
+        }
+        int port = authority.getPort() > 0 ? authority.getPort() : context.request().isSSL() ? 443 : 80;
+        PortState state = portStates.get(port);
+        RoutingView routing = state == null ? null : state.routing;
+        String host = normalizeHost(authority.getHost());
+        RoutedListener listener = null;
+        if (routing != null) {
+            String direct = routing.hosts().get(host);
+            listener = direct == null ? resolveAlias(routing, publicAlias(host)) : routing.listeners().get(direct);
+        }
+        if (listener == null) {
+            context.next();
+            return;
+        }
+        handleListener(context.request(), listener);
+    }
+
+    private Route53Service.PublicAlias publicAlias(String host) {
+        return route53 == null ? null : route53.lookupPublicAlias(host);
+    }
+
+    private RoutedListener resolveAlias(RoutingView routing, Route53Service.PublicAlias alias) {
+        if (alias == null) {
+            return null;
+        }
+        String target = normalizeHost(alias.dnsName());
+        if (target.startsWith("dualstack.")) {
+            target = target.substring("dualstack.".length());
+        }
+        String arn = routing.hosts().get(target);
+        RoutedListener listener = arn == null ? null : routing.listeners().get(arn);
+        if (listener == null) {
+            return null;
+        }
+        return alias.hostedZoneId() == null
+                || alias.hostedZoneId().equals(listener.canonicalHostedZoneId()) ? listener : null;
+    }
+
+    /** Selects the load balancer before evaluating rules against the original request Host. */
     private RoutedListener resolveListener(RoutingView routing, String hostHeader) {
         String host = normalizeHost(hostHeader);
         String direct = routing.hosts().get(host);
         if (direct != null) {
             return routing.listeners().get(direct);
+        }
+        Route53Service.PublicAlias alias = publicAlias(host);
+        if (alias != null) {
+            return resolveAlias(routing, alias);
         }
         List<RoutedListener> declaring = routing.listeners().values().stream()
                 .filter(listener -> listener.chain().stream().anyMatch(rule -> rule.declaresHost(host)))
@@ -846,13 +941,13 @@ public class ElbV2DataPlane {
         if (host == null) {
             return "";
         }
-        String normalized = host.trim().toLowerCase();
+        String normalized = host.trim().toLowerCase(Locale.ROOT);
         int colon = normalized.lastIndexOf(':');
         int bracket = normalized.lastIndexOf(']');
         if (colon > -1 && colon > bracket) {
             normalized = normalized.substring(0, colon);
         }
-        return normalized;
+        return normalized.endsWith(".") ? normalized.substring(0, normalized.length() - 1) : normalized;
     }
 
     private void executeAction(HttpServerRequest req, Action action, String region, String listenerArn) {
