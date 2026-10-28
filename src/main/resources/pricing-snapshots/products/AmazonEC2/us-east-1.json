@@ -124,5 +124,47 @@
       }
     },
     "version": "20260101000000"
+  },
+  {
+    "product": {
+      "productFamily": "Compute Instance",
+      "attributes": {
+        "servicecode": "AmazonEC2",
+        "location": "US East (N. Virginia)",
+        "locationType": "AWS Region",
+        "instanceType": "m6g.large",
+        "tenancy": "Shared",
+        "operatingSystem": "Linux",
+        "preInstalledSw": "NA",
+        "capacitystatus": "Used",
+        "regionCode": "us-east-1",
+        "usagetype": "BoxUsage:m6g.large"
+      },
+      "sku": "RSV572JURZ29ZMTS"
+    },
+    "publicationDate": "2026-10-12T19:39:25Z",
+    "serviceCode": "AmazonEC2",
+    "terms": {
+      "OnDemand": {
+        "RSV572JURZ29ZMTS.JRTCKXETXF": {
+          "priceDimensions": {
+            "RSV572JURZ29ZMTS.JRTCKXETXF.6YS6EN2CT7": {
+              "unit": "Hrs",
+              "endRange": "Inf",
+              "description": "$0.077 per On Demand Linux m6g.large Instance Hour",
+              "appliesTo": [],
+              "rateCode": "RSV572JURZ29ZMTS.JRTCKXETXF.6YS6EN2CT7",
+              "beginRange": "0",
+              "pricePerUnit": {"USD": "0.0770000000"}
+            }
+          },
+          "sku": "RSV572JURZ29ZMTS",
+          "effectiveDate": "2026-10-01T00:00:00Z",
+          "offerTermCode": "JRTCKXETXF",
+          "termAttributes": {}
+        }
+      }
+    },
+    "version": "20261012193925"
   }
 ]

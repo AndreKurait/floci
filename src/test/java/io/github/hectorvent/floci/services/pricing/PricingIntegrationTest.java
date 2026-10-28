@@ -83,7 +83,7 @@ class PricingIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("AttributeValues.Value", hasItems("t3.micro", "m5.large"));
+            .body("AttributeValues.Value", hasItems("t3.micro", "m5.large", "m6g.large"));
     }
 
     @Test
@@ -144,7 +144,7 @@ class PricingIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("PriceList", hasSize(3));
+            .body("PriceList", hasSize(4));
     }
 
     @Test
@@ -444,7 +444,7 @@ class PricingIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("PriceList", hasSize(1))
+            .body("PriceList", hasSize(2))
             .body("NextToken", nullValue());
     }
 }

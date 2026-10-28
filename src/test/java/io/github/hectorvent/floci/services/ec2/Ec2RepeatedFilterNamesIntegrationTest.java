@@ -99,6 +99,22 @@ class Ec2RepeatedFilterNamesIntegrationTest {
     }
 
     @Test
+    void paginatedVolumesPreserveContradictoryRepeatedFilters() {
+        String volume = ec2("CreateVolume", "AvailabilityZone", "us-east-1a",
+                "Size", "1", "VolumeType", "gp3").getString("CreateVolumeResponse.volumeId");
+        String path = "DescribeVolumesResponse.volumeSet.item.volumeId";
+        List<String> params = List.of("VolumeId.1", volume, "MaxResults", "5");
+        try {
+            assertEquals(Set.of(volume), values(describe("DescribeVolumes", params,
+                    filter("volume-type", "gp3")), path));
+            assertEquals(Set.of(), values(describe("DescribeVolumes", params,
+                    filter("volume-type", "gp2"), filter("volume-type", "gp3")), path));
+        } finally {
+            ec2("DeleteVolume", "VolumeId", volume);
+        }
+    }
+
+    @Test
     void describeInstancesAndsTwoTagKeyFilters() {
         String only = unique("RepeatedOnly");
         String shared = unique("RepeatedShared");
