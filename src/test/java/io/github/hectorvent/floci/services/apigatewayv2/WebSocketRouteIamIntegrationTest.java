@@ -10,6 +10,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -29,14 +30,17 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
 
 @QuarkusTest
 @TestProfile(SignedIamEnforcementProfile.class)
 class WebSocketRouteIamIntegrationTest {
     private static final String OWNER = "000000000000";
+    Supplier<String> roleNames = () -> "ws-route-role-" + UUID.randomUUID();
     @TestHTTPResource("/")
     URI endpoint;
     @RegisterExtension
@@ -73,13 +77,13 @@ class WebSocketRouteIamIntegrationTest {
     @Test
     void issuedRoleSessionsRetainPolicyTokenAndRevocationChecks() throws Exception {
         Fixture fixture = fixture(true, "AWS_IAM");
-        String name = "ws-route-role-" + UUID.randomUUID();
+        String name = roleNames.get();
         String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
                 + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
-        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
                 "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
                 .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
         SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
                 "PolicyDocument", policy(fixture.arn()))).then().statusCode(200);
@@ -92,6 +96,40 @@ class WebSocketRouteIamIntegrationTest {
         SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
                 "PolicyDocument", policy(fixture.arn()).replace("Allow", "Deny"))).then().statusCode(200);
         invoke(fixture, allowed, 403);
+    }
+
+    @Test
+    void rejectedRoleCreationPreservesPreexistingRole() throws Exception {
+        String name = "ws-route-existing-" + UUID.randomUUID();
+        SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
+                "AssumeRolePolicyDocument", "{\"Statement\":[]}")).then().statusCode(200);
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        WebSocketRouteIamIntegrationTest fixture = nestedFixture(name);
+        try {
+            assertThrows(AssertionError.class, fixture::issuedRoleSessionsRetainPolicyTokenAndRevocationChecks);
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(200);
+    }
+
+    @Test
+    void successfulRoleScenarioRemovesOwnedRoleAndPolicy() throws Exception {
+        String name = "ws-route-owned-" + UUID.randomUUID();
+        WebSocketRouteIamIntegrationTest fixture = nestedFixture(name);
+        try {
+            fixture.issuedRoleSessionsRetainPolicyTokenAndRevocationChecks();
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(404);
+    }
+
+    private WebSocketRouteIamIntegrationTest nestedFixture(String name) {
+        WebSocketRouteIamIntegrationTest fixture = new WebSocketRouteIamIntegrationTest();
+        fixture.endpoint = endpoint;
+        fixture.roleNames = () -> name;
+        return fixture;
     }
 
     private void cleanupIam(String action, Map<String, String> parameters) {
