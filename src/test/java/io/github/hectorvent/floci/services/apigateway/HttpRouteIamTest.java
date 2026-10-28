@@ -110,7 +110,7 @@ class HttpRouteIamTest {
         routeContext.routeToHttpApi("us-east-1");
         controller = new ApiGatewayExecuteController(null, null, gateway, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
-                routeContext, null, new RequestContext(), signature, null, null, direct, roles, callers);
+                routeContext, null, new RequestContext(), signature, null, null, direct, roles, callers, null);
     }
 
     @ParameterizedTest
@@ -223,6 +223,55 @@ class HttpRouteIamTest {
         when(iam.resolveCallerArns(KEY)).thenReturn(Optional.of(new IamService.CallerArns(principal, principal)));
         assertEquals(403, invoke());
         verifyNoInteractions(lambda);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"identity", "boundary", "session", "scp"})
+    void transportConditionsReachEveryPolicyLayer(String layer) {
+        String condition = "\"IpAddress\":{\"aws:SourceIp\":\"127.0.0.0/8\"},"
+                + "\"Bool\":{\"aws:SecureTransport\":\"false\"}";
+        String document = conditionalPolicy("Allow", condition);
+        applyPolicyLayer(layer, document);
+        assertEquals(200, invoke());
+        applyPolicyLayer(layer, document.replace("127.0.0.0/8", "192.0.2.0/24"));
+        assertEquals(403, invoke());
+        verify(lambda).invokeTarget(anyString(), anyString(), any(byte[].class), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"identity", "boundary", "session", "scp"})
+    void conditionalTransportDenyStopsBackend(String layer) {
+        String deny = conditionalPolicy("Deny", "\"Bool\":{\"aws:SecureTransport\":\"false\"}");
+        String document = "{\"Statement\":[" + ALLOW.substring(13, ALLOW.length() - 1) + ","
+                        + deny.substring(13, deny.length() - 1) + "]}";
+        applyPolicyLayer(layer, document);
+        assertEquals(403, invoke());
+        verifyNoInteractions(lambda, direct);
+    }
+
+    @Test
+    void secureRequestSuppliesTrue() {
+        when(uri.getRequestUri()).thenReturn(URI.create("https://localhost/execute-api/api/prod/"));
+        policy(conditionalPolicy("Allow", "\"Bool\":{\"aws:SecureTransport\":\"true\"}"));
+        assertEquals(200, invoke());
+    }
+
+    private static String conditionalPolicy(String effect, String condition) {
+        return "{\"Statement\":{\"Effect\":\"" + effect + "\","
+                + "\"Action\":\"execute-api:Invoke\",\"Resource\":\"" + INVOKE
+                + "\",\"Condition\":{" + condition + "}}}";
+    }
+
+    private void applyPolicyLayer(String layer, String document) {
+        switch (layer) {
+            case "identity" -> policy(document);
+            case "boundary" -> when(iam.resolveCallerContext(eq(KEY), any()))
+                    .thenReturn(new CallerContext(List.of(ALLOW), null, document));
+            case "session" -> when(iam.resolveCallerContext(eq(KEY), any()))
+                    .thenReturn(new CallerContext(List.of(ALLOW), document, null));
+            case "scp" -> when(scps.effectiveScpLevels(OWNER)).thenReturn(List.of(List.of(document)));
+            default -> throw new AssertionError(layer);
+        }
     }
 
     private void policy(String document) {
