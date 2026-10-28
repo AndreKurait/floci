@@ -104,6 +104,14 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - Target health starts in `initial` state with reason `Elb.RegistrationInProgress` and is updated by Floci's health checker when monitoring is active.
 - A newly registered Application Load Balancer target (HTTP/HTTPS target group or Lambda target) becomes healthy after its first successful check. Network and Gateway target groups retain `HealthyThresholdCount` for initial admission. The threshold applies to every group when recovering from `unhealthy`.
 - Health checks probe the target group's `HealthCheckPort` when it is a port number, and each target's own port when it is `traffic-port` (the default).
+- For faster local readiness tests, set
+  `floci.services.elbv2.max-health-check-interval-millis`, for example `100`.
+  Zero, the default, preserves each target group's requested interval. A positive
+  value caps the interval between probes without changing the settings returned
+  by the API. Real HTTP probes, their timeouts, healthy and unhealthy thresholds,
+  and the bounded probe queue still apply; one target never has overlapping probes.
+  This deliberately accelerates local health transitions and does not reproduce
+  AWS wall-clock timing. Negative values are rejected during startup.
 - Each `CreateListener` automatically creates an immutable default rule (`priority=default`, `isDefault=true`). This rule cannot be deleted; use `ModifyListener` to change its action.
 - Rule priorities are unique per listener: `CreateRule` and `SetRulePriorities` only reject a priority held by another rule on the same listener. `SetRulePriorities` is atomic: all priority assignments are validated before any change is committed.
 - `DeleteTargetGroup` is rejected with `ResourceInUse` while the target group is referenced by any listener or rule.
@@ -236,3 +244,11 @@ healthy and nothing else reports the collision.
 Giving each load balancer a `host-header` rule for the hostname it serves is usually enough, and it
 is the same configuration AWS needs. Moving one load balancer to a different listener port also
 works, at the cost of a Floci-only difference from the deployed template.
+
+### Target health scheduling
+
+ELBv2 probes independent targets concurrently, with up to 32 probes running and one
+outstanding probe per target. Repeated target registration preserves probe cadence.
+Changing the health interval reschedules monitoring, and late results from old
+registrations or settings cannot change current health. Configured healthy and
+unhealthy thresholds still apply to real HTTP results.

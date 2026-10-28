@@ -590,6 +590,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (unhealthyThreshold != null)  tg.setUnhealthyThresholdCount(unhealthyThreshold);
         if (matcher != null)             tg.setMatcher(matcher);
         persistRegion(targetGroups, region);
+        healthChecker.startMonitoring(tg);
     }
 
     public Map<String, String> describeTargetGroupAttributes(String region, String arn) {
