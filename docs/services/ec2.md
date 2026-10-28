@@ -268,7 +268,8 @@ permission sets or ordinary owner tags. The source remains independent.
 This is metadata and local catalog behavior, not EBS block-data copying.
 
 `DescribeImages` includes explicitly shared images in the selected region, preserving the source owner.
-Owner and tag filters apply to that view; only `ec2:SharedTag/` tags cross the account boundary.
+Owner and tag filters apply to that view; recipients see their own private tags and the owner's
+`ec2:SharedTag/` tags. Recipients can change their private tags but cannot change the owner's shared tags.
 Reads neither create recipient-owned aliases nor change source tags or mappings. Revocation removes visibility.
 Direct `CreateVolume` from a shared snapshot requires its create-volume grant and uses the snapshot size
 when size is omitted. Smaller sizes, missing grants, wrong regions and encrypted shared snapshots are refused.
@@ -288,10 +289,10 @@ forms, encrypted shared copies and KMS are unsupported.
 Container mode refuses foreign sources with unbound runtime ancestry. Captured Docker layers are
 refused in both modes, including captures in source ancestry. Direct shared-image container launches
 require a caller-owned copy. Same-account captured
-copies retain their existing behavior. `CopyImageTags`, tag specifications,
-encryption and placement options
-are refused. Copying foreign AMIs with `ec2:SharedTag/` tags is unsupported and
-explicitly refused; `DescribeImages` exposes those shared tags as described above.
+copies retain their existing behavior. Tag specifications, encryption and placement options are refused.
+Image tags are not copied by default. `CopyImageTags=true` copies the caller's private tags and visible
+`ec2:SharedTag/` tags into the destination account's tag store. Other owners' private tags and system
+tags are excluded, and source tags and permission sets remain unchanged.
 
 ### Cloud-image-derived AMI guests
 
@@ -627,6 +628,10 @@ with `DryRunOperation` before any of these checks, and creates nothing either.
 | RegisterImage | Registers an AMI from supplied metadata and block device mappings, with `image` tags from `TagSpecification`. |
 | CopyImage | Copies an AMI from `SourceRegion` into the request's region as a new AMI the caller owns, applying `image` and `snapshot` tags from `TagSpecification` to the copy and its new snapshots. |
 | DeregisterImage | Deregisters an AMI. Its snapshots are kept unless `DeleteAssociatedSnapshots=true`, and a snapshot another AMI still uses is kept either way. |
+
+`RegisterImage` accepts optional `image` tag specifications. Those tags appear in
+`DescribeImages` and its tag filters; unsupported tag resource types are rejected
+before the AMI is registered.
 
 Every resource EC2 creates is owned by the account the request resolves to, the same account
 [STS](sts.md) reports for those credentials, and that account is what `ownerId` and the resource ARN
