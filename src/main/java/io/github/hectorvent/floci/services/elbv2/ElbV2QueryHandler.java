@@ -70,6 +70,7 @@ public class ElbV2QueryHandler {
                 case "ModifyLoadBalancerAttributes"  -> handleModifyLoadBalancerAttributes(params, region);
                 case "DescribeLoadBalancerAttributes"-> handleDescribeLoadBalancerAttributes(params, region);
                 case "DescribeCapacityReservation"   -> handleDescribeCapacityReservation(params, region);
+                case "DescribeProvisionedCapacity"   -> handleDescribeProvisionedCapacity(params, region);
                 case "SetSecurityGroups"             -> handleSetSecurityGroups(params, region);
                 case "SetSubnets"                    -> handleSetSubnets(params, region);
                 case "SetIpAddressType"              -> handleSetIpAddressType(params, region);
@@ -234,6 +235,29 @@ public class ElbV2QueryHandler {
            .raw(AwsQueryResponse.responseMetadata())
            .end("DescribeCapacityReservationResponse");
         return Response.ok(xml.build()).type(MediaType.APPLICATION_XML).build();
+    }
+
+    private Response handleDescribeProvisionedCapacity(MultivaluedMap<String, String> p, String region) {
+        List<String> versions = p.get("Version");
+        if (versions == null || versions.size() != 1 || !"2015-12-01".equals(versions.get(0))) {
+            throw new AwsException("ValidationError", "Version must be 2015-12-01.", 400);
+        }
+        List<String> arns = p.get("LoadBalancerArn");
+        if (arns == null || arns.size() != 1) {
+            throw new AwsException("ValidationError", "Exactly one LoadBalancerArn must be specified.", 400);
+        }
+        String status = service.describeProvisionedCapacity(region, arns.get(0));
+        String xml = new XmlBuilder()
+                .start("DescribeProvisionedCapacityResponse", AwsNamespaces.ELB_V2)
+                .start("DescribeProvisionedCapacityResult")
+                  .start("ProvisionedCapacity")
+                    .elem("Status", status)
+                  .end("ProvisionedCapacity")
+                .end("DescribeProvisionedCapacityResult")
+                .raw(AwsQueryResponse.responseMetadata())
+                .end("DescribeProvisionedCapacityResponse")
+                .build();
+        return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
     }
 
     private Response handleSetSecurityGroups(MultivaluedMap<String, String> p, String region) {
