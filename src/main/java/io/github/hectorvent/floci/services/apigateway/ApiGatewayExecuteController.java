@@ -2929,8 +2929,21 @@ public class ApiGatewayExecuteController {
         LOG.debugv("execute-api v2: {0} {1}/{2}{3} → Lambda {4}", httpMethod, apiId, stageName, path, functionName);
 
         try {
+            if (("AWS_PROXY".equalsIgnoreCase(integrationType) || "AWS".equalsIgnoreCase(integrationType))
+                    && (integration.getCredentialsArn() == null || integration.getCredentialsArn().isBlank())) {
+                String accountId = regionResolver.getAccountId();
+                functionName = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
+                        region, accountId);
+                String functionRegion = AwsArnUtils.parse(functionName).region();
+                String sourceArn = AwsArnUtils.Arn.of("execute-api", functionRegion, accountId,
+                        apiId + "/" + stageName + "/" + httpMethod + path).toString();
+                if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionName,
+                        sourceArn, accountId) == Decision.DENY) {
+                    return httpApiError(500, "Internal Server Error");
+                }
+            }
             InvokeResult result = lambdaService.invokeTarget(region, functionName,
-                    eventJson.getBytes(), InvocationType.RequestResponse);
+                    eventJson.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
             return buildProxyResponse(result, true, !payloadV1);
         } catch (AwsException e) {
             // Measured: API Gateway answers an invocation Lambda refuses itself, with the CORS
