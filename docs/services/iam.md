@@ -2617,3 +2617,12 @@ API Gateway HTTP API quick-create Lambda integrations check an assigned executio
 REST API OpenAPI and Swagger integration imports check each assigned IAM role through `iam:PassRole` before creating, merging or overwriting API resources. The service parser resolves AWS variables and ANY-method operations; unused extensions, ignored integration types and caller credentials pass no role. Authorizer and HTTP API import credential checks remain separate follow-ups.
 
 REST API import role checks also cover explicitly assigned Lambda authorizer credentials in OpenAPI and Swagger documents. Omitted credentials on a merge retain the existing assignment; null credentials clear it without passing a new role.
+
+### Temporary credential issue time
+
+New local temporary credentials record their issuance time. Shared IAM principal context
+exposes this timestamp as `aws:TokenIssueTime` for policy conditions, preserving it across
+storage serialization and later requests. Long-term access keys do not include this key.
+Older persisted session records without an issuance timestamp leave it absent; Floci does
+not derive a replacement timestamp from expiration or restart time. This does not add
+MFA/session-tag context or issue new service execution-role sessions.

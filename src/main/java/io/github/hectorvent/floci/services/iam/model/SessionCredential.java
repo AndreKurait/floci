@@ -16,6 +16,7 @@ public class SessionCredential {
     private String roleSessionName;
     private String assumedRoleId;
     private Instant expiration;
+    private Instant issuedAt;
     /** Inline session policy passed to AssumeRole/GetFederationToken — further restricts role policies. */
     private String sessionPolicyDocument;
     /**
@@ -114,6 +115,9 @@ public class SessionCredential {
 
     public String getAssumedRoleId() { return assumedRoleId; }
     public void setAssumedRoleId(String assumedRoleId) { this.assumedRoleId = assumedRoleId; }
+
+    public Instant getIssuedAt() { return issuedAt; }
+    public void setIssuedAt(Instant issuedAt) { this.issuedAt = issuedAt; }
 
     public Instant getExpiration() { return expiration; }
     public void setExpiration(Instant expiration) { this.expiration = expiration; }
