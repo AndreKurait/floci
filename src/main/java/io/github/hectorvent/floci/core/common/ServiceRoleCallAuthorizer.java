@@ -53,15 +53,42 @@ public class ServiceRoleCallAuthorizer {
         if (!config.services().iam().enforcementEnabled()) {
             return Decision.ALLOW;
         }
-        if (!AwsArnUtils.isArnFor(roleArn, "iam") || !AwsArnUtils.isArn(resourceArn)
-                || !AwsArnUtils.isArn(sourceArn)) {
+        if (!AwsArnUtils.isArn(sourceArn)) {
+            return Decision.DENY;
+        }
+        AwsArnUtils.Arn source = AwsArnUtils.parse(sourceArn);
+        if (!source.accountId().equals(sourceAccount)) {
+            return Decision.DENY;
+        }
+        return authorizeRole(service, roleArn, action, resourceArn, sourceAccount,
+                source.partition(), sourceArn, sourceAccount);
+    }
+
+    /**
+     * Evaluates service trust without asserting service-specific source condition keys.
+     * The owning account still constrains which execution role the service may use.
+     */
+    public Decision authorizeWithoutSourceContext(String service, String roleArn, String action,
+                                                  String resourceArn, String ownerAccount, String ownerPartition) {
+        if (!config.services().iam().enforcementEnabled()) {
+            return Decision.ALLOW;
+        }
+        if (!AwsArnUtils.isArn(resourceArn)
+                || !AwsArnUtils.parse(resourceArn).partition().equals(ownerPartition)) {
+            return Decision.DENY;
+        }
+        return authorizeRole(service, roleArn, action, resourceArn, ownerAccount,
+                ownerPartition, null, null);
+    }
+
+    private Decision authorizeRole(String service, String roleArn, String action, String resourceArn,
+                                   String ownerAccount, String partition, String sourceArn, String sourceAccount) {
+        if (!AwsArnUtils.isArnFor(roleArn, "iam") || !AwsArnUtils.isArn(resourceArn)) {
             return Decision.DENY;
         }
         AwsArnUtils.Arn roleId = AwsArnUtils.parse(roleArn);
-        AwsArnUtils.Arn source = AwsArnUtils.parse(sourceArn);
         if (!roleId.region().isEmpty() || !roleId.resource().startsWith("role/")
-                || !roleId.accountId().equals(sourceAccount) || !source.accountId().equals(sourceAccount)
-                || !roleId.partition().equals(source.partition())
+                || !roleId.accountId().equals(ownerAccount) || !roleId.partition().equals(partition)
                 || !roleId.partition().equals(AwsArnUtils.parse(resourceArn).partition())) {
             return Decision.DENY;
         }
