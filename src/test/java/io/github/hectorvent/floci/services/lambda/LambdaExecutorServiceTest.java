@@ -30,6 +30,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -119,6 +120,82 @@ class LambdaExecutorServiceTest {
 
         assertEquals("TooManyRequestsException", ex.getErrorCode());
         verify(warmPool, never()).acquire(any());
+    }
+
+    @Test
+    void aProvisionedRuntimeDoesNotSpendUnreservedCapacityButColdSpilloverDoes() {
+        fn.setVersion("1");
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter(1, 0);
+        limiter.validateAndSetProvisioned(fn.getFunctionArn(), "live", 1);
+        RuntimeApiServer runtime = mock(RuntimeApiServer.class);
+        ContainerHandle handle = new ContainerHandle("cid-provisioned", "test-fn", runtime, ContainerState.WARM);
+        when(warmPool.acquireProvisioned(fn, "live")).thenReturn(handle, null);
+        doAnswer(invocation -> {
+            PendingInvocation pending = invocation.getArgument(0);
+            pending.getResultFuture().complete(new InvokeResult(200, null, "{}".getBytes(), null, pending.getRequestId()));
+            return pending.getResultFuture();
+        }).when(runtime).enqueue(any());
+        LambdaExecutorService provisionedExecutor = new LambdaExecutorService(warmPool, new ObjectMapper(), limiter);
+        executors.add(provisionedExecutor);
+
+        assertEquals(200, provisionedExecutor.invoke(fn, "{}".getBytes(),
+                InvocationType.RequestResponse, 0, "live").getStatusCode());
+        verify(warmPool).release(handle);
+        assertEquals("TooManyRequestsException", assertThrows(AwsException.class,
+                () -> provisionedExecutor.invoke(fn, "{}".getBytes(),
+                        InvocationType.RequestResponse, 0, "live")).getErrorCode());
+        verify(warmPool, never()).acquire(any());
+    }
+
+    @Test
+    void aRejectedProvisionedInvocationReturnsItsCheckedOutRuntime() {
+        fn.setVersion("1");
+        fn.setReservedConcurrentExecutions(1);
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter();
+        ContainerHandle handle = new ContainerHandle("cid-provisioned", "test-fn",
+                mock(RuntimeApiServer.class), ContainerState.WARM);
+        when(warmPool.acquireProvisioned(fn, "live")).thenReturn(handle);
+        LambdaExecutorService provisionedExecutor = new LambdaExecutorService(
+                warmPool, new ObjectMapper(), limiter);
+        executors.add(provisionedExecutor);
+
+        try (LambdaConcurrencyLimiter.Permit ignored = limiter.acquire(fn)) {
+            assertThrows(AwsException.class, () -> provisionedExecutor.invoke(fn, "{}".getBytes(),
+                    InvocationType.RequestResponse, 0, "live"));
+        }
+        verify(warmPool).release(handle);
+        verify(handle.getRuntimeApiServer(), never()).enqueue(any());
+    }
+
+    @Test
+    void anAsyncStoreFailureDoesNotCheckOutProvisionedCapacity() {
+        LambdaService lambdaService = mock(LambdaService.class);
+        when(lambdaService.isLive(fn)).thenThrow(new IllegalStateException("store unavailable"));
+        LambdaExecutorService provisionedExecutor = new LambdaExecutorService(
+                warmPool, new ObjectMapper(), concurrencyLimiter, null, lambdaService);
+        executors.add(provisionedExecutor);
+
+        assertThrows(IllegalStateException.class, () -> provisionedExecutor.invoke(fn, "{}".getBytes(),
+                InvocationType.Event, 0, "live"));
+        verify(warmPool, never()).acquireProvisioned(any(), any());
+        verify(concurrencyLimiter, never()).acquire(any());
+    }
+
+    @Test
+    void anAsyncInvocationRejectedDuringShutdownReturnsItsProvisionedRuntimeAndPermit() {
+        fn.setVersion("1");
+        ContainerHandle handle = new ContainerHandle("cid-provisioned", "test-fn",
+                mock(RuntimeApiServer.class), ContainerState.WARM);
+        LambdaConcurrencyLimiter.Permit permit = mock(LambdaConcurrencyLimiter.Permit.class);
+        when(warmPool.acquireProvisioned(fn, "live")).thenReturn(handle);
+        when(concurrencyLimiter.acquireProvisioned(fn)).thenReturn(permit);
+        executor.shutdown();
+
+        assertThrows(RejectedExecutionException.class, () -> executor.invoke(fn, "{}".getBytes(),
+                InvocationType.Event, 0, "live"));
+        verify(warmPool).release(handle);
+        verify(permit).close();
+        verify(handle.getRuntimeApiServer(), never()).enqueue(any());
     }
 
     @Test
@@ -660,8 +737,6 @@ class LambdaExecutorServiceTest {
         AsyncInvokeDestinationRouter router = mock(AsyncInvokeDestinationRouter.class);
         LambdaService lambdaService = eventInvokeConfig(2, 21600);
         LambdaExecutorService retryExecutor = retryingExecutor(router, lambdaService, Duration.ZERO);
-        LambdaConcurrencyLimiter.Permit permit = mock(LambdaConcurrencyLimiter.Permit.class);
-        when(concurrencyLimiter.acquire(fn)).thenReturn(permit);
         RuntimeApiServer rtas = mock(RuntimeApiServer.class);
         failEveryAttempt(rtas, failedAttempt("req-deleted-before-invoke"));
         // DeleteFunction ran between the caller resolving fn and this invoke: the function has left
@@ -674,7 +749,7 @@ class LambdaExecutorServiceTest {
         assertEquals(202, result.getStatusCode());
         verify(warmPool, after(1000).never()).acquire(any());
         verify(router, never()).route(any(), any(), any(), anyInt(), anyInt(), any());
-        verify(permit).close();
+        verify(concurrencyLimiter, never()).acquire(any());
     }
 
     @Test

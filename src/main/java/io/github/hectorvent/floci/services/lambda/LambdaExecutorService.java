@@ -31,6 +31,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -79,7 +80,12 @@ public class LambdaExecutorService implements Resettable {
             Math.max(8, Runtime.getRuntime().availableProcessors() * 4),
             60L, TimeUnit.SECONDS,
             new LinkedBlockingQueue<>(500),
-            new ThreadPoolExecutor.CallerRunsPolicy());
+            (task, executor) -> {
+                if (executor.isShutdown()) {
+                    throw new RejectedExecutionException("Lambda executor is stopping");
+                }
+                task.run();
+            });
 
     @Inject
     public LambdaExecutorService(WarmPool warmPool,
@@ -207,7 +213,6 @@ public class LambdaExecutorService implements Resettable {
         }
 
         LambdaService lambdaService = resolveLambdaService();
-        LambdaConcurrencyLimiter.Permit permit = acquire(lambdaService, fn);
 
         if (type == InvocationType.Event) {
             FunctionEventInvokeConfig eventInvokeConfig = null;
@@ -233,22 +238,23 @@ public class LambdaExecutorService implements Resettable {
             // again after it removes the function from the store. So either this check sees the function
             // gone, or the count moves after the event's snapshot and stale() drops the event.
             if (lambdaService != null && !lambdaService.isLive(fn)) {
-                permit.close();
                 return new InvokeResult(202, null, new byte[0], null, requestId);
             }
+            Capacity capacity = acquire(lambdaService, fn, invokedQualifier);
             try {
-                asyncExecutor.submit(() -> attempt(event, 1, null, permit));
+                asyncExecutor.submit(() -> attempt(event, 1, null, capacity));
             } catch (RuntimeException e) {
-                permit.close();
+                abandon(capacity);
                 throw e;
             }
             return new InvokeResult(202, null, new byte[0], null, requestId);
         }
 
+        Capacity capacity = acquire(lambdaService, fn, invokedQualifier);
         try {
-            return executeSync(fn, payload, requestId, clientContext, invokedQualifier);
+            return executeSync(fn, payload, requestId, clientContext, capacity.provisioned());
         } finally {
-            permit.close();
+            capacity.permit().close();
         }
     }
 
@@ -266,9 +272,28 @@ public class LambdaExecutorService implements Resettable {
      * Reserved concurrency is function-wide, so the permit is taken against the function's {@code $LATEST}
      * record, which holds the reservation, rather than a version's snapshot, which has none.
      */
-    private LambdaConcurrencyLimiter.Permit acquire(LambdaService lambdaService, LambdaFunction fn) {
+    private record Capacity(LambdaConcurrencyLimiter.Permit permit, ContainerHandle provisioned) {}
+
+    private Capacity acquire(LambdaService lambdaService, LambdaFunction fn, String qualifier) {
         LambdaFunction function = lambdaService != null ? lambdaService.findLatest(fn).orElse(fn) : fn;
-        return concurrencyLimiter.acquire(function);
+        ContainerHandle handle = qualifier == null ? null : warmPool.acquireProvisioned(fn, qualifier);
+        try {
+            LambdaConcurrencyLimiter.Permit permit = handle == null
+                    ? concurrencyLimiter.acquire(function) : concurrencyLimiter.acquireProvisioned(function);
+            return new Capacity(permit, handle);
+        } catch (RuntimeException failure) {
+            if (handle != null) {
+                warmPool.release(handle);
+            }
+            throw failure;
+        }
+    }
+
+    private void abandon(Capacity capacity) {
+        capacity.permit().close();
+        if (capacity.provisioned() != null) {
+            warmPool.release(capacity.provisioned());
+        }
     }
 
     /**
@@ -279,20 +304,20 @@ public class LambdaExecutorService implements Resettable {
      * invoke itself took.
      */
     private void attempt(AsyncEvent event, int attempt, InvokeResult previous,
-                         LambdaConcurrencyLimiter.Permit held) {
+                         Capacity held) {
         if (stale(event) || clock.millis() >= event.expiresAtMs()) {
             if (held != null) {
-                held.close();
+                abandon(held);
             }
             route(event, previous, attempt - 1);
             return;
         }
-        LambdaConcurrencyLimiter.Permit permit;
+        Capacity capacity;
         if (held != null) {
-            permit = held;
+            capacity = held;
         } else {
             try {
-                permit = acquire(resolveLambdaService(), event.fn());
+                capacity = acquire(resolveLambdaService(), event.fn(), event.invokedQualifier());
             } catch (AwsException throttled) {
                 // ponytail: AWS backs a throttled retry off exponentially, up to five minutes; one
                 // fixed poll is enough locally, and the event still expires on time.
@@ -301,8 +326,8 @@ public class LambdaExecutorService implements Resettable {
             }
         }
         InvokeResult result;
-        try (permit) {
-            result = executeSync(event.fn(), event.payload(), event.requestId(), null, event.invokedQualifier());
+        try (LambdaConcurrencyLimiter.Permit ignored = capacity.permit()) {
+            result = executeSync(event.fn(), event.payload(), event.requestId(), null, capacity.provisioned());
         } catch (RuntimeException e) {
             LOG.warnv("Error in async Lambda execution for {0}: {1}", event.fn().getFunctionName(), e.getMessage());
             // Stops retrying, as upstream did: routes the previous attempt's result, or UnknownError when
@@ -360,13 +385,10 @@ public class LambdaExecutorService implements Resettable {
     }
 
     private InvokeResult executeSync(LambdaFunction fn, byte[] payload, String requestId,
-                                     String clientContext, String invokedQualifier) {
+                                     String clientContext, ContainerHandle provisioned) {
         ContainerHandle handle;
         try {
-            handle = warmPool.acquireProvisioned(fn, invokedQualifier);
-            if (handle == null) {
-                handle = warmPool.acquire(fn);
-            }
+            handle = provisioned != null ? provisioned : warmPool.acquire(fn);
         } catch (Exception e) {
             LOG.warnv("Failed to acquire container for function {0}: {1}", fn.getFunctionName(), e.getMessage());
             return new InvokeResult(200, "Unhandled",
