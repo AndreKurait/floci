@@ -32,6 +32,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -74,6 +75,12 @@ class HttpIntegrationRoleTest {
         role.setAssumeRolePolicyDocument(TRUST);
         when(iam.findRole(OWNER, "integration")).thenReturn(Optional.of(role));
         when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(ALLOW)));
+        when(iam.resolveCallerArns(anyString())).thenAnswer(invocation -> Optional.of(new IamService.CallerArns(
+                "arn:aws:sts::" + OWNER + ":assumed-role/integration/test-session", ROLE,
+                IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROAEXAMPLE:test-session", null,
+                role.getPermissionsBoundaryArn() != null)));
+        when(iam.resolveCallerContext(anyString(), any(Instant.class)))
+                .thenAnswer(invocation -> iam.resolvePrincipalContext(ROLE));
         provider = mock(ResourcePolicyProvider.class);
         Instance<ResourcePolicyProvider> providers = mock(Instance.class);
         when(providers.iterator()).thenAnswer(invocation -> List.of(provider).iterator());
@@ -110,7 +117,7 @@ class HttpIntegrationRoleTest {
         routeContext.routeToHttpApi("us-east-1");
         controller = new ApiGatewayExecuteController(null, null, gateway, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
-                routeContext, null, new RequestContext(), null, null, null, direct, roles);
+                routeContext, null, new RequestContext(), null, null, null, direct, roles, null, null);
     }
 
     @ParameterizedTest
@@ -179,7 +186,7 @@ class HttpIntegrationRoleTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"arn:aws:iam::*:user/*", "*"})
+    @ValueSource(strings = {"*"})
     void callerCredentialsRetainSeparateUnqualifiedPath(String credentials) {
         integration.setCredentialsArn(credentials);
         assertEquals(200, invoke());

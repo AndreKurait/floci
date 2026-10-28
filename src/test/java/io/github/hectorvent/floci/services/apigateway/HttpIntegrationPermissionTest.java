@@ -148,8 +148,8 @@ class HttpIntegrationPermissionTest {
     }
 
     @Test
-    void callerPassthroughRetainsItsSeparatePath() {
-        integration.setCredentialsArn("arn:aws:iam::*:user/*");
+    void legacyStarRetainsItsSeparatePath() {
+        integration.setCredentialsArn("*");
         assertEquals(200, invoke("2.0"));
     }
 
@@ -226,7 +226,7 @@ class HttpIntegrationPermissionTest {
         routeContext.routeToHttpApi("us-east-1");
         return new ApiGatewayExecuteController(null, null, gateway, lambda,
                 new RegionResolver("us-east-1", "000000000000"), mapper, null, null, null, null, null,
-                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), serviceCallAuthorizer, roles);
+                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), serviceCallAuthorizer, roles, null, null);
     }
 
     private InvokeResult result(String payload) {

@@ -1144,5 +1144,10 @@ When IAM enforcement is enabled, HTTP API Lambda integrations with an execution 
 require API Gateway role trust and invocation permission through the shared identity,
 resource-policy, permissions-boundary and SCP evaluators. Cross-account targets also
 require a resource-policy grant. Authorization and invocation use one qualified target.
-Caller-identity passthrough remains a separate path; this does not qualify forwarding
-its permissions, full condition context, or issuance of execution-role STS sessions.
+The partition-aware `arn:aws:iam::*:user/*` credentials sentinel forwards the verified
+caller's invocation permissions. Signature verification binds the request path, query
+and body; identity, resource policies, session policies, permissions boundaries and
+SCPs use the shared IAM evaluator. Missing or invalid caller credentials return HTTP
+500 before invocation when IAM enforcement is enabled. The historical bare `*`
+compatibility spelling is preserved separately. Full forwarded condition context and
+issuance of execution-role STS sessions remain outside this behavior.
