@@ -3958,6 +3958,13 @@ public class Ec2QueryHandler {
      * @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CopyImage.html">CopyImage</a>
      */
     private Response handleCopyImage(MultivaluedMap<String, String> p, String region) {
+        if (p.containsKey("KmsKeyId") || Boolean.parseBoolean(p.getFirst("Encrypted"))
+                || Boolean.parseBoolean(p.getFirst("CopyImageTags"))
+                || p.keySet().stream().anyMatch(name -> name.startsWith("Destination")
+                        || name.equals("SnapshotCopyCompletionDurationMinutes"))) {
+            throw new AwsException("UnsupportedOperation",
+                    "CopyImage supports regional copies without encryption, copied tags or placement options.", 400);
+        }
         List<Tag> imageTags = parseTagsForResource(p, "image", IMAGE_TAG_RESOURCE_TYPES);
         List<Tag> snapshotTags = parseTagsForResource(p, "snapshot", IMAGE_TAG_RESOURCE_TYPES);
         Image image = service.copyImage(
