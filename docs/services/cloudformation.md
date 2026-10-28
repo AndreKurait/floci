@@ -264,7 +264,7 @@ Resource type AWS::Fake::Thing is not supported by Floci. It was stubbed and not
 
 Set `floci.services.cloudformation.allow-stub-unsupported-resource-types` to `false`
 (`FLOCI_SERVICES_CLOUDFORMATION_ALLOW_STUB_UNSUPPORTED_RESOURCE_TYPES=false`) to fail such a
-resource instead: it reaches `CREATE_FAILED` and the stack rolls back. Use it in a pipeline that
+resource instead: it reaches `CREATE_FAILED` and the stack rolls back by default. Use it in a pipeline that
 must not pass over a resource it never got.
 
 ## SES Email Identities
@@ -928,6 +928,17 @@ enabling TLS does not turn it into an AWS presigned S3 URL. The bundled Node.js 
 module for inline `ZipFile` code follows that URL's scheme and port and does not require TLS for
 this callback. The HTTPS/443 requirement applies to handlers with the hard-coded behavior above,
 not to every custom-resource handler.
+
+## Preserving failed creations
+
+`CreateStack` honors `DisableRollback=true`: a resource failure leaves the stack in
+`CREATE_FAILED` and preserves the resources already created. Inspect the stack events to find
+the failing resource; a later `DeleteStack` removes the retained deployment normally. An omitted
+or false option retains the default create rollback. `DescribeStacks` reports the saved
+`DisableRollback` value, including after a storage reload.
+
+`DisableRollback` and `OnFailure` cannot both be supplied to `CreateStack`, even when
+`DisableRollback` is false. The creation option does not disable a later update's normal rollback.
 
 ## Failed update rollbacks
 
