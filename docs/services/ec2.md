@@ -358,7 +358,10 @@ Notes and limitations:
 
 `UserData` must be base64-encoded in the request (matching the AWS wire format). Floci decodes it, copies the script into `/var/lib/user-data.sh` inside the container, and executes the script directly after SSH key injection so the script shebang selects the interpreter. Output is captured and logged.
 
-EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT` for IMDS and `AWS_ENDPOINT_URL` for AWS service API calls back to Floci.
+EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT=http://169.254.169.254`
+for IMDS and `AWS_ENDPOINT_URL` for AWS service API calls back to Floci. The
+metadata endpoint uses the instance's prepared link-local route, including when
+security groups deny ordinary egress.
 
 CloudFormation `AWS::EC2::VPCEndpoint` resolves `IpAddressType` on create and update, including parameter references. Omission, a selected `AWS::NoValue` branch, or `not-specified` uses the default `ipv4`; an explicitly empty value is rejected. Updates retain the existing replacement behavior; synthetic interfaces remain IPv4-only.
 
@@ -366,17 +369,38 @@ CloudFormation `AWS::EC2::LaunchTemplate` stores `LaunchTemplateData.MetadataOpt
 
 ## Instance Metadata Service (IMDS)
 
-Floci runs an IMDS-compatible HTTP server on port `9169` of the host. Each launched container receives the environment variable `AWS_EC2_METADATA_SERVICE_ENDPOINT` pointing to this server.
+Floci runs an IMDS-compatible HTTP server on port `9169` of the host. The
+instance's link-local route forwards metadata requests to this server.
 
-Inside each launched container, the link-local address `169.254.169.254` is a proxy to this
-server. The helper shells that install and start the proxy clear `LD_LIBRARY_PATH`,
-`PYTHONPATH` and `PYTHONHOME` before running system tools, so an application's library search
-path and Python installation do not reach the package manager, `socat` and `curl`. The
-container's configured environment and the application's processes keep these variables. The
-proxy is ready once an IMDSv2 token request with a 60-second TTL succeeds and that token reads the
+Before starting a guest image, Floci prepares its network in a trusted helper container.
+The guest joins that network namespace with its normal ENTRYPOINT and CMD. This prevents
+an early metadata request from reaching the Docker host's metadata service while Floci
+is still setting up the guest. The helper also owns the published SSH port and VPC network
+attachment. Stop/start keeps the namespace; termination removes both containers.
+
+The helper image is configured by `floci.services.ec2.metadata-helper-image`
+(`FLOCI_SERVICES_EC2_METADATA_HELPER_IMAGE`). The default `floci/network-helper:local` is
+built from Floci's bundled Dockerfile when absent. A custom value must identify an
+available image with a shell, `ip`, `iptables`, and `curl`. With security-group enforcement
+enabled, Floci prepares metadata in the existing firewall helper instead.
+
+Inside this namespace, the link-local address `169.254.169.254` routes to Floci's metadata
+server. Routing is ready once an IMDSv2 token request with a 60-second TTL succeeds and that token reads the
 instance ID. The check bypasses any HTTP proxy the image configures, a failed or empty token
 response does not fall back to a tokenless request, and the check passes on an instance that
-requires tokens.
+requires tokens. Failed setup prevents the guest image from starting. With `HttpEndpoint`
+disabled, the route is still installed, but the token readiness check is omitted so the
+instance can boot with metadata disabled.
+
+`HttpEndpoint=disabled` makes the local metadata server return HTTP 404 with no
+body for metadata and token requests, including requests using a previously
+issued token. Changes through `ModifyInstanceMetadataOptions` take effect
+without restarting the guest. The HTTP 404 is a local-emulator response; Floci
+keeps the route in place so disabled metadata cannot fall through to the host.
+Default helper images are rebuilt when their bundled Dockerfile changes, so
+an older Docker cache receives the current routing tools.
+
+Recreate containers launched by older Floci versions to receive the helper namespace.
 
 EC2 link-local routing uses a host route and an OUTPUT DNAT rule inside the
 guest network namespace. The host route selects the same existing interface

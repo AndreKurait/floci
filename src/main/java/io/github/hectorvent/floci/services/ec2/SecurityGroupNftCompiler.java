@@ -62,6 +62,10 @@ public final class SecurityGroupNftCompiler {
         rules.append("add rule inet floci_sg egress udp sport 68 udp dport 67 accept\n")
                 .append("add rule inet floci_sg ingress udp sport 67 udp dport 68 accept\n")
                 .append("add rule inet floci_sg egress ip daddr 169.254.169.254 accept\n")
+                // OUTPUT DNAT runs before this filter. Exempt only traffic originally sent to
+                // IMDS, not direct connections to the emulator's metadata or API ports.
+                .append("add rule inet floci_sg egress meta l4proto tcp"
+                        + " ct original ip daddr 169.254.169.254 ct original proto-dst 80 accept\n")
                 .append("add rule inet floci_sg ingress ip saddr 169.254.169.254 accept\n");
 
         List<Endpoint> managed = peers == null ? List.of() : peers.stream()

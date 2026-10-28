@@ -54,6 +54,10 @@ class LocallyBuiltHelperImageDockerIntegrationTest {
                         "/docker/native-platform-helper.Dockerfile");
 
                 assertTrue(DockerPlatform.matches(docker.inspectImageCmd(helper).exec(), nativePlatform));
+                String builtImage = docker.inspectImageCmd(helper).exec().getId();
+                LocallyBuiltHelperImage.ensureBuilt(docker, builder, helper, helper,
+                        "/docker/native-platform-helper.Dockerfile");
+                assertEquals(builtImage, docker.inspectImageCmd(helper).exec().getId());
                 containerId = docker.createContainerCmd(helper).exec().getId();
                 docker.startContainerCmd(containerId).exec();
                 try (WaitContainerResultCallback exited = new WaitContainerResultCallback()) {
