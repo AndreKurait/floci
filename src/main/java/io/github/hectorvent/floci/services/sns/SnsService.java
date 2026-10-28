@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
@@ -27,6 +28,7 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.firehose.FirehoseService;
 import io.github.hectorvent.floci.services.firehose.model.Record;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.sns.model.PlatformApplication;
@@ -170,6 +172,7 @@ public class SnsService implements Resettable, ResourceProvider {
     private final RegionResolver regionResolver;
     private final SqsService sqsService;
     private final LambdaService lambdaService;
+    private final ServiceCallAuthorizer serviceCallAuthorizer;
     private final FirehoseService firehoseService;
     private final String baseUrl;
     private final ObjectMapper objectMapper;
@@ -182,7 +185,8 @@ public class SnsService implements Resettable, ResourceProvider {
     public SnsService(StorageFactory storageFactory, EmulatorConfig config,
                       RegionResolver regionResolver, SqsService sqsService,
                       LambdaService lambdaService, FirehoseService firehoseService,
-                      ObjectMapper objectMapper, SnsMessageSigner messageSigner) {
+                      ObjectMapper objectMapper, SnsMessageSigner messageSigner,
+                      ServiceCallAuthorizer serviceCallAuthorizer) {
         this(
                 storageFactory.create("sns", "sns-topics.json",
                         new TypeReference<Map<String, Topic>>() {
@@ -211,7 +215,8 @@ public class SnsService implements Resettable, ResourceProvider {
                 firehoseService,
                 config.effectiveBaseUrl(),
                 objectMapper,
-                messageSigner
+                messageSigner,
+                serviceCallAuthorizer
         );
     }
 
@@ -253,6 +258,17 @@ public class SnsService implements Resettable, ResourceProvider {
                RegionResolver regionResolver, SqsService sqsService,
                LambdaService lambdaService,
                FirehoseService firehoseService) {
+        this(topicStore, subscriptionStore, platformAppStore, platformEndpointStore,
+                regionResolver, sqsService, lambdaService, firehoseService, null);
+    }
+
+    SnsService(StorageBackend<String, Topic> topicStore,
+               StorageBackend<String, Subscription> subscriptionStore,
+               StorageBackend<String, PlatformApplication> platformAppStore,
+               StorageBackend<String, PlatformEndpoint> platformEndpointStore,
+               RegionResolver regionResolver, SqsService sqsService,
+               LambdaService lambdaService, FirehoseService firehoseService,
+               ServiceCallAuthorizer serviceCallAuthorizer) {
         this.topicStore = topicStore;
         this.subscriptionStore = subscriptionStore;
         this.platformAppStore = platformAppStore;
@@ -263,6 +279,7 @@ public class SnsService implements Resettable, ResourceProvider {
         this.regionResolver = regionResolver;
         this.sqsService = sqsService;
         this.lambdaService = lambdaService;
+        this.serviceCallAuthorizer = serviceCallAuthorizer;
         this.firehoseService = firehoseService;
         this.baseUrl = "http://localhost:4566";
         this.objectMapper = new ObjectMapper();
@@ -332,6 +349,22 @@ public class SnsService implements Resettable, ResourceProvider {
                RegionResolver regionResolver, SqsService sqsService,
                LambdaService lambdaService, FirehoseService firehoseService,
                String baseUrl, ObjectMapper objectMapper, SnsMessageSigner messageSigner) {
+        this(topicStore, subscriptionStore, platformAppStore, platformEndpointStore, smsStore,
+                smsAttributesStore, smsSandboxStore, regionResolver, sqsService, lambdaService,
+                firehoseService, baseUrl, objectMapper, messageSigner, null);
+    }
+
+    SnsService(StorageBackend<String, Topic> topicStore,
+               StorageBackend<String, Subscription> subscriptionStore,
+               StorageBackend<String, PlatformApplication> platformAppStore,
+               StorageBackend<String, PlatformEndpoint> platformEndpointStore,
+               StorageBackend<String, SentSms> smsStore,
+               StorageBackend<String, Map<String, String>> smsAttributesStore,
+               StorageBackend<String, SmsSandboxPhoneNumber> smsSandboxStore,
+               RegionResolver regionResolver, SqsService sqsService,
+               LambdaService lambdaService, FirehoseService firehoseService,
+               String baseUrl, ObjectMapper objectMapper, SnsMessageSigner messageSigner,
+               ServiceCallAuthorizer serviceCallAuthorizer) {
         this.topicStore = topicStore;
         this.subscriptionStore = subscriptionStore;
         this.platformAppStore = platformAppStore;
@@ -342,6 +375,7 @@ public class SnsService implements Resettable, ResourceProvider {
         this.regionResolver = regionResolver;
         this.sqsService = sqsService;
         this.lambdaService = lambdaService;
+        this.serviceCallAuthorizer = serviceCallAuthorizer;
         this.firehoseService = firehoseService;
         this.baseUrl = baseUrl;
         this.objectMapper = objectMapper;
@@ -2546,6 +2580,12 @@ public class SnsService implements Resettable, ResourceProvider {
                             messageDeduplicationId, sqsAttributes, region, rawDelivery);
                 }
                 case "lambda" -> {
+                    AwsArnUtils.Arn source = AwsArnUtils.parse(topicArn);
+                    if (serviceCallAuthorizer != null && serviceCallAuthorizer.authorize(
+                            "sns", "lambda:InvokeFunction", sub.getEndpoint(), topicArn,
+                            source.accountId()) != Decision.ALLOW) {
+                        throw new AwsException("AccessDeniedException", "SNS cannot invoke the Lambda target", 403);
+                    }
                     String region = extractRegionFromArn(sub.getEndpoint());
                     String eventJson = buildSnsLambdaEvent(topicArn, messageId, protocolMessage,
                             subject, messageAttributes, sub.getSubscriptionArn(), signatureVersion);
