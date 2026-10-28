@@ -244,6 +244,26 @@ class RestRouteIamIntegrationTest {
     }
 
     @Test
+    void issuedSessionTokenIssueTimeIsEvaluatedAlongsideRolePolicy() throws Exception {
+        Fixture fixture = fixture("GET");
+        String name = fixtureNames.apply("rest-token-time-session-");
+        String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
+                + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
+        String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
+                "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
+                .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
+                "PolicyDocument", policy(fixture.arn()))).then().statusCode(200);
+        cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+        String sessionPolicy = conditionedPolicy(fixture.arn(),
+                "\"DateLessThan\":{\"aws:TokenIssueTime\":\"2100-01-01T00:00:00Z\"}");
+        invoke(fixture, assume(role, sessionPolicy), 200);
+        invoke(fixture, assume(role, sessionPolicy.replace("2100-01-01", "2000-01-01")), 403);
+        assertEquals(1, fixture.hits().get());
+    }
+
+    @Test
     void issuedSessionTimeWindowIsEvaluatedAlongsideRolePolicy() throws Exception {
         Fixture fixture = fixture("GET");
         String name = fixtureNames.apply("rest-time-session-");
@@ -264,7 +284,7 @@ class RestRouteIamIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"policy", "transport", "time"})
+    @ValueSource(strings = {"policy", "transport", "token-time", "time"})
     void rejectedRoleCreationPreservesPreexistingRole(String scenario) throws Exception {
         String name = "rest-existing-role-" + UUID.randomUUID();
         SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
@@ -274,6 +294,7 @@ class RestRouteIamIntegrationTest {
         Executable call = switch (scenario) {
             case "policy" -> fixture::issuedRoleSessionsRetainPolicyTokenAndRevocationChecks;
             case "transport" -> fixture::issuedSessionEvaluatesTransportConditionsAlongsideRolePolicy;
+            case "token-time" -> fixture::issuedSessionTokenIssueTimeIsEvaluatedAlongsideRolePolicy;
             case "time" -> fixture::issuedSessionTimeWindowIsEvaluatedAlongsideRolePolicy;
             default -> throw new IllegalArgumentException(scenario);
         };

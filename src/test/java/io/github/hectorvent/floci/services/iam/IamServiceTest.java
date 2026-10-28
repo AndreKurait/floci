@@ -445,7 +445,7 @@ class IamServiceTest {
         assertEquals(new IamService.CallerArns("arn:aws:sts::123456789012:assumed-role/TestRole/s",
                         "arn:aws:iam::123456789012:role/team/TestRole",
                         IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROATESTROLEID:s", null),
-                service.resolveCallerArns("ASIALIVESESSION").orElseThrow());
+                service.resolveCallerArns("ASIALIVESESSION").orElseThrow().withTokenIssueTime(null));
         // An expired session answers for neither, never for one and not the other.
         assertTrue(service.resolveCallerArns("ASIAEXPIREDSESSION").isEmpty());
     }
@@ -620,7 +620,7 @@ class IamServiceTest {
         // the guide gives one to an IAM user and to no other principal.
         assertEquals(new IamService.CallerArns(alice.getArn(), alice.getArn(),
                         IamService.CallerArns.TYPE_USER, alice.getUserId(), "alice"),
-                service.resolveCallerArns("ASIASESSIONTOKEN").orElseThrow());
+                service.resolveCallerArns("ASIASESSIONTOKEN").orElseThrow().withTokenIssueTime(null));
         assertEquals(alice.getUserId(), service.resolveCallerUserId("ASIASESSIONTOKEN", "token").orElseThrow());
     }
 
@@ -639,7 +639,7 @@ class IamServiceTest {
         assertEquals(new IamService.CallerArns("arn:aws:iam::000000000000:root",
                         "arn:aws:iam::000000000000:root", IamService.CallerArns.TYPE_ACCOUNT,
                         "000000000000", null),
-                service.resolveCallerArns("ASIAROOTSESSION").orElseThrow());
+                service.resolveCallerArns("ASIAROOTSESSION").orElseThrow().withTokenIssueTime(null));
     }
 
     @Test
@@ -749,7 +749,7 @@ class IamServiceTest {
         // aws:username: the guide lists it as not present for a federated user.
         assertEquals(new IamService.CallerArns(federatedArn, federatedArn,
                         IamService.CallerArns.TYPE_FEDERATED_USER, "000000000000:Bob", null),
-                service.resolveCallerArns("ASIAWITHPOLICY").orElseThrow());
+                service.resolveCallerArns("ASIAWITHPOLICY").orElseThrow().withTokenIssueTime(null));
         assertEquals("000000000000:Bob", service.resolveCallerUserId("ASIAWITHPOLICY", "token").orElseThrow());
     }
 

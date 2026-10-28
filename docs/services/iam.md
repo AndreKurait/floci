@@ -2527,3 +2527,12 @@ aws iam create-access-key --user-name alice --endpoint-url $AWS_ENDPOINT_URL
 # List roles
 aws iam list-roles --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+### Temporary credential issue time
+
+New local temporary credentials record their issuance time. Shared IAM principal context
+exposes this timestamp as `aws:TokenIssueTime` for policy conditions, preserving it across
+storage serialization and later requests. Long-term access keys do not include this key.
+Older persisted session records without an issuance timestamp leave it absent; Floci does
+not derive a replacement timestamp from expiration or restart time. This does not add
+MFA/session-tag context or issue new service execution-role sessions.
