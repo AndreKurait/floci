@@ -397,6 +397,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             return;
         }
 
+        if (iamService.sessionTokenDeniesOperation(akid, credentialScope, resolvedAuthorization.operation())) {
+            ctx.abortWith(accessDeniedForRequest(action, credentialScope, ctx));
+            return;
+        }
+
         // Service control policies from the caller's organization, when the Organizations
         // service is present and SCP enforcement is enabled. Resolved lazily via Instance
         // to avoid a hard IAM → Organizations dependency.
