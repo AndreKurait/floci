@@ -17,6 +17,8 @@ public class SessionCredential {
     private String assumedRoleId;
     private Instant expiration;
     private Instant issuedAt;
+    /** True only for credentials issued by GetSessionToken, never inferred from their key or token. */
+    private boolean sessionTokenCredential;
     private Boolean multiFactorAuthPresent;
     private Instant multiFactorAuthenticatedAt;
     /** Inline session policy passed to AssumeRole/GetFederationToken — further restricts role policies. */
@@ -120,6 +122,9 @@ public class SessionCredential {
 
     public Instant getIssuedAt() { return issuedAt; }
     public void setIssuedAt(Instant issuedAt) { this.issuedAt = issuedAt; }
+
+    public boolean isSessionTokenCredential() { return sessionTokenCredential; }
+    public void setSessionTokenCredential(boolean value) { sessionTokenCredential = value; }
 
     public Boolean getMultiFactorAuthPresent() { return multiFactorAuthPresent; }
     public void setMultiFactorAuthPresent(Boolean multiFactorAuthPresent) {
