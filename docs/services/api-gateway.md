@@ -1080,3 +1080,10 @@ cache miss or stage cache flush makes the next invocation check permission again
 Configured authorizer roles retain their existing execution path; this check does
 not implement role assumption, HTTP/WebSocket authorizer permissions, or prove
 live AWS or native-image parity.
+
+WebSocket REQUEST authorizers without `authorizerCredentialsArn` check the Lambda
+resource policy when IAM enforcement is enabled. The check uses the API account,
+the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
+qualified Lambda target. Missing permission returns the existing authorizer
+configuration error before invocation. Configured authorizer roles retain their
+separate execution path; this check does not implement role assumption.
