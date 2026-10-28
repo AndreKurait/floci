@@ -3510,21 +3510,26 @@ public class ApiGatewayExecuteController {
         // Invoke the authorizer Lambda
         InvokeResult invokeResult;
         try {
-            if (authorizer.getAuthorizerCredentialsArn() == null
-                    || authorizer.getAuthorizerCredentialsArn().isBlank()) {
-                String accountId = regionResolver.getAccountId();
-                String functionArn = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
-                        region, accountId);
+            String accountId = regionResolver.getAccountId();
+            String functionArn = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
+                    region, accountId);
+            String credentials = authorizer.getAuthorizerCredentialsArn();
+            Decision decision;
+            if (credentials == null || credentials.isBlank()) {
                 String sourceArn = AwsArnUtils.Arn.of("execute-api", region, accountId,
                         apiId + "/authorizers/" + route.getAuthorizerId()).toString();
-                if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
-                        sourceArn, accountId) == Decision.DENY) {
-                    return new RequestAuthorizerResult(Response.status(500)
-                            .entity(jsonMessage("Internal Server Error"))
-                            .type(MediaType.APPLICATION_JSON).build(), null);
-                }
+                decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                        sourceArn, accountId);
+            } else {
+                decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                        "lambda:InvokeFunction", functionArn, accountId, regionResolver.getPartition());
             }
-            invokeResult = lambdaService.invokeTarget(region, functionName,
+            if (decision == Decision.DENY) {
+                return new RequestAuthorizerResult(Response.status(500)
+                        .entity(jsonMessage("Internal Server Error"))
+                        .type(MediaType.APPLICATION_JSON).build(), null);
+            }
+            invokeResult = lambdaService.invokeTarget(region, functionArn,
                     eventJson.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
         } catch (Exception e) {
             LOG.warnv("Lambda REQUEST authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Authorizer;
@@ -51,6 +52,7 @@ class HttpAuthorizerPermissionTest {
     private UriInfo uri;
     private CurrentVertxRequest currentVertxRequest;
     private SocketAddress remoteAddress;
+    private IamPolicyEvaluator.Decision roleDecision;
 
     @BeforeEach
     void setUp() {
@@ -62,6 +64,15 @@ class HttpAuthorizerPermissionTest {
         when(iam.enforcementEnabled()).thenReturn(true);
         ResourcePolicyProvider provider = (scope, arn) -> {
             assertEquals("lambda", scope);
+            if ("arn:aws:lambda:us-east-1:000000000000:function:backend".equals(arn)) {
+                String backendGrant = """
+                        {"Statement":{"Effect":"Allow","Principal":{"Service":"apigateway.amazonaws.com"},
+                        "Action":"lambda:InvokeFunction","Resource":"arn:aws:lambda:us-east-1:000000000000:function:backend",
+                        "Condition":{"StringEquals":{"AWS:SourceAccount":"000000000000",
+                        "AWS:SourceArn":"arn:aws:execute-api:us-east-1:000000000000:api/test/GET/items"}}}}
+                        """;
+                return List.of(new ResourcePolicyProvider.ResourcePolicy(backendGrant, "000000000000"));
+            }
             assertEquals("arn:aws:lambda:us-west-2:444455556666:function:authorizer:live", arn);
             return policy == null ? List.of() : List.of(new ResourcePolicyProvider.ResourcePolicy(policy,
                     "444455556666"));
@@ -138,9 +149,11 @@ class HttpAuthorizerPermissionTest {
     }
 
     @Test
-    void configuredRoleRetainsItsSeparatePath() {
+    void configuredRoleDenialStopsInvocation() {
         authorizer.setAuthorizerCredentialsArn("arn:aws:iam::000000000000:role/authorizer");
-        assertEquals(200, invoke("2.0"));
+        roleDecision = IamPolicyEvaluator.Decision.DENY;
+        assertEquals(500, invoke("2.0"));
+        verifyNoInteractions(lambda);
     }
 
     @Test
@@ -197,9 +210,12 @@ class HttpAuthorizerPermissionTest {
 
         ApiGatewayExecuteRouteContext routeContext = new ApiGatewayExecuteRouteContext(currentVertxRequest);
         routeContext.routeToHttpApi("us-east-1");
+        ServiceRoleCallAuthorizer roles = mock(ServiceRoleCallAuthorizer.class);
+        when(roles.authorizeWithoutSourceContext(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenAnswer(call -> roleDecision);
         return new ApiGatewayExecuteController(null, null, gateway, lambda,
                 new RegionResolver("us-east-1", "000000000000"), mapper, null, null, null, null, null,
-                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), serviceCallAuthorizer);
+                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), serviceCallAuthorizer, roles, null, null);
     }
 
     private InvokeResult result(String payload) {
