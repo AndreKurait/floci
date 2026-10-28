@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.GET;
@@ -21,6 +22,7 @@ import jakarta.ws.rs.core.UriInfo;
  * {@link V1TagsController} (mounted at {@code /v1/tags}).
  */
 @Produces(MediaType.APPLICATION_JSON)
+@RegisterForReflection(fields = false)
 public abstract class AbstractTagsController {
 
     private final TagDispatcher dispatcher;
