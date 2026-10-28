@@ -75,6 +75,11 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
+    public void putAllDurably(Map<K, V> entries) {
+        putAllAtomically(entries);
+    }
+
+    @Override
     public Optional<V> get(K key) {
         return Optional.ofNullable(store.get(key));
     }
@@ -142,6 +147,15 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     public synchronized void clear() {
         store.clear();
         persistToDisk();
+    }
+
+    @Override
+    public synchronized void flushOrThrow() {
+        try {
+            StorageFiles.writeAtomically(filePath, tempFile -> objectMapper.writeValue(tempFile.toFile(), store));
+        } catch (IOException exception) {
+            throw new UncheckedIOException("Failed to persist data to " + filePath, exception);
+        }
     }
 
     private synchronized void persistToDisk() {

@@ -14,7 +14,36 @@
 | `running → shutting-down → terminated` | `docker rm -f` |
 | Reboot | `docker restart` |
 
-Terminated instances remain queryable for 1 hour (matching real EC2 tombstone behavior) before being pruned.
+Terminated instances normally remain queryable for 1 hour before being pruned.
+Instances retained by a successful `RunInstances` client token remain available for replay until storage is reset.
+
+## RunInstances request replay
+
+`ClientToken` identifies a launch request within its account and region. Repeating a successful
+request returns its original reservation and instance IDs with the instances' current state.
+The replay does not launch containers again, consume another Capacity Reservation slot, reapply
+interface tags, or resolve the launch template again. Requests without a token launch independently.
+An explicitly supplied network interface must still exist: a deleted interface returns
+`InvalidNetworkInterfaceID.NotFound` before exact replay or parameter mismatch.
+`DryRun` retains its validation behavior and does not consume a token.
+
+A subnet or explicit availability zone scopes the token to that zone. A request without either
+binds to its selected zone; an explicit request for that zone uses the same outcome and must
+match the original parameters. Other zones are independent. Request matching retains original
+parameter presence, including omitted versus explicit `Monitoring.Enabled=false` and
+`DisableApiTermination=false`. Metadata options without a launch template use their effective
+launch defaults. Transport signatures and timestamps do not form part of request identity.
+Changed parameters return `IdempotentParameterMismatch`.
+
+The journal and generated resource ownership use the EC2 storage backend. Persistent, hybrid,
+and WAL modes persist allocation intent before resource publication and flush launch resources
+before acknowledging a completed outcome. Interrupted attempts reclaim their owned resources
+before retry; cleanup failures retain that ownership for retry or service startup recovery.
+Startup logs failed recovery attempts and continues recovering other pending requests and zones.
+Memory mode remains volatile. This is request replay, separate from Capacity Reservation
+membership recovery. Tokens and protected instance tombstones currently have no automatic
+expiry. CreateFleet does not pass its token to independent member launches.
+CreateFleet request replay remains unsupported.
 
 ## Instance Resource Limits
 

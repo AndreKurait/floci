@@ -589,7 +589,7 @@ class Ec2DeregisterAndCopyImageIntegrationTest {
 
     /**
      * Blocks until the launch thread is waiting to enter the registry-lock section of
-     * {@code runInstances}, which is the only point at which the tombstone can be landed
+     * {@code launchInstances}, which is the only point at which the tombstone can be landed
      * mid-launch on purpose. Matching on the frame as well as the state keeps a thread blocked
      * somewhere else from being mistaken for a parked launch, which would deregister too early
      * and let the launch fail its *first* check instead, proving nothing.
@@ -599,7 +599,7 @@ class Ec2DeregisterAndCopyImageIntegrationTest {
         while (System.nanoTime() - deadline < 0) {
             StackTraceElement[] stack = thread.getStackTrace();
             if (thread.getState() == Thread.State.BLOCKED && stack.length > 0
-                    && "runInstances".equals(stack[0].getMethodName())
+                    && "launchInstances".equals(stack[0].getMethodName())
                     && Ec2Service.class.getName().equals(stack[0].getClassName())) {
                 return;
             }

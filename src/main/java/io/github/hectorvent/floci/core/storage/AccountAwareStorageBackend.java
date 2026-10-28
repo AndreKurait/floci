@@ -83,6 +83,18 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     @Override
+    public void putAllDurably(Map<String, V> entries) {
+        putAllDurablyForAccount(prefix(), entries);
+    }
+
+    public void putAllDurablyForAccount(String accountId, Map<String, V> entries) {
+        Map<String, V> prefixedEntries = new LinkedHashMap<>();
+        entries.forEach((key, value) -> prefixedEntries.put(accountId + "/" + key, value));
+        delegate.putAllDurably(prefixedEntries);
+        trackOwner(accountId);
+    }
+
+    @Override
     public void putAllAtomically(Map<String, V> entries) {
         putAllAtomicallyForAccount(prefix(), entries);
     }
@@ -149,6 +161,11 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
                 .filter(k -> k.startsWith(prefix))
                 .map(k -> k.substring(prefix.length()))
                 .collect(Collectors.toUnmodifiableSet());
+    }
+
+    @Override
+    public void flushOrThrow() {
+        delegate.flushOrThrow();
     }
 
     @Override
