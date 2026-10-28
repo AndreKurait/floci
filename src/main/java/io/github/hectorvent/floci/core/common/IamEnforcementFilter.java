@@ -18,6 +18,7 @@ import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
 import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
 import io.github.hectorvent.floci.services.iam.ResourcePolicyProviders;
 import io.github.hectorvent.floci.services.iam.ScpProvider;
+import io.github.hectorvent.floci.services.iam.StsSessionTags;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
@@ -506,6 +507,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 : iamService.resolveCallerArns(akid);
         if ("sts:AssumeRole".equals(action) && callerArns.isPresent()) {
             Map<String, String> parameters = IamConditionContextResolver.formParameters(ctx);
+            try {
+                StsSessionTags.readForm(parameters);
+            } catch (AwsException invalidTags) {
+                ctx.abortWith(queryXmlError(invalidTags.getErrorCode(), invalidTags.getMessage(), invalidTags.getHttpStatus()));
+                return;
+            }
             if (parameters.containsKey("SerialNumber") || parameters.containsKey("TokenCode")) {
                 try {
                     callerArns = Optional.of(iamService.authenticateRequestMfa(callerArns.get(),
@@ -558,7 +565,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 region, accountId, akid)) {
             return;
         }
-        if (tagOnCreate.isPresent() && abortIfTagOnCreateDenied(ctx, caller, principal, callerArns.orElse(null),
+        // STS combines TagSession trust grants with these same caller ceilings before issuing the session.
+        if (tagOnCreate.isPresent() && !"sts:AssumeRole".equals(action) && abortIfTagOnCreateDenied(ctx, caller, principal, callerArns.orElse(null),
                 action, resolvedAuthorization.operation(), tagOnCreate.get(), credentialScope, resources, region,
                 accountId, akid)) {
             return;
