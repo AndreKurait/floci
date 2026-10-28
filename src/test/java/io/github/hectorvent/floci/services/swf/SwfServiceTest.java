@@ -44,6 +44,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -194,6 +195,42 @@ class SwfServiceTest {
                     poll.get(5, TimeUnit.SECONDS).orElseThrow().getWorkflowId());
         } finally {
             returnScan.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void activityHeartbeatsDoNotRescanAnIdleDecisionPoll() throws Exception {
+        start("heartbeats");
+        scheduleActivity("heartbeats", "activity");
+        SwfActivityTask task = service.pollForActivityTask(REGION, DOMAIN, "act-tl", "worker").orElseThrow();
+        service = Mockito.spy(service);
+        CountDownLatch firstScan = new CountDownLatch(1);
+        CountDownLatch extraScan = new CountDownLatch(1);
+        AtomicInteger scans = new AtomicInteger();
+        Mockito.doAnswer(invocation -> {
+            Object result = invocation.callRealMethod();
+            if (scans.incrementAndGet() == 1) {
+                firstScan.countDown();
+            } else {
+                extraScan.countDown();
+            }
+            return result;
+        }).when(service).pollForDecisionTask(REGION, DOMAIN, "tl", "idle");
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Optional<SwfDecisionTask>> poll = executor.submit(() ->
+                    service.pollForDecisionTask(REGION, DOMAIN, "tl", "idle", Duration.ofSeconds(10)));
+            assertTrue(firstScan.await(5, TimeUnit.SECONDS));
+            for (int i = 0; i < 20; i++) {
+                service.recordActivityTaskHeartbeat(task.getTaskToken(), "working");
+            }
+            assertFalse(extraScan.await(200, TimeUnit.MILLISECONDS),
+                    "heartbeats publish no decision work and must not wake decision pollers");
+            service.respondActivityTaskCompleted(task.getTaskToken(), "done");
+            assertEquals("heartbeats", poll.get(5, TimeUnit.SECONDS).orElseThrow().getWorkflowId());
+        } finally {
             executor.shutdownNow();
             assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
         }

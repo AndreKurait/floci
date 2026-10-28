@@ -132,25 +132,40 @@ public class SwfService implements Resettable {
         }
     }
 
-    private record PollScope(String accountId, String region, String domain) {}
+    private record PollScope(String accountId, String region, String domain,
+                             String taskList, boolean decision) {}
 
     private static final class PollSignal {
         private long version;
         private boolean closed;
+        private int waiters;
     }
 
     private <T> Optional<T> pollForTask(String region, String domain, String taskList,
-                                      Duration timeout, Supplier<Optional<T>> claim) {
+                                      boolean decision, Duration timeout, Supplier<Optional<T>> claim) {
         requireDomain(region, domain);
         requireName(taskList, "taskList.name");
+        PollScope scope = new PollScope(executionStore.accountId(), region, domain, taskList, decision);
         PollSignal signal;
         synchronized (pollSignals) {
             if (pollingStopped) {
                 return Optional.empty();
             }
-            signal = pollSignals.computeIfAbsent(
-                    new PollScope(executionStore.accountId(), region, domain), ignored -> new PollSignal());
+            signal = pollSignals.computeIfAbsent(scope, ignored -> new PollSignal());
+            signal.waiters++;
         }
+        try {
+            return awaitTask(timeout, claim, signal);
+        } finally {
+            synchronized (pollSignals) {
+                if (--signal.waiters == 0) {
+                    pollSignals.remove(scope, signal);
+                }
+            }
+        }
+    }
+
+    private <T> Optional<T> awaitTask(Duration timeout, Supplier<Optional<T>> claim, PollSignal signal) {
         long deadline = System.nanoTime() + timeout.toNanos();
         while (!Thread.currentThread().isInterrupted()) {
             long version;
@@ -195,8 +210,24 @@ public class SwfService implements Resettable {
 
     private void storeExecutionForAccount(String accountId, String key, SwfWorkflowExecution execution) {
         executionStore.putForAccount(accountId, key, execution);
-        PollSignal signal = pollSignals.get(
-                new PollScope(accountId, execution.getRegion(), execution.getDomain()));
+        if (!execution.isOpen() || pollSignals.isEmpty()) {
+            return;
+        }
+        SwfDecisionTask decision = execution.getDecisionTask();
+        if (decision != null && SwfDecisionTask.STATE_SCHEDULED.equals(decision.getState())) {
+            signalPollers(new PollScope(accountId, execution.getRegion(), execution.getDomain(),
+                    execution.getTaskList(), true));
+        }
+        for (SwfActivityTask activity : execution.getActivities().values()) {
+            if (SwfActivityTask.STATE_SCHEDULED.equals(activity.getState())) {
+                signalPollers(new PollScope(accountId, execution.getRegion(), execution.getDomain(),
+                        activity.getTaskList(), false));
+            }
+        }
+    }
+
+    private void signalPollers(PollScope scope) {
+        PollSignal signal = pollSignals.get(scope);
         if (signal != null) {
             synchronized (signal) {
                 signal.version++;
@@ -636,7 +667,7 @@ public class SwfService implements Resettable {
 
     public Optional<SwfDecisionTask> pollForDecisionTask(String region, String domainName, String taskList,
                                                        String identity, Duration timeout) {
-        return pollForTask(region, domainName, taskList, timeout,
+        return pollForTask(region, domainName, taskList, true, timeout,
                 () -> pollForDecisionTask(region, domainName, taskList, identity));
     }
 
@@ -1398,7 +1429,7 @@ public class SwfService implements Resettable {
 
     public Optional<SwfActivityTask> pollForActivityTask(String region, String domainName, String taskList,
                                                        String identity, Duration timeout) {
-        return pollForTask(region, domainName, taskList, timeout,
+        return pollForTask(region, domainName, taskList, false, timeout,
                 () -> pollForActivityTask(region, domainName, taskList, identity));
     }
 
