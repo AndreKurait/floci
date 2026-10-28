@@ -150,6 +150,35 @@ The normal EC2 networking, resource limits, metadata, SSH and UserData behavior
 still applies. Omitted `guestRuntime` and unknown AMI IDs retain the `minimal`
 runtime; selecting `image` on one entry does not change other entries.
 
+### Guest startup files
+
+Deployment configuration can supply read-only files or directories before the
+guest's first process starts:
+
+```yaml
+floci:
+  services:
+    ec2:
+      read-only-binds:
+        - source: /srv/guest-inputs/ca.pem
+          target: /etc/guest-ca.pem
+```
+
+The equivalent environment variables are
+`FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE` and
+`FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET`; increment the index for more mounts.
+Both paths must be normalized absolute Linux paths, including when the Floci
+process runs on Windows. Sources must already exist on the Docker daemon host.
+Docker refuses a missing source without creating it.
+Duplicate targets and replacing the guest root are rejected before guest
+resources are allocated.
+
+These mounts apply to EC2 guest containers in every runtime mode. Helpers retain
+their own configuration. Image ENTRYPOINT/CMD, process limits, metadata and
+credential selection keep their existing behavior. A stop/start retains the
+container's mounts. Mount configuration is a deployment input, not an EC2 API
+extension.
+
 ### Binding registered AMIs to local images
 
 An external catalog entry can declare `registrationNames`, an optional list of

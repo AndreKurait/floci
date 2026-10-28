@@ -715,6 +715,9 @@ floci:
       # Explicit workload-only options; helper containers retain their own settings.
       extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
       ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
+      # read-only-binds:               # Paths belong to the Docker daemon host.
+      #   - source: /srv/guest-inputs/ca.pem
+      #     target: /etc/guest-ca.pem
       enabled: true
       imds-port: 9169
       metadata-helper-image: floci/network-helper:local
