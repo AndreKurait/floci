@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayService;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
+import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.applicationautoscaling.ApplicationAutoScalingService;
 import io.github.hectorvent.floci.services.appsync.AppSyncService;
 import io.github.hectorvent.floci.services.autoscaling.AutoScalingService;
@@ -23,6 +24,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewa
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayUsagePlanCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayV2CfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayV2DomainCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.AppConfigCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AppSyncCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApplicationAutoScalingCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AutoScalingGroupCfnProvisioner;
@@ -53,6 +55,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.DsqlCfnPr
 import io.github.hectorvent.floci.services.cloudformation.provisioners.DynamoDbCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2FlowLogCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2InstanceCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2KeyPairCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2LaunchTemplateCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2NetworkAclCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2NetworkCfnProvisioner;
@@ -205,6 +208,7 @@ final class CfnProvisionerFixture {
         private DynamoDbService dynamoDbService;
         private LambdaService lambdaService;
         private AppSyncService appSyncService;
+        private AppConfigService appConfigService;
         private IamService iamService;
         private SsmService ssmService;
         private KmsService kmsService;
@@ -304,6 +308,9 @@ final class CfnProvisionerFixture {
             ensureDynamicReferences();
             List<CfnResourceProvisioner> discovered = new ArrayList<>();
             discovered.add(new CdkMetadataCfnProvisioner());
+            if (appConfigService != null) {
+                discovered.add(new AppConfigCfnProvisioner(appConfigService));
+            }
             if (stepFunctionsService != null) {
                 discovered.add(new StepFunctionsCfnProvisioner(stepFunctionsService, s3Service, objectMapper));
             }
@@ -474,6 +481,9 @@ final class CfnProvisionerFixture {
             if (wafV2Service != null) {
                 discovered.add(new WafV2CfnProvisioner(wafV2Service));
             }
+            if (ec2Service != null && ssmService != null) {
+                discovered.add(new Ec2KeyPairCfnProvisioner(ec2Service, ssmService));
+            }
             if (ec2Service != null) {
                 discovered.add(new Ec2VpcCfnProvisioner(ec2Service));
                 discovered.add(new Ec2VpcEndpointCfnProvisioner(ec2Service));
@@ -571,6 +581,11 @@ final class CfnProvisionerFixture {
 
         public Builder ssm(SsmService v) {
             this.ssmService = v;
+            return this;
+        }
+
+        public Builder appConfig(AppConfigService value) {
+            this.appConfigService = value;
             return this;
         }
 
