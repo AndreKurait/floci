@@ -6,7 +6,10 @@ import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.Ports;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -54,6 +57,51 @@ class CurrentContainerNetworkResolverTest {
         CurrentContainerNetworkResolver resolver =
                 new TestResolver(dockerClient, containerDetector, "floci-container");
 
+        assertTrue(resolver.resolveNetworkName().isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"services-network", "services-network-id"})
+    void configuredNetworkWinsOverFirstAttachedNetwork(String selection) {
+        DockerClient dockerClient = mock(DockerClient.class);
+        ContainerDetector detector = mock(ContainerDetector.class);
+        when(detector.isRunningInContainer()).thenReturn(true);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().dockerNetwork()).thenReturn(Optional.of(selection));
+        InspectContainerCmd command = mock(InspectContainerCmd.class);
+        InspectContainerResponse inspect = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        Map<String, ContainerNetwork> attached = networks(
+                "egress-network", "172.25.0.2", "services-network", "172.26.0.2");
+        when(attached.get("services-network").getNetworkID()).thenReturn("services-network-id");
+        when(dockerClient.inspectContainerCmd("floci-container")).thenReturn(command);
+        when(command.exec()).thenReturn(inspect);
+        when(inspect.getNetworkSettings().getNetworks()).thenReturn(attached);
+        CurrentContainerNetworkResolver resolver =
+                new TestResolver(dockerClient, detector, "floci-container", config);
+
+        assertEquals(Optional.of("services-network"), resolver.resolveNetworkName());
+        assertEquals(Optional.of("172.26.0.2"), resolver.resolveContainerIp());
+        verify(command, times(1)).exec();
+    }
+
+    @Test
+    void missingConfiguredNetworkDoesNotSelectAnotherAttachment() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        ContainerDetector detector = mock(ContainerDetector.class);
+        when(detector.isRunningInContainer()).thenReturn(true);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().dockerNetwork()).thenReturn(Optional.of("missing-network"));
+        InspectContainerCmd command = mock(InspectContainerCmd.class);
+        InspectContainerResponse inspect = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(dockerClient.inspectContainerCmd("floci-container")).thenReturn(command);
+        when(command.exec()).thenReturn(inspect);
+        Map<String, ContainerNetwork> attached =
+                networks("egress-network", "172.25.0.2", "other-network", "172.26.0.2");
+        when(inspect.getNetworkSettings().getNetworks()).thenReturn(attached);
+        CurrentContainerNetworkResolver resolver =
+                new TestResolver(dockerClient, detector, "floci-container", config);
+
+        assertTrue(resolver.resolveContainerIp().isEmpty());
         assertTrue(resolver.resolveNetworkName().isEmpty());
     }
 
@@ -169,7 +217,12 @@ class CurrentContainerNetworkResolverTest {
         private final String containerId;
 
         TestResolver(DockerClient dockerClient, ContainerDetector containerDetector, String containerId) {
-            super(dockerClient, containerDetector);
+            this(dockerClient, containerDetector, containerId, null);
+        }
+
+        TestResolver(DockerClient dockerClient, ContainerDetector containerDetector, String containerId,
+                     EmulatorConfig config) {
+            super(dockerClient, containerDetector, config);
             this.containerId = containerId;
         }
 
