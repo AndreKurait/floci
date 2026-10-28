@@ -33,6 +33,37 @@ class SamTransformProcessorTest {
     }
 
     @Test
+    void provisionedConcurrencyIsPreservedOnTheGeneratedAlias() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {"Transform":"AWS::Serverless-2016-10-31","Resources":{"Function":{
+              "Type":"AWS::Serverless::Function","Properties":{
+                "Runtime":"python3.12","Handler":"index.handler","InlineCode":"def handler(e,c): return e",
+                "AutoPublishAlias":"live",
+                "ProvisionedConcurrencyConfig":{"ProvisionedConcurrentExecutions":{"Ref":"WarmCount"}}
+              }}}}
+            """);
+        JsonNode expanded = processor.expandSamTemplate(template);
+        JsonNode aliasProperties = expanded.at("/Resources/FunctionAliasLive/Properties");
+        assertFalse(aliasProperties.isMissingNode());
+        assertEquals(template.at("/Resources/Function/Properties/ProvisionedConcurrencyConfig"),
+                aliasProperties.path("ProvisionedConcurrencyConfig"));
+        assertFalse(expanded.at("/Resources/Function/Properties").has("ProvisionedConcurrencyConfig"));
+    }
+
+    @Test
+    void provisionedConcurrencyRequiresAutoPublishAlias() throws Exception {
+        JsonNode template = objectMapper.readTree("""
+            {"Transform":"AWS::Serverless-2016-10-31","Resources":{"Function":{
+              "Type":"AWS::Serverless::Function","Properties":{
+                "Runtime":"python3.12","Handler":"index.handler","InlineCode":"def handler(e,c): return e",
+                "ProvisionedConcurrencyConfig":{"ProvisionedConcurrentExecutions":1}
+              }}}}
+            """);
+        AwsException error = assertThrows(AwsException.class, () -> processor.expandSamTemplate(template));
+        assertTrue(error.getMessage().contains("AutoPublishAlias"));
+    }
+
+    @Test
     void hasSamTransform_withStringTransform() throws Exception {
         JsonNode template = objectMapper.readTree("""
             {"Transform": "AWS::Serverless-2016-10-31", "Resources": {}}
