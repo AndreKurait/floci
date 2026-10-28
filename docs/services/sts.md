@@ -282,3 +282,9 @@ context computes `aws:MultiFactorAuthAge` in whole elapsed seconds when resolvin
 Non-MFA, federated and legacy records without verified authentication time leave age absent.
 A server clock moving before the authentication instant yields zero elapsed seconds. This does
 not establish AssumeRole MFA propagation, hardware MFA or live AWS clock-drift parity.
+
+GetSessionToken credentials retain explicit issuance provenance. With IAM enforcement enabled,
+IAM API calls require verified MFA and STS calls are limited to AssumeRole and GetCallerIdentity.
+These restrictions apply before identity-policy grants; other services still evaluate the issuer's
+policies. Previously stored credentials without issuance provenance retain their existing behavior.
+This does not add AssumeRole MFA propagation, hardware/root MFA devices or workload credential delivery.
