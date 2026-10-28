@@ -2983,16 +2983,24 @@ public class ApiGatewayExecuteController {
         LOG.debugv("execute-api v2: {0} {1}/{2}{3} → Lambda {4}", httpMethod, apiId, stageName, path, functionName);
 
         try {
+            String credentials = integration.getCredentialsArn();
             if (("AWS_PROXY".equalsIgnoreCase(integrationType) || "AWS".equalsIgnoreCase(integrationType))
-                    && (integration.getCredentialsArn() == null || integration.getCredentialsArn().isBlank())) {
+                    && !callerCredentialsPassthrough(credentials)) {
                 String accountId = regionResolver.getAccountId();
                 functionName = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
                         region, accountId);
-                String functionRegion = AwsArnUtils.parse(functionName).region();
-                String sourceArn = AwsArnUtils.Arn.of("execute-api", functionRegion, accountId,
-                        apiId + "/" + stageName + "/" + httpMethod + path).toString();
-                if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionName,
-                        sourceArn, accountId) == Decision.DENY) {
+                Decision decision;
+                if (credentials == null || credentials.isBlank()) {
+                    String functionRegion = AwsArnUtils.parse(functionName).region();
+                    String sourceArn = AwsArnUtils.Arn.of("execute-api", functionRegion, accountId,
+                            apiId + "/" + stageName + "/" + httpMethod + path).toString();
+                    decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionName,
+                            sourceArn, accountId);
+                } else {
+                    decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                            "lambda:InvokeFunction", functionName, accountId, regionResolver.getPartition());
+                }
+                if (decision == Decision.DENY) {
                     return httpApiError(500, "Internal Server Error");
                 }
             }
@@ -3007,6 +3015,18 @@ public class ApiGatewayExecuteController {
             boolean throttled = e.getHttpStatus() == 429;
             return throttled ? httpApiError(503, "Service Unavailable") : httpApiError(500, "Internal Server Error");
         }
+    }
+
+    private boolean callerCredentialsPassthrough(String credentials) {
+        if ("*".equals(credentials)) {
+            return true;
+        }
+        if (!AwsArnUtils.isArnFor(credentials, "iam")) {
+            return false;
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(credentials);
+        return arn.partition().equals(regionResolver.getPartition()) && arn.region().isEmpty()
+                && "*".equals(arn.accountId()) && "user/*".equals(arn.resource());
     }
 
     private final io.github.hectorvent.floci.services.apigatewayv2.proxy.HttpProxyInvoker httpProxyInvoker =
