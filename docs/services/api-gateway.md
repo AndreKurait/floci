@@ -1051,3 +1051,10 @@ boundary and SCP evaluators. Forwarded IP/protocol headers do not supply these v
 the default server configuration. The downstream Lambda caller-permission check remains a
 separate service call and does not inherit these inbound transport keys. Other inbound
 condition keys and transport-context propagation for HTTP/WebSocket routes remain separate work.
+
+Caller policy evaluation supplies `aws:CurrentTime` and `aws:EpochTime` from the
+server clock. The same instant is used for caller session expiry and time-based
+identity, session, boundary, SCP and resource-policy conditions. REST anonymous
+and custom-authorizer resource-policy checks also receive these time keys.
+These values do not come from client-supplied date headers. This does not add
+other global condition keys or issue STS sessions for service execution roles.
