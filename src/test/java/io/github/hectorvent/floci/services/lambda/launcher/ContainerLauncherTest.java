@@ -193,14 +193,7 @@ class ContainerLauncherTest {
         lenient().when(ecrRegistryManager.rewriteImageUri(any()))
                 .thenAnswer(inv -> inv.getArgument(0));
 
-        ContainerBuilder containerBuilder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
-        ContainerReachableEndpoint reachableEndpoint =
-                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, 4566);
-        LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(reachableEndpoint);
-        launcher = new ContainerLauncher(containerBuilder, lifecycleManager, logStreamer, imageResolver,
-                runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
-                layerService, awsEnv,
-                executionRoleCredentials, codeVolumeFunctionStore());
+        launcher = newLauncher(imageResolver);
         lenient().when(lifecycleManager.tryVolumeLabels(anyString())).thenReturn(Optional.of(Map.of()));
 
         when(runtimeApiServerFactory.create()).thenReturn(runtimeApiServer);
@@ -684,6 +677,57 @@ class ContainerLauncherTest {
         verify(lifecycleManager, never()).create(any(ContainerSpec.class), anyString());
     }
 
+    private ContainerLauncher newLauncher(ImageResolver selectedResolver) {
+        ContainerBuilder builder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
+        ContainerReachableEndpoint endpoint =
+                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, 4566);
+        return new ContainerLauncher(builder, lifecycleManager, logStreamer, selectedResolver,
+                runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
+                layerService, new LaunchedContainerAwsEnv(endpoint),
+                executionRoleCredentials, codeVolumeFunctionStore());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "arm64, true, , linux/arm64, arm64",
+            "x86_64, true, , linux/amd64, amd64",
+            ", true, , linux/amd64, amd64",
+            "arm64, false, , , fallback",
+            "arm64, true, --platform linux/amd64, linux/amd64, amd64",
+            "x86_64, false, --platform linux/arm64, linux/arm64, arm64"
+    })
+    void launchFunction_selectsRuntimePinForEffectiveContainerPlatform(
+            String architecture, boolean honourArchitecture, String flags,
+            String expectedPlatform, String expectedImage) throws Exception {
+        EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
+        lenient().when(lambda.honourArchitectures()).thenReturn(honourArchitecture);
+        when(lambda.dockerFlags()).thenReturn(Optional.ofNullable(flags));
+        when(lambda.runtimeImages()).thenReturn(Map.of(
+                "nodejs20.x", "registry.example/node:fallback",
+                "nodejs20.x.linux.amd64", "registry.example/node:amd64",
+                "nodejs20.x.linux.arm64", "registry.example/node:arm64"));
+        launcher = newLauncher(new ImageResolver(config));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("runtime-pin-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(Files.createDirectory(tempDir.resolve("runtime-pin-code")).toString());
+        if (architecture != null) {
+            fn.setArchitectures(List.of(architecture));
+        }
+
+        launcher.launch(fn);
+
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
+        if (expectedPlatform == null) {
+            verify(lifecycleManager).create(spec.capture());
+            verify(lifecycleManager, never()).create(any(ContainerSpec.class), anyString());
+        } else {
+            verify(lifecycleManager).create(spec.capture(), eq(expectedPlatform));
+        }
+        assertEquals("registry.example/node:" + expectedImage, spec.getValue().image());
+    }
+
     @ParameterizedTest
     @MethodSource("invalidPersistedArchitectures")
     void launchFunction_rejectsInvalidPersistedArchitecturesBeforeCreatingContainer(
@@ -716,10 +760,13 @@ class ContainerLauncherTest {
                 List.of("arm64", "x86_64"));
     }
 
-    @Test
-    void launchFunction_usesArm64DockerPlatformForCodeVolumeHelper() throws Exception {
+    @ParameterizedTest
+    @CsvSource({"arm64, ", "x86_64, --platform linux/arm64"})
+    void launchFunction_usesArm64DockerPlatformForCodeVolumeHelper(String architecture, String flags)
+            throws Exception {
         EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
-        when(lambda.honourArchitectures()).thenReturn(true);
+        lenient().when(lambda.honourArchitectures()).thenReturn(true);
+        when(lambda.dockerFlags()).thenReturn(Optional.ofNullable(flags));
         Path codePath = Files.createDirectory(tempDir.resolve("large-arm64-code"));
         Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]);
 
@@ -729,7 +776,7 @@ class ContainerLauncherTest {
         fn.setHandler("index.handler");
         fn.setCodeLocalPath(codePath.toString());
         fn.setCodeSha256("large-arm64-code-sha");
-        fn.setArchitectures(List.of("arm64"));
+        fn.setArchitectures(List.of(architecture));
 
         withLoweredCodeVolumeThreshold(() -> {
             launcher.launch(fn);
