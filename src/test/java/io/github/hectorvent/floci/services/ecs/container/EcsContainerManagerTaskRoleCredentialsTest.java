@@ -263,7 +263,7 @@ class EcsContainerManagerTaskRoleCredentialsTest {
         // The reconciler's cleanup path is the other way a task's containers come off, and Docker
         // can refuse a removal here just as it can on the stop path.
         doThrow(new IllegalStateException("in use"))
-                .when(lifecycleManager).stopAndRemoveStrict("docker-id", null);
+                .when(lifecycleManager).stopAndRemoveStrict("docker-id", null, 5, true);
         EcsContainerManager stopping = new EcsContainerManager(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class), config,
                 mock(RegionResolver.class), baselineAwsEnv(), mock(SsmService.class),
@@ -292,7 +292,7 @@ class EcsContainerManagerTaskRoleCredentialsTest {
                 .thenReturn(new ContainerInfo("docker-id", Map.of()))
                 .thenThrow(new IllegalStateException("no daemon"));
         doThrow(new IllegalStateException("in use"))
-                .when(failing).stopAndRemoveStrict("docker-id", null);
+                .when(failing).stopAndRemoveStrict("docker-id", null, 5, true);
         EcsContainerManager failingManager = new EcsContainerManager(containerBuilder, failing,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class), config,
                 mock(RegionResolver.class), baselineAwsEnv(), mock(SsmService.class),
