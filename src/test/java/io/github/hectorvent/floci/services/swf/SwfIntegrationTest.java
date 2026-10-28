@@ -2,18 +2,29 @@ package io.github.hectorvent.floci.services.swf;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.mockito.InjectSpy;
 import io.restassured.response.Response;
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -28,7 +39,13 @@ import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.reset;
 
 /**
  * End-to-end coverage of the SWF wire protocol: registration, the decider/worker
@@ -44,9 +61,55 @@ class SwfIntegrationTest {
 
     private static final String SWF_CONTENT_TYPE = "application/x-amz-json-1.0";
 
+    @InjectSpy
+    SwfService service;
+
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    @BeforeEach
+    void shortenIdlePolls() {
+        // Keep existing empty-response tests fast while exercising the real wait/claim path.
+        // The delayed-task HTTP control below retains the production 60-second deadline.
+        doAnswer(call -> service.pollForDecisionTask(call.getArgument(0), call.getArgument(1),
+                call.getArgument(2), call.getArgument(3), Duration.ofMillis(100)))
+                .when(service).pollForDecisionTask(anyString(), anyString(), anyString(),
+                        nullable(String.class), eq(Duration.ofSeconds(60)));
+        doAnswer(call -> service.pollForActivityTask(call.getArgument(0), call.getArgument(1),
+                call.getArgument(2), call.getArgument(3), Duration.ofMillis(100)))
+                .when(service).pollForActivityTask(anyString(), anyString(), anyString(),
+                        nullable(String.class), eq(Duration.ofSeconds(60)));
+    }
+
+    @Test
+    void decisionPollWaitsForALaterTask() throws Exception {
+        reset(service);
+        String domain = uniqueName("long-poll");
+        registerDomain(domain);
+        registerWorkflowType(domain, "TestWf", "1.0");
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        CountDownLatch started = new CountDownLatch(1);
+        Future<Response> poll = executor.submit(() -> {
+            started.countDown();
+            return call("PollForDecisionTask", """
+                    {"domain": "%s", "taskList": {"name": "floci-tl"}}
+                    """.formatted(domain));
+        });
+        try {
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> poll.get(300, TimeUnit.MILLISECONDS),
+                    "An empty task list must hold the poll rather than trigger a tight client loop");
+            startExecution(domain, "later-task", null);
+            poll.get(5, TimeUnit.SECONDS).then().statusCode(200)
+                    .body("taskToken", not(equalTo("")))
+                    .body("workflowExecution.workflowId", equalTo("later-task"));
+        } finally {
+            poll.cancel(true);
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
     }
 
     // ──────────────────────────────── Domains ────────────────────────────────
@@ -596,8 +659,9 @@ class SwfIntegrationTest {
                 .body("executionInfo.closeStatus", equalTo("COMPLETED"));
     }
 
-    @Test
-    void closingDecisionWithOpenActivity_failsWithUnhandledDecision() {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void closingDecisionDistinguishesKnownWorkFromNewEvents(boolean newSignal) {
         String domain = uniqueName("unhandled");
         registerDomain(domain);
         registerWorkflowType(domain, "TestWf", "1.0");
@@ -621,8 +685,12 @@ class SwfIntegrationTest {
                 {"domain": "%s", "workflowId": "wf-unhandled", "signalName": "poke"}
                 """.formatted(domain)).then().statusCode(200);
 
-        // The scheduled activity is still open, so completing the execution is rejected.
         String second = pollDecisionToken(domain);
+        if (newSignal) {
+            call("SignalWorkflowExecution", """
+                    {"domain": "%s", "workflowId": "wf-unhandled", "signalName": "new"}
+                    """.formatted(domain)).then().statusCode(200);
+        }
         call("RespondDecisionTaskCompleted", """
                 {"taskToken": "%s", "decisions": [{
                    "decisionType": "CompleteWorkflowExecution",
@@ -634,16 +702,18 @@ class SwfIntegrationTest {
                 {"domain": "%s", "execution": {"workflowId": "wf-unhandled", "runId": "%s"}}
                 """.formatted(domain, runId))
                 .then()
-                .body("executionInfo.executionStatus", equalTo("OPEN"));
+                .body("executionInfo.executionStatus", equalTo(newSignal ? "OPEN" : "CLOSED"));
 
-        call("GetWorkflowExecutionHistory", """
+        Response history = call("GetWorkflowExecutionHistory", """
                 {"domain": "%s", "execution": {"workflowId": "wf-unhandled", "runId": "%s"}}
                 """.formatted(domain, runId))
-                .then()
-                .body("events.eventType", hasItem("CompleteWorkflowExecutionFailed"))
-                .body("events.find { it.eventType == 'CompleteWorkflowExecutionFailed' }"
-                        + ".completeWorkflowExecutionFailedEventAttributes.cause",
-                        equalTo("UNHANDLED_DECISION"));
+                .then().statusCode(200).extract().response();
+        history.then().body("events.eventType",
+                hasItem(newSignal ? "CompleteWorkflowExecutionFailed" : "WorkflowExecutionCompleted"));
+        if (newSignal) {
+            history.then().body("events.find { it.eventType == 'CompleteWorkflowExecutionFailed' }"
+                    + ".completeWorkflowExecutionFailedEventAttributes.cause", equalTo("UNHANDLED_DECISION"));
+        }
     }
 
     @Test

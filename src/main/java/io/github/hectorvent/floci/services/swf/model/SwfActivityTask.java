@@ -28,6 +28,7 @@ public class SwfActivityTask {
     private String taskPriority;
     private String input;
     private String control;
+    private String heartbeatDetails;
 
     private String scheduleToStartTimeout;
     private String scheduleToCloseTimeout;
@@ -133,6 +134,14 @@ public class SwfActivityTask {
 
     public void setControl(String control) {
         this.control = control;
+    }
+
+    public String getHeartbeatDetails() {
+        return heartbeatDetails;
+    }
+
+    public void setHeartbeatDetails(String heartbeatDetails) {
+        this.heartbeatDetails = heartbeatDetails;
     }
 
     public String getScheduleToStartTimeout() {
