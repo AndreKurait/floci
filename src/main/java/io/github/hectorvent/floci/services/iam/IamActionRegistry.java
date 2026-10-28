@@ -696,7 +696,7 @@ public class IamActionRegistry {
      * so a rule ending at the route's last segment has to match it too, or the request would pass as an
      * unknown action.
      */
-    static String routedPath(UriInfo uriInfo) {
+    public static String routedPath(UriInfo uriInfo) {
         String path = rawPath(uriInfo);
         while (path.length() > 1 && path.endsWith("/")) {
             path = path.substring(0, path.length() - 1);
