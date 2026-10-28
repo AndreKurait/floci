@@ -776,10 +776,11 @@ activates it when its start time is reached. Repeating a `ClientToken` returns t
 same reservation; changed reservation parameters, including creation tags, are rejected.
 Creation tags are persisted with the reservation and are not reapplied on replay, so
 later `CreateTags` edits survive a retry. Tag order does not change request identity.
-For stored open reservations, activation attaches eligible existing running instances
-using the same matching rules as immediate creation, without double assignment.
-AWS documents future-dated reservations as targeted-only; Floci currently also accepts
-open future reservations. This compatibility gap is not an AWS parity claim.
+Future-dated requests require explicit `InstanceMatchCriteria: targeted`, at least
+32 vCPUs in total using the instance-type catalog, and an instance type in the C, G,
+I, M, R, T, U or X families. Omitted or `open` matching is rejected before publication.
+Activation does not adopt existing running instances; launches must explicitly target
+the reservation. Immediate reservations retain their existing open-matching behavior.
 
 Assessment and incremental delivery are modeled synchronously, without AWS capacity
 assessment or billing. Cancellation retains Floci's immediate cancellation behavior;

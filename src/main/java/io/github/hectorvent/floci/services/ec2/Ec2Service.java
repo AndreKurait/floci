@@ -10671,6 +10671,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
+    private void validateFutureCapacityReservation(String instanceType, int count, String matching) {
+        if (!"targeted".equals(matching)) {
+            throw new AwsException("InvalidParameterValue",
+                    "Future-dated Capacity Reservations require targeted instance matching criteria.", 400);
+        }
+        boolean supportedFamily = switch (instanceType.charAt(0)) {
+            case 'c', 'g', 'i', 'm', 'r', 't', 'u', 'x' -> !instanceType.startsWith("mac")
+                    && !instanceType.startsWith("inf") && !instanceType.startsWith("trn");
+            default -> false;
+        };
+        if (!supportedFamily) {
+            throw new AwsException("InvalidParameterValue",
+                    "Future-dated Capacity Reservations support only C, G, I, M, R, T, U and X instance families.", 400);
+        }
+        int vcpus = instanceTypeCatalog.defaultVcpus(instanceType)
+                .orElseThrow(() -> new AwsException("InvalidParameterValue",
+                        "Instance type '" + instanceType + "' is not supported for future-dated reservations.", 400));
+        if ((long) count * vcpus < 32) {
+            throw new AwsException("InvalidParameterValue",
+                    "Future-dated Capacity Reservations require at least 32 vCPUs per request.", 400);
+        }
+    }
+
     private void reconcileCapacityMembership(String region) {
         Instant now = capacityReservationNow();
         List<CapacityReservation> reconciled = new ArrayList<>();
@@ -10956,7 +10979,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             Instant now = capacityReservationNow();
             validateCapacityReservationSchedule(startDate, commitmentDuration, deliveryPreference, endDate, now);
-            ensureDefaultResources(region);
             if (instanceType == null || instanceType.isBlank()) {
                 throw new AwsException("MissingParameter",
                         "The request must contain the parameter InstanceType.", 400);
@@ -10975,6 +10997,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         "The request must contain the parameter AvailabilityZone or AvailabilityZoneId.", 400);
             }
             int count = requirePositiveInstanceCount(instanceCount);
+            if (startDate != null) {
+                validateFutureCapacityReservation(instanceType, count, instanceMatchCriteria);
+            }
+            ensureDefaultResources(region);
             if (isSet(availabilityZoneId)) {
                 zoneNameForZoneId(region, availabilityZoneId);
             }
