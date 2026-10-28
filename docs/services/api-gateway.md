@@ -1094,3 +1094,5 @@ owner and region, the source ARN `<api-id>/authorizers/<authorizer-id>`, and the
 qualified Lambda target. Missing permission returns HTTP 500 before invocation;
 missing identity still returns HTTP 401 first. Configured authorizer roles retain
 their separate execution path. This check does not implement role assumption.
+
+WebSocket Lambda integrations (`AWS` and `AWS_PROXY`) without credentials check Lambda resource permissions when IAM enforcement is enabled. Grants must allow API Gateway for the qualified function and source API, stage, and selected route. Configured-role and caller-passthrough credentials retain their separate invocation behavior.
