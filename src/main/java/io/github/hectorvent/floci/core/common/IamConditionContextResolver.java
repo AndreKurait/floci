@@ -237,8 +237,12 @@ public class IamConditionContextResolver {
         putIfPresent(conditions, "aws:ResourceAccount", resourceAccount);
         putIfPresent(conditions, "aws:PrincipalAccount", accountId);
         putIfPresent(conditions, "aws:RequestedRegion", region);
-        // Enforcement evaluates signed IAM credentials, not direct AWS service principals.
-        conditions.put("aws:PrincipalIsAWSService", List.of("false"));
+        // This key exists for signed AWS credentials, not anonymous resource-policy callers.
+        if ("anonymous".equals(accountId)) {
+            conditions.remove("aws:PrincipalIsAWSService");
+        } else {
+            conditions.put("aws:PrincipalIsAWSService", List.of("false"));
+        }
         return conditions;
     }
 
