@@ -49,6 +49,9 @@ public class CapacityReservation {
     private List<String> instanceIds = new ArrayList<>();
     private Map<String, String> instanceOwners = new LinkedHashMap<>();
     private Map<String, CapacityReservationMove> completedMoves = new HashMap<>();
+    private String clientToken;
+    // Mutable reservation state must not change which original request a token identifies.
+    private Map<String, String> creationParameters = new LinkedHashMap<>();
 
     public CapacityReservation() {}
 
@@ -78,6 +81,8 @@ public class CapacityReservation {
         completedMoves = new HashMap<>(other.completedMoves);
         instanceIds = new ArrayList<>(other.instanceIds);
         instanceOwners = new LinkedHashMap<>(other.instanceOwners);
+        clientToken = other.clientToken;
+        creationParameters = new LinkedHashMap<>(other.creationParameters);
     }
 
     public String getCapacityReservationId() { return capacityReservationId; }
@@ -155,4 +160,12 @@ public class CapacityReservation {
     public void setCompletedMoves(Map<String, CapacityReservationMove> completedMoves) {
         this.completedMoves = completedMoves;
     }
+    public String getClientToken() { return clientToken; }
+    public void setClientToken(String clientToken) { this.clientToken = clientToken; }
+
+    public Map<String, String> getCreationParameters() { return creationParameters; }
+    public void setCreationParameters(Map<String, String> creationParameters) {
+        this.creationParameters = new LinkedHashMap<>(creationParameters);
+    }
+
 }
