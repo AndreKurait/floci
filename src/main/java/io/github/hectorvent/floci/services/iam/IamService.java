@@ -4848,12 +4848,22 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void registerSessionForAccount(String accountId, String sessionAccessKeyId, String secretAccessKey,
                                           String sessionToken, String roleArn, Instant expiration,
                                           String sessionPolicyDocument) {
+        registerSessionForAccount(accountId, sessionAccessKeyId, secretAccessKey, sessionToken, roleArn,
+                expiration, sessionPolicyDocument, null, null);
+    }
+
+    /** Stores an explicitly owned role session with the identity returned when its credentials are resolved. */
+    public void registerSessionForAccount(String accountId, String sessionAccessKeyId, String secretAccessKey,
+                                          String sessionToken, String roleArn, Instant expiration,
+                                          String sessionPolicyDocument, String roleSessionName, String assumedRoleId) {
         if (accountId == null || accountId.isBlank()) {
             throw new IllegalArgumentException("Session account ID must not be blank");
         }
         SessionCredential session = new SessionCredential(
                 sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, expiration, sessionPolicyDocument,
                 accountId);
+        session.setRoleSessionName(roleSessionName);
+        session.setAssumedRoleId(assumedRoleId);
         putSessionForAccount(accountId, sessionAccessKeyId, session);
     }
 
