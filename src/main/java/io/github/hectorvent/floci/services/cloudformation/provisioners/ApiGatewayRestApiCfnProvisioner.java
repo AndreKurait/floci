@@ -510,6 +510,7 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
         req.put("name", ctx.resolveOptional(props, "Name"));
         req.put("type", ctx.resolveOptional(props, "Type"));
         req.put("authorizerUri", ctx.resolveOptional(props, "AuthorizerUri"));
+        req.put("authorizerCredentials", ctx.resolveOptional(props, "AuthorizerCredentials"));
         req.put("identitySource", ctx.resolveOptional(props, "IdentitySource"));
         String ttl = ctx.resolveOptional(props, "AuthorizerResultTtlInSeconds");
         if (ttl != null) {
