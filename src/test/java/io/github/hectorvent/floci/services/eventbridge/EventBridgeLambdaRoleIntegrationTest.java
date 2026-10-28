@@ -13,6 +13,8 @@ import io.quarkus.test.junit.TestProfile;
 import io.quarkus.test.junit.mockito.InjectSpy;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -29,14 +31,17 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Supplier;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
@@ -57,6 +62,8 @@ class EventBridgeLambdaRoleIntegrationTest {
 
     @RegisterExtension
     final PartitionCleanup cleanup = new PartitionCleanup();
+
+    Supplier<String> roleNames = () -> "role-partition-" + UUID.randomUUID().toString().substring(0, 8);
 
     @BeforeAll
     static void configureRestAssured() {
@@ -143,7 +150,7 @@ class EventBridgeLambdaRoleIntegrationTest {
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(SOURCE, "test")))
                 .build();
         cleanup.register(events::close);
-        String name = "role-partition-" + UUID.randomUUID().toString().substring(0, 8);
+        String name = roleNames.get();
         String roleArn = "arn:aws:iam::" + SOURCE + ":role/" + name;
         String targetRegion = switch (partition) {
             case "aws-cn" -> "cn-north-1";
@@ -154,8 +161,8 @@ class EventBridgeLambdaRoleIntegrationTest {
                 + ":function:" + name + ":live";
         String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"Service\":"
                 + "\"events.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}}";
-        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
         iam("CreateRole", Map.of("RoleName", name, "AssumeRolePolicyDocument", trust));
+        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
         cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
         iam("PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke", "PolicyDocument",
                 "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\"*\"}}"));
@@ -169,6 +176,42 @@ class EventBridgeLambdaRoleIntegrationTest {
         publish(events, "default");
         verify(lambda, times(partition.equals("aws") ? 1 : 0)).invokeArn(eq(endpoint), any(byte[].class),
                 eq(InvocationType.Event));
+    }
+
+    @Test
+    void rejectedRoleCreationPreservesPreexistingRole() throws Exception {
+        String name = "event-existing-" + UUID.randomUUID();
+        iam("CreateRole", Map.of("RoleName", name, "AssumeRolePolicyDocument", "{\"Statement\":[]}"));
+        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
+        EventBridgeLambdaRoleIntegrationTest fixture = nestedFixture(name);
+        try {
+            assertThrows(AssertionError.class, () -> fixture.putEventsCannotDeliverRoleTargetAcrossPartitions("aws"));
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        iam("GetRole", Map.of("RoleName", name));
+    }
+
+    @Test
+    void successfulRoleScenarioRemovesOwnedRoleAndPolicy() throws Exception {
+        String name = "event-owned-" + UUID.randomUUID();
+        EventBridgeLambdaRoleIntegrationTest fixture = nestedFixture(name);
+        try {
+            fixture.putEventsCannotDeliverRoleTargetAcrossPartitions("aws");
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        given().header("Authorization", EnforcementFixtures.auth(SOURCE, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", "GetRole")
+                .formParam("RoleName", name).post("/").then().statusCode(404);
+    }
+
+    private EventBridgeLambdaRoleIntegrationTest nestedFixture(String name) {
+        EventBridgeLambdaRoleIntegrationTest fixture = new EventBridgeLambdaRoleIntegrationTest();
+        fixture.baseUri = baseUri;
+        fixture.lambda = lambda;
+        fixture.roleNames = () -> name;
+        return fixture;
     }
 
     private static void permission(String function, String qualifier, String statement, String roleArn) {
