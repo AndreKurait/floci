@@ -4773,31 +4773,45 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                                      String serialNumber, String tokenCode, Instant authenticationTime) {
         SessionCredential session = issuedSession(sessionAccessKeyId, secretAccessKey, sessionToken, null,
                 expiration, null, originAccountId, issuingAccessKeyId);
-        boolean authenticated = false;
-        if (serialNumber != null || tokenCode != null) {
-            if (serialNumber != null) {
-                validateSerialNumber(serialNumber);
-            }
-            if (tokenCode != null && !Totp.isSixDigits(tokenCode)) {
-                throw new AwsException("ValidationError", "TokenCode must contain six digits.", 400);
-            }
-            synchronized (mfaDeviceLock) {
-                VirtualMfaDevice device = serialNumber == null ? null
-                        : virtualMfaDevices.get(serialNumber).orElse(null);
-                IamUser user = device == null || device.getUserName() == null ? null
-                        : users.get(device.getUserName()).orElse(null);
-                if (user == null || !user.getArn().equals(session.getIssuerArn())
-                        || !user.getUserId().equals(session.getIssuerUserId())
-                        || !Totp.matchesCode(device.getBase32Seed(), tokenCode, 1, authenticationTime)) {
-                    throw new AwsException("AccessDenied", "MultiFactorAuthentication failed.", 403);
-                }
-                authenticated = true;
-            }
+        boolean authenticated = serialNumber != null || tokenCode != null;
+        if (authenticated) {
+            verifyMfa(session.getIssuerArn(), session.getIssuerUserId(), serialNumber, tokenCode, authenticationTime);
         }
         session.setSessionTokenCredential(true);
         session.setMultiFactorAuthPresent(authenticated);
         session.setMultiFactorAuthenticatedAt(authenticated ? authenticationTime : null);
         putNewSession(sessionAccessKeyId, session);
+    }
+
+    /** Authenticates supplied MFA for this request without attaching it to the resulting role session. */
+    public CallerArns authenticateRequestMfa(CallerArns caller, String serialNumber, String tokenCode,
+                                            Instant authenticationTime) {
+        if (serialNumber == null && tokenCode == null) {
+            return caller;
+        }
+        verifyMfa(caller.principalArn(), caller.userId(), serialNumber, tokenCode, authenticationTime);
+        return caller.withMultiFactorAuthPresent(true).withMultiFactorAuthAge(0L);
+    }
+
+    private void verifyMfa(String issuerArn, String issuerUserId, String serialNumber, String tokenCode,
+                           Instant authenticationTime) {
+        if (serialNumber != null) {
+            validateSerialNumber(serialNumber);
+        }
+        if (tokenCode != null && !Totp.isSixDigits(tokenCode)) {
+            throw new AwsException("ValidationError", "TokenCode must contain six digits.", 400);
+        }
+        synchronized (mfaDeviceLock) {
+            VirtualMfaDevice device = serialNumber == null ? null
+                    : virtualMfaDevices.get(serialNumber).orElse(null);
+            IamUser user = device == null || device.getUserName() == null ? null
+                    : users.get(device.getUserName()).orElse(null);
+            if (user == null || !user.getArn().equals(issuerArn)
+                    || !user.getUserId().equals(issuerUserId)
+                    || !Totp.matchesCode(device.getBase32Seed(), tokenCode, 1, authenticationTime)) {
+                throw new AwsException("AccessDenied", "MultiFactorAuthentication failed.", 403);
+            }
+        }
     }
 
     /** GetSessionToken credentials have API restrictions in addition to the issuer's policies. */
