@@ -3044,7 +3044,7 @@ public interface EmulatorConfig {
         @WithDefault("public.ecr.aws") // partition-literal: configurable; ECR Public exists only in the commercial partition
         String ecrBaseUri();
 
-        /** Full image references for individual runtimes, keyed by Lambda runtime identifier. */
+        /** Full image references keyed by runtime, or runtime.os.arch for a selected Docker platform. */
         Map<String, String> runtimeImages();
 
         @WithDefault("128")
