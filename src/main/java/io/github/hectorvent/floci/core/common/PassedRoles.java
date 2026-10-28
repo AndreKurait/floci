@@ -558,6 +558,9 @@ final class PassedRoles {
                         ? fromJson(ctx, API_GATEWAY, "authorizerCredentialsArn") : List.of();
             }
             case "apigateway:PATCH" -> {
+                if ("/account".equals(path)) {
+                    yield patchedRoles(ctx, "/cloudwatchRoleArn");
+                }
                 if (REST_INTEGRATION.matcher(path).matches()) {
                     yield patchedRoles(ctx, "/credentials");
                 }
