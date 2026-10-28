@@ -4684,7 +4684,8 @@ public class Ec2QueryHandler {
                 p.getFirst("InstanceMatchCriteria"),
                 p.getFirst("OutpostArn"),
                 p.getFirst("PlacementGroupArn"),
-                p.getFirst("ClientToken"), resourceTags);
+                instantOrNull(p, "StartDate"), longOrNull(p, "CommitmentDuration"),
+                p.getFirst("DeliveryPreference"), p.getFirst("ClientToken"), resourceTags);
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateCapacityReservationResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -4761,6 +4762,7 @@ public class Ec2QueryHandler {
                 .elem("ebsOptimized", reservation.isEbsOptimized())
                 .elem("ephemeralStorage", reservation.isEphemeralStorage())
                 .elem("state", reservation.getState())
+                .elem("deliveryPreference", reservation.getDeliveryPreference())
                 .elem("startDate", reservation.getStartDate() != null ? ISO_FMT.format(reservation.getStartDate()) : null)
                 .elem("endDate", reservation.getEndDate() != null ? ISO_FMT.format(reservation.getEndDate()) : null)
                 .elem("endDateType", reservation.getEndDateType())
@@ -4769,6 +4771,13 @@ public class Ec2QueryHandler {
                 .elem("outpostArn", reservation.getOutpostArn())
                 .elem("placementGroupArn", reservation.getPlacementGroupArn())
                 .raw(includeMetadata ? tagSetXml(reservation.getTags()) : null);
+        if (reservation.getCommitmentDuration() != null) {
+            xml.start("commitmentInfo")
+                    .elem("commitmentDuration", reservation.getCommitmentDuration())
+                    .elem("commitmentEndDate", ISO_FMT.format(reservation.getCommitmentEndDate()))
+                    .elem("committedInstanceCount", reservation.getCommittedInstanceCount())
+                    .end("commitmentInfo");
+        }
         return xml.build();
     }
 
