@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.apigateway;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import org.junit.jupiter.api.BeforeEach;
@@ -32,7 +33,7 @@ class JwtClaimsWireFormatTest {
                 null, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null,
                 null, null
-        , null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class));
+        , null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class));
     }
 
     private static String unsignedToken(String claimsJson) {
