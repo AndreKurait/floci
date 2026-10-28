@@ -3352,7 +3352,8 @@ public class LambdaService implements ResourceProvider {
         int concurrencyLimit = config != null
                 ? config.services().lambda().regionConcurrencyLimit()
                 : 1000;
-        long unreserved = Math.max(0, concurrencyLimit - reserved);
+        long unreserved = concurrencyLimiter == null ? Math.max(0, concurrencyLimit - reserved)
+                : concurrencyLimiter.unreservedCapacity(regionResolver.getAccountId(), region);
         return new AccountSettings(totalCodeSize, functions.size(), concurrencyLimit, unreserved);
     }
 

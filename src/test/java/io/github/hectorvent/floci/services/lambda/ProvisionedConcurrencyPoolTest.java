@@ -33,6 +33,7 @@ import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -119,6 +120,120 @@ class ProvisionedConcurrencyPoolTest {
 
     private ProvisionedConcurrencyPool.Status put(int count) {
         return pool.put(REGION, "example", "live", count, ACCOUNT);
+    }
+
+    @Test
+    void accountQuotaRejectsBeforePersistenceOrLaunchAndDeleteReleasesTheCommitment() throws Exception {
+        pool.shutdown();
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter(5, 2);
+        pool = new ProvisionedConcurrencyPool(
+                launcher, functions, aliases, storage, Clock.systemUTC(), 100, 0, false, 15, limiter);
+        AwsException greater = assertThrows(AwsException.class, () -> put(6));
+        assertEquals("Specified ConcurrentExecutions for function is greater than account's "
+                + "unreserved concurrency [5].", greater.getMessage());
+        AwsException minimum = assertThrows(AwsException.class, () -> put(4));
+        assertEquals("Specified ConcurrentExecutions for function decreases account's "
+                + "UnreservedConcurrentExecution below its minimum value of [2].", minimum.getMessage());
+        assertEquals("InvalidParameterValueException", minimum.getErrorCode());
+        assertTrue(storage.scanAllAccounts().isEmpty());
+        assertEquals(0, launcher.starts.get());
+        put(1);
+        launched().initialized.complete(null);
+        ready();
+        assertEquals(4, limiter.unreservedCapacity(ACCOUNT, REGION));
+        pool.delete(REGION, "example", "live", ACCOUNT);
+        assertEquals(5, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertTrue(storage.scanAllAccounts().isEmpty());
+    }
+
+    @Test
+    void failedPersistenceAndLocalCapacityRestoreTheAccountBudget() {
+        pool.shutdown();
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter();
+        AccountAwareStorageBackend<ProvisionedConcurrencyPool.Configuration> failing = spy(storage);
+        doThrow(new IllegalStateException("controlled persistence failure"))
+                .when(failing).putForAccount(anyString(), anyString(), any());
+        pool = new ProvisionedConcurrencyPool(
+                launcher, functions, aliases, failing, Clock.systemUTC(), 4, 8, false, 15, limiter);
+        assertThrows(IllegalStateException.class, () -> put(1));
+        assertEquals(1000, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertThrows(AwsException.class, () -> put(5));
+        assertEquals(1000, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertTrue(storage.scanAllAccounts().isEmpty());
+        assertEquals(0, launcher.starts.get());
+    }
+
+    @Test
+    void resetAfterStoppingReleasesPersistedProvisionedCommitments() throws Exception {
+        pool.shutdown();
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter();
+        pool = new ProvisionedConcurrencyPool(
+                launcher, functions, aliases, storage, Clock.systemUTC(), 4, 8, false, 15, limiter);
+        put(1);
+        launched().initialized.complete(null);
+        ready();
+        function("222222222222", REGION, "$LATEST");
+        function("222222222222", REGION, "1");
+        alias("222222222222", REGION, "live", "1", Map.of());
+        pool.put(REGION, "example", "live", 1, "222222222222");
+        launched().initialized.complete(null);
+        pool.stopManagedContainers();
+        assertEquals(999, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertEquals(999, limiter.unreservedCapacity("222222222222", REGION));
+
+        pool.clear();
+
+        assertEquals(1000, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertEquals(1000, limiter.unreservedCapacity("222222222222", REGION));
+        assertTrue(storage.scanAllAccounts().isEmpty());
+    }
+
+    @Test
+    void resetReleasesAPutThatFinishesBeforeAdmissionCloses() throws Exception {
+        pool.shutdown();
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter();
+        pool = spy(new ProvisionedConcurrencyPool(
+                launcher, functions, aliases, storage, Clock.systemUTC(), 4, 8, false, 15, limiter));
+        CountDownLatch stopping = new CountDownLatch(1);
+        CountDownLatch proceed = new CountDownLatch(1);
+        doAnswer(call -> {
+            stopping.countDown();
+            assertTrue(proceed.await(5, TimeUnit.SECONDS));
+            return call.callRealMethod();
+        }).when(pool).stopManagedContainers();
+        CompletableFuture<Void> reset = CompletableFuture.runAsync(pool::clear);
+        try {
+            assertTrue(stopping.await(5, TimeUnit.SECONDS));
+            put(1);
+            launched().initialized.complete(null);
+            ready();
+        } finally {
+            proceed.countDown();
+            reset.get(5, TimeUnit.SECONDS);
+        }
+        assertEquals(1000, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertTrue(storage.scanAllAccounts().isEmpty());
+    }
+
+    @Test
+    void failedResetKeepsPersistedCommitmentsUntilClearSucceeds() throws Exception {
+        pool.shutdown();
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter();
+        AccountAwareStorageBackend<ProvisionedConcurrencyPool.Configuration> failing = spy(storage);
+        doThrow(new IllegalStateException("controlled clear failure")).doCallRealMethod().when(failing).clear();
+        pool = new ProvisionedConcurrencyPool(
+                launcher, functions, aliases, failing, Clock.systemUTC(), 4, 8, false, 15, limiter);
+        put(1);
+        launched().initialized.complete(null);
+        ready();
+
+        assertThrows(IllegalStateException.class, pool::clear);
+
+        assertEquals(999, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertEquals(1, failing.scanAllAccounts().size());
+        pool.clear();
+        assertEquals(1000, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertTrue(failing.scanAllAccounts().isEmpty());
     }
 
     @ParameterizedTest
