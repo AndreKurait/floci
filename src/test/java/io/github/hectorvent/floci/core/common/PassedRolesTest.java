@@ -798,6 +798,53 @@ class PassedRolesTest {
         assertEquals(List.of(), PassedRoles.of("apigateway:PATCH", rest("/account/other", body), LOOKUPS));
     }
 
+    @Test
+    void quickCreateLambdaRoleUsesSharedPassRoleCheck() {
+        for (String path : new String[] {"/v2/apis", "/v2/apis/"}) {
+            String body = "{\"protocolType\":\"HTTP\",\"target\":\"arn:aws:lambda:us-east-1:000000000000:function:target\","
+                    + "\"credentialsArn\":\"" + ROLES + "teams/quick\"}";
+            assertEquals(List.of(passed("teams/quick", "apigateway.amazonaws.com")),
+                    PassedRoles.of("apigateway:POST", rest(path, body), LOOKUPS));
+        }
+    }
+
+    @Test
+    void quickCreateDefaultHttpProtocolUsesSharedPassRoleCheck() {
+        String body = "{\"target\":\"arn:aws-us-gov:lambda:us-gov-west-1:000000000000:function:target\","
+                + "\"credentialsArn\":\"arn:aws-us-gov:iam::000000000000:role/teams/quick\"}";
+        assertEquals(List.of(new PassedRoles.PassedRole("arn:aws-us-gov:iam::000000000000:role/teams/quick",
+                        "apigateway.amazonaws.com")),
+                PassedRoles.of("apigateway:POST", rest("/v2/apis", body), LOOKUPS));
+    }
+
+    @Test
+    void quickCreateIncompleteArnStillRequiresPassRole() {
+        String body = "{\"protocolType\":\"HTTP\",\"target\":\"arn:incomplete\",\"credentialsArn\":\""
+                + ROLES + "teams/quick\"}";
+        assertEquals(List.of(passed("teams/quick", "apigateway.amazonaws.com")),
+                PassedRoles.of("apigateway:POST", rest("/v2/apis", body), LOOKUPS));
+    }
+
+    @Test
+    void quickCreateUnusedAndCallerCredentialsPassNoRole() {
+        for (String target : new String[] {"", "https://example.com"}) {
+            String body = "{\"protocolType\":\"HTTP\",\"target\":\"" + target + "\",\"credentialsArn\":\""
+                    + ROLES + "unused\"}";
+            assertEquals(List.of(), PassedRoles.of("apigateway:POST", rest("/v2/apis", body), LOOKUPS));
+        }
+        for (String credential : new String[] {"", "arn:aws:iam::*:user/*", "*"}) {
+            String body = "{\"protocolType\":\"HTTP\",\"target\":\"arn:aws:lambda:us-east-1:000000000000:function:target\","
+                    + "\"credentialsArn\":\"" + credential + "\"}";
+            assertEquals(List.of(), PassedRoles.of("apigateway:POST", rest("/v2/apis", body), LOOKUPS));
+        }
+        String body = "{\"protocolType\":\"WEBSOCKET\",\"target\":\"arn:aws:lambda:us-east-1:000000000000:function:target\","
+                + "\"credentialsArn\":\"" + ROLES + "unused\"}";
+        assertEquals(List.of(), PassedRoles.of("apigateway:POST", rest("/v2/apis", body), LOOKUPS));
+        assertEquals(List.of(), PassedRoles.of("apigateway:PATCH", rest("/v2/apis", body), LOOKUPS));
+        String nullProtocol = body.replace("\"WEBSOCKET\"", "null");
+        assertEquals(List.of(), PassedRoles.of("apigateway:POST", rest("/v2/apis", nullProtocol), LOOKUPS));
+    }
+
     private static ContainerRequestContext rest(String path, String body) {
         ContainerRequestContext request = json(body);
         UriInfo uri = mock(UriInfo.class);
