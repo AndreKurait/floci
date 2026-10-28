@@ -46,6 +46,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
@@ -3674,6 +3675,107 @@ class IamServiceTest {
         // Null token -> empty
         Optional<String> nullOpt = iamService.resolveCallerUserId("ASIATOKENCHECKKEY", null);
         assertTrue(nullOpt.isEmpty());
+    }
+
+    @Test
+    void sessionMfaProvenancePreservesUnknownAndKnownFalse() throws Exception {
+        for (Boolean state : new Boolean[] {null, false, true}) {
+            SessionCredential original = new SessionCredential();
+            original.setMultiFactorAuthPresent(state);
+            ObjectMapper mapper = new ObjectMapper();
+            SessionCredential restored = mapper.readValue(mapper.writeValueAsBytes(original), SessionCredential.class);
+            assertEquals(state, restored.getMultiFactorAuthPresent());
+            IamService.CallerArns caller = IamService.CallerArns.accountRoot("arn:aws:iam::000000000000:root",
+                    "000000000000").withMultiFactorAuthPresent(state).withTokenIssueTime(Instant.EPOCH)
+                    .withPrincipalTags(Map.of("team", "test"));
+            Map<String, List<String>> context = new LinkedHashMap<>();
+            caller.putPrincipalKeys(context);
+            assertEquals(state == null ? null : List.of(state.toString()),
+                    context.get("aws:MultiFactorAuthPresent"));
+        }
+        assertNull(new ObjectMapper().readValue("{}", SessionCredential.class).getMultiFactorAuthPresent());
+    }
+
+    @Test
+    void genericAndFederatedSessionRegistrationDoesNotInventMfaProvenance() {
+        iamService.registerIssuedSession("ASIAUNKNOWN", "secret", "token", null,
+                Instant.now().plusSeconds(3600), null, "000000000000", "test");
+        iamService.registerIssuedSession("ASIAFEDERATED", "secret", "token",
+                "arn:aws:sts::000000000000:federated-user/test", Instant.now().plusSeconds(3600),
+                null, "000000000000", "test");
+        for (String key : List.of("ASIAUNKNOWN", "ASIAFEDERATED")) {
+            assertNull(iamService.resolveCallerArns(key).orElseThrow().multiFactorAuthPresent());
+        }
+        iamService.registerSessionToken("ASIANONMFA", "secret", "token", Instant.now().plusSeconds(3600),
+                "000000000000", "test", null, null, Instant.now());
+        assertEquals(Boolean.FALSE, iamService.resolveCallerArns("ASIANONMFA").orElseThrow()
+                .multiFactorAuthPresent());
+    }
+
+    @Test
+    void rejectedMfaDoesNotRegisterSession() {
+        AwsException denied = assertThrows(AwsException.class, () -> iamService.registerSessionToken(
+                "ASIAREJECTED", "secret", "token", Instant.now().plusSeconds(3600), "000000000000", "test",
+                "arn:aws:iam::000000000000:mfa/missing", "123456", Instant.now()));
+        assertEquals("AccessDenied", denied.getErrorCode());
+        assertTrue(iamService.resolveCallerArns("ASIAREJECTED").isEmpty());
+    }
+
+    @Test
+    void registeredMfaProvenanceSurvivesStorageRoundTripAndIsNotInferredFromDeviceAssignment() throws Exception {
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        service.createUser("mfa-issuer", "/");
+        AccessKey key = service.createAccessKey("mfa-issuer");
+        VirtualMfaDevice device = service.createVirtualMfaDevice("issuer-device", "/", Map.of());
+        Instant now = Instant.now();
+        long step = Totp.stepAt(now);
+        service.enableMfaDevice("mfa-issuer", device.getSerialNumber(),
+                Totp.codeAt(device.getBase32Seed(), step - 1), Totp.codeAt(device.getBase32Seed(), step));
+        service.registerSessionToken("ASIAWITHMFA", "secret", "token", now.plusSeconds(3600),
+                "000000000000", key.getAccessKeyId(), device.getSerialNumber(),
+                Totp.codeAt(device.getBase32Seed(), step), now);
+        service.registerSessionToken("ASIAWITHOUTMFA", "secret", "token", now.plusSeconds(3600),
+                "000000000000", key.getAccessKeyId(), null, null, now);
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        for (String sessionKey : List.of("ASIAWITHMFA", "ASIAWITHOUTMFA")) {
+            SessionCredential stored = sessions.getForAccount("000000000000", sessionKey).orElseThrow();
+            SessionCredential reloaded = mapper.readValue(mapper.writeValueAsBytes(stored), SessionCredential.class);
+            sessions.putForAccount("000000000000", sessionKey, reloaded);
+            assertEquals("ASIAWITHMFA".equals(sessionKey),
+                    service.resolveCallerArns(sessionKey).orElseThrow().multiFactorAuthPresent());
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void mfaIssuanceCannotChangeTheVerifiedUserIntoRootAfterKeyRemoval() {
+        StorageBackend<String, AccessKey> keys = Mockito.spy(new InMemoryStorage<String, AccessKey>());
+        IamService service = iamService(false, keys);
+        IamUser user = service.createUser("mfa-stable-issuer", "/");
+        AccessKey key = service.createAccessKey(user.getUserName());
+        VirtualMfaDevice device = service.createVirtualMfaDevice("stable-issuer-device", "/", Map.of());
+        Instant now = Instant.now();
+        long step = Totp.stepAt(now);
+        service.enableMfaDevice(user.getUserName(), device.getSerialNumber(),
+                Totp.codeAt(device.getBase32Seed(), step - 1), Totp.codeAt(device.getBase32Seed(), step));
+        AtomicBoolean removeAfterRead = new AtomicBoolean(true);
+        Mockito.doAnswer(invocation -> {
+            Optional<AccessKey> observed = (Optional<AccessKey>) invocation.callRealMethod();
+            if (removeAfterRead.compareAndSet(true, false)) {
+                keys.delete(key.getAccessKeyId());
+            }
+            return observed;
+        }).when(keys).get(key.getAccessKeyId());
+        service.registerSessionToken("ASIASTABLEISSUER", "secret", "token", now.plusSeconds(3600),
+                "000000000000", key.getAccessKeyId(), device.getSerialNumber(),
+                Totp.codeAt(device.getBase32Seed(), step), now);
+        IamService.CallerArns caller = service.resolveCallerArns("ASIASTABLEISSUER").orElseThrow();
+        assertEquals(user.getArn(), caller.principalArn());
+        assertEquals(user.getUserId(), caller.userId());
+        assertEquals(Boolean.TRUE, caller.multiFactorAuthPresent());
+        assertTrue(keys.get(key.getAccessKeyId()).isEmpty());
     }
 }
 
