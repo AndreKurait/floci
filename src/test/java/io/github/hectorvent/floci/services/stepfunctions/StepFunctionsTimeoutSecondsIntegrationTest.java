@@ -545,7 +545,7 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
 
     /**
      * Polls for 20 seconds: twice the longest bound any definition here declares, and far short of
-     * the 300-second default a task that ignores TimeoutSeconds falls back on.
+     * the default budget a task that ignores TimeoutSeconds falls back on.
      */
     private static Response waitForTerminalExecution(String execArn) throws InterruptedException {
         for (int poll = 0; poll < 200; poll++) {
