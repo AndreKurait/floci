@@ -354,6 +354,12 @@ aws logs put-retention-policy \
 
 **Protocol:** Query (XML) and JSON 1.0 (both supported)
 
+JSON 1.0 `PutMetricData` accepts `Content-Encoding: gzip`, as documented in the
+[AWS API reference](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_PutMetricData.html).
+The decoded body is limited to 5 MiB, matching live AWS responses. Signature and IAM checks
+still run before decoding. Malformed gzip receives a controlled client error; AWS may instead
+return an empty server error. Other JSON operations retain their existing body handling.
+
 CloudWatch Query operations accept form-encoded POST requests and root GET requests with
 URL query parameters. GET uses the existing handlers, signature validation and IAM policy checks. A `monitoring`
 credential in the Authorization header or presigned URL selects CloudWatch, including
