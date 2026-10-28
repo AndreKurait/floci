@@ -538,7 +538,7 @@ in that map, return `BadRequestException` rather than silently discarding or cha
 | `contentHandling` | `CONVERT_TO_TEXT` base64-encodes a binary request for mapping templates; `CONVERT_TO_BINARY` base64-decodes a text request before sending it |
 | `connectionType` / `connectionId` | `VPC_LINK` requires `connectionId` to name an existing, available VPC link; an unknown link yields `502` |
 | `cacheNamespace` / `cacheKeyParameters` | Form the response cache key (see below) |
-| `credentials` | Persisted and returned. With IAM enforcement enabled, REST Lambda integration roles are checked as described above; no actual STS session is issued. Other service integrations and caller passthrough retain their existing behavior |
+| `credentials` | Persisted and returned. With IAM enforcement enabled, REST Lambda integration roles and documented caller passthrough are checked as described above. Other service integrations retain their existing behavior |
 
 Integration responses additionally accept `contentHandling`, applied as an output conversion after response templates.
 
@@ -1113,3 +1113,21 @@ stage, HTTP method and request path, the Lambda function region, and the exact
 qualified target passed to invocation. Missing permission returns HTTP 500 before
 invocation. Configured roles and caller passthrough retain their separate paths;
 this check does not implement role assumption.
+
+### REST Lambda caller passthrough
+
+For REST `AWS` and `AWS_PROXY` Lambda integrations, the documented IAM caller sentinel
+(`arn:<partition>:iam::*:user/*`) forwards a verified SigV4 identity into Lambda permission
+evaluation when IAM enforcement is enabled. The caller's current identity and session policies,
+permissions boundary, SCPs and the target's resource policy are evaluated for the exact qualified
+function. Cross-account calls require both identity and resource grants. No execution role is
+assumed for this mode, and an anonymous or invalid signature cannot supply a caller identity.
+The API owner still determines the integration configuration; the caller can belong to a different
+account. Cached responses do not invoke Lambda again.
+
+The local `test` credential has no IAM policy context and is refused in enforced caller mode.
+IAM-disabled behavior and the historical bare `*` credential spelling retain their local bypass;
+bare `*` is not the documented AWS sentinel. This check is distinct from `execute-api:Invoke`
+route authorization. Issued session identities are read from IAM, not synthesized; full forwarded
+request condition context, other service integrations and HTTP/WebSocket caller modes remain
+outside this implementation.
