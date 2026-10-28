@@ -157,6 +157,43 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 class Ec2ServiceTest {
+    @ParameterizedTest
+    @CsvSource({
+            "vpc, DryRunOperation",
+            "group, DryRunOperation",
+            "default-group, DryRunOperation",
+            "missing-group-vpc, DryRunOperation",
+            "missing-subnet-vpc, DryRunOperation",
+            "invalid-vpc-cidr, DryRunOperation",
+            "invalid-vpc-tenancy, DryRunOperation"
+    })
+    void createDryRunDoesNotSeedFreshRegion(String operation, String errorCode) {
+        InMemoryStorageFactory storageFactory = new InMemoryStorageFactory();
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), storageFactory);
+        AwsException error = assertThrows(AwsException.class, () -> {
+            switch (operation) {
+                case "vpc" -> service.createVpc("eu-west-1", "10.86.0.0/16", false, true, null, true);
+                case "invalid-vpc-cidr" -> service.createVpc("eu-west-1", "invalid", false, false, null, true);
+                case "invalid-vpc-tenancy" -> service.createVpc("eu-west-1", "10.86.0.0/16", false, false, "invalid", true);
+                case "group" -> service.createSecurityGroup("eu-west-1", "probe", "probe", null, true);
+                case "default-group" -> service.createSecurityGroup("eu-west-1", "default", "probe", null, true);
+                case "missing-group-vpc" ->
+                        service.createSecurityGroup("eu-west-1", "probe", "probe", "vpc-missing", true);
+                case "missing-subnet-vpc" ->
+                        service.createSubnet("eu-west-1", "vpc-missing", "10.86.1.0/24", null, null, null, true);
+                default -> throw new AssertionError(operation);
+            }
+        });
+        assertEquals(errorCode, error.getErrorCode());
+        assertEquals("DryRunOperation".equals(errorCode) ? 412 : 400, error.getHttpStatus());
+        storageFactory.created.forEach(backend -> assertTrue(backend.scan(key -> true).isEmpty()));
+        // A dry run must not mark the region seeded and prevent a later normal call from seeding it.
+        service.ensureDefaultResources("eu-west-1");
+        assertTrue(service.describeVpcs("eu-west-1", List.of(), Map.of()).stream().anyMatch(Vpc::isDefault));
+    }
+
 
     @ParameterizedTest
     @CsvSource({
