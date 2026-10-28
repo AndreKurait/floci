@@ -340,6 +340,7 @@ floci:
       ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
       enabled: true
       imds-port: 9169
+      metadata-helper-image: floci/network-helper:local
       ssh-port-range-start: 2200
       ssh-port-range-end: 2299
       publish-security-group-ports: true

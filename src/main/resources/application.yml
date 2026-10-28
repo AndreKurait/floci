@@ -717,6 +717,7 @@ floci:
       ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
       enabled: true
       imds-port: 9169
+      metadata-helper-image: floci/network-helper:local
       # Sweep EC2 containers left on the daemon by a previous run that died mid-launch or
       # mid-terminate (SIGKILL, OOM, docker kill), which no surviving record refers to.
       # Scoped to this deployment's own containers; stopped instances are never swept.

@@ -277,6 +277,10 @@ public class Ec2PortForwardManager {
         if (containerId != null) {
             try {
                 InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
+                String mode = inspect.getHostConfig() == null ? null : inspect.getHostConfig().getNetworkMode();
+                if (mode != null && mode.startsWith("container:")) {
+                    inspect = dockerClient.inspectContainerCmd(mode.substring("container:".length())).exec();
+                }
                 if (inspect.getNetworkSettings() != null) {
                     Map<String, ContainerNetwork> networks = inspect.getNetworkSettings().getNetworks();
                     NetworkTarget target = pickTarget(networks);

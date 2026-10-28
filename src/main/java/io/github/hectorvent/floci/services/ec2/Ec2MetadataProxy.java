@@ -70,15 +70,19 @@ public final class Ec2MetadataProxy {
     }
 
     public static String[] ec2RoutingCommand(String flociHost, int imdsPort) {
+        return ec2RoutingCommand(flociHost, imdsPort, true);
+    }
+
+    static String[] ec2RoutingCommand(String flociHost, int imdsPort, boolean metadataEnabled) {
         if (flociHost == null || flociHost.length() > 253
                 || !flociHost.matches("[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
                 || imdsPort < 1 || imdsPort > 65535) {
             throw new IllegalArgumentException("IMDS requires an IPv4 address or hostname and a valid port");
         }
-        // Resolve inside the guest: host.docker.internal may exist only in its /etc/hosts.
+        // Resolve inside the namespace: host.docker.internal may exist only in its /etc/hosts.
+        // DNS is exempt from security groups; a direct HTTP request to the backend is not.
         String resolveTarget = flociHost.matches("[0-9.]+") ? "target_ip='" + flociHost + "'"
-                : "target_ip=$(curl -4 --noproxy '*' -sS --max-time 2 -o /dev/null -w '%{remote_ip}'"
-                + " 'http://" + flociHost + ":" + imdsPort + "/latest/meta-data/instance-id')";
+                : "target_ip=$(getent ahostsv4 '" + flociHost + "' | awk 'NR == 1 {print $1; exit}')";
         String rule = "-d 169.254.169.254/32 -p tcp --dport 80 -m comment --comment floci-imds"
                 + " -j DNAT --to-destination \"$target_ip:" + imdsPort + "\"";
         return new String[]{"sh", "-c", String.join("\n",
@@ -147,6 +151,8 @@ public final class Ec2MetadataProxy {
                 "owned_count=$(printf '%s\\n' \"$rules\" | grep -Ec -- '--comment \"?floci-imds\"?( |$)' || true)",
                 "[ \"$owned_count\" -eq 1 ] || refuse 'Floci IMDS routing changed during configuration'",
                 "iptables -w 2 -t nat -C OUTPUT " + rule,
+                // Disabled IMDS must still be routed locally rather than escaping to the host.
+                metadataEnabled ? ":" : "exit 0",
                 "for i in 1 2 3 4 5 6; do",
                 "  " + imdsProbeCommand("http://169.254.169.254"),
                 "  sleep 1",

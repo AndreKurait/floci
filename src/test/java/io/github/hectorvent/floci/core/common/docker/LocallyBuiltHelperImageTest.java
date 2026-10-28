@@ -7,13 +7,16 @@ import com.github.dockerjava.api.command.InfoCmd;
 import com.github.dockerjava.api.command.InspectImageCmd;
 import com.github.dockerjava.api.command.InspectImageResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.ContainerConfig;
 import com.github.dockerjava.api.model.Info;
+import io.github.hectorvent.floci.core.common.Digests;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.InputStream;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -25,12 +28,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Covers the decisions this helper makes before it ever touches a Dockerfile: that a caller pointed
- * at something other than Floci's own default is left to pull that image itself, that an image
- * already matching the daemon platform is not rebuilt, and that a build which produces no image id fails instead
- * of reporting success. All are branches the callers depend on and none needs a real daemon, so
- * they are pinned here rather than only through the EC2 security-group path, which uses the default
- * image and is skipped without Docker.
+ * Covers custom image selection, reuse of the current recipe on the correct platform, stale-cache
+ * rebuilding and failure when a build produces no image. Real Docker coverage lives separately.
  */
 class LocallyBuiltHelperImageTest {
 
@@ -63,13 +62,15 @@ class LocallyBuiltHelperImageTest {
     }
 
     @Test
-    void buildsNothingWhenTheImageIsAlreadyInTheDaemon() {
+    void buildsNothingWhenTheImageHasTheCurrentRecipeAndPlatform() throws Exception {
         stubResolvedImage();
         InspectImageCmd inspectCmd = mock(InspectImageCmd.class);
         when(dockerClient.inspectImageCmd(DEFAULT_IMAGE)).thenReturn(inspectCmd);
         InspectImageResponse image = mock(InspectImageResponse.class);
         when(image.getOs()).thenReturn("linux");
         when(image.getArch()).thenReturn("amd64");
+        when(image.getConfig()).thenReturn(new ContainerConfig()
+                .withLabels(Map.of(LocallyBuiltHelperImage.RECIPE_LABEL, recipe())));
         when(inspectCmd.exec()).thenReturn(image);
 
         LocallyBuiltHelperImage.ensureBuilt(dockerClient, containerBuilder,
@@ -79,7 +80,7 @@ class LocallyBuiltHelperImageTest {
     }
 
     @Test
-    void buildsFromTheDockerfileWhenTheImageIsMissing() {
+    void buildsFromTheDockerfileWhenTheImageIsMissing() throws Exception {
         stubMissingImage();
         BuildImageCmd build = stubBuildReturning("sha256:built");
 
@@ -87,6 +88,27 @@ class LocallyBuiltHelperImageTest {
                 DEFAULT_IMAGE, DEFAULT_IMAGE, DOCKERFILE);
 
         verify(dockerClient).buildImageCmd(any(InputStream.class));
+        verify(build).withPlatform("linux/amd64");
+        verify(build).withLabels(Map.of(LocallyBuiltHelperImage.RECIPE_LABEL, recipe()));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"missing", "old-recipe"})
+    void replacesNativeHelperFromAnOlderRecipe(String previous) {
+        stubResolvedImage();
+        InspectImageResponse image = mock(InspectImageResponse.class);
+        when(image.getOs()).thenReturn("linux");
+        when(image.getArch()).thenReturn("amd64");
+        when(image.getConfig()).thenReturn(new ContainerConfig().withLabels("missing".equals(previous)
+                ? Map.of() : Map.of(LocallyBuiltHelperImage.RECIPE_LABEL, previous)));
+        InspectImageCmd inspect = mock(InspectImageCmd.class);
+        when(inspect.exec()).thenReturn(image);
+        when(dockerClient.inspectImageCmd(DEFAULT_IMAGE)).thenReturn(inspect);
+        BuildImageCmd build = stubBuildReturning("sha256:rebuilt");
+
+        LocallyBuiltHelperImage.ensureBuilt(dockerClient, containerBuilder,
+                DEFAULT_IMAGE, DEFAULT_IMAGE, DOCKERFILE);
+
         verify(build).withPlatform("linux/amd64");
     }
 
@@ -135,6 +157,12 @@ class LocallyBuiltHelperImageTest {
 
     private void stubResolvedImage() {
         when(containerBuilder.resolveImage(DEFAULT_IMAGE)).thenReturn(DEFAULT_IMAGE);
+    }
+
+    private static String recipe() throws Exception {
+        try (InputStream dockerfile = LocallyBuiltHelperImageTest.class.getResourceAsStream(DOCKERFILE)) {
+            return Digests.sha256Hex(dockerfile.readAllBytes());
+        }
     }
 
     private void stubMissingImage() {
