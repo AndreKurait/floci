@@ -5,11 +5,13 @@ import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
 import io.github.hectorvent.floci.core.common.PassedRoles.PassedRole;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
@@ -695,6 +697,81 @@ class PassedRolesTest {
     private static String constraint(String type, String parameters) {
         return "{\"PortfolioId\":\"port\",\"ProductId\":\"prod\",\"Type\":\"" + type + "\",\"Parameters\":\""
                 + parameters + "\"}";
+    }
+
+    @Test
+    void apiGatewayDirectCredentialAssignmentsPassOnlyRoleArns() {
+        String[][] routes = {
+            {"PUT", "/restapis/a/resources/r/methods/GET/integration", "credentials"},
+            {"POST", "/restapis/a/authorizers", "authorizerCredentials"},
+            {"POST", "/v2/apis/a/integrations", "credentialsArn"},
+            {"PATCH", "/v2/apis/a/integrations/i", "credentialsArn"},
+            {"POST", "/v2/apis/a/authorizers", "authorizerCredentialsArn"},
+            {"PATCH", "/v2/apis/a/authorizers/z", "authorizerCredentialsArn"}
+        };
+        for (String[] route : routes) {
+            String body = "{\"" + route[2] + "\":\"" + ROLES + "teams/api/invoke\"}";
+            assertEquals(List.of(passed("teams/api/invoke", "apigateway.amazonaws.com")),
+                    PassedRoles.of("apigateway:" + route[0], rest(route[1], body), LOOKUPS), route[1]);
+            for (String value : new String[] {"null", "\"\"", "\"*\"", "\"arn:aws:iam::*:user/*\"", "123", "{}"}) {
+                assertEquals(List.of(), PassedRoles.of("apigateway:" + route[0],
+                        rest(route[1], "{\"" + route[2] + "\":" + value + "}"), LOOKUPS), route[1] + value);
+            }
+        }
+    }
+
+    @Test
+    void apiGatewayPatchesCheckEveryAssignedRoleBeforeMutation() {
+        for (String[] route : new String[][] {
+                {"/restapis/a/resources/r/methods/POST/integration", "/credentials"},
+                {"/restapis/a/authorizers/z", "/authorizerCredentials"}}) {
+            String body = "{\"patchOperations\":[{\"op\":\"add\",\"path\":\"" + route[1]
+                    + "\",\"value\":\"" + ROLES + "first\"},{\"op\":\"replace\",\"path\":\"" + route[1]
+                    + "\",\"value\":\"" + ROLES + "second\"}]}";
+            assertEquals(List.of(passed("first", "apigateway.amazonaws.com"),
+                            passed("second", "apigateway.amazonaws.com")),
+                    PassedRoles.of("apigateway:PATCH", rest(route[0], body), LOOKUPS));
+        }
+    }
+
+    @Test
+    void apiGatewayRemovalAndOtherFieldsDoNotPassRoles() {
+        for (String op : new String[] {"remove", "test", "copy", "move"}) {
+            assertEquals(List.of(), PassedRoles.of("apigateway:PATCH", rest(
+                    "/restapis/a/resources/r/methods/GET/integration", "{\"patchOperations\":[{\"op\":\""
+                            + op + "\",\"path\":\"/credentials\",\"value\":\"" + ROLES + "x\"}]}"), LOOKUPS));
+        }
+        assertEquals(List.of(), PassedRoles.of("apigateway:PATCH", rest(
+                "/restapis/a/authorizers/z", "{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/name\","
+                        + "\"value\":\"" + ROLES + "x\"}]}"), LOOKUPS));
+    }
+
+    @Test
+    void apiGatewayEncodedSegmentsAndPartitionsRetainExactRole() {
+        String role = "arn:aws-us-gov:iam::111122223333:role/teams/api/invoke";
+        assertEquals(List.of(new PassedRole(role, "apigateway.amazonaws.com")), PassedRoles.of("apigateway:PUT",
+                rest("/restapis/a/resources/r%2Fencoded/methods/GET/integration/", "{\"credentials\":\"" + role + "\"}"),
+                LOOKUPS));
+    }
+
+    @Test
+    void apiGatewayOtherResourcesAndVerbsDoNotReadRoleLookingFields() {
+        for (String path : new String[] {"/restapis/a/resources/r/methods/GET/integration/responses/200",
+                "/restapis/a/resources/r/methods/GET", "/v2/apis/a/routes", "/v2/apis/a/integrations/i/responses"}) {
+            assertEquals(List.of(), PassedRoles.of("apigateway:PUT",
+                    rest(path, "{\"credentials\":\"" + ROLES + "x\"}"), LOOKUPS));
+        }
+        assertEquals(List.of(), PassedRoles.of("apigateway:DELETE", rest(
+                "/v2/apis/a/integrations/i", "{\"credentialsArn\":\"" + ROLES + "x\"}"), LOOKUPS));
+    }
+
+    private static ContainerRequestContext rest(String path, String body) {
+        ContainerRequestContext request = json(body);
+        UriInfo uri = mock(UriInfo.class);
+        when(uri.getRequestUri()).thenReturn(URI.create("http://localhost/base" + path));
+        when(uri.getBaseUri()).thenReturn(URI.create("http://localhost/base/"));
+        when(request.getUriInfo()).thenReturn(uri);
+        return request;
     }
 
     private static PassedRole passed(String roleName, String service) {
