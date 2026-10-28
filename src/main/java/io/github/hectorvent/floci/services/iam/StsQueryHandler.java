@@ -391,8 +391,9 @@ public class StsQueryHandler {
 
         String result = credentialsXml(accessKeyId, secretKey, sessionToken, expiration);
         // No role ARN: the credentials route back to the caller's account and act as the caller.
-        iamService.registerIssuedSession(accessKeyId, secretKey, sessionToken, null, expiration, null,
-                regionResolver.getAccountId(), callerAccessKeyId());
+        iamService.registerSessionToken(accessKeyId, secretKey, sessionToken, expiration,
+                regionResolver.getAccountId(), callerAccessKeyId(), params.getFirst("SerialNumber"),
+                params.getFirst("TokenCode"), clock.instant());
         return Response.ok(AwsQueryResponse.envelope("GetSessionToken", AwsNamespaces.STS, result)).build();
     }
 

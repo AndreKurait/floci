@@ -264,3 +264,15 @@ When `FLOCI_AUTH_VALIDATE_SIGNATURES=true`, the shared signature verifier checks
 credentials for STS operations, including `GetCallerIdentity`, `GetSessionToken`, `GetFederationToken`
 and `AssumeRole`. It checks the request signature, credential scope, expiry and session token before
 execution. Nonblank Authorization headers retain priority. See [signature checks](../configuration/multi-account.md#signature-validation).
+
+### GetSessionToken MFA context
+
+GetSessionToken records whether its credentials were issued with verified MFA. A request without
+MFA has `aws:MultiFactorAuthPresent=false`; a request with a valid code from the caller's assigned
+virtual MFA device has `true`. Invalid, unassigned or another user's devices are refused before
+session registration. Virtual codes use the shared TOTP implementation with one adjacent
+30-second window on either side. Existing credentials without recorded MFA provenance and
+GetFederationToken credentials leave the condition key absent.
+
+Hardware and account-root MFA devices are not supported. MFA for AssumeRole, MFA age context,
+and GetSessionToken's separate IAM/STS API restrictions remain outside this implementation.
