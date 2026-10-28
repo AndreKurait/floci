@@ -1202,3 +1202,10 @@ WebSocket `AWS_IAM` connection authorization evaluates `aws:SourceIp` and
 `aws:SecureTransport` from the upgrade connection through the shared caller policy
 evaluator. Forwarded headers do not replace these connection facts. This applies
 to connection authorization, separately from downstream integration permissions.
+
+Caller policy evaluation supplies `aws:CurrentTime` and `aws:EpochTime` from the
+server clock. The same instant is used for caller session expiry and time-based
+identity, session, boundary, SCP and resource-policy conditions. REST anonymous
+and custom-authorizer resource-policy checks also receive these time keys.
+These values do not come from client-supplied date headers. This does not add
+other global condition keys or issue STS sessions for service execution roles.
