@@ -35,6 +35,11 @@ public interface StorageBackend<K, V> {
         throw new UnsupportedOperationException("Atomic batches are not supported by this backend");
     }
 
+    /** Atomic batch persisted before publication, including in hybrid mode; memory remains volatile. */
+    default void putAllDurably(Map<K, V> entries) {
+        throw new UnsupportedOperationException("Durable atomic batches are not supported by this backend");
+    }
+
     Optional<V> get(K key);
 
     void delete(K key);
@@ -55,6 +60,11 @@ public interface StorageBackend<K, V> {
 
     /** Persist data to disk if applicable. */
     void flush();
+
+    /** Persist current state and report failure before a dependent durable outcome is acknowledged. */
+    default void flushOrThrow() {
+        throw new UnsupportedOperationException("Checked persistence is not supported by this backend");
+    }
 
     /** Load data from disk on startup. */
     void load();
