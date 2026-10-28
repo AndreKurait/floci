@@ -54,6 +54,21 @@ class RestPublicResourcePolicyIntegrationTest {
     @RegisterExtension
     final PartitionCleanup cleanup = new PartitionCleanup();
 
+    @Test
+    void unsignedPrincipalFlagIsAbsentAndPolicyRevocationStopsBackend() throws Exception {
+        Fixture fixture = fixture("GET");
+        policy(fixture, resourcePolicy("Allow", fixture.arn(),
+                ",\"Condition\":{\"Bool\":{\"aws:PrincipalIsAWSService\":\"false\"}}"));
+        invoke(fixture, Map.of(), 403);
+        policy(fixture, resourcePolicy("Allow", fixture.arn(),
+                ",\"Condition\":{\"Null\":{\"aws:PrincipalIsAWSService\":\"true\"}}"));
+        invoke(fixture, Map.of(), 200);
+        policy(fixture, resourcePolicy("Deny", fixture.arn(),
+                ",\"Condition\":{\"Null\":{\"aws:PrincipalIsAWSService\":\"true\"}}"));
+        invoke(fixture, Map.of(), 403);
+        assertEquals(1, fixture.hits().get());
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"GET", "ANY"})
     void unsignedRequestNeedsMatchingPolicyAndRevocationStopsBackend(String routeKey) throws Exception {
