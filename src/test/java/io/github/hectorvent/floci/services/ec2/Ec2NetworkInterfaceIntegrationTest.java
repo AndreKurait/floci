@@ -178,6 +178,8 @@ class Ec2NetworkInterfaceIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
+            .body("RunInstancesResponse.instancesSet.item.networkInterfaceSet.item.macAddress",
+                    matchesPattern("(?:[0-9a-f]{2}:){5}[0-9a-f]{2}"))
             .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
 
         org.junit.jupiter.api.Assertions.assertTrue(instanceId.startsWith("i-"));
@@ -193,7 +195,9 @@ class Ec2NetworkInterfaceIntegrationTest {
         .then()
             .statusCode(200)
             .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceState.name",
-                    equalTo("running"));
+                    equalTo("running"))
+            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.networkInterfaceSet.item.macAddress",
+                    matchesPattern("(?:[0-9a-f]{2}:){5}[0-9a-f]{2}"));
     }
 
     @Test

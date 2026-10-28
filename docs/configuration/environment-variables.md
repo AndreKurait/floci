@@ -544,9 +544,12 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS` | `false` | Opt in to EC2 Run/Start admission against current running Standard On-Demand vCPU usage |
 | `FLOCI_SERVICES_EC2_ENABLED` | `true` | Enable the EC2 service |
 | `FLOCI_SERVICES_EC2_MOCK` | `false` | When `true`, instances are registered in state but no containers are spawned |
-| `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES` | `none` | Automatic public IPv4 address of a mock instance: `none`, `documentation` (from `203.0.113.0/24`) or `fixed` (`FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS`) |
+| `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES` | `none` | Automatic public IPv4 address of a mock instance: `none`, `documentation` (from `203.0.113.0/24`), `fixed` (`FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS`) or `pool` (`FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS_POOL`) |
 | `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS` | `127.0.0.1` | Address given to every mock instance due one when `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES` is `fixed`, and shown by an Elastic IP on its primary private address |
+| `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS_POOL` | (unset) | Network-aligned `/24` to `/32` IPv4 CIDR required in `pool` mode. Addresses are unique across accounts and regions and released on stop or termination |
 | `FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH` | (unset) | Path to a complete YAML image catalog replacing the bundled EC2 catalog; mount the file at this path when running in Docker |
+| `FLOCI_SERVICES_EC2_EXTRA_ENV` | (unset) | Explicit guest `KEY=VALUE` entries, comma-separated (escape a literal comma as `\,`). Duplicate keys and reserved identity, credential, region, endpoint and IMDS settings are rejected |
+| `FLOCI_SERVICES_EC2_ULIMITS` | (unset) | Guest process limits as comma-separated `name=soft[:hard]`, for example `memlock=-1,nofile=1024000`. Omitted hard equals soft; `-1` means unlimited |
 | `FLOCI_SERVICES_EC2_IMDS_PORT` | `9169` | Port for the EC2 Instance Metadata Service (IMDS) endpoint |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START` | `2200` | First port in the SSH port range for EC2 instances |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END` | `2299` | Last port in the SSH port range |
