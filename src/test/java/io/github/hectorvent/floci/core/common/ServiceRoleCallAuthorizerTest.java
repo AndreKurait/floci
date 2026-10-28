@@ -96,6 +96,39 @@ class ServiceRoleCallAuthorizerTest {
         when(config.enforcementEnabled()).thenReturn(false);
         assertEquals(Decision.ALLOW, authorizer.authorize("events", ROLE, INVOKE,
                 FUNCTION.replace("arn:aws:", "arn:aws-cn:"), RULE, ACCOUNT));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"allow", "wrong-service", "identity-deny", "boundary-deny", "scp-deny",
+            "conditional-source", "missing-role", "wrong-path", "foreign-role", "iam-off"})
+    void serviceWithoutSourceContextStillRequiresRolePolicies(String scenario) {
+        String apiTrust = """
+                {"Version":"2012-10-17","Statement":{"Effect":"Allow",
+                "Principal":{"Service":"apigateway.amazonaws.com"},"Action":"sts:AssumeRole"}}""";
+        role.setAssumeRolePolicyDocument(apiTrust);
+        String requestedRole = ROLE;
+        switch (scenario) {
+            case "wrong-service" -> role.setAssumeRolePolicyDocument(TRUST);
+            case "identity-deny" -> when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(DENY)));
+            case "boundary-deny" -> when(iam.resolvePrincipalContext(ROLE))
+                    .thenReturn(new CallerContext(List.of(ALLOW), null, DENY, null));
+            case "scp-deny" -> when(scps.effectiveScpLevels(ACCOUNT)).thenReturn(List.of(List.of(DENY)));
+            case "conditional-source" -> role.setAssumeRolePolicyDocument(
+                    TRUST.replace("events.amazonaws.com", "apigateway.amazonaws.com"));
+            case "missing-role" -> when(iam.findRole(ACCOUNT, "events")).thenReturn(Optional.empty());
+            case "wrong-path" -> requestedRole = ROLE.replace("service-role/", "other/");
+            case "foreign-role" -> requestedRole = ROLE.replace(ACCOUNT, OTHER);
+            case "iam-off" -> when(config.enforcementEnabled()).thenReturn(false);
+            default -> { }
+        }
+        assertEquals(scenario.equals("allow") || scenario.equals("iam-off") ? Decision.ALLOW : Decision.DENY,
+                authorizer.authorizeWithoutSourceContext("apigateway", requestedRole, INVOKE, FUNCTION, ACCOUNT, "aws"));
+    }
+
+    @Test
+    void noSourceContextRejectsCrossPartitionTargets() {
+        assertEquals(Decision.DENY, authorizer.authorizeWithoutSourceContext("apigateway", ROLE, INVOKE,
+                FUNCTION.replace("arn:aws:", "arn:aws-cn:"), ACCOUNT, "aws"));
         verifyNoInteractions(iam);
     }
 
