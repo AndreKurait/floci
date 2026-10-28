@@ -71,6 +71,8 @@ import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.Route;
 import io.github.hectorvent.floci.services.ec2.model.RouteTable;
 import io.github.hectorvent.floci.services.ec2.model.RouteTableAssociation;
+import io.github.hectorvent.floci.services.ec2.model.RunInstancesReplayRecord.Allocation;
+import io.github.hectorvent.floci.services.ec2.model.RunInstancesReplayRecord.Result;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
 import io.github.hectorvent.floci.services.ec2.model.Snapshot;
@@ -273,6 +275,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             "Windows", "Windows (Amazon VPC)");
     private static final Set<String> VALID_PRODUCT_DESCRIPTIONS = new HashSet<>(MODELLED_PRODUCT_DESCRIPTIONS);
 
+    private static final ObjectMapper REPLAY_MAPPER = new ObjectMapper();
+    private final Ec2RunInstancesReplay runInstancesReplay;
     private final String defaultAccountId;
     private final jakarta.enterprise.inject.Instance<RequestContext> requestContextInstance;
     private final EmulatorConfig config;
@@ -590,7 +594,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 storageFactory.create("ec2", "ec2-egress-only-internet-gateways.json",
                         new TypeReference<Map<String, EgressOnlyInternetGateway>>() {}),
                 storageFactory.create("ec2", "ec2-dhcp-options.json",
-                        new TypeReference<Map<String, DhcpOptions>>() {}));
+                        new TypeReference<Map<String, DhcpOptions>>() {}),
+                new Ec2RunInstancesReplay(storageFactory));
     }
 
     // Package-private for hermetic tests (pass in-memory or temp-dir-backed StorageBackends directly).
@@ -925,6 +930,109 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                StorageBackend<String, TransitGatewayPeeringAttachment> transitGatewayPeeringAttachments,
                StorageBackend<String, EgressOnlyInternetGateway> egressOnlyInternetGateways,
                StorageBackend<String, DhcpOptions> dhcpOptions) {
+        this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog, instanceTypeCatalog,
+                vpcs, subnets, securityGroups, securityGroupRules, internetGateways, routeTables, keyPairs,
+                addresses, instances, volumes, registeredImages, snapshots, launchTemplates, vpcEndpoints,
+                natGateways, spotInstanceRequests, networkAcls, managedPrefixLists, tags,
+                transitGateways, transitGatewayRouteTables, transitGatewayVpcAttachments,
+                transitGatewayPropagations, transitGatewayRoutes, vpcPeeringConnections,
+                networkInterfaces, capacityReservations, volumeModifications,
+                requestContextInstance, iamService, volumeBlockDeviceManager, hosts,
+                transitGatewayPeeringAttachments, egressOnlyInternetGateways, dhcpOptions,
+                new Ec2RunInstancesReplay(AccountAwareStorageBackend.inMemory(config.defaultAccountId())));
+    }
+
+    Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
+               Ec2PortForwardManager portForwardManager,
+               AmiImageResolver amiImageResolver, Ec2ImageCatalog imageCatalog,
+               Ec2InstanceTypeCatalog instanceTypeCatalog,
+               StorageBackend<String, Vpc> vpcs,
+               StorageBackend<String, Subnet> subnets,
+               StorageBackend<String, SecurityGroup> securityGroups,
+               StorageBackend<String, SecurityGroupRule> securityGroupRules,
+               StorageBackend<String, InternetGateway> internetGateways,
+               StorageBackend<String, RouteTable> routeTables,
+               StorageBackend<String, KeyPair> keyPairs,
+               StorageBackend<String, Address> addresses,
+               StorageBackend<String, Instance> instances,
+               StorageBackend<String, Volume> volumes,
+               StorageBackend<String, Image> registeredImages,
+               StorageBackend<String, Snapshot> snapshots,
+               StorageBackend<String, LaunchTemplate> launchTemplates,
+               StorageBackend<String, VpcEndpoint> vpcEndpoints,
+               StorageBackend<String, NatGateway> natGateways,
+               StorageBackend<String, SpotInstanceRequest> spotInstanceRequests,
+               StorageBackend<String, NetworkAcl> networkAcls,
+               StorageBackend<String, ManagedPrefixList> managedPrefixLists,
+               StorageBackend<String, List<Tag>> tags,
+               StorageBackend<String, TransitGateway> transitGateways,
+               StorageBackend<String, TransitGatewayRouteTable> transitGatewayRouteTables,
+               StorageBackend<String, TransitGatewayVpcAttachment> transitGatewayVpcAttachments,
+               StorageBackend<String, TransitGatewayRouteTablePropagation> transitGatewayPropagations,
+               StorageBackend<String, TransitGatewayRoute> transitGatewayRoutes,
+               StorageBackend<String, VpcPeeringConnection> vpcPeeringConnections,
+               StorageBackend<String, NetworkInterface> networkInterfaces,
+               StorageBackend<String, CapacityReservation> capacityReservations,
+               StorageBackend<String, VolumeModification> volumeModifications,
+               jakarta.enterprise.inject.Instance<RequestContext> requestContextInstance,
+               IamService iamService,
+               Ec2VolumeBlockDeviceManager volumeBlockDeviceManager,
+               StorageBackend<String, Host> hosts,
+               StorageBackend<String, TransitGatewayPeeringAttachment> transitGatewayPeeringAttachments,
+               StorageBackend<String, EgressOnlyInternetGateway> egressOnlyInternetGateways,
+               Ec2RunInstancesReplay runInstancesReplay) {
+        this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog, instanceTypeCatalog,
+                vpcs, subnets, securityGroups, securityGroupRules, internetGateways, routeTables, keyPairs,
+                addresses, instances, volumes, registeredImages, snapshots, launchTemplates, vpcEndpoints,
+                natGateways, spotInstanceRequests, networkAcls, managedPrefixLists, tags,
+                transitGateways, transitGatewayRouteTables, transitGatewayVpcAttachments,
+                transitGatewayPropagations, transitGatewayRoutes, vpcPeeringConnections,
+                networkInterfaces, capacityReservations, volumeModifications,
+                requestContextInstance, iamService, volumeBlockDeviceManager, hosts,
+                transitGatewayPeeringAttachments, egressOnlyInternetGateways, new InMemoryStorage<>(), runInstancesReplay);
+    }
+
+    Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
+               Ec2PortForwardManager portForwardManager,
+               AmiImageResolver amiImageResolver, Ec2ImageCatalog imageCatalog,
+               Ec2InstanceTypeCatalog instanceTypeCatalog,
+               StorageBackend<String, Vpc> vpcs,
+               StorageBackend<String, Subnet> subnets,
+               StorageBackend<String, SecurityGroup> securityGroups,
+               StorageBackend<String, SecurityGroupRule> securityGroupRules,
+               StorageBackend<String, InternetGateway> internetGateways,
+               StorageBackend<String, RouteTable> routeTables,
+               StorageBackend<String, KeyPair> keyPairs,
+               StorageBackend<String, Address> addresses,
+               StorageBackend<String, Instance> instances,
+               StorageBackend<String, Volume> volumes,
+               StorageBackend<String, Image> registeredImages,
+               StorageBackend<String, Snapshot> snapshots,
+               StorageBackend<String, LaunchTemplate> launchTemplates,
+               StorageBackend<String, VpcEndpoint> vpcEndpoints,
+               StorageBackend<String, NatGateway> natGateways,
+               StorageBackend<String, SpotInstanceRequest> spotInstanceRequests,
+               StorageBackend<String, NetworkAcl> networkAcls,
+               StorageBackend<String, ManagedPrefixList> managedPrefixLists,
+               StorageBackend<String, List<Tag>> tags,
+               StorageBackend<String, TransitGateway> transitGateways,
+               StorageBackend<String, TransitGatewayRouteTable> transitGatewayRouteTables,
+               StorageBackend<String, TransitGatewayVpcAttachment> transitGatewayVpcAttachments,
+               StorageBackend<String, TransitGatewayRouteTablePropagation> transitGatewayPropagations,
+               StorageBackend<String, TransitGatewayRoute> transitGatewayRoutes,
+               StorageBackend<String, VpcPeeringConnection> vpcPeeringConnections,
+               StorageBackend<String, NetworkInterface> networkInterfaces,
+               StorageBackend<String, CapacityReservation> capacityReservations,
+               StorageBackend<String, VolumeModification> volumeModifications,
+               jakarta.enterprise.inject.Instance<RequestContext> requestContextInstance,
+               IamService iamService,
+               Ec2VolumeBlockDeviceManager volumeBlockDeviceManager,
+               StorageBackend<String, Host> hosts,
+               StorageBackend<String, TransitGatewayPeeringAttachment> transitGatewayPeeringAttachments,
+               StorageBackend<String, EgressOnlyInternetGateway> egressOnlyInternetGateways,
+               StorageBackend<String, DhcpOptions> dhcpOptions,
+               Ec2RunInstancesReplay runInstancesReplay) {
+        this.runInstancesReplay = runInstancesReplay;
         this.hosts = hosts;
         this.egressOnlyInternetGateways = egressOnlyInternetGateways;
         this.transitGatewayPeeringAttachments = transitGatewayPeeringAttachments;
@@ -972,6 +1080,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     @PostConstruct
     void restoreMetadataRegistrations() {
+        runInstancesReplay.recoverPending(recovery -> RequestScopes.runAs(recovery.account(), recovery.region(),
+                () -> compensateRunInstances(recovery.region(), recovery.allocations())));
         migrateTagsToRegionKeys();
         if (portForwardManager != null) {
             portForwardManager.setPersister(inst -> {
@@ -3911,6 +4021,54 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                     List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings, boolean spot,
                                     String privateIpAddress,
                                     LaunchTemplateData.CapacityReservationSpecification capacitySpecification) {
+        Map<String, List<String>> parameters = new LinkedHashMap<>();
+        replayParameter(parameters, "imageId", imageId);
+        replayParameter(parameters, "instanceType", instanceType);
+        replayParameter(parameters, "minCount", minCount);
+        replayParameter(parameters, "maxCount", maxCount);
+        replayParameter(parameters, "keyName", keyName);
+        replayParameter(parameters, "securityGroupIds", securityGroupIds);
+        replayParameter(parameters, "subnetId", subnetId);
+        replayParameter(parameters, "instanceTags", instanceTags);
+        replayParameter(parameters, "userData", userData);
+        replayParameter(parameters, "iamInstanceProfileArn", iamInstanceProfileArn);
+        replayParameter(parameters, "associatePublicIp", associatePublicIp);
+        replayParameter(parameters, "networkInterfaceId", networkInterfaceId);
+        replayParameter(parameters, "networkInterfaceDeviceIndex", networkInterfaceDeviceIndex);
+        replayParameter(parameters, "availabilityZone", availabilityZone);
+        replayParameter(parameters, "metadataOptions", LaunchTemplateData.MetadataOptions.merge(
+                LaunchTemplateData.MetadataOptions.launchDefaults(), metadataOptions));
+        replayParameter(parameters, "creditSpecificationCpuCredits", creditSpecificationCpuCredits);
+        replayParameter(parameters, "encodedUserData", encodedUserData);
+        replayParameter(parameters, "hostId", hostId);
+        replayParameter(parameters, "tenancy", tenancy);
+        replayParameter(parameters, "blockDeviceMappings", blockDeviceMappings);
+        replayParameter(parameters, "spot", spot);
+        replayParameter(parameters, "privateIpAddress", privateIpAddress);
+        replayParameter(parameters, "capacitySpecification", capacitySpecification);
+        return replayRunInstances(region, clientToken, dryRun, parameters, networkInterfaceId,
+                () -> runInstancesScope(region, subnetId, networkInterfaceId, availabilityZone, hostId),
+                attempt -> launchInstances(region, imageId, instanceType, minCount, maxCount, keyName,
+                        securityGroupIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
+                        associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone,
+                        metadataOptions, creditSpecificationCpuCredits, encodedUserData, dryRun, hostId, tenancy,
+                        blockDeviceMappings, spot, privateIpAddress, capacitySpecification, attempt));
+    }
+
+    Reservation launchInstances(String region, String imageId, String instanceType,
+                                    int minCount, int maxCount, String keyName,
+                                    List<String> securityGroupIds, String subnetId,
+                                    String clientToken, List<Tag> instanceTags,
+                                    String userData, String iamInstanceProfileArn,
+                                    Boolean associatePublicIp, String networkInterfaceId,
+                                    int networkInterfaceDeviceIndex, String availabilityZone,
+                                    LaunchTemplateData.MetadataOptions metadataOptions,
+                                    String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
+                                    String hostId, String tenancy,
+                                    List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings, boolean spot,
+                                    String privateIpAddress,
+                                    LaunchTemplateData.CapacityReservationSpecification capacitySpecification,
+                                    Ec2RunInstancesReplay.Attempt attempt) {
         String capacityPreference = capacitySpecification == null
                 || capacitySpecification.getCapacityReservationPreference() == null ? "open"
                 : capacitySpecification.getCapacityReservationPreference();
@@ -3968,8 +4126,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 throw new AwsException("InvalidParameterCombination",
                         "Network interfaces may only be specified for a single instance.", 400);
             }
-            suppliedEni = takeNetworkInterfaceForLaunch(region, networkInterfaceId);
+            NetworkInterface available = takeNetworkInterfaceForLaunch(region, networkInterfaceId);
+            suppliedEni = attempt == null ? available : REPLAY_MAPPER.convertValue(available, NetworkInterface.class);
             subnetId = suppliedEni.getSubnetId();
+        }
+
+        if (attempt != null && (availabilityZone == null || availabilityZone.isBlank())
+                && (subnetId == null || subnetId.isBlank())) {
+            availabilityZone = attempt.selectedZone();
         }
 
         // Resolve subnet
@@ -4125,10 +4289,41 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         // since the unlocked check above.
                         validateHostPlacement(getRequiredAvailableHost(region, hostId), az, effectiveInstanceType, tenancy);
                     }
+                    if (suppliedEni != null) {
+                        // Another token may have attached this interface after the initial lookup.
+                        NetworkInterface current = takeNetworkInterfaceForLaunch(region, suppliedEni.getNetworkInterfaceId());
+                        if (attempt != null) {
+                            suppliedEni = REPLAY_MAPPER.convertValue(current, NetworkInterface.class);
+                        }
+                    }
                     List<String> privateIps = allocateLaunchAddresses(region, finalSubnetId, suppliedEni,
                             privateIpAddress, admitted);
+                    List<Allocation> allocations = new ArrayList<>(admitted);
                     for (int i = 0; i < admitted; i++) {
-                        String instanceId = "i-" + randomHex(17);
+                        List<String> additionalVolumeIds = launchVolumes.stream()
+                                .filter(volume -> !rootDeviceName.equals(volume.deviceName()))
+                                .map(volume -> "vol-" + randomHex(17)).toList();
+                        allocations.add(new Allocation("i-" + randomHex(17), "vol-" + randomHex(17),
+                                finalSubnetId, privateIps.get(i),
+                                suppliedEni == null ? null : suppliedEni.getNetworkInterfaceId(),
+                                suppliedEni == null ? "eni-" + randomHex(17) : null,
+                                Map.of(), Map.of(), additionalVolumeIds));
+                    }
+                    if (attempt != null) {
+                        try {
+                            attempt.rememberAll(allocations);
+                        } catch (RuntimeException failure) {
+                            if (suppliedEni == null && vpcNetworkManager != null) {
+                                for (String address : privateIps) {
+                                    vpcNetworkManager.releasePrivateIp(region, finalSubnetId, address);
+                                }
+                            }
+                            throw failure;
+                        }
+                    }
+                    for (int i = 0; i < admitted; i++) {
+                        Allocation allocation = allocations.get(i);
+                        String instanceId = allocation.instanceId();
                         String privateIp = privateIps.get(i);
 
                         Instance inst = new Instance();
@@ -4165,6 +4360,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         inst.setLaunchTime(Instant.now());
                         inst.setAmiLaunchIndex(i);
                         inst.setClientToken(clientToken);
+                        inst.setReplayProtected(attempt != null);
                         inst.setRegion(region);
                         inst.setUserData(userData);
                         inst.setEncodedUserData(encodedUserData);
@@ -4186,7 +4382,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         InstanceNetworkInterface eni = new InstanceNetworkInterface();
                         eni.setNetworkInterfaceId(suppliedEni != null
                                 ? suppliedEni.getNetworkInterfaceId()
-                                : "eni-" + randomHex(17));
+                                : allocation.generatedNetworkInterfaceId());
                         eni.setSubnetId(finalSubnetId);
                         eni.setVpcId(vpcId);
                         eni.setOwnerId(callerAccountId());
@@ -4218,7 +4414,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             launchAttachment.setDeleteOnTermination(false);
                             suppliedEni.setAttachment(launchAttachment);
                             suppliedEni.setStatus("in-use");
-                            networkInterfaces.put(key(region, suppliedEni.getNetworkInterfaceId()), suppliedEni);
+                            persistLaunchResource(networkInterfaces, key(region, suppliedEni.getNetworkInterfaceId()), suppliedEni, attempt);
                             // An Elastic IP the interface kept from an earlier instance is this one's
                             // public address; with a container, the launch re-points it once it runs.
                             Address carried = primaryElasticAddress(region, inst);
@@ -4228,9 +4424,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         }
 
                         inst.setRootDeviceName(rootDeviceName);
+                        int additionalVolumeIndex = 0;
                         for (LaunchVolume planned : launchVolumes) {
                             Volume volume = newVolume(region, az, planned.volumeType(), planned.size(),
                                     planned.encrypted(), planned.iops(), planned.throughput(), planned.snapshotId());
+                            volume.setVolumeId(rootDeviceName.equals(planned.deviceName())
+                                    ? allocation.rootVolumeId()
+                                    : allocation.additionalVolumeIds().get(additionalVolumeIndex++));
                             volume.setState("in-use");
                             VolumeAttachment attachment = new VolumeAttachment();
                             attachment.setVolumeId(volume.getVolumeId());
@@ -4240,14 +4440,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             attachment.setDeleteOnTermination(planned.deleteOnTermination());
                             attachment.setAttachTime(inst.getLaunchTime());
                             volume.getAttachments().add(attachment);
-                            volumes.put(key(region, volume.getVolumeId()), volume);
+                            persistLaunchResource(volumes, key(region, volume.getVolumeId()), volume, attempt);
                             reservation.getLaunchVolumeIds().add(volume.getVolumeId());
                             if (rootDeviceName.equals(planned.deviceName())) {
                                 inst.setRootVolumeId(volume.getVolumeId());
                             }
                         }
 
-                        instances.put(key(region, instanceId), inst);
+                        persistLaunchResource(instances, key(region, instanceId), inst, attempt);
                         launched.add(inst);
                         reservation.getInstances().add(inst);
                     }
@@ -4292,6 +4492,189 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
 
         return reservation;
+    }
+
+    private static <T> void persistLaunchResource(StorageBackend<String, T> store, String key, T value,
+                                                   Ec2RunInstancesReplay.Attempt attempt) {
+        if (attempt == null) {
+            store.put(key, value);
+        } else {
+            store.putAllAtomically(Map.of(key, value));
+        }
+    }
+
+    private static void replayParameter(Map<String, List<String>> parameters, String name, Object value) {
+        if (value != null) {
+            parameters.put(name, List.of(REPLAY_MAPPER.valueToTree(value).toString()));
+        }
+    }
+
+    Ec2RunInstancesReplay.Scope runInstancesScope(String region, String subnetId,
+                                                  String networkInterfaceId, String availabilityZone, String hostId) {
+        if (networkInterfaceId != null && !networkInterfaceId.isBlank()) {
+            subnetId = requireStandaloneNetworkInterface(region, networkInterfaceId).getSubnetId();
+        }
+        if (subnetId != null && !subnetId.isBlank()) {
+            return new Ec2RunInstancesReplay.Scope(requireSubnet(region, subnetId).getAvailabilityZone(), false);
+        }
+        if (availabilityZone != null && !availabilityZone.isBlank()) {
+            return new Ec2RunInstancesReplay.Scope(availabilityZone, false);
+        }
+        if (hostId != null && !hostId.isBlank()) {
+            return new Ec2RunInstancesReplay.Scope(getRequiredAvailableHost(region, hostId).getAvailabilityZone(), true);
+        }
+        String zone = subnets.scan(k -> true).stream()
+                .filter(subnet -> region.equals(subnet.getRegion()) && subnet.isDefaultForAz())
+                .map(Subnet::getAvailabilityZone).findFirst().orElse(region + "a");
+        return new Ec2RunInstancesReplay.Scope(zone, true);
+    }
+
+    Reservation replayRunInstances(String region, String token, boolean dryRun,
+                                   Map<String, List<String>> parameters,
+                                   Supplier<Ec2RunInstancesReplay.Scope> scope,
+                                   Function<Ec2RunInstancesReplay.Attempt, Reservation> launch) {
+        return replayRunInstances(region, token, dryRun, parameters, null, scope, launch);
+    }
+
+    Reservation replayRunInstances(String region, String token, boolean dryRun,
+                                   Map<String, List<String>> parameters, String networkInterfaceId,
+                                   Supplier<Ec2RunInstancesReplay.Scope> scope,
+                                   Function<Ec2RunInstancesReplay.Attempt, Reservation> launch) {
+        if (token == null || dryRun) {
+            return launch.apply(null);
+        }
+        if (token.isEmpty() || token.length() > 64 || !token.chars().allMatch(c -> c >= 32 && c <= 126)) {
+            throw new AwsException("InvalidParameterValue", "ClientToken must contain 1 to 64 ASCII characters.", 400);
+        }
+        if (networkInterfaceId != null && !networkInterfaceId.isBlank()) {
+            requireStandaloneNetworkInterface(region, networkInterfaceId);
+        }
+        Result result = runInstancesReplay.execute(callerAccountId(), region, scope, token, parameters, attempt -> {
+            Reservation reservation = launch.apply(attempt);
+            // A completed journal must never outrun its resource stores' durability boundaries.
+            instances.putAllAtomically(reservation.getInstances().stream()
+                    .collect(Collectors.toMap(instance -> key(region, instance.getInstanceId()), Function.identity())));
+            instances.flushOrThrow();
+            volumes.flushOrThrow();
+            networkInterfaces.flushOrThrow();
+            tags.flushOrThrow();
+            capacityReservations.flushOrThrow();
+            return new Result(reservation.getReservationId(),
+                    reservation.getInstances().stream().map(Instance::getInstanceId).toList());
+        }, allocations -> compensateRunInstances(region, allocations));
+        Reservation reservation = new Reservation();
+        reservation.setOwnerId(callerAccountId());
+        reservation.setReservationId(result.reservationId());
+        for (String instanceId : result.instanceIds()) {
+            reservation.getInstances().add(getRequiredInstance(region, instanceId));
+        }
+        return reservation;
+    }
+
+    void tagRunInstancesInterfaces(String region, List<String> interfaceIds, List<Tag> requested,
+                                  Ec2RunInstancesReplay.Attempt attempt) {
+        if (attempt == null) {
+            createTags(region, interfaceIds, requested);
+            return;
+        }
+        withTagWriteLocks(region, interfaceIds, () -> {
+            for (String interfaceId : interfaceIds) {
+                NetworkInterface existing = networkInterfaces.get(key(region, interfaceId)).orElse(null);
+                if (existing != null) {
+                    Map<String, String> before = new LinkedHashMap<>();
+                    existing.getTagSet().forEach(tag -> before.put(tag.getKey(), tag.getValue()));
+                    tagsOf(region, interfaceId).ifPresent(values ->
+                            values.forEach(tag -> before.put(tag.getKey(), tag.getValue())));
+                    Map<String, String> applied = new LinkedHashMap<>();
+                    requested.forEach(tag -> applied.put(tag.getKey(), tag.getValue()));
+                    attempt.rememberInterfaceTags(interfaceId, before, applied);
+                }
+            }
+            createTags(region, interfaceIds, requested);
+        });
+    }
+
+    private void restoreRunInstancesInterfaceTags(String region, Allocation allocation) {
+        if (allocation.appliedInterfaceTags().isEmpty()) {
+            return;
+        }
+        String interfaceId = allocation.suppliedNetworkInterfaceId();
+        withTagWriteLocks(region, List.of(interfaceId), () -> {
+            NetworkInterface existing = networkInterfaces.get(key(region, interfaceId)).orElse(null);
+            if (existing == null || existing.getAttachment() != null
+                    && !allocation.instanceId().equals(existing.getAttachment().getInstanceId())) {
+                return;
+            }
+            Map<String, String> restored = new LinkedHashMap<>();
+            existing.getTagSet().forEach(tag -> restored.put(tag.getKey(), tag.getValue()));
+            tagsOf(region, interfaceId).ifPresent(values ->
+                    values.forEach(tag -> restored.put(tag.getKey(), tag.getValue())));
+            allocation.appliedInterfaceTags().forEach((name, value) -> {
+                // Do not undo a later caller's edit to a resource this launch did not create.
+                if (Objects.equals(restored.get(name), value)) {
+                    if (allocation.previousInterfaceTags().containsKey(name)) {
+                        restored.put(name, allocation.previousInterfaceTags().get(name));
+                    } else {
+                        restored.remove(name);
+                    }
+                }
+            });
+            List<Tag> restoredTags = restored.entrySet().stream()
+                    .map(entry -> new Tag(entry.getKey(), entry.getValue())).toList();
+            NetworkInterface replacement = REPLAY_MAPPER.convertValue(existing, NetworkInterface.class);
+            replacement.setTagSet(new ArrayList<>(restoredTags));
+            networkInterfaces.putAllAtomically(Map.of(key(region, interfaceId), replacement));
+            tags.putAllAtomically(Map.of(key(region, interfaceId), new ArrayList<>(restoredTags)));
+        });
+    }
+
+    private void compensateRunInstances(String region, List<Allocation> allocations) {
+        synchronized (imageRegistryLock) {
+            synchronized (privateIpAllocationLock) {
+                for (Allocation allocation : allocations) {
+                    Instance instance = instances.get(key(region, allocation.instanceId())).orElse(null);
+                    if (instance != null && callerAccountId().equals(instance.getOwnerId())) {
+                        terminateInstances(region, List.of(allocation.instanceId()));
+                        instances.putAllAtomically(Map.of(key(region, allocation.instanceId()), instance));
+                    }
+                    for (String volumeId : allocation.volumeIds()) {
+                        Volume volume = volumes.get(key(region, volumeId)).orElse(null);
+                        if (volume != null && volume.getAttachments().stream()
+                                .allMatch(attachment -> allocation.instanceId().equals(attachment.getInstanceId()))) {
+                            volumes.delete(key(region, volumeId));
+                            removeTags(region, volumeId);
+                        }
+                    }
+                    if (allocation.suppliedNetworkInterfaceId() != null) {
+                        restoreRunInstancesInterfaceTags(region, allocation);
+                        String eniKey = key(region, allocation.suppliedNetworkInterfaceId());
+                        NetworkInterface eni = networkInterfaces.get(eniKey).orElse(null);
+                        if (eni != null && eni.getAttachment() != null
+                                && allocation.instanceId().equals(eni.getAttachment().getInstanceId())) {
+                            NetworkInterface released = REPLAY_MAPPER.convertValue(eni, NetworkInterface.class);
+                            released.setAttachment(null);
+                            released.setStatus("available");
+                            networkInterfaces.putAllAtomically(Map.of(eniKey, released));
+                        }
+                    } else {
+                        if (vpcNetworkManager != null && instance == null
+                                && !privateIpsHeldOnVpcNetwork(region, allocation.subnetId())
+                                        .contains(allocation.privateIpAddress())) {
+                            vpcNetworkManager.releasePrivateIp(region, allocation.subnetId(), allocation.privateIpAddress());
+                        }
+                        if (allocation.generatedNetworkInterfaceId() != null) {
+                            removeTags(region, allocation.generatedNetworkInterfaceId());
+                        }
+                    }
+                    removeTags(region, allocation.instanceId());
+                }
+                instances.flushOrThrow();
+                volumes.flushOrThrow();
+                networkInterfaces.flushOrThrow();
+                tags.flushOrThrow();
+            capacityReservations.flushOrThrow();
+            }
+        }
     }
 
     /**
@@ -5390,7 +5773,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         long cutoff = System.currentTimeMillis() - 3_600_000L;
         for (String storeKey : new ArrayList<>(instances.keys())) {
             Instance inst = instances.get(storeKey).orElse(null);
-            if (inst != null
+            if (inst != null && !inst.isReplayProtected()
                     && "terminated".equals(inst.getState().getName())
                     && inst.getTerminatedAt() > 0
                     && inst.getTerminatedAt() < cutoff) {
