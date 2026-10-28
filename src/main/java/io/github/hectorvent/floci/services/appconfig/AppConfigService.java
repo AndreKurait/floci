@@ -1,9 +1,9 @@
 package io.github.hectorvent.floci.services.appconfig;
 
 import com.fasterxml.jackson.core.type.TypeReference;
-import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.core.storage.StorageOperations;
@@ -44,6 +44,7 @@ public class AppConfigService {
     private final StorageBackend<String, Deployment> deploymentStore;
     private final StorageBackend<String, String> activeConfigStore; // envId::profileId -> versionNumber
     private final Clock clock;
+    private final RegionResolver regions;
     private final Map<String, DeploymentPageToken> deploymentPageTokens = new ConcurrentHashMap<>();
     private static final int MAX_DEPLOYMENT_PAGE_TOKENS = 1000;
     private static final int MAX_MONITORS = 5;
@@ -51,19 +52,27 @@ public class AppConfigService {
     private static final Pattern ROLE_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:role/.*");
 
     @Inject
-    public AppConfigService(StorageFactory storageFactory, EmulatorConfig config) {
-        this(storageFactory, config, Clock.systemUTC());
+    public AppConfigService(StorageFactory storageFactory, RegionResolver regions) {
+        this(storageFactory, regions, Clock.systemUTC());
     }
 
-    AppConfigService(StorageFactory storageFactory, EmulatorConfig config, Clock clock) {
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock) {
         this.clock = clock;
-        this.applicationStore = storageFactory.create("appconfig", "appconfig-applications.json", new TypeReference<>() {});
-        this.environmentStore = storageFactory.create("appconfig", "appconfig-environments.json", new TypeReference<>() {});
-        this.profileStore = storageFactory.create("appconfig", "appconfig-profiles.json", new TypeReference<>() {});
-        this.strategyStore = storageFactory.create("appconfig", "appconfig-strategies.json", new TypeReference<>() {});
-        this.versionStore = storageFactory.create("appconfig", "appconfig-versions.json", new TypeReference<>() {});
-        this.deploymentStore = storageFactory.create("appconfig", "appconfig-deployments.json", new TypeReference<>() {});
-        this.activeConfigStore = storageFactory.create("appconfig", "appconfig-active-configs.json", new TypeReference<>() {});
+        this.regions = regions;
+        this.applicationStore = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-applications.json", new TypeReference<>() {});
+        this.environmentStore = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-environments.json", new TypeReference<>() {});
+        this.profileStore = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-profiles.json", new TypeReference<>() {});
+        this.strategyStore = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-strategies.json", new TypeReference<>() {});
+        this.versionStore = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-versions.json", new TypeReference<>() {});
+        this.deploymentStore = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-deployments.json", new TypeReference<>() {});
+        this.activeConfigStore = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-active-configs.json", new TypeReference<>() {});
     }
 
     // ──────────────────────────── Application ────────────────────────────
@@ -99,6 +108,10 @@ public class AppConfigService {
                 .ifPresent(application -> applicationStore.delete(application.getId()));
     }
 
+    public synchronized void deleteApplicationById(String applicationId) {
+        applicationStore.delete(applicationId);
+    }
+
     // ──────────────────────────── Environment ────────────────────────────
 
     public Environment createEnvironment(String applicationIdentifier, Map<String, Object> request) {
@@ -123,13 +136,21 @@ public class AppConfigService {
     public synchronized void deleteEnvironment(String applicationIdentifier, String environmentIdentifier) {
         Application application = resolveApplication(applicationIdentifier);
         Environment environment = resolveEnvironment(application.getId(), environmentIdentifier);
-        String appId = application.getId();
-        String envId = environment.getId();
+        deleteResolvedEnvironment(application.getId(), environment.getId());
+    }
 
+    public synchronized void deleteEnvironmentById(String applicationId, String environmentId) {
+        Environment environment = environmentStore.get(environmentId)
+                .filter(value -> applicationId.equals(value.getApplicationId()))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Environment not found", 404));
+        deleteResolvedEnvironment(applicationId, environment.getId());
+    }
+
+    private void deleteResolvedEnvironment(String appId, String envId) {
         StorageOperations.deleteByPrefix(deploymentStore, appId + "::" + envId + "::");
         StorageOperations.deleteByPrefix(activeConfigStore, envId + "::");
 
-        String deploymentScope = appId + "::" + envId;
+        String deploymentScope = deploymentScope(appId, envId);
         deploymentPageTokens.entrySet().removeIf(entry -> entry.getValue().scope().equals(deploymentScope));
         environmentStore.delete(envId);
     }
@@ -242,7 +263,22 @@ public class AppConfigService {
         if (profile == null) {
             return;
         }
-        String profileId = profile.getId();
+        deleteResolvedConfigurationProfile(appId, profile.getId());
+    }
+
+    public synchronized void deleteConfigurationProfileById(String applicationId, String profileId) {
+        ConfigurationProfile profile = profileStore.get(profileId).orElse(null);
+        if (profile == null) {
+            return;
+        }
+        if (!applicationId.equals(profile.getApplicationId())) {
+            throw new AwsException("ResourceNotFoundException",
+                    "Configuration profile not found in this application", 404);
+        }
+        deleteResolvedConfigurationProfile(applicationId, profileId);
+    }
+
+    private void deleteResolvedConfigurationProfile(String appId, String profileId) {
         // A hosted configuration version isn't independently addressable outside its profile's
         // lifecycle - cascade the delete so a caller can't still fetch versions for a profile
         // that's supposedly gone.
@@ -524,7 +560,7 @@ public class AppConfigService {
             throw new AwsException("BadRequestException", "max_results must be between 1 and 50", 400);
         }
 
-        String scope = appId + "::" + envId;
+        String scope = deploymentScope(appId, envId);
         Integer afterDeploymentNumber = null;
         if (nextToken != null) {
             DeploymentPageToken token = deploymentPageTokens.get(nextToken);
@@ -612,6 +648,10 @@ public class AppConfigService {
         String token = UUID.randomUUID().toString().replace("-", "");
         deploymentPageTokens.put(token, new DeploymentPageToken(scope, lastDeploymentNumber));
         return token;
+    }
+
+    private String deploymentScope(String appId, String envId) {
+        return regions.getAccountId() + "/" + regions.getRegion() + "/" + appId + "::" + envId;
     }
 
     private record DeploymentPageToken(String scope, int lastDeploymentNumber) {

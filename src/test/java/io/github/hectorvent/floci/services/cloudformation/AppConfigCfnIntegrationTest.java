@@ -3,12 +3,18 @@ package io.github.hectorvent.floci.services.cloudformation;
 import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
 
+import java.net.URI;
 import java.util.List;
 import java.util.Map;
 
@@ -21,6 +27,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @QuarkusTest
 class AppConfigCfnIntegrationTest {
+    @TestHTTPResource
+    URI endpoint;
+
     private static final String STACK = "appconfig-owned-resources-test";
     private static final String ALARM = "arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration";
     private static final String TEMPLATE = """
@@ -48,6 +57,37 @@ class AppConfigCfnIntegrationTest {
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    @Test
+    void sdkStackDeleteAfterApplicationRemovalPreservesIdNamedApplication() {
+        String stack = "appconfig-exact-delete-stack";
+        String other = null;
+        try (CloudFormationClient client = CloudFormationClient.builder().endpointOverride(endpoint)
+                .region(Region.US_EAST_1).credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create("test", "test"))).build()) {
+            try {
+                client.createStack(request -> request.stackName(stack).templateBody("""
+                        {"Resources":{"Application":{"Type":"AWS::AppConfig::Application",
+                        "Properties":{"Name":"stack-original-application"}}}}
+                        """));
+                assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                String original = client.describeStackResource(request -> request.stackName(stack)
+                        .logicalResourceId("Application")).stackResourceDetail().physicalResourceId();
+                other = appconfig().body(Map.of("Name", original)).post("/applications")
+                        .then().statusCode(201).extract().path("Id");
+                appconfig().delete("/applications/" + original).then().statusCode(204);
+                client.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStackDeleted(stack);
+                appconfig().get("/applications/" + other).then().statusCode(200).body("Id", equalTo(other));
+            } finally {
+                client.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStackDeleted(stack);
+                if (other != null) {
+                    appconfig().delete("/applications/" + other).then().statusCode(204);
+                }
+            }
+        }
     }
 
     @Test
