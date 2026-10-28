@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.github.hectorvent.floci.services.iam.StsSessionTags;
 import jakarta.ws.rs.container.ContainerRequestContext;
 
 import java.util.ArrayList;
@@ -93,6 +94,12 @@ final class TagOnCreate {
             return Optional.empty();
         }
         Map<String, String> form = IamConditionContextResolver.formParameters(ctx);
+        // A trust condition must see exactly the tags STS will issue, never unused lookalike parameters.
+        if ("sts:AssumeRole".equals(operation) && !form.isEmpty()) {
+            Map<String, String> tags = StsSessionTags.readForm(form);
+            return tags.isEmpty() ? Optional.empty() : Optional.of(new Tagging(entry.tagging(),
+                    List.of(new TagSet(null, tags)), List.of(), entry.createAction(), entry.requestTags()));
+        }
         JsonNode body = form.isEmpty() ? PassedRoles.jsonBody(ctx) : null;
         Set<TagSet> sets = new LinkedHashSet<>();
         Set<TagSet> otherSpellings = new LinkedHashSet<>();
