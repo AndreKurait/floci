@@ -27,6 +27,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2InstanceTypeCatalog.CatalogIns
 import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.CapacityReservation;
+import io.github.hectorvent.floci.services.ec2.model.CapacityReservationMove;
 import io.github.hectorvent.floci.services.ec2.model.DhcpConfiguration;
 import io.github.hectorvent.floci.services.ec2.model.DhcpOptions;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
@@ -11188,6 +11189,178 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             + "InstanceCount must be greater than 0.", 400);
         }
         return instanceCount;
+    }
+
+    public record CapacityReservationMoveResult(CapacityReservation source,
+                                                CapacityReservation destination, int instanceCount) {
+    }
+
+    /**
+     * Transfers capacity and associated instances. Completed tokens are retained on the source reservation,
+     * including its cancelled tombstone, using the same account-aware persistent store.
+     */
+    public CapacityReservationMoveResult moveCapacityReservationInstances(String region, String sourceId,
+            String destinationId, Integer instanceCount, String clientToken) {
+        if (instanceCount == null) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter InstanceCount.", 400);
+        }
+        requireCapacityMoveId(sourceId, "SourceCapacityReservationId");
+        synchronized (capacityReservationLock) {
+            requireCapacityMoveSource(region, sourceId);
+            requireCapacityMoveId(destinationId, "DestinationCapacityReservationId");
+            if (sourceId.equals(destinationId)) {
+                throw new AwsException("InvalidParameterCombination",
+                        "The source and destination Capacity Reservations must be different.", 400);
+            }
+            if (instanceCount < 1 || instanceCount > 1000) {
+                throw new AwsException("InvalidParameterValue",
+                        "The instance count to move must be between 1 and 1000.", 400);
+            }
+            int count = instanceCount;
+            reconcileCapacityMembership(region);
+            CapacityReservation source = getRequiredCapacityReservation(region, sourceId);
+            CapacityReservationMove requested = new CapacityReservationMove(sourceId, destinationId, count);
+            boolean retry = false;
+            if (clientToken != null) {
+                for (CapacityReservation reservation : capacityReservations.scan(k -> true)) {
+                    if (!region.equals(reservation.getRegion())) {
+                        continue;
+                    }
+                    CapacityReservationMove completed = reservation.getCompletedMoves().get(clientToken);
+                    if (completed != null) {
+                        if (!completed.equals(requested)) {
+                            throw new AwsException("IdempotentParameterMismatch",
+                                    "The parameters do not match the previous request with this client token.", 400);
+                        }
+                        retry = true;
+                        break;
+                    }
+                }
+            }
+            if ("active".equals(source.getState()) && count > source.getAvailableInstanceCount()
+                    && capacityReservations.get(key(region, destinationId)).isEmpty()
+                    && capacityReservations instanceof AccountAwareStorageBackend<?> accountAware
+                    && accountAware.findAnyAccountEntry(key(region, destinationId)).isPresent()) {
+                throw new AwsException("InvalidParameterValue",
+                        "Consumed capacity cannot be moved to a Capacity Reservation owned by another account.", 400);
+            }
+            CapacityReservation destination = getRequiredCapacityReservation(region, destinationId);
+            if (!"active".equals(source.getState()) || !"active".equals(destination.getState())) {
+                throw new AwsException("Unsupported",
+                        "Both Capacity Reservations must be active.", 400);
+            }
+            if (!Objects.equals(source.getOwnerId(), destination.getOwnerId())
+                    || !Objects.equals(source.getOwnerId(), callerAccountId())) {
+                throw new AwsException("InvalidParameterValue",
+                        "Both Capacity Reservations must be owned by the calling account.", 400);
+            }
+            if (retry) {
+                return capacityMoveResult(region, requested);
+            }
+            int consumed = Math.max(0, count - source.getAvailableInstanceCount());
+            if (count > source.getTotalInstanceCount() || consumed > 0
+                    && (!"open".equals(source.getInstanceMatchCriteria())
+                    || !"open".equals(destination.getInstanceMatchCriteria())
+                    || consumed > source.getInstanceIds().size())) {
+                throw new AwsException("InvalidParameterValue",
+                        "There is insufficient available capacity in the source Capacity Reservation.", 400);
+            }
+            validateCapacityMoveAttributes(region, source, destination);
+            List<String> eligibleInstances = source.getInstanceIds().stream()
+                    .filter(id -> instances.get(key(region, id))
+                            .map(instance -> instance.getCapacityReservationTarget() == null
+                                    && "open".equals(instance.getCapacityReservationPreference()))
+                            .orElse(false))
+                    .toList();
+            if (eligibleInstances.size() < consumed) {
+                throw new AwsException("Unsupported",
+                        "There are insufficient eligible instances to move from the source Capacity Reservation.", 400);
+            }
+            if ((long) destination.getTotalInstanceCount() + count > Integer.MAX_VALUE
+                    || (long) destination.getAvailableInstanceCount() + count > Integer.MAX_VALUE) {
+                throw new AwsException("InvalidParameterValue",
+                        "The destination Capacity Reservation instance count is too large.", 400);
+            }
+            source = new CapacityReservation(source);
+            destination = new CapacityReservation(destination);
+            source.setTotalInstanceCount(source.getTotalInstanceCount() - count);
+            List<String> transferred = new ArrayList<>(eligibleInstances.subList(0, consumed));
+            source.getInstanceIds().removeAll(transferred);
+            destination.getInstanceIds().addAll(transferred);
+            source.setAvailableInstanceCount(source.getAvailableInstanceCount() - count + consumed);
+            destination.setTotalInstanceCount(destination.getTotalInstanceCount() + count);
+            destination.setAvailableInstanceCount(destination.getAvailableInstanceCount() + count - consumed);
+            if (source.getTotalInstanceCount() == 0) {
+                source.setState("cancelled");
+            }
+            if (clientToken != null) {
+                source.getCompletedMoves().put(clientToken, requested);
+            }
+            try {
+                capacityReservations.putAllAtomically(
+                        Map.of(key(region, sourceId), source, key(region, destinationId), destination));
+            } catch (RuntimeException failure) {
+                LOG.errorv(failure, "Failed to persist capacity move from {0} to {1}", sourceId, destinationId);
+                AwsException error = new AwsException("InternalError", "Could not persist the capacity move.", 500);
+                error.initCause(failure);
+                throw error;
+            }
+            return capacityMoveResult(region, requested);
+        }
+    }
+
+    private CapacityReservationMoveResult capacityMoveResult(String region, CapacityReservationMove move) {
+        return new CapacityReservationMoveResult(
+                new CapacityReservation(getRequiredCapacityReservation(region, move.sourceId())),
+                new CapacityReservation(getRequiredCapacityReservation(region, move.destinationId())),
+                move.instanceCount());
+    }
+
+    private void requireCapacityMoveSource(String region, String sourceId) {
+        String storageKey = key(region, sourceId);
+        if (capacityReservations.get(storageKey).isPresent()) {
+            return;
+        }
+        if (capacityReservations instanceof AccountAwareStorageBackend<?> accountAware
+                && accountAware.findAnyAccountEntry(storageKey).isPresent()) {
+            return;
+        }
+        getRequiredCapacityReservation(region, sourceId);
+    }
+
+    private void requireCapacityMoveId(String value, String parameter) {
+        if (value == null || (!value.isEmpty() && value.isBlank())) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter " + parameter + ".", 400);
+        }
+        if (!value.matches("cr-[0-9a-fA-F]{17}") || value.equals("cr-00000000000000000")) {
+            throw new AwsException("InvalidCapacityReservationId.Malformed",
+                    "Capacity Reservation ID '" + value + "' is malformed", 400);
+        }
+    }
+
+    private void validateCapacityMoveAttributes(String region, CapacityReservation source,
+                                                CapacityReservation destination) {
+        if (!Objects.equals(source.getInstanceType(), destination.getInstanceType())
+                || !Objects.equals(source.getInstancePlatform(), destination.getInstancePlatform())) {
+            throw new AwsException("Unsupported",
+                    "Moving capacity between reservations with different instance types or platforms is not supported.", 400);
+        }
+        if (!Objects.equals(source.getTenancy(), destination.getTenancy())
+                || !Objects.equals(source.getPlacementGroupArn(), destination.getPlacementGroupArn())) {
+            throw new AwsException("Unsupported",
+                    "Moving capacity between reservations with different tenancy or placement groups is not supported.", 400);
+        }
+        if (!Objects.equals(capacityReservationZone(region, source), capacityReservationZone(region, destination))) {
+            throw new AwsException("Unsupported",
+                    "Moving capacity between reservations with different Availability Zones is not supported.", 400);
+        }
+        if (!Objects.equals(source.getEndDateType(), destination.getEndDateType())
+                || (!"unlimited".equals(source.getEndDateType())
+                        && !Objects.equals(source.getEndDate(), destination.getEndDate()))) {
+            throw new AwsException("Unsupported",
+                    "Moving capacity between reservations with different end dates is not supported.", 400);
+        }
     }
 
     private String capacityReservationZone(String region, CapacityReservation reservation) {

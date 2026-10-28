@@ -265,6 +265,7 @@ public class Ec2QueryHandler {
                 case "DescribeCapacityReservations" -> handleDescribeCapacityReservations(params, region);
                 case "ModifyCapacityReservation" -> handleModifyCapacityReservation(params, region);
                 case "CancelCapacityReservation" -> handleCancelCapacityReservation(params, region);
+            case "MoveCapacityReservationInstances" -> handleMoveCapacityReservationInstances(params, region);
                 // Dedicated Hosts
                 case "AllocateHosts" -> handleAllocateHosts(params, region);
                 case "DescribeHosts" -> handleDescribeHosts(params, region);
@@ -4508,12 +4509,34 @@ public class Ec2QueryHandler {
         return booleanResponse("CancelCapacityReservation");
     }
 
+    private Response handleMoveCapacityReservationInstances(MultivaluedMap<String, String> p, String region) {
+        Integer instanceCount = intOrNull(p, "InstanceCount");
+        checkDryRun(p);
+        Ec2Service.CapacityReservationMoveResult moved = service.moveCapacityReservationInstances(region,
+                p.getFirst("SourceCapacityReservationId"), p.getFirst("DestinationCapacityReservationId"),
+                instanceCount, p.getFirst("ClientToken"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("MoveCapacityReservationInstancesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("sourceCapacityReservation").raw(capacityReservationXml(moved.source(), false))
+                .end("sourceCapacityReservation")
+                .start("destinationCapacityReservation").raw(capacityReservationXml(moved.destination(), false))
+                .end("destinationCapacityReservation")
+                .elem("instanceCount", moved.instanceCount())
+                .end("MoveCapacityReservationInstancesResponse");
+        return xmlResponse(xml.build());
+    }
+
     private String capacityReservationXml(CapacityReservation reservation) {
+        return capacityReservationXml(reservation, true);
+    }
+
+    private String capacityReservationXml(CapacityReservation reservation, boolean includeMetadata) {
         XmlBuilder xml = new XmlBuilder()
                 .elem("capacityReservationId", reservation.getCapacityReservationId())
                 .elem("ownerId", reservation.getOwnerId())
-                .elem("capacityReservationArn", reservation.getCapacityReservationArn())
-                .elem("availabilityZoneId", reservation.getAvailabilityZoneId())
+                .elem("capacityReservationArn", includeMetadata ? reservation.getCapacityReservationArn() : null)
+                .elem("availabilityZoneId", includeMetadata ? reservation.getAvailabilityZoneId() : null)
                 .elem("availabilityZone", reservation.getAvailabilityZone())
                 .elem("instanceType", reservation.getInstanceType())
                 .elem("instancePlatform", reservation.getInstancePlatform())
@@ -4531,7 +4554,7 @@ public class Ec2QueryHandler {
                 .elem("createDate", reservation.getCreateDate() != null ? ISO_FMT.format(reservation.getCreateDate()) : null)
                 .elem("outpostArn", reservation.getOutpostArn())
                 .elem("placementGroupArn", reservation.getPlacementGroupArn())
-                .raw(tagSetXml(reservation.getTags()));
+                .raw(includeMetadata ? tagSetXml(reservation.getTags()) : null);
         if (reservation.getCommitmentDuration() != null) {
             xml.start("commitmentInfo")
                     .elem("commitmentDuration", reservation.getCommitmentDuration())

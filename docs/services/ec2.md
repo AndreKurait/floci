@@ -757,6 +757,7 @@ Route table ids follow the live API's own inconsistency: an id that does not exi
 | DescribeCapacityReservations | Lists or returns stored Capacity Reservations. |
 | ModifyCapacityReservation | Updates `InstanceCount`, `EndDate`, `EndDateType` or `InstanceMatchCriteria` in place. |
 | CancelCapacityReservation | Marks a Capacity Reservation `cancelled` and its available count `0`, matching real AWS's retain-but-cancel behaviour rather than deleting the record. |
+| MoveCapacityReservationInstances | Transfers capacity between compatible reservations and returns both updated reservations. |
 
 `InstanceType`, `InstancePlatform` and `InstanceCount` are required, matching the AWS API, and
 one of `AvailabilityZone` or `AvailabilityZoneId` must be given; a request missing any of
@@ -786,6 +787,34 @@ Assessment and incremental delivery are modeled synchronously, without AWS capac
 assessment or billing. Cancellation retains Floci's immediate cancellation behavior;
 cancellation quotes and charges are not modeled.
 
+Capacity moves require different, active reservations in the caller's account and region
+with matching instance type, platform, Availability Zone, tenancy, placement group and
+end time. Eligibility (`open` or `targeted`) and tags can differ. Both total and available
+counts are updated, and moving all capacity cancels the empty source reservation.
+`DryRun` checks permissions without moving capacity. Case-sensitive `ClientToken` retries
+do not move capacity twice, including after a storage restart. A matching retry requires
+both reservations to remain active; a cancelled reservation returns `Unsupported`.
+Changed parameters return `IdempotentParameterMismatch`, including after cancellation.
+Malformed move IDs return `InvalidCapacityReservationId.Malformed`; source existence precedes
+count bounds, identical-ID checks and destination validation. An existing foreign source
+still permits those input checks before returning `InvalidCapacityReservationId.NotFound`;
+it never permits a transfer. Invalid IDs and counts are
+rejected before checking a completed client token. ID validation checks the prefix, hex
+length and all-zero ID; AWS's additional validation of synthetic IDs is not reproduced.
+Whitespace-only ID error precedence is not qualified.
+Moves accept 1 to 1,000 instances. Identical source and destination IDs return
+`InvalidParameterCombination`; differing instance types, platforms, Availability Zones, tenancy,
+placement groups or end dates return `Unsupported`. Completed tokens apply across source
+reservations in the same account and region; the same token can be used independently in
+another account or region. With a completed token, an inaccessible source returns
+`InvalidCapacityReservationId.NotFound`, while a changed destination returns
+`IdempotentParameterMismatch` before destination lookup.
+Rejected attribute checks do not consume the token.
+Available capacity is checked before matching reservation attributes. Move responses omit the
+ARN, Availability Zone ID and tags that remain available through DescribeCapacityReservations.
+Successful retries return the reservations' current capacity state. Moves, modifications, cancellations
+and describes share a lock.
+
 On-demand launches consume matching open reservation capacity unless their preference is
 `none`. RunInstances also honors an explicit reservation target, including one supplied by
 its launch template. `capacity-reservations-only` requires matching reservation capacity and
@@ -801,9 +830,6 @@ cancellation and expiration release membership; a restart acquires capacity usin
 instance's retained launch preference and target. A failed membership write reports an error;
 subsequent access reconciles released membership from persisted instance state.
 
-Membership and available counts publish in one atomic storage batch. Older snapshots without
-membership remain readable.
-
 `CapacityReservationResourceGroupArn` targets the members of an existing capacity pool
 in the caller's account and region. Only members with matching instance type, platform,
 Availability Zone and tenancy are eligible. Both open and targeted member reservations
@@ -815,6 +841,18 @@ Running group-targeted instances can acquire newly added matching members or mov
 another matching member after cancellation or expiration. Existing membership survives
 group deletion until the instance releases its reservation.
 
+Moves between open reservations can transfer consumed capacity and reassign the associated
+running instances with an `open` preference. An explicitly targeted instance remains in its
+reservation; moving capacity that requires it returns `Unsupported`. Unused capacity moves first. Reservation membership, counts and the move
+retry token share one atomic storage batch, including WAL replay. Targeted reservations
+continue to transfer only unused capacity. Older snapshots without membership remain readable.
+Live AWS checks confirm that an owner can move unused capacity between two RAM-shared
+reservations, while a recipient cannot move it even when Describe exposes the reservations.
+A move to a foreign-owned destination returns `InvalidCapacityReservationId.NotFound`
+when it only needs unused capacity, but `InvalidParameterValue` when it needs consumed
+capacity. Rejected moves preserve membership, counts and retry tokens.
+Shared used capacity, future-dated commitment periods and Capacity Blocks are not modeled.
+The consumed-sharing and inflight compatibility matrix remains incomplete.
 
 Capacity reservation zone IDs must be among those returned by `DescribeAvailabilityZones`.
 
@@ -1496,3 +1534,8 @@ Under `none` the rule still runs, but a mock instance has only the Elastic IP, i
 Otherwise a mock instance's address appears whether DescribeInstances or DescribeInstanceStatus
 observes the launch first. A terminated mock instance has no public address, and stopping it does not bring it
 back.
+
+Capacity reservation moves publish the source, destination and retry token as one storage
+batch. Persistent and WAL write failures return `InternalError` without publishing the
+candidate values in memory. Hybrid mode retains asynchronous persistence, but a flush
+cannot split a move between its source and destination.
