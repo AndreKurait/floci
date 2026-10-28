@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ec2.net;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Network;
+import com.github.dockerjava.core.command.ExecStartResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
@@ -16,11 +17,16 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 
 import static org.awaitility.Awaitility.await;
@@ -54,7 +60,20 @@ class VpcNetworkTeardownDockerIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void deletingDockerHostedVpcFreesItsCidrWithoutStoppingFloci(boolean restored) {
+    void deletingDockerHostedVpcFreesItsCidrWithoutStoppingFloci(boolean restored) throws Exception {
+        verifyVpcLifecycle(restored, false);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void vpcLifecyclePreservesFlociGatewayOnNamedNetwork(boolean restored) throws Exception {
+        String[] apiVersion = docker.versionCmd().exec().getApiVersion().split("\\.");
+        assumeTrue(Integer.parseInt(apiVersion[0]) > 1 || Integer.parseInt(apiVersion[1]) >= 48,
+                "Gateway priority requires Docker Engine 28 / API 1.48");
+        verifyVpcLifecycle(restored, true);
+    }
+
+    private void verifyVpcLifecycle(boolean restored, boolean namedPrimaryNetwork) throws Exception {
         String namespace = "vpc-delete-" + UUID.randomUUID();
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.port()).thenReturn(4650);
@@ -81,8 +100,20 @@ class VpcNetworkTeardownDockerIntegrationTest {
         List<String> containers = new ArrayList<>();
         List<String> networks = new ArrayList<>();
         try {
-            String self = startContainer(namespace + "-floci");
+            String primaryNetwork = "bridge";
+            if (namedPrimaryNetwork) {
+                // Sort after floci-* so an equal-priority VPC would replace this gateway.
+                primaryNetwork = "zz-" + namespace;
+                docker.createNetworkCmd().withName(primaryNetwork).withDriver("bridge")
+                        .withLabels(Map.of(ContainerStorageHelper.OWNER_LABEL,
+                                ContainerStorageHelper.ownerIdentity(config))).exec();
+                networks.add(primaryNetwork);
+            }
+            String self = lifecycleManager.createAndStart(containerBuilder.newContainer(TestImages.BUSYBOX)
+                    .withName(namespace + "-floci").withCmd(List.of("sleep", "120"))
+                    .withDockerNetwork(Optional.of(primaryNetwork)).build()).containerId();
             containers.add(self);
+            String gateway = defaultRoute(self);
             when(resolver.resolveContainerId()).thenReturn(Optional.of(self.substring(0, 12)));
             for (int round = 0; round < 2; round++) {
                 String vpcId = "vpc-" + round;
@@ -101,6 +132,9 @@ class VpcNetworkTeardownDockerIntegrationTest {
                 Network network = docker.inspectNetworkCmd().withNetworkId(networkName).exec();
                 assertTrue(network.getContainers().containsKey(self));
                 assertEquals(address + "/24", network.getContainers().get(guest).getIpv4Address());
+                if (namedPrimaryNetwork) {
+                    assertEquals(gateway, defaultRoute(self), "attaching a VPC must preserve Floci's gateway");
+                }
 
                 if (restored) {
                     manager.shutdown();
@@ -121,6 +155,9 @@ class VpcNetworkTeardownDockerIntegrationTest {
                 assertTrue(docker.inspectContainerCmd(self).exec().getState().getRunning());
                 assertFalse(docker.inspectContainerCmd(self).exec().getNetworkSettings()
                         .getNetworks().containsKey(networkName));
+                if (namedPrimaryNetwork) {
+                    assertEquals(gateway, defaultRoute(self), "deleting a VPC must preserve Floci's gateway");
+                }
             }
         } finally {
             manager.shutdown();
@@ -138,6 +175,21 @@ class VpcNetworkTeardownDockerIntegrationTest {
                 }
             }
         }
+    }
+
+    private String defaultRoute(String containerId) throws IOException, InterruptedException {
+        String execId = docker.execCreateCmd(containerId).withAttachStdout(true).withAttachStderr(true)
+                .withCmd("cat", "/proc/net/route").exec().getId();
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        try (ExecStartResultCallback callback = new ExecStartResultCallback(output, output)) {
+            assertTrue(docker.execStartCmd(execId).exec(callback).awaitCompletion(10, TimeUnit.SECONDS));
+        }
+        assertEquals(0L, docker.inspectExecCmd(execId).exec().getExitCodeLong());
+        return output.toString(StandardCharsets.UTF_8).lines().map(String::trim)
+                .map(line -> line.split("\\s+"))
+                .filter(columns -> columns.length > 2 && columns[1].equals("00000000"))
+                .map(columns -> columns[0] + " " + columns[2])
+                .findFirst().orElseThrow(() -> new AssertionError("No default route in " + output));
     }
 
     private String startContainer(String name) {

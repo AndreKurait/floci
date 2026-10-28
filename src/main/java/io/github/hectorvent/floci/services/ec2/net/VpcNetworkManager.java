@@ -4,6 +4,7 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
+import com.github.dockerjava.api.model.DockerObjectAccessor;
 import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
@@ -745,9 +746,16 @@ public class VpcNetworkManager {
             return;
         }
         try {
+            ContainerNetwork endpoint = new ContainerNetwork();
+            // Keep the emulator's default gateway on its original network. Otherwise Docker
+            // can move its published ports onto this temporary VPC and interrupt API requests
+            // when the VPC is attached or deleted. Docker Engine 28+ supports GwPriority;
+            // docker-java does not yet expose a typed setter for this endpoint field.
+            DockerObjectAccessor.overrideRawValue(endpoint, "GwPriority", -1);
             dockerClient.connectToNetworkCmd()
                     .withContainerId(containerId)
                     .withNetworkId(vpc.networkName)
+                    .withContainerNetwork(endpoint)
                     .exec();
             vpc.flociContainerId = containerId;
             LOG.infov("Attached Floci container {0} to VPC network {1}", containerId, vpc.networkName);
