@@ -274,17 +274,30 @@ session registration. Virtual codes use the shared TOTP implementation with one 
 30-second window on either side. Existing credentials without recorded MFA provenance and
 GetFederationToken credentials leave the condition key absent.
 
-Hardware and account-root MFA devices are not supported. MFA for AssumeRole
-and GetSessionToken's separate IAM/STS API restrictions remain outside this implementation.
+Hardware and account-root MFA devices are not supported. The API restrictions and
+AssumeRole request authentication are described below.
 
 Verified GetSessionToken MFA sessions retain their authentication instant. Shared caller policy
 context computes `aws:MultiFactorAuthAge` in whole elapsed seconds when resolving the session.
 Non-MFA, federated and legacy records without verified authentication time leave age absent.
 A server clock moving before the authentication instant yields zero elapsed seconds. This does
-not establish AssumeRole MFA propagation, hardware MFA or live AWS clock-drift parity.
+not establish hardware MFA or live AWS clock-drift parity.
 
 GetSessionToken credentials retain explicit issuance provenance. With IAM enforcement enabled,
 IAM API calls require verified MFA and STS calls are limited to AssumeRole and GetCallerIdentity.
 These restrictions apply before identity-policy grants; other services still evaluate the issuer's
 policies. Previously stored credentials without issuance provenance retain their existing behavior.
-This does not add AssumeRole MFA propagation, hardware/root MFA devices or workload credential delivery.
+This does not add hardware/root MFA devices or workload credential delivery.
+
+### AssumeRole MFA authentication
+
+AssumeRole validates supplied `SerialNumber` and `TokenCode` against the caller's assigned
+virtual MFA device before identity and trust policy evaluation. Valid MFA supplies
+`aws:MultiFactorAuthPresent=true` and `aws:MultiFactorAuthAge=0` for that request. A missing,
+invalid, unassigned, revoked or another user's device cannot authenticate the request. Omitting
+both parameters preserves the calling credential's existing condition context.
+
+The resulting assumed-role credentials do not inherit these MFA condition keys. AWS distinguishes
+AssumeRole request authentication from GetSessionToken credentials, which retain MFA information
+for later API calls. Hardware/root devices, MFA supplied by temporary callers and exact precedence
+between multiple invalid request fields are not qualified here.
