@@ -781,5 +781,12 @@
   "AWS::WAFv2::WebACL": [
     "Name",
     "Scope"
+  ],
+  "AWS::EC2::KeyPair": [
+    "KeyName",
+    "KeyType",
+    "KeyFormat",
+    "PublicKeyMaterial",
+    "Tags"
   ]
 }

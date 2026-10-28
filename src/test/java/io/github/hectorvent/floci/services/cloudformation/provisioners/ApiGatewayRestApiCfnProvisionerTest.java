@@ -225,6 +225,7 @@ class ApiGatewayRestApiCfnProvisionerTest {
                 op("replace", "/name", "shop"), op("replace", "/description", "v2")));
         verify(api).updateRestApi("us-east-1", "api-1", List.of(
                 op("replace", "/name", "shop"), op("replace", "/description", "v1")));
+        verify(api, never()).deleteRestApi(anyString(), anyString());
         assertFalse(r.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
         // The stack still holds the API it kept.
         verify(api, never()).deleteRestApi(anyString(), anyString());
