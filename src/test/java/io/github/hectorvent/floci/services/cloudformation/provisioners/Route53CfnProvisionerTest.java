@@ -49,6 +49,65 @@ import static org.mockito.Mockito.when;
 
 class Route53CfnProvisionerTest {
     @Test
+    void recordGroupDeletionKeepsBothGroupsTrackedUntilDisplacedCleanupSucceeds() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ResourceRecordSet record = new ResourceRecordSet();
+        record.setName("owned.example.com.");
+        record.setType("A");
+        record.setTtl(60L);
+        record.setRecords(List.of(new ResourceRecord("192.0.2.1")));
+        String records = mapper.writeValueAsString(List.of(record));
+        StackResource resource = new StackResource();
+        resource.setLogicalId("Group");
+        resource.setPhysicalId("Group");
+        resource.setResourceType("AWS::Route53::RecordSetGroup");
+        resource.getAttributes().put("__FlociRoute53RecordZoneId", "ZNEW");
+        resource.getAttributes().put("__FlociRoute53GroupRecords", records);
+        resource.getAttributes().put("__FlociRoute53GroupUpdate", mapper.writeValueAsString(Map.of(
+                "physicalId", "Group", "attributes", Map.of(
+                        "__FlociRoute53RecordZoneId", "ZOLD", "__FlociRoute53GroupRecords", records))));
+        Route53Service service = mock(Route53Service.class);
+        when(service.listResourceRecordSets(any(), any(), any(), eq(0))).thenReturn(List.of(record));
+        when(service.changeResourceRecordSets(eq("ZOLD"), any(), any()))
+                .thenThrow(new AwsException("InvalidChangeBatch", "displaced cleanup failed", 400))
+                .thenReturn(null);
+        Route53CfnProvisioner owner = new Route53CfnProvisioner(service);
+
+        assertThrows(AwsException.class, () -> owner.delete(resource, "us-east-1"));
+        assertTrue(resource.getAttributes().containsKey("__FlociRoute53GroupUpdate"));
+        verify(service, never()).listResourceRecordSets(eq("ZNEW"), any(), any(), eq(0));
+
+        owner.delete(resource, "us-east-1");
+        assertFalse(resource.getAttributes().containsKey("__FlociRoute53GroupUpdate"));
+        verify(service, times(2)).changeResourceRecordSets(eq("ZOLD"), any(), any());
+        verify(service).changeResourceRecordSets(eq("ZNEW"), any(), any());
+    }
+
+    @Test
+    void recordGroupValidatesEveryMemberBeforeChangingTheZone() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode props = mapper.readTree("""
+                {"HostedZoneId":"Z123","RecordSets":[
+                  {"Name":"valid.example.com","Type":"A","TTL":"60","ResourceRecords":["192.0.2.1"]},
+                  {"Name":"invalid.example.com"}
+                ]}
+                """);
+        Route53Service service = mock(Route53Service.class);
+        CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
+        when(engine.resolve(any())).thenAnswer(invocation -> invocation.<JsonNode>getArgument(0).asText());
+        when(engine.resolveNode(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(engine.resolveStringList(any())).thenReturn(List.of("192.0.2.1"));
+        StackResource resource = new StackResource();
+        resource.setLogicalId("Group");
+        resource.setResourceType("AWS::Route53::RecordSetGroup");
+        assertThrows(AwsException.class, () -> new Route53CfnProvisioner(service).provision(
+                resource, props, new ProvisionContext(engine, "us-east-1", "123456789012", "stack")));
+        verifyNoInteractions(service);
+        assertNull(resource.getPhysicalId());
+        assertTrue(resource.getAttributes().isEmpty());
+    }
+
+    @Test
     void createsBackingPrivateZoneAndExactAttributes() {
         Route53Service service = mock(Route53Service.class);
         VpcAssociation vpc = new VpcAssociation("vpc-123", "us-east-1");
