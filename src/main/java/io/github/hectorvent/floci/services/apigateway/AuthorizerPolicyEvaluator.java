@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.apigateway;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.ResourcePolicyDecision;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -136,4 +137,11 @@ public class AuthorizerPolicyEvaluator {
         return iamPolicyEvaluator.evaluate(CallerContext.of(List.of(policyDocument)), null,
                 "execute-api:Invoke", methodArn, conditions) == IamPolicyEvaluator.Decision.ALLOW;
     }
+    /** Combines a validated authorizer policy with the independently evaluated API policy. */
+    public boolean permits(String policyDocument, String methodArn, Map<String, List<String>> conditions,
+                           ResourcePolicyDecision resourceDecision) {
+        return iamPolicyEvaluator.evaluateResolvedResourcePolicy(CallerContext.of(List.of(policyDocument)),
+                resourceDecision, "execute-api:Invoke", methodArn, conditions) == IamPolicyEvaluator.Decision.ALLOW;
+    }
+
 }
