@@ -1288,7 +1288,6 @@ class WarmPoolTest {
         lenient().when(lambda.warmPoolMaxTotal()).thenReturn(maxTotal);
         return emulatorConfig;
     }
-
     @ParameterizedTest
     @CsvSource({"222222222222,us-east-1", "111111111111,eu-west-1"})
     void scopedDeletionPreservesOtherOwnersAndInvalidatesEveryOwnedVersion(String account, String region) {
@@ -1325,6 +1324,36 @@ class WarmPoolTest {
         verify(containerLauncher, times(1)).stop(foreign);
     }
 
+    @ParameterizedTest
+    @CsvSource({"222222222222,us-east-1", "111111111111,eu-west-1"})
+    void scopedDeletionRetriesOnlyItsOwnFailedRemoval(String account, String region) {
+        WarmPool pool = buildPool();
+        pool.init();
+        LambdaFunction latest = scopedFunction("111111111111", "us-east-1", "$LATEST");
+        LambdaFunction other = scopedFunction(account, region, "$LATEST");
+        ContainerHandle owned = new ContainerHandle("owned-retry", "shared", null, ContainerState.WARM);
+        ContainerHandle foreign = new ContainerHandle("foreign-retry", "shared", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(owned, foreign);
+        doThrow(new IllegalStateException("owned removal failed")).doNothing().when(containerLauncher).stop(owned);
+        doThrow(new IllegalStateException("foreign removal failed")).doNothing().when(containerLauncher).stop(foreign);
+        try {
+            pool.destroyHandle(pool.acquire(latest));
+            pool.destroyHandle(pool.acquire(other));
+
+            pool.drainFunction(latest);
+
+            verify(containerLauncher, times(2)).stop(owned);
+            verify(containerLauncher, times(1)).stop(foreign);
+            pool.drainFunction(latest);
+            verify(containerLauncher, times(2)).stop(owned);
+            verify(containerLauncher, times(1)).stop(foreign);
+            pool.drainFunction(other);
+            verify(containerLauncher, times(2)).stop(foreign);
+        } finally {
+            pool.shutdown();
+        }
+    }
+
     private static LambdaFunction scopedFunction(String account, String region, String version) {
         LambdaFunction fn = new LambdaFunction();
         fn.setFunctionName("shared");
@@ -1334,4 +1363,6 @@ class WarmPoolTest {
                 + ("$LATEST".equals(version) ? "" : ":" + version));
         return fn;
     }
+
+
 }

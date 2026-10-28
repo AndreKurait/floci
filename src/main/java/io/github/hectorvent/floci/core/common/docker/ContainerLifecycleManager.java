@@ -47,7 +47,6 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
@@ -83,8 +82,6 @@ public class ContainerLifecycleManager {
 
     /** Host interface a port marked loopback-only publishes on. */
     private static final String LOOPBACK_HOST_IP = "127.0.0.1";
-
-    private final Semaphore teardownSlots = new Semaphore(8, true);
 
     private final DockerClient dockerClient;
     private final ImageCacheService imageCacheService;
@@ -512,7 +509,7 @@ public class ContainerLifecycleManager {
      *        SIGTERM before Docker sends SIGKILL. Must be a non-negative integer.
      */
     public void stopAndRemove(String containerId, Closeable logStream, int stopTimeoutSeconds) {
-        withTeardownSlot(() -> stopAndRemoveAdmitted(containerId, logStream, stopTimeoutSeconds));
+        stopAndRemoveAdmitted(containerId, logStream, stopTimeoutSeconds);
     }
 
     private void stopAndRemoveAdmitted(String containerId, Closeable logStream, int stopTimeoutSeconds) {
@@ -591,7 +588,7 @@ public class ContainerLifecycleManager {
     }
 
     public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds) {
-        withTeardownSlot(() -> stopAndRemoveStrictAdmitted(containerId, logStream, stopTimeoutSeconds));
+        stopAndRemoveStrictAdmitted(containerId, logStream, stopTimeoutSeconds);
     }
 
     private void stopAndRemoveStrictAdmitted(String containerId, Closeable logStream, int stopTimeoutSeconds) {
@@ -618,27 +615,22 @@ public class ContainerLifecycleManager {
         } catch (NotFoundException e) {
             // Already gone, so cleanup succeeded.
         } catch (Exception e) {
-            IllegalStateException cleanupFailure = new IllegalStateException(
-                    "Failed to remove container " + containerId, e);
-            if (stopFailure != null) {
-                cleanupFailure.addSuppressed(stopFailure);
+            // Daemon AutoRemove may finish despite an explicit remove error. Only an
+            // authoritative absence permits the caller to retire runtime credentials.
+            if (presenceOf(containerId) != ContainerPresence.ABSENT) {
+                IllegalStateException cleanupFailure = new IllegalStateException(
+                        "Failed to remove container " + containerId, e);
+                if (stopFailure != null) {
+                    cleanupFailure.addSuppressed(stopFailure);
+                }
+                // Retain the stream and original failure for the caller's retry.
+                throw cleanupFailure;
             }
-            // The container still exists and may still be logging, so the stream stays open for
-            // the caller's retry.
-            throw cleanupFailure;
+            LOG.debugv("Container {0} is absent after its removal response failed", containerId);
         }
         // Closed only once the container is stopped and gone, as in stopAndRemove, so the follower
         // can drain the final tail.
         closeLogStreamIfPresent(logStream);
-    }
-
-    private void withTeardownSlot(Runnable stopAndRemove) {
-        teardownSlots.acquireUninterruptibly();
-        try {
-            stopAndRemove.run();
-        } finally {
-            teardownSlots.release();
-        }
     }
 
     private void closeLogStreamIfPresent(Closeable logStream) {
@@ -997,7 +989,10 @@ public class ContainerLifecycleManager {
         try {
             InspectContainerResponse.ContainerState state =
                     dockerClient.inspectContainerCmd(containerId).exec().getState();
-            boolean running = state != null && Boolean.TRUE.equals(state.getRunning());
+            Boolean running = state != null ? state.getRunning() : null;
+            if (running == null) {
+                return ContainerPresence.UNKNOWN;
+            }
             return running ? ContainerPresence.RUNNING : ContainerPresence.STOPPED;
         } catch (NotFoundException e) {
             return ContainerPresence.ABSENT;
@@ -1298,7 +1293,11 @@ public class ContainerLifecycleManager {
     }
 
     private HostConfig buildHostConfig(ContainerSpec spec) {
-        HostConfig hostConfig = HostConfig.newHostConfig();
+        // Lambda output and exit streams are registered before start; the daemon can therefore
+        // finish removing their captured runtime IDs even after Floci's shutdown budget expires.
+        // EC2, other services, and the unlabelled code-volume helpers keep their containers.
+        HostConfig hostConfig = HostConfig.newHostConfig().withAutoRemove(
+                "lambda".equals(ContainerStorageHelper.labelValue(spec.labels(), ContainerStorageHelper.SERVICE_LABEL)));
 
         // Privileged mode (required for e.g. k3s containers)
         if (spec.privileged()) {
