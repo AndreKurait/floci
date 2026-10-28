@@ -2582,3 +2582,9 @@ aws iam create-access-key --user-name alice --endpoint-url $AWS_ENDPOINT_URL
 # List roles
 aws iam list-roles --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+API Gateway account logging-role assignments also require `iam:PassRole`, with
+`iam:PassedToService` set to the API Gateway service principal. This applies to
+`UpdateAccount` replacements of `/cloudwatchRoleArn` before account state changes.
+Floci retains its existing add/remove patch compatibility, although AWS documents
+only replace for this field; locally accepted additions also require PassRole.
