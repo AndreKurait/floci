@@ -1114,7 +1114,7 @@ public class LambdaService implements ResourceProvider {
         if (executorService != null) {
             executorService.dropPending(fn);
         }
-        warmPool.drainFunction(functionName);
+        warmPool.drainFunction(fn);
         // Take the same per-function lock used by Put/DeleteFunctionConcurrency
         // so a concurrent concurrency mutation cannot interleave with the
         // limiter reset and store delete and leave the two views out of sync.
@@ -3307,6 +3307,7 @@ public class LambdaService implements ResourceProvider {
         // sync, regardless of which call acquires the reservedLock first.
         synchronized (lockForConcurrencyOp(arn)) {
             warmPool.validateProvisionedReservation(fn, reservedConcurrentExecutions);
+            Integer previousFunctionReserved = fn.getReservedConcurrentExecutions();
             Integer previousReserved = null;
             boolean limiterUpdated = false;
             if (concurrencyLimiter != null) {
@@ -3318,6 +3319,7 @@ public class LambdaService implements ResourceProvider {
             try {
                 functionStore.save(region, fn);
             } catch (RuntimeException e) {
+                fn.setReservedConcurrentExecutions(previousFunctionReserved);
                 if (limiterUpdated) {
                     concurrencyLimiter.rollbackReservedIfExpected(
                             arn, reservedConcurrentExecutions, previousReserved);
@@ -3362,6 +3364,7 @@ public class LambdaService implements ResourceProvider {
         LambdaFunction fn = getFunction(region, functionName);
         String arn = fn.getFunctionArn();
         synchronized (lockForConcurrencyOp(arn)) {
+            Integer previousFunctionReserved = fn.getReservedConcurrentExecutions();
             Integer previousReserved = null;
             boolean limiterCleared = false;
             if (concurrencyLimiter != null) {
@@ -3372,6 +3375,7 @@ public class LambdaService implements ResourceProvider {
             try {
                 functionStore.save(region, fn);
             } catch (RuntimeException e) {
+                fn.setReservedConcurrentExecutions(previousFunctionReserved);
                 if (limiterCleared && previousReserved != null) {
                     concurrencyLimiter.rollbackReservedIfExpected(
                             arn, null, previousReserved);
