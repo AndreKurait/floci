@@ -65,8 +65,8 @@ class ContainerLifecycleManagerTeardownTest {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void laterOwnedStopsReachDockerWhileEarlierRemovalsAreBlocked(boolean strict) throws Exception {
+    @ValueSource(strings = {"strict", "best-effort", "stop-only"})
+    void laterOwnedStopsReachDockerWhileEarlierRemovalsAreBlocked(String mode) throws Exception {
         DockerClient docker = mock(DockerClient.class);
         ContainerLifecycleManager manager = new ContainerLifecycleManager(docker, null, null, null);
         StopContainerCmd stop = mock(StopContainerCmd.class);
@@ -104,8 +104,10 @@ class ContainerLifecycleManagerTeardownTest {
             assertTrue(removing.await(10, TimeUnit.SECONDS));
             owners.add(Thread.ofVirtual().start(() -> {
                 try {
-                    if (strict) {
+                    if ("strict".equals(mode)) {
                         manager.stopAndRemoveStrict("ninth", null);
+                    } else if ("stop-only".equals(mode)) {
+                        manager.stop("ninth", 5);
                     } else {
                         manager.stopAndRemove("ninth", null);
                     }
@@ -124,7 +126,11 @@ class ContainerLifecycleManagerTeardownTest {
         }
         assertNull(failure.get());
         verify(docker).stopContainerCmd("ninth");
-        verify(docker).removeContainerCmd("ninth");
+        if ("stop-only".equals(mode)) {
+            verify(docker, never()).removeContainerCmd("ninth");
+        } else {
+            verify(docker).removeContainerCmd("ninth");
+        }
     }
 
     @Test
