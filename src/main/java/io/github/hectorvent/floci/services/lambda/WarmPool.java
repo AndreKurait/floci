@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.lambda;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.ContainerTeardowns;
@@ -30,6 +31,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 
 /**
  * Manages a pool of warm Lambda containers per function.
@@ -525,10 +527,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
         stopInParallel(toStop);
     }
 
-    /**
-     * Stops and removes all warm containers for every environment of the given function.
-     * Called on function deletion and emulator shutdown.
-     */
+    /** Drains every account/region with this name; deletion uses the owner-scoped overload. */
     public void drainFunction(String functionName) {
         List<ContainerHandle> handles = detachFunction(functionName);
         for (ContainerHandle handle : pendingTeardown) {
@@ -539,14 +538,35 @@ public class WarmPool implements ContainerTeardown, Resettable {
         stopInParallel(handles);
     }
 
+    /** Drains only the named account/region's environments, across all its versions. */
+    public void drainFunction(LambdaFunction fn) {
+        String arn = fn.getFunctionArn();
+        String scope = fn.getFunctionName();
+        if (arn != null && !arn.isBlank()) {
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            scope = new AwsArnUtils.Arn(parsed.partition(), "lambda", parsed.region(), parsed.accountId(),
+                    "function:" + fn.getFunctionName()).toString();
+        }
+        String functionScope = scope;
+        stopInParallel(detachFunction(fn.getFunctionName(), key ->
+                key.equals(functionScope) || key.startsWith(functionScope + ":")));
+    }
+
     private List<ContainerHandle> detachFunction(String functionName) {
+        return detachFunction(functionName, ignored -> true);
+    }
+
+    private List<ContainerHandle> detachFunction(String functionName, Predicate<String> matches) {
         PoolState poolState = poolStates.computeIfAbsent(functionName, ignored -> new PoolState());
         List<ContainerHandle> toStop;
         synchronized (poolState) {
-            poolState.epochByEnvironment.replaceAll((ignored, epoch) -> epoch + 1);
+            poolState.epochByEnvironment.replaceAll((key, epoch) -> matches.test(key) ? epoch + 1 : epoch);
             toStop = new ArrayList<>();
-            poolState.idleByEnvironment.values().forEach(toStop::addAll);
-            poolState.idleByEnvironment.clear();
+            for (String key : new ArrayList<>(poolState.idleByEnvironment.keySet())) {
+                if (matches.test(key)) {
+                    toStop.addAll(poolState.idleByEnvironment.remove(key));
+                }
+            }
         }
         LOG.infov("Draining {0} container(s) for function: {1}", toStop.size(), functionName);
         return toStop;
