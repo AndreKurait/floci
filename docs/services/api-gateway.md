@@ -1041,3 +1041,5 @@ aws apigatewayv2 create-stage \
 # Disconnect a client
 # curl -X DELETE http://localhost:4566/execute-api/$WS_API_ID/prod/@connections/$CONNECTION_ID
 ```
+
+REST Lambda authorizers retain `authorizerCredentials` through management, OpenAPI import/export and CloudFormation provisioning. The credential patch path supports `replace`; a null replacement clears the configured role. Omitted credential updates preserve the stored value. Credential retention does not itself enforce invocation permissions or assume the configured role.
