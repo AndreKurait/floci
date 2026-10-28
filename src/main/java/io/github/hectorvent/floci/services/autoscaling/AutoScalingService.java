@@ -16,6 +16,8 @@ import io.github.hectorvent.floci.services.ec2.Ec2UserDataDecoder;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
+import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
+import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -119,6 +121,17 @@ public class AutoScalingService {
 
     @Inject
     Ec2Service ec2Service;
+
+    private final ElbV2Service elbV2Service;
+
+    @Inject
+    public AutoScalingService(ElbV2Service elbV2Service) {
+        this.elbV2Service = elbV2Service;
+    }
+
+    AutoScalingService() {
+        this(null);
+    }
 
     // region :: name → resource
     private Map<String, LaunchConfiguration> launchConfigs = new ConcurrentHashMap<>();
@@ -852,6 +865,16 @@ public class AutoScalingService {
             AutoScalingGroup asg = requireGroup(region, name);
             List<String> detached = asg.getInstances().stream().map(AsgInstance::getInstanceId)
                     .filter(instanceIds::contains).toList();
+            if (!detached.isEmpty()) {
+                List<TargetDescription> targets = detached.stream().map(id -> {
+                    TargetDescription target = new TargetDescription();
+                    target.setId(id);
+                    return target;
+                }).toList();
+                for (String targetGroup : asg.getTargetGroupARNs()) {
+                    elbV2Service.deregisterTargets(region, targetGroup, targets);
+                }
+            }
             releaseRefreshOwnership(asg, detached);
             asg.getInstances().removeIf(i -> instanceIds.contains(i.getInstanceId()));
             if (decrementDesiredCapacity) {
