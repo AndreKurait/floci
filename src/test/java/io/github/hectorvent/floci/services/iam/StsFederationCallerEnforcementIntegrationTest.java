@@ -126,6 +126,30 @@ class StsFederationCallerEnforcementIntegrationTest {
         request(issued, "GetCallerIdentity", Map.of()).then().statusCode(200);
     }
 
+    @Test
+    void issuedUserSessionSuppliesTokenTimeToManagementConditions() throws Exception {
+        String condition = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"iam:ListUsers\","
+                + "\"Resource\":\"*\",\"Condition\":{\"DateLessThan\":{\"aws:TokenIssueTime\":\"2100-01-01T00:00:00Z\"}}}}";
+        Credentials user = userWithPolicy(condition);
+        Credentials session = remember(request(user, "GetSessionToken", Map.of()), "GetSessionToken");
+        request(user, "ListUsers", Map.of()).then().statusCode(403);
+        request(session, "ListUsers", Map.of()).then().statusCode(200);
+        String name = iam.resolveCallerArns(user.key()).orElseThrow().userName();
+        iam.putUserPolicy(name, "sts", condition.replace("2100-01-01", "2000-01-01"));
+        request(session, "ListUsers", Map.of()).then().statusCode(403);
+    }
+
+    @Test
+    void temporaryUserCannotBypassManagementTokenTimeDeny() throws Exception {
+        String policy = "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"iam:ListUsers\",\"Resource\":\"*\"},"
+                + "{\"Effect\":\"Deny\",\"Action\":\"iam:ListUsers\",\"Resource\":\"*\","
+                + "\"Condition\":{\"DateLessThan\":{\"aws:TokenIssueTime\":\"2100-01-01T00:00:00Z\"}}}]}";
+        Credentials user = userWithPolicy(policy);
+        Credentials session = remember(request(user, "GetSessionToken", Map.of()), "GetSessionToken");
+        request(user, "ListUsers", Map.of()).then().statusCode(200);
+        request(session, "ListUsers", Map.of()).then().statusCode(403);
+    }
+
     private Credentials issue(String action) throws Exception {
         Credentials user = user(true);
         Map<String, String> parameters = new LinkedHashMap<>();
