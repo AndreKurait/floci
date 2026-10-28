@@ -50,7 +50,16 @@ import io.github.hectorvent.floci.services.iot.IotDataController;
 import io.github.hectorvent.floci.services.iot.IotDomainConfigurationController;
 import io.github.hectorvent.floci.services.iot.IotFleetIndexingController;
 import io.github.hectorvent.floci.services.lakeformation.LakeFormationController;
+import io.github.hectorvent.floci.services.lambda.LambdaAccountSettingsController;
+import io.github.hectorvent.floci.services.lambda.LambdaCodeSigningConfigFunctionsController;
+import io.github.hectorvent.floci.services.lambda.LambdaCodeSigningController;
+import io.github.hectorvent.floci.services.lambda.LambdaConcurrencyController;
 import io.github.hectorvent.floci.services.lambda.LambdaController;
+import io.github.hectorvent.floci.services.lambda.LambdaEventInvokeController;
+import io.github.hectorvent.floci.services.lambda.LambdaLayerController;
+import io.github.hectorvent.floci.services.lambda.LambdaProvisionedConcurrencyController;
+import io.github.hectorvent.floci.services.lambda.LambdaTagController;
+import io.github.hectorvent.floci.services.lambda.LambdaUrlController;
 import io.github.hectorvent.floci.services.lambda.durable.DurableExecutionController;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsController;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaNetworkConnectorsController;
@@ -72,11 +81,13 @@ import io.github.hectorvent.floci.services.resourceexplorer2.ResourceExplorer2Co
 import io.github.hectorvent.floci.services.resourcegroups.ResourceGroupsController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
 import io.github.hectorvent.floci.services.rum.RumController;
+import io.github.hectorvent.floci.services.s3.S3ControlController;
 import io.github.hectorvent.floci.services.s3.S3Controller;
 import io.github.hectorvent.floci.services.s3tables.S3TablesController;
 import io.github.hectorvent.floci.services.s3vectors.S3VectorsController;
 import io.github.hectorvent.floci.services.sagemaker.SageMakerRuntimeController;
 import io.github.hectorvent.floci.services.scheduler.SchedulerController;
+import io.github.hectorvent.floci.services.securityadmin.SecurityAdminController;
 import io.github.hectorvent.floci.services.securityhub.SecurityHubController;
 import io.github.hectorvent.floci.services.ses.SesAccountController;
 import io.github.hectorvent.floci.services.ses.SesConfigurationSetController;
@@ -146,7 +157,9 @@ public class ResolvedServiceCatalog {
                         5000L, AwsNamespaces.S3, ServiceProtocol.REST_XML,
                         protocols(ServiceProtocol.REST_XML),
                         // s3express: directory-bucket (S3 Express One Zone) clients sign with it
-                        Set.of(), Set.of("s3", "s3express"), Set.of(), Set.of(S3Controller.class)).withLegacyAuthorization(),
+                        Set.of(), Set.of("s3", "s3express"), Set.of(), Set.of(S3Controller.class, S3ControlController.class))
+                        .withRequiredRestAuthentication(Set.of(S3ControlController.class))
+                        .withLegacyAuthorization(),
                 descriptor("dynamodb", "dynamodb", config.services().dynamodb().enabled(), true,
                         "dynamodb", storageMode(config.storage().services().dynamodb().mode(), config.storage().mode()),
                         config.storage().services().dynamodb().flushIntervalMs(), null, ServiceProtocol.JSON,
@@ -168,12 +181,23 @@ public class ResolvedServiceCatalog {
                                 DurableExecutionController.class,
                                 LambdaMicrovmsController.class,
                                 LambdaNetworkConnectorsController.class,
-                                LambdaWebController.class)),
+                                LambdaWebController.class,
+                                LambdaAccountSettingsController.class,
+                                LambdaCodeSigningConfigFunctionsController.class,
+                                LambdaCodeSigningController.class,
+                                LambdaConcurrencyController.class,
+                                LambdaEventInvokeController.class,
+                                LambdaLayerController.class,
+                                LambdaProvisionedConcurrencyController.class,
+                                LambdaTagController.class,
+                                LambdaUrlController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("apigateway", "apigateway", config.services().apigateway().enabled(), true,
                         "apigateway", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("apigateway", "execute-api"), Set.of(),
-                        Set.of(ApiGatewayController.class)),
+                        Set.of(ApiGatewayController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("iam", "iam", config.services().iam().enabled(), true,
                         "iam", config.storage().mode(), 5000L, AwsNamespaces.IAM, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY),
@@ -181,11 +205,13 @@ public class ResolvedServiceCatalog {
                 descriptor("kafka", "msk", config.services().msk().enabled(), true,
                         "msk", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("kafka"), Set.of(), Set.of(MskController.class)),
+                        Set.of(), Set.of("kafka"), Set.of(), Set.of(MskController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("mq", "amazonmq", config.services().amazonmq().enabled(), true,
                         "amazonmq", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("mq"), Set.of(), Set.of(AmazonMqController.class)),
+                        Set.of(), Set.of("mq"), Set.of(), Set.of(AmazonMqController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("sts", "iam", config.services().iam().enabled(), false,
                         null, null, 5000L, AwsNamespaces.STS, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY),
@@ -214,11 +240,13 @@ public class ResolvedServiceCatalog {
                         config.services().rds().enabled() && config.services().rdsData().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("rds-data"), Set.of(), Set.of(RdsDataController.class)),
+                        Set.of(), Set.of("rds-data"), Set.of(), Set.of(RdsDataController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("dsql", "dsql", config.services().dsql().enabled(), true,
                         "dsql", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("dsql"), Set.of(), Set.of(DsqlController.class)),
+                        Set.of(), Set.of("dsql"), Set.of(), Set.of(DsqlController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("neptune", "neptune", config.services().neptune().enabled(), true,
                         "neptune", storageMode(config.storage().services().neptune().mode(), config.storage().mode()),
                         5000L, AwsNamespaces.RDS, ServiceProtocol.QUERY,
@@ -262,7 +290,8 @@ public class ResolvedServiceCatalog {
                         config.storage().services().emrserverless().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("emr-serverless"), Set.of(),
-                        Set.of(EmrServerlessController.class)),
+                        Set.of(EmrServerlessController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("wafv2", "wafv2", config.services().wafv2().enabled(), true,
                         "wafv2", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -270,7 +299,8 @@ public class ResolvedServiceCatalog {
                 descriptor("scheduler", "scheduler", config.services().scheduler().enabled(), true,
                         "scheduler", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
-                        Set.of(), Set.of("scheduler"), Set.of(), Set.of(SchedulerController.class)),
+                        Set.of(), Set.of("scheduler"), Set.of(), Set.of(SchedulerController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("logs", "cloudwatchlogs", config.services().cloudwatchlogs().enabled(), true,
                         "cloudwatchlogs", storageMode(config.storage().services().cloudwatchlogs().mode(), config.storage().mode()),
                         config.storage().services().cloudwatchlogs().flushIntervalMs(), null, ServiceProtocol.JSON,
@@ -354,13 +384,15 @@ public class ResolvedServiceCatalog {
                                 SesReputationEntityController.class, SesSendController.class,
                                 SesSuppressionController.class, SesTagController.class,
                                 SesTemplateController.class, SesImportJobController.class,
-                                SesTenantController.class)),
+                                SesTenantController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("es", "opensearch", config.services().opensearch().enabled(), true,
                         "opensearch", storageMode(config.storage().services().opensearch().mode(), config.storage().mode()),
                         config.storage().services().opensearch().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("es"), Set.of(),
-                        Set.of(OpenSearchController.class, ElasticsearchController.class)),
+                        Set.of(OpenSearchController.class, ElasticsearchController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("ec2", "ec2", config.services().ec2().enabled(), true,
                         "ec2", storageMode(config.storage().services().ec2().mode(), config.storage().mode()),
                         5000L, AwsNamespaces.EC2, ServiceProtocol.QUERY,
@@ -375,12 +407,14 @@ public class ResolvedServiceCatalog {
                         "appconfig", storageMode(config.storage().services().appconfig().mode(), config.storage().mode()),
                         config.storage().services().appconfig().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("appconfig"), Set.of(), Set.of(AppConfigController.class)),
+                        Set.of(), Set.of("appconfig"), Set.of(), Set.of(AppConfigController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("appconfigdata", "appconfigdata", config.services().appconfigdata().enabled(), true,
                         "appconfigdata", storageMode(config.storage().services().appconfigdata().mode(), config.storage().mode()),
                         config.storage().services().appconfigdata().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("appconfigdata"), Set.of(), Set.of(AppConfigDataController.class)),
+                        Set.of(), Set.of("appconfigdata"), Set.of(), Set.of(AppConfigDataController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("ecr", "ecr", config.services().ecr().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -389,7 +423,8 @@ public class ResolvedServiceCatalog {
                         "resource-groups", storageMode(config.storage().services().resourceGroups().mode(), config.storage().mode()),
                         config.storage().services().resourceGroups().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("resource-groups"), Set.of(),
-                        Set.of(ResourceGroupsController.class)),
+                        Set.of(ResourceGroupsController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("tagging", "tagging", config.services().tagging().enabled(), true,
                         "tagging", storageMode(config.storage().services().tagging().mode(), config.storage().mode()),
                         config.storage().services().tagging().flushIntervalMs(), null, ServiceProtocol.JSON,
@@ -420,7 +455,8 @@ public class ResolvedServiceCatalog {
                 descriptor("eks", "eks", config.services().eks().enabled(), true,
                         "eks", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("eks"), Set.of(), Set.of(EksController.class)),
+                        Set.of(), Set.of("eks"), Set.of(), Set.of(EksController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("mwaa", "mwaa", config.services().mwaa().enabled(), true,
                         "mwaa", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
@@ -431,11 +467,13 @@ public class ResolvedServiceCatalog {
                         // double-registration technique as bedrock-runtime/bedrock above.
                         Set.of("airflow", "mwaa"),
                         Set.of(),
-                        Set.of(MwaaController.class)),
+                        Set.of(MwaaController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("pipes", "pipes", config.services().pipes().enabled(), true,
                         "pipes", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("pipes"), Set.of(), Set.of(PipesController.class)),
+                        Set.of(), Set.of("pipes"), Set.of(), Set.of(PipesController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("bedrock-agentcore-control", "bedrock-agentcore-control",
                         config.services().bedrockAgentCoreControl().enabled(), true,
                         "bedrockagentcore", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
@@ -444,7 +482,8 @@ public class ResolvedServiceCatalog {
                         Set.of(BedrockAgentCoreControlController.class, BedrockAgentCoreIdentityController.class,
                                 BedrockAgentCoreGatewayController.class, BedrockAgentCoreMemoryController.class,
                                 BedrockAgentCoreToolsController.class, BedrockAgentCoreGatewayRuleController.class,
-                                BedrockAgentCoreResourcePolicyController.class)),
+                                BedrockAgentCoreResourcePolicyController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("bedrock-agentcore", "bedrock-agentcore",
                         config.services().bedrockAgentCore().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.REST_JSON,
@@ -472,13 +511,15 @@ public class ResolvedServiceCatalog {
                         "batch", storageMode(config.storage().services().batch().mode(), config.storage().mode()),
                         config.storage().services().batch().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("batch"), Set.of(), Set.of(BatchController.class)),
+                        Set.of(), Set.of("batch"), Set.of(), Set.of(BatchController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("sagemaker", "sagemaker", config.services().sagemaker().enabled(), true,
                         "sagemaker", storageMode(config.storage().services().sagemaker().mode(), config.storage().mode()),
                         config.storage().services().sagemaker().flushIntervalMs(), null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON, ServiceProtocol.REST_JSON),
                         Set.of("SageMaker."), Set.of("sagemaker", "runtime.sagemaker"), Set.of(),
-                        Set.of(SageMakerRuntimeController.class)),
+                        Set.of(SageMakerRuntimeController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("codedeploy", "codedeploy", config.services().codedeploy().enabled(), true,
                         "codedeploy", storageMode(config.storage().services().codedeploy().mode(), config.storage().mode()),
                         config.storage().services().codedeploy().flushIntervalMs(), null, ServiceProtocol.JSON,
@@ -498,7 +539,8 @@ public class ResolvedServiceCatalog {
                         null, null, 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("ram"), Set.of(),
-                        Set.of(RamController.class)),
+                        Set.of(RamController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("config", "configservice", config.services().configservice().enabled(), true,
                         "config", storageMode(config.storage().services().config().mode(), config.storage().mode()),
                         config.storage().services().config().flushIntervalMs(), null, ServiceProtocol.JSON,
@@ -533,13 +575,16 @@ public class ResolvedServiceCatalog {
                         Set.of(), Set.of("sso-oauth"), Set.of(), Set.of(SsoOidcController.class)),
                 descriptor("macie2", "macie2", config.services().macie2().enabled(), true,
                         "macie2", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
-                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("macie2"), Set.of(), Set.of(MacieController.class)),
+                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("macie2"), Set.of(), Set.of(MacieController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("account", "account", config.services().account().enabled(), true,
                         "account", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
-                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("account"), Set.of(), Set.of(AccountController.class)),
+                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("account"), Set.of(), Set.of(AccountController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("access-analyzer", "accessanalyzer", config.services().accessanalyzer().enabled(), true,
                         "accessanalyzer", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
-                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("access-analyzer"), Set.of(), Set.of(AccessAnalyzerController.class)),
+                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("access-analyzer"), Set.of(), Set.of(AccessAnalyzerController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("identitystore", "identitystore", config.services().identitystore().enabled(), true,
                         "identitystore", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON), Set.of("AWSIdentityStore."), Set.of("identitystore"), Set.of(), Set.of()),
@@ -548,13 +593,16 @@ public class ResolvedServiceCatalog {
                         protocols(ServiceProtocol.JSON), Set.of("AWSBudgetServiceGateway."), Set.of("budgets"), Set.of(), Set.of()),
                 descriptor("detective", "detective", config.services().detective().enabled(), true,
                         "detective", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
-                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("detective"), Set.of(), Set.of(DetectiveController.class)),
+                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("detective"), Set.of(), Set.of(DetectiveController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("inspector2", "inspector2", config.services().inspector2().enabled(), true,
                         "inspector2", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
-                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("inspector2"), Set.of(), Set.of(Inspector2Controller.class)),
+                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("inspector2"), Set.of(), Set.of(Inspector2Controller.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("securityhub", "securityhub", config.services().securityhub().enabled(), true,
                         "securityhub", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
-                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("securityhub"), Set.of(), Set.of(SecurityHubController.class)),
+                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("securityhub"), Set.of(), Set.of(SecurityHubController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("autoscaling", "autoscaling", config.services().autoscaling().enabled(), true,
                         "autoscaling", config.storage().mode(), 5000L, AwsNamespaces.AUTOSCALING, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY),
@@ -577,7 +625,8 @@ public class ResolvedServiceCatalog {
                         "backup", storageMode(config.storage().services().backup().mode(), config.storage().mode()),
                         config.storage().services().backup().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("backup"), Set.of(), Set.of(BackupController.class)),
+                        Set.of(), Set.of("backup"), Set.of(), Set.of(BackupController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("resource-explorer-2", "resourceexplorer2",
                         config.services().resourceexplorer2().enabled(), true,
                         "resourceexplorer2",
@@ -586,12 +635,14 @@ public class ResolvedServiceCatalog {
                         null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("resource-explorer-2"), Set.of(),
-                        Set.of(ResourceExplorer2Controller.class)),
+                        Set.of(ResourceExplorer2Controller.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("fis", "fis", config.services().fis().enabled(), true,
                         "fis", storageMode(config.storage().services().fis().mode(), config.storage().mode()),
                         config.storage().services().fis().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("fis"), Set.of(), Set.of(FisController.class)),
+                        Set.of(), Set.of("fis"), Set.of(), Set.of(FisController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("ec2messages", "ec2messages", config.services().ssm().enabled(), false,
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -603,7 +654,8 @@ public class ResolvedServiceCatalog {
                 descriptor("route53", "route53", config.services().route53().enabled(), true,
                         "route53", config.storage().mode(), 5000L, null, ServiceProtocol.REST_XML,
                         protocols(ServiceProtocol.REST_XML),
-                        Set.of(), Set.of("route53"), Set.of(), Set.of(Route53Controller.class)),
+                        Set.of(), Set.of("route53"), Set.of(), Set.of(Route53Controller.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("textract", "textract", config.services().textract().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -654,29 +706,34 @@ public class ResolvedServiceCatalog {
                 descriptor("oam", "oam", config.services().oam().enabled(), true,
                         "oam", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("oam"), Set.of(), Set.of(OamController.class)),
+                        Set.of(), Set.of("oam"), Set.of(), Set.of(OamController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("cloudfront", "cloudfront", config.services().cloudfront().enabled(), true,
                         "cloudfront", storageMode(config.storage().services().cloudfront().mode(), config.storage().mode()),
                         5000L, AwsNamespaces.CLOUDFRONT, ServiceProtocol.REST_XML,
                         protocols(ServiceProtocol.REST_XML),
                         Set.of(), Set.of("cloudfront"), Set.of(),
-                        Set.of(CloudFrontController.class, CloudFrontServingController.class)),
+                        Set.of(CloudFrontController.class, CloudFrontServingController.class))
+                        .withRequiredRestAuthentication(Set.of(CloudFrontController.class)),
                 descriptor("appsync", "appsync", config.services().appsync().enabled(), true,
                         "appsync", storageMode(config.storage().services().appsync().mode(), config.storage().mode()),
                         config.storage().services().appsync().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("appsync"), Set.of(), Set.of(AppSyncController.class,
-                                AppSyncExecutionController.class)),
+                                AppSyncExecutionController.class))
+                        .withRequiredRestAuthentication(Set.of(AppSyncController.class)),
                 descriptor("s3vectors", "s3vectors", config.services().s3vectors().enabled(), true,
                         "s3vectors", storageMode(config.storage().services().s3vectors().mode(), config.storage().mode()),
                         config.storage().services().s3vectors().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("s3vectors"), Set.of(), Set.of(S3VectorsController.class)),
+                        Set.of(), Set.of("s3vectors"), Set.of(), Set.of(S3VectorsController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("s3tables", "s3tables", config.services().s3tables().enabled(), true,
                         "s3tables", storageMode(config.storage().services().s3tables().mode(), config.storage().mode()),
                         config.storage().services().s3tables().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("s3tables"), Set.of(), Set.of(S3TablesController.class)),
+                        Set.of(), Set.of("s3tables"), Set.of(), Set.of(S3TablesController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("iot", "iot", config.services().iot().enabled(), true,
                         "iot", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
@@ -685,7 +742,11 @@ public class ResolvedServiceCatalog {
                         // signs under its own name while IotController serves its /things/*/jobs routes
                         Set.of(), Set.of("iot", "execute-api", "iot-jobs-data"), Set.of(),
                         Set.of(IotController.class, IotDomainConfigurationController.class,
-                                IotAuthorizerController.class, IotFleetIndexingController.class)),
+                                IotAuthorizerController.class, IotFleetIndexingController.class))
+                        .withRequiredRestAuthentication()
+                        .withEndpointOwnedRestMethods(Map.of(IotController.class, Set.of(
+                                "listJobExecutionsForThing", "describeJobExecution",
+                                "startNextPendingJobExecution", "updateJobExecution"))),
                 descriptor("iotdata", "iotdata", config.services().iotdata().enabled(), true,
                         "iot", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
@@ -702,13 +763,15 @@ public class ResolvedServiceCatalog {
                         "rum", storageMode(config.storage().services().rum().mode(), config.storage().mode()),
                         config.storage().services().rum().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("rum"), Set.of(), Set.of(RumController.class)),
+                        Set.of(), Set.of("rum"), Set.of(), Set.of(RumController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("guardduty", "guardduty", config.services().guardduty().enabled(), true,
                         "guardduty",
                         storageMode(config.storage().services().guardduty().mode(), config.storage().mode()),
                         config.storage().services().guardduty().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("guardduty"), Set.of(), Set.of(GuardDutyController.class)),
+                        Set.of(), Set.of("guardduty"), Set.of(), Set.of(GuardDutyController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("route53resolver", "route53resolver", config.services().route53resolver().enabled(), true,
                         "route53resolver", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -717,17 +780,20 @@ public class ResolvedServiceCatalog {
                         "connect", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("connect"), Set.of(),
-                        Set.of(ConnectController.class)),
+                        Set.of(ConnectController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("app-integrations", "appintegrations",
                         config.services().appintegrations().enabled(), true,
                         "appintegrations", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("app-integrations"), Set.of(),
-                        Set.of(AppIntegrationsController.class)),
+                        Set.of(AppIntegrationsController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("dlm", "dlm", config.services().dlm().enabled(), true,
                         "dlm", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("dlm"), Set.of(), Set.of(DlmController.class)),
+                        Set.of(), Set.of("dlm"), Set.of(), Set.of(DlmController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("cognito-identity", "cognitoidentity",
                         config.services().cognitoidentity().enabled(), true,
                         "cognitoidentity", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
@@ -754,42 +820,49 @@ public class ResolvedServiceCatalog {
                         Set.of("AWS242ServiceCatalogService."), Set.of("servicecatalog"), Set.of(), Set.of()),
                 descriptor("controlcatalog", "controlcatalog", config.services().controlcatalog().enabled(), true,
                         "controlcatalog", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
-                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("controlcatalog"), Set.of(), Set.of(ControlCatalogController.class)),
+                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("controlcatalog"), Set.of(), Set.of(ControlCatalogController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("controltower", "controltower", config.services().controltower().enabled(), true,
                         "controltower", storageMode(config.storage().services().controltower().mode(), config.storage().mode()),
                         config.storage().services().controltower().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("controltower"), Set.of(), Set.of(ControlTowerController.class, ControlTowerControlController.class)),
+                        Set.of(), Set.of("controltower"), Set.of(), Set.of(ControlTowerController.class, ControlTowerControlController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("aps", "aps", config.services().aps().enabled(), true,
                         "aps", storageMode(config.storage().services().aps().mode(), config.storage().mode()),
                         config.storage().services().aps().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("aps"), Set.of(), Set.of(ApsController.class)),
+                        Set.of(), Set.of("aps"), Set.of(), Set.of(ApsController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("lakeformation", "lakeformation", config.services().lakeformation().enabled(), true,
                         "lakeformation",
                         storageMode(config.storage().services().lakeformation().mode(), config.storage().mode()),
                         config.storage().services().lakeformation().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("lakeformation"), Set.of(), Set.of(LakeFormationController.class)),
+                        Set.of(), Set.of("lakeformation"), Set.of(), Set.of(LakeFormationController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("efs", "efs", config.services().efs().enabled(), true,
                         "efs",
                         storageMode(config.storage().services().efs().mode(), config.storage().mode()),
                         config.storage().services().efs().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("elasticfilesystem"), Set.of(), Set.of(EfsController.class)),
+                        Set.of(), Set.of("elasticfilesystem"), Set.of(), Set.of(EfsController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("codeguru-reviewer", "codegurureviewer",
                         config.services().codegurureviewer().enabled(), true,
                         "codegurureviewer", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("codeguru-reviewer"), Set.of(),
-                        Set.of(CodeGuruReviewerController.class)),
+                        Set.of(CodeGuruReviewerController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("codeartifact", "codeartifact", config.services().codeartifact().enabled(), true,
                         "codeartifact", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("codeartifact"), Set.of(),
                         Set.of(CodeArtifactController.class,
                                 CodeArtifactMavenController.class,
-                                CodeArtifactPypiController.class)),
+                                CodeArtifactPypiController.class))
+                        .withRequiredRestAuthentication(Set.of(CodeArtifactController.class)),
                 descriptor("verifiedpermissions", "verifiedpermissions", config.services().verifiedpermissions().enabled(), true,
                         "verifiedpermissions", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -798,7 +871,8 @@ public class ResolvedServiceCatalog {
                         "marketplace", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON, ServiceProtocol.JSON, ServiceProtocol.CBOR),
                         Set.of("AWSMPCommerceService_v20200301.", "AWSMPEntitlementService.", "AWSMPMeteringService."), Set.of("aws-marketplace"), Set.of("AWS Marketplace Entitlement Service"),
-                        Set.of(MarketplaceCatalogController.class, MarketplaceDeploymentController.class, MarketplaceReportingController.class, MarketplaceDiscoveryController.class)),
+                        Set.of(MarketplaceCatalogController.class, MarketplaceDeploymentController.class, MarketplaceReportingController.class, MarketplaceDiscoveryController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("dms", "dms", config.services().dms().enabled(), true,
                         "dms", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -845,6 +919,20 @@ public class ResolvedServiceCatalog {
      */
     public String canonicalCredentialScope(String credentialScope) {
         return CREDENTIAL_SCOPE_ALIASES.getOrDefault(credentialScope, credentialScope);
+    }
+
+    /** S3 Control uses a different XML namespace from the S3 service that owns its storage. */
+    public String restAuthenticationXmlNamespace(Class<?> resourceClass) {
+        if (resourceClass == S3ControlController.class) {
+            return AwsNamespaces.S3_CONTROL;
+        }
+        return catalog.byResourceClass(resourceClass).map(ServiceDescriptor::xmlNamespace).orElse(null);
+    }
+
+    /** Shared management dispatchers have no single service owner; their operations require credentials. */
+    public boolean sharedRestRouteRequiresCredentials(Class<?> resourceClass) {
+        return resourceClass == SharedTagsController.class || resourceClass == V1TagsController.class
+                || resourceClass == SecurityAdminController.class;
     }
 
     public Optional<ServiceDescriptor> byResourceClass(Class<?> resourceClass) {
