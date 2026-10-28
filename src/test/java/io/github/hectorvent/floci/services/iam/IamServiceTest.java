@@ -18,6 +18,7 @@ import io.github.hectorvent.floci.services.iam.model.IamPolicy;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
+import io.github.hectorvent.floci.services.iam.model.LambdaExecutionBinding;
 import io.github.hectorvent.floci.services.iam.model.LoginProfile;
 import io.github.hectorvent.floci.services.iam.model.OpenIDConnectProvider;
 import io.github.hectorvent.floci.services.iam.model.OrganizationRootFeatures;
@@ -2632,6 +2633,30 @@ class IamServiceTest {
         assertTrue(service.resolveCallerArns("ASIAEXPIREDSERVICE").isEmpty());
         assertTrue(sessions.getForAccount(accountId, "ASIAEXPIREDSERVICE").isEmpty());
         assertTrue(sessions.getForAccount("333344445555", "ASIAOTHERSERVICE").isPresent());
+    }
+
+    @Test
+    void lambdaSessionBindingUsesUniqueExactKeysBeyondThePrincipalScanLimit() {
+        String account = "222233334444";
+        String role = "arn:aws:iam::222233334444:role/LambdaRole";
+        String key = "ASIALARGESESSIONREGISTRY";
+        AccountAwareStorageBackend<SessionCredential> sessions = AccountAwareStorageBackend.inMemory("000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        for (int i = 0; i < 5000; i++) {
+            sessions.putForAccount(account, "unrelated-" + i,
+                    new SessionCredential("unrelated-" + i, "secret", "token", role, null, null, account));
+        }
+        service.registerLambdaExecutionRoleSession(account, key, "secret", role);
+        LambdaExecutionBinding binding = new LambdaExecutionBinding(account, "us-east-1", "fn",
+                "arn:aws:lambda:us-east-1:222233334444:function:fn", "$LATEST", role,
+                "code", "revision", null, null);
+        service.bindLambdaExecution(account, key, binding);
+        assertEquals(binding, service.lambdaIdentitySession(key).orElseThrow().getLambdaExecution());
+        assertTrue(service.issuedSessionCandidates("missing").isEmpty());
+        assertThrows(IllegalStateException.class, () -> service.issuedSessionCandidates(null));
+        service.registerLambdaExecutionRoleSession("333344445555", key, "other-secret", role);
+        assertEquals(2, service.issuedSessionCandidates(key).size());
+        assertTrue(service.lambdaIdentitySession(key).isEmpty());
     }
 
     @Test

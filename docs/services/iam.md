@@ -2635,3 +2635,92 @@ Attached IAM user and role tags are available as `aws:PrincipalTag/<key>` in res
 The shared execution-role authorizer checks service trust before registering a temporary local role credential. It resolves that credential through IAM for policy evaluation, including the full role ARN, session ARN, role ID and `aws:userid`. Conditions on session identity therefore apply to both Allow and Deny statements.
 
 The credential is revoked when authorization evaluation ends, including denied and failed evaluations. It has a 15-minute expiration as a fallback and is not injected into the Lambda workload. Its locally selected session name is not a claim about AWS service-selected session names or credential caching. Session-tag overrides and the complete service trust condition context remain separate limitations.
+
+## Local issued-session management
+
+`FLOCI_SERVICES_IAM_ISSUED_SESSION_VERIFICATION_ENABLED=true` enables two local
+management operations. They are disabled by default and are not AWS API operations.
+Keep this management interface on a trusted local network: exact-selector lookup
+returns issuer metadata without authenticating the selector's holder. Neither
+operation grants authorization or evaluates IAM policies.
+
+Both accept JSON over POST, reject unknown/duplicate fields, and return
+`Cache-Control: no-store`. Request bodies are limited to 16,384 bytes.
+
+* `/_floci/iam/issued-sessions/verify` requires `correlationId`, `accessKeyId`,
+  `sessionToken`, `stringToSign` and `signature`. It checks the original four-line
+  `AWS4-HMAC-SHA256` string to sign, token, HMAC, current issuer role and finite
+  expiry. Timestamps may be at most 900 seconds old or 300 seconds ahead.
+* `/_floci/iam/issued-sessions/lookup` requires `correlationId` and exactly one of
+  `accessKeyId`, `principalArn` or `principalId`. There is no listing, account-only
+  selector or wildcard. Matching issuances must agree on identity, origin account
+  and restriction presence; the earliest current expiry is returned.
+
+Success returns `correlationId`, `operation` (`Verify` or `Lookup`),
+`kind` (`ASSUMED_ROLE`), `accountId`, `originAccountId`, `roleArn`, `roleId`,
+`roleSessionName`, `principalArn`, `principalId`, `expiresAt` and the explicit
+boolean `sessionPolicyPresent`. Only `Lookup` selected by `accessKeyId` also returns
+`accessKeyId`, bound to the current selected issuer record. `Verify` and principal
+lookups omit `accessKeyId`. Tokens, secrets and signing keys are never returned. Inline `Policy` or any supplied managed `PolicyArns` marks restrictions
+present; this flag does not claim those policies were evaluated. Consumers must
+apply their own authorization and inspect current public IAM policies and
+permissions boundaries.
+
+Only normal AssumeRole sessions issued in this process qualify. Their provenance
+marker is not persisted; restored sessions, WebIdentity, SAML, workload credentials,
+GetSessionToken, federation and long-term credentials refuse. Removing or replacing
+the issuer role invalidates admission. The role and registry are checked again
+before returning. Registry scans are bounded to 4,096 entries and 128 matches.
+
+Errors contain only `{"code":"..."}`: disabled operations return HTTP 404 with
+`IssuedSessionVerificationDisabled`; malformed requests return HTTP 400 with
+`InvalidIssuedSessionRequest`; unknown/stale credentials or failed proofs return
+HTTP 403 with `IssuedSessionVerificationFailed`. Tokens and proof inputs are not
+logged or echoed. Posting `{}` distinguishes an enabled handler from an older or
+disabled implementation without sending any credential material.
+
+## Local Lambda execution identity
+
+`FLOCI_SERVICES_IAM_LAMBDA_IDENTITY_VERIFICATION_ENABLED=true` enables
+`POST /_floci/lambda/issued-identities/lookup` and `/verify`. The existing IAM
+issued-session endpoints retain their original contract. These observations
+are identity evidence, not IAM authorization decisions, and never contain
+credentials. Both operations use the same strict request fields as the IAM
+issued-session protocol above.
+
+The response contains `correlationId`, `operation`, `kind`, `accountId`, `roleArn`,
+`roleId`, `principalArn`, `principalId`, `sessionPolicyPresent`, and `expiresAt`.
+`kind` is `LAMBDA_EXECUTION` for the native execution-role session and
+`LAMBDA_ASSUMED_ROLE` for one directly derived STS session. The nested `lambda`
+object always identifies the original execution: `accountId`, `functionArn`,
+`functionVersion`, `roleArn`, `principalArn`, `principalId`, `codeSha256`,
+`containerId`, and `containerStartedAt`.
+
+The issuer binds its generated credential to its native launch record. Every
+observation checks the current role ID, function version/code/revision, exact
+credential record, and running container/start time before and after proof
+verification. A stopped or restarted container, retired credential, replaced
+role, changed function, or ambiguous principal lookup is refused. A lookup
+selects records but does not authenticate the caller or confer lineage. Only an
+`accessKeyId`-selected `Lookup` returns `accessKeyId`, taken from the selected
+current root or derived session; principal lookups and `Verify` omit the field.
+
+`Verify` checks the session token and SigV4 `StringToSign` signature. Its signing
+time must be at most 60 seconds old and at most 5 seconds in the future. Its
+observation expires at the earliest of observation time plus 60 seconds, signed
+time plus 60 seconds, and the current/root credential expiry. Replaying an old
+proof cannot renew that deadline; retries inside the original window are not
+single-use nonce enforcement. `Lookup` returns a fresh observation lasting at
+most 60 seconds and still requires the current execution to be running.
+
+One-hop lineage is recorded only by normal `AssumeRole` after the native SigV4
+request verifier authenticates the parent key, token and complete request.
+The Lambda identity flag activates the existing signature verifier for native
+execution-role and one-hop credentials; it does not require globally enabling
+`FLOCI_AUTH_VALIDATE_SIGNATURES`. Other credentials retain their existing
+behavior, and no unknown-key secret fallback is added. Enabling the global flag
+still requires valid known credentials for all other signed AWS requests. Header-only calls, manually registered/restored sessions,
+second-hop sessions, Kubernetes executions, hot reload, external AWS credential
+mounts, and executions without a complete native start/code seal are not
+supported by this identity facility. Generic STS issuance retains its normal
+behavior even when no Lambda lineage can be established.

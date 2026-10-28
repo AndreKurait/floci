@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.iam.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
@@ -9,6 +10,21 @@ import java.util.Map;
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class SessionCredential {
+
+    /** In-process provenance only; restored credentials are never admitted by the management verifier. */
+    @JsonIgnore
+    private boolean assumeRoleIssued;
+    @JsonIgnore
+    private boolean managedSessionPolicyPresent;
+    @JsonIgnore
+    private LambdaExecutionBinding lambdaExecution;
+    @JsonIgnore
+    private SessionCredential lambdaParentSession;
+
+    public LambdaExecutionBinding getLambdaExecution() { return lambdaExecution; }
+    public void setLambdaExecution(LambdaExecutionBinding value) { lambdaExecution = value; }
+    public SessionCredential getLambdaParentSession() { return lambdaParentSession; }
+    public void setLambdaParentSession(SessionCredential value) { lambdaParentSession = value; }
 
     private String accessKeyId;
     private String secretAccessKey;
@@ -103,6 +119,12 @@ public class SessionCredential {
         this.sessionPolicyDocument = sessionPolicyDocument;
         this.originAccountId = originAccountId;
     }
+
+    public boolean isAssumeRoleIssued() { return assumeRoleIssued; }
+    public void setAssumeRoleIssued(boolean value) { assumeRoleIssued = value; }
+
+    public boolean isManagedSessionPolicyPresent() { return managedSessionPolicyPresent; }
+    public void setManagedSessionPolicyPresent(boolean value) { managedSessionPolicyPresent = value; }
 
     public String getAccessKeyId() { return accessKeyId; }
     public void setAccessKeyId(String accessKeyId) { this.accessKeyId = accessKeyId; }
