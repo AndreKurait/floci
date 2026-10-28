@@ -75,7 +75,8 @@ public class AppConfigService {
     /** The application whose ID or name is {@code idOrName}. */
     public Application resolveApplication(String idOrName) {
         return applicationStore.get(idOrName)
-                .or(() -> listApplications().stream().filter(a -> idOrName.equals(a.getName())).findFirst())
+                .or(() -> uniqueNamed(listApplications().stream()
+                        .filter(a -> idOrName.equals(a.getName())).toList(), "Application"))
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Application not found", 404));
     }
 
@@ -129,7 +130,8 @@ public class AppConfigService {
         // An exact ID always wins over another environment's name, and a direct lookup skips the scan.
         return environmentStore.get(idOrName)
                 .filter(e -> appId.equals(e.getApplicationId()))
-                .or(() -> listEnvironments(appId).stream().filter(e -> idOrName.equals(e.getName())).findFirst())
+                .or(() -> uniqueNamed(listEnvironments(appId).stream()
+                        .filter(e -> idOrName.equals(e.getName())).toList(), "Environment"))
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Environment not found", 404));
     }
 
@@ -190,8 +192,17 @@ public class AppConfigService {
     public ConfigurationProfile resolveConfigurationProfile(String appId, String idOrName) {
         return profileStore.get(idOrName)
                 .filter(p -> appId.equals(p.getApplicationId()))
-                .or(() -> listConfigurationProfiles(appId).stream().filter(p -> idOrName.equals(p.getName())).findFirst())
+                .or(() -> uniqueNamed(listConfigurationProfiles(appId).stream()
+                        .filter(p -> idOrName.equals(p.getName())).toList(), "Configuration profile"))
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Configuration profile not found", 404));
+    }
+
+    private static <T> Optional<T> uniqueNamed(List<T> matches, String resourceType) {
+        if (matches.size() > 1) {
+            throw new AwsException("BadRequestException",
+                    resourceType + " name is ambiguous; use its ID.", 400);
+        }
+        return matches.stream().findFirst();
     }
 
     public List<ConfigurationProfile> listConfigurationProfiles(String applicationIdentifier) {
