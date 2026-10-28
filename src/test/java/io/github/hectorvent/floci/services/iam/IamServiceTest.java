@@ -3676,10 +3676,43 @@ class IamServiceTest {
             SessionCredential stored = sessions.getForAccount("000000000000", sessionKey).orElseThrow();
             SessionCredential reloaded = mapper.readValue(mapper.writeValueAsBytes(stored), SessionCredential.class);
             sessions.putForAccount("000000000000", sessionKey, reloaded);
+            assertTrue(reloaded.isSessionTokenCredential());
+            assertEquals(!"ASIAWITHMFA".equals(sessionKey),
+                    service.sessionTokenDeniesOperation(sessionKey, "iam", "iam:GetUser"));
+            assertTrue(service.sessionTokenDeniesOperation(sessionKey, "sts", "sts:GetAccessKeyInfo"));
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "sts", "sts:GetCallerIdentity"));
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "sts", "sts:AssumeRole"));
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "ssm", "ssm:DescribeParameters"));
             assertEquals("ASIAWITHMFA".equals(sessionKey),
                     service.resolveCallerArns(sessionKey).orElseThrow().multiFactorAuthPresent());
             assertEquals("ASIAWITHMFA".equals(sessionKey) ? now : null, reloaded.getMultiFactorAuthenticatedAt());
         }
+    }
+
+    @Test
+    void sessionTokenRestrictionsRequireExplicitIssuanceAndDoNotApplyToLegacyOrFederatedSessions() throws Exception {
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        service.createUser("restriction-issuer", "/");
+        AccessKey key = service.createAccessKey("restriction-issuer");
+        Instant now = Instant.now();
+        service.registerIssuedSession("ASIALEGACY", "secret", "token", null, now.plusSeconds(3600),
+                null, "000000000000", key.getAccessKeyId());
+        service.registerIssuedSession("ASIAFEDERATED", "secret", "token",
+                "arn:aws:sts::000000000000:federated-user/reader", now.plusSeconds(3600),
+                null, "000000000000", key.getAccessKeyId());
+        for (String sessionKey : List.of("ASIALEGACY", "ASIAFEDERATED")) {
+            SessionCredential stored = sessions.getForAccount("000000000000", sessionKey).orElseThrow();
+            stored.setMultiFactorAuthPresent(false);
+            stored.setMultiFactorAuthenticatedAt(now);
+            sessions.putForAccount("000000000000", sessionKey, stored);
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "iam", "iam:GetUser"));
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "sts", "sts:GetAccessKeyInfo"));
+        }
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        SessionCredential old = mapper.readValue("{\"accessKeyId\":\"ASIAOLD\"}", SessionCredential.class);
+        assertFalse(old.isSessionTokenCredential());
     }
 
     @Test
