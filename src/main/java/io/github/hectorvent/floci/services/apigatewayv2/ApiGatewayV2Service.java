@@ -429,6 +429,14 @@ public class ApiGatewayV2Service {
         authorizerStore.put(authorizerKey(region, apiId, restored.getAuthorizerId()), restored);
     }
 
+    /** Replaces template-owned credentials, including clearing a removed CloudFormation property. */
+    public void replaceAuthorizerCredentials(String region, String apiId, String authorizerId,
+                                              String credentialsArn) {
+        Authorizer resource = getAuthorizer(region, apiId, authorizerId);
+        resource.setAuthorizerCredentialsArn(credentialsArn);
+        authorizerStore.put(authorizerKey(region, apiId, authorizerId), resource);
+    }
+
     public Authorizer updateAuthorizer(String region, String apiId, String authorizerId,
                                        Map<String, Object> request) {
         Authorizer auth = getAuthorizer(region, apiId, authorizerId);
@@ -748,6 +756,14 @@ public class ApiGatewayV2Service {
         getApi(region, apiId);
         integrationStore.put(integrationKey(region, apiId, integration.getIntegrationId()),
                 new Integration(integration));
+    }
+
+    /** Replaces template-owned credentials, including clearing a removed CloudFormation property. */
+    public void replaceIntegrationCredentials(String region, String apiId, String integrationId,
+                                              String credentialsArn) {
+        Integration resource = new Integration(getIntegration(region, apiId, integrationId));
+        resource.setCredentialsArn(credentialsArn);
+        integrationStore.put(integrationKey(region, apiId, integrationId), resource);
     }
 
     public Integration updateIntegration(String region, String apiId, String integrationId,
