@@ -2590,3 +2590,5 @@ Floci retains its existing add/remove patch compatibility, although AWS document
 only replace for this field; locally accepted additions also require PassRole.
 
 API Gateway HTTP API quick-create Lambda integrations check an assigned execution role through `iam:PassRole` before creating the API. Absent targets, HTTP URL targets and caller credentials pass no role. Credential retention is a separate prerequisite; this check does not implement integration execution authorization.
+
+REST API OpenAPI and Swagger integration imports check each assigned IAM role through `iam:PassRole` before creating, merging or overwriting API resources. The service parser resolves AWS variables and ANY-method operations; unused extensions, ignored integration types and caller credentials pass no role. Authorizer and HTTP API import credential checks remain separate follow-ups.
