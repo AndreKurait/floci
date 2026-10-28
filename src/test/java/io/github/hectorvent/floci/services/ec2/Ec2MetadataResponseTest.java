@@ -95,7 +95,7 @@ class Ec2MetadataResponseTest {
         private final Thread thread;
 
         BodyServer(boolean partial, boolean closeEarly) throws IOException {
-            listener = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+            listener = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
             listener.setSoTimeout(5000);
             thread = Thread.ofPlatform().start(() -> serve(partial, closeEarly));
         }
