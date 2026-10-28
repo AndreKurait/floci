@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.zip.GZIPOutputStream;
 
@@ -843,6 +844,23 @@ class PassedRolesTest {
         assertEquals(List.of(), PassedRoles.of("apigateway:PATCH", rest("/v2/apis", body), LOOKUPS));
         String nullProtocol = body.replace("\"WEBSOCKET\"", "null");
         assertEquals(List.of(), PassedRoles.of("apigateway:POST", rest("/v2/apis", nullProtocol), LOOKUPS));
+    }
+
+    @Test
+    void httpImportEnvelopeAndRawYamlReachTheOwningLookupWithoutConsumingTheBody() throws Exception {
+        String document = "openapi: 3.0.1\ninfo: {title: test, version: '1'}\npaths: {}";
+        PassedRoles.Lookups lookup = mock(PassedRoles.Lookups.class);
+        when(lookup.importedHttpApiRoles(document)).thenReturn(
+                List.of(ROLES + "teams/import", "arn:aws:iam::*:user/*"));
+        String envelope = new ObjectMapper().writeValueAsString(Map.of("body", document));
+        for (String body : List.of(document, envelope)) {
+            for (String path : List.of("/v2/apis", "/v2/apis/api/")) {
+                ContainerRequestContext request = rest(path, body);
+                assertEquals(List.of(passed("teams/import", "apigateway.amazonaws.com")),
+                        PassedRoles.of("apigateway:PUT", request, lookup));
+                assertEquals(body, new String(IamConditionContextResolver.bufferEntity(request), StandardCharsets.UTF_8));
+            }
+        }
     }
 
     private static ContainerRequestContext rest(String path, String body) {
