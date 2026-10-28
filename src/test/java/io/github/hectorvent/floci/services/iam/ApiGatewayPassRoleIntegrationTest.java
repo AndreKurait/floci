@@ -584,6 +584,137 @@ class ApiGatewayPassRoleIntegrationTest {
                 """.formatted(field, version, f.name, method, role, f.uri());
     }
 
+    @Test
+    void httpImportIntegrationRequiresPassRoleAndRevocationPreservesReimport() {
+        try (Fixture f = new Fixture()) {
+            registerHttpImports(f);
+            String document = importDocument(f, f.role, "get", "3.0.1");
+            int initial = f.v2.getApis().items().size();
+            assertEquals(403, assertThrows(ApiGatewayV2Exception.class,
+                    () -> f.v2.importApi(b -> b.body(document))).statusCode());
+            assertEquals(initial, f.v2.getApis().items().size());
+            f.policy("lambda.amazonaws.com");
+            assertEquals(403, assertThrows(ApiGatewayV2Exception.class,
+                    () -> f.v2.importApi(b -> b.body(document))).statusCode());
+            f.policy("apigateway.amazonaws.com");
+            String api = f.v2.importApi(b -> b.body(document)).apiId();
+            String integration = f.v2.getIntegrations(b -> b.apiId(api)).items().getFirst().integrationId();
+            assertEquals(f.role, f.v2.getIntegration(b -> b.apiId(api).integrationId(integration)).credentialsArn());
+            f.policy(null);
+            assertEquals(403, assertThrows(ApiGatewayV2Exception.class,
+                    () -> f.v2.reimportApi(b -> b.apiId(api).body(document))).statusCode());
+            assertEquals(integration, f.v2.getIntegrations(b -> b.apiId(api)).items().getFirst().integrationId());
+            String cleared = document.replace("\"credentials\":\"" + f.role + "\"", "\"credentials\":null");
+            f.v2.reimportApi(b -> b.apiId(api).body(cleared));
+            assertEquals(null, f.v2.getIntegrations(b -> b.apiId(api)).items().getFirst().credentialsArn());
+        }
+    }
+
+    @Test
+    void httpImportUnreferencedRequestAuthorizerRequiresPassRole() {
+        try (Fixture f = new Fixture()) {
+            registerHttpImports(f);
+            String document = authorizerDocument(f, f.role, "request", false)
+                    .replace("method.request.header.Authorization", "$request.header.Authorization");
+            assertEquals(403, assertThrows(ApiGatewayV2Exception.class,
+                    () -> f.v2.importApi(b -> b.body(document))).statusCode());
+            f.policy("apigateway.amazonaws.com");
+            String api = f.v2.importApi(b -> b.body(document)).apiId();
+            String authorizer = f.v2.getAuthorizers(b -> b.apiId(api)).items().getFirst().authorizerId();
+            assertEquals(f.role, f.v2.getAuthorizer(b -> b.apiId(api).authorizerId(authorizer))
+                    .authorizerCredentialsArn());
+            f.policy(null);
+            assertEquals(403, assertThrows(ApiGatewayV2Exception.class,
+                    () -> f.v2.reimportApi(b -> b.apiId(api).body(document))).statusCode());
+            assertEquals(authorizer, f.v2.getAuthorizers(b -> b.apiId(api)).items().getFirst().authorizerId());
+        }
+    }
+
+    @Test
+    void httpImportChecksEveryRoleBeforeCreatingAnyResources() throws Exception {
+        try (Fixture f = new Fixture()) {
+            registerHttpImports(f);
+            f.policy("apigateway.amazonaws.com");
+            ObjectMapper mapper = new ObjectMapper();
+            ObjectNode document = (ObjectNode) mapper.readTree(importDocument(f, f.role, "get", "3.0.1"));
+            ObjectNode other = (ObjectNode) mapper.readTree(authorizerDocument(f, f.role + "other", "request", false));
+            document.set("components", other.get("components"));
+            String body = mapper.writeValueAsString(document);
+            int initial = f.v2.getApis().items().size();
+            assertEquals(403, assertThrows(ApiGatewayV2Exception.class,
+                    () -> f.v2.importApi(b -> b.body(body))).statusCode());
+            assertEquals(initial, f.v2.getApis().items().size());
+        }
+    }
+
+    @Test
+    void httpImportYamlAnyMethodUsesTheSameRolePlan() {
+        try (Fixture f = new Fixture()) {
+            registerHttpImports(f);
+            String body = """
+                    openapi: 3.0.1
+                    info:
+                      title: %s
+                      version: '1'
+                    paths:
+                      /imported:
+                        x-amazon-apigateway-any-method:
+                          responses:
+                            '200':
+                              description: OK
+                          x-amazon-apigateway-integration:
+                            type: aws_proxy
+                            httpMethod: POST
+                            uri: '%s'
+                            credentials: '%s'
+                    """.formatted(f.name, f.uri(), f.role);
+            assertEquals(403, assertThrows(ApiGatewayV2Exception.class,
+                    () -> f.v2.importApi(b -> b.body(body))).statusCode());
+            f.policy("apigateway.amazonaws.com");
+            String api = f.v2.importApi(b -> b.body(body)).apiId();
+            assertEquals("ANY /imported", f.v2.getRoutes(b -> b.apiId(api)).items().getFirst().routeKey());
+            assertEquals(f.role, f.v2.getIntegrations(b -> b.apiId(api)).items().getFirst().credentialsArn());
+        }
+    }
+
+    @Test
+    void httpImportCallerAndUnusedCredentialsDoNotPassRoles() {
+        try (Fixture f = new Fixture()) {
+            registerHttpImports(f);
+            String caller = importDocument(f, "arn:aws:iam::*:user/*", "get", "3.0.1");
+            f.v2.importApi(b -> b.body(caller));
+            String unused = importDocument(f, f.role, "get", "3.0.1")
+                    .replace("\"credentials\"", "\"unusedCredentials\"");
+            String api = f.v2.importApi(b -> b.body(unused)).apiId();
+            assertEquals(null, f.v2.getIntegrations(b -> b.apiId(api)).items().getFirst().credentialsArn());
+            String http = importDocument(f, f.role, "get", "3.0.1").replace("aws_proxy", "http_proxy");
+            f.v2.importApi(b -> b.body(http));
+        }
+    }
+
+    @Test
+    void httpImportMalformedAuthorizerLeavesExistingApiUntouched() {
+        try (Fixture f = new Fixture()) {
+            registerHttpImports(f);
+            String plain = importDocument(f, "arn:aws:iam::*:user/*", "get", "3.0.1");
+            String api = f.v2.importApi(b -> b.body(plain)).apiId();
+            String route = f.v2.getRoutes(b -> b.apiId(api)).items().getFirst().routeId();
+            String invalid = authorizerDocument(f, f.role, "token", false);
+            assertEquals(400, assertThrows(ApiGatewayV2Exception.class,
+                    () -> f.v2.reimportApi(b -> b.apiId(api).body(invalid))).statusCode());
+            assertEquals(route, f.v2.getRoutes(b -> b.apiId(api)).items().getFirst().routeId());
+        }
+    }
+
+    private void registerHttpImports(Fixture f) {
+        cleanup.register(() -> {
+            try (ApiGatewayV2Client admin = f.adminV2()) {
+                admin.getApis().items().stream().filter(api -> f.name.equals(api.name()))
+                        .forEach(api -> admin.deleteApi(b -> b.apiId(api.apiId())));
+            }
+        });
+    }
+
     private ApiGatewayClient sessionClient(Credentials credentials) {
         return ApiGatewayClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
                 .credentialsProvider(StaticCredentialsProvider.create(AwsSessionCredentials.create(
