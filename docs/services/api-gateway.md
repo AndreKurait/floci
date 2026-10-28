@@ -1070,3 +1070,13 @@ normalized OpenAPI plan as the importer, including YAML and ANY-method operation
 creating or replacing API resources. Caller credentials, omitted or null credentials, HTTP
 integration credentials and JWT authorizer fields do not pass an execution role. This check
 does not add OpenAPI reference resolution or AWS-variable substitution beyond the existing importer.
+
+REST Lambda authorizers without `authorizerCredentials` check the Lambda resource
+policy when IAM enforcement is enabled. TOKEN and REQUEST authorizers use the API
+owner, the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
+qualified Lambda target. Missing permission returns an authorizer configuration
+error before invoking Lambda. Cached authorizer results do not invoke Lambda; a
+cache miss or stage cache flush makes the next invocation check permission again.
+Configured authorizer roles retain their existing execution path; this check does
+not implement role assumption, HTTP/WebSocket authorizer permissions, or prove
+live AWS or native-image parity.
