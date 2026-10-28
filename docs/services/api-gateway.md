@@ -1222,3 +1222,13 @@ REST resource-policy evaluation for callers without verified AWS credentials lea
 `aws:PrincipalIsAWSService` absent. `Bool` matching `false` does not match an
 absent key; `Null` and `BoolIfExists` retain their IAM condition semantics.
 A Cognito token or custom authorizer principal does not become an AWS credential.
+
+### WebSocket connection management permissions
+
+With IAM enforcement enabled, GET, POST and DELETE requests to `@connections`
+require a verified SigV4 caller and `execute-api:ManageConnections` permission.
+The resource is the API owner's `api-id/stage/METHOD/@connections` ARN, without
+an individual connection ID. Identity policies, session policies, permissions
+boundaries and SCPs use the shared caller evaluator. Policy changes apply to
+every request, and a permitted endpoint cannot access another API or stage's
+connection. IAM-disabled local connection management remains unsigned.
