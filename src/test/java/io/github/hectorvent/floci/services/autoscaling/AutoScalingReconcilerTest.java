@@ -505,6 +505,97 @@ class AutoScalingReconcilerTest {
         assertEquals("7", asg.getInstances().getFirst().getLaunchTemplateVersion());
     }
 
+    @ParameterizedTest
+    @MethodSource("launchTemplateVersionSelections")
+    void scaleOutDefaultsOmittedLaunchTemplateVersionAndPreservesExplicitVersions(
+            boolean mixed, String requestedVersion, String expectedSelector, String expectedVersion,
+            String expectedImage) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        AutoScalingReconciler reconciler =
+                new AutoScalingReconciler(asgService, ec2Service, mock(ElbV2Service.class));
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        asg.setDesiredCapacity(1);
+        when(asgService.saveAutoScalingGroupIfPresent(asg)).thenReturn(true);
+        if (mixed) {
+            MixedInstancesPolicy.LaunchTemplateSpecification specification =
+                    new MixedInstancesPolicy.LaunchTemplateSpecification();
+            specification.setLaunchTemplateId("lt-123");
+            specification.setVersion(requestedVersion);
+            MixedInstancesPolicy.LaunchTemplate policyTemplate = new MixedInstancesPolicy.LaunchTemplate();
+            policyTemplate.setLaunchTemplateSpecification(specification);
+            MixedInstancesPolicy policy = new MixedInstancesPolicy();
+            policy.setLaunchTemplate(policyTemplate);
+            asg.setMixedInstancesPolicy(policy);
+        } else {
+            asg.setLaunchTemplateId("lt-123");
+            asg.setLaunchTemplateVersion(requestedVersion);
+        }
+
+        LaunchTemplate template = new LaunchTemplate();
+        template.setLaunchTemplateId("lt-123");
+        template.setDefaultVersionNumber("1");
+        template.setLatestVersionNumber("2");
+        LaunchTemplate defaultVersion = new LaunchTemplate();
+        defaultVersion.setLatestVersionNumber("1");
+        defaultVersion.getData().setImageId("ami-default");
+        defaultVersion.getData().setInstanceType("t3.micro");
+        LaunchTemplate latestVersion = new LaunchTemplate();
+        latestVersion.setLatestVersionNumber("2");
+        latestVersion.getData().setImageId("ami-latest");
+        latestVersion.getData().setInstanceType("t3.small");
+        when(ec2Service.describeLaunchTemplates("us-east-1", List.of("lt-123"), List.of(), Map.of()))
+                .thenReturn(List.of(template));
+        when(ec2Service.describeLaunchTemplateVersions(eq("us-east-1"), eq("lt-123"), isNull(), anyList()))
+                .thenAnswer(invocation -> {
+                    List<String> selectors = invocation.getArgument(3);
+                    String selector = selectors.isEmpty() ? "$Latest" : selectors.getFirst();
+                    return switch (selector) {
+                        case "$Default", "1" -> List.of(defaultVersion);
+                        case "$Latest", "2" -> List.of(latestVersion);
+                        default -> throw new AssertionError("Unexpected version selector: " + selectors);
+                    };
+                });
+        Instance ec2Instance = new Instance();
+        ec2Instance.setInstanceId("i-launched");
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(ec2Instance));
+        when(ec2Service.runInstances(eq("us-east-1"), anyString(), anyString(),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
+                onlyGroupNameTag("app-asg"), eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any(),
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
+
+        reconciler.reconcile(asg);
+
+        assertEquals(1, asg.getInstances().size());
+        assertEquals(expectedVersion, asg.getInstances().getFirst().getLaunchTemplateVersion());
+        assertEquals(requestedVersion, mixed
+                ? asg.getMixedInstancesPolicy().getLaunchTemplate().getLaunchTemplateSpecification().getVersion()
+                : asg.getLaunchTemplateVersion());
+        verify(ec2Service).describeLaunchTemplateVersions(
+                "us-east-1", "lt-123", null, List.of(expectedSelector));
+        verify(ec2Service).runInstances(eq("us-east-1"), eq(expectedImage), anyString(),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
+                onlyGroupNameTag("app-asg"), eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any(),
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull());
+    }
+
+    static Stream<Arguments> launchTemplateVersionSelections() {
+        return Stream.of(
+                Arguments.of(false, null, "$Default", "1", "ami-default"),
+                Arguments.of(true, null, "$Default", "1", "ami-default"),
+                Arguments.of(false, "$Default", "$Default", "1", "ami-default"),
+                Arguments.of(true, "$Default", "$Default", "1", "ami-default"),
+                Arguments.of(false, "$Latest", "$Latest", "2", "ami-latest"),
+                Arguments.of(true, "$Latest", "$Latest", "2", "ami-latest"),
+                Arguments.of(false, "2", "2", "2", "ami-latest"),
+                Arguments.of(true, "2", "2", "2", "ami-latest"));
+    }
+
     @Test
     void scaleOutUsesMixedInstancesLaunchTemplateSpecification() {
         AutoScalingService asgService = scalingService();
@@ -1180,7 +1271,7 @@ class AutoScalingReconcilerTest {
                 && groupName.equals(tags.getFirst().getValue()));
     }
 
-    private static void stubLaunchTemplate(Ec2Service ec2Service, String imageId, String instanceType) {
+    private static LaunchTemplate stubLaunchTemplate(Ec2Service ec2Service, String imageId, String instanceType) {
         LaunchTemplate launchTemplate = new LaunchTemplate();
         launchTemplate.setLaunchTemplateId("lt-123");
         LaunchTemplate version = new LaunchTemplate();
@@ -1191,6 +1282,7 @@ class AutoScalingReconcilerTest {
                 .thenReturn(List.of(launchTemplate));
         when(ec2Service.describeLaunchTemplateVersions("us-east-1", "lt-123", null, List.of("1")))
                 .thenReturn(List.of(version));
+        return version;
     }
 
     private static AsgInstance instance(String lifecycleState) {
