@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.apigateway;
 
 import com.sun.net.httpserver.HttpServer;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.AccessKey;
@@ -17,7 +18,9 @@ import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -33,9 +36,11 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 import static io.restassured.RestAssured.given;
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
 
 @QuarkusTest
 @TestProfile(SignedIamEnforcementProfile.class)
@@ -47,6 +52,7 @@ class RestRouteIamIntegrationTest {
 
     @Inject
     IamService iam;
+    Function<String, String> fixtureNames = prefix -> prefix + UUID.randomUUID();
 
     @TestHTTPResource("/")
     URI endpoint;
@@ -81,16 +87,16 @@ class RestRouteIamIntegrationTest {
     @Test
     void issuedRoleSessionsRetainPolicyTokenAndRevocationChecks() throws Exception {
         Fixture fixture = fixture("GET");
-        String name = "rest-route-role-" + UUID.randomUUID();
+        String name = fixtureNames.apply("rest-route-role-");
         String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
                 + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
-        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
                 "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
                 .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
-        cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
                 "PolicyDocument", policy(fixture.arn()))).then().statusCode(200);
+        cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
         Key denied = assume(role, policy(fixture.arn()).replace("Allow", "Deny"));
         invoke(fixture, denied, 403);
         Key allowed = assume(role, null);
@@ -136,13 +142,13 @@ class RestRouteIamIntegrationTest {
     void foreignSignedCallerNeedsIdentityAndApiResourceGrants() throws Exception {
         Fixture fixture = fixture("GET");
         String account = "444455556666";
-        String name = "rest-foreign-" + UUID.randomUUID();
-        cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteUser(name)));
+        String name = fixtureNames.apply("rest-foreign-");
         RequestScopes.runAs(account, () -> iam.createUser(name, "/"));
+        cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteUser(name)));
         AccessKey access = RequestScopes.callAs(account, () -> iam.createAccessKey(name));
         cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteAccessKey(name, access.getAccessKeyId())));
-        cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteUserPolicy(name, "invoke")));
         RequestScopes.runAs(account, () -> iam.putUserPolicy(name, "invoke", policy(fixture.arn())));
+        cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteUserPolicy(name, "invoke")));
         Key key = new Key(access.getAccessKeyId(), access.getSecretAccessKey(), null);
         invoke(fixture, key, 403);
         String policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
@@ -154,6 +160,62 @@ class RestRouteIamIntegrationTest {
         RequestScopes.runAs(account, () -> iam.putUserPolicy(name, "invoke", "{\"Statement\":[]}"));
         invoke(fixture, key, 403);
         assertEquals(1, fixture.hits().get());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"policy"})
+    void rejectedRoleCreationPreservesPreexistingRole(String scenario) throws Exception {
+        String name = "rest-existing-role-" + UUID.randomUUID();
+        SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
+                "AssumeRolePolicyDocument", "{\"Statement\":[]}")).then().statusCode(200);
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        RestRouteIamIntegrationTest fixture = nestedFixture(name);
+        Executable call = switch (scenario) {
+            case "policy" -> fixture::issuedRoleSessionsRetainPolicyTokenAndRevocationChecks;
+            default -> throw new IllegalArgumentException(scenario);
+        };
+        try {
+            assertThrows(AssertionError.class, call);
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(200);
+    }
+
+    @Test
+    void rejectedForeignUserCreationPreservesPreexistingUser() throws Exception {
+        String account = "444455556666";
+        String name = "rest-existing-user-" + UUID.randomUUID();
+        RequestScopes.runAs(account, () -> iam.createUser(name, "/"));
+        cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteUser(name)));
+        RestRouteIamIntegrationTest fixture = nestedFixture(name);
+        try {
+            assertThrows(AwsException.class, fixture::foreignSignedCallerNeedsIdentityAndApiResourceGrants);
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        assertDoesNotThrow(() -> RequestScopes.callAs(account, () -> iam.getUser(name)));
+    }
+
+    @Test
+    void successfulForeignUserScenarioRemovesOwnedUserAndDependents() throws Exception {
+        String name = "rest-owned-user-" + UUID.randomUUID();
+        RestRouteIamIntegrationTest fixture = nestedFixture(name);
+        try {
+            fixture.foreignSignedCallerNeedsIdentityAndApiResourceGrants();
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        assertThrows(AwsException.class,
+                () -> RequestScopes.callAs("444455556666", () -> iam.getUser(name)));
+    }
+
+    private RestRouteIamIntegrationTest nestedFixture(String name) {
+        RestRouteIamIntegrationTest fixture = new RestRouteIamIntegrationTest();
+        fixture.iam = iam;
+        fixture.endpoint = endpoint;
+        fixture.fixtureNames = prefix -> name;
+        return fixture;
     }
 
     private void cleanupIam(String action, Map<String, String> parameters) {
