@@ -24,6 +24,7 @@ import software.amazon.awssdk.services.apigateway.ApiGatewayClient;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -52,6 +53,22 @@ class RestCustomResourcePolicyIntegrationTest {
 
     @RegisterExtension
     final PartitionCleanup cleanup = new PartitionCleanup();
+
+    @Test
+    void absentPrincipalFlagDenyPrecedesAuthorizerAndIsRecheckedOnCacheHit() throws Exception {
+        Fixture f = fixture("GET");
+        authorizer("Allow", f.arn() + "other");
+        String condition = ",\"Condition\":{\"Null\":{\"aws:PrincipalIsAWSService\":\"true\"}}";
+        policy(f, resourcePolicy("Deny", f.arn(), condition));
+        invoke(f, Map.of(), 403);
+        verifyNoInteractions(lambda);
+        policy(f, resourcePolicy("Allow", f.arn(), condition));
+        invoke(f, Map.of("Authorization", "token"), 200);
+        policy(f, resourcePolicy("Deny", f.arn(), condition));
+        invoke(f, Map.of("Authorization", "token"), 403);
+        verify(lambda, times(1)).invokeTarget(anyString(), anyString(), any(byte[].class), any());
+        assertEquals(1, f.hits().get());
+    }
 
     @ParameterizedTest
     @ValueSource(strings = {"GET", "ANY"})
@@ -148,6 +165,12 @@ class RestCustomResourcePolicyIntegrationTest {
                 .authorizerUri("arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:"
                         + OWNER + ":function:custom-policy-authorizer/invocations")
                 .identitySource("method.request.header.Authorization").authorizerResultTtlInSeconds(300)).id();
+        when(lambda.policyStatements(OWNER, "us-east-1", "custom-policy-authorizer")).thenReturn(List.of(Map.of(
+                "Effect", "Allow", "Principal", Map.of("Service", "apigateway.amazonaws.com"),
+                "Action", "lambda:InvokeFunction", "Resource",
+                "arn:aws:lambda:us-east-1:" + OWNER + ":function:custom-policy-authorizer",
+                "Condition", Map.of("StringEquals", Map.of("AWS:SourceAccount", OWNER,
+                        "AWS:SourceArn", "arn:aws:execute-api:us-east-1:" + OWNER + ":" + id + "/authorizers/" + auth)))));
         api.putMethod(request -> request.restApiId(id).resourceId(resourceId).httpMethod(routeKey)
                 .authorizationType("CUSTOM").authorizerId(auth));
         api.putIntegration(request -> request.restApiId(id).resourceId(resourceId).httpMethod(routeKey)

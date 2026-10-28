@@ -54,6 +54,20 @@ class RestRouteIamIntegrationTest {
     @RegisterExtension
     final PartitionCleanup cleanup = new PartitionCleanup();
 
+    @Test
+    void signedUserRetainsFalsePrincipalServiceFlag() throws Exception {
+        Fixture fixture = fixture("GET");
+        String document = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"execute-api:Invoke\","
+                + "\"Resource\":\"" + fixture.arn() + "\",\"Condition\":{\"Bool\":{\"aws:PrincipalIsAWSService\":\"false\"}}}}";
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "rest-principal-", "invoke", document)) {
+            Key key = new Key(user.accessKeyId(), user.secretAccessKey(), null);
+            invoke(fixture, key, 200);
+            putPolicy(user, document.replace("\"Bool\"", "\"Null\"").replace("\"false\"", "\"true\""));
+            invoke(fixture, key, 403);
+            assertEquals(1, fixture.hits().get());
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"GET", "ANY"})
     void signedCallerNeedsExactRoutePermissionBeforeHttpBackend(String routeKey) throws Exception {
