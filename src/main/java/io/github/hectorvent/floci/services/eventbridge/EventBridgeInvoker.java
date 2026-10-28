@@ -138,7 +138,10 @@ public class EventBridgeInvoker {
     }
 
     public void invokeTarget(Target target, String eventJson, String region) {
-        String arn = target.getArn();
+        invokeTarget(target, eventJson, region, target.getArn());
+    }
+
+    void invokeTarget(Target target, String eventJson, String region, String arn) {
         String payload;
         if (target.getInput() != null) {
             payload = target.getInput();
