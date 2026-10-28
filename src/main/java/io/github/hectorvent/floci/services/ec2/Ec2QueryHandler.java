@@ -1699,7 +1699,8 @@ public class Ec2QueryHandler {
         String cidrBlock = p.getFirst("CidrBlock");
         boolean amazonProvidedIpv6 = "true".equalsIgnoreCase(p.getFirst("AmazonProvidedIpv6CidrBlock"));
         List<Tag> vpcTags = parseTagsForResource(p, "vpc");
-        Vpc vpc = service.createVpc(region, cidrBlock, false, amazonProvidedIpv6, p.getFirst("InstanceTenancy"));
+        Vpc vpc = service.createVpc(region, cidrBlock, false, amazonProvidedIpv6,
+                p.getFirst("InstanceTenancy"), Boolean.parseBoolean(p.getFirst("DryRun")));
         applyResourceTags(vpcTags, region, vpc.getVpcId());
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateVpcResponse", AwsNamespaces.EC2)
@@ -3324,7 +3325,8 @@ public class Ec2QueryHandler {
         String azId = p.getFirst("AvailabilityZoneId");
         String ipv6CidrBlock = p.getFirst("Ipv6CidrBlock");
         List<Tag> tags = parseTagsForResource(p, "subnet", Set.of("subnet"));
-        Subnet subnet = service.createSubnet(region, vpcId, cidrBlock, az, azId, ipv6CidrBlock);
+        Subnet subnet = service.createSubnet(region, vpcId, cidrBlock, az, azId, ipv6CidrBlock,
+                Boolean.parseBoolean(p.getFirst("DryRun")));
         try {
             if (!tags.isEmpty()) {
                 service.createTags(region, List.of(subnet.getSubnetId()), tags);
@@ -3402,7 +3404,8 @@ public class Ec2QueryHandler {
         String groupName = requireParameter(p, "GroupName");
         String description = requireParameter(p, "GroupDescription");
         String vpcId = p.getFirst("VpcId");
-        SecurityGroup sg = service.createSecurityGroup(region, groupName, description, vpcId);
+        SecurityGroup sg = service.createSecurityGroup(region, groupName, description, vpcId,
+                Boolean.parseBoolean(p.getFirst("DryRun")));
         applyResourceTags(resourceTags, region, sg.getGroupId());
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateSecurityGroupResponse", AwsNamespaces.EC2)
