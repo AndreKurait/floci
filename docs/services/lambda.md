@@ -547,9 +547,12 @@ This implementation supports the non-ephemeral Docker executor with immutable pu
 versions and simple aliases. It refuses `$LATEST`, weighted aliases, hot reload, durable
 functions and other executors. Allocations share the configured `warm-pool-max-per-function`
 ceiling across a function's qualifiers, and the optional `warm-pool-max-total` ceiling across
-provisioned allocations. A function's reserved concurrency is also a ceiling. These local
-resource bounds do not implement AWS's complete regional provisioned-concurrency quota
-accounting, automatic scaling, or weighted-alias allocation. Provisioned runtimes receive
+provisioned allocations. A function's reserved concurrency is also a ceiling. Without a
+reservation, provisioned allocations consume the account and region's unreserved capacity;
+Put leaves at least `unreserved-concurrency-min` available. `GetAccountSettings` reflects
+these allocations without counting provisioned capacity twice when a function has a
+reservation. Cold spillover still consumes ordinary unreserved permits. Automatic scaling
+and weighted-alias allocation remain unsupported. Provisioned runtimes receive
 their numeric `AWS_LAMBDA_FUNCTION_VERSION` and
 `AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency`.
 
