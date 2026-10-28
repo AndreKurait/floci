@@ -48,6 +48,7 @@ import io.github.hectorvent.floci.services.apigateway.model.UsagePlan;
 import io.github.hectorvent.floci.services.apigateway.model.UsagePlanKey;
 import io.github.hectorvent.floci.services.apigateway.model.VpcLink;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
+import io.github.hectorvent.floci.services.iam.PassedRoleLookup;
 import io.swagger.parser.OpenAPIParser;
 import io.swagger.v3.core.util.Json;
 import io.swagger.v3.oas.models.OpenAPI;
@@ -87,7 +88,7 @@ import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
-public class ApiGatewayService implements ResourceProvider {
+public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
 
     /** The only partition where API Gateway offers edge-optimized APIs and custom domain names. */
     private static final Set<String> EDGE_OPTIMIZED_PARTITIONS = Set.of("aws");
@@ -3702,6 +3703,46 @@ public class ApiGatewayService implements ResourceProvider {
     }
 
     // ──────────────────────────── OpenAPI Import ────────────────────────────
+
+    /** Reads only integration assignments, before the shared IAM filter permits any import mutation. */
+    @Override
+    public List<String> importedRestApiIntegrationRoles(String document, String region) {
+        OpenAPI openAPI;
+        try {
+            openAPI = parseOpenApiSpec(region, document, false).openAPI();
+        } catch (AwsException expected) {
+            // The normal import path reports invalid documents; they cannot assign credentials.
+            LOG.debugv(expected, "Invalid REST API import has no integration role assignments");
+            return List.of();
+        }
+        List<String> roles = new ArrayList<>();
+        if (openAPI.getPaths() == null) {
+            return roles;
+        }
+        for (Map.Entry<String, PathItem> entry : openAPI.getPaths().entrySet()) {
+            PathItem path = entry.getValue();
+            for (Operation operation : path.readOperations()) {
+                collectImportedIntegrationRole(operation, roles);
+            }
+            Object any = path.getExtensions() == null ? null
+                    : path.getExtensions().get("x-amazon-apigateway-any-method");
+            if (any != null) {
+                collectImportedIntegrationRole(parseAnyMethodOperation(entry.getKey(), any), roles);
+            }
+        }
+        return roles;
+    }
+
+    private static void collectImportedIntegrationRole(Operation operation, List<String> roles) {
+        Object extension = operation.getExtensions() == null ? null
+                : operation.getExtensions().get("x-amazon-apigateway-integration");
+        if (extension instanceof Map<?, ?> integration
+                && integration.get("type") instanceof String type
+                && ApiGatewayIntegrationTypes.canonical(type) != null
+                && integration.get("credentials") instanceof String credentials) {
+            roles.add(credentials);
+        }
+    }
 
     public RestApi importRestApi(String region, String specBody) {
         return importRestApi(region, specBody, false);
