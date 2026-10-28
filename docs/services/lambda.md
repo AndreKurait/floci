@@ -1369,3 +1369,10 @@ remain in effect.
 
 Environment variables use the quoted map-key form, for example
 `FLOCI_SERVICES_LAMBDA_RUNTIME_IMAGES__JAVA17_LINUX_ARM64__`.
+
+### Provisioned concurrency recovery
+
+Terminal runtime failures, failed leases, alias updates and completed teardown wake
+the serial capacity reconciler. A ten-second repair sweep covers unobserved changes.
+Replacement environments still finish actual initialization and obey account and
+function capacity limits before becoming available.
