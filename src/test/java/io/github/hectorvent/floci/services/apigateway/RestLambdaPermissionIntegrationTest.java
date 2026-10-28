@@ -94,10 +94,9 @@ class RestLambdaPermissionIntegrationTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"AWS_PROXY,arn:aws:iam::121212121212:role/integration",
-            "AWS,arn:aws:iam::121212121212:role/integration",
-            "AWS_PROXY,arn:aws:iam::*:user/*", "AWS,arn:aws:iam::*:user/*"})
-    void configuredCredentialsRemainOutsideServicePrincipalEvaluation(String type, String credentials) throws Exception {
+    @CsvSource({"AWS_PROXY,arn:aws:iam::*:user/*", "AWS,arn:aws:iam::*:user/*",
+            "AWS_PROXY,*", "AWS,*"})
+    void callerCredentialsRemainOutsideServicePrincipalEvaluation(String type, String credentials) throws Exception {
         Fixture fixture = fixture(type, OWNER, REGION, credentials);
         invoke(fixture, 200);
         verifyInvocations(fixture, 2);
@@ -119,6 +118,52 @@ class RestLambdaPermissionIntegrationTest {
         } finally {
             doCallRealMethod().when(lambda).policyStatements(OWNER, REGION, fixture.name());
         }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"AWS_PROXY,121212121212,us-east-1", "AWS,121212121212,us-east-1",
+            "AWS_PROXY,343434343434,eu-west-1", "AWS,343434343434,eu-west-1"})
+    void configuredRoleRequiresTrustIdentityAndQualifiedResource(String type, String targetOwner,
+                                                                String targetRegion) throws Exception {
+        String roleName = "rest-role-permission-" + UUID.randomUUID().toString().substring(0, 8);
+        String roleArn = "arn:aws:iam::" + OWNER + ":role/service-role/" + roleName;
+        Fixture fixture = fixture(type, targetOwner, targetRegion, roleArn);
+        invoke(fixture, 500);
+        String trust = """
+                {"Version":"2012-10-17","Statement":{"Effect":"Allow",
+                "Principal":{"Service":"apigateway.amazonaws.com"},"Action":"sts:AssumeRole"}}""";
+        iam("CreateRole", Map.of("RoleName", roleName, "Path", "/service-role/",
+                "AssumeRolePolicyDocument", trust.replace("apigateway.amazonaws.com", "events.amazonaws.com")));
+        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", roleName)));
+        String policy = """
+                {"Statement":{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":"%s"}}"""
+                .formatted(fixture.arn());
+        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke", "PolicyDocument", policy));
+        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke")));
+        invoke(fixture, 500);
+        iam("UpdateAssumeRolePolicy", Map.of("RoleName", roleName, "PolicyDocument", trust));
+        if (!OWNER.equals(targetOwner)) {
+            invoke(fixture, 500);
+            lambdaRequest(targetOwner, targetRegion).queryParam("Qualifier", "live")
+                    .body(Map.of("StatementId", "role", "Action", "lambda:InvokeFunction", "Principal", roleArn))
+                    .post("/2015-03-31/functions/" + fixture.name() + "/policy").then().statusCode(201);
+        }
+        invoke(fixture, 200);
+        verifyInvocations(fixture, 2);
+        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke",
+                "PolicyDocument", policy.replace(fixture.arn(), fixture.arn().replace(":live", ":other"))));
+        invoke(fixture, 500);
+        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke", "PolicyDocument", policy));
+        iam("UpdateAssumeRolePolicy", Map.of("RoleName", roleName,
+                "PolicyDocument", trust.replace("Allow", "Deny")));
+        invoke(fixture, 500);
+        verifyInvocations(fixture, 2);
+    }
+
+    private static void iam(String action, Map<String, String> parameters) {
+        given().header("Authorization", EnforcementFixtures.auth(OWNER, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", action)
+                .formParams(parameters).post("/").then().statusCode(200);
     }
 
     private Fixture fixture(String type, String targetOwner, String targetRegion, String credentials) throws Exception {

@@ -12,9 +12,19 @@ integrations, the source ARN uses the function's region, as documented by AWS.
 Removing a grant prevents subsequent integration invocations. An existing cached
 API response does not invoke Lambda again.
 
-Configured role or caller-passthrough credentials retain their existing behavior;
-this check does not implement their authorization. HTTP/WebSocket integrations
-and Lambda authorizers are outside this REST integration permission check.
+Configured IAM roles must exist in the API owner's account, trust the `apigateway`
+service principal, and allow the qualified Lambda target through the shared IAM
+identity/resource-policy evaluator, permissions boundary and account SCPs.
+Cross-account targets require a resource-policy grant as well. Each invocation
+rechecks permissions and invokes the same captured target that was authorized.
+The role's full path and boundary attachment are retained during evaluation.
+
+Role trust evaluation does not synthesize API Gateway source condition keys:
+service-specific source context and actual issued STS session identities are not
+modeled here. The role principal is evaluated without issuing session credentials.
+Caller-passthrough credentials retain their existing behavior and remain outside
+this role check. HTTP/WebSocket integrations and Lambda authorizers are separate
+permission paths.
 IAM enforcement disabled retains the existing permissive behavior.
 
 
@@ -528,7 +538,7 @@ in that map, return `BadRequestException` rather than silently discarding or cha
 | `contentHandling` | `CONVERT_TO_TEXT` base64-encodes a binary request for mapping templates; `CONVERT_TO_BINARY` base64-decodes a text request before sending it |
 | `connectionType` / `connectionId` | `VPC_LINK` requires `connectionId` to name an existing, available VPC link; an unknown link yields `502` |
 | `cacheNamespace` / `cacheKeyParameters` | Form the response cache key (see below) |
-| `credentials` | Persisted and returned. Floci does not enforce IAM, so the role is not actually assumed |
+| `credentials` | Persisted and returned. With IAM enforcement enabled, REST Lambda integration roles are checked as described above; no actual STS session is issued. Other service integrations and caller passthrough retain their existing behavior |
 
 Integration responses additionally accept `contentHandling`, applied as an output conversion after response templates.
 
