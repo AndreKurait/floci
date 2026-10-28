@@ -13,12 +13,12 @@ import io.github.hectorvent.floci.services.iam.model.IamUser;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.HttpHeaders;
-import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
 
 import java.net.URI;
 import java.time.Instant;
+import java.util.function.Function;
 
 /**
  * Verifies the SigV4 signature on an execute-api data-plane request, so a route or method whose
@@ -106,7 +106,20 @@ public class ExecuteApiSigV4Authorizer {
     public Result authorize(String httpMethod, HttpHeaders headers, UriInfo uriInfo, byte[] body,
                             String signedRequestPath) {
         try {
-            return verify(httpMethod, headers, uriInfo, body, signedRequestPath);
+            return authorize(httpMethod, uriInfo.getRequestUri(),
+                    name -> headers == null ? null : headers.getHeaderString(name),
+                    uriInfo.getQueryParameters()::getFirst, body, signedRequestPath);
+        } catch (Exception e) {
+            LOG.debugv(e, "execute-api SigV4 request adaptation failed: {0}", e.getMessage());
+            return Result.rejected(Failure.MALFORMED, "signature could not be verified");
+        }
+    }
+
+    /** Verifies the original handshake without adapting or rewriting its signed URI. */
+    public Result authorize(String httpMethod, URI requestUri, Function<String, String> headers,
+                            Function<String, String> queryParameters, byte[] body, String signedRequestPath) {
+        try {
+            return verify(httpMethod, requestUri, headers, queryParameters, body, signedRequestPath);
         } catch (Exception e) {
             // A malformed credential, an unparsable date, an unsupported charset: every one of
             // these is a request we could not verify, and an unverifiable request is not
@@ -116,18 +129,18 @@ public class ExecuteApiSigV4Authorizer {
         }
     }
 
-    private Result verify(String httpMethod, HttpHeaders headers, UriInfo uriInfo, byte[] body,
+    private Result verify(String httpMethod, URI requestUri, Function<String, String> headers,
+                          Function<String, String> queryParameters, byte[] body,
                           String signedRequestPath) throws Exception {
-        MultivaluedMap<String, String> queryParameters = uriInfo.getQueryParameters();
-        String authorization = headers == null ? null : headers.getHeaderString(HttpHeaders.AUTHORIZATION);
-        boolean presigned = SigV4SignedRequest.ALGORITHM.equals(queryParameters.getFirst("X-Amz-Algorithm"));
+        String authorization = headers.apply(HttpHeaders.AUTHORIZATION);
+        boolean presigned = SigV4SignedRequest.ALGORITHM.equals(queryParameters.apply("X-Amz-Algorithm"));
 
         if (!presigned && (authorization == null || authorization.isBlank())) {
             return Result.rejected(Failure.MISSING, "request is not SigV4-signed");
         }
 
         SigV4SignedRequest signed = presigned
-                ? SigV4SignedRequest.fromQuery(queryParameters::getFirst)
+                ? SigV4SignedRequest.fromQuery(queryParameters::apply)
                 : SigV4SignedRequest.fromHeader(authorization, amzDate(headers));
         if (signed == null) {
             return Result.rejected(Failure.MALFORMED, "SigV4 credentials are incomplete");
@@ -167,23 +180,23 @@ public class ExecuteApiSigV4Authorizer {
         }
 
         Result sessionToken = checkSessionToken(scope.accessKeyId(), presigned
-                ? queryParameters.getFirst(SECURITY_TOKEN)
-                : headers == null ? null : headers.getHeaderString(SECURITY_TOKEN));
+                ? queryParameters.apply(SECURITY_TOKEN)
+                : headers.apply(SECURITY_TOKEN));
         if (sessionToken != null) {
             return sessionToken;
         }
 
         String payloadHash = SigV4Canonicalization.payloadHash(
-                headers == null ? null : headers.getHeaderString("x-amz-content-sha256"),
+                headers.apply("x-amz-content-sha256"),
                 signed.signedHeaders(), body, presigned);
         String canonicalHeaders = SigV4Canonicalization.canonicalHeaders(signed.signedHeaders(),
-                name -> "host".equals(name) ? hostHeader(headers, uriInfo) : headerValue(headers, name));
+                name -> "host".equals(name) ? hostHeader(headers, requestUri) : headerValue(headers, name));
         String canonicalQueryString = SigV4Canonicalization.canonicalQueryString(
-                uriInfo.getRequestUri().getRawQuery(), presigned);
+                requestUri.getRawQuery(), presigned);
 
         String rawPath = signedRequestPath != null
                 ? signedRequestPath
-                : uriInfo.getRequestUri().getRawPath();
+                : requestUri.getRawPath();
         if (SigV4Canonicalization.signatureMatches(httpMethod, rawPath, canonicalQueryString, canonicalHeaders,
                 signed.signedHeaders(), payloadHash, signed.amzDate(), scope, secretKey, signed.signature())) {
             return new Result(null, null, resolveIdentity(scope.accessKeyId()));
@@ -282,15 +295,15 @@ public class ExecuteApiSigV4Authorizer {
     }
 
     /** The signing time of a header signature: {@code X-Amz-Date}, or {@code Date} when it is absent. */
-    private static String amzDate(HttpHeaders headers) {
-        String amzDate = headers.getHeaderString("X-Amz-Date");
-        return isBlank(amzDate) ? headers.getHeaderString("Date") : amzDate;
+    private static String amzDate(Function<String, String> headers) {
+        String amzDate = headers.apply("X-Amz-Date");
+        return isBlank(amzDate) ? headers.apply("Date") : amzDate;
     }
 
     // ──────────────────────────── Canonical request ────────────────────────────
 
-    private static String headerValue(HttpHeaders headers, String name) {
-        String value = headers == null ? null : headers.getHeaderString(name);
+    private static String headerValue(Function<String, String> headers, String name) {
+        String value = headers.apply(name);
         return value == null ? "" : value;
     }
 
@@ -299,12 +312,11 @@ public class ExecuteApiSigV4Authorizer {
      * carried rather than from the resolved URI, because that is what the signer hashed; the URI
      * is only a fallback for callers (notably unit tests) that build a request without one.
      */
-    private static String hostHeader(HttpHeaders headers, UriInfo uriInfo) {
-        String host = headers == null ? null : headers.getHeaderString("Host");
+    private static String hostHeader(Function<String, String> headers, URI requestUri) {
+        String host = headers.apply("Host");
         if (host != null && !host.isBlank()) {
             return host;
         }
-        URI requestUri = uriInfo.getRequestUri();
         int port = requestUri.getPort();
         return port > 0 && port != 80 && port != 443
                 ? requestUri.getHost() + ":" + port
