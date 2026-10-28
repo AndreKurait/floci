@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
 import io.github.hectorvent.floci.services.apigateway.AwsServiceRouter;
 import io.github.hectorvent.floci.services.apigateway.VtlTemplateEngine;
@@ -62,20 +63,22 @@ public class WebSocketIntegrationInvoker {
     private final HttpClient httpClient;
     private final AddressResolver addressResolver;
     private final ServiceCallAuthorizer serviceCallAuthorizer;
+    private final ServiceRoleCallAuthorizer serviceRoleCallAuthorizer;
     private final RegionResolver regionResolver;
 
     @Inject
     public WebSocketIntegrationInvoker(LambdaService lambdaService, AwsServiceRouter serviceRouter,
                                        ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
-                                       ServiceCallAuthorizer serviceCallAuthorizer, RegionResolver regionResolver) {
+                                       ServiceCallAuthorizer serviceCallAuthorizer, RegionResolver regionResolver,
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer) {
         this(lambdaService, serviceRouter, objectMapper, vtlEngine, serviceCallAuthorizer, regionResolver,
-                InetAddress::getAllByName);
+                serviceRoleCallAuthorizer, InetAddress::getAllByName);
     }
 
     WebSocketIntegrationInvoker(LambdaService lambdaService, AwsServiceRouter serviceRouter,
                                 ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
                                 ServiceCallAuthorizer serviceCallAuthorizer, RegionResolver regionResolver,
-                                AddressResolver addressResolver) {
+                                ServiceRoleCallAuthorizer serviceRoleCallAuthorizer, AddressResolver addressResolver) {
         this.lambdaService = lambdaService;
         this.serviceRouter = serviceRouter;
         this.objectMapper = objectMapper;
@@ -84,6 +87,7 @@ public class WebSocketIntegrationInvoker {
         this.addressResolver = addressResolver;
         this.serviceCallAuthorizer = serviceCallAuthorizer;
         this.regionResolver = regionResolver;
+        this.serviceRoleCallAuthorizer = serviceRoleCallAuthorizer;
     }
 
     @FunctionalInterface
@@ -154,17 +158,25 @@ public class WebSocketIntegrationInvoker {
                 LOG.warnv("Could not extract function name from integration URI: {0}", integration.getIntegrationUri());
                 return new IntegrationResult(500, null, "Invalid integration URI");
             }
-            if (integration.getCredentialsArn() == null || integration.getCredentialsArn().isBlank()) {
-                String accountId = regionResolver.getAccountId();
-                String functionArn = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
-                        region, accountId);
+            String accountId = regionResolver.getAccountId();
+            String functionArn = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
+                    region, accountId);
+            String credentials = integration.getCredentialsArn();
+            Decision decision = Decision.ALLOW;
+            if (credentials == null || credentials.isBlank()) {
                 String sourceArn = AwsArnUtils.Arn.of("execute-api", region, accountId,
                         apiId + "/" + stageName + "/" + routeKey).toString();
-                if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
-                        sourceArn, accountId) == Decision.DENY) {
-                    return new IntegrationResult(500, null, "Invalid permissions on Lambda function");
-                }
+                decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                        sourceArn, accountId);
+            } else if (!"*".equals(credentials) && !credentials.equals(AwsArnUtils.Arn.global(
+                    regionResolver.getPartition(), "iam", "*", "user/*").toString())) {
+                decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                        "lambda:InvokeFunction", functionArn, accountId, regionResolver.getPartition());
             }
+            if (decision == Decision.DENY) {
+                return new IntegrationResult(500, null, "Invalid permissions on Lambda function");
+            }
+            functionName = functionArn;
         }
 
         return switch (integrationType) {
