@@ -153,6 +153,9 @@ class AlarmSnsNotifierTest {
                     composite.setAlarmName("unrelated");
                     composite.setAlarmRule("FALSE");
                     service.putCompositeAlarm(composite, REGION);
+                    MetricAlarm unrelatedAlarm = new MetricAlarm();
+                    unrelatedAlarm.setAlarmName("unrelated-metric");
+                    service.putMetricAlarm(unrelatedAlarm, REGION);
                     service.setAlarmState("test-alarm", "OK", "recovered", null, REGION);
                 });
                 unrelated.get(2, TimeUnit.SECONDS);
