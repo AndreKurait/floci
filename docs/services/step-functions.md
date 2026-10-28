@@ -307,6 +307,10 @@ is `0`. The state that was cut gets no `*StateExited` event. A `Parallel` or `Ma
 on its own thread and is not cut mid-state: the budget is enforced again as soon as the branch
 returns.
 
+The workflow's maximum execution time also bounds this budget: one year (365 days) for
+Standard workflows and five minutes for Express workflows. The Express limit applies to both
+`StartExecution` and `StartSyncExecution`. A shorter state-machine `TimeoutSeconds` takes precedence.
+
 A `Task` that waits for a task token — an activity, or a `.waitForTaskToken` integration — has
 two independent bounds. `TimeoutSeconds` is the whole wait; `HeartbeatSeconds` is the longest gap
 allowed between two `SendTaskHeartbeat` calls, and every heartbeat pushes that gap forward, so a
@@ -316,13 +320,13 @@ clock ends the state the same way: an `ActivityTimedOut` event — `TaskTimedOut
 reads `FAILED` with that same error. A `Catch` on a heartbeat expiry matches under
 `States.HeartbeatTimeout` and under `States.Timeout` alike. Neither timeout carries a cause:
 `DescribeExecution` and the `ExecutionFailed` event both leave the key out, where every other
-failure reports one. A `Task` that declares no `TimeoutSeconds` waits 300 seconds, where AWS
-waits a year.
+failure reports one. A `Task` that declares no `TimeoutSeconds` uses AWS's default of
+99,999,999 seconds, constrained by the workflow's execution budget.
 
 A `Task` that waits for a `.sync` job runs under the same two clocks and no other: the execution's
 budget ends it `TIMED_OUT`, its own `TimeoutSeconds` ends it `FAILED` with a `TaskTimedOut` event
 carrying `States.Timeout` and no cause, and a job that takes longer than either simply runs until
-the earlier clock fires. The default of 300 seconds applies here too when the state declares none.
+the earlier clock fires. The same default applies here when the state declares none.
 When the `Task`'s own clock fires, the job it was waiting on is stopped the way AWS stops it: the
 ECS task reads `stopCode: UserInitiated`, the child execution reads `ABORTED` with no error, and
 both carry the cause `The Task state in AWS Step Functions execution [<arn>] which was managing
@@ -1033,3 +1037,7 @@ aws stepfunctions get-execution-history \
   --execution-arn $EXEC_ARN \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+Execution history uses paginated, 24-hour continuation tokens. `maxResults` omitted or zero defaults to 100; the maximum is 1,000. A token remains valid when the page size or `includeExecutionData` changes, but is bound to its execution and `reverseOrder`.
+Floci authenticates history tokens with a process-local key. Edited or unsigned tokens return
+`InvalidToken`; restarting Floci invalidates outstanding tokens.
