@@ -163,11 +163,54 @@ class WebSocketRouteIamTest {
         assertEquals(403, invoke());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"identity", "session", "boundary", "scp"})
+    void connectionTransportConditionsApplyToEveryPolicyLayer(String layer) {
+        String allowed = conditioned("Allow", "127.0.0.0/8", false);
+        String denied = conditioned("Deny", "127.0.0.0/8", false);
+        switch (layer) {
+            case "identity" -> policy(allowed);
+            case "session" -> when(iam.resolveCallerContext(eq(KEY), any()))
+                    .thenReturn(new CallerContext(List.of(ALLOW), allowed, null));
+            case "boundary" -> when(iam.resolveCallerContext(eq(KEY), any()))
+                    .thenReturn(new CallerContext(List.of(ALLOW), null, allowed));
+            case "scp" -> when(scps.effectiveScpLevels(OWNER)).thenReturn(List.of(List.of(allowed)));
+            default -> throw new AssertionError(layer);
+        }
+        assertEquals(200, invoke());
+        switch (layer) {
+            case "identity" -> policy(denied);
+            case "session" -> when(iam.resolveCallerContext(eq(KEY), any()))
+                    .thenReturn(new CallerContext(List.of(ALLOW), denied, null));
+            case "boundary" -> when(iam.resolveCallerContext(eq(KEY), any()))
+                    .thenReturn(new CallerContext(List.of(ALLOW), null, denied));
+            case "scp" -> when(scps.effectiveScpLevels(OWNER)).thenReturn(List.of(List.of(denied)));
+            default -> throw new AssertionError(layer);
+        }
+        assertEquals(403, invoke());
+    }
+
+    @Test
+    void secureAndIpv6ConnectionsUseActualTransportValues() {
+        policy(conditioned("Allow", "2001:db8::/32", true));
+        assertTrue(controller.permitsConnect(route, verified, "us-east-1", "api", "prod", "2001:db8::1", true));
+        assertFalse(controller.permitsConnect(route, verified, "us-east-1", "api", "prod", "2001:db8::1", false));
+        assertFalse(controller.permitsConnect(route, verified, "us-east-1", "api", "prod", "192.0.2.1", true));
+        assertFalse(controller.permitsConnect(route, verified, "us-east-1", "api", "prod", null, true));
+    }
+
+    private static String conditioned(String effect, String address, boolean secure) {
+        return "{\"Statement\":{\"Effect\":\"" + effect
+                + "\",\"Action\":\"execute-api:Invoke\",\"Resource\":\"*\",\"Condition\":{"
+                + "\"IpAddress\":{\"aws:SourceIp\":\"" + address + "\"},"
+                + "\"Bool\":{\"aws:SecureTransport\":\"" + secure + "\"}}}}";
+    }
+
     private void policy(String document) {
         when(iam.resolveCallerContext(eq(KEY), any())).thenReturn(CallerContext.of(List.of(document)));
     }
 
     private int invoke() {
-        return controller.permitsConnect(route, verified, "us-east-1", "api", "prod") ? 200 : 403;
+        return controller.permitsConnect(route, verified, "us-east-1", "api", "prod", "127.0.0.1", false) ? 200 : 403;
     }
 }
