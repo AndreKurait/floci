@@ -543,7 +543,7 @@ public class ContainerLifecycleManager {
      *        SIGTERM before Docker sends SIGKILL. Must be a non-negative integer.
      */
     public void stop(String containerId, int stopTimeoutSeconds) {
-        withTeardownSlot(() -> stopAdmitted(containerId, stopTimeoutSeconds));
+        stopAdmitted(containerId, stopTimeoutSeconds);
     }
 
     private boolean stopAdmitted(String containerId, int stopTimeoutSeconds) {
