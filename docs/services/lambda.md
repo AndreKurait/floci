@@ -1366,6 +1366,19 @@ Replace `<digest>` with the image's full SHA-256 digest. The override applies to
 zip-based functions using that runtime; other runtimes retain their default images.
 Custom image URI passthrough and image-package functions are unaffected.
 
+For Docker functions that share a runtime but use different CPU architectures,
+add platform-specific keys such as `"java17.linux.amd64"` and
+`"java17.linux.arm64"`, each pointing to its platform manifest digest.
+The Docker launcher's effective platform selects that entry before the
+runtime-wide fallback. Enable `floci.services.lambda.honour-architectures` to
+use the function's architecture; an explicit Docker `--platform` takes precedence.
+The code-copy helper uses the same platform. With no selected Docker platform,
+or for the Kubernetes launcher, the runtime-wide entry and default resolution
+remain in effect.
+
+Environment variables use the quoted map-key form, for example
+`FLOCI_SERVICES_LAMBDA_RUNTIME_IMAGES__JAVA17_LINUX_ARM64__`.
+
 ### Provisioned concurrency recovery
 
 Terminal runtime failures, failed leases, alias updates and completed teardown wake
