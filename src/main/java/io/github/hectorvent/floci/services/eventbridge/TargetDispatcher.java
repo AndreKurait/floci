@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.github.hectorvent.floci.services.sqs.SqsService;
@@ -51,6 +52,7 @@ public class TargetDispatcher implements Resettable {
 
     private final EventBridgeInvoker invoker;
     private final ServiceCallAuthorizer authorizer;
+    private final ServiceRoleCallAuthorizer roleAuthorizer;
     private final SqsService sqsService;
     private final String baseUrl;
     private final Clock clock;
@@ -61,8 +63,8 @@ public class TargetDispatcher implements Resettable {
 
     @Inject
     public TargetDispatcher(EventBridgeInvoker invoker, SqsService sqsService, ServiceCallAuthorizer authorizer,
-                            EmulatorConfig config, Clock clock) {
-        this(invoker, sqsService, authorizer, config.baseUrl(), clock, Executors.newSingleThreadScheduledExecutor(runnable -> {
+                            ServiceRoleCallAuthorizer roleAuthorizer, EmulatorConfig config, Clock clock) {
+        this(invoker, sqsService, authorizer, roleAuthorizer, config.baseUrl(), clock, Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "eventbridge-target-retry");
             thread.setDaemon(true);
             return thread;
@@ -70,10 +72,11 @@ public class TargetDispatcher implements Resettable {
     }
 
     TargetDispatcher(EventBridgeInvoker invoker, SqsService sqsService, ServiceCallAuthorizer authorizer,
-                     String baseUrl, Clock clock,
+                     ServiceRoleCallAuthorizer roleAuthorizer, String baseUrl, Clock clock,
                      ScheduledExecutorService executor) {
         this.invoker = invoker;
         this.authorizer = authorizer;
+        this.roleAuthorizer = roleAuthorizer;
         this.sqsService = sqsService;
         this.baseUrl = baseUrl;
         this.clock = clock;
@@ -154,14 +157,23 @@ public class TargetDispatcher implements Resettable {
 
     private void attempt(Delivery delivery, Target target, Instant now) {
         try {
-            // A configured execution role uses identity policies rather than this service-principal path.
-            if (AwsArnUtils.isArnFor(target.getArn(), "lambda") && target.getRoleArn() == null
-                    && authorizer.authorize("events", "lambda:InvokeFunction", target.getArn(), delivery.ruleArn(),
-                            AwsArnUtils.parse(delivery.ruleArn()).accountId()) == Decision.DENY) {
-                throw new AwsException("AccessDeniedException", "EventBridge is not authorized to invoke "
-                        + target.getArn(), 403);
+            String targetArn = target.getArn();
+            if (AwsArnUtils.isArnFor(targetArn, "lambda")) {
+                String roleArn = target.getRoleArn();
+                String sourceAccount = AwsArnUtils.parse(delivery.ruleArn()).accountId();
+                Decision decision = roleArn == null
+                        ? authorizer.authorize("events", "lambda:InvokeFunction", targetArn,
+                                delivery.ruleArn(), sourceAccount)
+                        : roleAuthorizer.authorize("events", roleArn, "lambda:InvokeFunction", targetArn,
+                                delivery.ruleArn(), sourceAccount);
+                if (decision == Decision.DENY) {
+                    throw new AwsException("AccessDeniedException", "EventBridge is not authorized to invoke "
+                            + targetArn, 403);
+                }
+                invoker.invokeTarget(target, delivery.eventJson(), delivery.region(), targetArn);
+            } else {
+                invoker.invokeTarget(target, delivery.eventJson(), delivery.region());
             }
-            invoker.invokeTarget(target, delivery.eventJson(), delivery.region());
         } catch (Exception e) {
             if (delivery.generation() != generation.get()) {
                 return;

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.eventbridge.model.Archive;
@@ -46,6 +47,7 @@ class EventBridgeSchedulerIntegrationTest {
 
         EventBridgeInvoker invoker = new EventBridgeInvoker(null, null, null, new ObjectMapper(), createConfig());
         TargetDispatcher dispatcher = new TargetDispatcher(invoker, null, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class),
                 "http://localhost:4566", Clock.systemUTC(), null);
         scheduler = new RuleScheduler(vertx, createConfig(), new ObjectMapper(), dispatcher);
 
