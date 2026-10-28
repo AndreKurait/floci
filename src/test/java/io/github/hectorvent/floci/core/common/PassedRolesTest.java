@@ -765,6 +765,39 @@ class PassedRolesTest {
                 "/v2/apis/a/integrations/i", "{\"credentialsArn\":\"" + ROLES + "x\"}"), LOOKUPS));
     }
 
+    @Test
+    void apiGatewayAccountRoleAssignmentsUseTheSharedPassRoleCheck() {
+        for (String path : new String[] {"/account", "/account/"}) {
+            String body = "{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/cloudwatchRoleArn\","
+                    + "\"value\":\"" + ROLES + "teams/logging\"}]}";
+            assertEquals(List.of(passed("teams/logging", "apigateway.amazonaws.com")),
+                    PassedRoles.of("apigateway:PATCH", rest(path, body), LOOKUPS));
+        }
+    }
+
+    @Test
+    void apiGatewayAccountCompatibilityAddChecksEveryAssignment() {
+        String body = "{\"patchOperations\":[{\"op\":\"add\",\"path\":\"/cloudwatchRoleArn\","
+                + "\"value\":\"" + ROLES + "first\"},{\"op\":\"replace\",\"path\":\"/cloudwatchRoleArn\","
+                + "\"value\":\"" + ROLES + "second\"}]}";
+        assertEquals(List.of(passed("first", "apigateway.amazonaws.com"),
+                        passed("second", "apigateway.amazonaws.com")),
+                PassedRoles.of("apigateway:PATCH", rest("/account", body), LOOKUPS));
+    }
+
+    @Test
+    void apiGatewayAccountRemovalAndUnrelatedPathsPassNoRole() {
+        for (String op : new String[] {"remove", "copy", "test"}) {
+            String body = "{\"patchOperations\":[{\"op\":\"" + op + "\",\"path\":\"/cloudwatchRoleArn\","
+                    + "\"value\":\"" + ROLES + "logging\"}]}";
+            assertEquals(List.of(), PassedRoles.of("apigateway:PATCH", rest("/account", body), LOOKUPS));
+        }
+        String body = "{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/cloudwatchRoleArn\","
+                + "\"value\":\"" + ROLES + "logging\"}]}";
+        assertEquals(List.of(), PassedRoles.of("apigateway:POST", rest("/account", body), LOOKUPS));
+        assertEquals(List.of(), PassedRoles.of("apigateway:PATCH", rest("/account/other", body), LOOKUPS));
+    }
+
     private static ContainerRequestContext rest(String path, String body) {
         ContainerRequestContext request = json(body);
         UriInfo uri = mock(UriInfo.class);
