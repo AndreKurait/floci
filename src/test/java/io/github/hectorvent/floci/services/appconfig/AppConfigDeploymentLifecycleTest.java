@@ -2,9 +2,11 @@ package io.github.hectorvent.floci.services.appconfig;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.appconfig.model.Deployment;
+import io.github.hectorvent.floci.services.appconfig.model.DeploymentSummary;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -95,6 +97,75 @@ class AppConfigDeploymentLifecycleTest {
         storage.shutdownAll();
     }
 
+    @Test
+    void summaryPreservesBakingProgressAfterItsStrategyIsDeleted() {
+        StorageFactory storage = factory();
+        try {
+            AppConfigService service = service(storage, START);
+            Scope scope = scope(service);
+            deploy(service, scope, "1", scope.bake());
+            service.deleteDeploymentStrategy(scope.bake());
+
+            DeploymentSummary summary = service.listDeployments(scope.app(), scope.env(), 50, null).items().getFirst();
+
+            assertEquals("BAKING", summary.getState());
+            assertEquals(100.0f, summary.getPercentageComplete());
+            assertEquals(1, summary.getFinalBakeTimeInMinutes());
+            assertEquals(START.toString(), summary.getStartedAt());
+        } finally {
+            storage.shutdownAll();
+        }
+    }
+
+    @Test
+    void summaryRetainsCompletionTimeWithSavedStrategySettingsAfterRestart() {
+        StorageFactory first = factory();
+        Scope scope;
+        try {
+            AppConfigService service = service(first, START);
+            scope = scope(service);
+            deploy(service, scope, "1", scope.bake());
+            service.deleteDeploymentStrategy(scope.bake());
+        } finally {
+            first.shutdownAll();
+        }
+        StorageFactory second = factory();
+        try {
+            AppConfigService service = service(second, START.plusSeconds(120));
+            DeploymentSummary summary = service.listDeployments(scope.app(), scope.env(), 50, null).items().getFirst();
+
+            assertEquals("COMPLETE", summary.getState());
+            assertEquals(100.0f, summary.getPercentageComplete());
+            assertEquals(1, summary.getFinalBakeTimeInMinutes());
+            assertEquals(START.toString(), summary.getStartedAt());
+            assertEquals(START.plusSeconds(60).toString(), summary.getCompletedAt());
+        } finally {
+            second.shutdownAll();
+        }
+    }
+
+    @Test
+    void legacyLifecycleRecordRetainsItsBakeTimeWithoutTheOtherStrategyFields() {
+        StorageFactory storage = factory();
+        try {
+            AppConfigService service = service(storage, START);
+            Scope scope = scope(service);
+            Deployment deployment = deploy(service, scope, "1", scope.bake());
+            deployment.setDeploymentDurationInMinutes(null);
+            deployment.setGrowthFactor(null);
+            deployment.setGrowthType(null);
+            service.deleteDeploymentStrategy(scope.bake());
+
+            DeploymentSummary summary = service.listDeployments(scope.app(), scope.env(), 50, null).items().getFirst();
+
+            assertEquals(1, summary.getFinalBakeTimeInMinutes());
+            assertEquals("BAKING", summary.getState());
+            assertEquals(100.0f, summary.getPercentageComplete());
+        } finally {
+            storage.shutdownAll();
+        }
+    }
+
     private Scope scope(AppConfigService service) {
         String app = service.createApplication(Map.of("Name", "deployment-lifecycle")).getId();
         String env = service.createEnvironment(app, Map.of("Name", "environment")).getId();
@@ -111,7 +182,7 @@ class AppConfigDeploymentLifecycleTest {
     }
 
     private AppConfigService service(StorageFactory storage, Instant time) {
-        return new AppConfigService(storage, mock(EmulatorConfig.class), Clock.fixed(time, ZoneOffset.UTC));
+        return new AppConfigService(storage, new RegionResolver("us-east-1", "000000000000"), Clock.fixed(time, ZoneOffset.UTC));
     }
 
     private StorageFactory factory() {

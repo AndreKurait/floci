@@ -69,7 +69,7 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
                 Environment environment = service.createEnvironment(appId, request);
                 resource.setPhysicalId(environment.getId());
                 resource.getAttributes().put("EnvironmentId", environment.getId());
-                resource.getAttributes().put(APPLICATION, appId);
+                resource.getAttributes().put(APPLICATION, environment.getApplicationId());
             }
             case "AWS::AppConfig::ConfigurationProfile" -> {
                 String appId = required(request, "ApplicationId");
@@ -77,7 +77,7 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
                 ConfigurationProfile profile = service.createConfigurationProfile(appId, request);
                 resource.setPhysicalId(profile.getId());
                 resource.getAttributes().put("ConfigurationProfileId", profile.getId());
-                resource.getAttributes().put(APPLICATION, appId);
+                resource.getAttributes().put(APPLICATION, profile.getApplicationId());
             }
             case "AWS::AppConfig::DeploymentStrategy" -> {
                 request.put("DeploymentDurationInMinutes", minutes(request.get("DeploymentDurationInMinutes")));
@@ -149,10 +149,10 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
     public void delete(StackResource resource, String region) {
         String id = resource.getPhysicalId();
         switch (resource.getResourceType()) {
-            case "AWS::AppConfig::Application" -> service.deleteApplication(id);
+            case "AWS::AppConfig::Application" -> service.deleteApplicationById(id);
             case "AWS::AppConfig::Environment" -> CfnDeletes.safeDelete("AppConfig environment", id,
-                    () -> service.deleteEnvironment(application(resource), id), "ResourceNotFoundException");
-            case "AWS::AppConfig::ConfigurationProfile" -> service.deleteConfigurationProfile(application(resource), id);
+                    () -> service.deleteEnvironmentById(application(resource), id), "ResourceNotFoundException");
+            case "AWS::AppConfig::ConfigurationProfile" -> service.deleteConfigurationProfileById(application(resource), id);
             case "AWS::AppConfig::DeploymentStrategy" -> service.deleteDeploymentStrategy(id);
             default -> throw new IllegalStateException("Unsupported AppConfig resource type");
         }
