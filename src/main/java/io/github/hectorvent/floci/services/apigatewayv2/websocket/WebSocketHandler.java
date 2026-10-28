@@ -3,8 +3,10 @@ package io.github.hectorvent.floci.services.apigatewayv2.websocket;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayExecuteApiHostFilter;
 import io.github.hectorvent.floci.services.apigateway.ExecuteApiSigV4Authorizer;
@@ -14,6 +16,7 @@ import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Integration;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Route;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Stage;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.ServerWebSocket;
 import io.vertx.ext.web.Router;
@@ -56,6 +59,8 @@ public class WebSocketHandler {
     private final String baseHostname;
     private final ObjectMapper objectMapper;
     private final ExecuteApiSigV4Authorizer sigV4Authorizer;
+    private final CallerCallAuthorizer callerCallAuthorizer;
+    private final EmulatorConfig config;
     private final io.vertx.core.Vertx vertx;
 
     @Inject
@@ -68,7 +73,8 @@ public class WebSocketHandler {
                             RegionResolver regionResolver,
                             EmulatorConfig config,
                             ObjectMapper objectMapper,
-                            io.vertx.core.Vertx vertx, ExecuteApiSigV4Authorizer sigV4Authorizer) {
+                            io.vertx.core.Vertx vertx, ExecuteApiSigV4Authorizer sigV4Authorizer,
+                            CallerCallAuthorizer callerCallAuthorizer) {
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.connectionManager = connectionManager;
         this.routeSelectionEvaluator = routeSelectionEvaluator;
@@ -80,6 +86,8 @@ public class WebSocketHandler {
         this.objectMapper = objectMapper;
         this.vertx = vertx;
         this.sigV4Authorizer = sigV4Authorizer;
+        this.callerCallAuthorizer = callerCallAuthorizer;
+        this.config = config;
     }
 
     /**
@@ -238,6 +246,11 @@ public class WebSocketHandler {
         // Look up the $connect route
         Route connectRoute = apiGatewayV2Service.findRouteByKey(region, apiId, "$connect");
 
+        if (!permitsConnect(connectRoute, verified, region, apiId, stageName)) {
+            ctx.response().setStatusCode(403).end();
+            return;
+        }
+
         if (connectRoute != null && connectRoute.getTarget() != null) {
             // Check if the $connect route has a Lambda REQUEST authorizer configured
             if ("CUSTOM".equals(connectRoute.getAuthorizationType())
@@ -286,6 +299,22 @@ public class WebSocketHandler {
             completeUpgrade(ctx, connectionId, apiId, stageName, region,
                     connectedAt, sourceIp, userAgent);
         }
+    }
+
+    boolean permitsConnect(Route route, ExecuteApiSigV4Authorizer.Result verified,
+                           String region, String apiId, String stage) {
+        if (route == null || !"AWS_IAM".equalsIgnoreCase(route.getAuthorizationType())
+                || !config.services().iam().enforcementEnabled()) {
+            return true;
+        }
+        if (!verified.authorized() || verified.identity() == null) {
+            return false;
+        }
+        CallerIdentity caller = verified.identity();
+        String resource = AwsArnUtils.Arn.of("execute-api", region, regionResolver.getAccountId(),
+                apiId + "/" + stage + "/$connect").toString();
+        return callerCallAuthorizer.authorize(caller.accessKey(), caller.accountId(), caller.userArn(),
+                "execute-api:Invoke", resource, regionResolver.getPartition()) == Decision.ALLOW;
     }
 
     /**
