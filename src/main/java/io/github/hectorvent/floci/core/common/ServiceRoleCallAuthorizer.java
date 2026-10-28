@@ -18,6 +18,8 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -25,6 +27,7 @@ import java.util.Map;
 @ApplicationScoped
 public class ServiceRoleCallAuthorizer {
 
+    private final Clock clock;
     private final EmulatorConfig config;
     private final IamService iam;
     private final AssumeRolePolicyEvaluator trust;
@@ -32,10 +35,17 @@ public class ServiceRoleCallAuthorizer {
     private final Instance<ResourcePolicyProvider> providers;
     private final Instance<ScpProvider> scpProvider;
 
-    @Inject
     public ServiceRoleCallAuthorizer(EmulatorConfig config, IamService iam, AssumeRolePolicyEvaluator trust,
                                      IamPolicyEvaluator evaluator, Instance<ResourcePolicyProvider> providers,
                                      Instance<ScpProvider> scpProvider) {
+        this(config, iam, trust, evaluator, providers, scpProvider, Clock.systemUTC());
+    }
+
+    @Inject
+    public ServiceRoleCallAuthorizer(EmulatorConfig config, IamService iam, AssumeRolePolicyEvaluator trust,
+                                     IamPolicyEvaluator evaluator, Instance<ResourcePolicyProvider> providers,
+                                     Instance<ScpProvider> scpProvider, Clock clock) {
+        this.clock = clock;
         this.config = config;
         this.iam = iam;
         this.trust = trust;
@@ -95,8 +105,9 @@ public class ServiceRoleCallAuthorizer {
         String roleName = roleId.resource().substring(roleId.resource().lastIndexOf('/') + 1);
         IamRole role = iam.findRole(roleId.accountId(), roleName)
                 .filter(found -> IamService.roleArnMatches(roleArn, found)).orElse(null);
+        Instant now = clock.instant();
         if (role == null || !trust.allowsService(role.getAssumeRolePolicyDocument(), ServicePrincipals.of(service),
-                sourceArn, sourceAccount)) {
+                sourceArn, sourceAccount, now)) {
             return Decision.DENY;
         }
         AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
@@ -109,7 +120,9 @@ public class ServiceRoleCallAuthorizer {
                 ? scpProvider.get().effectiveScpLevels(roleId.accountId()) : null;
         Map<String, List<String>> context = IamConditionContextResolver.withGlobalContext(
                 Map.of("aws:PrincipalArn", List.of(role.getArn()),
-                        "aws:PrincipalType", List.of(IamService.CallerArns.TYPE_ASSUMED_ROLE)),
+                        "aws:PrincipalType", List.of(IamService.CallerArns.TYPE_ASSUMED_ROLE),
+                        "aws:CurrentTime", List.of(now.toString()),
+                        "aws:EpochTime", List.of(Long.toString(now.getEpochSecond()))),
                 resourceArn, resource.region(), roleId.accountId(), owner);
         String sessionArn = AwsArnUtils.Arn.global(roleId.partition(), "sts", roleId.accountId(),
                 "assumed-role/" + roleName).toString();
