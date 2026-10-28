@@ -5,6 +5,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.command.ListVolumesResponse;
+import com.github.dockerjava.api.command.RemoveContainerCmd;
 import com.github.dockerjava.api.command.StatsCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
@@ -567,7 +568,7 @@ public class EcsContainerManager {
                     }
                     fluentHost = inspectContainerIp(dockerId);
                 } else {
-                    ContainerInfo info = lifecycleManager.createAndStart(spec);
+                    ContainerInfo info = lifecycleManager.createAndStartEphemeral(spec);
                     dockerId = info.containerId();
                 }
 
@@ -1241,7 +1242,7 @@ public class EcsContainerManager {
                 continue;
             }
             try {
-                lifecycleManager.removeIfExistsStrict(container.getId());
+                lifecycleManager.removeIfExistsStrict(container.getId(), true);
                 leftoverRemovalFailuresReported.remove(container.getId());
                 LOG.infov("Removed ECS container {0} ({1}) left by a previous run", container.getId(),
                         container.getNames() == null ? "" : String.join(",", container.getNames()));
@@ -1466,7 +1467,7 @@ public class EcsContainerManager {
      */
     private boolean stopAndConfirmRemoved(String dockerId) {
         try {
-            lifecycleManager.stopAndRemoveStrict(dockerId, null);
+            lifecycleManager.stopAndRemoveStrict(dockerId, null, 5, true);
             return true;
         } catch (RuntimeException e) {
             LOG.warnv("Error removing ECS container {0}: {1}", dockerId, e.getMessage());
@@ -1522,7 +1523,10 @@ public class EcsContainerManager {
             // Read before the removal below, which is the last moment the daemon still knows it.
             handle.recordFinishedAt(name, getFinishedAtIfStopped(dockerId));
             try {
-                lifecycleManager.getDockerClient().removeContainerCmd(dockerId).withForce(true).exec();
+                RemoveContainerCmd remove = lifecycleManager.getDockerClient()
+                        .removeContainerCmd(dockerId).withForce(true);
+                remove.withRemoveVolumes(true);
+                remove.exec();
                 terminatedContainerIds.add(dockerId);
                 handle.recordContainerRemoved(name);
             } catch (NotFoundException ignored) {
