@@ -469,7 +469,7 @@ public class AwsQueryController {
             QueryService.modeled("email"),
             new QueryService("cognito-idp", Set.of(), COGNITO_ACTIONS),
             QueryService.modeled("ec2"),
-            QueryService.modeled("elasticloadbalancing"),
+            QueryService.modeled("elasticloadbalancing", "DescribeProvisionedCapacity"),
             QueryService.modeled("autoscaling"),
             QueryService.modeled("elasticbeanstalk"),
             QueryService.modeled("redshift"),
