@@ -22,7 +22,7 @@ unsupported properties are rejected before creation.
 
 The legacy `GetConfiguration` data-plane route accepts application, environment and profile names or IDs.
 It returns only the deployed version, its content type and `Configuration-Version`; a matching
-`ClientConfigurationVersion` returns HTTP 200 with no body. `ClientId` is required.
+`ClientConfigurationVersion` returns HTTP 204 with no body. `ClientId` is required.
 
 ### Supported Operations
 
@@ -53,7 +53,9 @@ It returns only the deployed version, its content type and `Configuration-Versio
 `GetConfiguration` accepts application, environment and configuration profile names or IDs, and requires
 `client_id`. It returns the deployed version's content with its `Content-Type` and `Configuration-Version`;
 feature flags are resolved as on the [data plane](#data-plane), including Ion for a caller that accepts it.
-A `client_configuration_version` equal to the deployed version returns HTTP 200 with an empty body.
+A `client_configuration_version` equal to the deployed version returns HTTP 204 with an empty body
+and `Configuration-Version`, without `Content-Type` or `Content-Length`. An empty configuration
+that the caller has not received still returns HTTP 200 and its stored content type.
 A missing or undeployed environment returns `BadRequestException`; an unknown application or configuration profile
 returns `ResourceNotFoundException`.
 Only hosted configurations are served: a deployed version with no hosted configuration version behind it,
