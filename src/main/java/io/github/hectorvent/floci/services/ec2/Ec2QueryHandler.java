@@ -3539,10 +3539,11 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteSecurityGroup(MultivaluedMap<String, String> p, String region) {
-        String groupId = p.getFirst("GroupId");
-        if (groupId == null) groupId = p.getFirst("GroupName");
-        service.deleteSecurityGroup(region, groupId);
-        return booleanResponse("DeleteSecurityGroup");
+        String groupId = service.deleteSecurityGroup(region, p.getFirst("GroupId"), p.getFirst("GroupName"),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return xmlResponse(new XmlBuilder().start("DeleteSecurityGroupResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString()).elem("return", "true")
+                .elem("groupId", groupId).end("DeleteSecurityGroupResponse").build());
     }
 
     private Response handleAuthorizeSecurityGroupIngress(MultivaluedMap<String, String> p, String region) {
