@@ -76,6 +76,7 @@ class AutoScalingInstanceMembershipTagIntegrationTest {
             standalone = given().header("Authorization", EC2_AUTH).formParam("Action", "RunInstances")
                     .formParam("ImageId", "ami-12345678").formParam("InstanceType", "t3.micro")
                     .formParam("MinCount", "1").formParam("MaxCount", "1")
+                    .formParam("Placement.AvailabilityZone", "us-east-1a")
                     .formParam("TagSpecification.1.ResourceType", "instance")
                     .formParam("TagSpecification.1.Tag.1.Key", "Team")
                     .formParam("TagSpecification.1.Tag.1.Value", "red")
@@ -89,7 +90,8 @@ class AutoScalingInstanceMembershipTagIntegrationTest {
 
             // An ID EC2 has no instance for gets no tags, which would otherwise outlive it in DescribeTags.
             String unknown = "i-0abcdef1234567890";
-            attach(other, unknown);
+            attach(other, unknown).statusCode(400)
+                    .body("ErrorResponse.Error.Code", equalTo("ValidationError"));
             given().header("Authorization", EC2_AUTH).formParam("Action", "DescribeTags")
                     .formParam("Filter.1.Name", "resource-id").formParam("Filter.1.Value.1", unknown)
                     .post("/").then().statusCode(200)
