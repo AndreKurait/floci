@@ -502,6 +502,17 @@ public class ApiGatewayExecuteController {
         AuthorizerResult authorizerResult = invokeAuthorizer(scope, region, apiId, stageName, httpMethod, path, matched.getPath(), matched.getId(), stage, method, headers, uriInfo, resolvedApiKey);
         if (authorizerResult.errorResponse() != null) return authorizerResult.errorResponse();
 
+        String authorizationType = method.getAuthorizationType();
+        if (authorizationType == null || "NONE".equalsIgnoreCase(authorizationType)
+                || "COGNITO_USER_POOLS".equalsIgnoreCase(authorizationType)) {
+            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod, path);
+            if (callerCallAuthorizer.authorizeAnonymousResource("execute-api:Invoke", invokeArn,
+                    routeContext.sourceIp(), isSecureTransport(uriInfo)) != Decision.ALLOW) {
+                return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
+                        "User is not authorized to access this resource");
+            }
+        }
+
         // API Gateway checks the API key requirement after authorization but before request
         // validation and throttling. resolvedApiKey is null when the header is missing or matches
         // no enabled key linked to this (apiId, stage) through a usage plan.

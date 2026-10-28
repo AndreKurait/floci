@@ -1040,3 +1040,5 @@ This uses the existing live API policy storage; deployment-snapshot policy activ
 here. Resource-policy workflows for unsigned, CUSTOM and Cognito routes, full inbound condition
 context and actual service execution-role STS sessions remain separate work. IAM-disabled routes
 retain signature validation without requiring policy grants.
+
+When IAM enforcement is enabled, REST methods using `NONE` require an explicit anonymous grant from an attached resource policy. Cognito user-pool methods authenticate the token first, then require that resource-policy grant. Missing policies retain existing access; an explicit deny or an attached policy without a matching allow rejects the request before backend dispatch. Source-IP conditions use the connection address, not `X-Forwarded-For`. These checks evaluate the current stored policy, not a deployment snapshot. CUSTOM authorizer/resource-policy combination, complete inbound condition context and actual service execution-role sessions remain separate limitations.
