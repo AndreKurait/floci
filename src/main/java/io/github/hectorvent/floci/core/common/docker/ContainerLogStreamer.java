@@ -15,6 +15,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
@@ -28,10 +29,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -92,6 +96,30 @@ public class ContainerLogStreamer {
             String accountId, String containerId, String logGroup, String logStream,
             String region, String logPrefix) {
         return attachForAccount(accountId, containerId, logGroup, logStream, region, logPrefix, null);
+    }
+
+    /** Registers live output pipes before a runtime that may immediately exit and be removed starts. */
+    public Closeable attachBeforeStartForAccount(
+            String accountId, String containerId, String logGroup, String logStream,
+            String region, String logPrefix, Duration readinessTimeout) {
+        ensureLogGroupAndStreamForAccount(accountId, logGroup, logStream, region);
+        LogReassemblyCallback callback = new LogReassemblyCallback(line -> {
+            String trimmed = line.stripTrailing();
+            if (!trimmed.isEmpty()) {
+                LOG.infov("[{0}] {1}", logPrefix, trimmed);
+                forwardToCloudWatchLogs(accountId, logGroup, logStream, region, trimmed);
+            }
+        });
+        try {
+            dockerClient.attachContainerCmd(containerId)
+                    .withStdOut(true).withStdErr(true).withFollowStream(true).withLogs(false)
+                    .exec(callback);
+            callback.awaitAttachment(readinessTimeout);
+            return new ContainerLogHandle(callback);
+        } catch (RuntimeException e) {
+            callback.closeTransportAndFlush();
+            throw e;
+        }
     }
 
     /**
@@ -343,6 +371,8 @@ public class ContainerLogStreamer {
         private final ReentrantReadWriteLock callbackGate = new ReentrantReadWriteLock(true);
         private final BiConsumer<StreamType, String> lineConsumer;
         private final long closeGraceMillis;
+        private final CompletableFuture<Void> attachment = new CompletableFuture<>();
+        private volatile Throwable attachmentFailure;
         // Guarded by 'buffers'. Set only by the Docker transport terminal callback; afterwards onNext
         // refuses to append, so nothing is ever buffered past the final flush.
         private boolean terminated;
@@ -365,6 +395,42 @@ public class ContainerLogStreamer {
         LogReassemblyCallback(long closeGraceMillis, BiConsumer<StreamType, String> lineConsumer) {
             this.lineConsumer = lineConsumer;
             this.closeGraceMillis = closeGraceMillis;
+        }
+
+        @Override
+        public void onStart(Closeable stream) {
+            super.onStart(stream);
+            boolean alreadyTerminated;
+            synchronized (buffers) {
+                alreadyTerminated = terminated;
+            }
+            if (alreadyTerminated) {
+                closeTransportAndFlush();
+                return;
+            }
+            attachment.complete(null);
+        }
+
+        void awaitAttachment(Duration timeout) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IllegalStateException("Interrupted while attaching container output");
+            }
+            try {
+                attachment.get(Math.max(0, timeout.toNanos()), TimeUnit.NANOSECONDS);
+                if (attachmentFailure != null) {
+                    throw new IllegalStateException("Container output stream failed before start", attachmentFailure);
+                }
+                synchronized (buffers) {
+                    if (terminated) {
+                        throw new IllegalStateException("Container output stream ended before start");
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while attaching container output", e);
+            } catch (ExecutionException | TimeoutException e) {
+                throw new IllegalStateException("Container output stream was not ready before start", e);
+            }
         }
 
         @Override
@@ -401,6 +467,8 @@ public class ContainerLogStreamer {
         public void onComplete() {
             callbackGate.readLock().lock();
             try {
+                attachmentFailure = new IllegalStateException("Container output stream ended before start");
+                attachment.completeExceptionally(attachmentFailure);
                 flush();
                 super.onComplete();
             } finally {
@@ -412,6 +480,8 @@ public class ContainerLogStreamer {
         public void onError(Throwable throwable) {
             callbackGate.readLock().lock();
             try {
+                attachmentFailure = throwable;
+                attachment.completeExceptionally(throwable);
                 flush();
                 super.onError(throwable);
             } finally {

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.AttachContainerCmd;
 import com.github.dockerjava.api.command.LogContainerCmd;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
@@ -12,9 +13,11 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 import java.io.Closeable;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -28,6 +31,8 @@ import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -35,6 +40,7 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -44,6 +50,114 @@ class ContainerLogStreamerTest {
 
     private static byte[] utf8(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
+    }
+
+    @Test
+    void preStartAttachmentCapturesBothFragmentedFinalTailsThroughTheOwningAccount() throws Exception {
+        DockerClient docker = mock(DockerClient.class);
+        AttachContainerCmd attach = mock(AttachContainerCmd.class, RETURNS_SELF);
+        when(docker.attachContainerCmd("captured-runtime")).thenReturn(attach);
+        Closeable transport = mock(Closeable.class);
+        when(attach.exec(any())).thenAnswer(call -> {
+            ResultCallback<Frame> callback = call.getArgument(0);
+            callback.onStart(transport);
+            return callback;
+        });
+        CloudWatchLogsService logs = mock(CloudWatchLogsService.class);
+        ContainerLogStreamer streamer = new ContainerLogStreamer(docker, logs);
+        Closeable handle = streamer.attachBeforeStartForAccount(
+                "111111111111", "captured-runtime", "/aws/lambda/example", "stream",
+                "us-east-1", "lambda:example", Duration.ZERO);
+        assertNotNull(handle);
+        ArgumentCaptor<ContainerLogStreamer.LogReassemblyCallback> callback =
+                ArgumentCaptor.forClass(ContainerLogStreamer.LogReassemblyCallback.class);
+        verify(attach).exec(callback.capture());
+        verify(attach).withLogs(false);
+        callback.getValue().onNext(new Frame(StreamType.STDOUT, utf8("out-")));
+        callback.getValue().onNext(new Frame(StreamType.STDERR, utf8("err-")));
+        callback.getValue().onNext(new Frame(StreamType.STDOUT, utf8("tail")));
+        callback.getValue().onNext(new Frame(StreamType.STDERR, utf8("tail")));
+        callback.getValue().onComplete();
+        handle.close();
+        handle.close();
+
+        InOrder order = inOrder(logs);
+        order.verify(logs).putLogEventsForAccount(eq("111111111111"), any(), any(),
+                argThat(events -> events.size() == 1 && "out-tail".equals(events.getFirst().get("message"))),
+                eq("us-east-1"));
+        order.verify(logs).putLogEventsForAccount(eq("111111111111"), any(), any(),
+                argThat(events -> events.size() == 1 && "err-tail".equals(events.getFirst().get("message"))),
+                eq("us-east-1"));
+        verify(transport).close();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing-start", "error-before-start", "error-after-start", "complete-before-start"})
+    void preStartAttachmentRefusesMissingOrUnhealthyReadiness(String mode) {
+        DockerClient docker = mock(DockerClient.class);
+        AttachContainerCmd attach = mock(AttachContainerCmd.class, RETURNS_SELF);
+        when(docker.attachContainerCmd("captured-runtime")).thenReturn(attach);
+        Closeable transport = mock(Closeable.class);
+        when(attach.exec(any())).thenAnswer(call -> {
+            ResultCallback<Frame> callback = call.getArgument(0);
+            if ("error-after-start".equals(mode)) {
+                callback.onStart(transport);
+            }
+            if (mode.startsWith("error-")) {
+                callback.onError(new IllegalStateException("Attachment failed"));
+            } else if ("complete-before-start".equals(mode)) {
+                callback.onComplete();
+            }
+            return callback;
+        });
+        ContainerLogStreamer streamer = new ContainerLogStreamer(docker, mock(CloudWatchLogsService.class));
+
+        assertThrows(IllegalStateException.class, () -> streamer.attachBeforeStartForAccount(
+                "111111111111", "captured-runtime", "/aws/lambda/example", "stream",
+                "us-east-1", "lambda:example", Duration.ZERO));
+    }
+
+    @Test
+    void aLateAttachmentAfterReadinessTimeoutClosesItsOwnTransport() throws Exception {
+        DockerClient docker = mock(DockerClient.class);
+        AttachContainerCmd attach = mock(AttachContainerCmd.class, RETURNS_SELF);
+        when(docker.attachContainerCmd("captured-runtime")).thenReturn(attach);
+        ContainerLogStreamer streamer = new ContainerLogStreamer(docker, mock(CloudWatchLogsService.class));
+        assertThrows(IllegalStateException.class, () -> streamer.attachBeforeStartForAccount(
+                "111111111111", "captured-runtime", "/aws/lambda/example", "stream",
+                "us-east-1", "lambda:example", Duration.ZERO));
+        ArgumentCaptor<ContainerLogStreamer.LogReassemblyCallback> callback =
+                ArgumentCaptor.forClass(ContainerLogStreamer.LogReassemblyCallback.class);
+        verify(attach).exec(callback.capture());
+        Closeable lateTransport = mock(Closeable.class);
+
+        callback.getValue().onStart(lateTransport);
+
+        verify(lateTransport).close();
+    }
+
+    @Test
+    void interruptedReadinessDoesNotClearCancellationEvenAfterAcknowledgment() throws Exception {
+        DockerClient docker = mock(DockerClient.class);
+        AttachContainerCmd attach = mock(AttachContainerCmd.class, RETURNS_SELF);
+        when(docker.attachContainerCmd("captured-runtime")).thenReturn(attach);
+        Closeable transport = mock(Closeable.class);
+        when(attach.exec(any())).thenAnswer(call -> {
+            ResultCallback<Frame> callback = call.getArgument(0);
+            callback.onStart(transport);
+            return callback;
+        });
+        ContainerLogStreamer streamer = new ContainerLogStreamer(docker, mock(CloudWatchLogsService.class));
+        Thread.currentThread().interrupt();
+        try {
+            assertThrows(IllegalStateException.class, () -> streamer.attachBeforeStartForAccount(
+                    "111111111111", "captured-runtime", "/aws/lambda/example", "stream",
+                    "us-east-1", "lambda:example", Duration.ZERO));
+            assertTrue(Thread.currentThread().isInterrupted());
+            verify(transport).close();
+        } finally {
+            Thread.interrupted();
+        }
     }
 
     @Test

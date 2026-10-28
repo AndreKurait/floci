@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.lambda;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
+import com.github.dockerjava.api.command.WaitContainerCmd;
+import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
@@ -31,6 +33,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.io.Closeable;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Path;
@@ -267,6 +270,15 @@ class LambdaImageConfigTest {
             when(lifecycleManager.startCreated(eq("container-123"), any()))
                     .thenReturn(new ContainerLifecycleManager.ContainerInfo("container-123", Map.of()));
             when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
+            WaitContainerCmd wait = mock(WaitContainerCmd.class, RETURNS_SELF);
+            when(dockerClient.waitContainerCmd("container-123")).thenReturn(wait);
+            when(wait.exec(any())).thenAnswer(call -> {
+                WaitContainerResultCallback callback = call.getArgument(0);
+                callback.onStart(mock(Closeable.class));
+                return callback;
+            });
+            when(logStreamer.attachBeforeStartForAccount(any(), any(), any(), any(), any(), any(), any()))
+                    .thenReturn(mock(Closeable.class));
 
             lenient().when(dockerClient.copyArchiveToContainerCmd(any())).thenAnswer(inv -> {
                 CopyArchiveToContainerCmd cmd = mock(CopyArchiveToContainerCmd.class);
