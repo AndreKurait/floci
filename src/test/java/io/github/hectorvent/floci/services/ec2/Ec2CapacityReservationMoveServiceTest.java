@@ -38,6 +38,7 @@ class Ec2CapacityReservationMoveServiceTest {
     private static final String REGION = "us-east-1";
     private Ec2Service service;
     private EmulatorConfig config;
+    private InMemoryStorageFactory storageFactory;
 
     @BeforeEach
     void setUp() {
@@ -46,7 +47,8 @@ class Ec2CapacityReservationMoveServiceTest {
         when(config.services().ec2().mock()).thenReturn(true);
         when(config.services().ec2().mockPublicAddresses())
                 .thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.NONE);
-        service = newService(new InMemoryStorageFactory(ACCOUNT));
+        storageFactory = new InMemoryStorageFactory(ACCOUNT);
+        service = newService(storageFactory);
     }
 
     @Test
@@ -227,8 +229,8 @@ class Ec2CapacityReservationMoveServiceTest {
     @Test
     void insufficientCapacityPrecedesUnsupportedZoneWithoutMutation() {
         CapacityReservation source = create(service, 2);
-        CapacityReservation destination = create(service, 1);
-        destination.setAvailabilityZone("us-east-1b");
+        CapacityReservation destination = service.createCapacityReservation(REGION, "t3.micro", "Linux/UNIX",
+                "us-east-1b", null, 1, null, null, null, null, null, null, null, null);
         assertError("InvalidParameterValue", () -> move(source, destination, 3, null));
         assertError("Unsupported", () -> move(source, destination, 1, null));
         assertCounts(source, 2, 2);
@@ -278,6 +280,7 @@ class Ec2CapacityReservationMoveServiceTest {
         CapacityReservation source = create(service, 3);
         CapacityReservation destination = create(service, 1);
         source.setAvailableInstanceCount(1);
+        persistReservation(source);
         assertError("InvalidParameterValue", () -> move(source, destination, 2, null));
         move(source, destination, 1, null);
         assertCounts(source, 2, 0);
@@ -374,6 +377,8 @@ class Ec2CapacityReservationMoveServiceTest {
         source.setInstanceMatchCriteria("targeted");
         destination.setInstanceMatchCriteria("targeted");
         source.setAvailableInstanceCount(2);
+        persistReservation(source);
+        persistReservation(destination);
 
         move(source, destination, 1, "first-unused");
         assertError("InvalidParameterValue", () -> move(source, destination, 2, "used"));
@@ -490,6 +495,12 @@ class Ec2CapacityReservationMoveServiceTest {
             CapacityReservation destination, int count, String token) {
         return service.moveCapacityReservationInstances(REGION, source.getCapacityReservationId(),
                 destination.getCapacityReservationId(), count, token);
+    }
+
+    private void persistReservation(CapacityReservation reservation) {
+        AccountAwareStorageBackend<CapacityReservation> store = storageFactory.create("ec2",
+                "ec2-capacity-reservations.json", new TypeReference<Map<String, CapacityReservation>>() {});
+        store.put(REGION + "::" + reservation.getCapacityReservationId(), reservation);
     }
 
     private CapacityReservation describe(CapacityReservation reservation) {
