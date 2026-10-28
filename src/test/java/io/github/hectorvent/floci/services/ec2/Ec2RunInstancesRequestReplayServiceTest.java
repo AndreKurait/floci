@@ -42,6 +42,69 @@ class Ec2RunInstancesRequestReplayServiceTest {
     @TempDir
     Path directory;
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void retainedPrimaryInterfaceSurvivesExactReplayAndTermination(boolean query) {
+        try (Fixture fixture = new Fixture("memory", directory)) {
+            if (query) {
+                MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
+                Map.of("ImageId", "ami-test", "InstanceType", "t3.micro", "ClientToken", "retained-token",
+                        "NetworkInterface.1.DeviceIndex", "0", "NetworkInterface.1.DeleteOnTermination", "false")
+                        .forEach(parameters::putSingle);
+                Ec2QueryHandler handler = new Ec2QueryHandler(fixture.service,
+                        mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), null, null, null, null, null);
+                assertEquals(200, handler.handle("RunInstances", parameters, "us-east-1").getStatus());
+                assertEquals(200, handler.handle("RunInstances", parameters, "us-east-1").getStatus());
+            } else {
+                Reservation first = fixture.launchRetained("retained-token", false);
+                Reservation replay = fixture.launchRetained("retained-token", false);
+                assertEquals(first.getReservationId(), replay.getReservationId());
+                AwsException mismatch = assertThrows(AwsException.class,
+                        () -> fixture.launchRetained("retained-token", true));
+                assertEquals("IdempotentParameterMismatch", mismatch.getErrorCode());
+            }
+            List<NetworkInterface> retained = fixture.factory.<NetworkInterface>store("ec2-network-interfaces.json")
+                    .scan(key -> key.startsWith("us-east-1::"));
+            assertEquals(1, retained.size());
+            NetworkInterface eni = retained.getFirst();
+            assertFalse(eni.getAttachment().isDeleteOnTermination());
+            fixture.service.terminateInstances("us-east-1", List.of(eni.getAttachment().getInstanceId()));
+            NetworkInterface detached = fixture.factory.<NetworkInterface>store("ec2-network-interfaces.json")
+                    .get("us-east-1::" + eni.getNetworkInterfaceId()).orElseThrow();
+            assertNull(detached.getAttachment());
+            assertEquals("available", detached.getStatus());
+        }
+    }
+
+    @Test
+    void rejectedRetainedInterfaceOutcomeRemovesOnlyItsGeneratedInterface() {
+        try (Fixture fixture = new Fixture("persistent", directory)) {
+            String subnet = fixture.service.describeSubnets("us-east-1", List.of(), Map.of()).getFirst().getSubnetId();
+            NetworkInterface unrelated = fixture.service.createNetworkInterface("us-east-1", subnet,
+                    "preserved", null, List.of(), List.of(), List.of());
+            AccountAwareStorageBackend<RunInstancesReplayJournal> journal = fixture.factory.store("ec2-run-instances-replays.json");
+            AtomicBoolean rejected = new AtomicBoolean();
+            doAnswer(call -> {
+                Map<String, RunInstancesReplayJournal> replacements = call.getArgument(1);
+                if (replacements.values().stream().flatMap(value -> value.zones().values().stream())
+                        .anyMatch(record -> record.result() != null) && !rejected.getAndSet(true)) {
+                    throw new IllegalStateException("outcome failed");
+                }
+                return call.callRealMethod();
+            }).when(journal).putAllDurablyForAccount(anyString(), anyMap());
+            IllegalStateException failure = assertThrows(IllegalStateException.class,
+                    () -> fixture.launchRetained("rejected-retained-token", false));
+            assertEquals("outcome failed", failure.getMessage());
+            List<NetworkInterface> retained = fixture.factory.<NetworkInterface>store("ec2-network-interfaces.json")
+                    .scan(key -> key.startsWith("us-east-1::"));
+            assertEquals(List.of(unrelated.getNetworkInterfaceId()),
+                    retained.stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+            fixture.launchRetained("rejected-retained-token", false);
+            assertEquals(2, fixture.factory.<NetworkInterface>store("ec2-network-interfaces.json")
+                    .scan(key -> key.startsWith("us-east-1::")).size());
+        }
+    }
+
     @Test
     void exactTokenReplayReturnsOneReservation() {
         try (Fixture fixture = new Fixture("memory", directory)) {
@@ -559,6 +622,12 @@ class Ec2RunInstancesRequestReplayServiceTest {
             return service.runInstances("us-east-1", "ami-test", "t3.micro", 1, 1, null, List.of(), null,
                     "host-token", List.of(), null, null, null, null, 0, zone, null, null, null,
                     false, host, "host", null, false, null, null);
+        }
+
+        private Reservation launchRetained(String token, boolean deleteOnTermination) {
+            return service.runInstances("us-east-1", "ami-test", "t3.micro", 1, 1, null, List.of(), null,
+                    token, List.of(), null, null, null, null, 0, null, null, null, null, false,
+                    null, null, null, false, null, null, deleteOnTermination);
         }
 
         private Reservation launchIn(String region, String zone, String token, String eni) {
