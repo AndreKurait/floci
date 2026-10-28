@@ -94,6 +94,42 @@ class WebSocketRouteIamIntegrationTest {
         invoke(fixture, allowed, 403);
     }
 
+    @Test
+    void signedConnectionUsesPeerAddressAndTransportRatherThanForwardedHeaders() throws Exception {
+        Fixture fixture = fixture(true, "AWS_IAM");
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "ws-transport-", "invoke",
+                transportPolicy(fixture.arn(), "Allow"))) {
+            Key key = new Key(user.accessKeyId(), user.secretAccessKey(), null);
+            invoke(fixture, key, 101);
+            putPolicy(user, transportPolicy(fixture.arn(), "Deny"));
+            invoke(fixture, key, 403);
+        }
+    }
+
+    @Test
+    void issuedSessionEvaluatesConnectionTransportConditions() throws Exception {
+        Fixture fixture = fixture(false, "AWS_IAM");
+        String name = "ws-transport-role-" + UUID.randomUUID();
+        String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
+                + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
+                "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
+                .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+        SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
+                "PolicyDocument", policy(fixture.arn()))).then().statusCode(200);
+        invoke(fixture, assume(role, transportPolicy(fixture.arn(), "Allow")), 101);
+        invoke(fixture, assume(role, transportPolicy(fixture.arn(), "Deny")), 403);
+    }
+
+    private static String transportPolicy(String arn, String effect) {
+        return "{\"Statement\":{\"Effect\":\"" + effect
+                + "\",\"Action\":\"execute-api:Invoke\",\"Resource\":\"" + arn + "\",\"Condition\":{"
+                + "\"IpAddress\":{\"aws:SourceIp\":[\"127.0.0.0/8\",\"::1/128\"]},"
+                + "\"Bool\":{\"aws:SecureTransport\":\"false\"}}}}";
+    }
+
     private void cleanupIam(String action, Map<String, String> parameters) {
         try {
             SignedIamUsers.iam(endpoint, action, parameters).then().statusCode(200);
@@ -145,7 +181,8 @@ class WebSocketRouteIamIntegrationTest {
     private void invoke(Fixture fixture, Key key, int status) throws Exception {
         String path = "/ws/" + fixture.apiId() + "/prod";
         try (HttpClient client = HttpClient.newHttpClient()) {
-            WebSocket.Builder builder = client.newWebSocketBuilder();
+            WebSocket.Builder builder = client.newWebSocketBuilder()
+                    .header("X-Forwarded-For", "192.0.2.5").header("X-Forwarded-Proto", "https");
             if (key != null) {
                 ExecuteApiRequestSigner.signedHeaders("GET", path, Map.of("tag", "a b"),
                         endpoint.getHost() + ":" + endpoint.getPort(), new byte[0], key.accessKey(), key.secret(),
