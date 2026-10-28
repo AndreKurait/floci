@@ -90,7 +90,6 @@ public class SqsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, Map<String, Long>> dedupStore;
     private final StorageBackend<String, Map<String, Map<String, String>>> dedupIdentityStore;
     private final ConcurrentHashMap<String, GuardedMessageQueue> messagesByQueue = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Object> queueLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, RedrivePolicy> redrivePolicyCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Instant>> deduplicationCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, DeduplicationIdentity>> deduplicationIdentityCache =
@@ -453,12 +452,12 @@ public class SqsService implements Resettable, ResourceProvider {
     @PreDestroy
     void stop() {
         moveTaskExecutor.shutdownNow();
+        messagesByQueue.values().forEach(GuardedMessageQueue::close);
     }
 
     public void clear() {
         messagesByQueue.values().forEach(GuardedMessageQueue::close);
         messagesByQueue.clear();
-        queueLocks.clear();
         redrivePolicyCache.clear();
         deduplicationCache.clear();
         deduplicationIdentityCache.clear();
@@ -837,11 +836,6 @@ public class SqsService implements Resettable, ResourceProvider {
         if (dedupIdentityStore != null) {
             dedupIdentityStore.delete(storageKey);
         }
-        // Wake parked ReceiveMessage long polls so they observe the deletion
-        // and finish, instead of staying registered against this queue URL.
-        // Left alone they would survive a delete + recreate under the same URL
-        // and consume deliveries that belong to the new queue's consumers.
-        notifyReceivers(storageKey);
         LOG.infov("Deleted queue: {0}", queueUrl);
     }
 
@@ -1170,7 +1164,6 @@ public class SqsService implements Resettable, ResourceProvider {
                         .putIfAbsent(dedupCacheKey,
                                 new DeduplicationIdentity(message.getMessageId(), message.getSequenceNumber()));
                 persistDedupIdentities(storageKey);
-                notifyReceivers(storageKey);
                 LOG.debugv("Sent FIFO message {0} to queue {1}, group={2}, seq={3}",
                         message.getMessageId(), queueUrl, messageGroupId, message.getSequenceNumber());
                 LOG.tracev("Sent message {0} to queue {1} body={2} attributes={3}",
@@ -1196,7 +1189,6 @@ public class SqsService implements Resettable, ResourceProvider {
         GuardedMessageQueue messages = getOrCreateQueue(storageKey);
         messages.addMessage(message);
         messages.activity().sent(totalSize, false);
-        notifyReceivers(storageKey);
         LOG.debugv("Sent message {0} to queue {1}", message.getMessageId(), queueUrl);
         LOG.tracev("Sent message {0} to queue {1} body={2} attributes={3}",
                 message.getMessageId(), queueUrl, body, message.getMessageAttributes());
@@ -1383,15 +1375,6 @@ public class SqsService implements Resettable, ResourceProvider {
         }
     }
 
-    private void notifyReceivers(String storageKey) {
-        Object lock = queueLocks.get(storageKey);
-        if (lock != null) {
-            synchronized (lock) {
-                lock.notifyAll();
-            }
-        }
-    }
-
     private void cleanupDeduplicationCache(String queueUrl) {
         ConcurrentHashMap<String, Instant> dedupMap = deduplicationCache.get(queueUrl);
         if (dedupMap != null) {
@@ -1447,16 +1430,16 @@ public class SqsService implements Resettable, ResourceProvider {
                             + "Reason: Must be >= 0 and <= " + MAX_RECEIVE_WAIT_TIME_SECONDS + ".", 400);
         }
 
-        long start = System.currentTimeMillis();
-        long maxWait = resolveWaitTimeSeconds(queue, waitTimeSeconds) * 1000L;
-        Object lock = queueLocks.computeIfAbsent(storageKey, k -> new Object());
+        long maxWait = TimeUnit.SECONDS.toNanos(resolveWaitTimeSeconds(queue, waitTimeSeconds));
+        long deadline = System.nanoTime() + maxWait;
         // The queue incarnation this call polls against. DeleteQueue removes it
         // from messagesByQueue (and CreateQueue registers a fresh instance), so
         // an identity change tells a parked long poll that its queue is gone.
         GuardedMessageQueue polledQueue = getOrCreateQueue(storageKey);
 
         while (true) {
-            if (messagesByQueue.get(storageKey) != polledQueue) {
+            long observed = polledQueue.changeVersion();
+            if (polledQueue.isClosed() || messagesByQueue.get(storageKey) != polledQueue) {
                 // The queue was deleted mid-poll (and possibly recreated under
                 // the same URL). Finish empty-handed: a receive opened against
                 // the deleted incarnation must not consume deliveries — nor
@@ -1464,7 +1447,8 @@ public class SqsService implements Resettable, ResourceProvider {
                 // to the new queue's consumers.
                 return Collections.emptyList();
             }
-            List<Message> result = doReceiveMessage(storageKey, queueUrl, maxMessages, visibilityTimeout, region);
+            List<Message> result = doReceiveMessage(
+                    storageKey, queueUrl, maxMessages, visibilityTimeout, region, polledQueue);
             if (!result.isEmpty() || maxWait <= 0) {
                 if (!result.isEmpty() && LOG.isTraceEnabled()) {
                     for (Message m : result) {
@@ -1474,14 +1458,12 @@ public class SqsService implements Resettable, ResourceProvider {
                 }
                 return recordReceive(polledQueue, result);
             }
-            long elapsed = System.currentTimeMillis() - start;
-            if (elapsed >= maxWait) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
                 return recordReceive(polledQueue, result);
             }
             try {
-                synchronized (lock) {
-                    lock.wait(Math.min(1000, maxWait - elapsed));
-                }
+                polledQueue.awaitChange(observed, remaining);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return recordReceive(polledQueue, result);
@@ -1525,7 +1507,8 @@ public class SqsService implements Resettable, ResourceProvider {
         });
     }
 
-    private List<Message> doReceiveMessage(String storageKey, String queueUrl, int maxMessages, int visibilityTimeout, String region) {
+    private List<Message> doReceiveMessage(String storageKey, String queueUrl, int maxMessages, int visibilityTimeout,
+                                          String region, GuardedMessageQueue guardedQueue) {
         Queue queue = getQueueByUrl(storageKey, queueUrl).orElse(null);
         if (queue == null) {
             return Collections.emptyList();
@@ -1543,7 +1526,7 @@ public class SqsService implements Resettable, ResourceProvider {
         int maxReceiveCount = rp != null ? rp.maxReceiveCount() : -1;
         String deadLetterTargetArn = rp != null ? rp.deadLetterTargetArn() : null;
 
-        GuardedMessageQueue guardedQueue = unexpiredMessages(storageKey, queue);
+        guardedQueue.removeExpired(retentionCutoff(queue));
         GuardedMessageQueue.ClaimResult claimResult = guardedQueue.claimVisibleMessages(
                 maxMessages, effectiveTimeout, queue.isFifo(), maxReceiveCount, deadLetterTargetArn);
 
