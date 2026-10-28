@@ -35,6 +35,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
@@ -395,9 +396,46 @@ class IamEnforcementFilterTest {
         verify(actionRegistry, never()).resolve(any(), any());
     }
 
+    @ParameterizedTest
+    @CsvSource({"false,false,403", "true,false,0", "true,true,403"})
+    void managementOwnershipAuthenticatesCredentialsEvenWithoutAnActionMapping(
+            boolean known, boolean expired, int expectedStatus) {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        String auth = "AWS4-HMAC-SHA256 Credential=ASIAOWNER/20260924/us-east-1/apigateway/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+        requestContext.setAccountId("000000000000");
+        requestContext.setRegion("us-east-1");
+        when(request.getHeaderString("Authorization")).thenReturn(auth);
+        when(request.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY)).thenReturn(ProtocolClaim.rest());
+        when(accountResolver.extractAccessKeyId(auth)).thenReturn("ASIAOWNER");
+        when(catalog.byResourceClass(ApiGatewayController.class))
+                .thenReturn(Optional.of(descriptor("apigateway", ServiceProtocol.REST_JSON,
+                        Set.of("apigateway"), ApiGatewayController.class).withRequiredRestAuthentication()));
+        when(iamService.isKnownAccessKey("ASIAOWNER")).thenReturn(known);
+        when(iamService.isExpiredSession(eq("ASIAOWNER"), any())).thenReturn(expired);
+
+        newFilter(resourceInfo(ApiGatewayController.class)).filter(request);
+
+        if (expectedStatus == 0) {
+            verify(request, never()).abortWith(any());
+        } else {
+            ArgumentCaptor<Response> response = ArgumentCaptor.captor();
+            verify(request).abortWith(response.capture());
+            assertEquals(expectedStatus, response.getValue().getStatus());
+            assertTrue(entityString(response.getValue()).contains(
+                    expired ? "ExpiredTokenException" : "UnrecognizedClientException"));
+        }
+        verifyNoInteractions(evaluator);
+    }
+
     @Test
     void restRouteAuthorizesTheServiceThatMatchedTheRequest() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(containerRequest.getUriInfo()).thenReturn(uriInfo);
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/restapis"));
+        when(uriInfo.getBaseUri()).thenReturn(URI.create("http://localhost/"));
+        when(containerRequest.getMethod()).thenReturn("POST");
         String auth = "AWS4-HMAC-SHA256 Credential=AKIAUSER/20260924/us-east-1/iam/aws4_request, "
                 + "SignedHeaders=host, Signature=abc";
         requestContext.setAccountId("000000000000");
