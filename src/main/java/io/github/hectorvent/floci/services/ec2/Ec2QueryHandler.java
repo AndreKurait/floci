@@ -4039,11 +4039,10 @@ public class Ec2QueryHandler {
      */
     private Response handleCopyImage(MultivaluedMap<String, String> p, String region) {
         if (p.containsKey("KmsKeyId") || Boolean.parseBoolean(p.getFirst("Encrypted"))
-                || Boolean.parseBoolean(p.getFirst("CopyImageTags"))
                 || p.keySet().stream().anyMatch(name -> name.startsWith("Destination")
                         || name.equals("SnapshotCopyCompletionDurationMinutes"))) {
             throw new AwsException("UnsupportedOperation",
-                    "CopyImage supports regional copies without encryption, copy tags or placement options.", 400);
+                    "CopyImage supports regional copies without encryption or placement options.", 400);
         }
         List<Tag> imageTags = parseTagsForResource(p, "image", IMAGE_TAG_RESOURCE_TYPES);
         List<Tag> snapshotTags = parseTagsForResource(p, "snapshot", IMAGE_TAG_RESOURCE_TYPES);
@@ -4053,7 +4052,8 @@ public class Ec2QueryHandler {
                 p.getFirst("SourceImageId"),
                 p.getFirst("Name"),
                 p.getFirst("Description"),
-                Boolean.parseBoolean(p.getFirst("DryRun")));
+                Boolean.parseBoolean(p.getFirst("DryRun")),
+                Boolean.parseBoolean(p.getFirst("CopyImageTags")));
         applyResourceTags(imageTags, region, image.getImageId());
         applyImageSnapshotTags(snapshotTags, region, image);
         XmlBuilder xml = new XmlBuilder()
