@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.iam;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.github.hectorvent.floci.testing.SignedIamEnforcementProfile;
 import io.quarkus.test.common.http.TestHTTPResource;
@@ -11,6 +13,7 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.apigateway.ApiGatewayClient;
 import software.amazon.awssdk.services.apigateway.model.ApiGatewayException;
@@ -277,6 +280,160 @@ class ApiGatewayPassRoleIntegrationTest {
                     .target("https://example.com").credentialsArn(f.role)).apiId();
             assertEquals("HTTP_PROXY", f.v2.getIntegrations(b -> b.apiId(proxy)).items().getFirst().integrationTypeAsString());
         }
+    }
+
+    @Test
+    void importedRestIntegrationsRequirePassRoleBeforeCreation() {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            String spec = importDocument(f, f.role, "get", "3.0.1");
+            int initial = f.rest.getRestApis().items().size();
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                    .body(SdkBytes.fromUtf8String(spec)))).statusCode());
+            assertEquals(initial, f.rest.getRestApis().items().size());
+            f.policy("lambda.amazonaws.com");
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                    .body(SdkBytes.fromUtf8String(spec)))).statusCode());
+            f.policy("apigateway.amazonaws.com");
+            String api = f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(spec))).id();
+            String resource = f.rest.getResources(b -> b.restApiId(api)).items().stream()
+                    .filter(item -> "/imported".equals(item.path())).findFirst().orElseThrow().id();
+            assertEquals(f.role, f.rest.getIntegration(b -> b.restApiId(api).resourceId(resource)
+                    .httpMethod("GET")).credentials());
+        }
+    }
+
+    @Test
+    void importedSwaggerAnyIntegrationUsesTheSameRoleCheck() {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            String spec = importDocument(f, f.role, "x-amazon-apigateway-any-method", "2.0");
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                    .body(SdkBytes.fromUtf8String(spec)))).statusCode());
+            f.policy("apigateway.amazonaws.com");
+            String api = f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(spec))).id();
+            String resource = f.rest.getResources(b -> b.restApiId(api)).items().stream()
+                    .filter(item -> "/imported".equals(item.path())).findFirst().orElseThrow().id();
+            assertEquals(f.role, f.rest.getIntegration(b -> b.restApiId(api).resourceId(resource)
+                    .httpMethod("ANY")).credentials());
+        }
+    }
+
+    @Test
+    void deniedRestImportMergeAndOverwritePreserveExistingState() {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            f.policy("apigateway.amazonaws.com");
+            String spec = importDocument(f, f.role, "get", "3.0.1");
+            String api = f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(spec))).id();
+            f.policy(null);
+            for (String mode : new String[] {"merge", "overwrite"}) {
+                String changed = spec.replace("/imported", "/replacement");
+                assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.putRestApi(b -> b
+                        .restApiId(api).mode(mode).body(SdkBytes.fromUtf8String(changed)))).statusCode());
+                assertEquals(2, f.rest.getResources(b -> b.restApiId(api)).items().size());
+                String resource = f.rest.getResources(b -> b.restApiId(api)).items().stream()
+                        .filter(item -> "/imported".equals(item.path())).findFirst().orElseThrow().id();
+                assertEquals(f.role, f.rest.getIntegration(b -> b.restApiId(api).resourceId(resource)
+                        .httpMethod("GET")).credentials());
+            }
+            String cleared = spec.replace("\"credentials\":\"" + f.role + "\",", "");
+            f.rest.putRestApi(b -> b.restApiId(api).mode("overwrite").body(SdkBytes.fromUtf8String(cleared)));
+            String resource = f.rest.getResources(b -> b.restApiId(api)).items().stream()
+                    .filter(item -> "/imported".equals(item.path())).findFirst().orElseThrow().id();
+            assertEquals(null, f.rest.getIntegration(b -> b.restApiId(api).resourceId(resource)
+                    .httpMethod("GET")).credentials());
+        }
+    }
+
+    @Test
+    void yamlImportResolvesAwsVariablesBeforeRoleAuthorization() {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            String spec = """
+                    openapi: 3.0.1
+                    info:
+                      title: %s
+                      version: '1'
+                    paths:
+                      /imported:
+                        get:
+                          responses:
+                            '200':
+                              description: OK
+                          x-amazon-apigateway-integration:
+                            type: aws_proxy
+                            httpMethod: POST
+                            uri: %s
+                            credentials: '%s'
+                    """.formatted(f.name, f.uri(), f.role.replace("arn:aws:iam::000000000000:",
+                            "arn:${AWS::Partition}:iam::${AWS::AccountId}:"));
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                    .body(SdkBytes.fromUtf8String(spec)))).statusCode());
+            f.policy("apigateway.amazonaws.com");
+            String api = f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(spec))).id();
+            String resource = f.rest.getResources(b -> b.restApiId(api)).items().stream()
+                    .filter(item -> "/imported".equals(item.path())).findFirst().orElseThrow().id();
+            assertEquals(f.role, f.rest.getIntegration(b -> b.restApiId(api).resourceId(resource)
+                    .httpMethod("GET")).credentials());
+        }
+    }
+
+    @Test
+    void importIgnoresUnconsumedRoleLookalikesAndCallerCredentials() {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            String spec = importDocument(f, "arn:aws:iam::*:user/*", "get", "3.0.1")
+                    .replace("\"info\":", "\"x-unused\":{\"credentials\":\"" + f.role + "\"},\"info\":");
+            f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(spec)));
+            String unknown = importDocument(f, f.role, "get", "3.0.1").replace("aws_proxy", "unknown");
+            f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(unknown)));
+            assertEquals(400, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                    .body(SdkBytes.fromUtf8String("invalid")))).statusCode());
+        }
+    }
+
+    @Test
+    void everyImportedIntegrationRoleIsCheckedBeforeAnyResourceChanges() throws Exception {
+        try (Fixture f = new Fixture()) {
+            registerImportedApis(f);
+            f.policy("apigateway.amazonaws.com");
+            String spec = importDocument(f, f.role, "get", "3.0.1");
+            ObjectMapper mapper = new ObjectMapper();
+            ObjectNode document = (ObjectNode) mapper.readTree(spec);
+            ObjectNode paths = (ObjectNode) document.get("paths");
+            ObjectNode rejected = (ObjectNode) paths.get("/imported").deepCopy();
+            rejected.withObject("/get/x-amazon-apigateway-integration").put("credentials", f.role + "other");
+            paths.set("/rejected", rejected);
+            String multiple = mapper.writeValueAsString(document);
+            int initial = f.rest.getRestApis().items().size();
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.importRestApi(b -> b
+                    .body(SdkBytes.fromUtf8String(multiple)))).statusCode());
+            assertEquals(initial, f.rest.getRestApis().items().size());
+            String api = f.rest.importRestApi(b -> b.body(SdkBytes.fromUtf8String(spec))).id();
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.putRestApi(b -> b
+                    .restApiId(api).mode("overwrite").body(SdkBytes.fromUtf8String(multiple)))).statusCode());
+            assertEquals(2, f.rest.getResources(b -> b.restApiId(api)).items().size());
+        }
+    }
+
+    private void registerImportedApis(Fixture f) {
+        cleanup.register(() -> {
+            try (ApiGatewayClient admin = f.adminRest()) {
+                admin.getRestApisPaginator().items().stream().filter(api -> f.name.equals(api.name()))
+                        .forEach(api -> admin.deleteRestApi(b -> b.restApiId(api.id())));
+            }
+        });
+    }
+
+    private static String importDocument(Fixture f, String role, String method, String version) {
+        String field = "2.0".equals(version) ? "swagger" : "openapi";
+        return """
+                {"%s":"%s","info":{"title":"%s","version":"1"},"paths":{"/imported":{
+                  "%s":{"responses":{"200":{"description":"OK"}},
+                    "x-amazon-apigateway-integration":{"type":"aws_proxy","httpMethod":"POST",
+                      "credentials":"%s","uri":"%s"}}}}}
+                """.formatted(field, version, f.name, method, role, f.uri());
     }
 
     private ApiGatewayClient sessionClient(Credentials credentials) {
