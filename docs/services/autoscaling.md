@@ -82,7 +82,9 @@ Member instances carry the tags the
 [EC2 instance tagging lifecycle](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-tagging.html#tag-lifecycle)
 describes. An instance the group launches gets its launch template's instance tags, then the
 group's `PropagateAtLaunch` tags, which win a key both set, then `aws:autoscaling:groupName` with
-the group's name. `AttachInstances` adds the same group tags and `aws:autoscaling:groupName`,
+the group's name. `CreateAutoScalingGroup` defaults an omitted `PropagateAtLaunch` to `true`;
+an explicit `false` keeps the tag on the group only.
+`AttachInstances` adds the same group tags and `aws:autoscaling:groupName`,
 overwriting existing tags with the same keys. `DetachInstances` removes only
 `aws:autoscaling:groupName`, and only while it names the group being detached from.
 
