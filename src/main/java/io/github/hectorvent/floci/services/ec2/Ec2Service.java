@@ -4330,7 +4330,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 // ancestor supplies the guest runtime (systemd vs minimal, cloud-init), which a
                 // committed layer does not change; the captured file system, when there is one,
                 // then replaces the image to actually run.
-                dockerImage = amiImageResolver.resolveImage(resolveLaunchableImageId(region, imageId));
+                String launchableImageId = image != null && !callerAccountId().equals(image.getOwnerId())
+                        && !foreignImageEntries(region, imageId).isEmpty()
+                        ? sharedImageAncestor(region, image) : resolveLaunchableImageId(region, imageId);
+                dockerImage = amiImageResolver.resolveImage(launchableImageId);
                 String captured = capturedImageFor(region, imageId);
                 if (captured != null) {
                     dockerImage = new ResolvedAmiImage(captured, dockerImage.guestRuntime(),
@@ -5647,8 +5650,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * Stops the Docker containers of running instances on emulator shutdown. Without this
-     * they outlive the process as orphans. Instances flip to {@code stopped} — the container
-     * really is stopped, and the id is kept so StartInstances can revive it after a restart.
+     * they outlive the process as orphans. Persistent instances flip to {@code stopped},
+     * keeping the container so StartInstances can revive it after a restart. Memory-only
+     * instances are removed synchronously, including containers already stopped, because
+     * their tracking records cannot survive the process.
      * Runs during the ShutdownEvent phase, so the state change is captured by the final flush.
      */
     @Override
@@ -5656,15 +5661,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (!config.services().ec2().enabled() || config.services().ec2().mock()) {
             return;
         }
+        boolean ephemeral = "memory".equals(config.storage().services().ec2().mode().orElse(config.storage().mode()));
         for (AccountAwareStorageBackend.AccountEntry<Instance> entry : entriesOfEveryAccount(instances)) {
             Instance inst = entry.value();
             if (inst == null || inst.getDockerContainerId() == null
-                    || inst.getState() == null || !"running".equals(inst.getState().getName())) {
+                    || (!ephemeral && (inst.getState() == null || !"running".equals(inst.getState().getName())))) {
                 continue;
             }
             try {
-                containerManager.stopForShutdown(inst);
-                inst.setState(InstanceState.stopped());
+                if (inst.getState() != null && "running".equals(inst.getState().getName())) {
+                    containerManager.stopForShutdown(inst);
+                }
+                if (ephemeral) {
+                    containerManager.terminateForShutdown(inst);
+                    inst.setState(InstanceState.terminated());
+                } else {
+                    inst.setState(InstanceState.stopped());
+                }
                 putForOwner(instances, entry, inst);
             } catch (Exception e) {
                 LOG.warnv("Failed to stop EC2 instance container {0} on shutdown: {1}",
@@ -9964,7 +9977,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             validateNewResourceTags(copiedTags);
             List<BlockDeviceMapping> mappings = foreign
                     ? sharedCopyMappings(sourceRegion, source) : sourceImageMappings(source);
-            String ancestor = foreign ? sharedCopyAncestor(sourceRegion, source)
+            String ancestor = foreign ? sharedImageAncestor(sourceRegion, source)
                     : resolveLaunchableImageId(sourceRegion, sourceImageId);
             requireNotDryRun(dryRun);
             Image copy = registerImage(destinationRegion, name, description, source.getArchitecture(),
@@ -10211,13 +10224,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return result;
     }
 
-    private String sharedCopyAncestor(String region, Image source) {
+    private String sharedImageAncestor(String region, Image source) {
         Set<String> visited = new HashSet<>();
         Image current = source;
         while (visited.size() < 16 && visited.add(current.getImageId())) {
             if (current.getDockerImage() != null) {
                 throw new AwsException("UnsupportedOperation",
-                        "Shared copies of captured Docker images are not supported.", 400);
+                        "Shared captured Docker images are not supported.", 400);
             }
             String ancestor = current.getSourceImageId();
             if (ancestor == null) {
@@ -10225,7 +10238,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     return null;
                 }
                 throw new AwsException("UnsupportedOperation",
-                        "Container-backed shared copies require a catalog-bound source image.", 400);
+                        "Container-backed shared images require a catalog-bound source image.", 400);
             }
             if (imageCatalog.findByIdOrAlias(ancestor).isPresent()) {
                 return ancestor;
@@ -10246,10 +10259,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (image == null && !foreignImageEntries(region, imageId).isEmpty()) {
             image = sharedImageForCaller(region, imageId).orElseThrow(() ->
                     new AwsException("InvalidAMIID.NotFound", "The image is not available: " + imageId, 400));
-            if (!config.services().ec2().mock()) {
-                throw new AwsException("UnsupportedOperation",
-                        "Container-backed shared image launch requires a caller-owned copy.", 400);
-            }
         }
         if (image != null && DEREGISTERED_STATE.equals(image.getState())) {
             throw new AwsException("InvalidAMIID.Unavailable",

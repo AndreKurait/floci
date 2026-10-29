@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
 import io.github.hectorvent.floci.services.ec2.model.Image;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.Snapshot;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
@@ -18,6 +19,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 
 import java.util.HashMap;
 import java.util.List;
@@ -30,7 +32,11 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class Ec2ImageSharingServiceTest {
@@ -44,6 +50,80 @@ class Ec2ImageSharingServiceTest {
     private final Ec2ImageCatalog catalog = catalog();
     private final Ec2Service owner = service(OWNER);
     private final Ec2Service recipient = service(RECIPIENT);
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void catalogBoundSharedLaunchRetainsRuntimeAndRecipientOwnership(boolean intermediateAncestor) {
+        Image source = source();
+        if (intermediateAncestor) {
+            Image intermediate = owner.registerImage(REGION, "intermediate", null,
+                    "arm64", "/dev/xvda", List.of());
+            intermediate.setSourceImageId(source.getSourceImageId());
+            source.setSourceImageId(intermediate.getImageId());
+        }
+        owner.modifyImageLaunchPermissions(REGION, source.getImageId(), List.of(RECIPIENT), List.of(), false);
+        Set<String> images = Set.copyOf(store("ec2-registered-images.json").keys());
+        Set<String> snapshots = Set.copyOf(store("ec2-snapshots.json").keys());
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service launcher = service(RECIPIENT, false, manager);
+
+        Instance instance = launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
+                null, List.of(), null, null, List.of(), "native user data", null).getInstances().getFirst();
+
+        ArgumentCaptor<ResolvedAmiImage> runtime = ArgumentCaptor.forClass(ResolvedAmiImage.class);
+        verify(manager).launch(eq(instance), runtime.capture(), any(), eq(REGION), any(), any(), any(), any());
+        assertEquals(new AmiImageResolver(catalog).resolveImage("ami-catalog-worker"), runtime.getValue());
+        assertEquals("example/worker:1", runtime.getValue().dockerImage());
+        assertEquals("arm64", instance.getArchitecture());
+        assertEquals(source.getImageId(), instance.getImageId());
+        assertEquals("native user data", instance.getUserData());
+        assertEquals(RECIPIENT, launcher.callerAccountId());
+        assertEquals(OWNER, source.getOwnerId());
+        assertTrue(store("ec2-instances.json").keys().contains(RECIPIENT + "/" + REGION + "::" + instance.getInstanceId()));
+        assertEquals(snapshotId(source), launcher.describeVolumes(REGION, List.of(), Map.of())
+                .getFirst().getSnapshotId());
+        assertEquals(images, store("ec2-registered-images.json").keys());
+        assertEquals(snapshots, store("ec2-snapshots.json").keys());
+        assertTrue(owner.describeSnapshots(REGION, List.of(snapshotId(source)), List.of(), Map.of())
+                .getFirst().getCreateVolumePermissionUserIds().isEmpty());
+        owner.modifyImageLaunchPermissions(REGION, source.getImageId(), List.of(), List.of(RECIPIENT), false);
+        assertEquals("InvalidAMIID.NotFound", assertThrows(AwsException.class,
+                () -> launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
+                        null, List.of(), null, null, List.of(), null, null)).getErrorCode());
+        assertEquals(1, launcher.describeInstances(REGION, List.of(), Map.of()).size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"unbound", "captured", "captured-ancestor", "missing-ancestor", "cycle"})
+    void unsupportedSharedRuntimeCannotFallBackOrAllocateLaunchResources(String fault) {
+        Image source = source();
+        grant(source);
+        switch (fault) {
+            case "unbound" -> source.setSourceImageId(null);
+            case "captured" -> source.setDockerImage("example/captured:1");
+            case "captured-ancestor" -> {
+                Image ancestor = owner.registerImage(REGION, "captured", null, "arm64", "/dev/xvda", List.of());
+                ancestor.setDockerImage("example/captured:1");
+                source.setSourceImageId(ancestor.getImageId());
+            }
+            case "missing-ancestor" -> source.setSourceImageId("ami-0123456789abcdef0");
+            case "cycle" -> source.setSourceImageId(source.getImageId());
+            default -> throw new AssertionError(fault);
+        }
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service launcher = service(RECIPIENT, false, manager);
+        String code = switch (fault) {
+            case "missing-ancestor" -> "InvalidAMIID.NotFound";
+            case "cycle" -> "InvalidAMIID.Unavailable";
+            default -> "UnsupportedOperation";
+        };
+        assertEquals(code, assertThrows(AwsException.class,
+                () -> launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
+                        null, List.of(), null, null, List.of(), null, null)).getErrorCode());
+        assertTrue(launcher.describeInstances(REGION, List.of(), Map.of()).isEmpty());
+        assertTrue(launcher.describeVolumes(REGION, List.of(), Map.of()).isEmpty());
+        verifyNoInteractions(manager);
+    }
 
     @Test
     void catalogBoundCopyRetainsRuntimeAncestryAndIndependentSnapshotMetadata() {
@@ -401,6 +481,10 @@ class Ec2ImageSharingServiceTest {
     }
 
     private Ec2Service service(String account, boolean mockMode) {
+        return service(account, mockMode, mock(Ec2ContainerManager.class));
+    }
+
+    private Ec2Service service(String account, boolean mockMode, Ec2ContainerManager manager) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
@@ -415,7 +499,7 @@ class Ec2ImageSharingServiceTest {
                 return new AccountAwareStorageBackend<>(store(fileName), null, account);
             }
         };
-        return new Ec2Service(config, mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
+        return new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
                 new AmiImageResolver(catalog), catalog, new Ec2InstanceTypeCatalog(), storage);
     }
 

@@ -140,6 +140,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.clearInvocations;
@@ -6465,6 +6466,48 @@ class Ec2ServiceTest {
                 .orElseThrow().getState().getName());
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "memory, none, true", "persistent, none, false", "hybrid, none, false", "wal, none, false",
+            "memory, persistent, false", "persistent, memory, true", "hybrid, memory, true", "wal, memory, true"
+    })
+    void shutdownUsesEffectiveEc2StorageMode(String global, String override, boolean ephemeral) {
+        EmulatorConfig config = mockConfig(false);
+        when(config.storage().mode()).thenReturn(global);
+        when(config.storage().services().ec2().mode())
+                .thenReturn("none".equals(override) ? Optional.empty() : Optional.of(override));
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        List<Instance> instances = new ArrayList<>();
+        for (InstanceState state : List.of(InstanceState.running(), InstanceState.stopped(), InstanceState.pending())) {
+            Instance instance = persistedInstance("i-" + state.getName(), "10.20.1.10", state);
+            instance.setDockerContainerId("container-" + state.getName());
+            instanceStore.putForAccount("111122223333", "us-east-1::" + instance.getInstanceId(), instance);
+            instances.add(instance);
+        }
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), mock(VpcNetworkManager.class));
+
+        service.stopManagedContainers();
+
+        verify(containers).stopForShutdown(instances.getFirst());
+        for (Instance instance : instances) {
+            if (ephemeral) {
+                verify(containers).terminateForShutdown(instance);
+                assertEquals("terminated", instance.getState().getName());
+            } else {
+                verify(containers, never()).terminateForShutdown(instance);
+            }
+        }
+        if (!ephemeral) {
+            assertEquals(List.of("stopped", "stopped", "pending"),
+                    instances.stream().map(instance -> instance.getState().getName()).toList());
+        }
+        assertEquals(Set.of("111122223333"), instanceStore.scanAllAccountEntries(key -> true).stream()
+                .map(AccountAwareStorageBackend.AccountEntry::accountId).collect(Collectors.toSet()));
+    }
+
     @Test
     void restoreReReservesThePrivateAddressesOfInstancesThatSurvivedTheRestart() {
         // The lease table is in-memory, so a restart rebuilds it empty while the containers of
@@ -9276,6 +9319,10 @@ class Ec2ServiceTest {
 
     private static EmulatorConfig mockConfig(boolean ec2Mock) {
         EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.StorageConfig storage = mock(EmulatorConfig.StorageConfig.class, RETURNS_DEEP_STUBS);
+        when(config.storage()).thenReturn(storage);
+        when(storage.mode()).thenReturn("persistent");
+        when(storage.services().ec2().mode()).thenReturn(Optional.empty());
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
         when(config.defaultAccountId()).thenReturn("000000000000");

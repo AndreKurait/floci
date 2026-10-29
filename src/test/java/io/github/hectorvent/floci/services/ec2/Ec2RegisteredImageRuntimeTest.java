@@ -51,6 +51,7 @@ class Ec2RegisteredImageRuntimeTest {
     void createServiceWithExplicitCatalogBindings() throws Exception {
         Path file = directory.resolve("images.yaml");
         Files.writeString(file, """
+                includeDefaultImages: true
                 defaultDockerImage: example/fallback:1
                 images:
                   - imageId: ami-native-arm

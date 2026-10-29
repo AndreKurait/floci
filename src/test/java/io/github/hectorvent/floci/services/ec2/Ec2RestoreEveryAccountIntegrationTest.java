@@ -107,7 +107,7 @@ class Ec2RestoreEveryAccountIntegrationTest {
     }
 
     @Test
-    void shutdownWritesAnotherAccountsInstanceOnlyToItsOwnAccount() throws Throwable {
+    void memoryShutdownRemovesAnotherAccountsInstanceOnlyInItsOwnAccount() throws Throwable {
         Instance instance = runningInstanceOf(OTHER_ACCOUNT);
         restoreOutsideAnyRequest();
         // Stopping a container unpublishes its forwards, and the port-forward manager persists that.
@@ -123,7 +123,8 @@ class Ec2RestoreEveryAccountIntegrationTest {
         runOutsideAnyRequest(service::stopManagedContainers);
 
         verify(containerManager).stopForShutdown(argThat(stopped -> isSame(stopped, instance)));
-        assertEquals("stopped", RequestScopes.callAs(OTHER_ACCOUNT,
+        verify(containerManager).terminateForShutdown(argThat(stopped -> isSame(stopped, instance)));
+        assertEquals("terminated", RequestScopes.callAs(OTHER_ACCOUNT,
                 () -> describe(instance.getInstanceId()).getFirst().getState().getName()));
         assertFalse(RequestScopes.callAs("000000000000", () -> describe(null).stream()
                 .anyMatch(listed -> listed.getInstanceId().equals(instance.getInstanceId()))));

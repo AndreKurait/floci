@@ -13,6 +13,7 @@ import com.github.dockerjava.api.model.MountType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
@@ -213,8 +214,7 @@ public class Ec2ContainerManager {
                 || !ALIASES.matches(labels, LABEL_OWNER, ownerIdentity())) {
             throw new IllegalStateException("EC2 workload network namespace is not Floci protected");
         }
-        String address = preferredMetadataSourceIp(helper.getNetworkSettings().getNetworks())
-                .orElseThrow(() -> new IllegalStateException("EC2 network helper has no Docker IP"));
+        String address = Ec2PublicAddressRouting.privateAddress(helper, instance.getContainerBridgeIp());
         return new ProtectedNamespace(helperId, address, securityGroupsEnforced);
     }
 
@@ -461,9 +461,11 @@ public class Ec2ContainerManager {
         // network, exposeReachablePrivateAddress replaces the reported private IP with the bridge
         // one, and the address actually leased would otherwise be unrecoverable on the paths below.
         String leasedPrivateIp = instance.getPrivateIpAddress();
+        String accountId = instance.getOwnerId() != null
+                ? instance.getOwnerId() : regionResolver.getAccountId();
 
         try {
-            executor.execute(() -> {
+            executor.execute(() -> RequestScopes.runAs(accountId, region, () -> {
                 try {
                     String instanceId = instance.getInstanceId();
                 // IMDS endpoint that this container should use
@@ -559,7 +561,7 @@ public class Ec2ContainerManager {
                         markContainerlessRunning(instance);
                     }
                 }
-            });
+            }));
         } catch (RejectedExecutionException e) {
             LOG.warnv("Could not schedule EC2 instance {0} launch because the launch executor is saturated or stopping",
                     instance.getInstanceId());
@@ -573,8 +575,10 @@ public class Ec2ContainerManager {
                                                      Map<String, List<String>> prefixLists) {
         String instanceId = instance.getInstanceId();
         String containerName = ContainerStorageHelper.resourceName(config, "ec2", null, instanceId);
-        String serviceEndpoint = reachableEndpoint.baseUrl();
         GuestOptions options = guestOptions(config.services().ec2());
+        boolean customResolver = options.mounts().stream().anyMatch(mount ->
+                "/etc".equals(mount.getTarget()) || "/etc/resolv.conf".equals(mount.getTarget()));
+        String serviceEndpoint = customResolver ? reachableEndpoint.baseUrl(false) : reachableEndpoint.baseUrl();
 
         return portAllocator.allocateAndStart(
                 config.services().ec2().sshPortRangeStart(),
@@ -631,6 +635,10 @@ public class Ec2ContainerManager {
                 refreshImdsSourceRegistration(instance, helperId, containerIp);
                 refreshMetadataAddresses(instance, helperId);
                 configureLinkLocalMetadataEndpoint(helperId, instance, flociHost, imdsPort);
+                preparePublicAddressRouting(helperId, instance);
+                if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, false)) {
+                    exposeReachablePublicAddress(instance);
+                }
                 if (isLaunchCancelled(instance)) {
                     throw new IllegalStateException("EC2 launch was canceled before guest startup");
                 }
@@ -700,7 +708,8 @@ public class Ec2ContainerManager {
                 // sibling emulator's live instances off a shared daemon. See LABEL_OWNER.
                 .withLabels(Map.of(LABEL_OWNER, ownerIdentity()))
                 .withNetworkMode("container:" + helperId)
-                .withPrivileged(!enforceSecurityGroups);
+                .withPrivileged(config.services().ec2().privileged() && !enforceSecurityGroups);
+        config.services().ec2().capDrop().orElse(List.of()).forEach(specBuilder::withCapDrop);
         options.ulimits().forEach((name, limit) -> specBuilder.withUlimit(name, limit.soft(), limit.hard()));
         options.mounts().forEach(specBuilder::withMount);
         if (!image.imageRuntime()) {
@@ -1092,6 +1101,10 @@ public class Ec2ContainerManager {
                     refreshMetadataAddresses(instance, namespace.helperId());
                     configureLinkLocalMetadataEndpoint(namespace.helperId(), instance, dockerHostResolver.resolve(),
                             config.services().ec2().imdsPort());
+                    preparePublicAddressRouting(namespace.helperId(), instance);
+                    if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, true)) {
+                        exposeReachablePublicAddress(instance);
+                    }
                 }
                 dockerClient.startContainerCmd(containerId).exec();
                 boolean running = false;
@@ -1258,7 +1271,7 @@ public class Ec2ContainerManager {
             return !known.isEmpty();
         }
         String networkContainer = namespace == null ? containerId : namespace.helperId();
-        String containerIp = getContainerBridgeIp(networkContainer);
+        String containerIp = namespace == null ? getContainerBridgeIp(networkContainer) : namespace.transportAddress();
         if (containerIp == null || containerIp.isBlank()) {
             containerIp = instance.getContainerBridgeIp();
         }
@@ -1276,12 +1289,15 @@ public class Ec2ContainerManager {
         if (firewallManager == null || !firewallManager.enabled()) {
             exposeReachablePrivateAddress(instance, containerIp, config.services().ec2().awsFaithfulPrivateIp());
         }
-        if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, true)) {
-            exposeReachablePublicAddress(instance);
-        }
         metadataServer.registerContainer(containerIp, instance.getInstanceId(), instance);
         refreshImdsSourceRegistration(instance, networkContainer, containerIp);
         refreshMetadataAddresses(instance, networkContainer);
+        if (namespace != null) {
+            preparePublicAddressRouting(networkContainer, instance);
+        }
+        if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, true)) {
+            exposeReachablePublicAddress(instance);
+        }
         return true;
     }
 
@@ -1369,17 +1385,35 @@ public class Ec2ContainerManager {
      * translate. Where they are not, it falls back to {@code 127.0.0.1}, which is where the
      * published high host ports live — reachable, though not on the ports AWS clients assume.
      *
+     * A prepared VPC guest uses its primary Docker network for public traffic;
+     * namespace-local translation delivers it to the private listener.
+     *
      * @return the address, or null if the instance has no container IP yet
      */
     public String reachablePublicAddress(Instance instance) {
         if (instance == null) {
             return null;
         }
-        String containerIp = instance.getContainerBridgeIp();
+        String containerIp = instance.getContainerPublicIp() != null
+                ? instance.getContainerPublicIp() : instance.getContainerBridgeIp();
         if (containerIp == null || containerIp.isBlank()) {
             return null;
         }
         return containerNetworkReachability.isContainerIpRoutable(containerIp) ? containerIp : "127.0.0.1";
+    }
+
+    private void preparePublicAddressRouting(String namespaceId, Instance instance) {
+        InspectContainerResponse namespace = dockerClient.inspectContainerCmd(namespaceId).exec();
+        String primary = Ec2PublicAddressRouting.primaryAddress(namespace);
+        String privateAddress = Ec2PublicAddressRouting.privateAddress(namespace, instance.getContainerBridgeIp());
+        if (!primary.equals(privateAddress)) {
+            ContainerExec.Result result = execInContainerForResult(namespaceId,
+                    Ec2PublicAddressRouting.command(privateAddress, primary), 15);
+            if (result.exitCode() != 0) {
+                throw new IllegalStateException("Cannot prepare EC2 public-address routing: " + result.summary());
+            }
+        }
+        instance.setContainerPublicIp(primary);
     }
 
     /**
@@ -1453,6 +1487,18 @@ public class Ec2ContainerManager {
      * than killing the executor task.
      */
     public void terminate(Instance instance, Runnable afterTeardown) {
+        executor.submit(terminationOperation(instance, afterTeardown));
+    }
+
+    /** Complete ephemeral teardown before shutdown destroys the lifecycle executor. */
+    public void terminateForShutdown(Instance instance) {
+        terminationOperation(instance, null).run();
+        if (instance.getState() == null || !"terminated".equals(instance.getState().getName())) {
+            throw new IllegalStateException("EC2 instance teardown did not complete: " + instance.getInstanceId());
+        }
+    }
+
+    private Runnable terminationOperation(Instance instance, Runnable afterTeardown) {
         String containerId;
         String containerIp;
         String imdsSourceIp;
@@ -1467,7 +1513,7 @@ public class Ec2ContainerManager {
                     ? null : instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
             instance.setState(InstanceState.shuttingDown());
         }
-        executor.submit(() -> {
+        return () -> {
             // The post-teardown hook's only precondition; see the Javadoc above for why.
             boolean containerGone = false;
             try {
@@ -1535,7 +1581,7 @@ public class Ec2ContainerManager {
                             + "being gone would fail", instance.getInstanceId());
                 }
             }
-        });
+        };
     }
 
     /**
