@@ -303,6 +303,9 @@ public final class CfnRollback {
      */
     public static final String NETWORK_CONNECTOR_UPDATE_SNAPSHOT_ATTR = "__FlociNetworkConnectorUpdateSnapshot";
 
+    /** The complete standalone API Gateway V2 authorizer before an in-place update. */
+    public static final String API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR = "__FlociApiAuthorizerUpdateSnapshot";
+
     private CfnRollback() {
     }
 
