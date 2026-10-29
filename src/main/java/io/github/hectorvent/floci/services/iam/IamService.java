@@ -4545,6 +4545,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 .filter(token -> !token.isBlank());
     }
 
+    /** Role chaining requires a live role credential with this request's matching issued token. */
+    public boolean isRoleSession(String accessKeyId, String sessionToken) {
+        return currentSession(accessKeyId)
+                .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .map(SessionCredential::getRoleArn)
+                .filter(AwsArnUtils::isArn)
+                .map(AwsArnUtils::parse)
+                .filter(arn -> "iam".equals(arn.service()) && arn.resource().startsWith("role/"))
+                .isPresent();
+    }
+
     /**
      * When the session a temporary access key belongs to expires, for callers that must not hand
      * out something outliving it. Empty for a long-term key, which names no session, and for a
