@@ -996,3 +996,10 @@ aws apigatewayv2 create-stage \
 # Disconnect a client
 # curl -X DELETE http://localhost:4566/execute-api/$WS_API_ID/prod/@connections/$CONNECTION_ID
 ```
+
+CloudFormation in-place updates to standalone V2 authorizers snapshot their complete
+configuration before mutation. Failure during the update or in a later stack
+resource restores the previous authorizer ID, credentials and settings. Failed
+restoration keeps the snapshot for rollback retry; successful stack updates clear
+it. This does not cover changing the owning API, deployment activation, concurrent
+transaction isolation or process-crash recovery.

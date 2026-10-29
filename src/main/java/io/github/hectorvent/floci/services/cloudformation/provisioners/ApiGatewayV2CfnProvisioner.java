@@ -132,11 +132,17 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
-        return ReplacementCleanup.complete(resource, this::delete);
+        UpdateCleanupResult result = ReplacementCleanup.complete(resource, this::delete);
+        if (!result.applicable()
+                && resource.getAttributes().containsKey(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR)) {
+            return new UpdateCleanupResult(true, true, null, 0, null);
+        }
+        return result;
     }
 
     @Override
     public void clearUpdate(StackResource resource) {
+        resource.getAttributes().remove(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
         resource.getAttributes().remove(CfnRollback.VPC_LINK_UPDATE_SNAPSHOT_ATTR);
         resource.getAttributes().remove(CfnRollback.INTEGRATION_CONNECTION_SNAPSHOT_ATTR);
         ReplacementCleanup.clear(resource);
@@ -150,6 +156,9 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         if (VPC_LINK.equals(resource.getResourceType())) {
             return rollbackVpcLinkUpdate(resource);
         }
+        if (AUTHORIZER.equals(resource.getResourceType())) {
+            return rollbackAuthorizerUpdate(resource);
+        }
         if (INTEGRATION.equals(resource.getResourceType())) {
             return rollbackIntegrationConnection(resource);
         }
@@ -158,6 +167,14 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
+        if (AUTHORIZER.equals(previous.getResourceType())) {
+            String authorizerSnapshot = attempted.getAttributes().get(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
+            if (authorizerSnapshot != null) {
+                previous.getAttributes().put(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR, authorizerSnapshot);
+            }
+            return;
+        }
+
         // Only the Api carries body-generated sub-resource ids; keep any the failed attempt created
         // so the restored resource still owns them for the next cleanup or stack delete.
         if (!API.equals(previous.getResourceType())) {
@@ -819,19 +836,56 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
             req.put("jwtConfiguration", jwtConfig);
         }
 
+        r.getAttributes().remove(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
         Authorizer authorizer;
-        if (r.getPhysicalId() == null) {
+        if (!ctx.isUpdate()) {
             authorizer = apiGatewayV2Service.createAuthorizer(region, apiId, req);
         } else {
-            authorizer = apiGatewayV2Service.updateAuthorizer(region, apiId, r.getPhysicalId(), req);
-            if (req.get("authorizerCredentialsArn") == null) {
-                apiGatewayV2Service.replaceAuthorizerCredentials(region, apiId, r.getPhysicalId(), null);
+            Authorizer prior = apiGatewayV2Service.getAuthorizer(region, apiId, ctx.priorPhysicalId());
+            ObjectNode snapshot = objectMapper.createObjectNode();
+            snapshot.put("region", region);
+            snapshot.put("apiId", apiId);
+            snapshot.set("authorizer", objectMapper.valueToTree(prior));
+            r.getAttributes().put(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR, snapshot.toString());
+            try {
+                authorizer = apiGatewayV2Service.updateAuthorizer(region, apiId, ctx.priorPhysicalId(), req);
+                if (req.get("authorizerCredentialsArn") == null) {
+                    apiGatewayV2Service.replaceAuthorizerCredentials(region, apiId, ctx.priorPhysicalId(), null);
+                }
+            } catch (RuntimeException failure) {
+                try {
+                    rollbackAuthorizerUpdate(r);
+                } catch (RuntimeException restoreFailure) {
+                    r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR,
+                            "Could not restore authorizer " + ctx.priorPhysicalId() + ": "
+                                    + restoreFailure.getMessage());
+                    if (restoreFailure != failure) {
+                        failure.addSuppressed(restoreFailure);
+                    }
+                }
+                throw failure;
             }
         }
         r.setPhysicalId(authorizer.getAuthorizerId());
         r.getAttributes().put("AuthorizerId", authorizer.getAuthorizerId());
         // ApiId is needed by delete() to scope deleteAuthorizer; the id-only delete path has none.
         r.getAttributes().put("ApiId", apiId);
+    }
+
+    private boolean rollbackAuthorizerUpdate(StackResource resource) {
+        String raw = resource.getAttributes().get(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
+        if (raw == null) {
+            return false;
+        }
+        try {
+            JsonNode snapshot = objectMapper.readTree(raw);
+            apiGatewayV2Service.restoreAuthorizer(snapshot.path("region").asText(), snapshot.path("apiId").asText(),
+                    objectMapper.treeToValue(snapshot.path("authorizer"), Authorizer.class));
+        } catch (JsonProcessingException failure) {
+            throw new IllegalStateException("Could not read authorizer update snapshot", failure);
+        }
+        resource.getAttributes().remove(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
+        return true;
     }
 
     // ── Route ────────────────────────────────────────────────────────────────
