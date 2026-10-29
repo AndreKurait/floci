@@ -664,12 +664,22 @@ public class StsQueryHandler {
         String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
         IamRole role = iamService.findRole(accountId, roleName).orElseThrow(() ->
                 new AwsException("AccessDenied", "Not authorized to perform sts:AssumeRoleWithSAML on resource: " + roleArn, 403));
-        if (!samlTrustEvaluator.allows(role.getAssumeRolePolicyDocument(), principalArn, Map.of(
-                "aud", List.of(STS_AUDIENCE),
-                "iss", List.of(verified.issuer()),
-                "sub", List.of(verified.subject()),
-                "namequalifier", List.of(verified.nameQualifier())))) {
+        Map<String, List<String>> conditionClaims = new LinkedHashMap<>();
+        conditionClaims.put("aud", List.of(STS_AUDIENCE));
+        conditionClaims.put("iss", List.of(verified.issuer()));
+        conditionClaims.put("sub", List.of(verified.subject()));
+        conditionClaims.put("namequalifier", List.of(verified.nameQualifier()));
+        if (verified.sourceIdentity() != null) {
+            conditionClaims.put("sts:SourceIdentity", List.of(verified.sourceIdentity()));
+        }
+        if (!samlTrustEvaluator.allows(role.getAssumeRolePolicyDocument(), principalArn, conditionClaims)) {
             throw new AwsException("AccessDenied", "Not authorized to perform sts:AssumeRoleWithSAML on resource: " + roleArn, 403);
+        }
+
+        if (verified.sourceIdentity() != null && !samlTrustEvaluator.allows(
+                role.getAssumeRolePolicyDocument(), principalArn, conditionClaims, "sts:SetSourceIdentity")) {
+            throw new AwsException("AccessDenied", "Not authorized to perform sts:SetSourceIdentity on resource: "
+                    + roleArn, 403);
         }
 
         if (durationSeconds > role.getMaxSessionDuration()) {
@@ -692,13 +702,16 @@ public class StsQueryHandler {
         String assumedRoleId = "AROA" + randomId(16) + ":" + sessionName;
 
         iamService.registerSession(accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, null,
-                callerAccountId, sessionName, assumedRoleId);
-        String result = new XmlBuilder()
+                callerAccountId, sessionName, assumedRoleId, Map.of(), Map.of(), verified.sourceIdentity());
+        XmlBuilder result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
                 .start("AssumedRoleUser").elem("Arn", assumedRoleArn).elem("AssumedRoleId", assumedRoleId).end("AssumedRoleUser")
                 .elem("PackedPolicySize", "0").elem("Issuer", verified.issuer()).elem("Audience", "urn:amazon:webservices")
-                .elem("NameQualifier", verified.nameQualifier()).elem("SubjectType", verified.subjectType()).elem("Subject", verified.subject()).build();
-        return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithSAML", AwsNamespaces.STS, result)).build();
+                .elem("NameQualifier", verified.nameQualifier()).elem("SubjectType", verified.subjectType()).elem("Subject", verified.subject());
+        if (verified.sourceIdentity() != null) {
+            result.elem("SourceIdentity", verified.sourceIdentity());
+        }
+        return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithSAML", AwsNamespaces.STS, result.build())).build();
     }
 
     /** The access key that signed this request, in the header or presigned in the query. */

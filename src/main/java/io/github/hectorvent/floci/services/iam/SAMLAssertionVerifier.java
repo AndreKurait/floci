@@ -38,7 +38,7 @@ final class SAMLAssertionVerifier {
     private SAMLAssertionVerifier() {}
 
     record Verified(String issuer, String subject, String subjectType, String nameQualifier,
-                    Instant expiration, List<RolePair> roles) {}
+                    Instant expiration, List<RolePair> roles, String sourceIdentity) {}
     record RolePair(String roleArn, String principalArn) {}
 
     static Verified verify(String encoded, SAMLProvider provider, Instant now) throws InvalidAssertionException {
@@ -143,9 +143,18 @@ final class SAMLAssertionVerifier {
             }
 
             List<RolePair> roles = new ArrayList<>();
+            String sourceIdentity = null;
             NodeList attributes = assertion.getElementsByTagNameNS(SAML, "Attribute");
             for (int i = 0; i < attributes.getLength(); i++) {
                 Element attribute = (Element) attributes.item(i);
+                if ("https://aws.amazon.com/SAML/Attributes/SourceIdentity".equals(attribute.getAttribute("Name"))) {
+                    NodeList sourceValues = attribute.getElementsByTagNameNS(SAML, "AttributeValue");
+                    if (sourceIdentity != null || sourceValues.getLength() != 1) {
+                        throw invalid("source identity must have exactly one value");
+                    }
+                    sourceIdentity = StsSourceIdentity.resolve(sourceValues.item(0).getTextContent(), null);
+                    continue;
+                }
                 if (!"https://aws.amazon.com/SAML/Attributes/Role".equals(attribute.getAttribute("Name"))) {
                     continue;
                 }
@@ -169,7 +178,7 @@ final class SAMLAssertionVerifier {
             }
             String nameQualifier = java.util.Base64.getEncoder().encodeToString(
                     Digests.sha1((issuer + provider.getArn()).getBytes(StandardCharsets.UTF_8)));
-            return new Verified(issuer, name, subjectType, nameQualifier, notOnOrAfter, roles);
+            return new Verified(issuer, name, subjectType, nameQualifier, notOnOrAfter, roles, sourceIdentity);
         } catch (InvalidAssertionException e) {
             throw e;
         } catch (Exception e) {

@@ -88,7 +88,7 @@ class AssumeRoleWithSamlValidationIntegrationTest {
     SAMLProviderService samlProviders;
 
     private static KeyPair signingKeys;
-    private static String certificateBase64;
+    static String certificateBase64;
     private static boolean providerRegistered;
 
     @BeforeAll
@@ -359,6 +359,97 @@ class AssumeRoleWithSamlValidationIntegrationTest {
         assertTrue(samlProviders.find(providers.getFirst()).isEmpty());
     }
 
+    @Test
+    void sourceIdentityIsReturnedAndStoredFromSignedAssertion() {
+        try (DurationFixture fixture = new DurationFixture(3600)) {
+            fixture.sourceTrust(true, null);
+            AssumeRoleWithSamlResponse response = fixture.assumeSource("employee-123", true);
+            assertEquals("employee-123", response.sourceIdentity());
+            assertEquals("employee-123", iamService.findSourceIdentity(
+                    response.credentials().accessKeyId(), response.credentials().sessionToken()));
+            assertEquals(null, iamService.findSourceIdentity(response.credentials().accessKeyId(), "wrong-token"));
+        }
+    }
+
+    @Test
+    void sourceIdentityRequiresSeparateTrustPermission() {
+        try (DurationFixture fixture = new DurationFixture(3600)) {
+            StsException denied = assertThrows(StsException.class,
+                    () -> fixture.assumeSource("employee-123", true));
+            assertEquals("AccessDenied", denied.awsErrorDetails().errorCode());
+        }
+    }
+
+    @Test
+    void sourceIdentityTrustConditionUsesVerifiedValue() {
+        try (DurationFixture fixture = new DurationFixture(3600)) {
+            fixture.sourceTrust(true, "employee-123");
+            assertEquals("employee-123", fixture.assumeSource("employee-123", true).sourceIdentity());
+            StsException denied = assertThrows(StsException.class,
+                    () -> fixture.assumeSource("employee-456", true));
+            assertEquals("AccessDenied", denied.awsErrorDetails().errorCode());
+        }
+    }
+
+    @Test
+    void sourceIdentityExplicitDenyOverridesAllow() {
+        try (DurationFixture fixture = new DurationFixture(3600)) {
+            fixture.sourceTrust(true, null);
+            String trust = "{\"Version\":\"2012-10-17\",\"Statement\":["
+                    + "{\"Effect\":\"Allow\",\"Principal\":{\"Federated\":\"" + fixture.providerArn
+                    + "\"},\"Action\":\"sts:*\"},"
+                    + "{\"Effect\":\"Deny\",\"Principal\":{\"Federated\":\"" + fixture.providerArn
+                    + "\"},\"Action\":\"sts:SetSourceIdentity\"}]}";
+            fixture.client.updateAssumeRolePolicy(b -> b.roleName(fixture.name).policyDocument(trust));
+            StsException denied = assertThrows(StsException.class,
+                    () -> fixture.assumeSource("employee-123", true));
+            assertEquals("AccessDenied", denied.awsErrorDetails().errorCode());
+        }
+    }
+
+    @Test
+    void sourceIdentityCannotBypassAssertionSignature() {
+        try (DurationFixture fixture = new DurationFixture(3600)) {
+            fixture.sourceTrust(true, null);
+            StsException denied = assertThrows(StsException.class,
+                    () -> fixture.assumeSource("employee-123", false));
+            assertEquals("InvalidIdentityToken", denied.awsErrorDetails().errorCode());
+        }
+    }
+
+    @Test
+    void sourceIdentityAbsentRetainsExistingTrustContract() {
+        try (DurationFixture fixture = new DurationFixture(3600)) {
+            AssumeRoleWithSamlResponse response = fixture.assume(900, Instant.now().plusSeconds(1800), true);
+            assertEquals(null, response.sourceIdentity());
+            assertEquals(null, iamService.findSourceIdentity(
+                    response.credentials().accessKeyId(), response.credentials().sessionToken()));
+        }
+    }
+
+    @Test
+    void sourceIdentityMalformedValueIsRejected() {
+        try (DurationFixture fixture = new DurationFixture(3600)) {
+            fixture.sourceTrust(true, null);
+            for (String source : List.of("", "a", "employee name", "aws:employee", "a".repeat(65))) {
+                StsException denied = assertThrows(StsException.class, () -> fixture.assumeSource(source, true));
+                assertEquals("InvalidIdentityToken", denied.awsErrorDetails().errorCode());
+            }
+        }
+    }
+
+    @Test
+    void sourceIdentityTrustGrantRevocationIsImmediate() {
+        try (DurationFixture fixture = new DurationFixture(3600)) {
+            fixture.sourceTrust(true, null);
+            assertEquals("employee-123", fixture.assumeSource("employee-123", true).sourceIdentity());
+            fixture.sourceTrust(false, null);
+            StsException denied = assertThrows(StsException.class,
+                    () -> fixture.assumeSource("employee-123", true));
+            assertEquals("AccessDenied", denied.awsErrorDetails().errorCode());
+        }
+    }
+
     private final class DurationFixture implements AutoCloseable {
         private final IamClient client;
         private final StsClient sts;
@@ -407,6 +498,32 @@ class AssumeRoleWithSamlValidationIntegrationTest {
             AssumeRoleWithSamlResponse response = sts.assumeRoleWithSAML(b -> b.roleArn(roleArn)
                     .principalArn(providerArn).durationSeconds(duration)
                     .samlAssertion(assertion(roleArn, providerArn, expiry, AUDIENCE, ISSUER, sign)));
+            sessions.add(response.credentials().accessKeyId());
+            return response;
+        }
+
+        private void sourceTrust(boolean allowSource, String source) {
+            String actions = allowSource ? "[\"sts:AssumeRoleWithSAML\",\"sts:SetSourceIdentity\"]"
+                    : "\"sts:AssumeRoleWithSAML\"";
+            String condition = source == null ? "" : ",\"Condition\":{\"StringEquals\":{\"sts:SourceIdentity\":\""
+                    + source + "\"}}";
+            String trust = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                    + "\"Principal\":{\"Federated\":\"" + providerArn + "\"},\"Action\":" + actions + condition + "}]}";
+            client.updateAssumeRolePolicy(b -> b.roleName(name).policyDocument(trust));
+        }
+
+        private AssumeRoleWithSamlResponse assumeSource(String source, boolean sign) {
+            String encoded = assertion(roleArn, providerArn, Instant.now().plusSeconds(1800), AUDIENCE, ISSUER,
+                    sign, false, factory -> List.of(enveloped(factory)), document -> {
+                        Element attribute = document.createElementNS(SAML_NS, "saml:Attribute");
+                        attribute.setAttribute("Name", "https://aws.amazon.com/SAML/Attributes/SourceIdentity");
+                        Element value = document.createElementNS(SAML_NS, "saml:AttributeValue");
+                        value.setTextContent(source);
+                        attribute.appendChild(value);
+                        document.getElementsByTagNameNS(SAML_NS, "AttributeStatement").item(0).appendChild(attribute);
+                    });
+            AssumeRoleWithSamlResponse response = sts.assumeRoleWithSAML(b -> b.roleArn(roleArn)
+                    .principalArn(providerArn).durationSeconds(900).samlAssertion(encoded));
             sessions.add(response.credentials().accessKeyId());
             return response;
         }
@@ -528,6 +645,14 @@ class AssumeRoleWithSamlValidationIntegrationTest {
     private static String assertion(String role, String provider, Instant expiry, String audience,
                                     String issuer, boolean sign, boolean unrelatedConfirmation,
                                     Function<XMLSignatureFactory, List<Transform>> transforms) {
+        return assertion(role, provider, expiry, audience, issuer, sign, unrelatedConfirmation, transforms,
+                document -> { });
+    }
+
+    static String assertion(String role, String provider, Instant expiry, String audience,
+                                    String issuer, boolean sign, boolean unrelatedConfirmation,
+                                    Function<XMLSignatureFactory, List<Transform>> transforms,
+                                    Consumer<Document> customize) {
         String id = "_" + UUID.randomUUID();
         String extraConfirmation = unrelatedConfirmation
                 ? "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:sender-vouches\"><saml:SubjectConfirmationData Recipient=\"https://unrelated.example.test\" NotOnOrAfter=\"" + Instant.now().minusSeconds(1) + "\"/></saml:SubjectConfirmation>"
@@ -539,6 +664,7 @@ class AssumeRoleWithSamlValidationIntegrationTest {
                 + "<saml:AttributeStatement><saml:Attribute Name=\"https://aws.amazon.com/SAML/Attributes/Role\"><saml:AttributeValue>" + role + "," + provider + "</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></saml:Assertion>";
         try {
             Document document = XmlParser.parseDocument(xml);
+            customize.accept(document);
             if (!sign) {
                 return encoded(document);
             }
