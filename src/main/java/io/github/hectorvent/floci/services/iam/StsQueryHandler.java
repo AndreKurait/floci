@@ -187,6 +187,8 @@ public class StsQueryHandler {
         if (durationValidation != null) {
             return durationValidation;
         }
+        String sourceIdentity = StsSourceIdentity.resolve(getParam(params, "SourceIdentity"),
+                iamService.findSourceIdentity(callerAccessKeyId(), callerSessionToken(params)));
         Map<String, String> sessionTags = StsSessionTags.read(params);
         Map<String, String> form = new LinkedHashMap<>();
         params.keySet().forEach(key -> form.put(key, params.getFirst(key)));
@@ -210,7 +212,7 @@ public class StsQueryHandler {
 
         IamRole role = iamService.findRole(accountId, roleName).orElse(null);
         Response trustDenied = enforceTrustPolicy(roleArn, role, accountId, params, sessionTags,
-                transitiveKeys, !inheritedTags.isEmpty());
+                transitiveKeys, !inheritedTags.isEmpty(), sourceIdentity);
         if (trustDenied != null) {
             return trustDenied;
         }
@@ -230,17 +232,19 @@ public class StsQueryHandler {
         iamService.registerSession(
                 accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy, callerAccountId,
                 sessionName, assumedRoleId, effectiveTags,
-                StsSessionTags.transitive(sessionTags, transitiveKeys, inheritedTags));
+                StsSessionTags.transitive(sessionTags, transitiveKeys, inheritedTags), sourceIdentity);
 
-        String result = new XmlBuilder()
+        XmlBuilder response = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
                 .start("AssumedRoleUser")
                   .elem("Arn", assumedRoleArn)
                   .elem("AssumedRoleId", assumedRoleId)
                 .end("AssumedRoleUser")
-                .elem("PackedPolicySize", "0")
-                .build();
-        return Response.ok(AwsQueryResponse.envelope("AssumeRole", AwsNamespaces.STS, result)).build();
+                .elem("PackedPolicySize", "0");
+        if (sourceIdentity != null) {
+            response.elem("SourceIdentity", sourceIdentity);
+        }
+        return Response.ok(AwsQueryResponse.envelope("AssumeRole", AwsNamespaces.STS, response.build())).build();
     }
 
     /**
@@ -261,7 +265,7 @@ public class StsQueryHandler {
      */
     private Response enforceTrustPolicy(String roleArn, IamRole role, String roleAccountId,
                                         MultivaluedMap<String, String> params, Map<String, String> sessionTags,
-                                        List<String> transitiveKeys, boolean hasInheritedTags) {
+                                        List<String> transitiveKeys, boolean hasInheritedTags, String sourceIdentity) {
         String callerAccount = regionResolver.getAccountId();
         IamService.CallerArns caller = iamService.resolveCallerArns(callerAccessKeyId())
                 .orElseGet(() -> IamService.CallerArns.accountRoot(
@@ -284,6 +288,9 @@ public class StsQueryHandler {
         Map<String, List<String>> requestContext = IamConditionContextResolver.withGlobalContext(
                 null, roleArn, regionResolver.getRegion(), callerAccount, roleAccountId);
         requestContext.putAll(StsSessionTags.context(sessionTags));
+        if (sourceIdentity != null) {
+            requestContext.put("sts:SourceIdentity", List.of(sourceIdentity));
+        }
         if (!transitiveKeys.isEmpty()) {
             requestContext.put("sts:TransitiveTagKeys", transitiveKeys);
         }
@@ -298,6 +305,12 @@ public class StsQueryHandler {
                     callerAccount, role, requestContext)) {
                 return AwsQueryResponse.error("AccessDenied",
                         "User: " + callerArn + " is not authorized to perform: sts:TagSession on resource: " + roleArn,
+                        AwsNamespaces.STS, 403);
+            }
+            if (sourceIdentity != null && !sessionTagAuthorizer.allowsSourceIdentity(callerAccessKeyId(), caller,
+                    callerAccount, role, requestContext)) {
+                return AwsQueryResponse.error("AccessDenied",
+                        "User: " + callerArn + " is not authorized to perform: sts:SetSourceIdentity on resource: " + roleArn,
                         AwsNamespaces.STS, 403);
             }
             return null;

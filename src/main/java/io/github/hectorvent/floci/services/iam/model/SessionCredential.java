@@ -16,6 +16,7 @@ public class SessionCredential {
     private String roleArn;
     private String roleSessionName;
     private String assumedRoleId;
+    private String sourceIdentity;
     private Map<String, String> sessionTags = Map.of();
     private Map<String, String> transitiveSessionTags = Map.of();
     private Instant expiration;
@@ -119,6 +120,9 @@ public class SessionCredential {
 
     public String getRoleSessionName() { return roleSessionName; }
     public void setRoleSessionName(String roleSessionName) { this.roleSessionName = roleSessionName; }
+
+    public String getSourceIdentity() { return sourceIdentity; }
+    public void setSourceIdentity(String value) { sourceIdentity = value; }
 
     public String getAssumedRoleId() { return assumedRoleId; }
     public void setAssumedRoleId(String assumedRoleId) { this.assumedRoleId = assumedRoleId; }
