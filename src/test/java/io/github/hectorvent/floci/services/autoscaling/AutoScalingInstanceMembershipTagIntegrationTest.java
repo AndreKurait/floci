@@ -49,9 +49,10 @@ class AutoScalingInstanceMembershipTagIntegrationTest {
                 .formParam("MinSize", "0").formParam("MaxSize", "3").formParam("DesiredCapacity", "1")
                 .formParam("AvailabilityZones.member.1", "us-east-1a")
                 .formParam("Tags.member.1.Key", "Team").formParam("Tags.member.1.Value", "blue")
-                .formParam("Tags.member.1.PropagateAtLaunch", "true")
                 .formParam("Tags.member.2.Key", "Private").formParam("Tags.member.2.Value", "group-only")
                 .formParam("Tags.member.2.PropagateAtLaunch", "false")
+                .formParam("Tags.member.3.Key", "Environment").formParam("Tags.member.3.Value", "test")
+                .formParam("Tags.member.3.PropagateAtLaunch", "true")
                 .post("/").then().statusCode(200);
         given().header("Authorization", AUTH).formParam("Action", "CreateAutoScalingGroup")
                 .formParam("AutoScalingGroupName", other)
@@ -69,7 +70,7 @@ class AutoScalingInstanceMembershipTagIntegrationTest {
                             + ".AutoScalingGroups.member.Instances.member.size()", equalTo(1))
                     .extract().path("DescribeAutoScalingGroupsResponse.DescribeAutoScalingGroupsResult"
                             + ".AutoScalingGroups.member.Instances.member.InstanceId");
-            assertEquals(Map.of("Source", "template", "Team", "blue"), userTags(launched));
+            assertEquals(Map.of("Source", "template", "Team", "blue", "Environment", "test"), userTags(launched));
             assertEquals(name, instanceTags(launched).get(GROUP_NAME_TAG));
             assertEquals(List.of(launched), instancesTaggedWith(name));
 
@@ -84,7 +85,7 @@ class AutoScalingInstanceMembershipTagIntegrationTest {
                     .post("/").then().statusCode(200)
                     .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
             attach(name, standalone).statusCode(200);
-            assertEquals(Map.of("Owner", "me", "Team", "blue"), userTags(standalone));
+            assertEquals(Map.of("Owner", "me", "Team", "blue", "Environment", "test"), userTags(standalone));
             assertEquals(name, instanceTags(standalone).get(GROUP_NAME_TAG));
 
             // An ID EC2 has no instance for gets no tags, which would otherwise outlive it in DescribeTags.
@@ -107,7 +108,7 @@ class AutoScalingInstanceMembershipTagIntegrationTest {
                     .formParam("AutoScalingGroupName", name).formParam("InstanceIds.member.1", standalone)
                     .formParam("ShouldDecrementDesiredCapacity", "true")
                     .post("/").then().statusCode(200);
-            assertEquals(Map.of("Owner", "me", "Team", "blue"), instanceTags(standalone));
+            assertEquals(Map.of("Owner", "me", "Team", "blue", "Environment", "test"), instanceTags(standalone));
             assertEquals(List.of(launched), instancesTaggedWith(name));
         } finally {
             for (String group : List.of(name, other)) {
