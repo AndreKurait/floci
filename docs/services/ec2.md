@@ -17,6 +17,12 @@
 Terminated instances normally remain queryable for 1 hour before being pruned.
 Instances retained by a successful `RunInstances` client token remain available for replay until storage is reset.
 
+On emulator shutdown, EC2's effective storage mode controls container retention.
+Memory-only instances are stopped and removed synchronously, including containers
+already stopped, because their tracking records disappear with the process.
+Persistent, hybrid and WAL modes retain stopped containers for restart recovery.
+The EC2-specific storage override takes precedence over the global mode.
+
 ## RunInstances request replay
 
 `ClientToken` identifies a launch request within its account and region. Repeating a successful
@@ -184,6 +190,46 @@ credential selection keep their existing behavior. A stop/start retains the
 container's mounts. Mount configuration is a deployment input, not an EC2 API
 extension.
 
+When a mount replaces `/etc/resolv.conf` or `/etc`, the injected
+`AWS_ENDPOINT_URL` uses the Docker-reachable host address. It does not depend on
+Floci's embedded DNS names being available through the guest's custom resolver.
+Floci uses its selected workload-network address when available, avoiding an
+egress address returned by a multi-homed Docker hostname. Otherwise it resolves
+the configured Docker host before passing that address to the guest; an
+unresolvable override fails the launch. Docker's
+`host.docker.internal` hosts-file alias remains usable without DNS.
+Other mounts retain the usual endpoint selection.
+
+### Guest privileges
+
+EC2 guest containers use Docker privileged mode by default. Deployments whose
+images do not require it can disable that mode and drop additional Linux
+capabilities:
+
+```yaml
+floci:
+  services:
+    ec2:
+      privileged: false
+      cap-drop: [NET_ADMIN, NET_RAW]
+```
+
+The equivalent environment variables are `FLOCI_SERVICES_EC2_PRIVILEGED=false`
+and `FLOCI_SERVICES_EC2_CAP_DROP=NET_ADMIN,NET_RAW`. Capability names are
+case-insensitive, accept an optional `CAP_` prefix, and support `ALL`.
+Use `privileged: false` for capability restrictions to take effect.
+
+These settings apply to guest containers in every runtime mode. The network
+and volume helpers retain their own privileges. Security-group enforcement
+always disables guest privileged mode and drops `NET_ADMIN` and `NET_RAW`;
+configuration can add restrictions but cannot remove those mandatory ones.
+
+Choose settings the guest image can run with. Disabling privileged mode does
+not grant the permissions needed by systemd or physical block-device mounts.
+Floci does not escalate privileges to make those operations succeed.
+Stop/start retains the existing container's settings; changed settings apply
+to newly launched instances.
+
 ### Binding registered AMIs to local images
 
 An external catalog entry can declare `registrationNames`, an optional list of
@@ -276,8 +322,13 @@ A shared AMI's launch permission permits snapshot IDs already present in that
 AMI's unencrypted backing mappings in this launch path only, including when an
 override places the same backing snapshot on another device. It does not grant direct `CreateVolume` or `CopyImage`
 access to those snapshots. These are metadata volumes; launching does not copy
-snapshot block data. Container-backed shared-image launch retains its existing
-caller-owned-copy requirement.
+snapshot block data. Container-backed launches can use a shared catalog-bound
+AMI directly. Runtime ancestry is resolved in the source owner's account, while
+instances and launch volumes belong to the caller. Launching does not create an
+AMI alias or grant direct access to the source snapshots.
+Asynchronous container launch retains the instance owner's account and launch
+region for metadata helpers, Docker ownership labels, and launch callbacks.
+The executor thread's prior request scope is restored after each launch.
 
 ### Account permissions and shared AMI copies
 
@@ -322,7 +373,7 @@ forms, encrypted shared copies and KMS are unsupported.
 
 Container mode refuses foreign sources with unbound runtime ancestry. Captured Docker layers are
 refused in both modes, including captures in source ancestry. Direct shared-image container launches
-require a caller-owned copy. Same-account captured
+use the same catalog ancestry validation and cannot fall back from an unbound source. Same-account captured
 copies retain their existing behavior. Tag specifications, encryption and placement options are refused.
 Image tags are not copied by default. `CopyImageTags=true` copies the caller's private tags and visible
 `ec2:SharedTag/` tags into the destination account's tag store. Other owners' private tags and system
@@ -575,6 +626,25 @@ naming different VPCs find nothing.
 | ModifyInstanceMetadataOptions | Updates an instance's IMDS options, changing only the fields the request names. An EKS cluster node is refused with `OperationNotPermitted`. |
 
 ### VPCs
+
+Docker-backed EC2 guests retain their actual VPC private address. When a guest
+also has a primary Docker transport network, Floci prepares address translation
+inside its existing network helper before starting the guest. The public
+address is that primary interface's address; connections to it reach services
+bound to the private address. Traffic within the VPC keeps its private source.
+Translation uses the instance's recorded transport address, so Docker network
+names and inspection order do not change the selected private address.
+That address must still exist on the helper. A retained helper without a recorded
+address is accepted only when it has one unambiguous network address.
+This avoids requiring other containers on the primary network to join each VPC
+or install per-instance routes.
+
+The same routing is checked on guest start and emulator recovery. A conflicting
+owned rule or missing interface prevents successful preparation. The existing
+public-address eligibility and host-loopback fallback still apply. This does
+not implement Internet routing or expand security-group enforcement fidelity.
+Legacy containers without a Floci-owned network helper retain their previous
+address behavior.
 
 | Action | Description |
 |--------|-------------|
@@ -1627,6 +1697,8 @@ State is reported settled rather than transitional, as elsewhere in this service
 
 | Environment variable | Default | Description |
 |---|---|---|
+| `FLOCI_SERVICES_EC2_PRIVILEGED` | `true` | Docker privileged mode for guest containers; security-group enforcement always disables it |
+| `FLOCI_SERVICES_EC2_CAP_DROP` | unset | Comma-separated Linux capabilities to drop from unprivileged guest containers, in addition to mandatory security-group restrictions |
 | `FLOCI_SERVICES_EC2_IMDS_PORT` | `9169` | Host port for the IMDS server |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START` | `2200` | Start of SSH host port range |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END` | `2299` | End of SSH host port range |
@@ -1846,10 +1918,35 @@ aws ec2 associate-address \
 
 Set `FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH` (`floci.services.ec2.image-catalog-path`)
 to a readable YAML file to replace the bundled image catalog for a Floci process.
-The file uses the same schema as `src/main/resources/ec2/image-catalog.yaml` and must
-include every image that process should expose. Missing or invalid files fail on first
-catalog use; leaving the setting unset preserves the bundled catalog. Containerized
-Floci needs the file mounted at the configured container path.
+The file uses the same schema as `src/main/resources/ec2/image-catalog.yaml`. By
+default, it must include every image that process should expose and its
+`defaultDockerImage`. Missing or invalid files fail on first catalog use;
+leaving the setting unset preserves the bundled catalog. Containerized Floci
+needs the file mounted at the configured container path.
+
+To add local images while keeping the bundled AMIs and their public SSM
+parameters, set `includeDefaultImages: true` in the file:
+
+```yaml
+includeDefaultImages: true
+images:
+  - imageId: ami-local-worker
+    dockerImage: example/worker:1
+    name: local-worker
+    description: Worker with its own startup command
+    architecture: arm64
+    creationDate: '2026-10-08T00:00:00.000Z'
+    guestRuntime: image
+    registrationNames: [worker-release]
+```
+
+This mode inherits the bundled `defaultDockerImage` when the file omits it.
+An explicit value changes only the fallback for unmatched AMIs. The additional
+images keep their declared runtime, architecture, aliases and registration
+names. IDs, aliases, public parameter names and registration names must remain
+unambiguous across the combined catalog; conflicting entries fail instead of
+overriding bundled images. The flag defaults to false, preserving full
+replacement for existing files.
 
 ### Public IPv4 addresses
 

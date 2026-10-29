@@ -709,12 +709,14 @@ floci:
     ec2:
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
-      # Optional complete catalog override for locally built guest images.
+      # Optional external catalog; includeDefaultImages in the file retains bundled images.
       image-catalog-path: ${FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH:}
       managed-prefix-list-catalog-path: ${FLOCI_SERVICES_EC2_MANAGED_PREFIX_LIST_CATALOG_PATH:}
       # Explicit workload-only options; helper containers retain their own settings.
       extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
       ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
+      privileged: true
+      cap-drop: ${FLOCI_SERVICES_EC2_CAP_DROP:}
       # read-only-binds:               # Paths belong to the Docker daemon host.
       #   - source: /srv/guest-inputs/ca.pem
       #     target: /etc/guest-ca.pem

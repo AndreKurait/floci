@@ -85,6 +85,8 @@ public class Instance {
     // Docker backing fields (not serialised to AWS wire format)
     private String dockerContainerId;
     private String containerBridgeIp;
+    // Separate from IMDS source registration: set only after public routing is prepared.
+    private String containerPublicIp;
     /**
      * The container's default-bridge address, kept alongside {@code containerBridgeIp} when the
      * instance is also attached to its VPC's Docker network. IMDS identifies a caller by the
@@ -255,6 +257,8 @@ public class Instance {
     public void setTerminatedAt(long terminatedAt) { this.terminatedAt = terminatedAt; }
 
     public String getContainerBridgeIp() { return containerBridgeIp; }
+    public String getContainerPublicIp() { return containerPublicIp; }
+    public void setContainerPublicIp(String containerPublicIp) { this.containerPublicIp = containerPublicIp; }
     public void setContainerBridgeIp(String containerBridgeIp) { this.containerBridgeIp = containerBridgeIp; }
 
     public String getImdsSourceIp() { return imdsSourceIp; }

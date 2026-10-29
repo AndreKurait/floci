@@ -3387,7 +3387,7 @@ public interface EmulatorConfig {
         @WithDefault("floci/network-helper:local")
         String metadataHelperImage();
 
-        /** Optional full EC2 catalog file for locally built guest images. */
+        /** Optional EC2 catalog file; includeDefaultImages in that file retains the bundled catalog. */
         Optional<String> imageCatalogPath();
 
         /** Optional JSON file of additional regional AWS-managed prefix lists. */
@@ -3406,6 +3406,21 @@ public interface EmulatorConfig {
          * Env: {@code FLOCI_SERVICES_EC2_ULIMITS}, comma-separated.
          */
         Optional<List<String>> ulimits();
+
+        /**
+         * Docker privileged mode for guest containers. Security-group enforcement always
+         * disables it. Network and volume helpers retain their own privilege settings.
+         * Env: {@code FLOCI_SERVICES_EC2_PRIVILEGED}.
+         */
+        @WithDefault("true")
+        boolean privileged();
+
+        /**
+         * Linux capabilities to drop from guest containers, in addition to mandatory
+         * security-group restrictions. Set privileged=false for capability restrictions.
+         * Env: {@code FLOCI_SERVICES_EC2_CAP_DROP}, comma-separated.
+         */
+        Optional<List<String>> capDrop();
 
         /**
          * Read-only bind mounts supplied by the deployment before the guest starts.

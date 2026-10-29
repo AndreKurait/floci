@@ -6,6 +6,9 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
 /**
  * Computes the Floci base URL reachable from <em>inside</em> a Docker container that Floci launches.
  *
@@ -60,11 +63,27 @@ public class ContainerReachableEndpoint {
         return baseUrl(true);
     }
 
-    /** Uses the Docker host when the container does not receive Floci's DNS resolver. */
+    /** Selects the workload network before handing an address to a container with different DNS. */
     public String baseUrl(boolean useEmbeddedDns) {
-        String flociHostname = useEmbeddedDns && embeddedDnsServer.getServerIp().isPresent()
-                ? config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX)
-                : dockerHostResolver.resolve();
+        String flociHostname;
+        if (useEmbeddedDns && embeddedDnsServer.getServerIp().isPresent()) {
+            flociHostname = config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
+        } else if (useEmbeddedDns) {
+            flociHostname = dockerHostResolver.resolve();
+        } else {
+            flociHostname = dockerHostResolver.resolveContainerIp().orElseGet(dockerHostResolver::resolve);
+        }
+        if (!useEmbeddedDns && !"host.docker.internal".equals(flociHostname)) {
+            try {
+                flociHostname = InetAddress.getByName(flociHostname).getHostAddress();
+            } catch (UnknownHostException e) {
+                throw new IllegalStateException("Cannot resolve the configured Floci Docker host", e);
+            }
+        }
+        // host.docker.internal is supplied through Docker's hosts mapping, independent of DNS.
+        if (flociHostname.contains(":")) {
+            flociHostname = "[" + flociHostname + "]";
+        }
         return "http://" + flociHostname + ":" + port();
     }
 

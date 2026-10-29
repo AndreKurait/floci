@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.ec2;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -34,8 +36,101 @@ class Ec2ExternalImageCatalogTest {
         assertEquals("example/worker:1", external.findByIdOrAlias("ami-worker-alias").orElseThrow().dockerImage);
         assertEquals("systemd", external.findByIdOrAlias("ami-local-worker").orElseThrow().guestRuntime);
         assertEquals("example/base:1", external.defaultDockerImage());
+        assertTrue(external.findByIdOrAlias("ami-amazonlinux2023").isEmpty());
         assertTrue(new Ec2ImageCatalog().findByIdOrAlias("ami-amazonlinux2023").isPresent());
         assertTrue(new Ec2ImageCatalog().findByIdOrAlias("ami-local-worker").isEmpty());
+    }
+
+    @Test
+    void additiveCatalogRetainsPublicAmiSelectionAlongsideLocalRuntimeBindings() throws Exception {
+        Ec2ImageCatalog catalog = extension("", "");
+        Ec2ImageCatalog bundled = new Ec2ImageCatalog();
+        AmiImageResolver resolver = new AmiImageResolver(catalog);
+
+        assertEquals(bundled.defaultDockerImage(), catalog.defaultDockerImage());
+        assertEquals(bundled.images().size() + 1, catalog.images().size());
+        assertEquals(bundled.publicParameterNames(), catalog.publicParameterNames());
+        for (String architecture : List.of("x86_64", "arm64")) {
+            String parameter = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-" + architecture;
+            Ec2ImageCatalog.CatalogImage image = catalog.findByPublicParameterName(parameter).orElseThrow();
+            assertEquals(bundled.findByPublicParameterName(parameter).orElseThrow().imageId, image.imageId);
+            assertEquals(architecture, image.architecture);
+            assertEquals("arm64".equals(architecture) ? "linux/arm64" : "linux/amd64",
+                    resolver.resolveImage(image.imageId).dockerPlatform());
+            assertFalse(resolver.resolveImage(image.imageId).imageRuntime());
+        }
+        Ec2ImageCatalog.CatalogImage worker = catalog.findByRegistrationName("worker-release").orElseThrow();
+        assertEquals("ami-local-worker", worker.imageId);
+        assertEquals(new ResolvedAmiImage("example/worker:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"),
+                resolver.resolveImage("ami-worker-alias"));
+        assertTrue(bundled.findByIdOrAlias(worker.imageId).isEmpty());
+    }
+
+    @Test
+    void additiveCatalogCanSetFallbackWithoutReplacingBundledImages() throws Exception {
+        Ec2ImageCatalog catalog = extension("defaultDockerImage: example/fallback:1\n", "");
+        AmiImageResolver resolver = new AmiImageResolver(catalog);
+
+        assertEquals(ResolvedAmiImage.minimal("example/fallback:1"), resolver.resolveImage("ami-unknown"));
+        assertEquals(new AmiImageResolver(new Ec2ImageCatalog()).resolveImage("ami-amazonlinux2023"),
+                resolver.resolveImage("ami-amazonlinux2023"));
+    }
+
+    @Test
+    void additiveCatalogWithNoEntriesRetainsTheBundledCatalog() throws Exception {
+        Path file = directory.resolve("no-additions.yaml");
+        Files.writeString(file, "includeDefaultImages: true\nimages: []\n");
+        Ec2ImageCatalog catalog = new Ec2ImageCatalog(file);
+        Ec2ImageCatalog bundled = new Ec2ImageCatalog();
+
+        assertEquals(bundled.defaultDockerImage(), catalog.defaultDockerImage());
+        assertEquals(bundled.images().size(), catalog.images().size());
+        assertEquals(bundled.publicParameterNames(), catalog.publicParameterNames());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"id", "alias", "public-parameter"})
+    void additiveCatalogRejectsAmbiguousBindingsToBundledImages(String collision) throws Exception {
+        Ec2ImageCatalog.CatalogImage builtin =
+                new Ec2ImageCatalog().findByIdOrAlias("ami-amazonlinux2023").orElseThrow();
+        String field = switch (collision) {
+            case "id" -> "imageId: " + builtin.imageId;
+            case "alias" -> "aliases: [ami-amazonlinux2023]";
+            default -> "publicParameterNames: [" + builtin.publicParameterNames().getFirst() + "]";
+        };
+        Ec2ImageCatalog catalog = extension("defaultDockerImage: example/fallback:1\n", field);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class, catalog::images);
+        assertTrue(error.getMessage().contains("Duplicate EC2 image catalog"), error.getMessage());
+    }
+
+    @Test
+    void additiveCatalogDoesNotSilentlyReplaceAnExplicitBlankFallback() throws Exception {
+        Ec2ImageCatalog catalog = extension("defaultDockerImage: ' '\n", "");
+
+        IllegalStateException error = assertThrows(IllegalStateException.class, catalog::images);
+        assertTrue(error.getMessage().contains("defaultDockerImage"));
+    }
+
+    private Ec2ImageCatalog extension(String settings, String field) throws Exception {
+        Path file = directory.resolve("extension.yaml");
+        String id = field.startsWith("imageId: ") ? field.substring("imageId: ".length()) : "ami-local-worker";
+        String aliases = field.startsWith("aliases: ") ? field : "aliases: [ami-worker-alias]";
+        String parameter = field.startsWith("publicParameterNames: ") ? "    " + field + "\n" : "";
+        Files.writeString(file, settings + """
+                includeDefaultImages: true
+                images:
+                  - imageId: %s
+                    %s
+                    dockerImage: example/worker:1
+                    name: local-worker
+                    description: local worker
+                    architecture: arm64
+                    creationDate: '2026-10-08T00:00:00.000Z'
+                    guestRuntime: image
+                    registrationNames: [worker-release]
+                """.formatted(id, aliases) + parameter);
+        return new Ec2ImageCatalog(file);
     }
 
     @Test

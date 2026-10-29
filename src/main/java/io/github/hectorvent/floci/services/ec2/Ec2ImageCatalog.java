@@ -117,8 +117,9 @@ public class Ec2ImageCatalog {
         private final Map<String, CatalogImage> imagesByRegistrationName;
 
         Loaded(Catalog catalog) {
-            this.defaultDockerImage = require(catalog.defaultDockerImage, "defaultDockerImage");
-            this.images = List.copyOf(catalog.images == null ? List.of() : catalog.images);
+            Catalog effective = includeDefaultImages(catalog);
+            this.defaultDockerImage = require(effective.defaultDockerImage, "defaultDockerImage");
+            this.images = List.copyOf(effective.images == null ? List.of() : effective.images);
             if (this.images.isEmpty()) {
                 throw new IllegalStateException("EC2 image catalog has no images: " + CATALOG_RESOURCE_NAME);
             }
@@ -126,6 +127,20 @@ public class Ec2ImageCatalog {
             this.imagesByPublicParameterName = indexPublicParameterNames(this.images);
             this.imagesByRegistrationName = indexRegistrationNames(this.images);
         }
+    }
+
+    private static Catalog includeDefaultImages(Catalog catalog) {
+        if (!catalog.includeDefaultImages) {
+            return catalog;
+        }
+        Catalog combined = readResource(CATALOG_RESOURCE_NAME, Catalog.class);
+        if (catalog.defaultDockerImage != null) {
+            combined.defaultDockerImage = catalog.defaultDockerImage;
+        }
+        List<CatalogImage> images = new ArrayList<>(combined.images);
+        images.addAll(catalog.images == null ? List.of() : catalog.images);
+        combined.images = images;
+        return combined;
     }
 
     private static Catalog readFile(Path path) {
@@ -212,6 +227,7 @@ public class Ec2ImageCatalog {
     @JsonIgnoreProperties(ignoreUnknown = true)
     @RegisterForReflection
     public static final class Catalog {
+        public boolean includeDefaultImages;
         public String defaultDockerImage;
         public List<CatalogImage> images = List.of();
     }
