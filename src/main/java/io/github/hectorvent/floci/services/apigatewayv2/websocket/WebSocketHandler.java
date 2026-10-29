@@ -252,7 +252,7 @@ public class WebSocketHandler {
                             finalConnectionId, finalConnectedAt, finalSourceIp, finalUserAgent,
                             finalStageVariables, headers, queryParams, authResult.context());
                 }).onFailure(e -> {
-                    LOG.warnv("Lambda authorizer invocation failed for API {0}: {1}",
+                    LOG.warnv(e, "Lambda authorizer invocation failed for API {0}: {1}",
                             apiId, e.getMessage());
                     ctx.response().setStatusCode(500).end();
                 });
@@ -325,7 +325,7 @@ public class WebSocketHandler {
                 ctx.response().setStatusCode(403).end();
             }
         }).onFailure(e -> {
-            LOG.warnv("$connect integration invocation failed for API {0}: {1}",
+            LOG.warnv(e, "$connect integration invocation failed for API {0}: {1}",
                     apiId, e.getMessage());
             ctx.response().setStatusCode(500).end();
         });
@@ -600,7 +600,7 @@ public class WebSocketHandler {
                 }
             }
         }).onFailure(e -> {
-            LOG.warnv("Integration invocation failed for route {0} on connection {1}: {2}",
+            LOG.warnv(e, "Integration invocation failed for route {0} on connection {1}: {2}",
                     finalRoute.getRouteKey(), finalConnectionId, e.getMessage());
             String requestId = UUID.randomUUID().toString();
             String errorFrame = String.format(
@@ -682,7 +682,7 @@ public class WebSocketHandler {
             }).onComplete(ar -> {
                 if (ar.failed()) {
                     // $disconnect errors must never prevent cleanup — log and continue
-                    LOG.warnv("Error invoking $disconnect route for connection {0}: {1}",
+                    LOG.warnv(ar.cause(), "Error invoking $disconnect route for connection {0}: {1}",
                             connectionId, ar.cause().getMessage());
                 }
             });
