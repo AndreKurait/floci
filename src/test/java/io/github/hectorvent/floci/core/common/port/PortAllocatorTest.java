@@ -9,9 +9,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.function.IntPredicate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -35,23 +36,24 @@ class PortAllocatorTest {
     }
 
     @Test
-    void concurrentAllocationsAreUnique() throws InterruptedException {
+    void concurrentAllocationsAreUnique() throws Exception {
         PortAllocator allocator = new PortAllocator(9200, 9299, w -> { }, ALWAYS_BINDABLE);
         int threads = 50;
         Set<Integer> ports = ConcurrentHashMap.newKeySet();
-        CountDownLatch latch = new CountDownLatch(threads);
         ExecutorService executor = Executors.newFixedThreadPool(threads);
-
-        for (int i = 0; i < threads; i++) {
-            executor.submit(() -> {
-                ports.add(allocator.allocate());
-                latch.countDown();
-            });
+        try {
+            List<Future<?>> submissions = new ArrayList<>();
+            for (int i = 0; i < threads; i++) {
+                submissions.add(executor.submit(() -> ports.add(allocator.allocate())));
+            }
+            for (Future<?> submission : submissions) {
+                submission.get(5, TimeUnit.SECONDS);
+            }
+            assertEquals(threads, ports.size(), "All allocated ports must be unique");
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "Allocation workers must terminate");
         }
-
-        latch.await();
-        executor.shutdown();
-        assertEquals(threads, ports.size(), "All allocated ports must be unique");
     }
 
     @Test
