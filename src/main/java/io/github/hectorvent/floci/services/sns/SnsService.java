@@ -2694,7 +2694,7 @@ public class SnsService implements Resettable, ResourceProvider {
             // times larger. A topic left at the 262144-byte default clears an ordinary queue
             // with room to spare; a queue configured with a smaller MaximumMessageSize crosses
             // the limit more easily. Either way the message is dropped here.
-            LOG.warnv("Failed to deliver SNS message to {0}: {1}", sub.getEndpoint(), e.getMessage());
+            LOG.warnv(e, "Failed to deliver SNS message to {0}: {1}", sub.getEndpoint(), e.getMessage());
         }
     }
 

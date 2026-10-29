@@ -10,16 +10,24 @@ import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
 import io.github.hectorvent.floci.services.lambda.LambdaResourcePolicyProvider;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.testutil.LogCapture;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
@@ -123,6 +131,52 @@ class SnsLambdaPermissionTest {
 
         verify(lambda, never()).invoke(eq(REGION), eq(FUNCTION), any(byte[].class), eq(InvocationType.Event));
         verify(lambda).invoke(eq(REGION), eq(allowed), any(byte[].class), eq(InvocationType.Event));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void deliveryFailureRetainsCauseWithoutStoppingFanout(boolean nullMessage) {
+        when(iam.enforcementEnabled()).thenReturn(false);
+        String healthy = FUNCTION + ":healthy";
+        RuntimeException nested = new IllegalArgumentException("transport cause");
+        RuntimeException failure = new IllegalStateException(nullMessage ? null : "delivery failed", nested);
+        sns.subscribe(TOPIC, "lambda", FUNCTION, REGION, Map.of());
+        sns.subscribe(TOPIC, "lambda", healthy, REGION, Map.of());
+        doAnswer(invocation -> {
+            assertFalse(Thread.holdsLock(sns));
+            throw failure;
+        }).when(lambda).invoke(eq(REGION), eq(FUNCTION), any(byte[].class), eq(InvocationType.Event));
+        doAnswer(invocation -> {
+            assertFalse(Thread.holdsLock(sns));
+            return null;
+        }).when(lambda).invoke(eq(REGION), eq(healthy), any(byte[].class), eq(InvocationType.Event));
+
+        List<LogRecord> records = LogCapture.capture(SnsService.class,
+                () -> assertNotNull(sns.publish(TOPIC, null, "payload", null, REGION)));
+
+        verify(lambda).invoke(eq(REGION), eq(FUNCTION), any(byte[].class), eq(InvocationType.Event));
+        verify(lambda).invoke(eq(REGION), eq(healthy), any(byte[].class), eq(InvocationType.Event));
+        List<LogRecord> warnings = records.stream()
+                .filter(record -> record.getLevel().intValue() == Level.WARNING.intValue()).toList();
+        assertEquals(1, warnings.size());
+        LogRecord warning = warnings.getFirst();
+        assertEquals("Failed to deliver SNS message to {0}: {1}", warning.getMessage());
+        assertEquals(FUNCTION, warning.getParameters()[0]);
+        assertEquals(failure.getMessage(), warning.getParameters()[1]);
+        assertSame(failure, warning.getThrown());
+        assertSame(nested, warning.getThrown().getCause());
+    }
+
+    @Test
+    void successfulDeliveryDoesNotEmitFailureWarning() {
+        when(iam.enforcementEnabled()).thenReturn(false);
+        sns.subscribe(TOPIC, "lambda", FUNCTION, REGION, Map.of());
+
+        List<LogRecord> records = LogCapture.capture(SnsService.class,
+                () -> assertNotNull(sns.publish(TOPIC, null, "payload", null, REGION)));
+
+        verify(lambda).invoke(eq(REGION), eq(FUNCTION), any(byte[].class), eq(InvocationType.Event));
+        assertTrue(records.stream().noneMatch(record -> record.getLevel().intValue() >= Level.WARNING.intValue()));
     }
 
     private void deliver(String endpoint, int deliveries) {
