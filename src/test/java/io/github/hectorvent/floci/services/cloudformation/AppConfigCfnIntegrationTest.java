@@ -112,7 +112,7 @@ class AppConfigCfnIntegrationTest {
                     .body("Monitors[0]", not(hasKey("AlarmRoleArn")));
             appconfig().get(profilePath).then().statusCode(200)
                     .body("Name", equalTo("settings"), "LocationUri", equalTo("hosted"),
-                            "Type", equalTo(null));
+                            "Type", equalTo("AWS.Freeform"));
             appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(200)
                     .body("DeploymentDurationInMinutes", equalTo(0), "GrowthFactor", equalTo(100f));
             appconfig().body("{\"enabled\":true}").post(profilePath + "/hostedconfigurationversions")

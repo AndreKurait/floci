@@ -424,7 +424,7 @@ class ApiGatewayRestExecuteApiHostIntegrationTest {
     }
 
     @Test
-    void directWebSocketConnectionRoutingFindsNonDefaultAndDuplicateOwners() {
+    void directWebSocketConnectionRoutingFindsNonDefaultOwnerAndRejectsDuplicateOwners() {
         String authorization = "AWS4-HMAC-SHA256 Credential=000000000001/20260929/us-east-1/apigateway/aws4_request, "
                 + "SignedHeaders=host, Signature=abc";
         String apiId = given()
@@ -445,7 +445,8 @@ class ApiGatewayRestExecuteApiHostIntegrationTest {
         try {
             given()
                     .when().get("/execute-api/" + apiId + "/test/@connections/missing")
-                    .then().statusCode(410);
+                    .then().statusCode(409)
+                    .body("message", equalTo("API id '" + apiId + "' is ambiguous across accounts"));
         } finally {
             RequestScopes.runAs("000000000002", () -> v2Service.deleteApi("us-east-1", apiId));
             RequestScopes.runAs("000000000001", () -> v2Service.deleteApi("us-east-1", apiId));
