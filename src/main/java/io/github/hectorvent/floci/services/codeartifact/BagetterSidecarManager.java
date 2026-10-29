@@ -122,7 +122,7 @@ public class BagetterSidecarManager implements ContainerTeardown {
             LOG.infov("BaGetter sidecar for nuget repository {0} is ready at {1}", nugetRepositoryId, url);
             return new PerKeyContainerPool.StartedContainer(containerId, url);
         } catch (RuntimeException e) {
-            lifecycleManager.stopAndRemove(containerId, null);
+            pool.removeFailedStart(nugetRepositoryId, containerId, e);
             throw e;
         }
     }
