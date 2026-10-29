@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsQueryResponse;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
+import io.github.hectorvent.floci.services.autoscaling.AutoScalingService.AutoScalingInstanceDetails;
 import io.github.hectorvent.floci.services.autoscaling.model.*;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -67,6 +68,8 @@ public class AutoScalingQueryHandler {
                 case "SetInstanceHealth"            -> handleSetInstanceHealth(p, region);
                 case "AttachInstances"              -> handleAttachInstances(p, region);
                 case "DetachInstances"              -> handleDetachInstances(p, region);
+                case "EnterStandby"                 -> handleEnterStandby(p, region);
+                case "ExitStandby"                  -> handleExitStandby(p, region);
                 case "TerminateInstanceInAutoScalingGroup" -> handleTerminateInstance(p, region);
                 // Load balancer attachment
                 case "AttachLoadBalancerTargetGroups"    -> handleAttachLoadBalancerTargetGroups(p, region);
@@ -602,18 +605,21 @@ public class AutoScalingQueryHandler {
     // ── Instances ─────────────────────────────────────────────────────────────
 
     private Response handleDescribeAutoScalingInstances(MultivaluedMap<String, String> p, String region) {
-        List<AsgInstance> instances = service.describeAutoScalingInstances(
+        List<AutoScalingInstanceDetails> instances = service.describeAutoScalingInstances(
                 region, memberList(p, "InstanceIds"));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeAutoScalingInstancesResponse", NS)
                   .start("DescribeAutoScalingInstancesResult")
                     .start("AutoScalingInstances");
-        for (AsgInstance inst : instances) {
+        for (AutoScalingInstanceDetails details : instances) {
+            AsgInstance inst = details.instance();
+            String healthStatus = inst.getHealthStatus();
             xml.start("member")
                .elem("InstanceId", inst.getInstanceId())
+               .elem("AutoScalingGroupName", details.autoScalingGroupName())
                .elem("AvailabilityZone", inst.getAvailabilityZone())
                .elem("LifecycleState", inst.getLifecycleState())
-               .elem("HealthStatus", inst.getHealthStatus())
+               .elem("HealthStatus", healthStatus != null ? healthStatus.toUpperCase(Locale.ROOT) : null)
                .elem("ProtectedFromScaleIn", String.valueOf(inst.isProtectedFromScaleIn()));
             if (inst.getLaunchConfigurationName() != null) {
                 xml.elem("LaunchConfigurationName", inst.getLaunchConfigurationName());
@@ -627,6 +633,16 @@ public class AutoScalingQueryHandler {
                 .raw(AwsQueryResponse.responseMetadata())
                 .end("DescribeAutoScalingInstancesResponse");
         return ok(xml.build());
+    }
+
+    private Response handleEnterStandby(MultivaluedMap<String, String> p, String region) {
+        return activitiesResponse("EnterStandby", service.enterStandby(region, p.getFirst("AutoScalingGroupName"),
+                indexedMembers(p, "InstanceIds"), requiredBoolParam(p, "ShouldDecrementDesiredCapacity")));
+    }
+
+    private Response handleExitStandby(MultivaluedMap<String, String> p, String region) {
+        return activitiesResponse("ExitStandby", service.exitStandby(region, p.getFirst("AutoScalingGroupName"),
+                indexedMembers(p, "InstanceIds")));
     }
 
     private Response handleSetInstanceProtection(MultivaluedMap<String, String> p, String region) {
@@ -1360,11 +1376,14 @@ public class AutoScalingQueryHandler {
     // ── Activities ────────────────────────────────────────────────────────────
 
     private Response handleDescribeScalingActivities(MultivaluedMap<String, String> p, String region) {
-        List<ScalingActivity> activities = service.describeScalingActivities(
-                region, p.getFirst("AutoScalingGroupName"));
+        return activitiesResponse("DescribeScalingActivities",
+                service.describeScalingActivities(region, p.getFirst("AutoScalingGroupName")));
+    }
+
+    private Response activitiesResponse(String action, List<ScalingActivity> activities) {
         XmlBuilder xml = new XmlBuilder()
-                .start("DescribeScalingActivitiesResponse", NS)
-                  .start("DescribeScalingActivitiesResult")
+                .start(action + "Response", NS)
+                  .start(action + "Result")
                     .start("Activities");
         for (ScalingActivity a : activities) {
             xml.start("member")
@@ -1380,9 +1399,9 @@ public class AutoScalingQueryHandler {
             xml.end("member");
         }
         xml.end("Activities")
-           .end("DescribeScalingActivitiesResult")
+           .end(action + "Result")
            .raw(AwsQueryResponse.responseMetadata())
-           .end("DescribeScalingActivitiesResponse");
+           .end(action + "Response");
         return ok(xml.build());
     }
 
@@ -1666,17 +1685,20 @@ public class AutoScalingQueryHandler {
         CapacityReservationSpecification specification = new CapacityReservationSpecification();
         specification.setCapacityReservationPreference(p.getFirst(prefix + "CapacityReservationPreference"));
         specification.setCapacityReservationIds(
-                capacityTargetMembers(p, prefix + "CapacityReservationTarget.CapacityReservationIds"));
+                indexedMembers(p, prefix + "CapacityReservationTarget.CapacityReservationIds"));
         specification.setCapacityReservationResourceGroupArns(
-                capacityTargetMembers(p, prefix + "CapacityReservationTarget.CapacityReservationResourceGroupArns"));
+                indexedMembers(p, prefix + "CapacityReservationTarget.CapacityReservationResourceGroupArns"));
         return specification;
     }
 
-    private List<String> capacityTargetMembers(MultivaluedMap<String, String> params, String prefix) {
+    private List<String> indexedMembers(MultivaluedMap<String, String> params, String prefix) {
         String memberPrefix = prefix + ".member.";
         return params.entrySet().stream()
                 .filter(entry -> entry.getKey().startsWith(memberPrefix))
                 .filter(entry -> entry.getKey().substring(memberPrefix.length()).matches("[1-9][0-9]*"))
+                // Positive indexes have no leading zeros: length then text preserves numeric order without overflow.
+                .sorted(Comparator.comparingInt((Map.Entry<String, List<String>> entry) -> entry.getKey().length())
+                        .thenComparing(Map.Entry::getKey))
                 .flatMap(entry -> entry.getValue().stream())
                 .toList();
     }

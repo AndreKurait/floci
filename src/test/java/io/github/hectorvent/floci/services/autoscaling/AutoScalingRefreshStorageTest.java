@@ -124,6 +124,37 @@ class AutoScalingRefreshStorageTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void standbyTransitionsResumeAcrossStorageReload(String mode) throws IOException {
+        setUp(mode);
+        ScalingActivity entering = service.enterStandby(REGION, "suspended-group",
+                List.of("i-original"), true).getFirst();
+        restart(mode);
+        assertEquals("EnteringStandby", group.getInstances().getFirst().getLifecycleState());
+        assertEquals(entering.getActivityId(), group.getInstances().getFirst().getStandbyActivityId());
+        assertEquals(0, group.getDesiredCapacity());
+        reconciler.reconcile(group);
+        assertEquals("Standby", group.getInstances().getFirst().getLifecycleState());
+        assertEquals("Successful", service.describeScalingActivities(REGION, "suspended-group")
+                .getFirst().getStatusCode());
+        assertEquals("suspended-group", service.describeAutoScalingInstances(REGION, List.of("i-original"))
+                .getFirst().autoScalingGroupName());
+
+        ScalingActivity exiting = service.exitStandby(REGION, "suspended-group", List.of("i-original")).getFirst();
+        restart(mode);
+        assertEquals("Pending", group.getInstances().getFirst().getLifecycleState());
+        assertEquals(exiting.getActivityId(), group.getInstances().getFirst().getStandbyActivityId());
+        assertEquals(1, group.getDesiredCapacity());
+        reconciler.reconcile(group);
+        restart(mode);
+        assertEquals("InService", group.getInstances().getFirst().getLifecycleState());
+        assertNull(group.getInstances().getFirst().getStandbyActivityId());
+        assertEquals("Successful", service.describeScalingActivities(REGION, "suspended-group")
+                .getFirst().getStatusCode());
+        assertNotNull(service.describeScalingActivities(REGION, "suspended-group").getFirst().getEndTime());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
     void replacementWithoutDeclaredZoneUsesTheAcceptedEc2Placement(String mode) throws IOException {
         setUp(mode);
         group.setAvailabilityZones(List.of());
