@@ -254,6 +254,11 @@ matches another registration binding. Names without a declared binding retain
 the existing metadata registration and default-image fallback behavior.
 The mapping does not import snapshot bytes or prove that a guest boots.
 
+`CopyImage` accepts a name already used by another AMI, including another copy
+of the same source or a different architecture. Each copy receives its own AMI
+and snapshot IDs. `RegisterImage` and `CreateImage` still reject a name already
+held by an available AMI.
+
 ### Image creation provenance
 
 `DescribeImages` reports `SourceImageId` and `SourceImageRegion` for images

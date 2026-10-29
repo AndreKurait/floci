@@ -9675,6 +9675,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // DeregisterImage scans before deleting a snapshot; both run under the registry lock so
         // a registration cannot slip between that scan and the delete.
         synchronized (imageRegistryLock) {
+            boolean duplicateName = registeredImages.scan(k -> true).stream()
+                    .filter(img -> region.equals(img.getRegion()))
+                    // Deregistered AMIs release their names immediately in Floci.
+                    .filter(img -> !DEREGISTERED_STATE.equals(img.getState()))
+                    .anyMatch(img -> name.equals(img.getName()));
+            if (duplicateName) {
+                throw new AwsException("InvalidAMIName.Duplicate",
+                        "AMI name '" + name + "' is already in use.", 400);
+            }
             Ec2ImageCatalog.CatalogImage source = bindRegistrationName
                     ? imageCatalog.findByRegistrationName(name).orElse(null) : null;
             if (source != null && architecture != null && !source.architecture.equals(architecture)) {
@@ -9691,18 +9700,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private Image registerImageLocked(String region, String name, String description, String architecture,
                                       String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings,
                                       String sourceImageId) {
-        boolean duplicateName = registeredImages.scan(k -> true).stream()
-                .filter(img -> region.equals(img.getRegion()))
-                // A deregistered AMI no longer holds its name: "If you have recently deregistered
-                // an AMI with the same name, allow enough time for the change to propagate"
-                // (InvalidAMIName.Duplicate). Floci has no propagation delay, so the name is free
-                // immediately -- which is what Packer's force_deregister then rebuild relies on.
-                .filter(img -> !DEREGISTERED_STATE.equals(img.getState()))
-                .anyMatch(img -> name.equals(img.getName()));
-        if (duplicateName) {
-            throw new AwsException("InvalidAMIName.Duplicate",
-                    "AMI name '" + name + "' is already in use.", 400);
-        }
         Image image = new Image();
         image.setImageId("ami-" + randomHex(17));
         image.setName(name);
@@ -9980,8 +9977,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             String ancestor = foreign ? sharedImageAncestor(sourceRegion, source)
                     : resolveLaunchableImageId(sourceRegion, sourceImageId);
             requireNotDryRun(dryRun);
-            Image copy = registerImage(destinationRegion, name, description, source.getArchitecture(),
-                    source.getRootDeviceName(), mappings, false);
+            // CopyImage accepts repeated names; only RegisterImage/CreateImage require uniqueness.
+            Image copy = registerImageLocked(destinationRegion, name, description, source.getArchitecture(),
+                    source.getRootDeviceName(), mappings, null);
             copy.setVirtualizationType(source.getVirtualizationType());
             copy.setRootDeviceType(source.getRootDeviceType());
             copy.setPlatform(source.getPlatform());
