@@ -58,8 +58,10 @@ class ApiGatewayV2CfnProvisionerTest {
 
         Api api = new Api();
         api.setApiId(API_ID);
+        api.setProtocolType("HTTP");
         api.setApiEndpoint("https://" + API_ID + ".execute-api.localhost");
         when(apiGatewayV2Service.createApi(eq(REGION), anyMap())).thenReturn(api);
+        when(apiGatewayV2Service.getApi(REGION, API_ID)).thenReturn(api);
         when(apiGatewayV2Service.updateApi(eq(REGION), eq(API_ID), anyMap())).thenReturn(api);
     }
 

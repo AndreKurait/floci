@@ -1020,3 +1020,11 @@ Unresolved ownership fails without deleting children; Floci does not search othe
 APIs using an unscoped child ID. Live exports and dynamic references are not used
 to reconstruct historical ownership. Old SSM parameter values must already be
 stored. Deletion-policy retention and genuine stub resources require no recovery.
+
+CloudFormation replaces an `AWS::ApiGatewayV2::Api` when `ProtocolType` changes.
+Referenced children move to the new API through their recorded parent identities.
+The old API remains available until the update commits, and
+`UpdateReplacePolicy: Retain` preserves it. Rollback restores the old API identity and Body ownership
+metadata, deleting the replacement through the shared retryable cleanup lifecycle.
+Ordinary API name updates remain in place. These lifecycle checks use local SDK
+and service tests; they do not establish deployment activation or live AWS parity.
