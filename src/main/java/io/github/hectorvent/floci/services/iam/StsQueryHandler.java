@@ -701,8 +701,9 @@ public class StsQueryHandler {
         String assumedRoleArn = assumedRoleArn(sessionRoleArn, accountId, roleName, sessionName);
         String assumedRoleId = "AROA" + randomId(16) + ":" + sessionName;
 
-        iamService.registerSession(accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, null,
-                callerAccountId, sessionName, assumedRoleId, Map.of(), Map.of(), verified.sourceIdentity());
+        iamService.registerSession(accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration,
+                getParam(params, "Policy"), callerAccountId, sessionName, assumedRoleId,
+                Map.of(), Map.of(), verified.sourceIdentity());
         XmlBuilder result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
                 .start("AssumedRoleUser").elem("Arn", assumedRoleArn).elem("AssumedRoleId", assumedRoleId).end("AssumedRoleUser")

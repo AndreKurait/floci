@@ -100,6 +100,37 @@ class SamlSourceIdentityWireIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"omitted", "allow", "explicit-deny", "implicit-deny", "condition-deny", "cannot-expand"})
+    void samlInlineSessionPolicyRestrictsSignedDownstreamRequests(String scenario) throws Exception {
+        String policy = switch (scenario) {
+            case "omitted" -> null;
+            case "allow" -> "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"iam:ListRoles\",\"Resource\":\"*\"}}";
+            case "explicit-deny" -> "{\"Statement\":{\"Effect\":\"Deny\",\"Action\":\"iam:ListRoles\",\"Resource\":\"*\"}}";
+            case "implicit-deny" -> "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"iam:ListUsers\",\"Resource\":\"*\"}}";
+            case "condition-deny" -> "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"iam:ListRoles\",\"Resource\":\"*\","
+                    + "\"Condition\":{\"StringEquals\":{\"aws:SourceIdentity\":\"Other\"}}}}";
+            case "cannot-expand" -> "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"iam:*\",\"Resource\":\"*\"}}";
+            default -> throw new IllegalArgumentException(scenario);
+        };
+        try (Fixture fixture = new Fixture()) {
+            Credentials session = fixture.assume("present", policy).credentials();
+            try (IamClient caller = fixture.caller(session)) {
+                if (scenario.endsWith("deny")) {
+                    assertEquals("AccessDenied", assertThrows(IamException.class, caller::listRoles)
+                            .awsErrorDetails().errorCode());
+                } else {
+                    assertDoesNotThrow(() -> caller.listRoles());
+                    if ("cannot-expand".equals(scenario)) {
+                        assertEquals("AccessDenied", assertThrows(IamException.class, caller::listUsers)
+                                .awsErrorDetails().errorCode());
+                    }
+                }
+            }
+            assertEquals(SOURCE, iam.findSourceIdentity(session.accessKeyId(), session.sessionToken()));
+        }
+    }
+
     private final class Fixture implements AutoCloseable {
         private final SignedIamUsers.User user;
         private final IamClient admin;
@@ -151,6 +182,10 @@ class SamlSourceIdentityWireIntegrationTest {
         }
 
         private AssumeRoleWithSamlResponse assume(String scenario) {
+            return assume(scenario, null);
+        }
+
+        private AssumeRoleWithSamlResponse assume(String scenario, String policy) {
             String assertion = AssumeRoleWithSamlValidationIntegrationTest.assertion(role.arn(), providerArn,
                     Instant.now().plusSeconds(1800), "urn:amazon:webservices", ISSUER, true, false,
                     factory -> {
@@ -161,7 +196,7 @@ class SamlSourceIdentityWireIntegrationTest {
                         }
                     }, document -> addSource(document, scenario));
             AssumeRoleWithSamlResponse response = anonymous.assumeRoleWithSAML(b -> b.roleArn(role.arn())
-                    .principalArn(providerArn).samlAssertion(assertion).durationSeconds(900));
+                    .principalArn(providerArn).samlAssertion(assertion).durationSeconds(900).policy(policy));
             sessions.add(response.credentials());
             return response;
         }
