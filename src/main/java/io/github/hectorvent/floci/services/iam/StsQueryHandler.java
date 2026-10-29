@@ -627,16 +627,18 @@ public class StsQueryHandler {
             throw new AwsException("AccessDenied", "Not authorized to perform sts:AssumeRoleWithSAML on resource: " + roleArn, 403);
         }
 
+        if (durationSeconds > role.getMaxSessionDuration()) {
+            return AwsQueryResponse.error("ValidationError",
+                    "The requested DurationSeconds exceeds the MaxSessionDuration set for this role.",
+                    AwsNamespaces.STS, 400);
+        }
+
         String sessionName = verified.subject().replaceAll("[^A-Za-z0-9+=,.@_-]", "_");
         if (sessionName.length() > 64) {
             sessionName = sessionName.substring(0, 64);
         }
         Instant requestedExpiration = clock.instant().plusSeconds(durationSeconds);
-        Instant roleExpiration = clock.instant().plusSeconds(role.getMaxSessionDuration());
         Instant expiration = verified.expiration().isBefore(requestedExpiration) ? verified.expiration() : requestedExpiration;
-        if (roleExpiration.isBefore(expiration)) {
-            expiration = roleExpiration;
-        }
         String accessKeyId = "ASIA" + randomId(16);
         String secretKey = randomSecret(40);
         String sessionToken = randomSecret(200);
