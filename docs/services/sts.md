@@ -337,3 +337,5 @@ signature-enforcing SDK tests do not establish managed AWS error-message or runt
 `AssumeRole` retains a supplied `SourceIdentity` in the issued session and returns it in the response. Role chaining inherits the value and rejects attempts to change it. With IAM enforcement enabled, setting or inheriting it requires the target trust policy's `sts:SetSourceIdentity` permission and applicable caller permission ceilings. Role chaining requires the caller role's identity permission as well.
 
 Trust and identity policies can use `sts:SourceIdentity` during assumption; downstream policies receive `aws:SourceIdentity` from the issued credentials. Requests without source identity leave that condition key absent. This covers direct `AssumeRole`; SAML and web-identity claim ingestion and CloudTrail source-identity reporting are separate remaining work.
+
+SAML role sessions reject `DurationSeconds` above the target role maximum. Accepted requests retain the shorter assertion expiration.
