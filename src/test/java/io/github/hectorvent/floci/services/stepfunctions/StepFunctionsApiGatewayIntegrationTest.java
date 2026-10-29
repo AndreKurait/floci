@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.testutil.AwsRequestSigner;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
 import io.restassured.response.Response;
+import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -51,27 +52,27 @@ class StepFunctionsApiGatewayIntegrationTest {
                 "Principal":{"Service":"states.amazonaws.com"},"Action":"sts:AssumeRole"}]}
                 """, null, 3600, Map.of());
         try {
-            api = given().contentType(ContentType.JSON).body(Map.of("name", name)).post("/restapis")
+            api = api().contentType(ContentType.JSON).body(Map.of("name", name)).post("/restapis")
                     .then().statusCode(201).extract().path("id");
-            String root = given().get("/restapis/" + api + "/resources")
+            String root = api().get("/restapis/" + api + "/resources")
                     .then().statusCode(200).extract().path("item[0].id");
-            String resource = given().contentType(ContentType.JSON).body(Map.of("pathPart", "invoke"))
+            String resource = api().contentType(ContentType.JSON).body(Map.of("pathPart", "invoke"))
                     .post("/restapis/" + api + "/resources/" + root)
                     .then().statusCode(201).extract().path("id");
             String method = "/restapis/" + api + "/resources/" + resource + "/methods/POST";
-            given().contentType(ContentType.JSON).body(Map.of("authorizationType", "AWS_IAM"))
+            api().contentType(ContentType.JSON).body(Map.of("authorizationType", "AWS_IAM"))
                     .put(method).then().statusCode(201);
-            given().contentType(ContentType.JSON).body(Map.of("responseParameters", Map.of()))
+            api().contentType(ContentType.JSON).body(Map.of("responseParameters", Map.of()))
                     .put(method + "/responses/200").then().statusCode(201);
-            given().contentType(ContentType.JSON).body(Map.of("type", "MOCK", "requestTemplates",
+            api().contentType(ContentType.JSON).body(Map.of("type", "MOCK", "requestTemplates",
                     Map.of("application/json", "{\"statusCode\":200}")))
                     .put(method + "/integration").then().statusCode(201);
-            given().contentType(ContentType.JSON).body(Map.of("selectionPattern", "", "responseTemplates",
+            api().contentType(ContentType.JSON).body(Map.of("selectionPattern", "", "responseTemplates",
                     Map.of("application/json", "{\"owned\":true}")))
                     .put(method + "/integration/responses/200").then().statusCode(201);
-            String deployment = given().contentType(ContentType.JSON).body(Map.of("description", "owned"))
+            String deployment = api().contentType(ContentType.JSON).body(Map.of("description", "owned"))
                     .post("/restapis/" + api + "/deployments").then().statusCode(201).extract().path("id");
-            given().contentType(ContentType.JSON).body(Map.of("stageName", "gamma", "deploymentId", deployment))
+            api().contentType(ContentType.JSON).body(Map.of("stageName", "gamma", "deploymentId", deployment))
                     .post("/restapis/" + api + "/stages").then().statusCode(201);
             iam.putRolePolicy(name, "invoke", MAPPER.writeValueAsString(Map.of("Version", "2012-10-17",
                     "Statement", List.of(Map.of("Effect", "Allow", "Action", "execute-api:Invoke", "Resource",
@@ -124,7 +125,7 @@ class StepFunctionsApiGatewayIntegrationTest {
                 sfn("DeleteStateMachine", Map.of("stateMachineArn", machine)).then().statusCode(200);
             }
             if (api != null) {
-                given().delete("/restapis/" + api).then().statusCode(202);
+                api().delete("/restapis/" + api).then().statusCode(202);
             }
             if (taskRole != null) {
                 if (taskPolicy) {
@@ -166,6 +167,10 @@ class StepFunctionsApiGatewayIntegrationTest {
             assertTrue(System.nanoTime() < deadline, "API workflow did not terminate");
             Thread.sleep(25);
         }
+    }
+
+    private static RequestSpecification api() {
+        return given().filter(AwsRequestSigner.signedAs("000000000000", "test", "apigateway"));
     }
 
     private static Response sfn(String action, Map<String, String> body) throws Exception {
