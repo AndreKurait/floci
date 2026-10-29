@@ -121,7 +121,12 @@ public class WebIdentityTokenVerifier {
             throw new InvalidTokenException("The web identity token has no subject claim");
         }
 
-        return new WebIdentityToken(issuer, subject, audiences);
+        JsonNode sourceIdentity = claims.get("https://aws.amazon.com/source_identity");
+        if (sourceIdentity != null && !sourceIdentity.isTextual()) {
+            throw new InvalidTokenException("The source identity claim must be a string");
+        }
+        return new WebIdentityToken(issuer, subject, audiences,
+                sourceIdentity == null ? null : sourceIdentity.textValue());
     }
 
     private void verifyValidityWindow(JsonNode claims) throws InvalidTokenException {
