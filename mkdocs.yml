@@ -236,3 +236,4 @@ nav:
   - Development:
     - Contributing: contributing.md
     - Local concurrency primitives: concurrency.md
+    - Event-driven reconciliation: performance/reconciliation.md

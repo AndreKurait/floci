@@ -1689,8 +1689,8 @@ public class AutoScalingQueryHandler {
             if (key == null) { break; }
             String value = p.getFirst("Tags.member." + i + ".Value");
             tags.put(key, value != null ? value : "");
-            propagateAtLaunch.put(key,
-                    Boolean.parseBoolean(p.getFirst("Tags.member." + i + ".PropagateAtLaunch")));
+            String propagate = p.getFirst("Tags.member." + i + ".PropagateAtLaunch");
+            propagateAtLaunch.put(key, propagate == null || Boolean.parseBoolean(propagate));
         }
         return new ParsedTags(tags, propagateAtLaunch);
     }

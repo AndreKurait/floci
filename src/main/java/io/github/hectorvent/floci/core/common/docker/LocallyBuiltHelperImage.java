@@ -71,7 +71,7 @@ public final class LocallyBuiltHelperImage {
             }
             try (BuildImageResultCallback callback = new BuildImageResultCallback()) {
                 String built = dockerClient.buildImageCmd(new ByteArrayInputStream(archive.toByteArray()))
-                        .withTags(Set.of(image)).withPlatform(platform)
+                        .withTags(Set.of(image)).withPlatform(platform).withPull(true)
                         .withLabels(Map.of(RECIPE_LABEL, recipe)).exec(callback).awaitImageId();
                 if (built == null || built.isBlank()) {
                     throw new IllegalStateException("Docker did not build the Floci helper image: " + image);
