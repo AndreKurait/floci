@@ -345,3 +345,7 @@ SAML role sessions reject `DurationSeconds` above the target role maximum. Accep
 `AssumeRoleWithSAML` reads the `https://aws.amazon.com/SAML/Attributes/SourceIdentity` attribute only from the verified assertion. A present attribute must contain one valid source identity value. The role trust policy must allow both `sts:AssumeRoleWithSAML` and `sts:SetSourceIdentity`; each evaluation receives the verified `sts:SourceIdentity` value. Explicit denial prevents session creation.
 
 The response and issued session retain the source identity through the existing shared session metadata. Missing attributes preserve the existing trust contract. This does not establish full SAML condition support, session-tag issuance, CloudTrail reporting, native-image behavior or managed AWS parity.
+
+### SAML inline session policies
+
+`AssumeRoleWithSAML` retains the supplied inline `Policy` with the issued credentials. With IAM enforcement enabled, signed downstream requests must satisfy both the role policies and this session policy. A session policy can restrict the role's permissions, including through conditions, but cannot expand them. Omitting `Policy` preserves the role's existing permissions. Managed session policies (`PolicyArns`) remain unsupported.
