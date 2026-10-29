@@ -2,8 +2,8 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import org.jboss.logging.Logger;
 
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Lazily starts, health-checks, and reuses one container per arbitrary key. Pulled out of
@@ -35,15 +35,8 @@ public class PerKeyContainerPool {
     private final String healthPath;
     private final ConcurrentHashMap<String, StartedContainer> containers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> startLocks = new ConcurrentHashMap<>();
-    /**
-     * Bumped by every {@link #stopAll()}. {@link #ensureReady} reads it before and after starting
-     * a container: {@code stopAll()} takes no per-key lock (it has no single key to take), so it
-     * cannot see a container that only starts registering itself after {@code stopAll()} already
-     * iterated the map. A changed generation is how a start still notices that a teardown happened
-     * while it was building, so it can stop what it just started instead of leaving it running with
-     * nothing left able to ever stop it again.
-     */
-    private final AtomicLong generation = new AtomicLong();
+    private final Object registryLock = new Object();
+    private long generation;
 
     /**
      * @param healthPath path (e.g. {@code /-/ping}) appended to a container's base URL to probe
@@ -75,25 +68,20 @@ public class PerKeyContainerPool {
                 LOG.warnv("Sidecar container for key {0} is no longer healthy; restarting it", key);
                 lifecycleManager.stopAndRemove(existing.containerId(), null);
             }
-            long startedGeneration = generation.get();
+            long startedGeneration;
+            synchronized (registryLock) {
+                startedGeneration = generation;
+            }
             StartedContainer started = starter.start();
-            // Registered before checking the generation, not after: checking first and only then
-            // registering leaves a gap between the two where a concurrent stopAll() can run and
-            // see nothing (this container isn't in the map yet) without the generation bump alone
-            // catching it either, since that only tells this call a reset happened, not whether
-            // stopAll()'s own sweep already passed the point where it could have found this
-            // container. Registering first means stopAll() either sees it in the map and stops it,
-            // or runs entirely before this put and gets caught by the generation check below;
-            // there is no window where neither happens.
-            containers.put(key, started);
-            if (generation.get() != startedGeneration) {
-                // A stopAll() ran while this container was being built and may have already swept
-                // past this key (its forEach found nothing, since the put above hadn't happened
-                // yet) before clearing the map out from under this registration. Remove and stop
-                // it directly rather than trust the map state, which that same stopAll() may have
-                // already cleared.
+            boolean reset;
+            synchronized (registryLock) {
+                reset = generation != startedGeneration;
+                if (!reset) {
+                    containers.put(key, started);
+                }
+            }
+            if (reset) {
                 LOG.warnv("Sidecar pool was reset while starting a container for key {0}; stopping it", key);
-                containers.remove(key);
                 lifecycleManager.stopAndRemove(started.containerId(), null);
                 throw new IllegalStateException("Sidecar pool was reset while starting a container for key " + key);
             }
@@ -127,27 +115,34 @@ public class PerKeyContainerPool {
         }
         Object lock = startLocks.computeIfAbsent(key, k -> new Object());
         synchronized (lock) {
-            StartedContainer container = containers.remove(key);
+            StartedContainer container;
+            synchronized (registryLock) {
+                container = containers.remove(key);
+            }
             if (container != null) {
                 lifecycleManager.stopAndRemove(container.containerId(), null);
             }
         }
     }
 
-    /** Stops and removes every container this pool has started, then forgets them all. */
+    /** Detaches this generation's containers, then stops them without blocking later starts. */
     public void stopAll() {
-        generation.incrementAndGet();
-        if (containers.isEmpty()) {
+        Map<String, StartedContainer> detached;
+        synchronized (registryLock) {
+            generation++;
+            detached = Map.copyOf(containers);
+            containers.clear();
+        }
+        if (detached.isEmpty()) {
             return;
         }
-        LOG.infov("Stopping {0} pooled sidecar container(s)", containers.size());
-        containers.forEach((key, container) -> {
+        LOG.infov("Stopping {0} pooled sidecar container(s)", detached.size());
+        detached.forEach((key, container) -> {
             try {
                 lifecycleManager.stopAndRemove(container.containerId(), null);
             } catch (Exception e) {
                 LOG.debugv(e, "Failed to stop pooled sidecar container for key {0}", key);
             }
         });
-        containers.clear();
     }
 }
