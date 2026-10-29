@@ -172,12 +172,12 @@ are evaluated as the identity whose long-term key signed the call, as on AWS:
 
 - `GetSessionToken` credentials have the permissions of that IAM user, or of the account root when its key minted them,
   still bounded by the account's service control policies.
-- `GetFederationToken` credentials have no permissions without a session policy (`Policy`). With one, they have the
+- `GetFederationToken` credentials have no permissions without an inline or managed session policy. With one, they have the
   intersection of that policy and the permissions of the IAM user that minted them, never those of a role that shares
   the federated user's name. A resource policy naming the federated user's ARN can grant access on its own, but not
   past an explicit `Deny` in the user's policies or permissions boundary. Whatever their policies allow, they cannot
   call any IAM operation, nor any STS operation except `GetCallerIdentity`.
-  Managed session policies (`PolicyArns`) are not supported yet.
+  Managed session policies (`PolicyArns`) are resolved and evaluated alongside the inline policy, as described below.
 
 A session minted with another session's temporary credentials, which AWS does not accept here, with an inactive access
 key or one that belongs to another account, or by an IAM user since deleted and recreated under the same name, is not
@@ -336,7 +336,7 @@ signature-enforcing SDK tests do not establish managed AWS error-message or runt
 
 `AssumeRole` retains a supplied `SourceIdentity` in the issued session and returns it in the response. Role chaining inherits the value and rejects attempts to change it. With IAM enforcement enabled, setting or inheriting it requires the target trust policy's `sts:SetSourceIdentity` permission and applicable caller permission ceilings. Role chaining requires the caller role's identity permission as well.
 
-Trust and identity policies can use `sts:SourceIdentity` during assumption; downstream policies receive `aws:SourceIdentity` from the issued credentials. Requests without source identity leave that condition key absent. CloudTrail source-identity reporting remain separate work.
+Trust and identity policies can use `sts:SourceIdentity` during assumption; downstream policies receive `aws:SourceIdentity` from the issued credentials. Requests without source identity leave that condition key absent. CloudTrail source-identity reporting remains separate work.
 
 SAML role sessions reject `DurationSeconds` above the target role maximum. Accepted requests retain the shorter assertion expiration.
 
@@ -348,7 +348,13 @@ The response and issued session retain the source identity through the existing 
 
 ### SAML inline session policies
 
-`AssumeRoleWithSAML` retains the supplied inline `Policy` with the issued credentials. With IAM enforcement enabled, signed downstream requests must satisfy both the role policies and this session policy. A session policy can restrict the role's permissions, including through conditions, but cannot expand them. Omitting `Policy` preserves the role's existing permissions. Managed session policies (`PolicyArns`) remain unsupported.
+`AssumeRoleWithSAML` retains the supplied inline `Policy` with the issued credentials. With IAM enforcement enabled, signed downstream requests must satisfy both the role policies and this session policy. A session policy can restrict the role's permissions, including through conditions, but cannot expand them. Omitting `Policy` preserves the role's existing permissions. Managed session policies (`PolicyArns`) are evaluated separately alongside the inline policy.
+
+### Managed session policies
+
+`AssumeRole`, `AssumeRoleWithSAML`, `AssumeRoleWithWebIdentity`, and `GetFederationToken` resolve `PolicyArns` before registering credentials. Customer-managed policies must belong to the session's account and partition; AWS-managed policies use the existing catalog. Requests permit at most ten ARNs and 2,048 combined characters of inline policy and ARN text.
+
+The issued session retains the inline document and managed policy ARNs separately. Each authorization resolves the current default document for those ARNs, preserving each document's policy-language version. The shared IAM evaluator unions their statements and intersects that permission set with the issuing identity, while preserving explicit denies, permissions boundaries, and SCPs. Default-version changes affect existing sessions; a deleted policy contributes no permissions without removing the session restriction. A bounded AWS AssumeRole probe confirmed version updates and deletion affecting already-issued credentials. Propagation timing, delete-and-recreate identity behavior, other STS lifecycle paths on AWS, exact AWS error precedence, and packed-token size reporting remain outside that proof.
 
 ### Verified OIDC source identity
 

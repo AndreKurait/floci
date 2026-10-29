@@ -1610,6 +1610,33 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return policy;
     }
 
+    String sessionPolicyDocument(String accountId, String policyArn) {
+        return sessionPolicy(accountId, policyArn).map(IamPolicy::getDefaultDocument).orElseThrow(() ->
+                new AwsException("MalformedPolicyDocument", "The session policy does not exist: " + policyArn, 400));
+    }
+
+    private Optional<IamPolicy> sessionPolicy(String accountId, String policyArn) {
+        if (AwsManagedPolicies.isManagedPolicyArn(policyArn)) {
+            return resolvePolicy(policyArn);
+        }
+        if (policies instanceof AccountAwareStorageBackend<IamPolicy> aware) {
+            return aware.getForAccount(accountId, policyArn);
+        }
+        return policies.get(policyArn);
+    }
+
+    private List<String> managedSessionPolicyDocuments(SessionCredential session) {
+        List<String> documents = new ArrayList<>();
+        if (!session.getManagedSessionPolicyArns().isEmpty()) {
+            String accountId = AwsArnUtils.parse(session.getRoleArn()).accountId();
+            for (String arn : session.getManagedSessionPolicyArns()) {
+                documents.add(sessionPolicy(accountId, arn).map(IamPolicy::getDefaultDocument)
+                        .orElse("{\"Statement\":[]}"));
+            }
+        }
+        return List.copyOf(documents);
+    }
+
     private IamPolicy requirePolicy(String policyArn) {
         return resolvePolicy(policyArn)
                 .orElseThrow(() -> new AwsException("NoSuchEntity",
@@ -4777,11 +4804,22 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 sessionPolicyDocument, originAccountId, roleSessionName, assumedRoleId, sessionTags, transitiveTags, null);
     }
 
-    /** Registers the source identity atomically with the issued session and its tags. */
+    /** Registers source identity and managed policies atomically with its temporary credentials. */
     void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
                          String roleArn, Instant expiration, String sessionPolicyDocument,
                          String originAccountId, String roleSessionName, String assumedRoleId,
-                         Map<String, String> sessionTags, Map<String, String> transitiveTags, String sourceIdentity) {
+                         Map<String, String> sessionTags, Map<String, String> transitiveTags,
+                         String sourceIdentity) {
+        registerSession(sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, expiration,
+                sessionPolicyDocument, originAccountId, roleSessionName, assumedRoleId, sessionTags,
+                transitiveTags, sourceIdentity, List.of());
+    }
+
+    void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                         String roleArn, Instant expiration, String sessionPolicyDocument,
+                         String originAccountId, String roleSessionName, String assumedRoleId,
+                         Map<String, String> sessionTags, Map<String, String> transitiveTags,
+                         String sourceIdentity, List<String> managedPolicyArns) {
         SessionCredential session = new SessionCredential(sessionAccessKeyId, secretAccessKey, sessionToken,
                 roleArn, expiration, sessionPolicyDocument, originAccountId);
         session.setRoleSessionName(roleSessionName);
@@ -4789,6 +4827,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         session.setSessionTags(sessionTags);
         session.setTransitiveSessionTags(transitiveTags);
         session.setSourceIdentity(sourceIdentity);
+        session.setManagedSessionPolicyArns(managedPolicyArns);
         putNewSession(sessionAccessKeyId, session);
     }
 
@@ -4807,8 +4846,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void registerIssuedSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
                                       String federatedUserArn, Instant expiration, String sessionPolicyDocument,
                                       String originAccountId, String issuingAccessKeyId) {
-        putNewSession(sessionAccessKeyId, issuedSession(sessionAccessKeyId, secretAccessKey, sessionToken,
-                federatedUserArn, expiration, sessionPolicyDocument, originAccountId, issuingAccessKeyId));
+        registerIssuedSession(sessionAccessKeyId, secretAccessKey, sessionToken, federatedUserArn, expiration,
+                sessionPolicyDocument, originAccountId, issuingAccessKeyId, List.of());
+    }
+
+    public void registerIssuedSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                                      String federatedUserArn, Instant expiration, String sessionPolicyDocument,
+                                      String originAccountId, String issuingAccessKeyId, List<String> managedPolicyArns) {
+        SessionCredential session = issuedSession(sessionAccessKeyId, secretAccessKey, sessionToken,
+                federatedUserArn, expiration, sessionPolicyDocument, originAccountId, issuingAccessKeyId);
+        session.setManagedSessionPolicyArns(managedPolicyArns);
+        putNewSession(sessionAccessKeyId, session);
     }
 
     /** Records explicit authentication provenance only for the GetSessionToken issuance path. */
@@ -5262,7 +5310,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     private CallerContext federatedUserContext(SessionCredential session) {
         String sessionPolicy = session.getSessionPolicyDocument();
-        if (sessionPolicy == null || sessionPolicy.isBlank()) {
+        if ((sessionPolicy == null || sessionPolicy.isBlank())
+                && session.getManagedSessionPolicyArns().isEmpty()) {
             return issuingUser(session)
                     .map(user -> CallerContext.of(List.of(denyStatementsOf(user.getUserName()))))
                     .orElse(CallerContext.of(List.of()));
@@ -5437,7 +5486,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 return delegatedApproverContext(session);
             }
             if (isFederatedUserSession(session)) {
-                return withFederatedUserLimits(federatedUserContext(session));
+                return withFederatedUserLimits(federatedUserContext(session))
+                        .withManagedSessionPolicies(managedSessionPolicyDocuments(session));
             }
             if (session.getRoleArn() == null) {
                 if (session.getPresignedAction() != null) {
@@ -5462,7 +5512,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             }
             List<String> identityPolicies = collectRolePolicies(session.getRoleArn());
             String boundaryDoc = resolveRoleBoundaryDocument(session.getRoleArn());
-            return new CallerContext(identityPolicies, session.getSessionPolicyDocument(), boundaryDoc);
+            return new CallerContext(identityPolicies, session.getSessionPolicyDocument(), boundaryDoc)
+                    .withManagedSessionPolicies(managedSessionPolicyDocuments(session));
         }
 
         // Unknown key — bypass

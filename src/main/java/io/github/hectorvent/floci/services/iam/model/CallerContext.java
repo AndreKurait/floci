@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.iam.model;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -8,7 +9,8 @@ import java.util.List;
  * <p>Carries all inputs required for the complete AWS policy evaluation algorithm:
  * <ul>
  *   <li>{@code identityPolicies}: inline + attached policies of the user, role, and groups</li>
- *   <li>{@code sessionPolicyDocument}: optional inline session policy from AssumeRole (Phase 3)</li>
+ *   <li>{@code sessionPolicyDocument}: optional inline session policy</li>
+ *   <li>{@code managedSessionPolicyDocuments}: separately versioned managed session policies</li>
  *   <li>{@code boundaryPolicyDocument}: optional permissions boundary document (Phase 3)</li>
  *   <li>{@code scpLevels}: optional effective service control policies for the caller's
  *       account, one list of policy documents per organization level (root, each OU on the
@@ -23,8 +25,32 @@ public record CallerContext(
         String sessionPolicyDocument,
         String boundaryPolicyDocument,
         List<List<String>> scpLevels,
-        String principalArn
+        String principalArn,
+        List<String> managedSessionPolicyDocuments
 ) {
+    public CallerContext {
+        managedSessionPolicyDocuments = managedSessionPolicyDocuments == null
+                ? List.of() : List.copyOf(managedSessionPolicyDocuments);
+    }
+
+    public CallerContext(List<String> identityPolicies, String sessionPolicyDocument,
+                         String boundaryPolicyDocument, List<List<String>> scpLevels, String principalArn) {
+        this(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels, principalArn, List.of());
+    }
+
+    public List<String> sessionPolicyDocuments() {
+        List<String> documents = new ArrayList<>(managedSessionPolicyDocuments);
+        if (sessionPolicyDocument != null) {
+            documents.add(sessionPolicyDocument);
+        }
+        return List.copyOf(documents);
+    }
+
+    public CallerContext withManagedSessionPolicies(List<String> documents) {
+        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
+                scpLevels, principalArn, documents);
+    }
+
     /** Source-compatible constructor for callers predating principalArn support. */
     public CallerContext(List<String> identityPolicies, String sessionPolicyDocument,
                          String boundaryPolicyDocument, List<List<String>> scpLevels) {
@@ -44,11 +70,13 @@ public record CallerContext(
 
     /** Copy of this context with the effective SCP levels attached. */
     public CallerContext withScpLevels(List<List<String>> levels) {
-        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, levels, principalArn);
+        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
+                levels, principalArn, managedSessionPolicyDocuments);
     }
 
     /** Copy of this context with the caller principal ARN attached. */
     public CallerContext withPrincipalArn(String principalArn) {
-        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels, principalArn);
+        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
+                scpLevels, principalArn, managedSessionPolicyDocuments);
     }
 }

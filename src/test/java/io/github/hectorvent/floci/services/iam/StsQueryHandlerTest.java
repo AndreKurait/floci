@@ -141,7 +141,7 @@ class StsQueryHandlerTest {
         assertEquals(200, response.getStatus());
         assertTrue(response.getEntity().toString().contains("<SourceIdentity>original</SourceIdentity>"));
         verify(service).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
-                isNull(), eq("000000000000"), eq("source"), anyString(), eq(Map.of()), eq(Map.of()), eq("original"));
+                isNull(), eq("000000000000"), eq("source"), anyString(), eq(Map.of()), eq(Map.of()), eq("original"), eq(List.of()));
     }
 
     @Test
@@ -159,7 +159,7 @@ class StsQueryHandlerTest {
         parameters.putSingle("Tags.member.3.Value", "session");
         assertEquals(200, handler.handle("AssumeRole", parameters).getStatus());
         verify(service).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
-                isNull(), eq("000000000000"), eq("tagged"), anyString(), eq(Map.of("Project", "session")), eq(Map.of()), isNull());
+                isNull(), eq("000000000000"), eq("tagged"), anyString(), eq(Map.of("Project", "session")), eq(Map.of()), isNull(), eq(List.of()));
         parameters.putSingle("Tags.member.3.Key", "");
         assertThrows(AwsException.class, () -> handler.handle("AssumeRole", parameters));
     }
@@ -408,7 +408,7 @@ class StsQueryHandlerTest {
 
         assertEquals(200, response.getStatus(), (String) response.getEntity());
         verify(iamService).registerSession(anyString(), anyString(), anyString(), eq(storedArn), any(),
-                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"), eq(Map.of()), eq(Map.of()), isNull());
+                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"), eq(Map.of()), eq(Map.of()), isNull(), eq(List.of()));
     }
 
     @Test
@@ -883,7 +883,7 @@ class StsQueryHandlerTest {
         assertEquals(expected, extract(EXPIRATION, (String) response.getEntity()));
         ArgumentCaptor<Instant> sessionExpiration = ArgumentCaptor.forClass(Instant.class);
         verify(iamService).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()),
-                sessionExpiration.capture(), isNull(), eq("000000000000"), eq("s"), anyString(), eq(Map.of()), eq(Map.of()), isNull());
+                sessionExpiration.capture(), isNull(), eq("000000000000"), eq("s"), anyString(), eq(Map.of()), eq(Map.of()), isNull(), eq(List.of()));
         assertEquals(expiration, sessionExpiration.getValue());
     }
 
@@ -931,6 +931,6 @@ class StsQueryHandlerTest {
                 eq("arn:aws:iam::000000000002:user/admin"), eq(expiry), isNull(),
                 eq("000000000002"));
         verify(iamService, never()).registerIssuedSession(anyString(), anyString(), anyString(),
-                anyString(), any(), any(), anyString(), any());
+                anyString(), any(), any(), anyString(), any(), anyList());
     }
 }

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 
 @RegisterForReflection
@@ -27,6 +28,7 @@ public class SessionCredential {
     private Instant multiFactorAuthenticatedAt;
     /** Inline session policy passed to AssumeRole/GetFederationToken — further restricts role policies. */
     private String sessionPolicyDocument;
+    private List<String> managedSessionPolicyArns = List.of();
     /**
      * Account of the caller that minted this session, captured at mint time. Used to route
      * temporary credentials that carry no role ARN (e.g. GetSessionToken) back to the caller. A
@@ -153,6 +155,11 @@ public class SessionCredential {
 
     public Instant getExpiration() { return expiration; }
     public void setExpiration(Instant expiration) { this.expiration = expiration; }
+
+    public List<String> getManagedSessionPolicyArns() { return managedSessionPolicyArns; }
+    public void setManagedSessionPolicyArns(List<String> arns) {
+        managedSessionPolicyArns = arns == null ? List.of() : List.copyOf(arns);
+    }
 
     public String getSessionPolicyDocument() { return sessionPolicyDocument; }
     public void setSessionPolicyDocument(String sessionPolicyDocument) { this.sessionPolicyDocument = sessionPolicyDocument; }

@@ -8,6 +8,7 @@ import io.quarkus.test.junit.TestProfile;
 import io.quarkus.test.junit.mockito.InjectSpy;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.w3c.dom.Document;
@@ -25,6 +26,7 @@ import software.amazon.awssdk.services.sts.StsClient;
 import software.amazon.awssdk.services.sts.model.AssumeRoleResponse;
 import software.amazon.awssdk.services.sts.model.AssumeRoleWithSamlResponse;
 import software.amazon.awssdk.services.sts.model.Credentials;
+import software.amazon.awssdk.services.sts.model.PolicyDescriptorType;
 import software.amazon.awssdk.services.sts.model.StsException;
 
 import javax.xml.crypto.dsig.Transform;
@@ -96,7 +98,7 @@ class SamlSourceIdentityWireIntegrationTest {
             assertEquals("InvalidIdentityToken", denied.awsErrorDetails().errorCode());
             verify(iam, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
                     any(Instant.class), nullable(String.class), anyString(), anyString(), anyString(),
-                    anyMap(), anyMap(), nullable(String.class));
+                    anyMap(), anyMap(), nullable(String.class), anyList());
         }
     }
 
@@ -128,6 +130,68 @@ class SamlSourceIdentityWireIntegrationTest {
                 }
             }
             assertEquals(SOURCE, iam.findSourceIdentity(session.accessKeyId(), session.sessionToken()));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"omitted", "allow", "explicit-deny", "implicit-deny", "condition-deny", "cannot-expand",
+            "inline-union", "inline-deny"})
+    void samlManagedSessionPolicyRestrictsSignedDownstreamRequests(String scenario) throws Exception {
+        String policy = switch (scenario) {
+            case "omitted", "allow", "inline-deny" -> "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"iam:ListRoles\",\"Resource\":\"*\"}}";
+            case "explicit-deny" -> "{\"Statement\":{\"Effect\":\"Deny\",\"Action\":\"iam:ListRoles\",\"Resource\":\"*\"}}";
+            case "implicit-deny", "inline-union" -> "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"iam:ListUsers\",\"Resource\":\"*\"}}";
+            case "condition-deny" -> "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"iam:ListRoles\",\"Resource\":\"*\","
+                    + "\"Condition\":{\"StringEquals\":{\"aws:SourceIdentity\":\"Other\"}}}}";
+            case "cannot-expand" -> "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"iam:*\",\"Resource\":\"*\"}}";
+            default -> throw new IllegalArgumentException(scenario);
+        };
+        try (Fixture fixture = new Fixture()) {
+            String policyArn = "arn:aws:iam::" + ACCOUNT + ":policy/" + fixture.name;
+            try (AutoCloseable policyCleanup = () -> {
+                try {
+                    fixture.admin.deletePolicy(b -> b.policyArn(policyArn));
+                } catch (NoSuchEntityException expected) {
+                    // The known-name create may fail before storing this owned policy.
+                }
+                assertThrows(NoSuchEntityException.class, () -> fixture.admin.getPolicy(b -> b.policyArn(policyArn)));
+            }) {
+                fixture.admin.createPolicy(b -> b.policyName(fixture.name).policyDocument(policy));
+                String inline = switch (scenario) {
+                    case "inline-union" -> "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"iam:ListRoles\",\"Resource\":\"*\"}}";
+                    case "inline-deny" -> "{\"Statement\":{\"Effect\":\"Deny\",\"Action\":\"iam:ListRoles\",\"Resource\":\"*\"}}";
+                    default -> null;
+                };
+                Credentials session = fixture.assume("present", inline,
+                        "omitted".equals(scenario) ? List.of()
+                                : List.of(PolicyDescriptorType.builder().arn(policyArn).build())).credentials();
+                try (IamClient caller = fixture.caller(session)) {
+                    if (scenario.endsWith("deny")) {
+                        assertEquals("AccessDenied", assertThrows(IamException.class, caller::listRoles)
+                                .awsErrorDetails().errorCode());
+                    } else {
+                        assertDoesNotThrow(() -> caller.listRoles());
+                        if ("cannot-expand".equals(scenario)) {
+                            assertEquals("AccessDenied", assertThrows(IamException.class, caller::listUsers)
+                                    .awsErrorDetails().errorCode());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void missingManagedPolicyDoesNotRegisterCredentials() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            clearInvocations(iam);
+            String missing = "arn:aws:iam::" + ACCOUNT + ":policy/" + fixture.name;
+            StsException failure = assertThrows(StsException.class, () -> fixture.assume("present", null,
+                    List.of(PolicyDescriptorType.builder().arn(missing).build())));
+            assertEquals("MalformedPolicyDocument", failure.awsErrorDetails().errorCode());
+            verify(iam, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
+                    any(Instant.class), nullable(String.class), anyString(), anyString(), anyString(),
+                    anyMap(), anyMap(), nullable(String.class), anyList());
         }
     }
 
@@ -186,6 +250,11 @@ class SamlSourceIdentityWireIntegrationTest {
         }
 
         private AssumeRoleWithSamlResponse assume(String scenario, String policy) {
+            return assume(scenario, policy, List.of());
+        }
+
+        private AssumeRoleWithSamlResponse assume(String scenario, String policy,
+                                                 List<PolicyDescriptorType> policyArns) {
             String assertion = AssumeRoleWithSamlValidationIntegrationTest.assertion(role.arn(), providerArn,
                     Instant.now().plusSeconds(1800), "urn:amazon:webservices", ISSUER, true, false,
                     factory -> {
@@ -196,7 +265,7 @@ class SamlSourceIdentityWireIntegrationTest {
                         }
                     }, document -> addSource(document, scenario));
             AssumeRoleWithSamlResponse response = anonymous.assumeRoleWithSAML(b -> b.roleArn(role.arn())
-                    .principalArn(providerArn).samlAssertion(assertion).durationSeconds(900).policy(policy));
+                    .principalArn(providerArn).samlAssertion(assertion).durationSeconds(900).policy(policy).policyArns(policyArns));
             sessions.add(response.credentials());
             return response;
         }
@@ -232,7 +301,7 @@ class SamlSourceIdentityWireIntegrationTest {
                 assertEquals("AccessDenied", changed.awsErrorDetails().errorCode());
                 verify(iam, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
                     any(Instant.class), nullable(String.class), anyString(), anyString(), anyString(),
-                    anyMap(), anyMap(), nullable(String.class));
+                    anyMap(), anyMap(), nullable(String.class), anyList());
             }
         }
 
