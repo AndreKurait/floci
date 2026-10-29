@@ -88,6 +88,9 @@ A decision that cannot be applied appends its `*Failed` event with the AWS cause
 fresh decision task. A closing decision must be last in the batch: a batch with anything
 after it is rejected with `ValidationException` ("Close must be last decision in list") and
 no decision is applied.
+A closing decision is deferred with `UNHANDLED_DECISION` when a new event arrived after
+its decision task started. Known pending activities, timers and children do not prevent
+closure; normal activity cleanup and the configured child policy still apply.
 
 An empty decision response leaves the execution open and waits for a new event.
 It does not schedule another task merely because no activity, timer, or child is
@@ -253,9 +256,12 @@ Faults use the AWS codes and messages, so SDK error handling works unchanged:
 
 ## Limitations
 
-- **Long polling.** `PollForDecisionTask` and `PollForActivityTask` return immediately
-  instead of holding the connection for up to 60 seconds. Workers that loop on an empty
-  poll behave the same; workers that rely on the call blocking will spin.
+- **Long polling.** `PollForDecisionTask` and `PollForActivityTask` hold an empty
+  poll for up to 60 seconds and wake when a matching task becomes available. Decision
+  history continuation requests return the next page without starting another poll.
+  Notifications are scoped by account, region, domain, task list and task type.
+  Activity heartbeats do not wake idle decision pollers, and idle notification
+  registrations are removed when their last waiter leaves.
 - **Task tokens are in-memory.** Tokens do not survive a restart even under persistent
   storage modes, matching the fact that SWF tokens are not durable handles.
 - **Retention.** `workflowExecutionRetentionPeriodInDays` is stored and returned but

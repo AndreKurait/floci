@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.swf.model.SwfActivityTask;
@@ -16,12 +17,14 @@ import io.github.hectorvent.floci.services.swf.model.SwfHistoryEvent;
 import io.github.hectorvent.floci.services.swf.model.SwfTimer;
 import io.github.hectorvent.floci.services.swf.model.SwfWorkflowExecution;
 import io.github.hectorvent.floci.services.swf.model.SwfWorkflowType;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
@@ -30,7 +33,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 /**
  * Amazon SWF domain logic: registration, the workflow execution state machine, and
@@ -71,11 +76,13 @@ public class SwfService implements Resettable {
     private final StorageBackend<String, SwfDomain> domainStore;
     private final StorageBackend<String, SwfWorkflowType> workflowTypeStore;
     private final StorageBackend<String, SwfActivityType> activityTypeStore;
-    private final StorageBackend<String, SwfWorkflowExecution> executionStore;
+    private final AccountAwareStorageBackend<SwfWorkflowExecution> executionStore;
 
     private final Map<String, String> decisionTokens = new ConcurrentHashMap<>();
     private final Map<String, String> activityTokens = new ConcurrentHashMap<>();
     private final Map<String, Object> domainLocks = new ConcurrentHashMap<>();
+    private final Map<PollScope, PollSignal> pollSignals = new ConcurrentHashMap<>();
+    private boolean pollingStopped;
 
     private final RegionResolver regionResolver;
     private final Clock clock;
@@ -100,9 +107,132 @@ public class SwfService implements Resettable {
 
     @Override
     public void clear() {
+        closePolls(false);
         decisionTokens.clear();
         activityTokens.clear();
         domainLocks.clear();
+    }
+
+    @PreDestroy
+    void stopPolling() {
+        closePolls(true);
+    }
+
+    private void closePolls(boolean stopping) {
+        synchronized (pollSignals) {
+            pollingStopped |= stopping;
+            for (PollSignal signal : pollSignals.values()) {
+                synchronized (signal) {
+                    signal.closed = true;
+                    signal.notifyAll();
+                }
+            }
+            pollSignals.clear();
+        }
+    }
+
+    private record PollScope(String accountId, String region, String domain,
+                             String taskList, boolean decision) {}
+
+    private static final class PollSignal {
+        private long version;
+        private boolean closed;
+        private int waiters;
+    }
+
+    private <T> Optional<T> pollForTask(String region, String domain, String taskList,
+                                      boolean decision, Duration timeout, Supplier<Optional<T>> claim) {
+        requireDomain(region, domain);
+        requireName(taskList, "taskList.name");
+        PollScope scope = new PollScope(executionStore.accountId(), region, domain, taskList, decision);
+        PollSignal signal;
+        synchronized (pollSignals) {
+            if (pollingStopped) {
+                return Optional.empty();
+            }
+            signal = pollSignals.computeIfAbsent(scope, ignored -> new PollSignal());
+            signal.waiters++;
+        }
+        try {
+            return awaitTask(timeout, claim, signal);
+        } finally {
+            synchronized (pollSignals) {
+                if (--signal.waiters == 0) {
+                    pollSignals.remove(scope, signal);
+                }
+            }
+        }
+    }
+
+    private <T> Optional<T> awaitTask(Duration timeout, Supplier<Optional<T>> claim, PollSignal signal) {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (!Thread.currentThread().isInterrupted()) {
+            long version;
+            synchronized (signal) {
+                if (signal.closed) {
+                    return Optional.empty();
+                }
+                version = signal.version;
+            }
+            // Claiming takes the existing domain lock. Never hold the signal monitor while
+            // claiming, so a producer can persist and notify without a lock-order cycle.
+            Optional<T> task = claim.get();
+            if (task.isPresent()) {
+                return task;
+            }
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                return Optional.empty();
+            }
+            synchronized (signal) {
+                if (signal.closed) {
+                    return Optional.empty();
+                }
+                // A producer that published between the empty scan and this wait changed
+                // the version, so rescan instead of losing its notification.
+                if (version == signal.version) {
+                    try {
+                        TimeUnit.NANOSECONDS.timedWait(signal, remaining);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return Optional.empty();
+                    }
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private void storeExecution(String key, SwfWorkflowExecution execution) {
+        storeExecutionForAccount(executionStore.accountId(), key, execution);
+    }
+
+    private void storeExecutionForAccount(String accountId, String key, SwfWorkflowExecution execution) {
+        executionStore.putForAccount(accountId, key, execution);
+        if (!execution.isOpen() || pollSignals.isEmpty()) {
+            return;
+        }
+        SwfDecisionTask decision = execution.getDecisionTask();
+        if (decision != null && SwfDecisionTask.STATE_SCHEDULED.equals(decision.getState())) {
+            signalPollers(new PollScope(accountId, execution.getRegion(), execution.getDomain(),
+                    execution.getTaskList(), true));
+        }
+        for (SwfActivityTask activity : execution.getActivities().values()) {
+            if (SwfActivityTask.STATE_SCHEDULED.equals(activity.getState())) {
+                signalPollers(new PollScope(accountId, execution.getRegion(), execution.getDomain(),
+                        activity.getTaskList(), false));
+            }
+        }
+    }
+
+    private void signalPollers(PollScope scope) {
+        PollSignal signal = pollSignals.get(scope);
+        if (signal != null) {
+            synchronized (signal) {
+                signal.version++;
+                signal.notifyAll();
+            }
+        }
     }
 
     // ──────────────────────────────── Domains ────────────────────────────────
@@ -362,7 +492,7 @@ public class SwfService implements Resettable {
             SwfWorkflowExecution execution = buildExecution(request, type);
             appendWorkflowExecutionStarted(execution, request.input(), null);
             scheduleDecisionTask(execution);
-            executionStore.put(executionKey(execution), execution);
+            storeExecution(executionKey(execution), execution);
             LOG.debugv("Started SWF execution {0}/{1} run {2}",
                     execution.getDomain(), execution.getWorkflowId(), execution.getRunId());
             return execution.getRunId();
@@ -513,8 +643,7 @@ public class SwfService implements Resettable {
 
     /**
      * Claims the oldest scheduled decision task on {@code taskList}, or returns empty when
-     * none is available. SWF long-polls for up to 60s; the emulator answers immediately and
-     * lets the caller decide whether to poll again, which keeps request threads free.
+     * none is available. The HTTP handler uses the timed overload for SWF's long poll.
      */
     public Optional<SwfDecisionTask> pollForDecisionTask(String region, String domainName, String taskList, String identity) {
         requireDomain(region, domainName);
@@ -533,6 +662,12 @@ public class SwfService implements Resettable {
             }
         }
         return Optional.empty();
+    }
+
+    public Optional<SwfDecisionTask> pollForDecisionTask(String region, String domainName, String taskList,
+                                                       String identity, Duration timeout) {
+        return pollForTask(region, domainName, taskList, true, timeout,
+                () -> pollForDecisionTask(region, domainName, taskList, identity));
     }
 
     private SwfDecisionTask tryClaimDecisionTask(SwfWorkflowExecution candidate, String taskList, String identity) {
@@ -560,7 +695,7 @@ public class SwfService implements Resettable {
             String token = newTaskToken();
             task.setTaskToken(token);
             decisionTokens.put(token, executionKey(execution));
-            executionStore.put(executionKey(execution), execution);
+            storeExecution(executionKey(execution), execution);
             return task;
         }
     }
@@ -599,6 +734,7 @@ public class SwfService implements Resettable {
             // Rejected before anything is mutated: the live service answers 400 and leaves
             // the task outstanding, so the decider can retry with a corrected batch.
             requireValidBatch(decisions);
+            boolean unhandledEvents = execution.getEvents().getLast().getEventId() > task.getStartedEventId();
 
             SwfHistoryEvent completed = appendEvent(execution, "DecisionTaskCompleted");
             completed.attr("executionContext", executionContext)
@@ -613,13 +749,13 @@ public class SwfService implements Resettable {
                 execution.setLatestExecutionContext(executionContext);
             }
 
-            applyDecisions(execution, decisions, queued, decisionEventId);
+            applyDecisions(execution, decisions, queued, decisionEventId, unhandledEvents);
 
             if (execution.isOpen() && execution.isDecisionNeeded()) {
                 execution.setDecisionNeeded(false);
                 scheduleDecisionTask(execution);
             }
-            executionStore.put(executionKey(execution), execution);
+            storeExecution(executionKey(execution), execution);
         }
         // Only reached when the batch was applied and stored: anything thrown above leaves
         // `queued` unreferenced, so a failed request cannot invoke a function.
@@ -673,7 +809,7 @@ public class SwfService implements Resettable {
     }
 
     private void applyDecisions(SwfWorkflowExecution execution, List<Decision> decisions,
-                                List<PendingLambda> queued, long decisionEventId) {
+                                List<PendingLambda> queued, long decisionEventId, boolean unhandledEvents) {
         if (decisions == null) {
             return;
         }
@@ -681,6 +817,13 @@ public class SwfService implements Resettable {
             if (!execution.isOpen()) {
                 LOG.debugv("Dropping {0} decision: execution {1} already closed",
                         decision.type(), execution.getRunId());
+                return;
+            }
+            if (unhandledEvents && SwfConstants.CLOSING_DECISIONS.contains(decision.type())) {
+                appendEvent(execution, decision.type() + "Failed")
+                        .attr("cause", "UNHANDLED_DECISION")
+                        .attr("decisionTaskCompletedEventId", decisionEventId);
+                execution.setDecisionNeeded(true);
                 return;
             }
             applyDecision(execution, decision, queued, decisionEventId);
@@ -830,13 +973,6 @@ public class SwfService implements Resettable {
     }
 
     private void completeWorkflowExecution(SwfWorkflowExecution execution, Decision decision, long decisionEventId) {
-        if (hasOpenWork(execution)) {
-            appendEvent(execution, "CompleteWorkflowExecutionFailed")
-                    .attr("cause", "UNHANDLED_DECISION")
-                    .attr("decisionTaskCompletedEventId", decisionEventId);
-            execution.setDecisionNeeded(true);
-            return;
-        }
         appendEvent(execution, "WorkflowExecutionCompleted")
                 .attr("result", decision.string("result"))
                 .attr("decisionTaskCompletedEventId", decisionEventId);
@@ -844,13 +980,6 @@ public class SwfService implements Resettable {
     }
 
     private void failWorkflowExecution(SwfWorkflowExecution execution, Decision decision, long decisionEventId) {
-        if (hasOpenWork(execution)) {
-            appendEvent(execution, "FailWorkflowExecutionFailed")
-                    .attr("cause", "UNHANDLED_DECISION")
-                    .attr("decisionTaskCompletedEventId", decisionEventId);
-            execution.setDecisionNeeded(true);
-            return;
-        }
         appendEvent(execution, "WorkflowExecutionFailed")
                 .attr("reason", decision.string("reason"))
                 .attr("details", decision.string("details"))
@@ -859,13 +988,6 @@ public class SwfService implements Resettable {
     }
 
     private void cancelWorkflowExecution(SwfWorkflowExecution execution, Decision decision, long decisionEventId) {
-        if (hasOpenWork(execution)) {
-            appendEvent(execution, "CancelWorkflowExecutionFailed")
-                    .attr("cause", "UNHANDLED_DECISION")
-                    .attr("decisionTaskCompletedEventId", decisionEventId);
-            execution.setDecisionNeeded(true);
-            return;
-        }
         appendEvent(execution, "WorkflowExecutionCanceled")
                 .attr("details", decision.string("details"))
                 .attr("decisionTaskCompletedEventId", decisionEventId);
@@ -895,7 +1017,7 @@ public class SwfService implements Resettable {
                 closing.getParentWorkflowId(), closing.getParentRunId());
         executionStore.get(parentKey).ifPresent(parent -> {
             parent.getChildExecutions().put(successor.getWorkflowId(), successor.getRunId());
-            executionStore.put(parentKey, parent);
+            storeExecution(parentKey, parent);
         });
     }
 
@@ -945,7 +1067,7 @@ public class SwfService implements Resettable {
 
         appendWorkflowExecutionStarted(next, decision.string("input"), execution.getRunId());
         scheduleDecisionTask(next);
-        executionStore.put(executionKey(next), next);
+        storeExecution(executionKey(next), next);
     }
 
     private void recordMarker(SwfWorkflowExecution execution, Decision decision, long decisionEventId) {
@@ -1141,7 +1263,7 @@ public class SwfService implements Resettable {
         // The child reports this id back on startedEventId of every
         // ChildWorkflowExecution* event, so it has to be stored before the child is saved.
         child.setParentStartedEventId(childStarted.getEventId());
-        executionStore.put(executionKey(child), child);
+        storeExecution(executionKey(child), child);
     }
 
     /** Maps a DefaultUndefinedFault message onto the matching child-start failure cause. */
@@ -1258,7 +1380,7 @@ public class SwfService implements Resettable {
             reason = e.getErrorCode();
             details = e.getMessage();
         } catch (RuntimeException e) {
-            LOG.warnv("SWF Lambda invocation {0} ({1}) failed: {2}",
+            LOG.warnv(e, "SWF Lambda invocation {0} ({1}) failed: {2}",
                     pending.id(), pending.name(), e.getMessage());
             eventType = "LambdaFunctionFailed";
             reason = e.getClass().getSimpleName();
@@ -1277,7 +1399,7 @@ public class SwfService implements Resettable {
                     .attr("details", details)
                     .attr("result", result);
             scheduleDecisionTaskIfIdle(execution);
-            executionStore.put(pending.executionKey(), execution);
+            storeExecution(pending.executionKey(), execution);
         }
     }
 
@@ -1302,6 +1424,12 @@ public class SwfService implements Resettable {
             }
         }
         return Optional.empty();
+    }
+
+    public Optional<SwfActivityTask> pollForActivityTask(String region, String domainName, String taskList,
+                                                       String identity, Duration timeout) {
+        return pollForTask(region, domainName, taskList, false, timeout,
+                () -> pollForActivityTask(region, domainName, taskList, identity));
     }
 
     private SwfActivityTask tryClaimActivityTask(SwfWorkflowExecution candidate, String taskList, String identity) {
@@ -1332,7 +1460,7 @@ public class SwfService implements Resettable {
             String token = newTaskToken();
             task.setTaskToken(token);
             activityTokens.put(token, executionKey(execution) + "|" + task.getActivityId());
-            executionStore.put(executionKey(execution), execution);
+            storeExecution(executionKey(execution), execution);
             return task;
         }
     }
@@ -1341,10 +1469,8 @@ public class SwfService implements Resettable {
     public boolean recordActivityTaskHeartbeat(String taskToken, String details) {
         return withActivityToken(taskToken, (execution, task) -> {
             task.setLastHeartbeatTimestamp(now());
-            if (details != null) {
-                task.setControl(details);
-            }
-            executionStore.put(executionKey(execution), execution);
+            task.setHeartbeatDetails(details);
+            storeExecution(executionKey(execution), execution);
             return task.isCancelRequested();
         });
     }
@@ -1390,7 +1516,7 @@ public class SwfService implements Resettable {
         // genuine token whose task has closed (Unknown activity, scheduledEventId = N) from
         // a token that never existed. Reuse is still refused by the isOpen() check there.
         scheduleDecisionTaskIfIdle(execution);
-        executionStore.put(executionKey(execution), execution);
+        storeExecution(executionKey(execution), execution);
     }
 
     private <T> T withActivityToken(String taskToken, ActivityTokenAction<T> action) {
@@ -1450,7 +1576,7 @@ public class SwfService implements Resettable {
                 .attr("externalWorkflowExecution", externalExecution)
                 .attr("externalInitiatedEventId", externalInitiatedEventId);
         scheduleDecisionTaskIfIdle(execution);
-        executionStore.put(executionKey(execution), execution);
+        storeExecution(executionKey(execution), execution);
     }
 
     public void requestCancelWorkflowExecution(String region, String domainName, String workflowId, String runId) {
@@ -1468,13 +1594,18 @@ public class SwfService implements Resettable {
 
     private void deliverCancelRequest(SwfWorkflowExecution execution, Map<String, String> externalExecution,
                                       Long externalInitiatedEventId, String cause) {
+        deliverCancelRequest(execution, externalExecution, externalInitiatedEventId, cause, executionStore.accountId());
+    }
+
+    private void deliverCancelRequest(SwfWorkflowExecution execution, Map<String, String> externalExecution,
+                                      Long externalInitiatedEventId, String cause, String accountId) {
         appendEvent(execution, "WorkflowExecutionCancelRequested")
                 .attr("externalWorkflowExecution", externalExecution)
                 .attr("externalInitiatedEventId", externalInitiatedEventId)
                 .attr("cause", cause);
         execution.setCancelRequested(true);
         scheduleDecisionTaskIfIdle(execution);
-        executionStore.put(executionKey(execution), execution);
+        storeExecutionForAccount(accountId, executionKey(execution), execution);
     }
 
     public void terminateWorkflowExecution(String region, String domainName, String workflowId, String runId,
@@ -1494,13 +1625,18 @@ public class SwfService implements Resettable {
 
     private void terminate(SwfWorkflowExecution execution, String reason, String details,
                            String childPolicy, String cause) {
+        terminate(execution, reason, details, childPolicy, cause, executionStore.accountId());
+    }
+
+    private void terminate(SwfWorkflowExecution execution, String reason, String details,
+                           String childPolicy, String cause, String accountId) {
         appendEvent(execution, "WorkflowExecutionTerminated")
                 .attr("reason", reason)
                 .attr("details", details)
                 .attr("childPolicy", childPolicy)
                 .attr("cause", cause);
-        closeExecution(execution, SwfConstants.CLOSE_STATUS_TERMINATED);
-        executionStore.put(executionKey(execution), execution);
+        closeExecution(execution, SwfConstants.CLOSE_STATUS_TERMINATED, accountId);
+        storeExecutionForAccount(accountId, executionKey(execution), execution);
     }
 
     // ──────────────────────────────── Tagging ────────────────────────────────
@@ -1563,22 +1699,25 @@ public class SwfService implements Resettable {
      */
     public void sweep() {
         double nowSeconds = now();
-        for (String key : executionStore.keys()) {
+        for (AccountAwareStorageBackend.AccountEntry<SwfWorkflowExecution> entry
+                : executionStore.scanAllAccountEntries(key -> true)) {
+            String accountId = entry.accountId();
+            String key = entry.key();
             synchronized (domainLockForKey(key)) {
-                SwfWorkflowExecution execution = executionStore.get(key).orElse(null);
+                SwfWorkflowExecution execution = executionStore.getForAccount(accountId, key).orElse(null);
                 if (execution == null || !execution.isOpen()) {
                     continue;
                 }
                 boolean changed = fireTimers(execution, nowSeconds)
                         | timeOutActivities(execution, nowSeconds)
                         | timeOutDecisionTask(execution, nowSeconds);
-                if (timeOutExecution(execution, nowSeconds)) {
+                if (timeOutExecution(execution, nowSeconds, accountId)) {
                     changed = true;
                 } else if (changed && execution.isOpen()) {
                     scheduleDecisionTaskIfIdle(execution);
                 }
                 if (changed) {
-                    executionStore.put(key, execution);
+                    storeExecutionForAccount(accountId, key, execution);
                 }
             }
         }
@@ -1610,6 +1749,7 @@ public class SwfService implements Resettable {
             }
             appendEvent(execution, "ActivityTaskTimedOut")
                     .attr("timeoutType", timeoutType)
+                    .attr("details", task.getHeartbeatDetails())
                     .attr("scheduledEventId", task.getScheduledEventId())
                     .attr("startedEventId", task.getStartedEventId() != null ? task.getStartedEventId() : 0L);
             task.setState(SwfActivityTask.STATE_CLOSED);
@@ -1674,7 +1814,7 @@ public class SwfService implements Resettable {
         return true;
     }
 
-    private boolean timeOutExecution(SwfWorkflowExecution execution, double nowSeconds) {
+    private boolean timeOutExecution(SwfWorkflowExecution execution, double nowSeconds, String accountId) {
         Double startToClose = timeoutSeconds(execution.getExecutionStartToCloseTimeout());
         if (startToClose == null || nowSeconds - execution.getStartTimestamp() < startToClose) {
             return false;
@@ -1682,7 +1822,7 @@ public class SwfService implements Resettable {
         appendEvent(execution, "WorkflowExecutionTimedOut")
                 .attr("timeoutType", "START_TO_CLOSE")
                 .attr("childPolicy", execution.getChildPolicy());
-        closeExecution(execution, SwfConstants.CLOSE_STATUS_TIMED_OUT);
+        closeExecution(execution, SwfConstants.CLOSE_STATUS_TIMED_OUT, accountId);
         return true;
     }
 
@@ -1767,6 +1907,10 @@ public class SwfService implements Resettable {
     }
 
     private void closeExecution(SwfWorkflowExecution execution, String closeStatus) {
+        closeExecution(execution, closeStatus, executionStore.accountId());
+    }
+
+    private void closeExecution(SwfWorkflowExecution execution, String closeStatus, String accountId) {
         execution.setExecutionStatus(SwfConstants.EXECUTION_STATUS_CLOSED);
         execution.setCloseStatus(closeStatus);
         execution.setCloseTimestamp(now());
@@ -1785,8 +1929,8 @@ public class SwfService implements Resettable {
         }
         execution.getTimers().clear();
 
-        notifyParent(execution);
-        applyChildPolicy(execution);
+        notifyParent(execution, accountId);
+        applyChildPolicy(execution, accountId);
     }
 
     /**
@@ -1794,7 +1938,7 @@ public class SwfService implements Resettable {
      * matching ChildWorkflowExecution* event. CONTINUED_AS_NEW is deliberately silent:
      * the continuation run carries the parent link and reports for itself.
      */
-    private void notifyParent(SwfWorkflowExecution execution) {
+    private void notifyParent(SwfWorkflowExecution execution, String accountId) {
         if (execution.getParentWorkflowId() == null || execution.getParentRunId() == null) {
             return;
         }
@@ -1803,7 +1947,7 @@ public class SwfService implements Resettable {
         }
         String parentKey = executionKey(execution.getRegion(), execution.getDomain(),
                 execution.getParentWorkflowId(), execution.getParentRunId());
-        SwfWorkflowExecution parent = executionStore.get(parentKey).orElse(null);
+        SwfWorkflowExecution parent = executionStore.getForAccount(accountId, parentKey).orElse(null);
         if (parent == null || !parent.isOpen()) {
             return;
         }
@@ -1839,7 +1983,7 @@ public class SwfService implements Resettable {
         }
 
         scheduleDecisionTaskIfIdle(parent);
-        executionStore.put(parentKey, parent);
+        storeExecutionForAccount(accountId, parentKey, parent);
     }
 
     private Object lastEventAttribute(SwfWorkflowExecution execution, String eventType, String attribute) {
@@ -1857,43 +2001,24 @@ public class SwfService implements Resettable {
      * TERMINATE ends them, REQUEST_CANCEL asks their deciders to wind down, and
      * ABANDON leaves them running.
      */
-    private void applyChildPolicy(SwfWorkflowExecution execution) {
+    private void applyChildPolicy(SwfWorkflowExecution execution, String accountId) {
         if (execution.getChildExecutions().isEmpty()
                 || SwfConstants.CHILD_POLICY_ABANDON.equals(execution.getChildPolicy())) {
             return;
         }
         for (Map.Entry<String, String> entry : execution.getChildExecutions().entrySet()) {
             String childKey = executionKey(execution.getRegion(), execution.getDomain(), entry.getKey(), entry.getValue());
-            SwfWorkflowExecution child = executionStore.get(childKey).orElse(null);
+            SwfWorkflowExecution child = executionStore.getForAccount(accountId, childKey).orElse(null);
             if (child == null || !child.isOpen()) {
                 continue;
             }
             if (SwfConstants.CHILD_POLICY_TERMINATE.equals(execution.getChildPolicy())) {
-                terminate(child, null, null, child.getChildPolicy(), "CHILD_POLICY_APPLIED");
+                terminate(child, null, null, child.getChildPolicy(), "CHILD_POLICY_APPLIED", accountId);
             } else {
-                deliverCancelRequest(child, null, null, "CHILD_POLICY_APPLIED");
+                deliverCancelRequest(child, null, null, "CHILD_POLICY_APPLIED", accountId);
             }
         }
     }
-
-    /**
-     * True when the execution still has activities, timers, or children the decider must
-     * resolve before it may close the execution. SWF rejects a closing decision in that
-     * state with UNHANDLED_DECISION.
-     */
-    private boolean hasOpenWork(SwfWorkflowExecution execution) {
-        if (execution.getActivities().values().stream().anyMatch(SwfActivityTask::isOpen)) {
-            return true;
-        }
-        if (!execution.getTimers().isEmpty()) {
-            return true;
-        }
-        return execution.getChildExecutions().entrySet().stream().anyMatch(entry -> executionStore
-                .get(executionKey(execution.getRegion(), execution.getDomain(), entry.getKey(), entry.getValue()))
-                .filter(SwfWorkflowExecution::isOpen)
-                .isPresent());
-    }
-
 
     public int openActivityCount(SwfWorkflowExecution execution) {
         return (int) execution.getActivities().values().stream().filter(SwfActivityTask::isOpen).count();
