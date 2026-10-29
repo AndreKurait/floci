@@ -76,6 +76,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Map<String, String> attributesBefore = new HashMap<>(r.getAttributes());
         switch (r.getResourceType()) {
             case API -> provisionApi(r, props, ctx);
             case AUTHORIZER -> provisionAuthorizer(r, props, ctx);
@@ -86,31 +87,97 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
             case VPC_LINK -> provisionVpcLink(r, props, ctx);
             default -> throw new IllegalStateException("Unhandled type: " + r.getResourceType());
         }
+        if (isChild(r)) {
+            StackResource cleanup = childCleanupResource(r);
+            String priorApi = attributesBefore.getOrDefault("ApiId", r.getAttributes().get("ApiId"));
+            String prior = ctx.isUpdate() ? priorApi + "/" + ctx.priorPhysicalId() : null;
+            ProvisionContext cleanupContext = new ProvisionContext(ctx.engine(), ctx.region(), ctx.accountId(),
+                    ctx.stackName(), prior, ctx.progress(), ctx.priorProperties());
+            ReplacementCleanup.record(cleanup, cleanupContext, attributesBefore);
+        }
+    }
+
+    private static boolean isChild(StackResource resource) {
+        return switch (resource.getResourceType()) {
+            case AUTHORIZER, ROUTE, INTEGRATION, STAGE, DEPLOYMENT -> true;
+            default -> false;
+        };
+    }
+
+    private static boolean replacingChild(StackResource resource, String apiId, ProvisionContext ctx) {
+        String priorApi = resource.getAttributes().get("ApiId");
+        return ctx.isUpdate() && priorApi != null && !priorApi.equals(apiId);
+    }
+
+    // Cleanup identities include the owning API; Ref and resource events retain the AWS child id.
+    private static StackResource childCleanupResource(StackResource resource) {
+        if (!isChild(resource)) {
+            return resource;
+        }
+        StackResource cleanup = new StackResource();
+        cleanup.setResourceType(resource.getResourceType());
+        cleanup.setPhysicalId(resource.getAttributes().get("ApiId") + "/" + resource.getPhysicalId());
+        cleanup.setAttributes(resource.getAttributes());
+        cleanup.setUpdateReplacePolicy(resource.getUpdateReplacePolicy());
+        return cleanup;
+    }
+
+    private static String childPhysicalId(String identity) {
+        return identity == null ? null : identity.substring(identity.indexOf('/') + 1);
+    }
+
+    private void deleteReplacement(String type, String identity, String region) {
+        int separator = identity == null ? -1 : identity.indexOf('/');
+        if (VPC_LINK.equals(type)) {
+            delete(type, identity, region);
+            return;
+        }
+        if (separator <= 0 || separator == identity.length() - 1) {
+            throw new AwsException("ValidationError", "Cannot delete replacement without its owning API", 400);
+        }
+        StackResource child = new StackResource();
+        child.setResourceType(type);
+        child.setPhysicalId(childPhysicalId(identity));
+        child.getAttributes().put("ApiId", identity.substring(0, separator));
+        deleteChild(child, region);
     }
 
     @Override
     public void delete(StackResource resource, String region) {
         switch (resource.getResourceType()) {
             case API -> apiGatewayV2Service.deleteApi(region, resource.getPhysicalId());
-            case AUTHORIZER -> {
-                // Deleting an authorizer needs the api id (a create-time attribute) as well as the
-                // authorizer id (the physical id), which the id-only delete path cannot supply.
-                String apiId = resource.getAttributes().get("ApiId");
-                if (apiId != null && !apiId.isBlank()) {
-                    try {
-                        apiGatewayV2Service.deleteAuthorizer(region, apiId, resource.getPhysicalId());
-                    } catch (RuntimeException e) {
-                        LOG.debugv("Error deleting authorizer {0}: {1}",
-                                resource.getPhysicalId(), e.getMessage());
-                    }
+            case AUTHORIZER, ROUTE, INTEGRATION, STAGE, DEPLOYMENT -> {
+                for (String identity : ReplacementCleanup.owedPhysicalIds(resource)) {
+                    deleteReplacement(resource.getResourceType(), identity, region);
                 }
+                deleteChild(resource, region);
             }
             case VPC_LINK -> delete(VPC_LINK, resource.getPhysicalId(), region);
             default -> {
-                // Route, Integration, Stage and Deployment are removed when their Api is deleted.
+                // Unhandled types are rejected by provision().
             }
         }
     }
+
+    private void deleteChild(StackResource resource, String region) {
+        String apiId = resource.getAttributes().get("ApiId");
+        if (apiId == null || apiId.isBlank()) {
+            throw new AwsException("ValidationError", "Cannot delete " + resource.getResourceType()
+                    + " without its recorded ApiId", 400);
+        }
+        String id = resource.getPhysicalId();
+        CfnDeletes.safeDelete(resource.getResourceType(), id, () -> {
+            switch (resource.getResourceType()) {
+                case AUTHORIZER -> apiGatewayV2Service.deleteAuthorizer(region, apiId, id);
+                case ROUTE -> apiGatewayV2Service.deleteRoute(region, apiId, id);
+                case INTEGRATION -> apiGatewayV2Service.deleteIntegration(region, apiId, id);
+                case STAGE -> apiGatewayV2Service.deleteStage(region, apiId, id);
+                case DEPLOYMENT -> apiGatewayV2Service.deleteDeployment(region, apiId, id);
+                default -> throw new IllegalStateException("Unhandled child: " + resource.getResourceType());
+            }
+        }, "NotFoundException");
+    }
+
 
     @Override
     public void delete(String resourceType, String physicalId, String region) {
@@ -127,12 +194,17 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public String updateCleanupPhysicalId(StackResource resource) {
-        return ReplacementCleanup.cleanupPhysicalId(resource);
+        String identity = ReplacementCleanup.cleanupPhysicalId(childCleanupResource(resource));
+        return isChild(resource) ? childPhysicalId(identity) : identity;
     }
 
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
-        UpdateCleanupResult result = ReplacementCleanup.complete(resource, this::delete);
+        UpdateCleanupResult result = ReplacementCleanup.complete(childCleanupResource(resource), this::deleteReplacement);
+        if (isChild(resource)) {
+            result = new UpdateCleanupResult(result.applicable(), result.complete(),
+                    childPhysicalId(result.previousPhysicalId()), result.attempts(), result.failureReason());
+        }
         if (!result.applicable()
                 && resource.getAttributes().containsKey(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR)) {
             return new UpdateCleanupResult(true, true, null, 0, null);
@@ -150,8 +222,15 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public boolean rollbackUpdate(StackResource resource) {
-        if (ReplacementCleanup.rollback(resource, this::delete)) {
-            return true;
+        StackResource cleanup = childCleanupResource(resource);
+        try {
+            if (ReplacementCleanup.rollback(cleanup, this::deleteReplacement)) {
+                return true;
+            }
+        } finally {
+            if (isChild(resource)) {
+                resource.setPhysicalId(childPhysicalId(cleanup.getPhysicalId()));
+            }
         }
         if (VPC_LINK.equals(resource.getResourceType())) {
             return rollbackVpcLinkUpdate(resource);
@@ -838,7 +917,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
         r.getAttributes().remove(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
         Authorizer authorizer;
-        if (!ctx.isUpdate()) {
+        if (!ctx.isUpdate() || replacingChild(r, apiId, ctx)) {
             authorizer = apiGatewayV2Service.createAuthorizer(region, apiId, req);
         } else {
             Authorizer prior = apiGatewayV2Service.getAuthorizer(region, apiId, ctx.priorPhysicalId());
@@ -903,13 +982,14 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         req.put("target", ctx.resolveOptional(props, "Target"));
 
         Route route;
-        if (r.getPhysicalId() == null) {
+        if (!ctx.isUpdate() || replacingChild(r, apiId, ctx)) {
             route = apiGatewayV2Service.createRoute(region, apiId, req);
         } else {
             route = apiGatewayV2Service.updateRoute(region, apiId, r.getPhysicalId(), req);
         }
         r.setPhysicalId(route.getRouteId());
         r.getAttributes().put("RouteId", route.getRouteId());
+        r.getAttributes().put("ApiId", apiId);
     }
 
     // ── Integration ──────────────────────────────────────────────────────────
@@ -930,7 +1010,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().remove(CfnRollback.INTEGRATION_CONNECTION_SNAPSHOT_ATTR);
 
         Integration integration;
-        if (r.getPhysicalId() == null) {
+        if (!ctx.isUpdate() || replacingChild(r, apiId, ctx)) {
             integration = apiGatewayV2Service.createIntegration(region, apiId, req);
         } else {
             Integration prior = apiGatewayV2Service.getIntegration(region, apiId, r.getPhysicalId());
@@ -962,6 +1042,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         }
         r.setPhysicalId(integration.getIntegrationId());
         r.getAttributes().put("IntegrationId", integration.getIntegrationId());
+        r.getAttributes().put("ApiId", apiId);
     }
 
     /**
@@ -1035,12 +1116,13 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
             req.put("stageVariables", stageVariables);
         }
 
-        if (r.getPhysicalId() == null) {
+        if (!ctx.isUpdate() || replacingChild(r, apiId, ctx) || !stageName.equals(ctx.priorPhysicalId())) {
             apiGatewayV2Service.createStage(region, apiId, req);
             r.setPhysicalId(stageName);
         } else {
             apiGatewayV2Service.updateStage(region, apiId, r.getPhysicalId(), req);
         }
+        r.getAttributes().put("ApiId", apiId);
     }
 
     // ── Deployment ───────────────────────────────────────────────────────────
@@ -1048,16 +1130,17 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
     private void provisionDeployment(StackResource r, JsonNode props, ProvisionContext ctx) {
         // Deployments are immutable point-in-time snapshots; on redeploy keep the existing one
         // rather than minting a duplicate (idempotent re-deploy).
-        if (r.getPhysicalId() != null) {
+        String apiId = ctx.resolveOptional(props, "ApiId");
+        if (ctx.isUpdate() && !replacingChild(r, apiId, ctx)) {
             return;
         }
-        String apiId = ctx.resolveOptional(props, "ApiId");
         Map<String, Object> req = new HashMap<>();
         req.put("description", ctx.resolveOptional(props, "Description"));
 
         Deployment deployment = apiGatewayV2Service.createDeployment(ctx.region(), apiId, req);
         r.setPhysicalId(deployment.getDeploymentId());
         r.getAttributes().put("DeploymentId", deployment.getDeploymentId());
+        r.getAttributes().put("ApiId", apiId);
     }
 
     // ── VpcLink ──────────────────────────────────────────────────────────────
