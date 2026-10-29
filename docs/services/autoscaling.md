@@ -10,7 +10,7 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 - `arn:aws:autoscaling:<region>:<account>:launchConfiguration:<uuid>:launchConfigurationName/<name>`
 - `arn:aws:autoscaling:<region>:<account>:scalingPolicy:<uuid>:autoScalingGroupName/<group>/policyName/<name>`
 
-## Supported Operations (53 total)
+## Supported Operations (55 total)
 
 ### Launch Configurations
 
@@ -86,9 +86,17 @@ EC2 instance can use a default subnet in a different zone.
 | `SetDesiredCapacity` | Updates desired count; reconciler handles scale-out / scale-in within 10 s |
 | `AttachInstances` | Attaches existing EC2 instances to a group; sets lifecycle state to `InService`. Refuses the whole batch with `ValidationError` when an instance already belongs to a group |
 | `DetachInstances` | Detaches instances from a group; optionally decrements desired capacity |
+| `EnterStandby` | Preserves membership while removing traffic and excluding the instances from active capacity; optionally decrements desired capacity within the group's minimum |
+| `ExitStandby` | Restores traffic and `InService` state; increments desired capacity within the group's maximum |
 | `TerminateInstanceInAutoScalingGroup` | Terminates a specific instance; optionally decrements desired capacity |
 | `SuspendProcesses` | Records suspended scaling processes (empty list suspends all); reported back by `DescribeAutoScalingGroups` |
 | `ResumeProcesses` | Clears suspended processes (empty list resumes all) |
+
+Standby transitions complete synchronously in Floci. Entering standby preserves the
+EC2 instance and its group tags, and removes it from attached load balancers. With
+`ShouldDecrementDesiredCapacity=false`, the reconciler launches replacement capacity.
+Exiting standby restores traffic and increases desired capacity. Connection draining
+delays are not simulated.
 
 Member instances carry the tags the
 [EC2 instance tagging lifecycle](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-tagging.html#tag-lifecycle)

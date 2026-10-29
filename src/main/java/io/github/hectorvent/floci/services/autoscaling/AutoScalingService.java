@@ -18,6 +18,7 @@ import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.iam.PassedRoleLookup;
@@ -48,6 +49,7 @@ public class AutoScalingService implements PassedRoleLookup {
 
     private final Event<AutoScalingGroupChanged> groupChanges;
     private final ElbV2Service elbV2Service;
+    private final ElbClassicService elbClassicService;
 
     public AutoScalingService() {
         this(null, null);
@@ -57,10 +59,16 @@ public class AutoScalingService implements PassedRoleLookup {
         this(groupChanges, null);
     }
 
-    @Inject
     AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service) {
+        this(groupChanges, elbV2Service, null);
+    }
+
+    @Inject
+    AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
+                       ElbClassicService elbClassicService) {
         this.groupChanges = groupChanges;
         this.elbV2Service = elbV2Service;
+        this.elbClassicService = elbClassicService;
     }
 
     private void requestReconciliation(AutoScalingGroup group) {
@@ -1042,6 +1050,67 @@ public class AutoScalingService implements PassedRoleLookup {
             }
         }
         return byId;
+    }
+
+    public List<ScalingActivity> changeStandby(String region, String name, List<String> instanceIds,
+                                               boolean enter, boolean decrementDesiredCapacity) {
+        List<String> requested = distinctInstanceIds(instanceIds);
+        if (requested.size() > 20) {
+            throw new AwsException("ValidationError", "You may specify at most 20 instances.", 400);
+        }
+        String key = asgKey(region, name);
+        synchronized (lockFor(key)) {
+            AutoScalingGroup asg = requireGroup(region, name);
+            String expectedState = enter ? "InService" : "Standby";
+            List<AsgInstance> selected = new ArrayList<>();
+            for (String id : requested) {
+                AsgInstance instance = asg.getInstances().stream().filter(i -> id.equals(i.getInstanceId()))
+                        .findFirst().orElseThrow(() -> new AwsException("ValidationError",
+                                "The instance " + id + " is not part of Auto Scaling group " + name + ".", 400));
+                if (!expectedState.equals(instance.getLifecycleState())) {
+                    throw new AwsException("ValidationError",
+                            "The instance " + id + " is not in " + expectedState + ".", 400);
+                }
+                selected.add(instance);
+            }
+            long desired = (long) asg.getDesiredCapacity()
+                    + (enter ? (decrementDesiredCapacity ? -selected.size() : 0) : selected.size());
+            if (desired < asg.getMinSize() || desired > asg.getMaxSize()) {
+                throw capacityChangeError(asg, selected.size(), enter ? "enter standby for" : "exit standby for");
+            }
+            List<TargetDescription> targets = requested.stream().map(id -> {
+                TargetDescription target = new TargetDescription();
+                target.setId(id);
+                return target;
+            }).toList();
+            for (String targetGroup : asg.getTargetGroupARNs()) {
+                if (enter) {
+                    elbV2Service.deregisterTargets(region, targetGroup, targets);
+                } else {
+                    elbV2Service.registerTargets(region, targetGroup, targets);
+                }
+            }
+            for (String loadBalancer : asg.getLoadBalancerNames()) {
+                if (enter) {
+                    elbClassicService.deregisterInstances(region, loadBalancer, requested);
+                } else {
+                    elbClassicService.registerInstances(region, loadBalancer, requested);
+                }
+            }
+            List<ScalingActivity> result = new ArrayList<>();
+            for (AsgInstance instance : selected) {
+                instance.setLifecycleState(enter ? "Standby" : "InService");
+                ScalingActivity activity = recordActivity(region, name,
+                        "Moving EC2 instance " + (enter ? "to" : "out of") + " Standby: " + instance.getInstanceId(),
+                        "User requested " + (enter ? "EnterStandby" : "ExitStandby"), "Successful");
+                completeActivity(activity.getActivityId(), "Successful", null);
+                result.add(activity);
+            }
+            asg.setDesiredCapacity((int) desired);
+            groups.put(key, asg);
+            requestReconciliation(asg);
+            return result;
+        }
     }
 
     public void detachInstances(String region, String name, List<String> instanceIds,

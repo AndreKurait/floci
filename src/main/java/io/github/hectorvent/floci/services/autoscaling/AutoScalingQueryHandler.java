@@ -67,6 +67,8 @@ public class AutoScalingQueryHandler {
                 case "SetInstanceHealth"            -> handleSetInstanceHealth(p, region);
                 case "AttachInstances"              -> handleAttachInstances(p, region);
                 case "DetachInstances"              -> handleDetachInstances(p, region);
+                case "EnterStandby"                 -> handleStandby(p, region, true);
+                case "ExitStandby"                  -> handleStandby(p, region, false);
                 case "TerminateInstanceInAutoScalingGroup" -> handleTerminateInstance(p, region);
                 // Load balancer attachment
                 case "AttachLoadBalancerTargetGroups"    -> handleAttachLoadBalancerTargetGroups(p, region);
@@ -1359,6 +1361,18 @@ public class AutoScalingQueryHandler {
 
     // ── Activities ────────────────────────────────────────────────────────────
 
+    private Response handleStandby(MultivaluedMap<String, String> p, String region, boolean enter) {
+        boolean decrement = enter && requiredBoolParam(p, "ShouldDecrementDesiredCapacity");
+        List<ScalingActivity> activities = service.changeStandby(region, p.getFirst("AutoScalingGroupName"),
+                memberList(p, "InstanceIds"), enter, decrement);
+        String action = enter ? "EnterStandby" : "ExitStandby";
+        XmlBuilder xml = new XmlBuilder().start(action + "Response", NS)
+                .start(action + "Result").start("Activities");
+        appendActivities(xml, activities);
+        return ok(xml.end("Activities").end(action + "Result")
+                .raw(AwsQueryResponse.responseMetadata()).end(action + "Response").build());
+    }
+
     private Response handleDescribeScalingActivities(MultivaluedMap<String, String> p, String region) {
         List<ScalingActivity> activities = service.describeScalingActivities(
                 region, p.getFirst("AutoScalingGroupName"));
@@ -1366,6 +1380,15 @@ public class AutoScalingQueryHandler {
                 .start("DescribeScalingActivitiesResponse", NS)
                   .start("DescribeScalingActivitiesResult")
                     .start("Activities");
+        appendActivities(xml, activities);
+        xml.end("Activities")
+           .end("DescribeScalingActivitiesResult")
+           .raw(AwsQueryResponse.responseMetadata())
+           .end("DescribeScalingActivitiesResponse");
+        return ok(xml.build());
+    }
+
+    private static void appendActivities(XmlBuilder xml, List<ScalingActivity> activities) {
         for (ScalingActivity a : activities) {
             xml.start("member")
                .elem("ActivityId", a.getActivityId())
@@ -1379,11 +1402,6 @@ public class AutoScalingQueryHandler {
             if (a.getStatusMessage() != null) { xml.elem("StatusMessage", a.getStatusMessage()); }
             xml.end("member");
         }
-        xml.end("Activities")
-           .end("DescribeScalingActivitiesResult")
-           .raw(AwsQueryResponse.responseMetadata())
-           .end("DescribeScalingActivitiesResponse");
-        return ok(xml.build());
     }
 
     // ── Metadata responses ────────────────────────────────────────────────────
