@@ -107,9 +107,8 @@ public class ApiGatewayTaskInvoker {
                 && api.getEndpointConfiguration().getTypes().contains(EndpointType.PRIVATE)) {
             throw unsupported("private APIs are not supported by this integration");
         }
-        if (api.getPolicy() != null && !api.getPolicy().isBlank()) {
-            throw unsupported("API resource policies are not supported by this integration");
-        }
+        // An API's resource policy is not checked here: the request goes to the execute-api listener,
+        // which evaluates it as execute-api:Invoke for the signed caller like any other request.
         String stage = input.path("Stage").asText();
         String path = input.path("Path").asText();
         if (path.startsWith("/")) {
