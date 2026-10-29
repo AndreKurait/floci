@@ -25,6 +25,7 @@ import software.amazon.awssdk.services.sts.StsClient;
 import software.amazon.awssdk.services.sts.model.AssumeRoleResponse;
 import software.amazon.awssdk.services.sts.model.AssumeRoleWithWebIdentityResponse;
 import software.amazon.awssdk.services.sts.model.Credentials;
+import software.amazon.awssdk.services.sts.model.PolicyDescriptorType;
 import software.amazon.awssdk.services.sts.model.StsException;
 
 import java.net.URI;
@@ -59,10 +60,13 @@ class WebIdentitySourceIdentityIntegrationTest {
             "named,condition,allow", "named,mismatch,AccessDenied", "absent,missing,allow",
             "absent,condition,AccessDenied", "short,allow,ValidationError",
             "blank,allow,ValidationError", "number,allow,InvalidIdentityToken",
-            "null,allow,InvalidIdentityToken", "tampered,allow,InvalidIdentityToken"})
+            "null,allow,InvalidIdentityToken", "tampered,allow,InvalidIdentityToken",
+            "managed-allow,allow,allow", "managed-deny,allow,allow"})
     void verifiedClaimRequiresTrustAndReachesSignedSession(String claimKind, String trustKind,
                                                          String expected) throws Exception {
         String name = "web-source-" + UUID.randomUUID();
+        String policyArn = "arn:aws:iam::000000000000:policy/" + name;
+        boolean managed = claimKind.startsWith("managed-");
         String issuer = oidc.newIssuerUrl("us-east-1");
         String provider = "arn:aws:iam::000000000000:oidc-provider/" + issuer.substring(8);
         String actions = "missing".equals(trustKind)
@@ -86,7 +90,15 @@ class WebIdentitySourceIdentityIntegrationTest {
                      .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
                              user.accessKeyId(), user.secretAccessKey()))).build();
              StsClient sts = StsClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
-                     .credentialsProvider(AnonymousCredentialsProvider.create()).build()) {
+                     .credentialsProvider(AnonymousCredentialsProvider.create()).build();
+             AutoCloseable managedCleanup = () -> {
+                 try {
+                     admin.deletePolicy(b -> b.policyArn(policyArn));
+                 } catch (NoSuchEntityException expectedAbsent) {
+                     // Only managed-policy cases create this known-name resource.
+                 }
+                 assertThrows(NoSuchEntityException.class, () -> admin.getPolicy(b -> b.policyArn(policyArn)));
+             }) {
             try {
                 Role role = admin.createRole(b -> b.roleName(name).path("/teams/web/")
                         .assumeRolePolicyDocument(trust)).role();
@@ -94,7 +106,12 @@ class WebIdentitySourceIdentityIntegrationTest {
                         .policyDocument("{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"iam:ListRoles\","
                                 + "\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{"
                                 + "\"aws:SourceIdentity\":\"Person_A\"}}}}"));
-                String token = token(name, issuer, claimKind);
+                if (managed) {
+                    String action = "managed-deny".equals(claimKind) ? "iam:ListUsers" : "iam:ListRoles";
+                    admin.createPolicy(b -> b.policyName(name).policyDocument(
+                            "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"" + action + "\",\"Resource\":\"*\"}}"));
+                }
+                String token = token(name, issuer, managed ? "named" : claimKind);
                 if (!"allow".equals(expected)) {
                     clearInvocations(iam);
                     StsException error = assertThrows(StsException.class, () -> sessions.add(sts
@@ -102,10 +119,12 @@ class WebIdentitySourceIdentityIntegrationTest {
                                     .webIdentityToken(token)).credentials()));
                     assertEquals(expected, error.awsErrorDetails().errorCode());
                     verify(iam, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
-                            any(), any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), any());
+                            any(), any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), any(), anyList());
                 } else {
                     AssumeRoleWithWebIdentityResponse response = sts.assumeRoleWithWebIdentity(b ->
-                            b.roleArn(role.arn()).roleSessionName("source").webIdentityToken(token));
+                            b.roleArn(role.arn()).roleSessionName("source").webIdentityToken(token)
+                                    .policyArns(managed ? List.of(PolicyDescriptorType.builder().arn(policyArn).build())
+                                            : List.of()));
                     Credentials credentials = response.credentials();
                     sessions.add(credentials);
                     assertEquals("absent".equals(claimKind) ? null : "Person_A", response.sourceIdentity());
@@ -117,11 +136,11 @@ class WebIdentitySourceIdentityIntegrationTest {
                             .credentialsProvider(StaticCredentialsProvider.create(AwsSessionCredentials.create(
                                     credentials.accessKeyId(), credentials.secretAccessKey(),
                                     credentials.sessionToken()))).build()) {
-                        if ("absent".equals(claimKind)) {
+                        if ("absent".equals(claimKind) || "managed-deny".equals(claimKind)) {
                             assertEquals(403, assertThrows(IamException.class, caller::listRoles).statusCode());
                         } else {
                             assertDoesNotThrow(() -> caller.listRoles());
-                            if ("allow".equals(trustKind)) {
+                            if ("allow".equals(trustKind) && !managed) {
                                 assertChain(admin, role, credentials, sessions);
                             }
                         }

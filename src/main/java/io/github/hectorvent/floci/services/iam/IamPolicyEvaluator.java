@@ -190,8 +190,8 @@ public class IamPolicyEvaluator {
             Map<String, List<String>> conditionCtx) {
         Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
         List<PolicyStatement> identityStmts = parseAll(caller.identityPolicies());
-        List<PolicyStatement> sessionStmts = caller.sessionPolicyDocument() == null
-                ? null : parseAll(List.of(caller.sessionPolicyDocument()));
+        List<PolicyStatement> sessionStmts = caller.sessionPolicyDocuments().isEmpty()
+                ? null : parseAll(caller.sessionPolicyDocuments());
         List<PolicyStatement> boundaryStmts = caller.boundaryPolicyDocument() == null
                 ? null : parseAll(List.of(caller.boundaryPolicyDocument()));
         ResourcePolicyDecision resolvedDecision = resourcePolicyDecision == null
@@ -364,8 +364,8 @@ public class IamPolicyEvaluator {
         Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
         String loweredAction = lowercase(action);
         List<PolicyStatement> identityStmts = parseAll(caller.identityPolicies());
-        List<PolicyStatement> sessionStmts = caller.sessionPolicyDocument() == null
-                ? null : parseAll(List.of(caller.sessionPolicyDocument()));
+        List<PolicyStatement> sessionStmts = caller.sessionPolicyDocuments().isEmpty()
+                ? null : parseAll(caller.sessionPolicyDocuments());
         List<PolicyStatement> boundaryStmts = caller.boundaryPolicyDocument() == null
                 ? null : parseAll(List.of(caller.boundaryPolicyDocument()));
 
