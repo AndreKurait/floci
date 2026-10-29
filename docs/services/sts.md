@@ -212,8 +212,8 @@ when its condition matches.
 ### Known limitations
 
 - Federation support is operation-specific. Direct `AssumeRole` session tags and source identity
-  are documented below. Verified SAML source identity is supported;
-  OIDC source identity and federation session-tag ingestion remain separate work.
+  are documented below. Verified SAML and OIDC source identity are supported;
+  federation session-tag ingestion remains separate work.
 
 ## Web Identity Validation (IRSA)
 
@@ -336,7 +336,7 @@ signature-enforcing SDK tests do not establish managed AWS error-message or runt
 
 `AssumeRole` retains a supplied `SourceIdentity` in the issued session and returns it in the response. Role chaining inherits the value and rejects attempts to change it. With IAM enforcement enabled, setting or inheriting it requires the target trust policy's `sts:SetSourceIdentity` permission and applicable caller permission ceilings. Role chaining requires the caller role's identity permission as well.
 
-Trust and identity policies can use `sts:SourceIdentity` during assumption; downstream policies receive `aws:SourceIdentity` from the issued credentials. Requests without source identity leave that condition key absent. OIDC claim ingestion and CloudTrail source-identity reporting remain separate work.
+Trust and identity policies can use `sts:SourceIdentity` during assumption; downstream policies receive `aws:SourceIdentity` from the issued credentials. Requests without source identity leave that condition key absent. CloudTrail source-identity reporting remain separate work.
 
 SAML role sessions reject `DurationSeconds` above the target role maximum. Accepted requests retain the shorter assertion expiration.
 
@@ -349,3 +349,10 @@ The response and issued session retain the source identity through the existing 
 ### SAML inline session policies
 
 `AssumeRoleWithSAML` retains the supplied inline `Policy` with the issued credentials. With IAM enforcement enabled, signed downstream requests must satisfy both the role policies and this session policy. A session policy can restrict the role's permissions, including through conditions, but cannot expand them. Omitting `Policy` preserves the role's existing permissions. Managed session policies (`PolicyArns`) remain unsupported.
+
+### Verified OIDC source identity
+
+`AssumeRoleWithWebIdentity` reads the `https://aws.amazon.com/source_identity` string claim only after token signature, issuer, audience and lifetime verification. A supplied value must satisfy the source identity constraints. The federated trust policy must allow both `sts:AssumeRoleWithWebIdentity` and `sts:SetSourceIdentity`; both evaluations can use `sts:SourceIdentity`. An explicit deny prevents credential issuance.
+
+The response and issued session retain the value, and signed downstream requests receive `aws:SourceIdentity`. Missing claims leave that context absent. This does not extend the set of supported OIDC issuers or claim full federation condition, session-tag, native-image or managed AWS parity.
+

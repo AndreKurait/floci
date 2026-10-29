@@ -50,6 +50,11 @@ public class WebIdentityTrustPolicyEvaluator {
      */
     public boolean allows(String trustPolicyDocument, String oidcProviderArn, String issuerKeyPrefix,
                           Map<String, List<String>> claims) {
+        return allows(trustPolicyDocument, oidcProviderArn, issuerKeyPrefix, claims, WEB_IDENTITY_ACTION);
+    }
+
+    public boolean allows(String trustPolicyDocument, String oidcProviderArn, String issuerKeyPrefix,
+                          Map<String, List<String>> claims, String action) {
         if (trustPolicyDocument == null || trustPolicyDocument.isBlank()) {
             return false;
         }
@@ -64,7 +69,7 @@ public class WebIdentityTrustPolicyEvaluator {
         boolean allow = false;
         if (statements.isArray()) {
             for (JsonNode stmt : statements) {
-                switch (evaluate(stmt, oidcProviderArn, issuerKeyPrefix, claims)) {
+                switch (evaluate(stmt, oidcProviderArn, issuerKeyPrefix, claims, action)) {
                     case DENY -> { return false; }
                     case ALLOW -> allow = true;
                     case NO_MATCH -> { }
@@ -73,7 +78,7 @@ public class WebIdentityTrustPolicyEvaluator {
             return allow;
         }
         if (statements.isObject()) {
-            return evaluate(statements, oidcProviderArn, issuerKeyPrefix, claims) == Match.ALLOW;
+            return evaluate(statements, oidcProviderArn, issuerKeyPrefix, claims, action) == Match.ALLOW;
         }
         return false;
     }
@@ -81,8 +86,8 @@ public class WebIdentityTrustPolicyEvaluator {
     private enum Match { ALLOW, DENY, NO_MATCH }
 
     private Match evaluate(JsonNode stmt, String oidcProviderArn, String issuerKeyPrefix,
-                           Map<String, List<String>> claims) {
-        if (!actionApplies(stmt)) {
+                           Map<String, List<String>> claims, String action) {
+        if (!actionApplies(stmt, action)) {
             return Match.NO_MATCH;
         }
         if (!matchesFederatedPrincipal(stmt.get("Principal"), oidcProviderArn)) {
@@ -98,26 +103,26 @@ public class WebIdentityTrustPolicyEvaluator {
      * True when the statement's action element covers {@code sts:AssumeRoleWithWebIdentity}. Action
      * names are case-insensitive in AWS policy documents, and wildcards are honoured.
      */
-    private boolean actionApplies(JsonNode stmt) {
+    private boolean actionApplies(JsonNode stmt, String requestedAction) {
         JsonNode action = stmt.get("Action");
         if (action != null) {
-            return matchesAction(action);
+            return matchesAction(action, requestedAction);
         }
         JsonNode notAction = stmt.get("NotAction");
         if (notAction != null) {
-            return !matchesAction(notAction);
+            return !matchesAction(notAction, requestedAction);
         }
         return false;
     }
 
-    private boolean matchesAction(JsonNode actionNode) {
+    private boolean matchesAction(JsonNode actionNode, String requestedAction) {
         if (actionNode.isTextual()) {
-            return IamPolicyEvaluator.globMatches(actionNode.asText(), WEB_IDENTITY_ACTION);
+            return IamPolicyEvaluator.globMatches(actionNode.asText(), requestedAction);
         }
         if (actionNode.isArray()) {
             for (JsonNode entry : actionNode) {
                 if (entry.isTextual()
-                        && IamPolicyEvaluator.globMatches(entry.asText(), WEB_IDENTITY_ACTION)) {
+                        && IamPolicyEvaluator.globMatches(entry.asText(), requestedAction)) {
                     return true;
                 }
             }
@@ -227,6 +232,9 @@ public class WebIdentityTrustPolicyEvaluator {
                                       Map<String, List<String>> claims) {
         if (conditionKey == null) {
             return List.of();
+        }
+        if ("sts:SourceIdentity".equalsIgnoreCase(conditionKey)) {
+            return claims.getOrDefault("sts:SourceIdentity", List.of());
         }
         int separator = conditionKey.lastIndexOf(':');
         if (separator < 0) {

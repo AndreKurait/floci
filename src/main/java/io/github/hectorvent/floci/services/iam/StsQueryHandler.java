@@ -490,13 +490,14 @@ public class StsQueryHandler {
                 : (providerId != null && !providerId.isBlank() ? providerId : "accounts.google.com");
         String audience = verified != null ? verified.audience() : STS_AUDIENCE;
         String subject = verified != null ? verified.subject() : "web-identity-subject";
+        String sourceIdentity = verified != null ? verified.sourceIdentity() : null;
 
         String sessionPolicy = getParam(params, "Policy");
         iamService.registerSession(
                 accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy, callerAccountId,
-                sessionName, assumedRoleId);
+                sessionName, assumedRoleId, Map.of(), Map.of(), sourceIdentity);
 
-        String result = new XmlBuilder()
+        XmlBuilder result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
                 .start("AssumedRoleUser")
                   .elem("Arn", assumedRoleArn)
@@ -505,9 +506,12 @@ public class StsQueryHandler {
                 .elem("PackedPolicySize", "0")
                 .elem("Provider", provider)
                 .elem("Audience", audience)
-                .elem("SubjectFromWebIdentityToken", subject)
-                .build();
-        return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithWebIdentity", AwsNamespaces.STS, result)).build();
+                .elem("SubjectFromWebIdentityToken", subject);
+        if (sourceIdentity != null) {
+            result.elem("SourceIdentity", sourceIdentity);
+        }
+        return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithWebIdentity", AwsNamespaces.STS,
+                result.build())).build();
     }
 
     private Response validateIamRoleArn(String roleArn) {
@@ -530,7 +534,7 @@ public class StsQueryHandler {
     }
 
     /** The claims of a token Floci issued and verified, used to fill the response accurately. */
-    private record VerifiedWebIdentity(String issuer, String subject, String audience) {}
+    private record VerifiedWebIdentity(String issuer, String subject, String audience, String sourceIdentity) {}
 
     private record WebIdentityOutcome(VerifiedWebIdentity verified, IamRole role, Response denial) {
 
@@ -589,9 +593,13 @@ public class StsQueryHandler {
         String oidcProviderArn = AwsArnUtils.Arn.global(
                 AwsArnUtils.partitionOrDefault(role.get().getArn(), regionResolver.getPartition()),
                 "iam", roleAccountId, "oidc-provider/" + issuerKeyPrefix).toString();
-        Map<String, List<String>> conditionClaims = Map.of(
-                "sub", List.of(claims.subject()),
-                "aud", claims.audiences());
+        String sourceIdentity = StsSourceIdentity.resolve(claims.sourceIdentity(), null);
+        Map<String, List<String>> conditionClaims = new LinkedHashMap<>();
+        conditionClaims.put("sub", List.of(claims.subject()));
+        conditionClaims.put("aud", claims.audiences());
+        if (sourceIdentity != null) {
+            conditionClaims.put("sts:SourceIdentity", List.of(sourceIdentity));
+        }
 
         if (!webIdentityTrustEvaluator.allows(role.get().getAssumeRolePolicyDocument(),
                 oidcProviderArn, issuerKeyPrefix, conditionClaims)) {
@@ -600,9 +608,14 @@ public class StsQueryHandler {
             return WebIdentityOutcome.deny(accessDenied(roleArn));
         }
 
+        if (sourceIdentity != null && !webIdentityTrustEvaluator.allows(role.get().getAssumeRolePolicyDocument(),
+                oidcProviderArn, issuerKeyPrefix, conditionClaims, "sts:SetSourceIdentity")) {
+            return WebIdentityOutcome.deny(accessDenied(roleArn));
+        }
+
         // verify() already required the audience list to contain STS_AUDIENCE.
         return WebIdentityOutcome.allow(
-                new VerifiedWebIdentity(claims.issuer(), claims.subject(), STS_AUDIENCE), role.get());
+                new VerifiedWebIdentity(claims.issuer(), claims.subject(), STS_AUDIENCE, sourceIdentity), role.get());
     }
 
     /**
