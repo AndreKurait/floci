@@ -121,7 +121,7 @@ public class VerdaccioSidecarManager implements ContainerTeardown {
             LOG.infov("Verdaccio sidecar for npm repository {0} is ready at {1}", npmRepositoryId, url);
             return new PerKeyContainerPool.StartedContainer(containerId, url);
         } catch (RuntimeException e) {
-            lifecycleManager.stopAndRemove(containerId, null);
+            pool.removeFailedStart(npmRepositoryId, containerId, e);
             throw e;
         }
     }

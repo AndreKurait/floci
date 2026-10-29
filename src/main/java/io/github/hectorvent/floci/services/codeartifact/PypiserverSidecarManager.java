@@ -117,7 +117,7 @@ public class PypiserverSidecarManager implements ContainerTeardown {
             LOG.infov("pypiserver sidecar for pypi repository {0} is ready at {1}", pypiRepositoryId, url);
             return new PerKeyContainerPool.StartedContainer(containerId, url);
         } catch (RuntimeException e) {
-            lifecycleManager.stopAndRemove(containerId, null);
+            pool.removeFailedStart(pypiRepositoryId, containerId, e);
             throw e;
         }
     }

@@ -37,7 +37,7 @@ public class PerKeyContainerPool {
     private final ConcurrentHashMap<String, StartedContainer> containers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> startLocks = new ConcurrentHashMap<>();
     private final Object registryLock = new Object();
-    private record PendingRemoval(String key, StartedContainer container) {}
+    private record PendingRemoval(String key, String containerId) {}
 
     private final Map<String, PendingRemoval> pendingCleanup = new ConcurrentHashMap<>();
     private long generation;
@@ -70,7 +70,7 @@ public class PerKeyContainerPool {
             }
             if (existing != null) {
                 LOG.warnv("Sidecar container for key {0} is no longer healthy; restarting it", key);
-                removeOwned(new PendingRemoval(key, existing));
+                removeOwned(new PendingRemoval(key, existing.containerId()));
             }
             long startedGeneration;
             synchronized (registryLock) {
@@ -86,7 +86,7 @@ public class PerKeyContainerPool {
             }
             if (reset) {
                 LOG.warnv("Sidecar pool was reset while starting a container for key {0}; stopping it", key);
-                removeOwned(new PendingRemoval(key, started));
+                removeOwned(new PendingRemoval(key, started.containerId()));
                 throw new IllegalStateException("Sidecar pool was reset while starting a container for key " + key);
             }
             SidecarHealthHelper.waitForHealth(started.baseUrl(), healthPath);
@@ -124,7 +124,7 @@ public class PerKeyContainerPool {
             synchronized (registryLock) {
                 StartedContainer container = containers.remove(key);
                 if (container != null) {
-                    pendingCleanup.put(container.containerId(), new PendingRemoval(key, container));
+                    pendingCleanup.put(container.containerId(), new PendingRemoval(key, container.containerId()));
                 }
                 removals = pendingCleanup.values().stream()
                         .filter(removal -> key.equals(removal.key())).toList();
@@ -133,14 +133,27 @@ public class PerKeyContainerPool {
         }
     }
 
-    private void removeOwned(PendingRemoval removal) {
-        StartedContainer container = removal.container();
-        synchronized (registryLock) {
-            pendingCleanup.put(container.containerId(), removal);
+    /**
+     * Compensates a starter failure after container creation but before it returns a ready endpoint.
+     * Failed removal remains owned for release or reset; the caller still throws its startup failure.
+     */
+    public void removeFailedStart(String key, String containerId, RuntimeException startupFailure) {
+        try {
+            removeOwned(new PendingRemoval(key, containerId));
+        } catch (RuntimeException cleanupFailure) {
+            if (cleanupFailure != startupFailure) {
+                startupFailure.addSuppressed(cleanupFailure);
+            }
         }
-        lifecycleManager.stopAndRemoveStrict(container.containerId(), null);
+    }
+
+    private void removeOwned(PendingRemoval removal) {
         synchronized (registryLock) {
-            pendingCleanup.remove(container.containerId(), removal);
+            pendingCleanup.put(removal.containerId(), removal);
+        }
+        lifecycleManager.stopAndRemoveStrict(removal.containerId(), null);
+        synchronized (registryLock) {
+            pendingCleanup.remove(removal.containerId(), removal);
         }
     }
 
@@ -150,7 +163,7 @@ public class PerKeyContainerPool {
         synchronized (registryLock) {
             generation++;
             containers.forEach((key, container) -> pendingCleanup.put(container.containerId(),
-                    new PendingRemoval(key, container)));
+                    new PendingRemoval(key, container.containerId())));
             containers.clear();
             detached = Map.copyOf(pendingCleanup);
         }
