@@ -4159,7 +4159,7 @@ class Ec2ServiceTest {
 
         assertEquals(1, images.size());
         Image matched = images.getFirst();
-        assertEquals("ami-amazonlinux2023-arm64", matched.getImageId());
+        assertEquals("ami-0abcdef1234567894", matched.getImageId());
         assertEquals("arm64", matched.getArchitecture());
         assertEquals("al2023-ami-2023.0.20230315.0-kernel-6.1-arm64", matched.getName());
     }

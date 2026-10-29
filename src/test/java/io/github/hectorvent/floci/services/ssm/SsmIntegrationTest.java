@@ -1341,7 +1341,7 @@ class SsmIntegrationTest {
         .then()
             .statusCode(200)
             .body("Parameter.Name", equalTo(al2023Arm64))
-            .body("Parameter.Value", equalTo("ami-amazonlinux2023-arm64"))
+            .body("Parameter.Value", equalTo("ami-0abcdef1234567894"))
             .body("Parameter.Type", equalTo("String"))
             .body("Parameter.Version", equalTo(1))
             .body("Parameter.ARN", equalTo("arn:aws:ssm:us-east-1::parameter" + al2023Arm64));
@@ -1414,7 +1414,7 @@ class SsmIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("Parameter.Value", containsString("\"image_id\":\"ami-amazonlinux2023-arm64\""));
+            .body("Parameter.Value", containsString("\"image_id\":\"ami-0abcdef1234567894\""));
 
         given()
             .header("X-Amz-Target", "AmazonSSM.GetParameters")
@@ -1428,7 +1428,7 @@ class SsmIntegrationTest {
             .statusCode(200)
             .body("InvalidParameters", empty())
             .body("Parameters.Value", hasItems(
-                    "al2023-ami-2023.0.20230315.0-kernel-6.1-x86_64", "ami-amazonlinux2023-arm64"));
+                    "al2023-ami-2023.0.20230315.0-kernel-6.1-x86_64", "ami-0abcdef1234567894"));
 
         given()
             .header("X-Amz-Target", "AmazonSSM.GetParametersByPath")

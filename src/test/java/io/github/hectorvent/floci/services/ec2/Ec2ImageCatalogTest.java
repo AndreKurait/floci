@@ -32,7 +32,7 @@ class Ec2ImageCatalogTest {
         assertEquals(Set.of(
                 "ami-0abcdef1234567890",
                 "ami-0abcdef1234567891",
-                "ami-amazonlinux2023-arm64",
+                "ami-0abcdef1234567894",
                 "ami-0abcdef1234567892",
                 "ami-ubuntu2204",
                 "ami-ubuntu2404-arm64",
