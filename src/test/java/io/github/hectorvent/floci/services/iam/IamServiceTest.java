@@ -94,6 +94,27 @@ class IamServiceTest {
     }
 
     @Test
+    void sourceIdentityRequiresCurrentMatchingSessionAndSurvivesCallerResolution() {
+        MutableClock clock = new MutableClock();
+        StorageBackend<String, SessionCredential> sessions = new InMemoryStorage<>();
+        IamService service = new IamService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), sessions, new RegionResolver("us-east-1", "000000000000"), false, clock);
+        IamRole role = service.createRole("source-role", "/source/", "{}", null, 3600, null);
+        service.registerSession("ASIASOURCE", "secret", "token", role.getArn(),
+                clock.instant().plusSeconds(900), null, "000000000000", "source-session",
+                role.getRoleId() + ":source-session", Map.of(), Map.of(), "original");
+        assertEquals("original", service.findSourceIdentity("ASIASOURCE", "token"));
+        assertNull(service.findSourceIdentity("ASIASOURCE", "wrong"));
+        assertNull(service.findSourceIdentity("ASIASOURCE", null));
+        assertNull(service.findSourceIdentity("absent", "token"));
+        assertEquals("original", service.resolveCallerArns("ASIASOURCE").orElseThrow().sourceIdentity());
+        clock.advance(Duration.ofSeconds(901));
+        assertNull(service.findSourceIdentity("ASIASOURCE", "token"));
+        assertTrue(service.resolveCallerArns("ASIASOURCE").isEmpty());
+    }
+
+    @Test
     void inheritedTagsRequireTheIssuedTokenAndFollowTheSessionClock() {
         MutableClock clock = new MutableClock();
         IamService service = new IamService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),

@@ -4545,6 +4545,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 .filter(token -> !token.isBlank());
     }
 
+    /** Source identity survives chaining only from a live, token-matched role session. */
+    public String findSourceIdentity(String accessKeyId, String sessionToken) {
+        return currentSession(accessKeyId)
+                .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .map(SessionCredential::getSourceIdentity).orElse(null);
+    }
+
     /** Inherited tags come only from a live session whose issued token matches this request. */
     public Map<String, String> findTransitiveSessionTags(String accessKeyId, String sessionToken) {
         return currentSession(accessKeyId)
@@ -4766,12 +4773,22 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                                 String roleArn, Instant expiration, String sessionPolicyDocument,
                                 String originAccountId, String roleSessionName, String assumedRoleId,
                                 Map<String, String> sessionTags, Map<String, String> transitiveTags) {
+        registerSession(sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, expiration,
+                sessionPolicyDocument, originAccountId, roleSessionName, assumedRoleId, sessionTags, transitiveTags, null);
+    }
+
+    /** Registers the source identity atomically with the issued session and its tags. */
+    void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                         String roleArn, Instant expiration, String sessionPolicyDocument,
+                         String originAccountId, String roleSessionName, String assumedRoleId,
+                         Map<String, String> sessionTags, Map<String, String> transitiveTags, String sourceIdentity) {
         SessionCredential session = new SessionCredential(sessionAccessKeyId, secretAccessKey, sessionToken,
                 roleArn, expiration, sessionPolicyDocument, originAccountId);
         session.setRoleSessionName(roleSessionName);
         session.setAssumedRoleId(assumedRoleId);
         session.setSessionTags(sessionTags);
         session.setTransitiveSessionTags(transitiveTags);
+        session.setSourceIdentity(sourceIdentity);
         putNewSession(sessionAccessKeyId, session);
     }
 
@@ -5566,7 +5583,21 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     public record CallerArns(String callerArn, String principalArn, String principalType,
                              String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
-                             Map<String, String> principalTags, Boolean multiFactorAuthPresent, Long multiFactorAuthAge) {
+                             Map<String, String> principalTags, Boolean multiFactorAuthPresent, Long multiFactorAuthAge,
+                             String sourceIdentity) {
+
+        public CallerArns(String callerArn, String principalArn, String principalType,
+                          String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
+                          Map<String, String> principalTags, Boolean multiFactorAuthPresent, Long multiFactorAuthAge) {
+            this(callerArn, principalArn, principalType, userId, userName, permissionsBoundary,
+                    tokenIssueTime, principalTags, multiFactorAuthPresent, multiFactorAuthAge, null);
+        }
+
+        public CallerArns withSourceIdentity(String value) {
+            return new CallerArns(callerArn, principalArn, principalType, userId, userName,
+                    permissionsBoundary, tokenIssueTime, principalTags, multiFactorAuthPresent,
+                    multiFactorAuthAge, value);
+        }
 
         public CallerArns(String callerArn, String principalArn, String principalType,
                           String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
@@ -5589,7 +5620,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         public CallerArns withMultiFactorAuthPresent(Boolean present) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
                     permissionsBoundary, tokenIssueTime, principalTags, present,
-                    Boolean.TRUE.equals(present) ? multiFactorAuthAge : null);
+                    Boolean.TRUE.equals(present) ? multiFactorAuthAge : null, sourceIdentity);
         }
 
         public CallerArns(String callerArn, String principalArn, String principalType, String userId,
@@ -5600,7 +5631,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         public CallerArns withPrincipalTags(Map<String, String> tags) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, tokenIssueTime, tags, multiFactorAuthPresent, multiFactorAuthAge);
+                    permissionsBoundary, tokenIssueTime, tags, multiFactorAuthPresent, multiFactorAuthAge, sourceIdentity);
         }
 
         /**
@@ -5638,12 +5669,12 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         public CallerArns withTokenIssueTime(Instant issuedAt) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, issuedAt, principalTags, multiFactorAuthPresent, multiFactorAuthAge);
+                    permissionsBoundary, issuedAt, principalTags, multiFactorAuthPresent, multiFactorAuthAge, sourceIdentity);
         }
 
         public CallerArns withMultiFactorAuthAge(Long age) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, tokenIssueTime, principalTags, multiFactorAuthPresent, age);
+                    permissionsBoundary, tokenIssueTime, principalTags, multiFactorAuthPresent, age, sourceIdentity);
         }
 
         /** A caller with no permissions boundary attached. */
@@ -5669,6 +5700,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
          */
         public void putPrincipalKeys(Map<String, List<String>> context) {
             context.put("aws:PrincipalArn", List.of(principalArn));
+            if (sourceIdentity != null) {
+                context.put("aws:SourceIdentity", List.of(sourceIdentity));
+            }
             principalTags.forEach((key, value) -> context.put("aws:PrincipalTag/" + key, List.of(value)));
             if (multiFactorAuthPresent != null) {
                 context.put("aws:MultiFactorAuthPresent", List.of(multiFactorAuthPresent.toString()));
@@ -5754,7 +5788,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 deleteSession(accessKeyId, session);
                 return Optional.empty();
             }
-            return sessionCallerArns(session).map(arns -> arns.withTokenIssueTime(session.getIssuedAt())
+            return sessionCallerArns(session).map(arns -> arns.withSourceIdentity(session.getSourceIdentity())
+                    .withTokenIssueTime(session.getIssuedAt())
                     .withMultiFactorAuthPresent(session.getMultiFactorAuthPresent())
                     .withMultiFactorAuthAge(Boolean.TRUE.equals(session.getMultiFactorAuthPresent())
                             && session.getMultiFactorAuthenticatedAt() != null

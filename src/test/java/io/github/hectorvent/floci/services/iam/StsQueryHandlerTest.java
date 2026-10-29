@@ -126,6 +126,25 @@ class StsQueryHandlerTest {
     }
 
     @Test
+    void iamDisabledAssumeRoleRetainsSourceIdentityWithoutRequiringTrustPermission() {
+        IamService service = mock(IamService.class);
+        IamRole role = new IamRole();
+        role.setRoleName("TestRole");
+        role.setArn("arn:aws:iam::000000000000:role/TestRole");
+        when(service.findRole(anyString(), anyString())).thenReturn(Optional.of(role));
+        StsQueryHandler handler = newHandler(service, new RegionResolver(REGION, "000000000000"));
+        MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
+        parameters.putSingle("RoleArn", role.getArn());
+        parameters.putSingle("RoleSessionName", "source");
+        parameters.putSingle("SourceIdentity", "original");
+        Response response = handler.handle("AssumeRole", parameters);
+        assertEquals(200, response.getStatus());
+        assertTrue(response.getEntity().toString().contains("<SourceIdentity>original</SourceIdentity>"));
+        verify(service).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
+                isNull(), eq("000000000000"), eq("source"), anyString(), eq(Map.of()), eq(Map.of()), eq("original"));
+    }
+
+    @Test
     void iamDisabledAssumeRoleStillValidatesAndStoresSessionTags() {
         IamService service = mock(IamService.class);
         IamRole role = new IamRole();
@@ -140,7 +159,7 @@ class StsQueryHandlerTest {
         parameters.putSingle("Tags.member.3.Value", "session");
         assertEquals(200, handler.handle("AssumeRole", parameters).getStatus());
         verify(service).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
-                isNull(), eq("000000000000"), eq("tagged"), anyString(), eq(Map.of("Project", "session")), eq(Map.of()));
+                isNull(), eq("000000000000"), eq("tagged"), anyString(), eq(Map.of("Project", "session")), eq(Map.of()), isNull());
         parameters.putSingle("Tags.member.3.Key", "");
         assertThrows(AwsException.class, () -> handler.handle("AssumeRole", parameters));
     }
@@ -389,7 +408,7 @@ class StsQueryHandlerTest {
 
         assertEquals(200, response.getStatus(), (String) response.getEntity());
         verify(iamService).registerSession(anyString(), anyString(), anyString(), eq(storedArn), any(),
-                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"), eq(Map.of()), eq(Map.of()));
+                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"), eq(Map.of()), eq(Map.of()), isNull());
     }
 
     @Test
@@ -864,7 +883,7 @@ class StsQueryHandlerTest {
         assertEquals(expected, extract(EXPIRATION, (String) response.getEntity()));
         ArgumentCaptor<Instant> sessionExpiration = ArgumentCaptor.forClass(Instant.class);
         verify(iamService).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()),
-                sessionExpiration.capture(), isNull(), eq("000000000000"), eq("s"), anyString(), eq(Map.of()), eq(Map.of()));
+                sessionExpiration.capture(), isNull(), eq("000000000000"), eq("s"), anyString(), eq(Map.of()), eq(Map.of()), isNull());
         assertEquals(expiration, sessionExpiration.getValue());
     }
 
