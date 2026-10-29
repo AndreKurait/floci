@@ -211,9 +211,9 @@ when its condition matches.
 
 ### Known limitations
 
-- **Session tags and source identity are not modelled.** `aws:RequestTag/*`, `aws:TagKeys`,
-  `sts:TransitiveTagKeys` and `sts:SourceIdentity` are not in the request context, so a condition
-  on them does not match, and `sts:TagSession` and `sts:SetSourceIdentity` are not checked.
+- Federation support is operation-specific. Direct `AssumeRole` session tags and source identity
+  are documented below. Verified SAML source identity is supported;
+  OIDC source identity and federation session-tag ingestion remain separate work.
 
 ## Web Identity Validation (IRSA)
 
@@ -336,6 +336,12 @@ signature-enforcing SDK tests do not establish managed AWS error-message or runt
 
 `AssumeRole` retains a supplied `SourceIdentity` in the issued session and returns it in the response. Role chaining inherits the value and rejects attempts to change it. With IAM enforcement enabled, setting or inheriting it requires the target trust policy's `sts:SetSourceIdentity` permission and applicable caller permission ceilings. Role chaining requires the caller role's identity permission as well.
 
-Trust and identity policies can use `sts:SourceIdentity` during assumption; downstream policies receive `aws:SourceIdentity` from the issued credentials. Requests without source identity leave that condition key absent. This covers direct `AssumeRole`; SAML and web-identity claim ingestion and CloudTrail source-identity reporting are separate remaining work.
+Trust and identity policies can use `sts:SourceIdentity` during assumption; downstream policies receive `aws:SourceIdentity` from the issued credentials. Requests without source identity leave that condition key absent. OIDC claim ingestion and CloudTrail source-identity reporting remain separate work.
 
 SAML role sessions reject `DurationSeconds` above the target role maximum. Accepted requests retain the shorter assertion expiration.
+
+### Verified SAML source identity
+
+`AssumeRoleWithSAML` reads the `https://aws.amazon.com/SAML/Attributes/SourceIdentity` attribute only from the verified assertion. A present attribute must contain one valid source identity value. The role trust policy must allow both `sts:AssumeRoleWithSAML` and `sts:SetSourceIdentity`; each evaluation receives the verified `sts:SourceIdentity` value. Explicit denial prevents session creation.
+
+The response and issued session retain the source identity through the existing shared session metadata. Missing attributes preserve the existing trust contract. This does not establish full SAML condition support, session-tag issuance, CloudTrail reporting, native-image behavior or managed AWS parity.

@@ -19,12 +19,16 @@ public class SAMLTrustPolicyEvaluator {
     }
 
     public boolean allows(String document, String providerArn, Map<String, List<String>> claims) {
+        return allows(document, providerArn, claims, "sts:AssumeRoleWithSAML");
+    }
+
+    public boolean allows(String document, String providerArn, Map<String, List<String>> claims, String action) {
         try {
             JsonNode statements = mapper.readTree(document).path("Statement");
             if (statements.isArray()) {
                 boolean allowed = false;
                 for (JsonNode statement : statements) {
-                    int result = evaluate(statement, providerArn, claims);
+                    int result = evaluate(statement, providerArn, claims, action);
                     if (result < 0) {
                         return false;
                     }
@@ -34,14 +38,14 @@ public class SAMLTrustPolicyEvaluator {
                 }
                 return allowed;
             }
-            return statements.isObject() && evaluate(statements, providerArn, claims) > 0;
+            return statements.isObject() && evaluate(statements, providerArn, claims, action) > 0;
         } catch (Exception e) {
             return false;
         }
     }
 
-    private int evaluate(JsonNode statement, String providerArn, Map<String, List<String>> claims) {
-        if (!actionApplies(statement) || !principal(statement.path("Principal"), providerArn)
+    private int evaluate(JsonNode statement, String providerArn, Map<String, List<String>> claims, String action) {
+        if (!actionApplies(statement, action) || !principal(statement.path("Principal"), providerArn)
                 || !conditionsSatisfied(statement.get("Condition"), claims)) {
             return 0;
         }
@@ -67,7 +71,7 @@ public class SAMLTrustPolicyEvaluator {
                 String key = entry.getKey();
                 int colon = key.indexOf(':');
                 String claimName = colon < 0 ? key : key.substring(colon + 1);
-                List<String> actual = claims.getOrDefault(claimName, List.of());
+                List<String> actual = claims.getOrDefault(key, claims.getOrDefault(claimName, List.of()));
                 List<String> expected = entry.getValue().isArray()
                         ? java.util.stream.StreamSupport.stream(entry.getValue().spliterator(), false)
                                 .filter(JsonNode::isTextual).map(JsonNode::asText).toList()
@@ -101,31 +105,31 @@ public class SAMLTrustPolicyEvaluator {
         return false;
     }
 
-    private boolean actionApplies(JsonNode statement) {
+    private boolean actionApplies(JsonNode statement, String requestedAction) {
         JsonNode action = statement.get("Action");
         if (action != null) {
-            return action(action);
+            return action(action, requestedAction);
         }
         JsonNode notAction = statement.get("NotAction");
-        return notAction != null && !action(notAction);
+        return notAction != null && !action(notAction, requestedAction);
     }
 
-    private boolean action(JsonNode node) {
+    private boolean action(JsonNode node, String requestedAction) {
         if (node.isTextual()) {
-            return matches(node.asText());
+            return matches(node.asText(), requestedAction);
         }
         if (node.isArray()) {
             for (JsonNode value : node) {
-                if (value.isTextual() && matches(value.asText())) {
+                if (value.isTextual() && matches(value.asText(), requestedAction)) {
                     return true;
                 }
             }
         }
         return false;
     }
-    private boolean matches(String action) {
+    private boolean matches(String action, String requestedAction) {
         String regex = action.replace(".", "\\.").replace("*", ".*").replace("?", ".");
-        return "sts:AssumeRoleWithSAML".matches("(?i)^" + regex + "$");
+        return requestedAction.matches("(?i)^" + regex + "$");
     }
     private boolean principal(JsonNode node, String providerArn) {
         JsonNode federated = node.isObject() ? node.get("Federated") : null;
