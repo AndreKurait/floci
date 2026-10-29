@@ -75,6 +75,39 @@ class AutoScalingServiceTest {
     private AutoScalingService service;
 
     @Test
+    void standbyValidatesWholeBatchBeforeTrafficOrCapacityChanges() {
+        ElbV2Service elb = mock(ElbV2Service.class);
+        AutoScalingService selected = new AutoScalingService(null, elb);
+        selected.regionResolver = service.regionResolver;
+        selected.groups = service.groups;
+        AutoScalingGroup group = service.requireGroup(REGION, "test-asg");
+        AsgInstance owned = new AsgInstance();
+        owned.setInstanceId("i-owned");
+        owned.setLifecycleState("InService");
+        group.getInstances().add(owned);
+        group.setTargetGroupARNs(List.of("shared-target-group"));
+
+        assertThrows(AwsException.class, () -> selected.changeStandby(REGION, "test-asg",
+                List.of("i-owned", "i-foreign"), true, true));
+        verifyNoInteractions(elb);
+        assertEquals("InService", owned.getLifecycleState());
+        assertEquals(1, group.getDesiredCapacity());
+        selected.changeStandby(REGION, "test-asg", List.of("i-owned"), true, true);
+        ArgumentCaptor<List<TargetDescription>> removed = ArgumentCaptor.captor();
+        verify(elb).deregisterTargets(eq(REGION), eq("shared-target-group"), removed.capture());
+        assertEquals(List.of("i-owned"), removed.getValue().stream().map(TargetDescription::getId).toList());
+        assertEquals("Standby", owned.getLifecycleState());
+        assertEquals(0, group.getDesiredCapacity());
+        assertEquals(1, group.getInstances().size());
+        selected.changeStandby(REGION, "test-asg", List.of("i-owned"), false, false);
+        ArgumentCaptor<List<TargetDescription>> restored = ArgumentCaptor.captor();
+        verify(elb).registerTargets(eq(REGION), eq("shared-target-group"), restored.capture());
+        assertEquals(List.of("i-owned"), restored.getValue().stream().map(TargetDescription::getId).toList());
+        assertEquals("InService", owned.getLifecycleState());
+        assertEquals(1, group.getDesiredCapacity());
+    }
+
+    @Test
     void detachDeregistersOnlyActualMembersBeforeRemovingOwnership() {
         ElbV2Service elb = mock(ElbV2Service.class);
         AutoScalingService selected = new AutoScalingService(null, elb);
