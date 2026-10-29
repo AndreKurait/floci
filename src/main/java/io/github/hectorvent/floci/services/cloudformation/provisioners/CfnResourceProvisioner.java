@@ -42,6 +42,16 @@ public interface CfnResourceProvisioner {
         return null;
     }
 
+    /** Whether a stored resource lacks ownership metadata needed for its next lifecycle operation. */
+    default boolean requiresOwnershipRecovery(StackResource resource) {
+        return false;
+    }
+
+    /** Recovers metadata on a copy, using only the stack's previous template and resource identities. */
+    default void recoverOwnership(StackResource resource, JsonNode properties, ProvisionContext context) {
+        // Existing provisioners already retain their required ownership metadata.
+    }
+
     /** Most implementations delegate to {@code service.deleteX(physicalId, region)}. */
     default void delete(String resourceType, String physicalId, String region) {
         // no-op by default: some resource types have no backing delete

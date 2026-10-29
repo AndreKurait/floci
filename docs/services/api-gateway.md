@@ -1012,3 +1012,11 @@ alongside each child ID, including stages with the same name on different APIs.
 the previous child; `UpdateReplacePolicy: Retain` keeps a displaced child. Stage
 name changes also replace the stage. Deployment activation remains a separate
 compatibility scope.
+
+Legacy CloudFormation V2 child records without a stored `ApiId` recover ownership
+from the previous stack template, parameters, conditions and resource identities
+before update or deletion. Recovered metadata is persisted before children change.
+Unresolved ownership fails without deleting children; Floci does not search other
+APIs using an unscoped child ID. Live exports and dynamic references are not used
+to reconstruct historical ownership. Old SSM parameter values must already be
+stored. Deletion-policy retention and genuine stub resources require no recovery.
