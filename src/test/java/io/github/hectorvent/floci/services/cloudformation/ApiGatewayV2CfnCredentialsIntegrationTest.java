@@ -1,11 +1,13 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -37,9 +39,11 @@ class ApiGatewayV2CfnCredentialsIntegrationTest {
     void templateCredentialsUpdateAndRemovalKeepResourceIds(String protocol) {
         try (ApiGatewayV2Client api = api()) {
             String name = "v2-credentials-" + UUID.randomUUID();
-            stackAction("CreateStack", name, template(protocol, ROLE, ROLE, false));
-            try {
+            String apiId;
+            try (StackCleanup cleanup = new StackCleanup(name)) {
+                stackAction("CreateStack", name, template(protocol, ROLE, ROLE, false));
                 Map<String, String> ids = outputs(waitFor(name, "CREATE_COMPLETE"));
+                apiId = ids.get("Api");
                 assertEquals(ids.get("Integration"), ids.get("IntegrationAttr"));
                 assertEquals(ids.get("Authorizer"), ids.get("AuthorizerAttr"));
                 assertCredentials(api, ids, ROLE, ROLE);
@@ -55,12 +59,8 @@ class ApiGatewayV2CfnCredentialsIntegrationTest {
                     assertEquals(ids, outputs(waitFor(name, "UPDATE_COMPLETE")));
                     assertCredentials(api, ids, credentials, authorizerCredentials);
                 }
-            } finally {
-                String apiId = outputs(cloudFormation.describeStacks(name, "us-east-1").getFirst()).get("Api");
-                stackAction("DeleteStack", name, null);
-                CfnStackWaits.awaitStackDeleted(name);
-                assertThrows(NotFoundException.class, () -> api.getApi(b -> b.apiId(apiId)));
             }
+            assertThrows(NotFoundException.class, () -> api.getApi(b -> b.apiId(apiId)));
         }
     }
 
@@ -69,16 +69,70 @@ class ApiGatewayV2CfnCredentialsIntegrationTest {
     void failedLaterResourceRestoresIntegrationCredentials(String protocol) {
         try (ApiGatewayV2Client api = api()) {
             String name = "v2-credentials-rollback-" + UUID.randomUUID();
-            stackAction("CreateStack", name, template(protocol, ROLE, ROLE, false));
-            try {
+            try (StackCleanup cleanup = new StackCleanup(name)) {
+                stackAction("CreateStack", name, template(protocol, ROLE, ROLE, false));
                 Map<String, String> ids = outputs(waitFor(name, "CREATE_COMPLETE"));
                 stackAction("UpdateStack", name, template(protocol, null, ROLE, true));
                 waitFor(name, "UPDATE_ROLLBACK_COMPLETE");
                 assertCredentials(api, ids, ROLE, ROLE);
-            } finally {
-                stackAction("DeleteStack", name, null);
-                CfnStackWaits.awaitStackDeleted(name);
             }
+        }
+    }
+
+    @Test
+    void cleanupPreservesFailureBeforeCreation() {
+        String name = "v2-cleanup-absent-" + UUID.randomUUID();
+        AssertionError original = new AssertionError("before creation");
+        AssertionError actual = assertThrows(AssertionError.class, () -> {
+            try (StackCleanup cleanup = new StackCleanup(name)) {
+                throw original;
+            }
+        });
+        assertSame(original, actual);
+        assertEquals(0, actual.getSuppressed().length);
+    }
+
+    @Test
+    void cleanupPreservesFailureAfterCreationAndDeletesResources() {
+        String name = "v2-cleanup-created-" + UUID.randomUUID();
+        AssertionError original = new AssertionError("after creation");
+        String[] apiId = new String[1];
+        AssertionError actual = assertThrows(AssertionError.class, () -> {
+            try (StackCleanup cleanup = new StackCleanup(name)) {
+                stackAction("CreateStack", name, template("HTTP", ROLE, ROLE, false));
+                apiId[0] = outputs(waitFor(name, "CREATE_COMPLETE")).get("Api");
+                throw original;
+            }
+        });
+        assertSame(original, actual);
+        assertEquals(0, actual.getSuppressed().length);
+        try (ApiGatewayV2Client api = api()) {
+            assertThrows(NotFoundException.class, () -> api.getApi(b -> b.apiId(apiId[0])));
+        }
+    }
+
+    private class StackCleanup implements AutoCloseable {
+        private final String name;
+
+        private StackCleanup(String name) {
+            this.name = name;
+        }
+
+        @Override
+        public void close() {
+            try {
+                cloudFormation.describeStacks(name, "us-east-1");
+            } catch (AwsException expected) {
+                if ("ValidationError".equals(expected.getErrorCode())
+                        && ("Stack with id " + name + " does not exist").equals(expected.getMessage())) {
+                    // Creation may have failed before a stack was stored.
+                    return;
+                }
+                throw expected;
+            }
+            CfnStackWaits.awaitTerminal(name);
+            stackAction("DeleteStack", name, null);
+            CfnStackWaits.awaitStackDeleted(name);
         }
     }
 
