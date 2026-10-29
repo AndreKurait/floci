@@ -122,6 +122,36 @@ class StsQueryHandlerTest {
     }
 
     @ParameterizedTest
+    @CsvSource({"false, absent, 3600", "false, 900, 900", "false, 3600, 3600",
+            "false, 3601, 3600", "false, 129600, 3600", "true, absent, 43200",
+            "true, 900, 900", "true, 3600, 3600", "true, 3601, 3601", "true, 129600, 129600"})
+    void accountTokensAreCappedWhileIamUserDurationsArePreserved(boolean knownUser, String duration,
+                                                                 int expectedSeconds) {
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+        for (String action : new String[]{"GetSessionToken", "GetFederationToken"}) {
+            IamService service = mock(IamService.class);
+            when(service.isKnownAccessKey("AKIAlongterm")).thenReturn(knownUser);
+            StsQueryHandler handler = newHandler(service, new RegionResolver(REGION, "000000000000"),
+                    Clock.fixed(now, ZoneOffset.UTC));
+            setCaller(handler, "AKIAlongterm", "-");
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("Name", "duration");
+            if (!"absent".equals(duration)) {
+                params.putSingle("DurationSeconds", duration);
+            }
+            Response response = handler.handle(action, params);
+            assertEquals(200, response.getStatus(), response.getEntity().toString());
+            Instant expected = now.plusSeconds(expectedSeconds);
+            assertEquals(expected.toString(), extract(EXPIRATION, response.getEntity().toString()), action);
+            ArgumentCaptor<Instant> expiration = ArgumentCaptor.forClass(Instant.class);
+            verify(service).registerIssuedSession(anyString(), anyString(), anyString(),
+                    "GetSessionToken".equals(action) ? isNull() : anyString(), expiration.capture(),
+                    isNull(), eq("000000000000"), eq("AKIAlongterm"));
+            assertEquals(expected, expiration.getValue());
+        }
+    }
+
+    @ParameterizedTest
     @CsvSource({"ASIAtemporary, AKIAlongterm", "-, ASIAtemporary", "ASIAtemporary, -",
             "blank, ASIAtemporary", "space, ASIAtemporary"})
     void temporaryHeaderOrQueryCallerIsRejectedBeforeSessionRegistration(String headerKey, String queryKey) {

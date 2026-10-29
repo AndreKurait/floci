@@ -162,6 +162,13 @@ against this emulator.
 
 ## Session Token and Federation Token Permissions
 
+`GetSessionToken` and `GetFederationToken` cap account-root credentials at one hour,
+including an omitted duration. A shorter valid request keeps its requested duration.
+IAM-user credentials retain the 12-hour default and the requested duration up to 36 hours.
+This follows the STS duration contract using Floci's existing account-credential convention;
+it does not introduce separate root access-key storage. Input constraints are checked before
+the root cap, so an out-of-range duration is still rejected.
+
 `GetSessionToken` and `GetFederationToken` reject temporary callers with `AccessDenied` before issuing credentials,
 including when IAM policy enforcement is disabled. Use a long-term IAM user or account key.
 For an authenticated temporary caller, `GetFederationToken` returns
