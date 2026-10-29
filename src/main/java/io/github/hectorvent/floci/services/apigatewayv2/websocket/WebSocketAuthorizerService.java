@@ -159,7 +159,7 @@ public class WebSocketAuthorizerService {
             invokeResult = lambdaService.invokeTarget(region, functionName,
                     authorizerEventJson.getBytes(), InvocationType.RequestResponse);
         } catch (Exception e) {
-            LOG.warnv("Lambda authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());
+            LOG.warnv(e, "Lambda authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());
             return AuthorizerResult.error();
         }
 
@@ -207,7 +207,7 @@ public class WebSocketAuthorizerService {
 
             return AuthorizerResult.allow(context);
         } catch (Exception e) {
-            LOG.warnv("Failed to parse authorizer policy for API {0}: {1}", apiId, e.getMessage());
+            LOG.warnv(e, "Failed to parse authorizer policy for API {0}: {1}", apiId, e.getMessage());
             return AuthorizerResult.error();
         }
     }
