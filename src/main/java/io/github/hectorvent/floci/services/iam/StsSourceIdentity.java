@@ -4,7 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 
 import java.util.regex.Pattern;
 
-/** The immutable source identity passed into a direct AssumeRole session. */
+/** The immutable source identity passed into an STS role session. */
 public final class StsSourceIdentity {
     private static final Pattern VALUE = Pattern.compile("[\\w+=,.@-]{2,64}");
 
