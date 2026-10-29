@@ -241,7 +241,7 @@ class ApiGatewayTaskInvokerTest {
     }
 
     @Test
-    void optionalRequestAndResourcePolicyFeaturesRefuseBeforeTransport() {
+    void optionalRequestFeaturesRefuseBeforeTransport() {
         request.putObject("QueryParameters").putArray("key").add("value");
         denied("States.TaskFailed");
         request.remove("QueryParameters");
@@ -250,13 +250,19 @@ class ApiGatewayTaskInvokerTest {
         request.remove("AllowNullValues");
         ((ObjectNode) request.path("RequestBody")).putNull("optional");
         denied("States.TaskFailed");
-        ((ObjectNode) request.path("RequestBody")).remove("optional");
-        RestApi resourcePolicyApi = new RestApi();
-        resourcePolicyApi.setPolicy("{}");
-        when(api.getRestApi("eu-west-1", "owned")).thenReturn(resourcePolicyApi);
-        denied("States.TaskFailed");
         assertEquals(0, calls.get());
         assertEquals(null, credentials.get());
+    }
+
+    @Test
+    void resourcePolicyApisAreSentToTheListenerForEvaluation() throws Exception {
+        RestApi resourcePolicyApi = new RestApi();
+        resourcePolicyApi.setPolicy("{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\","
+                + "\"Action\":\"execute-api:Invoke\",\"Resource\":\"*\"}]}");
+        when(api.getRestApi("eu-west-1", "owned")).thenReturn(resourcePolicyApi);
+        assertEquals(200, invoker.invoke(request, machine, null).path("StatusCode").asInt());
+        assertEquals(1, calls.get());
+        assertEquals(null, serverFailure.get());
     }
 
     @Test
