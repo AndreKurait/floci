@@ -64,7 +64,7 @@ class SsmServicePublicAmiParameterTest {
     void resolvesTheDocumentedAl2023Arm64DefaultFromTheImageCatalog() {
         Parameter param = ssmService.getParameter(AL2023_ARM64_DEFAULT, REGION);
 
-        assertEquals("ami-amazonlinux2023-arm64", param.getValue());
+        assertEquals("ami-0abcdef1234567894", param.getValue());
         assertEquals("String", param.getType());
         assertEquals(1, param.getVersion());
         assertEquals("arn:aws:ssm:eu-west-1::parameter" + AL2023_ARM64_DEFAULT, param.getArn());
@@ -72,10 +72,19 @@ class SsmServicePublicAmiParameterTest {
     }
 
     @Test
+    void publicAmazonLinuxParametersReturnEc2ImageIds() {
+        for (Parameter parameter : ssmService.getParametersByPath(
+                "/aws/service/ami-amazon-linux-latest", false, REGION)) {
+            assertTrue(parameter.getValue().matches("ami-[0-9a-f]{17}"),
+                    parameter.getName() + " returned " + parameter.getValue());
+        }
+    }
+
+    @Test
     void resolvesAllDocumentedAl2023Arm64VariantsFromTheImageCatalog() {
         for (String paramName : List.of(AL2023_ARM64_DEFAULT, AL2023_ARM64_MINIMAL, AL2023_ARM64_KERNEL_6_1)) {
             Parameter param = ssmService.getParameter(paramName, REGION);
-            assertEquals("ami-amazonlinux2023-arm64", param.getValue(), paramName);
+            assertEquals("ami-0abcdef1234567894", param.getValue(), paramName);
         }
     }
 
@@ -186,7 +195,7 @@ class SsmServicePublicAmiParameterTest {
 
         String arm64Param = "/aws/service/eks/optimized-ami/1.31/amazon-linux-2023/arm64/standard/recommended/image_id";
         Parameter arm64 = ssmService.getParameter(arm64Param, REGION);
-        assertEquals("ami-amazonlinux2023-arm64", arm64.getValue());
+        assertEquals("ami-0abcdef1234567894", arm64.getValue());
         assertEquals("String", arm64.getType());
         assertEquals(1, arm64.getVersion());
         assertEquals("arn:aws:ssm:eu-west-1::parameter" + arm64Param, arm64.getArn());

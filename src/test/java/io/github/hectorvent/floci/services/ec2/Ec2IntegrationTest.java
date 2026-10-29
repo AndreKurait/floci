@@ -875,7 +875,7 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .contentType("application/xml")
             .body("DescribeImagesResponse.imagesSet.item.size()", equalTo(1))
-            .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo("ami-amazonlinux2023-arm64"))
+            .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo("ami-0abcdef1234567894"))
             .body("DescribeImagesResponse.imagesSet.item.architecture", equalTo("arm64"))
             .body("DescribeImagesResponse.imagesSet.item.name",
                     equalTo("al2023-ami-2023.0.20230315.0-kernel-6.1-arm64"));
