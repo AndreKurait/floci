@@ -992,3 +992,10 @@ aws apigatewayv2 create-stage \
 # Disconnect a client
 # curl -X DELETE http://localhost:4566/execute-api/$WS_API_ID/prod/@connections/$CONNECTION_ID
 ```
+
+HTTP API Lambda REQUEST authorizers without `authorizerCredentialsArn` check the
+Lambda resource policy when IAM enforcement is enabled. The permission uses the API
+owner and region, the source ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
+qualified Lambda target. Missing permission returns HTTP 500 before invocation;
+missing identity still returns HTTP 401 first. Configured authorizer roles retain
+their separate execution path. This check does not implement role assumption.
