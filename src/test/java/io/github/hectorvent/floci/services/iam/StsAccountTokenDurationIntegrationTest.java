@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.iam;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.testing.SignedIamEnforcementProfile;
 import io.github.hectorvent.floci.testing.SignedIamUsers;
@@ -43,7 +44,10 @@ class StsAccountTokenDurationIntegrationTest {
             "GetFederationToken, 3601, 3600", "GetFederationToken, 129600, 3600"})
     void rootIssuedCredentialsUseTheCappedLifetime(String action, String duration, int expected) {
         try (StsClient sts = client("test", "test")) {
-            assertEquals("arn:aws:iam::" + ACCOUNT + ":root", sts.getCallerIdentity().arn());
+            AwsArnUtils.Arn caller = AwsArnUtils.parse(sts.getCallerIdentity().arn());
+            assertEquals("iam", caller.service());
+            assertEquals(ACCOUNT, caller.accountId());
+            assertEquals("root", caller.resource());
             checkLifetime(sts, action, duration, expected);
         }
     }
