@@ -101,6 +101,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -123,6 +124,7 @@ import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.ED25519
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.RSA_FINGERPRINT;
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.RSA_KEY;
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.TRUNCATED_RSA_KEY;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -9304,6 +9306,87 @@ class Ec2ServiceTest {
         AwsException error = assertThrows(AwsException.class, () -> service.modifyInstanceMetadataOptions(
                 "us-east-1", "i-0123456789abcdef0", new LaunchTemplateData.MetadataOptions()));
         assertEquals("InvalidInstanceID.NotFound", error.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void imageRegistrySerializesContendingMutations(boolean deregister) throws Exception {
+        ParkingStore<Image> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Image> images = new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-registered-images.json", images)));
+        Image original = deregister
+                ? service.registerImage("us-east-1", "contested", null, "x86_64", "/dev/xvda", null) : null;
+        if (deregister) {
+            parking.parkNextRead();
+        } else {
+            parking.parkNextWrite();
+        }
+        Callable<Image> request = () -> {
+            if (deregister) {
+                service.deregisterImage("us-east-1", original.getImageId(), true);
+                return original;
+            }
+            return service.registerImage("us-east-1", "contested", null, "x86_64", "/dev/xvda", null);
+        };
+        AtomicReference<Thread> firstWorker = new AtomicReference<>();
+        AtomicReference<Thread> secondWorker = new AtomicReference<>();
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        Throwable primaryFailure = null;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        try {
+            Future<Image> firstResult = workers.submit(() -> {
+                firstWorker.set(Thread.currentThread());
+                return request.call();
+            });
+            assertTrue(parking.awaitParked(), "the first mutation never reached the image store");
+            Future<Image> secondResult = workers.submit(() -> {
+                secondWorker.set(Thread.currentThread());
+                return request.call();
+            });
+            // An unlocked contender finishes; a correct contender waits behind the parked owner.
+            Awaitility.await("the competing image mutation to finish or enter the registry monitor")
+                    .atMost(Duration.ofSeconds(5)).until(() -> secondResult.isDone()
+                    || isBlockedIn(secondWorker.get(), deregister ? "deregisterImage" : "registerImage",
+                            firstWorker.get()));
+            parking.release();
+            assertAll(
+                    () -> assertDoesNotThrow(() -> firstResult.get(
+                            Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)),
+                    () -> {
+                        ExecutionException refusal = assertThrows(ExecutionException.class,
+                                () -> secondResult.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS));
+                        AwsException error = assertInstanceOf(AwsException.class, refusal.getCause());
+                        assertEquals(deregister ? "InvalidAMIID.Unavailable" : "InvalidAMIName.Duplicate",
+                                error.getErrorCode());
+                    },
+                    () -> assertEquals(deregister ? 0 : 1,
+                            service.describeImages("us-east-1", List.of(), List.of("self")).size(),
+                            "the final image inventory must reflect one successful mutation"));
+        } catch (Exception | Error failure) {
+            primaryFailure = failure;
+            throw failure;
+        } finally {
+            parking.release();
+            workers.shutdownNow();
+            try {
+                assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS), "image mutation workers must terminate");
+            } catch (Exception | Error cleanupFailure) {
+                if (cleanupFailure instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                if (primaryFailure != null) {
+                    primaryFailure.addSuppressed(cleanupFailure);
+                } else {
+                    throw cleanupFailure;
+                }
+            } finally {
+                if (primaryFailure instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
     }
 
     private static Ec2Service mockModeService() {
