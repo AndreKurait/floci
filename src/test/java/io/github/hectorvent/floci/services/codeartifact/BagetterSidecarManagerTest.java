@@ -42,8 +42,8 @@ class BagetterSidecarManagerTest {
 
         manager.stopManagedContainers();
 
-        verify(lifecycleManager).stopAndRemove("tracked-bagetter-1", null);
-        verify(lifecycleManager).stopAndRemove("tracked-bagetter-2", null);
+        verify(lifecycleManager).stopAndRemoveStrict("tracked-bagetter-1", null);
+        verify(lifecycleManager).stopAndRemoveStrict("tracked-bagetter-2", null);
     }
 
     @Test

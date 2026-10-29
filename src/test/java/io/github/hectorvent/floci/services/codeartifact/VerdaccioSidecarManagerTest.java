@@ -42,8 +42,8 @@ class VerdaccioSidecarManagerTest {
 
         manager.stopManagedContainers();
 
-        verify(lifecycleManager).stopAndRemove("tracked-verdaccio-1", null);
-        verify(lifecycleManager).stopAndRemove("tracked-verdaccio-2", null);
+        verify(lifecycleManager).stopAndRemoveStrict("tracked-verdaccio-1", null);
+        verify(lifecycleManager).stopAndRemoveStrict("tracked-verdaccio-2", null);
     }
 
     @Test
