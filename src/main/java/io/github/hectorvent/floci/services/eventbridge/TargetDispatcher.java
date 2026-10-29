@@ -103,7 +103,7 @@ public class TargetDispatcher implements Resettable {
             attempt(new Delivery(ruleArn, target.getId(), eventJson, region, currentTargets, generation.get(), now, 0,
                     null, null, now), target, now);
         } catch (RuntimeException e) {
-            LOG.warnv("EventBridge rule {0} could not dispatch to target {1}: {2}",
+            LOG.warnv(e, "EventBridge rule {0} could not dispatch to target {1}: {2}",
                     ruleArn, target.getId(), e.getMessage());
         }
     }
@@ -122,7 +122,7 @@ public class TargetDispatcher implements Resettable {
             try {
                 RequestScopes.runAs(AwsArnUtils.parse(delivery.ruleArn()).accountId(), () -> retry(delivery, now));
             } catch (RuntimeException e) {
-                LOG.warnv("EventBridge retry for rule {0} target {1} failed: {2}",
+                LOG.warnv(e, "EventBridge retry for rule {0} target {1} failed: {2}",
                         delivery.ruleArn(), delivery.targetId(), e.getMessage());
             }
         }
@@ -170,7 +170,7 @@ public class TargetDispatcher implements Resettable {
             String message = e.getMessage() != null && !e.getMessage().isBlank()
                     ? e.getMessage()
                     : e.getClass().getSimpleName();
-            LOG.warnv("EventBridge rule {0} target {1} delivery failed with {2}: {3}",
+            LOG.warnv(e, "EventBridge rule {0} target {1} delivery failed with {2}: {3}",
                     delivery.ruleArn(), target.getId(), errorCode, message);
             long backoffSeconds = Math.min(MAXIMUM_BACKOFF_SECONDS, 1L << Math.min(delivery.retryAttempts(), 9));
             Instant backoff = now.plusSeconds(backoffSeconds);
@@ -232,7 +232,7 @@ public class TargetDispatcher implements Resettable {
             sqsService.sendMessage(AwsArnUtils.arnToQueueUrl(queueArn, baseUrl), delivery.eventJson(), 0, null, null,
                     attributes, delivery.region());
         } catch (RuntimeException e) {
-            LOG.warnv("EventBridge rule {0} target {1} dead-letter delivery to {2} failed: {3}",
+            LOG.warnv(e, "EventBridge rule {0} target {1} dead-letter delivery to {2} failed: {3}",
                     delivery.ruleArn(), target.getId(), queueArn, e.getMessage());
         }
     }
