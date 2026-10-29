@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
+import io.github.hectorvent.floci.testutil.LogCapture;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.core.http.HttpConnection;
 import io.vertx.core.http.HttpServerRequest;
@@ -33,6 +34,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.logging.LogRecord;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -148,6 +150,85 @@ class HttpAuthorizerPermissionTest {
         authorizer.setIdentitySource(List.of("$request.header.Authorization"));
         assertEquals(401, invoke("2.0"));
         verifyNoInteractions(lambda);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"service-policy", "service-invocation", "credential-invocation"})
+    void unexpectedInvocationFailureRetainsOriginalCause(String stage) {
+        RuntimeException cause = new IllegalStateException("transport cause");
+        RuntimeException failure = new IllegalStateException("authorizer failure", cause);
+        serviceCallAuthorizer = mock(ServiceCallAuthorizer.class);
+        when(serviceCallAuthorizer.authorize(anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
+        if ("service-policy".equals(stage)) {
+            when(serviceCallAuthorizer.authorize(anyString(), anyString(), anyString(), anyString(), anyString()))
+                    .thenThrow(failure);
+        } else {
+            when(lambda.invokeTarget(anyString(), anyString(), any(byte[].class), any())).thenThrow(failure);
+        }
+        if ("credential-invocation".equals(stage)) {
+            authorizer.setAuthorizerCredentialsArn("arn:aws:iam::000000000000:role/authorizer");
+        }
+        List<LogRecord> records = captureFailure();
+        verifyAuthorizerInvocations("service-policy".equals(stage) ? 0 : 1);
+        assertWarning(records, "Lambda REQUEST authorizer invocation failed for API {0}: {1}", failure);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1.0", "2.0"})
+    void responseParsingFailureRetainsOriginalCause(String version) throws Exception {
+        policy = grant();
+        mapper = spy(new ObjectMapper());
+        byte[] invalidPayload = "invalid response".getBytes(StandardCharsets.UTF_8);
+        RuntimeException cause = new IllegalStateException("decoder cause");
+        RuntimeException failure = new IllegalStateException("response decode failed", cause);
+        doThrow(failure).when(mapper).readTree(same(invalidPayload));
+        when(lambda.invokeTarget(eq("us-east-1"),
+                eq("arn:aws:lambda:us-west-2:444455556666:function:authorizer:live"),
+                any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult(200, null, invalidPayload, null, "request"));
+        List<LogRecord> records = LogCapture.capture(ApiGatewayExecuteController.class, () -> {
+            try (Response response = controller(version, "2.0".equals(version))
+                    .handleGet(headers, uri, "api", "test", "items")) {
+                assertEquals(500, response.getStatus());
+                assertTrue(response.getEntity().toString().contains("Internal Server Error"));
+            }
+        });
+        verify(mapper).readTree(same(invalidPayload));
+        verifyAuthorizerInvocations(1);
+        assertWarning(records, "Failed to parse authorizer response for API {0}: {1}", failure);
+    }
+
+    @Test
+    void modeledDenialDoesNotLogUnexpectedFailure() {
+        List<LogRecord> records = captureFailure();
+        verifyNoInteractions(lambda);
+        assertTrue(records.stream().noneMatch(record -> record.getMessage().contains("failed")
+                || record.getMessage().startsWith("Failed to parse")));
+    }
+
+    private List<LogRecord> captureFailure() {
+        return LogCapture.capture(ApiGatewayExecuteController.class, () -> {
+            try (Response response = controller("2.0", false).handleGet(headers, uri, "api", "test", "items")) {
+                assertEquals(500, response.getStatus());
+                assertTrue(response.getEntity().toString().contains("Internal Server Error"));
+            }
+        });
+    }
+
+    private void verifyAuthorizerInvocations(int count) {
+        verify(lambda, times(count)).invokeTarget(eq("us-east-1"),
+                eq("arn:aws:lambda:us-west-2:444455556666:function:authorizer:live"),
+                any(byte[].class), eq(InvocationType.RequestResponse));
+        verifyNoMoreInteractions(lambda);
+    }
+
+    private static void assertWarning(List<LogRecord> records, String template, RuntimeException failure) {
+        LogRecord warning = records.stream().filter(record -> template.equals(record.getMessage()))
+                .findFirst().orElseThrow();
+        assertArrayEquals(new Object[]{"api", failure.getMessage()}, warning.getParameters());
+        assertSame(failure, warning.getThrown());
+        assertSame(failure.getCause(), warning.getThrown().getCause());
     }
 
     private int invoke(String version) {
