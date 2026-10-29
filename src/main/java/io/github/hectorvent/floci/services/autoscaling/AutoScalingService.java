@@ -578,6 +578,8 @@ public class AutoScalingService implements PassedRoleLookup {
                             }
                         });
             }
+            active.forEach(instance -> completeStandbyActivity(instance, "Cancelled",
+                    "The Auto Scaling group was deleted."));
             groups.remove(key);
             instanceRefreshes.entrySet().removeIf(e -> region.equals(e.getValue().getRegion())
                     && name.equals(e.getValue().getAutoScalingGroupName()));
@@ -779,17 +781,111 @@ public class AutoScalingService implements PassedRoleLookup {
 
     // ── Instance management ────────────────────────────────────────────────────
 
-    public List<AsgInstance> describeAutoScalingInstances(String region, List<String> instanceIds) {
-        List<AsgInstance> all = groups.values().stream()
+    public List<AutoScalingInstanceDetails> describeAutoScalingInstances(String region, List<String> instanceIds) {
+        List<AutoScalingInstanceDetails> all = groups.values().stream()
                 .filter(Objects::nonNull)
                 .filter(g -> region.equals(g.getRegion()))
-                .flatMap(g -> g.getInstances().stream())
+                .flatMap(g -> g.getInstances().stream()
+                        .map(instance -> new AutoScalingInstanceDetails(g.getAutoScalingGroupName(), instance)))
                 .collect(Collectors.toList());
         if (instanceIds != null && !instanceIds.isEmpty()) {
             Set<String> ids = new HashSet<>(instanceIds);
-            return all.stream().filter(i -> ids.contains(i.getInstanceId())).collect(Collectors.toList());
+            return all.stream().filter(i -> ids.contains(i.instance().getInstanceId())).collect(Collectors.toList());
         }
         return all;
+    }
+
+    public record AutoScalingInstanceDetails(String autoScalingGroupName, AsgInstance instance) {}
+
+    public List<ScalingActivity> enterStandby(String region, String name, List<String> instanceIds,
+                                             boolean decrementDesiredCapacity) {
+        return startStandbyTransition(region, name, instanceIds, true, decrementDesiredCapacity);
+    }
+
+    public List<ScalingActivity> exitStandby(String region, String name, List<String> instanceIds) {
+        return startStandbyTransition(region, name, instanceIds, false, false);
+    }
+
+    private List<ScalingActivity> startStandbyTransition(String region, String name, List<String> instanceIds,
+                                                        boolean entering, boolean decrementDesiredCapacity) {
+        String invalidName = name == null ? SmithyValidationErrors.notNull("autoScalingGroupName")
+                : SmithyValidationErrors.lengthOutOfRange("autoScalingGroupName", name, 1, 255);
+        if (invalidName != null) {
+            throw SmithyValidationErrors.validationError(invalidName);
+        }
+        List<String> ids = instanceIds != null ? instanceIds : List.of();
+        String invalidSize = SmithyValidationErrors.sizeOutOfRange("instanceIds", ids.size(), 0, 20);
+        if (invalidSize != null) {
+            throw SmithyValidationErrors.validationError(invalidSize);
+        }
+        String key = asgKey(region, name);
+        synchronized (lockFor(key)) {
+            AutoScalingGroup asg = requireGroup(region, name);
+            if (!entering && asg.getSuspendedProcesses().contains("Launch")) {
+                throw new AwsException("ValidationError", "Cannot exit standby for AutoScalingGroup " + name
+                        + " while the Launch process is suspended", 400);
+            }
+            List<AsgInstance> selected = new ArrayList<>();
+            String requiredState = entering ? "InService" : "Standby";
+            for (String id : new LinkedHashSet<>(ids)) {
+                AsgInstance instance = asg.getInstances().stream()
+                        .filter(member -> member.getInstanceId().equals(id))
+                        .findFirst()
+                        .orElseThrow(() -> new AwsException("ValidationError",
+                                "The instance " + id + " is not part of Auto Scaling group " + name + ".", 400));
+                if (!requiredState.equals(instance.getLifecycleState())) {
+                    throw new AwsException("ValidationError",
+                            "The instance " + id + " is not in " + requiredState + ".", 400);
+                }
+                selected.add(instance);
+            }
+            int previousDesired = asg.getDesiredCapacity();
+            long desired = entering
+                    ? (long) previousDesired - (decrementDesiredCapacity ? selected.size() : 0)
+                    : (long) previousDesired + selected.size();
+            if (desired < asg.getMinSize() || desired > asg.getMaxSize()) {
+                throw capacityChangeError(asg, selected.size(), entering ? "place into standby" : "place in service");
+            }
+
+            if (entering) {
+                completeInstanceRefreshIfSettled(region, name);
+            }
+            List<ScalingActivity> started = new ArrayList<>();
+            for (AsgInstance instance : selected) {
+                String direction = entering ? "to" : "out of";
+                String capacityChange = desired == previousDesired ? "maintaining the capacity at " + desired
+                        : (entering ? "shrinking" : "increasing") + " the capacity from "
+                                + previousDesired + " to " + desired;
+                ScalingActivity activity = recordActivity(region, name,
+                        "Moving EC2 instance " + direction + " Standby: " + instance.getInstanceId(),
+                        "At " + Instant.now() + " instance " + instance.getInstanceId() + " was moved "
+                                + direction + " standby in response to a user request, " + capacityChange + ".",
+                        entering ? "InProgress" : "PreInService");
+                activity.setProgress(entering ? 50 : 30);
+                activities.put(activity.getActivityId(), activity);
+                instance.setStandbyActivityId(activity.getActivityId());
+                instance.setLifecycleState(entering ? "EnteringStandby" : "Pending");
+                started.add(new ScalingActivity(activity));
+            }
+            asg.setDesiredCapacity((int) desired);
+            groups.put(key, asg);
+            return started;
+        }
+    }
+
+    private static AwsException capacityChangeError(AutoScalingGroup asg, int count, String action) {
+        return new AwsException("ValidationError", "AutoScalingGroup " + asg.getAutoScalingGroupName()
+                + " has min-size=" + asg.getMinSize() + ", max-size=" + asg.getMaxSize()
+                + ", and desired-size=" + asg.getDesiredCapacity() + ". To " + action + " " + count
+                + " instance" + (count == 1 ? "" : "s")
+                + ", please update the AutoScalingGroup sizes appropriately.", 400);
+    }
+
+    void completeStandbyActivity(AsgInstance instance, String status, String message) {
+        if (instance.getStandbyActivityId() != null) {
+            completeActivity(instance.getStandbyActivityId(), status, message);
+            instance.setStandbyActivityId(null);
+        }
     }
 
     public void setInstanceProtection(String region, String groupName, List<String> instanceIds,
@@ -941,6 +1037,13 @@ public class AutoScalingService implements PassedRoleLookup {
         String key = asgKey(region, name);
         synchronized (lockFor(key)) {
             AutoScalingGroup asg = requireGroup(region, name);
+            for (AsgInstance instance : asg.getInstances()) {
+                if (instanceIds.contains(instance.getInstanceId()) && instance.getStandbyActivityId() != null) {
+                    throw new AwsException("ValidationError", "The instance " + instance.getInstanceId()
+                            + " is not in InService or Standby or Pending:Retained or Terminating:Retained"
+                            + " or Warmed:Pending:Retained or Warmed:Terminating:Retained.", 400);
+                }
+            }
             List<String> detached = asg.getInstances().stream().map(AsgInstance::getInstanceId)
                     .filter(instanceIds::contains).toList();
             if (!detached.isEmpty()) {
@@ -972,7 +1075,10 @@ public class AutoScalingService implements PassedRoleLookup {
             asg.getInstances().stream()
                     .filter(i -> instanceId.equals(i.getInstanceId()))
                     .findFirst()
-                    .ifPresent(i -> i.setLifecycleState("Terminating"));
+                    .ifPresent(instance -> {
+                        completeStandbyActivity(instance, "Cancelled", "The instance was selected for termination.");
+                        instance.setLifecycleState("Terminating");
+                    });
             if (decrementDesiredCapacity) {
                 int newDesired = Math.max(asg.getMinSize(), asg.getDesiredCapacity() - 1);
                 asg.setDesiredCapacity(newDesired);
@@ -1016,6 +1122,9 @@ public class AutoScalingService implements PassedRoleLookup {
 
             applyDesiredConfiguration(asg, refresh);
             List<String> instanceIds = markInstancesForRefresh(asg, refresh);
+            asg.getInstances().stream().filter(instance -> instanceIds.contains(instance.getInstanceId()))
+                    .forEach(instance -> completeStandbyActivity(instance, "Cancelled",
+                            "The instance was selected for an instance refresh."));
             List<InstanceRefreshReplacement> replacements = new ArrayList<>();
             for (String instanceId : instanceIds) {
                 InstanceRefreshReplacement replacement = new InstanceRefreshReplacement();
