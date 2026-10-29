@@ -459,6 +459,17 @@ public class CloudFormationTemplateEngine {
         return resolved.isTextual() ? resolved.asText() : resolved.toString();
     }
 
+    /** Resolves stored lifecycle metadata without accepting unresolved intrinsic placeholders. */
+    public JsonNode resolveNodeStrict(JsonNode node) {
+        int before = unresolvedIntrinsics.size();
+        JsonNode resolved = resolveNode(node);
+        if (unresolvedIntrinsics.size() > before) {
+            throw new AwsException("ValidationError", "Unresolved CloudFormation intrinsics: "
+                    + String.join(", ", unresolvedIntrinsics.subList(before, unresolvedIntrinsics.size())), 400);
+        }
+        return resolved;
+    }
+
     public String resolveJsonAttributeStrict(JsonNode node) {
         int before = unresolvedIntrinsics.size();
         String resolved = resolveJsonAttribute(node);

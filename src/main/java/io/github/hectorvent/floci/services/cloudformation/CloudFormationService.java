@@ -29,6 +29,7 @@ import io.github.hectorvent.floci.services.cloudformation.model.TemplateSummary;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnDynamicReferences;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.ProvisionContext;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.UpdateCleanupResult;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
@@ -1927,6 +1928,10 @@ public class CloudFormationService implements ResourceProvider {
         boolean updateCommitted = false;
         Set<String> attemptedResourceIds = new LinkedHashSet<>();
         try {
+            if (!isCreate) {
+                recoverResourceOwnership(stack, region, accountId, false);
+                previousState = snapshotForUpdate(stack);
+            }
             Set<String> changedResourceIds = isCreate
                     ? Set.of()
                     : changedResourceIds(stack, templateBody, params, region);
@@ -2983,6 +2988,66 @@ public class CloudFormationService implements ResourceProvider {
         return value;
     }
 
+    private void recoverResourceOwnership(Stack stack, String region, String accountId, boolean deleting)
+            throws CloudFormationTemplateParser.TemplateFormatException {
+        Map<String, StackResource> previous = stack.resourcesSnapshot();
+        List<StackResource> requiringRecovery = previous.values().stream()
+                .filter(dispatcher::requiresOwnershipRecovery)
+                .filter(resource -> !deleting || !retainsResource(resource, false))
+                .toList();
+        if (requiringRecovery.isEmpty()) {
+            return;
+        }
+        JsonNode template = parseTemplate(stack.getTemplateBody());
+        Map<String, String> parameters = stack.resolvedParametersSnapshot().isEmpty()
+                ? resolveDefaultParameters(template, stack.parametersSnapshot()) : stack.resolvedParametersSnapshot();
+        if (stack.resolvedParametersSnapshot().isEmpty()
+                && template.path("Parameters").properties().stream()
+                    .anyMatch(entry -> entry.getValue().path("Type").asText().startsWith("AWS::SSM::Parameter::Value<"))) {
+            throw new AwsException("ValidationError",
+                    "Cannot recover previous ownership without the stored resolved SSM parameters", 400);
+        }
+        Map<String, Boolean> conditions = resolveConditions(template, parameters, stack, region, accountId);
+        Map<String, String> physicalIds = new LinkedHashMap<>();
+        Map<String, Map<String, String>> attributes = new LinkedHashMap<>();
+        previous.forEach((id, resource) -> {
+            if (resource.getPhysicalId() != null) {
+                physicalIds.put(id, resource.getPhysicalId());
+                attributes.put(id, new HashMap<>(resource.getAttributes()));
+            }
+        });
+        Map<String, JsonNode> mappings = new LinkedHashMap<>();
+        template.path("Mappings").properties().forEach(entry -> mappings.put(entry.getKey(), entry.getValue()));
+        CloudFormationTemplateEngine engine = new CloudFormationTemplateEngine(accountId, region,
+                stack.getStackName(), stack.getStackId(), parameters, physicalIds, attributes, conditions,
+                mappings, objectMapper, name -> {
+                    throw new AwsException("ValidationError",
+                            "Cannot recover previous ownership from a live export: " + name, 400);
+                });
+        Map<String, StackResource> recovered = new LinkedHashMap<>();
+        for (StackResource resource : requiringRecovery) {
+            JsonNode definition = template.path("Resources").path(resource.getLogicalId());
+            String condition = definition.path("Condition").asText(null);
+            if (!resource.getResourceType().equals(definition.path("Type").asText())
+                    || (condition != null && !conditions.getOrDefault(condition, false))) {
+                throw new AwsException("ValidationError", "Cannot recover previous ownership for "
+                        + resource.getLogicalId() + " from its stack definition", 400);
+            }
+            StackResource copy = copyResource(resource);
+            dispatcher.recoverOwnership(copy, engine.omitNoValue(definition.path("Properties")),
+                    new ProvisionContext(engine, region, accountId, stack.getStackName(), resource.getPhysicalId()));
+            recovered.put(copy.getLogicalId(), copy);
+        }
+        // Resolve every required owner before publishing any recovered metadata or touching a child.
+        recovered.forEach(stack.getResources()::put);
+        try {
+            persistStack(stack);
+        } catch (RuntimeException failure) {
+            recovered.keySet().forEach(id -> stack.getResources().put(id, previous.get(id)));
+            throw failure;
+        }
+    }
+
     private StackUpdateSnapshot snapshotForUpdate(Stack stack) {
         return new StackUpdateSnapshot(
                 stack.getTemplateBody(),
@@ -3552,6 +3617,7 @@ public class CloudFormationService implements ResourceProvider {
 
     void deleteStackResources(Stack stack, String region, String accountId) {
         try {
+            recoverResourceOwnership(stack, region, accountId, true);
             List<StackResource> resources = resourcesInCreationOrder(stack, region);
             Collections.reverse(resources); // Dependents go before what they depend on
 
@@ -3669,9 +3735,7 @@ public class CloudFormationService implements ResourceProvider {
      */
     private boolean skipRetainedResource(Stack stack, StackResource resource, boolean createRollback) {
         String policy = resource.getDeletionPolicy();
-        boolean retained = "Retain".equals(policy)
-                || (!createRollback && "RetainExceptOnCreate".equals(policy));
-        if (!retained) {
+        if (!retainsResource(resource, createRollback)) {
             return false;
         }
         resource.setStatus("DELETE_SKIPPED");
@@ -3680,6 +3744,11 @@ public class CloudFormationService implements ResourceProvider {
         LOG.infov("Retained {0} ({1}) in stack {2}: DeletionPolicy {3}",
                 resource.getResourceType(), resource.getPhysicalId(), stack.getStackName(), policy);
         return true;
+    }
+
+    private static boolean retainsResource(StackResource resource, boolean createRollback) {
+        String policy = resource.getDeletionPolicy();
+        return "Retain".equals(policy) || (!createRollback && "RetainExceptOnCreate".equals(policy));
     }
 
     private void completeResourceDeletion(Stack stack, StackResource resource) {
