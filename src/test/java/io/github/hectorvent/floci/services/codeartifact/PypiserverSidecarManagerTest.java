@@ -52,8 +52,8 @@ class PypiserverSidecarManagerTest {
 
         manager.stopManagedContainers();
 
-        verify(lifecycleManager).stopAndRemove("tracked-pypiserver-1", null);
-        verify(lifecycleManager).stopAndRemove("tracked-pypiserver-2", null);
+        verify(lifecycleManager).stopAndRemoveStrict("tracked-pypiserver-1", null);
+        verify(lifecycleManager).stopAndRemoveStrict("tracked-pypiserver-2", null);
     }
 
     /**
