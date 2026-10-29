@@ -11,6 +11,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -50,7 +51,6 @@ class PortAllocatorTest {
     void concurrentAllocationsAreUnique() throws Exception {
         PortAllocator allocator = new PortAllocator();
         int threads = 20;
-        // Range must be at least as wide as the thread count
         int base = 19900;
         int max = base + threads - 1;
 
@@ -58,29 +58,37 @@ class PortAllocatorTest {
         CountDownLatch ready = new CountDownLatch(threads);
         CountDownLatch go = new CountDownLatch(1);
         ExecutorService executor = Executors.newFixedThreadPool(threads);
-        List<Future<?>> futures = new ArrayList<>();
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < threads; i++) {
+                futures.add(executor.submit(() -> {
+                    ready.countDown();
+                    try {
+                        assertTrue(go.await(5, TimeUnit.SECONDS), "Allocation workers must be released");
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("Allocation worker interrupted before release", e);
+                    }
+                    ports.add(allocator.allocate(base, max));
+                }));
+            }
 
-        for (int i = 0; i < threads; i++) {
-            futures.add(executor.submit(() -> {
-                ready.countDown();
-                try { go.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-                int p = allocator.allocate(base, max);
-                ports.add(p);
-            }));
+            assertTrue(ready.await(5, TimeUnit.SECONDS), "Allocation workers must become ready");
+            go.countDown();
+            for (Future<?> future : futures) {
+                future.get(5, TimeUnit.SECONDS);
+            }
+            assertEquals(threads, ports.size(),
+                    "Concurrent allocations must all return unique ports; got duplicates: " + ports);
+        } finally {
+            go.countDown();
+            executor.shutdownNow();
+            try {
+                assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "Allocation workers must terminate");
+            } finally {
+                ports.forEach(allocator::release);
+            }
         }
-
-        ready.await();   // all threads are lined up
-        go.countDown();  // release them simultaneously
-
-        for (Future<?> f : futures) {
-            f.get();
-        }
-        executor.shutdown();
-
-        assertEquals(threads, ports.size(),
-                "Concurrent allocations must all return unique ports; got duplicates: " + ports);
-
-        ports.forEach(allocator::release);
     }
 
     @Test
