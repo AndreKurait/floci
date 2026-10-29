@@ -264,3 +264,9 @@ When `FLOCI_AUTH_VALIDATE_SIGNATURES=true`, the shared signature verifier checks
 credentials for STS operations, including `GetCallerIdentity`, `GetSessionToken`, `GetFederationToken`
 and `AssumeRole`. It checks the request signature, credential scope, expiry and session token before
 execution. Nonblank Authorization headers retain priority. See [signature checks](../configuration/multi-account.md#signature-validation).
+
+### AssumeRole duration
+
+AssumeRole applies the target role's `MaxSessionDuration` and limits role chaining to one hour.
+The default duration remains 3,600 seconds. A token-matched GetSessionToken user session is not
+classified as role chaining. These checks run before issuing the new session.

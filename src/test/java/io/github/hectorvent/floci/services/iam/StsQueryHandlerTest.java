@@ -215,6 +215,25 @@ class StsQueryHandlerTest {
      * token's subject is signed and outlives the request that asked for it.
      */
     @Test
+    void iamDisabledAssumeRoleChecksRoleDurationBeforeRegisteringCredentials() {
+        IamService service = mock(IamService.class);
+        IamRole role = new IamRole();
+        role.setRoleName("TestRole");
+        role.setArn("arn:aws:iam::000000000000:role/TestRole");
+        when(service.findRole(anyString(), anyString())).thenReturn(Optional.of(role));
+        StsQueryHandler handler = newHandler(service, new RegionResolver(REGION, "000000000000"));
+        MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
+        parameters.putSingle("RoleArn", role.getArn());
+        parameters.putSingle("RoleSessionName", "too-long");
+        parameters.putSingle("DurationSeconds", "3601");
+        Response response = handler.handle("AssumeRole", parameters);
+        assertEquals(400, response.getStatus());
+        assertTrue(response.getEntity().toString().contains("MaxSessionDuration"));
+        verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(), any(),
+                any(), anyString(), anyString(), anyString());
+    }
+
+    @Test
     void aTemporaryCredentialWithNoLiveSessionIsRefusedRatherThanSignedAsRoot() {
         IamService iamService = mock(IamService.class);
         when(iamService.findEnabledOutboundWebIdentityFederation())
@@ -395,7 +414,11 @@ class StsQueryHandlerTest {
         params.putSingle("RoleSessionName", "test-session");
         params.putSingle("DurationSeconds", durationSeconds);
 
-        Response response = newHandler().handle("AssumeRole", params);
+        IamRole role = new IamRole();
+        role.setRoleName("TestRole");
+        role.setArn(params.getFirst("RoleArn"));
+        role.setMaxSessionDuration(43200);
+        Response response = newHandler(role).handle("AssumeRole", params);
 
         assertEquals(200, response.getStatus(), (String) response.getEntity());
     }
