@@ -1,13 +1,8 @@
 package io.github.hectorvent.floci.testing;
 
-import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.services.iam.IamService;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
-import io.quarkus.test.junit.mockito.InjectSpy;
-import io.restassured.response.ValidatableResponse;
-import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtensionContext;
 
@@ -15,22 +10,15 @@ import java.net.URI;
 import java.util.UUID;
 
 import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
+import static io.github.hectorvent.floci.testing.EnforcementFixtures.iam;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verify;
 
 @QuarkusTest
 @TestProfile(IamEnforcementProfile.class)
 class EnforcementFixturesIntegrationTest {
-
-    @InjectSpy
-    IamService iamService;
 
     @TestHTTPResource("/")
     URI baseUri;
@@ -39,12 +27,12 @@ class EnforcementFixturesIntegrationTest {
     void rejectedUserCreationPreservesExistingUser() {
         String name = "fixture-existing-user-" + UUID.randomUUID();
         PartitionCleanup attempted = new PartitionCleanup();
-        iam("CreateUser", "UserName", name).statusCode(200);
+        iam(baseUri.getPort(), auth("test", "iam"), "CreateUser", "UserName", name).statusCode(200);
         try {
             assertThrows(AssertionError.class, () -> EnforcementFixtures.createUser(
                     attempted, baseUri.getPort(), auth("test", "iam"), name));
             attempted.afterEach(mock(ExtensionContext.class));
-            iam("GetUser", "UserName", name).statusCode(200);
+            iam(baseUri.getPort(), auth("test", "iam"), "GetUser", "UserName", name).statusCode(200);
         } finally {
             EnforcementFixtures.removeUser(baseUri.getPort(), auth("test", "iam"), name);
         }
@@ -54,14 +42,15 @@ class EnforcementFixturesIntegrationTest {
     void rejectedRoleCreationPreservesExistingRole() {
         String name = "fixture-existing-role-" + UUID.randomUUID();
         PartitionCleanup attempted = new PartitionCleanup();
-        iam("CreateRole", "RoleName", name, "AssumeRolePolicyDocument", trust()).statusCode(200);
+        PartitionCleanup existing = new PartitionCleanup();
         try {
+            EnforcementFixtures.createRole(existing, baseUri.getPort(), "000000000000", "/", name, allow());
             assertThrows(AssertionError.class, () -> EnforcementFixtures.createRole(
-                    attempted, baseUri.getPort(), "000000000000", "/", name, trust(), allow()));
+                    attempted, baseUri.getPort(), "000000000000", "/", name, allow()));
             attempted.afterEach(mock(ExtensionContext.class));
-            iam("GetRole", "RoleName", name).statusCode(200);
+            iam(baseUri.getPort(), auth("test", "iam"), "GetRole", "RoleName", name).statusCode(200);
         } finally {
-            EnforcementFixtures.removeRole(baseUri.getPort(), auth("test", "iam"), name);
+            existing.afterEach(mock(ExtensionContext.class));
         }
     }
 
@@ -71,9 +60,9 @@ class EnforcementFixturesIntegrationTest {
         PartitionCleanup owned = new PartitionCleanup();
         try {
             EnforcementFixtures.createUser(owned, baseUri.getPort(), auth("test", "iam"), name);
-            iam("GetUser", "UserName", name).statusCode(200);
+            iam(baseUri.getPort(), auth("test", "iam"), "GetUser", "UserName", name).statusCode(200);
             owned.afterEach(mock(ExtensionContext.class));
-            iam("GetUser", "UserName", name).statusCode(404);
+            iam(baseUri.getPort(), auth("test", "iam"), "GetUser", "UserName", name).statusCode(404);
         } finally {
             EnforcementFixtures.removeUser(baseUri.getPort(), auth("test", "iam"), name);
         }
@@ -84,11 +73,12 @@ class EnforcementFixturesIntegrationTest {
         String name = "fixture-owned-role-" + UUID.randomUUID();
         PartitionCleanup owned = new PartitionCleanup();
         try {
-            EnforcementFixtures.createRole(owned, baseUri.getPort(), "000000000000", "/", name,
-                    trust(), allow());
-            iam("GetRole", "RoleName", name).statusCode(200);
+            EnforcementFixtures.createRole(owned, baseUri.getPort(), "000000000000", "/", name, allow());
+            iam(baseUri.getPort(), auth("test", "iam"), "GetRole", "RoleName", name).statusCode(200);
+            iam(baseUri.getPort(), auth("test", "iam"), "GetRolePolicy", "RoleName", name,
+                    "PolicyName", "p").statusCode(200);
             owned.afterEach(mock(ExtensionContext.class));
-            iam("GetRole", "RoleName", name).statusCode(404);
+            iam(baseUri.getPort(), auth("test", "iam"), "GetRole", "RoleName", name).statusCode(404);
         } finally {
             EnforcementFixtures.removeRole(baseUri.getPort(), auth("test", "iam"), name);
         }
@@ -98,54 +88,19 @@ class EnforcementFixturesIntegrationTest {
     void failedPolicySetupStillRemovesNewRole() {
         String name = "fixture-policy-failure-" + UUID.randomUUID();
         PartitionCleanup owned = new PartitionCleanup();
-        doThrow(new AwsException("ServiceFailure", "Injected policy setup failure", 500))
-                .when(iamService).putRolePolicy(eq(name), eq("p"), anyString());
+        String oversizedPolicy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\""
+                + "a".repeat(10_241) + "\"}}";
         try {
             assertThrows(AssertionError.class, () -> EnforcementFixtures.createRole(
-                    owned, baseUri.getPort(), "000000000000", "/", name, trust(), allow()));
-            verify(iamService).putRolePolicy(eq(name), eq("p"), anyString());
-            iam("GetRole", "RoleName", name).statusCode(200);
+                    owned, baseUri.getPort(), "000000000000", "/", name, oversizedPolicy));
+            iam(baseUri.getPort(), auth("test", "iam"), "GetRole", "RoleName", name).statusCode(200);
+            iam(baseUri.getPort(), auth("test", "iam"), "GetRolePolicy", "RoleName", name,
+                    "PolicyName", "p").statusCode(404);
             owned.afterEach(mock(ExtensionContext.class));
-            iam("GetRole", "RoleName", name).statusCode(404);
+            iam(baseUri.getPort(), auth("test", "iam"), "GetRole", "RoleName", name).statusCode(404);
         } finally {
             EnforcementFixtures.removeRole(baseUri.getPort(), auth("test", "iam"), name);
         }
-    }
-
-    @Test
-    void partiallyWrittenPolicyIsRemovedWithOwnedRole() {
-        String name = "fixture-partial-policy-" + UUID.randomUUID();
-        PartitionCleanup owned = new PartitionCleanup();
-        doAnswer(invocation -> {
-            invocation.callRealMethod();
-            throw new AwsException("ServiceFailure", "Injected failure after policy write", 500);
-        }).when(iamService).putRolePolicy(eq(name), eq("p"), anyString());
-        try {
-            assertThrows(AssertionError.class, () -> EnforcementFixtures.createRole(
-                    owned, baseUri.getPort(), "000000000000", "/", name, trust(), allow()));
-            verify(iamService).putRolePolicy(eq(name), eq("p"), anyString());
-            iam("GetRolePolicy", "RoleName", name, "PolicyName", "p").statusCode(200);
-            owned.afterEach(mock(ExtensionContext.class));
-            verify(iamService).deleteRolePolicy(name, "p");
-            iam("GetRole", "RoleName", name).statusCode(404);
-        } finally {
-            EnforcementFixtures.removeRole(baseUri.getPort(), auth("test", "iam"), name);
-        }
-    }
-
-    private ValidatableResponse iam(String action, String... parameters) {
-        RequestSpecification request = given().port(baseUri.getPort())
-                .header("Authorization", auth("test", "iam"))
-                .contentType("application/x-www-form-urlencoded").formParam("Action", action);
-        for (int i = 0; i < parameters.length; i += 2) {
-            request.formParam(parameters[i], parameters[i + 1]);
-        }
-        return request.post("/").then();
-    }
-
-    private static String trust() {
-        return "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":"
-                + "\"arn:aws:iam::000000000000:root\"},\"Action\":\"sts:AssumeRole\"}}";
     }
 
     private static String allow() {

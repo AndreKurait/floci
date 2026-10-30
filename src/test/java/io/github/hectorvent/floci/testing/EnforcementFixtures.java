@@ -397,7 +397,7 @@ public final class EnforcementFixtures {
     private record ObjectVersion(String key, String versionId) {
     }
 
-    private static ValidatableResponse iam(int port, String authorization, String action,
+    static ValidatableResponse iam(int port, String authorization, String action,
                                            String... params) {
         return query(port, authorization, action, params);
     }
