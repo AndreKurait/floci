@@ -40,6 +40,7 @@ import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.s3.model.TopicNotification;
 import io.github.hectorvent.floci.services.s3.model.WebsiteConfiguration;
 import io.github.hectorvent.floci.services.sns.SnsQueryHandler;
+import io.vertx.ext.web.RoutingContext;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
@@ -280,8 +281,7 @@ public class S3Controller {
                                @Context UriInfo uriInfo,
                                @Context HttpHeaders httpHeaders) {
         try {
-            S3Service.RequestAuthorization authorization = S3RequestAuthorizationParser.parseIfRequired(
-                    s3Service.isAuthEnforced(), httpHeaders, uriInfo);
+            S3Service.RequestAuthorization authorization = requestAuthorization(httpHeaders, uriInfo);
             if (isWebsiteRequest(httpHeaders, uriInfo)) {
                 Response websiteResponse = serveWebsiteObject(bucket, "", authorization, false);
                 if (websiteResponse != null) {
@@ -310,8 +310,7 @@ public class S3Controller {
                                   byte[] body) {
         try {
             validateRawUri();
-            S3Service.RequestAuthorization authorization = S3RequestAuthorizationParser.parseIfRequired(
-                    s3Service.isAuthEnforced(), httpHeaders, uriInfo);
+            S3Service.RequestAuthorization authorization = requestAuthorization(httpHeaders, uriInfo);
             if (hasQueryParam(uriInfo, "notification")) {
                 s3Service.authorizeBucketWrite(bucket, "s3:PutBucketNotification", authorization);
                 return handlePutBucketNotification(bucket, body,
@@ -501,8 +500,7 @@ public class S3Controller {
                                   @Context HttpHeaders httpHeaders) {
         try {
             validateRawUri();
-            S3Service.RequestAuthorization authorization = S3RequestAuthorizationParser.parseIfRequired(
-                    s3Service.isAuthEnforced(), httpHeaders, uriInfo);
+            S3Service.RequestAuthorization authorization = requestAuthorization(httpHeaders, uriInfo);
             if (hasQueryParam(uriInfo, "tagging")) {
                 s3Service.authorizeBucketWrite(bucket, "s3:PutBucketTagging", authorization);
                 s3Service.deleteBucketTagging(bucket);
@@ -605,8 +603,7 @@ public class S3Controller {
                                 @Context HttpHeaders httpHeaders) {
         try {
             validateRawUri();
-            S3Service.RequestAuthorization authorization = S3RequestAuthorizationParser.parseIfRequired(
-                    s3Service.isAuthEnforced(), httpHeaders, uriInfo);
+            S3Service.RequestAuthorization authorization = requestAuthorization(httpHeaders, uriInfo);
             if (hasQueryParam(uriInfo, "uploads")) {
                 s3Service.authorizeBucketRead(bucket, "s3:ListBucketMultipartUploads", authorization);
                 return handleListMultipartUploads(bucket);
@@ -839,8 +836,7 @@ public class S3Controller {
                               InputStream body) {
         try {
             key = extractObjectKey(uriInfo, bucket, key);
-            S3Service.RequestAuthorization authorization = S3RequestAuthorizationParser.parseIfRequired(
-                    s3Service.isAuthEnforced(), httpHeaders, uriInfo);
+            S3Service.RequestAuthorization authorization = requestAuthorization(httpHeaders, uriInfo);
 
             // The sub-resource actions are checked as IAM checks them: as their version counterpart
             // when the request names a version, and offered the tags or Object Lock settings the
@@ -1012,8 +1008,7 @@ public class S3Controller {
         S3Service.RequestAuthorization authorization = S3Service.RequestAuthorization.unsigned();
         try {
             key = extractObjectKey(uriInfo, bucket, key);
-            authorization = S3RequestAuthorizationParser.parseIfRequired(
-                    s3Service.isAuthEnforced(), httpHeaders, uriInfo);
+            authorization = requestAuthorization(httpHeaders, uriInfo);
 
             if (isWebsiteRequest(httpHeaders, uriInfo)) {
                 Response website = serveWebsiteObject(bucket, key, authorization, true);
@@ -1363,8 +1358,7 @@ public class S3Controller {
         S3Service.RequestAuthorization authorization = S3Service.RequestAuthorization.unsigned();
         try {
             key = extractObjectKey(uriInfo, bucket, key);
-            authorization = S3RequestAuthorizationParser.parseIfRequired(
-                    s3Service.isAuthEnforced(), httpHeaders, uriInfo);
+            authorization = requestAuthorization(httpHeaders, uriInfo);
             if (isWebsiteRequest(httpHeaders, uriInfo)) {
                 Response websiteResponse = serveWebsiteObject(bucket, key, authorization, false);
                 if (websiteResponse != null) {
@@ -1526,8 +1520,7 @@ public class S3Controller {
                                  @Context HttpHeaders httpHeaders) {
         try {
             key = extractObjectKey(uriInfo, bucket, key);
-            S3Service.RequestAuthorization authorization = S3RequestAuthorizationParser.parseIfRequired(
-                    s3Service.isAuthEnforced(), httpHeaders, uriInfo);
+            S3Service.RequestAuthorization authorization = requestAuthorization(httpHeaders, uriInfo);
 
             if (hasQueryParam(uriInfo, "tagging")) {
                 s3Service.authorizeObjectWrite(bucket, key, versionId, "s3:DeleteObjectTagging", authorization, null);
@@ -1629,8 +1622,7 @@ public class S3Controller {
                                          byte[] body) {
         try {
             key = extractObjectKey(uriInfo, bucket, key);
-            S3Service.RequestAuthorization authorization = S3RequestAuthorizationParser.parseIfRequired(
-                    s3Service.isAuthEnforced(), httpHeaders, uriInfo);
+            S3Service.RequestAuthorization authorization = requestAuthorization(httpHeaders, uriInfo);
 
             if (hasQueryParam(uriInfo, "uploads")) {
                 ObjectLockHeaders lock = objectLockHeaders(httpHeaders);
@@ -1760,8 +1752,7 @@ public class S3Controller {
         boolean bypass = "true".equalsIgnoreCase(
                 httpHeaders.getHeaderString("x-amz-bypass-governance-retention"));
 
-        S3Service.RequestAuthorization authorization = S3RequestAuthorizationParser.parseIfRequired(
-                s3Service.isAuthEnforced(), httpHeaders, uriInfo);
+        S3Service.RequestAuthorization authorization = requestAuthorization(httpHeaders, uriInfo);
         s3Service.authorizeSignedRequest(authorization);
         String iamCredential = iamCredential(httpHeaders, uriInfo);
         List<XmlParser.KeyVersion> authorizedEntries = new ArrayList<>();
@@ -4070,7 +4061,7 @@ public class S3Controller {
         // Route through the same bucket-policy/ACL check every other S3 write path uses, so this
         // path automatically inherits any future strengthening there too.
         s3Service.authorizeObjectWrite(bucket, key, "s3:PutObject",
-                new S3Service.RequestAuthorization(true, accessKeyId, sessionToken));
+                withTransport(new S3Service.RequestAuthorization(true, accessKeyId, sessionToken)));
 
         validatePolicyExpiration(policy);
         validatePolicyConditions(policy, bucket, fields, contentLength);
@@ -4529,6 +4520,19 @@ public class S3Controller {
             iamEnforcementFilter.authorizeAdditionalResource(
                     credential, action, resource, policyDecision);
         }
+    }
+
+    private S3Service.RequestAuthorization requestAuthorization(HttpHeaders headers, UriInfo uri) {
+        return withTransport(S3RequestAuthorizationParser.parseIfRequired(s3Service.isAuthEnforced(), headers, uri));
+    }
+
+    private S3Service.RequestAuthorization withTransport(S3Service.RequestAuthorization authorization) {
+        RoutingContext routingContext = currentVertxRequest == null ? null : currentVertxRequest.getCurrent();
+        if (routingContext == null || routingContext.request() == null) {
+            return authorization;
+        }
+        return new S3Service.RequestAuthorization(authorization.signed(), authorization.accessKeyId(),
+                authorization.sessionToken(), routingContext.request().isSSL());
     }
 
     /**

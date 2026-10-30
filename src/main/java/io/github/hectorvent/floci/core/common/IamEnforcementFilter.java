@@ -583,9 +583,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 && !conditionContext.getOrDefault("aws:TagKeys", List.of()).isEmpty()) {
             String groupResource = resources.getFirst();
             String taggingResource = groupResource.substring(0, groupResource.length() - 2);
-            Map<String, List<String>> taggingContext = IamConditionContextResolver.withGlobalContext(
+            Map<String, List<String>> taggingContext = withRequestContext(
                     conditionContext, taggingResource, region, accountId, accountId);
-            Map<String, List<String>> groupContext = IamConditionContextResolver.withGlobalContext(
+            Map<String, List<String>> groupContext = withRequestContext(
                     conditionContext, groupResource, region, accountId, accountId);
             if (evaluator.evaluate(caller, null, "logs:TagResource", taggingResource, taggingContext) == Decision.DENY
                     && evaluator.evaluate(caller, null, "logs:TagLogGroup", groupResource, groupContext) == Decision.DENY) {
@@ -1011,7 +1011,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             if (callerArns != null) {
                 callerArns.putPrincipalKeys(context);
             }
-            Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
+            Map<String, List<String>> effectiveContext = withRequestContext(
                     context, connector, region, accountId, accountId);
             if (evaluator.evaluate(caller, null, action, connector, effectiveContext) != Decision.DENY) {
                 continue;
@@ -1182,6 +1182,18 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 .orElse(List.of());
     }
 
+    private Map<String, List<String>> withRequestContext(Map<String, List<String>> serviceContext,
+                                                        String resourceArn, String region,
+                                                        String accountId, String resourceOwnerAccountId) {
+        Map<String, List<String>> context = IamConditionContextResolver.withGlobalContext(
+                serviceContext, resourceArn, region, accountId, resourceOwnerAccountId);
+        RoutingContext routingContext = currentVertxRequest.getCurrent();
+        if (routingContext != null && routingContext.request() != null) {
+            context.put("aws:SecureTransport", List.of(Boolean.toString(routingContext.request().isSSL())));
+        }
+        return context;
+    }
+
     /**
      * Evaluates one action against every resource and target context, aborting the request with
      * AccessDenied on the first DENY. Returns true when the request was aborted.
@@ -1236,7 +1248,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 }
             }
             for (Map<String, List<String>> targetContext : resourceContexts) {
-                Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
+                Map<String, List<String>> effectiveContext = withRequestContext(
                         targetContext, resource, region, accountId, resourceOwnerAccountId);
                 ResourcePolicyDecision resourcePolicyDecision = evaluator.evaluateResourcePolicyFor(
                         effectiveResourcePolicies, principal, action, resource, effectiveContext);
@@ -1381,8 +1393,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * covered by its signed policy document and do not correspond to what {@code S3Controller}
      * actually applies to the uploaded object, so trusting one here would let an attacker satisfy a
      * tag-scoped grant condition with a header the object is never actually tagged with. Only the
-     * caller-identity {@code aws:PrincipalArn} and the server-derived global keys (via {@link
-     * IamConditionContextResolver#withGlobalContext}) are safe to add.
+     * caller-identity {@code aws:PrincipalArn} and the server-derived global keys, including
+     * the connection's TLS state, are safe to add.
      */
     public void authorizeAdditionalResource(
             String authorizationHeader,
@@ -1515,7 +1527,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
             String region = requestContext.getRegion() == null
                     ? config.defaultRegion() : requestContext.getRegion();
-            Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
+            Map<String, List<String>> effectiveContext = withRequestContext(
                     conditionContext, resource, region, accountId, effectiveOwnerAccountId);
             if (effectiveDecision == null) {
                 effectiveDecision = evaluator.evaluateResourcePolicyFor(
