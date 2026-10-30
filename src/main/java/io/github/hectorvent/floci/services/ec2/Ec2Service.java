@@ -10007,15 +10007,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                                         boolean decodeUserData) {
         ensureDefaultResources(region);
         LaunchTemplate launchTemplate = findLaunchTemplate(region, id, name);
-        String resolvedVersion = resolveLaunchTemplateVersion(
-                launchTemplate,
-                version,
-                launchTemplate.getDefaultVersionNumber());
-        LaunchTemplateData data = new LaunchTemplateData(versionData(launchTemplate, resolvedVersion));
-        if (decodeUserData) {
-            data.setUserData(Ec2UserDataDecoder.decodeIfMissing(data.getUserData(), data.getEncodedUserData()));
+        synchronized (launchTemplate) {
+            String resolvedVersion = resolveLaunchTemplateVersion(
+                    launchTemplate,
+                    version,
+                    launchTemplate.getDefaultVersionNumber());
+            LaunchTemplateData data = new LaunchTemplateData(versionData(launchTemplate, resolvedVersion));
+            if (decodeUserData) {
+                data.setUserData(Ec2UserDataDecoder.decodeIfMissing(data.getUserData(), data.getEncodedUserData()));
+            }
+            return data;
         }
-        return data;
     }
 
     public LaunchTemplate deleteLaunchTemplate(String region, String id, String name) {
@@ -10086,6 +10088,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     } else if (!template.getVersions().containsKey(number)) {
                         errorCode = "launchTemplateVersionDoesNotExist";
                         errorMessage = "The specified launch template version does not exist.";
+                    } else if (template.getVersions().size() == 1) {
+                        errorCode = "unexpectedError";
+                        errorMessage = "The last remaining launch template version cannot be deleted.";
                     } else {
                         template.getVersions().remove(number);
                         template.getVersionDescriptions().remove(number);

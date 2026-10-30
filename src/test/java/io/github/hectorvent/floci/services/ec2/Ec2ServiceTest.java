@@ -9046,6 +9046,108 @@ class Ec2ServiceTest {
         return config;
     }
 
+    @Test
+    void templateResolutionCopiesVersionBeforeConcurrentDeletion() throws Exception {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        LaunchTemplateData first = new LaunchTemplateData();
+        first.setImageId("ami-first");
+        LaunchTemplate template = service.createLaunchTemplate("us-east-1", "resolution-race", first, List.of());
+        LaunchTemplateData second = new LaunchTemplateData();
+        second.setImageId("ami-second");
+        service.createLaunchTemplateVersion("us-east-1", template.getLaunchTemplateId(), null, null, second);
+        Map<String, LaunchTemplateData> versions = spy(new LinkedHashMap<>(template.getVersions()));
+        Field versionsField = LaunchTemplate.class.getDeclaredField("versions");
+        versionsField.setAccessible(true);
+        versionsField.set(template, versions);
+        CountDownLatch checked = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Thread> reader = new AtomicReference<>();
+        doAnswer(call -> {
+            boolean present = (boolean) call.callRealMethod();
+            if (Thread.currentThread() == reader.get() && checked.getCount() != 0) {
+                checked.countDown();
+                assertTrue(release.await(5, TimeUnit.SECONDS));
+            }
+            return present;
+        }).when(versions).containsKey("2");
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<LaunchTemplateData> resolved = executor.submit(() -> {
+                reader.set(Thread.currentThread());
+                return service.resolveLaunchTemplateData("us-east-1", template.getLaunchTemplateId(), null, "2");
+            });
+            assertTrue(checked.await(5, TimeUnit.SECONDS));
+            AtomicReference<Thread> deletingThread = new AtomicReference<>();
+            Future<List<Ec2Service.LaunchTemplateVersionDeletion>> deleted = executor.submit(() -> {
+                deletingThread.set(Thread.currentThread());
+                return service.deleteLaunchTemplateVersions("us-east-1", template.getLaunchTemplateId(), null,
+                        List.of("2"), false);
+            });
+            Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> deleted.isDone()
+                    || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED);
+            release.countDown();
+            assertEquals("ami-second", assertDoesNotThrow(() -> resolved.get(5, TimeUnit.SECONDS)).getImageId());
+            assertNull(deleted.get(5, TimeUnit.SECONDS).getFirst().errorCode());
+            assertEquals(Set.of("1"), template.getVersions().keySet());
+        } finally {
+            release.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void deletingOnlyReconstructedLegacyVersionPreservesItsData() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        LaunchTemplateData data = new LaunchTemplateData();
+        data.setImageId("ami-legacy-latest");
+        LaunchTemplate template = service.createLaunchTemplate("us-east-1", "legacy-singleton", data, List.of());
+        template.setVersions(Map.of());
+        template.setLatestVersionNumber("9");
+        template.setDefaultVersionNumber("1");
+        Ec2Service.LaunchTemplateVersionDeletion result = assertDoesNotThrow(() -> service.deleteLaunchTemplateVersions(
+                "us-east-1", template.getLaunchTemplateId(), null, List.of("9"), false)).getFirst();
+        assertEquals("unexpectedError", result.errorCode());
+        assertEquals(Set.of("9"), template.getVersions().keySet());
+        assertEquals("ami-legacy-latest", template.getVersions().get("9").getImageId());
+        assertEquals("9", template.getLatestVersionNumber());
+        assertEquals("1", template.getDefaultVersionNumber());
+    }
+
+    @Test
+    void templateResolutionAfterVersionDeletionReturnsNotFound() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        LaunchTemplate template = service.createLaunchTemplate("us-east-1", "already-deleted-version",
+                new LaunchTemplateData(), List.of());
+        service.createLaunchTemplateVersion("us-east-1", template.getLaunchTemplateId(), null, null,
+                new LaunchTemplateData());
+        service.deleteLaunchTemplateVersions("us-east-1", template.getLaunchTemplateId(), null, List.of("2"), false);
+        AwsException error = assertThrows(AwsException.class, () -> service.resolveLaunchTemplateData(
+                "us-east-1", template.getLaunchTemplateId(), null, "2"));
+        assertEquals("InvalidLaunchTemplateVersion.NotFound", error.getErrorCode());
+        assertNotNull(service.resolveLaunchTemplateData("us-east-1", template.getLaunchTemplateId(), null, "1"));
+    }
+
+    @Test
+    void deletingOnlyDefaultVersionStillReturnsDefaultError() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        LaunchTemplate template = service.createLaunchTemplate("us-east-1", "default-singleton",
+                new LaunchTemplateData(), List.of());
+        Ec2Service.LaunchTemplateVersionDeletion result = service.deleteLaunchTemplateVersions(
+                "us-east-1", template.getLaunchTemplateId(), null, List.of("1"), false).getFirst();
+        assertEquals("unexpectedError", result.errorCode());
+        assertEquals("The default version of a launch template cannot be deleted.", result.errorMessage());
+        assertEquals(Set.of("1"), template.getVersions().keySet());
+    }
+
     private static final class InMemoryStorageFactory extends StorageFactory {
         private final Map<String, AccountAwareStorageBackend<?>> overrides;
         private final jakarta.enterprise.inject.Instance<RequestContext> requestContextInstance;
