@@ -69,6 +69,7 @@ public class SqsService implements Resettable, ResourceProvider {
     private static final Logger LOG = Logger.getLogger(SqsService.class);
     private static final int DEDUP_WINDOW_SECONDS = 300; // 5 minutes
     private static final int DEDUP_LOCK_STRIPES = 256;
+    private static final int MESSAGE_PERSISTENCE_LOCK_STRIPES = 256;
     private static final int MAX_RECEIVE_WAIT_TIME_SECONDS = 20;
     private static final int MAX_BATCH_ENTRIES = 10;
     private static final int MAX_LIST_QUEUES_RESULTS = 1000;
@@ -91,6 +92,7 @@ public class SqsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, Map<String, Map<String, String>>> dedupIdentityStore;
     private final ConcurrentHashMap<String, GuardedMessageQueue> messagesByQueue = new ConcurrentHashMap<>();
     private volatile long queueResetGeneration;
+    private final Object[] messagePersistenceLocks = new Object[MESSAGE_PERSISTENCE_LOCK_STRIPES];
     private final ConcurrentHashMap<String, RedrivePolicy> redrivePolicyCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Instant>> deduplicationCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, DeduplicationIdentity>> deduplicationIdentityCache =
@@ -441,6 +443,9 @@ public class SqsService implements Resettable, ResourceProvider {
         this.requestContextInstance = requestContextInstance;
         this.iamService = iamService;
         this.moveTasksByHandle = new MoveTaskStore(clock);
+        for (int i = 0; i < messagePersistenceLocks.length; i++) {
+            messagePersistenceLocks[i] = new Object();
+        }
         rekeyToAccountAndName(queueStore);
         rekeyToAccountAndName(messageStore);
         rekeyToAccountAndName(dedupStore);
@@ -563,12 +568,12 @@ public class SqsService implements Resettable, ResourceProvider {
         }
         if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware) {
             aware.scanAllAccountsAsMap().forEach((key, msgs) ->
-                    messagesByQueue.put(key, new GuardedMessageQueue(msgs, messageStore, key, receiptHandleSecret)));
+                    messagesByQueue.put(key, newMessageQueue(key, msgs)));
         } else {
             for (String key : messageStore.keys()) {
                 messageStore.get(key).ifPresent(msgs ->
                         messagesByQueue.put(key,
-                                new GuardedMessageQueue(msgs, messageStore, key, receiptHandleSecret)));
+                                newMessageQueue(key, msgs)));
             }
         }
     }
@@ -641,8 +646,16 @@ public class SqsService implements Resettable, ResourceProvider {
     private GuardedMessageQueue getOrCreateQueue(String storageKey) {
         synchronized (messagesByQueue) {
             return messagesByQueue.computeIfAbsent(storageKey,
-                    k -> new GuardedMessageQueue(new ArrayList<>(), messageStore, k, receiptHandleSecret));
+                    k -> newMessageQueue(k, List.of()));
         }
+    }
+
+    private GuardedMessageQueue newMessageQueue(String storageKey, List<Message> initial) {
+        long generation = queueResetGeneration;
+        Object persistenceLock = messagePersistenceLocks[Math.floorMod(storageKey.hashCode(),
+                messagePersistenceLocks.length)];
+        return new GuardedMessageQueue(initial, messageStore, storageKey, receiptHandleSecret,
+                persistenceLock, () -> generation == queueResetGeneration);
     }
 
     private void persistDedup(String storageKey) {
@@ -813,10 +826,9 @@ public class SqsService implements Resettable, ResourceProvider {
         }
 
         queueStore.put(storageKey, queue);
-        GuardedMessageQueue messages = new GuardedMessageQueue(new ArrayList<>(), messageStore, storageKey,
-                receiptHandleSecret);
-        messages.activity().accessed();
         synchronized (messagesByQueue) {
+            GuardedMessageQueue messages = newMessageQueue(storageKey, List.of());
+            messages.activity().accessed();
             messagesByQueue.put(storageKey, messages);
         }
         LOG.infov("Created {0} queue: {1} in region {2}", queue.isFifo() ? "FIFO" : "standard", queueName, region);

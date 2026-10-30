@@ -90,6 +90,8 @@ wake receivers, including internal redrive delivery and visibility changes. A no
 between an empty scan and parking is retained. Nonempty queues retain periodic
 checks for visibility and retention expiry. Deletion, reset and shutdown wake old
 receivers; they cannot claim messages from a replacement queue.
+Reset also fences message-store writes across queue generations. An old write
+that finishes after reset cannot overwrite a replacement queue's persisted messages.
 
 ```bash
 # Enable long polling for every consumer of the queue

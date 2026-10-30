@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -29,6 +30,8 @@ class GuardedMessageQueue {
     private final StorageBackend<String, List<Message>> messageStore;
     private final String storageKey;
     private final String receiptHandleSecret;
+    private final Object persistenceLock;
+    private final BooleanSupplier currentGeneration;
     private final SqsQueueActivity activity = new SqsQueueActivity();
     private volatile boolean closed;
 
@@ -53,6 +56,13 @@ class GuardedMessageQueue {
 
     GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
                         String receiptHandleSecret) {
+        this(initial, messageStore, storageKey, receiptHandleSecret, new Object(), () -> true);
+    }
+
+    GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
+                        String receiptHandleSecret, Object persistenceLock, BooleanSupplier currentGeneration) {
+        this.persistenceLock = persistenceLock;
+        this.currentGeneration = currentGeneration;
         this.messages = new ArrayList<>(initial);
         this.messageStore = messageStore;
         this.storageKey = storageKey;
@@ -403,15 +413,25 @@ class GuardedMessageQueue {
     }
 
     private void persist(boolean notifyReceivers) {
-        if (closed) {
-            return;
-        }
-        if (messageStore != null && storageKey != null) {
-            String accountId = extractAccountFromStorageKey(storageKey);
-            if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware && accountId != null) {
-                aware.putForAccount(accountId, storageKey, new ArrayList<>(messages));
-            } else {
-                messageStore.put(storageKey, new ArrayList<>(messages));
+        // Reset detaches before waiting for queue locks. Serialize old and new generations'
+        // writes on a stable storage-key stripe without reacquiring the queue registry monitor.
+        synchronized (persistenceLock) {
+            if (closed || !currentGeneration.getAsBoolean()) {
+                return;
+            }
+            if (messageStore != null && storageKey != null) {
+                String accountId = extractAccountFromStorageKey(storageKey);
+                if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware && accountId != null) {
+                    aware.putForAccount(accountId, storageKey, new ArrayList<>(messages));
+                    if (!currentGeneration.getAsBoolean()) {
+                        aware.deleteForAccount(accountId, storageKey);
+                    }
+                } else {
+                    messageStore.put(storageKey, new ArrayList<>(messages));
+                    if (!currentGeneration.getAsBoolean()) {
+                        messageStore.delete(storageKey);
+                    }
+                }
             }
         }
         if (notifyReceivers) {
