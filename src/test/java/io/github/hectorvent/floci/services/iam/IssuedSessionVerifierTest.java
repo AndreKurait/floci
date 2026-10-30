@@ -89,6 +89,69 @@ class IssuedSessionVerifierTest {
         }
     }
 
+    private SessionCredential issueInstanceProfile() {
+        sessions.delete(KEY);
+        SessionCredential session = new SessionCredential(KEY, "dummy-secret", "dummy-token",
+                role.getArn(), NOW.plusSeconds(3600), null, ACCOUNT);
+        session.setEc2InstanceId("i-0123456789abcdef0");
+        session.setEc2RoleId(role.getRoleId());
+        session.setAssumedRoleId(role.getRoleId() + ":" + session.getEc2InstanceId());
+        iam.registerEc2InstanceSession(session);
+        return session;
+    }
+
+    @Test
+    void verifiesNativeInstanceProfileWithoutReclassifyingItAsAssumeRole() throws Exception {
+        SessionCredential session = issueInstanceProfile();
+        Identity identity = verifier.verify(proof());
+        assertEquals("EC2_INSTANCE_PROFILE", identity.kind());
+        assertEquals(session.getEc2InstanceId(), identity.roleSessionName());
+        assertEquals(role.getRoleId() + ":" + session.getEc2InstanceId(), identity.principalId());
+        assertTrue(identity.principalArn().endsWith("/worker/" + session.getEc2InstanceId()));
+        assertEquals(identity.principalArn(), verifier.lookup(Map.of(
+                "correlationId", "lookup", "accessKeyId", KEY)).principalArn());
+        String response = json.writeValueAsString(identity);
+        for (String privateValue : List.of(KEY, "dummy-token", "dummy-secret", proof().get("signature"))) {
+            assertFalse(response.contains(privateValue));
+        }
+        sessions.delete(KEY);
+        Map<String, String> request = proof();
+        assertThrows(IllegalArgumentException.class, () -> verifier.verify(request));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"accessKeyId", "sessionToken", "stringToSign", "signature"})
+    void verifiesEveryInstanceProfileProofField(String field) throws Exception {
+        issueInstanceProfile();
+        Map<String, String> request = proof();
+        request.put(field, field.equals("signature") ? "0".repeat(64) : request.get(field) + "x");
+        assertThrows(IllegalArgumentException.class, () -> verifier.verify(request));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"instance", "role-id", "principal", "origin", "expired", "nonexpiring",
+            "mixed-assume-role", "mixed-lambda", "role-replaced", "policy"})
+    void refusesInvalidOrMixedInstanceProfileIssuance(String mutation) throws Exception {
+        SessionCredential session = issueInstanceProfile();
+        switch (mutation) {
+            case "instance" -> session.setEc2InstanceId("i-invalid");
+            case "role-id" -> session.setEc2RoleId("AROADIFFERENT");
+            case "principal" -> session.setAssumedRoleId(role.getRoleId() + ":another-instance");
+            case "origin" -> session.setOriginAccountId("999999999999");
+            case "expired" -> session.setExpiration(NOW);
+            case "nonexpiring" -> session.setExpiration(null);
+            case "mixed-assume-role" -> session.setAssumeRoleIssued(true);
+            case "mixed-lambda" -> session.setLambdaExecutionRole(true);
+            case "role-replaced" -> role.setRoleId("AROAREPLACEMENT");
+            case "policy" -> session.setManagedSessionPolicyPresent(true);
+            default -> fail();
+        }
+        Map<String, String> request = proof();
+        assertThrows(IllegalArgumentException.class, () -> verifier.verify(request));
+        assertThrows(IllegalArgumentException.class,
+                () -> verifier.lookup(Map.of("correlationId", "lookup", "accessKeyId", KEY)));
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"accessKeyId", "sessionToken", "stringToSign", "signature"})
     void rejectsEachTamperedProofComponent(String field) throws Exception {
