@@ -5894,11 +5894,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         new HashSet<>(groupIds), byId, policyPrefixLists(region, current));
             }
 
-            inst.setSecurityGroups(new ArrayList<>(identifiers));
-            if (inst.getNetworkInterfaces() != null) {
-                inst.getNetworkInterfaces().forEach(eni -> eni.setGroups(new ArrayList<>(identifiers)));
+            synchronized (attachmentTopologyLock(region)) {
+                inst.setSecurityGroups(new ArrayList<>(identifiers));
+                if (inst.getNetworkInterfaces() != null) {
+                    for (InstanceNetworkInterface eni : inst.getNetworkInterfaces()) {
+                        eni.setGroups(new ArrayList<>(identifiers));
+                        networkInterfaces.get(key(region, eni.getNetworkInterfaceId())).ifPresent(stored -> {
+                            NetworkInterfaceAttachment attachment = stored.getAttachment();
+                            if (attachment != null && instanceId.equals(attachment.getInstanceId())) {
+                                stored.setGroups(new ArrayList<>(identifiers));
+                                networkInterfaces.put(key(region, stored.getNetworkInterfaceId()), stored);
+                            }
+                        });
+                    }
+                }
+                instances.put(key(region, instanceId), inst);
             }
-            instances.put(key(region, instanceId), inst);
 
             if (config.services().ec2().publishSecurityGroupPorts() && !config.services().ec2().mock()
                     && inst.getDockerContainerId() != null
