@@ -141,7 +141,11 @@ public class S3Service implements Resettable, ResourceProvider {
     /** Last {@code s3.object.sequencer} handed out, in microseconds since the epoch. */
     private final AtomicLong lastEventSequencer = new AtomicLong();
 
-    record RequestAuthorization(boolean signed, String accessKeyId, String sessionToken) {
+    record RequestAuthorization(boolean signed, String accessKeyId, String sessionToken, Boolean secureTransport) {
+        RequestAuthorization(boolean signed, String accessKeyId, String sessionToken) {
+            this(signed, accessKeyId, sessionToken, null);
+        }
+
         static RequestAuthorization unsigned() {
             return new RequestAuthorization(false, null, null);
         }
@@ -1563,7 +1567,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 RequestPrincipal.caller(caller),
                 action,
                 resourceArn,
-                bucketPolicyContext(caller, requestConditions));
+                bucketPolicyContext(caller, authorization, requestConditions));
 
         if (decision == ResourcePolicyDecision.EXPLICIT_DENY) {
             throw accessDeniedException(bucketName, key);
@@ -1607,13 +1611,16 @@ public class S3Service implements Resettable, ResourceProvider {
      * {@code aws:PrincipalArn} is the role's ARN. {@code requestConditions}, when present, are the keys
      * the request itself offers, such as an object creation's tags and Object Lock settings.
      */
-    private static Map<String, List<String>> bucketPolicyContext(CallerArns caller,
+    private static Map<String, List<String>> bucketPolicyContext(CallerArns caller, RequestAuthorization authorization,
                                                                  Map<String, List<String>> requestConditions) {
         Map<String, List<String>> context = new HashMap<>();
         if (requestConditions != null) {
             context.putAll(requestConditions);
         }
         context.put("aws:PrincipalIsAWSService", List.of("false"));
+        if (authorization != null && authorization.secureTransport() != null) {
+            context.put("aws:SecureTransport", List.of(authorization.secureTransport().toString()));
+        }
         if (caller != null) {
             caller.putPrincipalKeys(context);
         }
@@ -1666,7 +1673,7 @@ public class S3Service implements Resettable, ResourceProvider {
                         RequestPrincipal.caller(caller.get()),
                         action,
                         resourceArn,
-                        bucketPolicyContext(caller.get(), null));
+                        bucketPolicyContext(caller.get(), authorization, null));
         return new SignedPrincipalResourcePolicyEvaluation(decision, ownedBucket.account());
     }
 
