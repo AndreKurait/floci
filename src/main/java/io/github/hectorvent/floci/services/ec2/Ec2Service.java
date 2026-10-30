@@ -14989,6 +14989,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     .orElseThrow(() -> new AwsException("InvalidAttachmentID.NotFound",
                             "The attachment ID '" + attachmentId + "' does not exist", 400));
             NetworkInterfaceAttachment detached = ni.getAttachment();
+            if (detached.getDeviceIndex() == 0) {
+                throw new AwsException("OperationNotPermitted",
+                        "The primary network interface of an instance cannot be detached", 400);
+            }
             ni.setAttachment(null);
             ni.setStatus("available");
             networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);

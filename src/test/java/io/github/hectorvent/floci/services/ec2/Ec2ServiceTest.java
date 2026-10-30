@@ -4931,6 +4931,63 @@ class Ec2ServiceTest {
         assertNotNull(readInterface(service, interfaceId).getAttachment());
     }
 
+    @ParameterizedTest
+    @CsvSource({"false,running", "true,running", "false,stopped", "true,stopped"})
+    void primaryInterfaceCannotBeDetachedBeforeTermination(boolean force, String state) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.238.0.0/24");
+        NetworkInterface primary = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        String interfaceId = primary.getNetworkInterfaceId();
+        Instance owner = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), null, null, List.of(), null, null, null, interfaceId, 0).getInstances().getFirst();
+        owner.setState("stopped".equals(state) ? InstanceState.stopped() : InstanceState.running());
+        String attachment = primary.getAttachment().getAttachmentId();
+        String address = primary.getPrivateIpAddress();
+        service.createTags(region, List.of(interfaceId), List.of(new Tag("retained", "value")));
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.detachNetworkInterface(region, attachment, force));
+        assertEquals("OperationNotPermitted", error.getErrorCode());
+        assertEquals(attachment, readInterface(service, interfaceId).getAttachment().getAttachmentId());
+        assertEquals("in-use", primary.getStatus());
+        assertEquals(address, primary.getPrivateIpAddress());
+        assertEquals(interfaceId, owner.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+        assertEquals(address, owner.getPrivateIpAddress());
+        assertEquals(state, owner.getState().getName());
+        assertEquals("value", service.resourceTags(region, interfaceId).getFirst().getValue());
+        service.terminateInstances(region, List.of(owner.getInstanceId()));
+        assertNull(readInterface(service, interfaceId).getAttachment());
+        assertEquals("available", primary.getStatus());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void secondaryInterfaceCanBeDetachedWithoutChangingPrimary(boolean force) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.239.0.0/24");
+        Instance owner = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        owner.setState(InstanceState.running());
+        String primary = owner.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        String address = owner.getPrivateIpAddress();
+        String secondary = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        String attachment = service.attachNetworkInterface(region, secondary, owner.getInstanceId(), 1)
+                .getAttachmentId();
+        service.detachNetworkInterface(region, attachment, force);
+        assertNull(readInterface(service, secondary).getAttachment());
+        assertEquals("available", readInterface(service, secondary).getStatus());
+        assertEquals(1, owner.getNetworkInterfaces().size());
+        assertEquals(primary, owner.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+        assertEquals(address, owner.getPrivateIpAddress());
+        assertEquals("InvalidAttachmentID.NotFound", assertThrows(AwsException.class,
+                () -> service.detachNetworkInterface(region, attachment, force)).getErrorCode());
+        assertEquals("MissingParameter", assertThrows(AwsException.class,
+                () -> service.detachNetworkInterface(region, null, force)).getErrorCode());
+    }
+
     @Test
     void terminationDoesNotReleaseAnInterfaceReattachedAfterItsInstanceSnapshot() {
         Ec2Service service = tagTestService(new InMemoryStorageFactory());
