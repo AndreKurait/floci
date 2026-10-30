@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.ec2.net;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ConnectToNetworkCmd;
 import com.github.dockerjava.api.command.CreateNetworkCmd;
@@ -10,6 +12,7 @@ import com.github.dockerjava.api.command.ListNetworksCmd;
 import com.github.dockerjava.api.command.RemoveNetworkCmd;
 import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
@@ -491,6 +494,14 @@ class VpcNetworkManagerTest {
         verify(connect).withContainerId("floci-container");
         verify(connect).withContainerId("instance-1");
         verify(connect, times(2)).withNetworkId(networkName);
+        ArgumentCaptor<ContainerNetwork> endpoints = ArgumentCaptor.forClass(ContainerNetwork.class);
+        verify(connect, times(2)).withContainerNetwork(endpoints.capture());
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode flociEndpoint = mapper.valueToTree(endpoints.getAllValues().get(0));
+        JsonNode guestEndpoint = mapper.valueToTree(endpoints.getAllValues().get(1));
+        assertEquals(-1, flociEndpoint.required("GwPriority").intValue());
+        assertFalse(guestEndpoint.has("GwPriority"), "guest routing retains Docker's default priority");
+        assertEquals(address, guestEndpoint.path("IPAMConfig").path("IPv4Address").asText());
     }
 
     @Test

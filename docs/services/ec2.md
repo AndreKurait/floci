@@ -1281,6 +1281,13 @@ For overlapping VPC CIDRs, the first VPC whose addresses are needed keeps the de
 later VPCs use the fallback pool. Within one emulator run, allocated addresses remain on the
 same effective range.
 
+When Floci runs in Docker, use Docker Engine 28 or newer for VPC networking.
+Floci joins each VPC with gateway priority `-1`, keeping its default gateway and
+published API ports on the original network (whose Docker default priority is `0`).
+The EC2 guests retain their normal gateway priority. Older engines ignore this
+endpoint setting and can interrupt API connections when a VPC is attached or deleted.
+If you explicitly configure gateway priorities, keep Floci's original network above `-1`.
+
 When Floci runs in Docker, deleting a VPC disconnects Floci's own container before removing
 the VPC network. Other endpoints are not forcibly disconnected: removal retries while they
 drain, up to five attempts two seconds apart. After successful removal, a new VPC can reuse
