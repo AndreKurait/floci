@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Authorizer;
@@ -53,6 +54,7 @@ class HttpAuthorizerPermissionTest {
     private UriInfo uri;
     private CurrentVertxRequest currentVertxRequest;
     private SocketAddress remoteAddress;
+    private IamPolicyEvaluator.Decision roleDecision;
 
     @BeforeEach
     void setUp() {
@@ -140,9 +142,11 @@ class HttpAuthorizerPermissionTest {
     }
 
     @Test
-    void configuredRoleRetainsItsSeparatePath() {
+    void configuredRoleDenialStopsInvocation() {
         authorizer.setAuthorizerCredentialsArn("arn:aws:iam::000000000000:role/authorizer");
-        assertEquals(200, invoke("2.0"));
+        roleDecision = IamPolicyEvaluator.Decision.DENY;
+        assertEquals(500, invoke("2.0"));
+        verifyNoInteractions(lambda);
     }
 
     @Test
@@ -278,9 +282,12 @@ class HttpAuthorizerPermissionTest {
 
         ApiGatewayExecuteRouteContext routeContext = new ApiGatewayExecuteRouteContext(currentVertxRequest);
         routeContext.routeToHttpApi("us-east-1");
+        ServiceRoleCallAuthorizer roles = mock(ServiceRoleCallAuthorizer.class);
+        when(roles.authorizeWithoutSourceContext(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenAnswer(call -> roleDecision);
         return new ApiGatewayExecuteController(null, null, gateway, lambda,
                 new RegionResolver("us-east-1", "000000000000"), mapper, null, null, null, null, null,
-                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), serviceCallAuthorizer);
+                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), serviceCallAuthorizer, roles);
     }
 
     private InvokeResult result(String payload) {

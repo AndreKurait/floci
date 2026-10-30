@@ -27,6 +27,7 @@ import io.github.hectorvent.floci.core.common.CookieHeaders;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
 import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.ApiKey;
@@ -123,6 +124,7 @@ public class ApiGatewayExecuteController {
     private final ApiGatewayV2Service apiGatewayV2Service;
     private final LambdaService lambdaService;
     private final ServiceCallAuthorizer serviceCallAuthorizer;
+    private final ServiceRoleCallAuthorizer serviceRoleCallAuthorizer;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
     private final Configuration jsonPathConfiguration;
@@ -152,12 +154,14 @@ public class ApiGatewayExecuteController {
                                        RequestContext requestContext,
                                        ExecuteApiSigV4Authorizer sigV4Authorizer, RestLambdaAuthorizer restLambdaAuthorizer,
                                        AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
-                                       ServiceCallAuthorizer serviceCallAuthorizer) {
+                                       ServiceCallAuthorizer serviceCallAuthorizer,
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer) {
         this.apiGatewayService = apiGatewayService;
         this.cognitoAuthorizer = cognitoAuthorizer;
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.lambdaService = lambdaService;
         this.serviceCallAuthorizer = serviceCallAuthorizer;
+        this.serviceRoleCallAuthorizer = serviceRoleCallAuthorizer;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
         this.jsonPathConfiguration = Configuration.builder()
@@ -3312,21 +3316,26 @@ public class ApiGatewayExecuteController {
         // Invoke the authorizer Lambda
         InvokeResult invokeResult;
         try {
-            if (authorizer.getAuthorizerCredentialsArn() == null
-                    || authorizer.getAuthorizerCredentialsArn().isBlank()) {
-                String accountId = regionResolver.getAccountId();
-                String functionArn = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
-                        region, accountId);
+            String accountId = regionResolver.getAccountId();
+            String functionArn = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
+                    region, accountId);
+            String credentials = authorizer.getAuthorizerCredentialsArn();
+            Decision decision;
+            if (credentials == null || credentials.isBlank()) {
                 String sourceArn = AwsArnUtils.Arn.of("execute-api", region, accountId,
                         apiId + "/authorizers/" + route.getAuthorizerId()).toString();
-                if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
-                        sourceArn, accountId) == Decision.DENY) {
-                    return new RequestAuthorizerResult(Response.status(500)
-                            .entity(jsonMessage("Internal Server Error"))
-                            .type(MediaType.APPLICATION_JSON).build(), null);
-                }
+                decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                        sourceArn, accountId);
+            } else {
+                decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                        "lambda:InvokeFunction", functionArn, accountId, regionResolver.getPartition());
             }
-            invokeResult = lambdaService.invokeTarget(region, functionName,
+            if (decision == Decision.DENY) {
+                return new RequestAuthorizerResult(Response.status(500)
+                        .entity(jsonMessage("Internal Server Error"))
+                        .type(MediaType.APPLICATION_JSON).build(), null);
+            }
+            invokeResult = lambdaService.invokeTarget(region, functionArn,
                     eventJson.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
         } catch (Exception e) {
             LOG.warnv(e, "Lambda REQUEST authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());

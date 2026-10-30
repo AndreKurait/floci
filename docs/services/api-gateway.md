@@ -999,3 +999,5 @@ owner and region, the source ARN `<api-id>/authorizers/<authorizer-id>`, and the
 qualified Lambda target. Missing permission returns HTTP 500 before invocation;
 missing identity still returns HTTP 401 first. Configured authorizer roles retain
 their separate execution path. This check does not implement role assumption.
+
+HTTP API REQUEST Lambda authorizers with configured execution roles check API-owner role trust and Lambda invocation permissions when IAM enforcement is enabled. Role identity policies, resource policies, permissions boundaries and SCPs are evaluated against the same qualified target used for invocation. Absent credentials retain service-principal resource-policy authorization. Authorizer credentials support role ARNs, not the integration caller-credentials sentinel. Actual execution-role STS session issuance and full condition-context forwarding are not modeled by this check.
