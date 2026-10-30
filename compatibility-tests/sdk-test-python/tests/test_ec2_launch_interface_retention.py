@@ -45,6 +45,9 @@ def test_primary_interface_retention(ec2_client, via_template, supplied_interfac
     with ExitStack() as cleanup:
         vpc = ec2.create_vpc(CidrBlock="10.238.0.0/24")["Vpc"]["VpcId"]
         cleanup.callback(ec2.delete_vpc, VpcId=vpc)
+        group = ec2.create_security_group(
+            GroupName=name, Description="replacement interface group", VpcId=vpc)["GroupId"]
+        cleanup.callback(ec2.delete_security_group, GroupId=group)
         subnet = ec2.create_subnet(VpcId=vpc, CidrBlock="10.238.0.0/26")["Subnet"]["SubnetId"]
         cleanup.callback(ec2.delete_subnet, SubnetId=subnet)
         image = ec2.register_image(
@@ -96,7 +99,12 @@ def test_primary_interface_retention(ec2_client, via_template, supplied_interfac
             return ec2.describe_network_interfaces(
                 Filters=[{"Name": "network-interface-id", "Values": [eni_id]}])["NetworkInterfaces"]
 
+        ec2.modify_instance_attribute(InstanceId=instance_id, Groups=[group])
         before = interfaces()[0]
+        assert [entry["GroupId"] for entry in before["Groups"]] == [group]
+        with pytest.raises(ClientError):
+            ec2.modify_instance_attribute(InstanceId=instance_id, Groups=["sg-00000000000000000"])
+        assert interfaces()[0]["Groups"] == before["Groups"]
         assert before["Attachment"]["DeleteOnTermination"] == expected_delete
         assert before["TagSet"] == [{"Key": "Name", "Value": name}]
         ec2.stop_instances(InstanceIds=[instance_id])

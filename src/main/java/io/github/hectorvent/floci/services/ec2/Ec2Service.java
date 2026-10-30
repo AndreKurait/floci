@@ -5914,7 +5914,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
         inst.setSecurityGroups(new ArrayList<>(identifiers));
         if (inst.getNetworkInterfaces() != null) {
-            inst.getNetworkInterfaces().forEach(eni -> eni.setGroups(new ArrayList<>(identifiers)));
+            inst.getNetworkInterfaces().forEach(eni -> {
+                eni.setGroups(new ArrayList<>(identifiers));
+                networkInterfaces.get(key(region, eni.getNetworkInterfaceId())).ifPresent(standalone -> {
+                    standalone.setGroups(new ArrayList<>(identifiers));
+                    networkInterfaces.put(key(region, standalone.getNetworkInterfaceId()), standalone);
+                });
+            });
         }
         instances.put(key(region, instanceId), inst);
 

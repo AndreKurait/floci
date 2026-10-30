@@ -154,6 +154,43 @@ import static org.mockito.Mockito.withSettings;
 class Ec2ServiceTest {
 
     @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false"})
+    void changedInstanceGroupsReachRetainedInterfaceSnapshots(boolean supplied, boolean deleteOnTermination) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        SecurityGroup next = service.createSecurityGroup(region, "replacement-groups",
+                "replacement groups", subnet.getVpcId());
+        String suppliedId = supplied ? service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of(), List.of(), List.of()).getNetworkInterfaceId() : null;
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), supplied ? null : subnet.getSubnetId(), null, List.of(), null, null,
+                null, suppliedId, 0, null, null, null, null, false, null, null, List.of(), false,
+                null, null, deleteOnTermination).getInstances().getFirst();
+        String interfaceId = instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        List<String> groups = List.of(next.getGroupId());
+
+        service.modifyInstanceGroups(region, instance.getInstanceId(), groups);
+
+        assertEquals(groups, service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of())
+                .networkInterfaces().getFirst().getGroups().stream().map(GroupIdentifier::getGroupId).toList());
+        assertEquals(groups, service.describeInstances(region, List.of(instance.getInstanceId()), Map.of())
+                .getFirst().getInstances().getFirst().getSecurityGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+        assertThrows(AwsException.class, () -> service.modifyInstanceGroups(region, instance.getInstanceId(),
+                List.of("sg-missing")));
+        assertEquals(groups, service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of())
+                .networkInterfaces().getFirst().getGroups().stream().map(GroupIdentifier::getGroupId).toList());
+        service.terminateInstances(region, List.of(instance.getInstanceId()));
+        if (!deleteOnTermination) {
+            NetworkInterface retained = service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of())
+                    .networkInterfaces().getFirst();
+            assertEquals(groups, retained.getGroups().stream().map(GroupIdentifier::getGroupId).toList());
+            assertEquals("available", retained.getStatus());
+        }
+    }
+
+    @ParameterizedTest
     @CsvSource({
             "false, aws:autoscaling:groupName", "true, aws:autoscaling:groupName",
             "false, AWS:custom", "true, AWS:custom",
