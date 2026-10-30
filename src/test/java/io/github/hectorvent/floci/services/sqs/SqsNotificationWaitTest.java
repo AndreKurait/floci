@@ -3,12 +3,16 @@ package io.github.hectorvent.floci.services.sqs;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.Queue;
+import io.github.hectorvent.floci.testing.ParkingStore;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -20,6 +24,85 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class SqsNotificationWaitTest {
     private static final String REGION = "us-east-1";
+
+    @Test
+    void aReceiveResolvedBeforeResetCannotConsumeFromTheRecreatedQueue() throws Exception {
+        ParkingStore<Queue> storage = new ParkingStore<>();
+        SqsService service = new SqsService(storage, 30, 1048576, "http://localhost:4566", Clock.systemUTC());
+        Queue queue = service.createQueue("reset-incarnation", null, REGION);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            storage.parkNextRead();
+            Future<List<Message>> receive = executor.submit(
+                    () -> service.receiveMessage(queue.getQueueUrl(), 1, 30, 20, REGION));
+            assertTrue(storage.awaitParked());
+            storage.clear();
+            service.clear();
+            Queue replacement = service.createQueue("reset-incarnation", null, REGION);
+            service.sendMessage(replacement.getQueueUrl(), "new incarnation", null, null, null, REGION);
+            storage.release();
+            assertTrue(receive.get(2, TimeUnit.SECONDS).isEmpty(),
+                    "A receive holding pre-reset metadata must not claim a post-reset delivery");
+            List<Message> messages = service.receiveMessage(replacement.getQueueUrl(), 1, 30, 0, REGION);
+            assertEquals(1, messages.size());
+            assertEquals("new incarnation", messages.getFirst().getBody());
+        } finally {
+            storage.release();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS));
+            service.stop();
+        }
+    }
+
+    @Test
+    void resetDetachesOldQueuesBeforeClosingAndPreservesNewIncarnations() throws Exception {
+        InMemoryStorage<String, Queue> storage = new InMemoryStorage<>();
+        SqsService service = new SqsService(storage, 30, 1048576, "http://localhost:4566", Clock.systemUTC());
+        Queue queue = service.createQueue("reset-close", null, REGION);
+        Field field = SqsService.class.getDeclaredField("messagesByQueue");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        ConcurrentHashMap<String, GuardedMessageQueue> queues =
+                (ConcurrentHashMap<String, GuardedMessageQueue>) field.get(service);
+        String key = queues.keySet().iterator().next();
+        CountDownLatch closing = new CountDownLatch(1);
+        CountDownLatch releaseClose = new CountDownLatch(1);
+        GuardedMessageQueue old = new GuardedMessageQueue(null, null) {
+            @Override
+            void close() {
+                closing.countDown();
+                try {
+                    assertTrue(releaseClose.await(2, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(e);
+                }
+                super.close();
+            }
+        };
+        queues.put(key, old).close();
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            storage.clear();
+            Future<?> reset = executor.submit(service::clear);
+            assertTrue(closing.await(2, TimeUnit.SECONDS));
+            assertTrue(queues.isEmpty(), "Reset must detach its old incarnations before closing them");
+            Queue replacement = service.createQueue("reset-close", null, REGION);
+            assertEquals(queue.getQueueUrl(), replacement.getQueueUrl());
+            service.sendMessage(replacement.getQueueUrl(), "post-reset delivery", null, REGION);
+            releaseClose.countDown();
+            reset.get(2, TimeUnit.SECONDS);
+            assertTrue(old.isClosed());
+            assertFalse(queues.get(key).isClosed());
+            assertEquals("post-reset delivery",
+                    service.receiveMessage(replacement.getQueueUrl(), 1, 30, 0, REGION).getFirst().getBody());
+        } finally {
+            releaseClose.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS));
+            service.stop();
+        }
+    }
 
     @Test
     void anIdleLongPollDoesNotReadStorageOncePerSecond() throws Exception {

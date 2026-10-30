@@ -90,6 +90,7 @@ public class SqsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, Map<String, Long>> dedupStore;
     private final StorageBackend<String, Map<String, Map<String, String>>> dedupIdentityStore;
     private final ConcurrentHashMap<String, GuardedMessageQueue> messagesByQueue = new ConcurrentHashMap<>();
+    private volatile long queueResetGeneration;
     private final ConcurrentHashMap<String, RedrivePolicy> redrivePolicyCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Instant>> deduplicationCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, DeduplicationIdentity>> deduplicationIdentityCache =
@@ -456,8 +457,13 @@ public class SqsService implements Resettable, ResourceProvider {
     }
 
     public void clear() {
-        messagesByQueue.values().forEach(GuardedMessageQueue::close);
-        messagesByQueue.clear();
+        List<GuardedMessageQueue> removed;
+        synchronized (messagesByQueue) {
+            queueResetGeneration++;
+            removed = new ArrayList<>(messagesByQueue.values());
+            messagesByQueue.clear();
+        }
+        removed.forEach(GuardedMessageQueue::close);
         redrivePolicyCache.clear();
         deduplicationCache.clear();
         deduplicationIdentityCache.clear();
@@ -633,8 +639,10 @@ public class SqsService implements Resettable, ResourceProvider {
     }
 
     private GuardedMessageQueue getOrCreateQueue(String storageKey) {
-        return messagesByQueue.computeIfAbsent(storageKey,
-                k -> new GuardedMessageQueue(new ArrayList<>(), messageStore, k, receiptHandleSecret));
+        synchronized (messagesByQueue) {
+            return messagesByQueue.computeIfAbsent(storageKey,
+                    k -> new GuardedMessageQueue(new ArrayList<>(), messageStore, k, receiptHandleSecret));
+        }
     }
 
     private void persistDedup(String storageKey) {
@@ -808,7 +816,9 @@ public class SqsService implements Resettable, ResourceProvider {
         GuardedMessageQueue messages = new GuardedMessageQueue(new ArrayList<>(), messageStore, storageKey,
                 receiptHandleSecret);
         messages.activity().accessed();
-        messagesByQueue.put(storageKey, messages);
+        synchronized (messagesByQueue) {
+            messagesByQueue.put(storageKey, messages);
+        }
         LOG.infov("Created {0} queue: {1} in region {2}", queue.isFifo() ? "FIFO" : "standard", queueName, region);
         return queue;
     }
@@ -1416,6 +1426,7 @@ public class SqsService implements Resettable, ResourceProvider {
 
     public List<Message> receiveMessage(String queueUrl, int maxMessages, int visibilityTimeout,
                                         Integer waitTimeSeconds, String region) {
+        long resetGeneration = queueResetGeneration;
         String storageKey = regionKey(region, queueUrl);
         Queue queue = getQueueByUrl(storageKey, queueUrl)
                 .orElseThrow(() -> new AwsException("AWS.SimpleQueueService.NonExistentQueue",
@@ -1435,7 +1446,13 @@ public class SqsService implements Resettable, ResourceProvider {
         // The queue incarnation this call polls against. DeleteQueue removes it
         // from messagesByQueue (and CreateQueue registers a fresh instance), so
         // an identity change tells a parked long poll that its queue is gone.
-        GuardedMessageQueue polledQueue = getOrCreateQueue(storageKey);
+        GuardedMessageQueue polledQueue;
+        synchronized (messagesByQueue) {
+            if (resetGeneration != queueResetGeneration) {
+                return Collections.emptyList();
+            }
+            polledQueue = getOrCreateQueue(storageKey);
+        }
 
         while (true) {
             long observed = polledQueue.changeVersion();
