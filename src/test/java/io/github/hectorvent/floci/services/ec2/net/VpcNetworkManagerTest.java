@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -446,6 +447,60 @@ class VpcNetworkManagerTest {
         verify(docker.createNetworkCmd()).withIpam(ipam.capture());
         assertEquals("10.0.0.0/16", ipam.getValue().getConfig().get(0).getSubnet());
         verify(docker.connectToNetworkCmd()).withContainerId("container-1");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void createsVpcNetworksWithTheConfiguredInternalSetting(boolean internal) {
+        when(config.services().ec2().vpcNetworks().internal()).thenReturn(internal);
+        manager.declareVpc(REGION, "vpc-1", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-1", "subnet-a", "10.0.1.0/24");
+        String address = manager.allocatePrivateIp(REGION, "subnet-a").orElseThrow();
+
+        assertTrue(manager.attach(REGION, "vpc-1", "subnet-a", "container-1", address).isPresent());
+
+        verify(docker.createNetworkCmd()).withInternal(internal);
+        verify(docker.connectToNetworkCmd()).withContainerId("container-1");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void adoptsAnExistingVpcNetworkWithTheSameInternalSetting(boolean internal) {
+        when(config.services().ec2().vpcNetworks().internal()).thenReturn(internal);
+        String name = manager.networkName(REGION, "vpc-1");
+        existingNetwork(name, "10.0.0.0/16", ourLabels("vpc-1", "4650"));
+        when(existingNetworks.getFirst().getInternal()).thenReturn(internal);
+        manager.declareVpc(REGION, "vpc-1", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-1", "subnet-a", "10.0.1.0/24");
+        String address = manager.allocatePrivateIp(REGION, "subnet-a").orElseThrow();
+
+        assertTrue(manager.attach(REGION, "vpc-1", "subnet-a", "container-1", address).isPresent());
+
+        verify(docker, never()).createNetworkCmd();
+        assertTrue(removedNetworks.isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void preservesAndRefusesAnExistingVpcNetworkWithADifferentInternalSetting(boolean internal) {
+        when(config.services().ec2().vpcNetworks().internal()).thenReturn(internal);
+        String name = manager.networkName(REGION, "vpc-1");
+        existingNetwork(name, "10.0.0.0/16", ourLabels("vpc-1", "4650"),
+                Map.of("retained-guest", mock(Network.ContainerNetworkConfig.class)));
+        when(existingNetworks.getFirst().getInternal()).thenReturn(!internal);
+        manager.declareVpc(REGION, "vpc-1", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-1", "subnet-a", "10.0.1.0/24");
+        String address = manager.allocatePrivateIp(REGION, "subnet-a").orElseThrow();
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager.attach(REGION, "vpc-1", "subnet-a", "container-1", address));
+
+        assertTrue(failure.getMessage().contains("different internal setting"));
+        verify(docker, never()).createNetworkCmd();
+        verify(docker, never()).connectToNetworkCmd();
+        verify(docker, never()).disconnectFromNetworkCmd();
+        assertTrue(removedNetworks.isEmpty());
+        assertTrue(existingNetworks.getFirst().getContainers().containsKey("retained-guest"));
     }
 
     @Test
