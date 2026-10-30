@@ -63,7 +63,7 @@ class WebSocketAuthorizerPermissionIntegrationTest {
     @CsvSource({"000000000000,us-east-1", "343434343434,us-west-2"})
     void handshakeRequiresQualifiedGrantAndRechecksAfterRevocation(String targetOwner, String targetRegion)
             throws Exception {
-        Fixture fixture = fixture(targetOwner, targetRegion);
+        Fixture fixture = fixture(targetOwner, targetRegion, null);
         invoke(fixture, 500);
         String source = sourceArn(fixture, REGION);
         add(fixture, new Grant(null, "apigateway.amazonaws.com", source, OWNER));
@@ -80,7 +80,43 @@ class WebSocketAuthorizerPermissionIntegrationTest {
         verifyInvocations(fixture, 1);
     }
 
-    private Fixture fixture(String targetOwner, String targetRegion) throws Exception {
+    @ParameterizedTest
+    @CsvSource({"000000000000,us-east-1", "343434343434,eu-west-1"})
+    void configuredRoleRequiresTrustIdentityAndQualifiedResource(String owner, String region) throws Exception {
+        String roleName = "authorizer-" + UUID.randomUUID().toString().substring(0, 8);
+        String roleArn = "arn:aws:iam::" + OWNER + ":role/service-role/" + roleName;
+        Fixture fixture = fixture(owner, region, roleArn);
+        invoke(fixture, 500);
+        String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},"
+                + "\"Action\":\"sts:AssumeRole\"}}";
+        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", roleName)));
+        iam("CreateRole", Map.of("RoleName", roleName, "Path", "/service-role/", "AssumeRolePolicyDocument", trust));
+        invoke(fixture, 500);
+        String policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\""
+                + fixture.arn() + "\"}}";
+        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke")));
+        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke", "PolicyDocument", policy));
+        if (!OWNER.equals(owner)) {
+            invoke(fixture, 500);
+            lambdaRequest(owner, region).queryParam("Qualifier", "live")
+                    .body(Map.of("StatementId", "invoke", "Action", "lambda:InvokeFunction", "Principal", roleArn))
+                    .post("/2015-03-31/functions/" + fixture.name() + "/policy").then().statusCode(201);
+        }
+        invoke(fixture, 101);
+        verifyInvocations(fixture, 1);
+        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke",
+                "PolicyDocument", policy.replace("Allow", "Deny")));
+        invoke(fixture, 500);
+        verifyInvocations(fixture, 1);
+    }
+
+    private static void iam(String action, Map<String, String> parameters) {
+        given().header("Authorization", EnforcementFixtures.auth(OWNER, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", action)
+                .formParam("Version", "2010-05-08").formParams(parameters).post("/").then().statusCode(200);
+    }
+
+    private Fixture fixture(String targetOwner, String targetRegion, String credentials) throws Exception {
         ApiGatewayV2Client gateway = ApiGatewayV2Client.builder().endpointOverride(baseUri).region(Region.of(REGION))
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(OWNER, "test"))).build();
         cleanup.register(gateway::close);
@@ -108,7 +144,7 @@ class WebSocketAuthorizerPermissionIntegrationTest {
         String auth = gateway.createAuthorizer(request -> request.apiId(api).name("permission")
                 .authorizerType("REQUEST").authorizerUri("arn:aws:apigateway:" + targetRegion
                         + ":lambda:path/2015-03-31/functions/" + arn + "/invocations")
-                .identitySource(List.of("$request.header.Authorization"))).authorizerId();
+                .authorizerCredentialsArn(credentials).identitySource(List.of("$request.header.Authorization"))).authorizerId();
         String integration = gateway.createIntegration(request -> request.apiId(api).integrationType("MOCK")
                 .requestTemplates(Map.of("application/json", "{\"statusCode\":200}"))).integrationId();
         gateway.createRoute(request -> request.apiId(api).routeKey("$connect").authorizationType("CUSTOM")

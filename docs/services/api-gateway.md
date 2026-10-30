@@ -999,3 +999,5 @@ the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
 qualified Lambda target. Missing permission returns the existing authorizer
 configuration error before invocation. Configured authorizer roles retain their
 separate execution path; this check does not implement role assumption.
+
+WebSocket REQUEST Lambda authorizers with configured credentials check the API owner's IAM role trust and Lambda invocation permissions when IAM enforcement is enabled. The role must trust API Gateway; shared identity/resource policy, permissions boundary and SCP evaluation applies to the same qualified function invoked. Foreign-account targets also require a resource grant. Missing credentials retain Lambda resource-policy authorization. Full service trust condition context and actual issued execution-role STS sessions are not modeled by this check.
