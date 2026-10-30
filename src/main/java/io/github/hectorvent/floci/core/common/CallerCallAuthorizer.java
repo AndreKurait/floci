@@ -44,6 +44,11 @@ public class CallerCallAuthorizer {
         this.scpProvider = scpProvider;
     }
 
+    /** Whether endpoints require authenticated callers for opt-in IAM policy evaluation. */
+    public boolean enforcementEnabled() {
+        return config.services().iam().enforcementEnabled();
+    }
+
     /**
      * The entry point must verify the signature before supplying this identity. Re-resolving it
      * here preserves current policy, session and boundary state without trusting request headers.
@@ -68,7 +73,7 @@ public class CallerCallAuthorizer {
 
     private Decision authorize(String accessKey, String account, String callerArn, String action,
                                String resourceArn, String partition, Map<String, List<String>> requestContext) {
-        if (!config.services().iam().enforcementEnabled()) {
+        if (!enforcementEnabled()) {
             return Decision.ALLOW;
         }
         if (accessKey == null || account == null || !AwsArnUtils.isArn(callerArn)

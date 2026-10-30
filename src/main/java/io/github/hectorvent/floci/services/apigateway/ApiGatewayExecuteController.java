@@ -23,6 +23,7 @@ import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.CookieHeaders;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -226,6 +227,47 @@ public class ApiGatewayExecuteController {
         return URLDecoder.decode(rawConnectionId, StandardCharsets.UTF_8);
     }
 
+    private Response handleConnectionRequest(String method, String apiId, String stageName,
+                                             String connectionId, HttpHeaders headers, UriInfo uriInfo, byte[] body) {
+        Optional<ApiGatewayV2Service.ApiOwner> owner = apiGatewayV2Service.findApiOwner(apiId);
+        if (owner.isEmpty()) {
+            return Response.status(403).entity(jsonMessage("Forbidden"))
+                    .type(MediaType.APPLICATION_JSON).build();
+        }
+        ApiGatewayV2Service.ApiOwner apiOwner = owner.get();
+        applyApiOwnerContext(apiOwner);
+        if (callerCallAuthorizer.enforcementEnabled()) {
+            ExecuteApiSigV4Authorizer.Result signature = sigV4Authorizer.authorize(
+                    method, headers, uriInfo, body, routeContext.signedRequestPath());
+            if (!signature.authorized()) {
+                return httpApiIamRejection(signature);
+            }
+            ExecuteApiSigV4Authorizer.CallerIdentity caller = signature.identity();
+            String resource = AwsArnUtils.Arn.of("execute-api", apiOwner.region(), apiOwner.accountId(),
+                    apiId + "/" + stageName + "/" + method + "/@connections").toString();
+            if (callerCallAuthorizer.authorizeRequest(caller == null ? null : caller.accessKey(),
+                    caller == null ? null : caller.accountId(), caller == null ? null : caller.userArn(),
+                    "execute-api:ManageConnections", resource, AwsRegions.partitionFor(apiOwner.region()),
+                    routeContext.sourceIp(), isSecureTransport(uriInfo)) != Decision.ALLOW) {
+                return Response.status(403).entity(jsonMessage("Forbidden"))
+                        .type(MediaType.APPLICATION_JSON).build();
+            }
+        }
+        ConnectionInfo info = webSocketConnectionManager.getConnectionInfo(connectionId);
+        if (info == null || !apiId.equals(info.getApiId()) || !stageName.equals(info.getStageName())
+                || !apiOwner.region().equals(info.getRegion())) {
+            return Response.status(410)
+                    .entity(new AwsErrorResponse("GoneException", "GoneException"))
+                    .type(MediaType.APPLICATION_JSON).build();
+        }
+        return switch (method) {
+            case "GET" -> handleGetConnectionInfo(connectionId);
+            case "POST" -> handlePostToConnection(connectionId, body);
+            case "DELETE" -> handleDeleteConnection(connectionId);
+            default -> throw new IllegalArgumentException("Unsupported connection method: " + method);
+        };
+    }
+
     /** Maximum payload size for @connections POST (128 KB, matching AWS limit). */
     private static final int MAX_CONNECTIONS_PAYLOAD_BYTES = 128 * 1024;
 
@@ -286,7 +328,7 @@ public class ApiGatewayExecuteController {
                               @PathParam("proxy") String proxy) {
         if (isWebSocketConnectionRequest(apiId, proxy)) {
             String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
-            return handleGetConnectionInfo(connectionId);
+            return handleConnectionRequest("GET", apiId, stageName, connectionId, headers, uriInfo, null);
         }
         return dispatch("GET", apiId, stageName, proxy, headers, uriInfo, null);
     }
@@ -301,7 +343,7 @@ public class ApiGatewayExecuteController {
                                byte[] body) {
         if (isWebSocketConnectionRequest(apiId, proxy)) {
             String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
-            return handlePostToConnection(connectionId, body);
+            return handleConnectionRequest("POST", apiId, stageName, connectionId, headers, uriInfo, body);
         }
         return dispatch("POST", apiId, stageName, proxy, headers, uriInfo, body);
     }
@@ -326,7 +368,7 @@ public class ApiGatewayExecuteController {
                                  @PathParam("proxy") String proxy) {
         if (isWebSocketConnectionRequest(apiId, proxy)) {
             String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
-            return handleDeleteConnection(connectionId);
+            return handleConnectionRequest("DELETE", apiId, stageName, connectionId, headers, uriInfo, null);
         }
         return dispatch("DELETE", apiId, stageName, proxy, headers, uriInfo, null);
     }
