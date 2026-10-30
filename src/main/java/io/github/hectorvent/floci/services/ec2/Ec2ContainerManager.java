@@ -1366,10 +1366,12 @@ public class Ec2ContainerManager {
         instance.setPrivateIpAddress(privateIp);
         instance.setPrivateDnsName(privateDnsName);
         if (instance.getNetworkInterfaces() != null) {
-            instance.getNetworkInterfaces().forEach(networkInterface -> {
-                networkInterface.setPrivateIpAddress(privateIp);
-                networkInterface.setPrivateDnsName(privateDnsName);
-            });
+            instance.getNetworkInterfaces().stream()
+                    .filter(networkInterface -> networkInterface.getDeviceIndex() == 0)
+                    .forEach(networkInterface -> {
+                        networkInterface.setPrivateIpAddress(privateIp);
+                        networkInterface.setPrivateDnsName(privateDnsName);
+                    });
         }
     }
 

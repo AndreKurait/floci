@@ -88,30 +88,40 @@ class Ec2RuntimeInterfaceAddressIntegrationTest {
                 String subnet = client.createSubnet(b -> b.vpcId(vpc).cidrBlock("10.241.0.0/24"))
                         .subnet().subnetId();
                 try (AutoCloseable deleteSubnet = () -> client.deleteSubnet(b -> b.subnetId(subnet))) {
-                    String host = client.runInstances(b -> b.imageId("ami-1234567890abcdef0").instanceType("t3.micro")
-                            .minCount(1).maxCount(1).networkInterfaces(InstanceNetworkInterfaceSpecification.builder()
-                                    .deviceIndex(0).subnetId(subnet).deleteOnTermination(false).build()))
-                            .instances().getFirst().instanceId();
-                    String eni = client.describeInstances(b -> b.instanceIds(host)).reservations().getFirst()
-                            .instances().getFirst().networkInterfaces().getFirst().networkInterfaceId();
-                    try (AutoCloseable deleteEni = () -> client.deleteNetworkInterface(b -> b.networkInterfaceId(eni));
-                         AutoCloseable terminate = () -> client.terminateInstances(b -> b.instanceIds(host))) {
-                        assertEquals("172.17.0.81", client.describeNetworkInterfaces(b -> b.networkInterfaceIds(eni))
-                                .networkInterfaces().getFirst().privateIpAddress());
-                        if (restore) {
-                            service.restoreMetadataRegistrations();
-                        } else {
-                            service.findInstanceForAccount(account, "us-east-1", host).orElseThrow()
-                                    .setState(InstanceState.stopped());
-                            client.startInstances(b -> b.instanceIds(host));
+                    String secondary = client.createNetworkInterface(b -> b.subnetId(subnet)
+                            .privateIpAddress("10.241.0.201")).networkInterface().networkInterfaceId();
+                    try (AutoCloseable deleteSecondary = () -> client.deleteNetworkInterface(b -> b.networkInterfaceId(secondary))) {
+                        String host = client.runInstances(b -> b.imageId("ami-1234567890abcdef0").instanceType("t3.micro")
+                                .minCount(1).maxCount(1).networkInterfaces(InstanceNetworkInterfaceSpecification.builder()
+                                        .deviceIndex(0).subnetId(subnet).deleteOnTermination(false).build()))
+                                .instances().getFirst().instanceId();
+                        String eni = client.describeInstances(b -> b.instanceIds(host)).reservations().getFirst()
+                                .instances().getFirst().networkInterfaces().getFirst().networkInterfaceId();
+                        try (AutoCloseable deleteEni = () -> client.deleteNetworkInterface(b -> b.networkInterfaceId(eni));
+                             AutoCloseable terminate = () -> client.terminateInstances(b -> b.instanceIds(host))) {
+                            client.attachNetworkInterface(b -> b.networkInterfaceId(secondary).instanceId(host).deviceIndex(1));
+                            assertEquals("172.17.0.81", client.describeNetworkInterfaces(b -> b.networkInterfaceIds(eni))
+                                    .networkInterfaces().getFirst().privateIpAddress());
+                            if (restore) {
+                                service.restoreMetadataRegistrations();
+                            } else {
+                                service.findInstanceForAccount(account, "us-east-1", host).orElseThrow()
+                                        .setState(InstanceState.stopped());
+                                client.startInstances(b -> b.instanceIds(host));
+                            }
+                            String instanceIp = client.describeInstances(b -> b.instanceIds(host)).reservations()
+                                    .getFirst().instances().getFirst().privateIpAddress();
+                            assertEquals("172.17.0.82", instanceIp);
+                            assertEquals("10.241.0.201", client.describeInstances(b -> b.instanceIds(host))
+                                    .reservations().getFirst().instances().getFirst().networkInterfaces().stream()
+                                    .filter(ni -> ni.attachment().deviceIndex() == 1).findFirst().orElseThrow().privateIpAddress());
+                            assertEquals("10.241.0.201", client.describeNetworkInterfaces(b -> b.networkInterfaceIds(secondary))
+                                    .networkInterfaces().getFirst().privateIpAddress());
+                            assertEquals(instanceIp, client.describeNetworkInterfaces(b -> b.networkInterfaceIds(eni))
+                                    .networkInterfaces().getFirst().privateIpAddress());
+                            assertEquals(instanceIp, client.describeNetworkInterfaces(b -> b.networkInterfaceIds(eni))
+                                    .networkInterfaces().getFirst().privateIpAddresses().getFirst().privateIpAddress());
                         }
-                        String instanceIp = client.describeInstances(b -> b.instanceIds(host)).reservations()
-                                .getFirst().instances().getFirst().privateIpAddress();
-                        assertEquals("172.17.0.82", instanceIp);
-                        assertEquals(instanceIp, client.describeNetworkInterfaces(b -> b.networkInterfaceIds(eni))
-                                .networkInterfaces().getFirst().privateIpAddress());
-                        assertEquals(instanceIp, client.describeNetworkInterfaces(b -> b.networkInterfaceIds(eni))
-                                .networkInterfaces().getFirst().privateIpAddresses().getFirst().privateIpAddress());
                     }
                 }
             }

@@ -224,6 +224,20 @@ class Ec2ServiceTest {
         List<Tag> interfaceTags = List.copyOf(before.getTagSet());
         List<String> secondaryAddresses = before.getPrivateIpAddresses().stream().filter(ip -> !ip.isPrimary())
                 .map(NetworkInterfacePrivateIpAddress::getPrivateIpAddress).toList();
+        NetworkInterface secondary = service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of("172.31.0.223"), List.of(), List.of(new Tag("secondary", "preserved")));
+        String secondaryId = secondary.getNetworkInterfaceId();
+        host.setState(InstanceState.running());
+        service.attachNetworkInterface(region, secondaryId, host.getInstanceId(), 1);
+        String secondaryIp = secondary.getPrivateIpAddress();
+        String secondaryDns = secondary.getPrivateDnsName();
+        List<NetworkInterfacePrivateIpAddress> secondaryIps = List.copyOf(secondary.getPrivateIpAddresses());
+        List<GroupIdentifier> secondaryGroups = List.copyOf(secondary.getGroups());
+        List<Tag> secondaryTags = List.copyOf(secondary.getTagSet());
+        // The primary is selected by device index, not by list position.
+        InstanceNetworkInterface primaryView = host.getNetworkInterfaces().getFirst();
+        InstanceNetworkInterface secondaryView = host.getNetworkInterfaces().getLast();
+        host.setNetworkInterfaces(new ArrayList<>(List.of(secondaryView, primaryView)));
         host.setDockerContainerId("runtime-sync");
         host.setState(restore ? InstanceState.running() : InstanceState.stopped());
         when(config.services().ec2().mock()).thenReturn(false);
@@ -255,6 +269,23 @@ class Ec2ServiceTest {
         assertEquals(interfaceTags, after.getTagSet());
         assertEquals(secondaryAddresses, after.getPrivateIpAddresses().stream().filter(ip -> !ip.isPrimary())
                 .map(NetworkInterfacePrivateIpAddress::getPrivateIpAddress).toList());
+        Instance described = service.describeInstances(region, List.of(host.getInstanceId()), Map.of())
+                .getFirst().getInstances().getFirst();
+        InstanceNetworkInterface describedSecondary = described.getNetworkInterfaces().stream()
+                .filter(eni -> eni.getDeviceIndex() == 1).findFirst().orElseThrow();
+        assertEquals(secondaryIp, describedSecondary.getPrivateIpAddress());
+        assertEquals(secondaryDns, describedSecondary.getPrivateDnsName());
+        assertEquals(expected, described.getNetworkInterfaces().stream()
+                .filter(eni -> eni.getDeviceIndex() == 0).findFirst().orElseThrow().getPrivateIpAddress());
+        NetworkInterface storedSecondary = service.describeNetworkInterfaces(region, List.of(secondaryId), Map.of())
+                .networkInterfaces().getFirst();
+        assertEquals(secondaryIp, storedSecondary.getPrivateIpAddress());
+        assertEquals(secondaryDns, storedSecondary.getPrivateDnsName());
+        assertEquals(secondaryIps, storedSecondary.getPrivateIpAddresses());
+        assertEquals("172.31.0.223", storedSecondary.getPrivateIpAddresses().stream()
+                .filter(address -> !address.isPrimary()).findFirst().orElseThrow().getPrivateIpAddress());
+        assertEquals(secondaryGroups, storedSecondary.getGroups());
+        assertEquals(secondaryTags, storedSecondary.getTagSet());
         if (restore) {
             verify(docker, never()).startContainerCmd("runtime-sync");
         } else {

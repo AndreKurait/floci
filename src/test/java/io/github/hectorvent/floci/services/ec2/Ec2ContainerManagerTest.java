@@ -1303,6 +1303,41 @@ class Ec2ContainerManagerTest {
         verify(harness.metadataServer).registerContainer("172.18.0.9", "i-waitip", instance);
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void launchPreservesSecondaryInterfaceAddress(boolean faithful) throws Exception {
+        LaunchHarness harness = launchHarness();
+        when(harness.config.services().ec2().awsFaithfulPrivateIp()).thenReturn(faithful);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse response = inspectResponse("172.18.0.9");
+        when(inspect.exec()).thenReturn(response);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+        Instance instance = instance("i-secondary-launch");
+        instance.setPrivateIpAddress("10.0.1.10");
+        InstanceNetworkInterface primary = new InstanceNetworkInterface();
+        primary.setDeviceIndex(0);
+        primary.setPrivateIpAddress("10.0.1.10");
+        InstanceNetworkInterface secondary = new InstanceNetworkInterface();
+        secondary.setDeviceIndex(1);
+        secondary.setPrivateIpAddress("10.0.1.20");
+        secondary.setPrivateDnsName("secondary-dns");
+        instance.setNetworkInterfaces(List.of(secondary, primary));
+        CountDownLatch completed = new CountDownLatch(1);
+        try {
+            harness.manager.launch(instance, ResolvedAmiImage.minimal("ubuntu:24.04"), null, "us-west-2",
+                    Set.of(), List.of(), Map.of(), completed::countDown);
+            assertTrue(completed.await(5, TimeUnit.SECONDS));
+            assertEquals("running", instance.getState().getName());
+            assertEquals(faithful ? "10.0.1.10" : "172.18.0.9", instance.getPrivateIpAddress());
+            assertEquals(instance.getPrivateIpAddress(), primary.getPrivateIpAddress());
+            assertEquals("10.0.1.20", secondary.getPrivateIpAddress());
+            assertEquals("secondary-dns", secondary.getPrivateDnsName());
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
     @Test
     void launchTerminatesWhenContainerBridgeIpNeverAppears() throws Exception {
         Ec2ContainerManager.containerBridgeIpAttempts = 2;

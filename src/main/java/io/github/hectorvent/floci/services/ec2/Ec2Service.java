@@ -1040,6 +1040,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 return;
             }
             for (InstanceNetworkInterface attached : instance.getNetworkInterfaces()) {
+                if (attached.getDeviceIndex() != 0) {
+                    continue;
+                }
                 NetworkInterface standalone = networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware
                         ? aware.getForAccount(accountId, key(region, attached.getNetworkInterfaceId())).orElse(null)
                         : networkInterfaces.get(key(region, attached.getNetworkInterfaceId())).orElse(null);
