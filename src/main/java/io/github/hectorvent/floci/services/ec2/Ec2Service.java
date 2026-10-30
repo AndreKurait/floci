@@ -13134,9 +13134,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         "Address " + address.getPublicIp() + " is in use.", 400);
             }
             if (address.getAssociationId() != null) {
-                NetworkInterface ni = networkInterfaces.get(key(region, address.getNetworkInterfaceId())).orElse(null);
-                String vpcId = ni != null ? ni.getVpcId()
-                        : getRequiredInstance(region, address.getInstanceId()).getVpcId();
+                String vpcId = associatedAddressVpcId(region, address);
                 if (!getRequiredVpc(region, vpcId).isDefault()) {
                     throw new AwsException("InvalidIPAddress.InUse",
                             "Address " + address.getPublicIp() + " is in use.", 400);
@@ -13145,6 +13143,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             addresses.delete(key(region, allocationId));
         }
+    }
+
+    private String associatedAddressVpcId(String region, Address address) {
+        NetworkInterface ni = networkInterfaces.get(key(region, address.getNetworkInterfaceId())).orElse(null);
+        if (ni != null) {
+            return ni.getVpcId();
+        }
+        String instanceId = address.getInstanceId();
+        if (instanceId == null && address.getNetworkInterfaceId() != null) {
+            instanceId = instances.scan(k -> k.startsWith(region + "::")).stream()
+                    .filter(host -> host.getNetworkInterfaces() != null && host.getNetworkInterfaces().stream()
+                            .anyMatch(eni -> address.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())))
+                    .map(Instance::getInstanceId)
+                    .findFirst().orElse(null);
+        }
+        return getRequiredInstance(region, instanceId).getVpcId();
     }
 
     private void releaseInterfaceAddresses(String region, String networkInterfaceId, boolean deleted) {

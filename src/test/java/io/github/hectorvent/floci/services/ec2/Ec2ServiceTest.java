@@ -172,6 +172,55 @@ import static org.mockito.Mockito.withSettings;
 class Ec2ServiceTest {
 
     @ParameterizedTest
+    @CsvSource({"false,false,false", "false,false,true", "false,true,false", "false,true,true",
+            "true,false,false", "true,false,true", "true,true,false", "true,true,true"})
+    void releaseAddressKeepsVpcContextAfterFailedLaunch(boolean supplied, boolean defaultVpc,
+                                                       boolean clearAttribution) throws Exception {
+        EmulatorConfig config = mockConfig(true);
+        Ec2ContainerManager manager = new Ec2ContainerManager(mock(ContainerBuilder.class),
+                mock(ContainerLifecycleManager.class), mock(ContainerLogStreamer.class),
+                mock(ContainerDetector.class), mock(DockerHostResolver.class), mock(DockerClient.class),
+                mock(PortAllocator.class), config, mock(Ec2MetadataServer.class),
+                mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class), mock(ExecutorService.class), Duration.ofSeconds(1));
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnet = defaultVpc ? service.describeSubnets(region, List.of(), Map.of()).getFirst().getSubnetId()
+                : service.createSubnet(region, service.createVpc(region, "10.237.0.0/24", false).getVpcId(),
+                        "10.237.0.0/26", "us-east-1a").getSubnetId();
+        String suppliedId = supplied ? service.createNetworkInterface(region, subnet, null,
+                null, List.of(), List.of(), List.of()).getNetworkInterfaceId() : null;
+        Instance host = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null, List.of(),
+                subnet, null, List.of(), null, null, null, suppliedId, 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        String association = service.associateAddress(region, address.getAllocationId(), host.getInstanceId()).getAssociationId();
+        String interfaceId = address.getNetworkInterfaceId();
+        Method failLaunch = Ec2ContainerManager.class.getDeclaredMethod("failLaunch", Instance.class);
+        failLaunch.setAccessible(true);
+        failLaunch.invoke(manager, host);
+        assertEquals("terminated", host.getState().getName());
+        if (clearAttribution) {
+            Address described = service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).getFirst();
+            assertNull(described.getInstanceId());
+            assertEquals(interfaceId, described.getNetworkInterfaceId());
+            assertEquals(association, described.getAssociationId());
+        }
+        if (!defaultVpc) {
+            AwsException error = assertThrows(AwsException.class,
+                    () -> service.releaseAddress(region, address.getAllocationId()));
+            assertEquals("InvalidIPAddress.InUse", error.getErrorCode());
+            assertEquals(association, address.getAssociationId());
+            assertEquals(interfaceId, address.getNetworkInterfaceId());
+            service.disassociateAddress(region, association);
+        }
+        service.releaseAddress(region, address.getAllocationId());
+        assertTrue(service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).isEmpty());
+    }
+
+    @ParameterizedTest
     @CsvSource({"false,false,false,start", "true,false,false,start", "false,true,false,start",
             "true,true,false,start", "false,false,true,start", "false,false,false,restore",
             "true,false,false,restore", "false,true,false,restore", "true,true,false,restore",

@@ -12,6 +12,7 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.Address;
+import software.amazon.awssdk.services.ec2.model.Ec2Exception;
 import software.amazon.awssdk.services.ec2.model.Filter;
 import software.amazon.awssdk.services.ec2.model.InstanceNetworkInterfaceSpecification;
 import software.amazon.awssdk.services.ec2.model.NetworkInterfaceStatus;
@@ -21,6 +22,7 @@ import java.net.URI;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
@@ -28,6 +30,76 @@ class Ec2DeadHostAddressIntegrationTest {
 
     @Inject
     Ec2Service service;
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void releasesImplicitInterfaceAddressAfterTerminalReadback(boolean defaultVpc) throws Exception {
+        String account = "000000000000";
+        try (Ec2Client client = Ec2Client.builder()
+                .endpointOverride(URI.create("http://localhost:" + RestAssured.port))
+                .region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(account, "test")))
+                .build()) {
+            String vpc = defaultVpc ? client.describeVpcs(b -> b.filters(Filter.builder()
+                    .name("is-default").values("true").build())).vpcs().getFirst().vpcId()
+                    : client.createVpc(b -> b.cidrBlock("10.238.0.0/24")).vpc().vpcId();
+            String subnet = null;
+            String host = null;
+            String allocation = null;
+            try {
+                subnet = defaultVpc ? client.describeSubnets(b -> b.filters(Filter.builder()
+                        .name("vpc-id").values(vpc).build())).subnets().getFirst().subnetId()
+                        : client.createSubnet(b -> b.vpcId(vpc).cidrBlock("10.238.0.0/24")).subnet().subnetId();
+                String selectedSubnet = subnet;
+                host = client.runInstances(b -> b.imageId("ami-1234567890abcdef0").instanceType("t3.micro")
+                        .minCount(1).maxCount(1).subnetId(selectedSubnet)).instances().getFirst().instanceId();
+                allocation = client.allocateAddress().allocationId();
+                String selectedHost = host;
+                String selectedAllocation = allocation;
+                String association = client.associateAddress(b -> b.allocationId(selectedAllocation)
+                        .instanceId(selectedHost)).associationId();
+                // Model the terminal state produced by failed launch; the service test runs the failure method.
+                service.findInstanceForAccount(account, "us-east-1", host).orElseThrow()
+                        .setState(InstanceState.terminated());
+                Address address = client.describeAddresses(b -> b.allocationIds(selectedAllocation))
+                        .addresses().getFirst();
+                assertNull(address.instanceId());
+                assertEquals(association, address.associationId());
+                if (!defaultVpc) {
+                    Ec2Exception error = assertThrows(Ec2Exception.class,
+                            () -> client.releaseAddress(b -> b.allocationId(selectedAllocation)));
+                    assertEquals("InvalidIPAddress.InUse", error.awsErrorDetails().errorCode());
+                    assertEquals(association, client.describeAddresses(b -> b.allocationIds(selectedAllocation))
+                            .addresses().getFirst().associationId());
+                    client.disassociateAddress(b -> b.associationId(association));
+                }
+                client.releaseAddress(b -> b.allocationId(selectedAllocation));
+                allocation = null;
+                assertTrue(client.describeAddresses(b -> b.allocationIds(selectedAllocation)).addresses().isEmpty());
+            } finally {
+                if (allocation != null) {
+                    String remainingAllocation = allocation;
+                    Address remaining = client.describeAddresses(b -> b.allocationIds(remainingAllocation))
+                            .addresses().getFirst();
+                    if (remaining.associationId() != null) {
+                        client.disassociateAddress(b -> b.associationId(remaining.associationId()));
+                    }
+                    client.releaseAddress(b -> b.allocationId(remainingAllocation));
+                }
+                if (host != null) {
+                    String remainingHost = host;
+                    client.terminateInstances(b -> b.instanceIds(remainingHost));
+                }
+                if (!defaultVpc) {
+                    if (subnet != null) {
+                        String remainingSubnet = subnet;
+                        client.deleteSubnet(b -> b.subnetId(remainingSubnet));
+                    }
+                    client.deleteVpc(b -> b.vpcId(vpc));
+                }
+            }
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
