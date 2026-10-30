@@ -9,8 +9,13 @@ final class SqsResetAdmission {
     private static final long DRAIN_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(5);
 
     private final ThreadLocal<Integer> depth = ThreadLocal.withInitial(() -> 0);
+    private final Runnable recovery;
     private volatile boolean paused;
     private int active;
+
+    SqsResetAdmission(Runnable recovery) {
+        this.recovery = recovery;
+    }
 
     @FunctionalInterface
     interface Operation extends AutoCloseable {
@@ -26,7 +31,20 @@ final class SqsResetAdmission {
         return operation;
     }
 
-    synchronized Operation tryEnter() {
+    Operation tryEnter() {
+        Operation operation = acquire();
+        if (operation != null) {
+            try {
+                recovery.run();
+            } catch (RuntimeException | Error failure) {
+                operation.close();
+                throw failure;
+            }
+        }
+        return operation;
+    }
+
+    private synchronized Operation acquire() {
         int nesting = depth.get();
         if (paused && nesting == 0) {
             depth.remove();

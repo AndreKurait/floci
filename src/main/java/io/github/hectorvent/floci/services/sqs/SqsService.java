@@ -93,9 +93,11 @@ public class SqsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, List<Message>> messageStore;
     private final StorageBackend<String, Map<String, Long>> dedupStore;
     private final StorageBackend<String, Map<String, Map<String, String>>> dedupIdentityStore;
-    private final SqsResetAdmission resetAdmission = new SqsResetAdmission();
+    private final SqsResetAdmission resetAdmission = new SqsResetAdmission(this::recoverResetState);
     private final SqsQueueLifecycle queueLifecycle = new SqsQueueLifecycle();
     private boolean resetDrained;
+    private final Object resetRecoveryLock = new Object();
+    private volatile boolean resetRecoveryRequired;
     private final ConcurrentHashMap<String, GuardedMessageQueue> messagesByQueue = new ConcurrentHashMap<>();
     // Only active metadata lookups are retained; deletion invalidates this queue's pending captures.
     private final Map<String, Set<Object>> pendingQueueLookups = new HashMap<>();
@@ -485,14 +487,27 @@ public class SqsService implements Resettable, ResourceProvider {
             // A prior service's clear may fail after the storage wipe but before our clear.
             // Rebuild from the authoritative stores only after all admitted operations drained.
             if (resetDrained && messageStore != null) {
-                clear();
-                loadPersistedMessages();
-                loadPersistedDedup();
-                loadPersistedDedupIdentities();
+                resetRecoveryRequired = true;
+                recoverResetState();
             }
         } finally {
             resetDrained = false;
             resetAdmission.resume();
+        }
+    }
+
+    private void recoverResetState() {
+        if (!resetRecoveryRequired) {
+            return;
+        }
+        synchronized (resetRecoveryLock) {
+            if (resetRecoveryRequired) {
+                clear();
+                loadPersistedMessages();
+                loadPersistedDedup();
+                loadPersistedDedupIdentities();
+                resetRecoveryRequired = false;
+            }
         }
     }
 

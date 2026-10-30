@@ -310,6 +310,67 @@ class SqsOuterResetPersistenceTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"messages", "dedup", "identities", "none"})
+    void partialClearAndFailedReloadCannotOverwriteRetainedMessages(String failedStore) {
+        StorageFactory factory = spy(factory());
+        AccountAwareStorageBackend<List<Message>> messages = spy(factory.create("sqs", "messages.json", MESSAGES));
+        AccountAwareStorageBackend<Map<String, Long>> dedup = spy(factory.create("sqs", "dedup.json", DEDUP));
+        AccountAwareStorageBackend<Map<String, Map<String, String>>> identities =
+                spy(factory.create("sqs", "identities.json", IDENTITIES));
+        AccountAwareStorageBackend<Queue> sibling = factory.create("sqs", "sibling.json", QUEUES);
+        SqsService service = service(factory.create("sqs", "queues.json", QUEUES), messages, dedup, identities);
+        IllegalStateException wipeFailure = new IllegalStateException("partial wipe failed");
+        IllegalStateException readFailure = new IllegalStateException("retained store unavailable");
+        try {
+            Queue queue = service.createQueue("retained.fifo", null, REGION);
+            Message original = service.sendMessage(queue.getQueueUrl(), "retained", null, "group", "original", REGION);
+            sibling.put("unrelated", queue);
+            doAnswer(call -> {
+                sibling.clear();
+                throw wipeFailure;
+            }).when(factory).clearAll();
+            switch (failedStore) {
+                case "messages" -> doThrow(readFailure).when(messages).scanAllAccountsAsMap();
+                case "dedup" -> doThrow(readFailure).when(dedup).scanAllAccountsAsMap();
+                case "identities" -> doThrow(readFailure).when(identities).scanAllAccountsAsMap();
+                default -> { }
+            }
+            assertSame(wipeFailure, assertThrows(IllegalStateException.class,
+                    () -> controller(factory, service).reset()));
+            assertTrue(sibling.keys().isEmpty(), "the reset really cleared a separate persistent store");
+            if (!"none".equals(failedStore)) {
+                assertEquals(List.of(readFailure), List.of(wipeFailure.getSuppressed()));
+                assertSame(readFailure, assertThrows(IllegalStateException.class,
+                        () -> service.sendMessage(queue.getQueueUrl(), "must-not-write", null,
+                                "rejected-group", "rejected", REGION)));
+                assertSame(readFailure, assertThrows(IllegalStateException.class, service::deleteExpiredMessages));
+            }
+            doCallRealMethod().when(messages).scanAllAccountsAsMap();
+            doCallRealMethod().when(dedup).scanAllAccountsAsMap();
+            doCallRealMethod().when(identities).scanAllAccountsAsMap();
+            service.sendMessage(queue.getQueueUrl(), "new", null, "other-group", "new", REGION);
+            factory.flushAll();
+            StorageFactory reopened = factory();
+            try {
+                List<Message> persisted = reopened.create("sqs", "messages.json", MESSAGES)
+                        .scanAllAccountsAsMap().values().stream().flatMap(List::stream).toList();
+                assertEquals(List.of("retained", "new"), persisted.stream().map(Message::getBody).toList(),
+                        "check reopened disk before receive can rewrite the queue");
+            } finally {
+                reopened.shutdownAll();
+            }
+            Message duplicate = service.sendMessage(queue.getQueueUrl(), "retained", null, "group", "original", REGION);
+            assertEquals(original.getMessageId(), duplicate.getMessageId(), "retry retains the FIFO identity");
+        } finally {
+            doCallRealMethod().when(messages).scanAllAccountsAsMap();
+            doCallRealMethod().when(dedup).scanAllAccountsAsMap();
+            doCallRealMethod().when(identities).scanAllAccountsAsMap();
+            service.stop();
+            factory.shutdownAll();
+        }
+    }
+
     private static void awaitResetBoundary(AtomicReference<Thread> thread, Future<?> reset) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() - deadline < 0) {
