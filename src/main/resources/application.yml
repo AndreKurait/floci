@@ -712,6 +712,9 @@ floci:
       metadata-helper-image: floci/network-helper:local
       privileged: true
       cap-drop: []
+      # read-only-binds:
+      #   - source: /srv/guest-inputs/ca.pem
+      #     target: /etc/guest-ca.pem
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
       # Optional complete catalog override for locally built guest images.

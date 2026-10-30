@@ -27,6 +27,7 @@ import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Mount;
+import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.NetworkSettings;
 import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -2756,7 +2757,11 @@ class Ec2ContainerManagerTest {
         ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
                 "example/guest:1", runtime, "systemd".equals(runtime), "linux/arm64"), Map.of(
                 "FLOCI_SERVICES_EC2_EXTRA_ENV", "CUSTOM_MODE=ready,TEXT=a\\,b=c,EMPTY=,AWS_CA_BUNDLE=/public/ca.pem",
-                "FLOCI_SERVICES_EC2_ULIMITS", "memlock=-1,nofile=1024000,nproc=1024:2048"),
+                "FLOCI_SERVICES_EC2_ULIMITS", "memlock=-1,nofile=1024000,nproc=1024:2048",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input files,one/ca.pem",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", "/public/ca.pem",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_1__SOURCE", "/host/literal\\resolver",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_1__TARGET", "/etc/resolv.conf"),
                 false, false, false);
 
         assertTrue(spec.env().containsAll(List.of(
@@ -2769,6 +2774,12 @@ class Ec2ContainerManagerTest {
                 "memlock", new ContainerSpec.ResourceLimit(-1, -1),
                 "nofile", new ContainerSpec.ResourceLimit(1024000, 1024000),
                 "nproc", new ContainerSpec.ResourceLimit(1024, 2048)), spec.ulimits());
+        List<Mount> binds = spec.mounts().stream().filter(mount -> mount.getType() == MountType.BIND).toList();
+        assertEquals(List.of("/host/input files,one/ca.pem", "/host/literal\\resolver"),
+                binds.stream().map(Mount::getSource).toList());
+        assertEquals(List.of("/public/ca.pem", "/etc/resolv.conf"),
+                binds.stream().map(Mount::getTarget).toList());
+        assertTrue(binds.stream().allMatch(mount -> Boolean.TRUE.equals(mount.getReadOnly())));
         assertEquals(1024L * 1024 * 1024, spec.memoryBytes());
         assertEquals(2_000_000_000L, spec.nanoCpus());
         assertNull(spec.entrypoint());
@@ -2779,6 +2790,28 @@ class Ec2ContainerManagerTest {
                     : List.of("tail", "-f", "/dev/null"), spec.cmd());
         }
         assertEquals("systemd".equals(runtime) ? "host" : null, spec.cgroupnsMode());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "/etc,http://172.30.0.2:4680",
+            "/etc/resolv.conf,http://172.30.0.2:4680",
+            "/etc/guest-ca.pem,http://localhost.floci.io:4680",
+            "/etc/resolv.conf.backup,http://localhost.floci.io:4680"
+    })
+    void guestResolverMountSelectsAnEndpointIndependentOfEmbeddedDns(String target, String endpoint)
+            throws Exception {
+        ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), false, true, false);
+
+        assertTrue(spec.env().contains("AWS_ENDPOINT_URL=" + endpoint));
+        assertEquals(target, spec.mounts().getFirst().getTarget());
+        assertTrue(spec.mounts().getFirst().getReadOnly());
+        assertFalse(spec.env().stream().anyMatch(value -> value.startsWith("AWS_ACCESS_KEY_ID=")));
+        assertNull(spec.entrypoint());
+        assertNull(spec.cmd());
     }
 
     @Test
@@ -2892,6 +2925,33 @@ class Ec2ContainerManagerTest {
     void invalidProcessLimitsRefuseBeforePortsHelpersOrWorkload(String entries) throws Exception {
         assertNull(launchConfiguredGuest(ResolvedAmiImage.minimal("ubuntu:24.04"),
                 Map.of("FLOCI_SERVICES_EC2_ULIMITS", entries), true, false, true));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "relative,/etc/ca.pem",
+            "/host/../ca.pem,/etc/ca.pem",
+            "/host//ca.pem,/etc/ca.pem",
+            "/host/ca.pem,relative",
+            "/host/ca.pem,/",
+            "/host/ca.pem,/etc/./ca.pem",
+            "/host/ca.pem,/etc/../ca.pem",
+            "/host/ca.pem,/etc/ca.pem/"
+    })
+    void invalidMountPathsRefuseBeforePortsHelpersOrWorkload(String source, String target) throws Exception {
+        assertNull(launchConfiguredGuest(new ResolvedAmiImage(
+                "example/worker:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"),
+                Map.of("FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", source,
+                        "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), true, false, true));
+    }
+
+    @Test
+    void duplicateMountTargetsRefuseBeforePortsHelpersOrWorkload() throws Exception {
+        assertNull(launchConfiguredGuest(ResolvedAmiImage.minimal("ubuntu:24.04"), Map.of(
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/first.pem",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", "/etc/ca.pem",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_1__SOURCE", "/host/second.pem",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_1__TARGET", "/etc/ca.pem"), false, false, true));
     }
 
     private static ContainerSpec launchWithRealBuilder(ResolvedAmiImage image) throws Exception {
