@@ -51,7 +51,9 @@ FETCH_TIMEOUT_SECONDS = 60
 
 # The resource types whose provisioners read their properties through CfnPropertyTypes.
 RESOURCE_TYPES = ["AWS::AutoScaling::LaunchConfiguration", "AWS::DSQL::Cluster", "AWS::EC2::Instance",
-                  "AWS::EC2::LaunchTemplate", "AWS::ECS::TaskDefinition", "AWS::Events::Rule",
+                  "AWS::EC2::LaunchTemplate", "AWS::ECS::TaskDefinition",
+                  "AWS::ElasticLoadBalancingV2::LoadBalancer", "AWS::ElasticLoadBalancingV2::TargetGroup",
+                  "AWS::Events::Rule",
                   "AWS::Lambda::Function", "AWS::Lambda::LayerVersion"]
 
 # The shared shape each scalar body is written as, inline; a definition keeps its own name.
@@ -59,7 +61,7 @@ SCALAR_SHAPES = {"string": "String", "integer": "Integer", "boolean": "Boolean",
 SCHEMA_SCALARS = {"string": "string", "integer": "integer", "boolean": "boolean", "number": "double"}
 SHAPE_TYPES = {"structure", "list", "map", *SCALAR_SHAPES}
 
-# Types the provisioners rely on, each measured on CloudFormation: (shape, member) -> member shape,
+# Types the provisioners rely on: (shape, member) -> member shape,
 # and for a list or a map the shape of its items or values.
 ANCHORS = {
     ("AWS::Events::Rule/RetryPolicy", "MaximumRetryAttempts"): "Integer",
@@ -75,12 +77,15 @@ ANCHORS = {
     ("AWS::ECS::TaskDefinition/ContainerDefinition", "Memory"): "Integer",
     ("AWS::ECS::TaskDefinition/ContainerDefinition", "Essential"): "Boolean",
     ("AWS::ECS::TaskDefinition/KernelCapabilities", "Add"): ["String"],
+    ("AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription", "Port"): "Integer",
+    ("AWS::ElasticLoadBalancingV2::LoadBalancer/LoadBalancerAttribute", "Value"): "String",
 }
 
-# Required members the provisioners rely on, measured the same way: shape -> its required members.
+# Required members the provisioners rely on: shape -> its required members.
 REQUIRED_ANCHORS = {
     "AWS::ECS::TaskDefinition/ContainerDefinition": ["Name", "Image"],
     "AWS::ECS::TaskDefinition/Tmpfs": ["Size"],
+    "AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription": ["Id"],
 }
 
 
