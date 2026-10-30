@@ -420,8 +420,29 @@ class CloudFormationLaunchTemplateIntegrationTest {
             assertNetworkTemplate(templateName, "2", Boolean.TRUE);
             assertNetworkTemplate(templateName, "$Default", "1", Boolean.FALSE);
 
+            given()
+                .header("Authorization", EC2_AUTH)
+                .formParam("Action", "DescribeLaunchTemplateVersions")
+                .formParam("LaunchTemplateName", templateName)
+                .formParam("LaunchTemplateVersion.1", "3")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body(containsString("<Code>InvalidLaunchTemplateVersion.NotFound</Code>"));
+
             applyNetworkTemplate(stackName, networkTemplate(templateName, null, true, false), true);
-            assertNetworkTemplate(templateName, "3", null);
+            assertNetworkTemplate(templateName, "4", null);
+            given()
+                .header("Authorization", EC2_AUTH)
+                .formParam("Action", "DescribeLaunchTemplateVersions")
+                .formParam("LaunchTemplateName", templateName)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeLaunchTemplateVersionsResponse.launchTemplateVersionSet.item.versionNumber",
+                        contains("1", "2", "4"));
             assertTemplateLaunchPublicIp(templateName, true);
         } finally {
             given()
