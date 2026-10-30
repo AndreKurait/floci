@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.lambda.launcher;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.ContainerNetwork;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.Digests;
@@ -23,6 +25,7 @@ import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.LambdaLayerVersion;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
+import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -45,9 +48,11 @@ import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -298,6 +303,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         applyDockerFlags(specBuilder, dockerFlags);
 
         specBuilder.withEmbeddedDns();
+        List<String> additionalNetworks = configuredAdditionalDockerNetworks();
 
         // Inject extra hosts entries into the container if present. Split on the FIRST
         // colon, mirroring docker --add-host: hostnames cannot contain colons, but IPv6
@@ -391,6 +397,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Copy code into container via Docker API tar stream (works inside Docker too).
         // Hot-reload functions skip the tar-copy — the bind-mount already wires the host path.
         DockerClient dockerClient = lifecycleManager.getDockerClient();
+        attachAdditionalNetworks(dockerClient, containerId, additionalNetworks);
         if (!fn.isHotReload() && fn.getCodeLocalPath() != null) {
             Path codePath = Path.of(fn.getCodeLocalPath());
 
@@ -554,6 +561,53 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     + fn.getArchitectures() + " for function '" + fn.getFunctionName() + "'");
         }
         return lifecycleManager.create(spec, platform.get());
+    }
+
+    private List<String> configuredAdditionalDockerNetworks() {
+        List<String> networks = config.services().lambda().additionalDockerNetworks().orElse(List.of());
+        Set<String> distinct = new HashSet<>();
+        for (String network : networks) {
+            if (network == null || !network.matches("[A-Za-z0-9][A-Za-z0-9_.-]*")
+                    || !distinct.add(network)) {
+                throw new IllegalArgumentException(
+                        "Lambda additional Docker networks must contain distinct Docker network names or IDs");
+            }
+        }
+        return List.copyOf(networks);
+    }
+
+    private static void attachAdditionalNetworks(
+            DockerClient dockerClient, String containerId, List<String> networks) {
+        if (networks.isEmpty()) {
+            return;
+        }
+        Set<String> connectedIds = new HashSet<>();
+        dockerClient.inspectContainerCmd(containerId).exec().getNetworkSettings().getNetworks()
+                .forEach((name, endpoint) -> {
+                    String id = endpoint.getNetworkID();
+                    // Docker leaves NetworkID empty until the container starts.
+                    connectedIds.add(id == null || id.isBlank()
+                            ? dockerClient.inspectNetworkCmd().withNetworkId(name).exec().getId() : id);
+                });
+        for (String network : networks) {
+            String id = dockerClient.inspectNetworkCmd().withNetworkId(network).exec().getId();
+            if (connectedIds.add(id)) {
+                dockerClient.connectToNetworkCmd()
+                        .withNetworkId(id)
+                        .withContainerId(containerId)
+                        .withContainerNetwork(new AdditionalNetworkEndpoint())
+                        .exec();
+            }
+        }
+    }
+
+    /** Docker's gateway priority is not yet exposed by docker-java's endpoint model. */
+    @RegisterForReflection
+    private static final class AdditionalNetworkEndpoint extends ContainerNetwork {
+        @JsonProperty("GwPriority")
+        public int getGatewayPriority() {
+            return -1;
+        }
     }
 
     private LambdaDockerFlags configuredDockerFlags() {
