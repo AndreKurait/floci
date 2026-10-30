@@ -27,6 +27,7 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.sns.SnsService;
+import io.github.hectorvent.floci.services.sqs.SqsQueueLifecycle.Lease;
 import io.github.hectorvent.floci.services.sqs.SqsResetAdmission.Operation;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
@@ -93,6 +94,7 @@ public class SqsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, Map<String, Long>> dedupStore;
     private final StorageBackend<String, Map<String, Map<String, String>>> dedupIdentityStore;
     private final SqsResetAdmission resetAdmission = new SqsResetAdmission();
+    private final SqsQueueLifecycle queueLifecycle = new SqsQueueLifecycle();
     private boolean resetDrained;
     private final ConcurrentHashMap<String, GuardedMessageQueue> messagesByQueue = new ConcurrentHashMap<>();
     // Only active metadata lookups are retained; deletion invalidates this queue's pending captures.
@@ -802,99 +804,103 @@ public class SqsService implements Resettable, ResourceProvider {
             String queueUrl = buildQueueUrl(region, accountId, queueName);
             String storageKey = regionKey(region, queueUrl);
 
-            // If queue already exists with same name, check for attribute conflicts
-            Queue existing = queueStore.get(storageKey).orElse(null);
-            if (existing != null) {
-                if (attributes != null && !attributes.isEmpty()) {
-                    Set<String> readOnlyAttrs = Set.of("QueueArn", "CreatedTimestamp", "LastModifiedTimestamp",
-                            "ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible",
-                            "ApproximateNumberOfMessagesDelayed");
-                    // A queue saved by an earlier build can hold a non-compact policy; compare compact forms.
-                    Map<String, String> effective = new LinkedHashMap<>(compactRedrivePolicies(existing.getAttributes()));
-                    applyDerivedAttributes(effective);
-                    for (Map.Entry<String, String> entry : attributes.entrySet()) {
-                        if (readOnlyAttrs.contains(entry.getKey())) {
-                            continue;
-                        }
-                        // Compare against what GetQueueAttributes reports, not the raw stored map:
-                        // SqsManagedSseEnabled is derived on read and never stored, so the stored map
-                        // alone would let a differing value through.
-                        String storedValue = effective.get(entry.getKey());
-                        String requested = entry.getValue();
-                        // The effective MaximumMessageSize is canonical ("1024"); canonicalise the
-                        // already-validated request too so "01024" is not a conflict with itself,
-                        // and an empty value maps to the same default the effective map reports.
-                        if ("MaximumMessageSize".equals(entry.getKey())) {
-                            requested = String.valueOf(parseMaxMessageSize(requested));
-                        }
-                        if (storedValue != null && !storedValue.equals(requested)) {
-                            throw new AwsException("QueueAlreadyExists",
-                                    "A queue already exists with the same name but different attributes.", 400);
+            try (Lease lease = queueLifecycle.enter(storageKey)) {
+                // If queue already exists with same name, check for attribute conflicts
+                Queue existing = queueStore.get(storageKey).orElse(null);
+                if (existing != null) {
+                    if (attributes != null && !attributes.isEmpty()) {
+                        Set<String> readOnlyAttrs = Set.of("QueueArn", "CreatedTimestamp", "LastModifiedTimestamp",
+                                "ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible",
+                                "ApproximateNumberOfMessagesDelayed");
+                        // A queue saved by an earlier build can hold a non-compact policy; compare compact forms.
+                        Map<String, String> effective = new LinkedHashMap<>(compactRedrivePolicies(existing.getAttributes()));
+                        applyDerivedAttributes(effective);
+                        for (Map.Entry<String, String> entry : attributes.entrySet()) {
+                            if (readOnlyAttrs.contains(entry.getKey())) {
+                                continue;
+                            }
+                            // Compare against what GetQueueAttributes reports, not the raw stored map:
+                            // SqsManagedSseEnabled is derived on read and never stored, so the stored map
+                            // alone would let a differing value through.
+                            String storedValue = effective.get(entry.getKey());
+                            String requested = entry.getValue();
+                            // The effective MaximumMessageSize is canonical ("1024"); canonicalise the
+                            // already-validated request too so "01024" is not a conflict with itself,
+                            // and an empty value maps to the same default the effective map reports.
+                            if ("MaximumMessageSize".equals(entry.getKey())) {
+                                requested = String.valueOf(parseMaxMessageSize(requested));
+                            }
+                            if (storedValue != null && !storedValue.equals(requested)) {
+                                throw new AwsException("QueueAlreadyExists",
+                                        "A queue already exists with the same name but different attributes.", 400);
+                            }
                         }
                     }
+                    getOrCreateQueue(storageKey).activity().accessed();
+                    return withCurrentQueueUrl(existing, region);
                 }
+
+                Queue queue = new Queue(queueName, queueUrl);
+                queue.setAccountId(regionResolver.getAccountId());
+                if (attributes != null) {
+                    queue.getAttributes().putAll(attributes);
+                }
+                if (tags != null) {
+                    queue.getTags().putAll(tags);
+                }
+                // Set default attributes
+                queue.getAttributes().putIfAbsent("VisibilityTimeout", String.valueOf(defaultVisibilityTimeout));
+                queue.getAttributes().putIfAbsent("MaximumMessageSize", String.valueOf(maxMessageSize));
+                queue.getAttributes().putIfAbsent("DelaySeconds", "0");
+                queue.getAttributes().putIfAbsent("ReceiveMessageWaitTimeSeconds", "0");
+                queue.getAttributes().putIfAbsent("MessageRetentionPeriod", "345600");
+                if (queue.isFifo()) {
+                    if (attributes != null && attributes.containsKey("ContentBasedDeduplication") && "true".equals(attributes.get("ContentBasedDeduplication"))) {
+                        queue.getAttributes().putIfAbsent("ContentBasedDeduplication", "true");
+                    } else {
+                        queue.getAttributes().putIfAbsent("ContentBasedDeduplication", "false");
+                    }
+                }
+
+                queueStore.put(storageKey, queue);
                 getOrCreateQueue(storageKey).activity().accessed();
-                return withCurrentQueueUrl(existing, region);
+                LOG.infov("Created {0} queue: {1} in region {2}", queue.isFifo() ? "FIFO" : "standard", queueName, region);
+                return queue;
             }
-
-            Queue queue = new Queue(queueName, queueUrl);
-            queue.setAccountId(regionResolver.getAccountId());
-            if (attributes != null) {
-                queue.getAttributes().putAll(attributes);
-            }
-            if (tags != null) {
-                queue.getTags().putAll(tags);
-            }
-            // Set default attributes
-            queue.getAttributes().putIfAbsent("VisibilityTimeout", String.valueOf(defaultVisibilityTimeout));
-            queue.getAttributes().putIfAbsent("MaximumMessageSize", String.valueOf(maxMessageSize));
-            queue.getAttributes().putIfAbsent("DelaySeconds", "0");
-            queue.getAttributes().putIfAbsent("ReceiveMessageWaitTimeSeconds", "0");
-            queue.getAttributes().putIfAbsent("MessageRetentionPeriod", "345600");
-            if (queue.isFifo()) {
-                if (attributes != null && attributes.containsKey("ContentBasedDeduplication") && "true".equals(attributes.get("ContentBasedDeduplication"))) {
-                    queue.getAttributes().putIfAbsent("ContentBasedDeduplication", "true");
-                } else {
-                    queue.getAttributes().putIfAbsent("ContentBasedDeduplication", "false");
-                }
-            }
-
-            queueStore.put(storageKey, queue);
-            getOrCreateQueue(storageKey).activity().accessed();
-            LOG.infov("Created {0} queue: {1} in region {2}", queue.isFifo() ? "FIFO" : "standard", queueName, region);
-            return queue;
         }
     }
 
     public void deleteQueue(String queueUrl, String region) {
         try (Operation operation = resetAdmission.enter()) {
             String storageKey = regionKey(region, queueUrl);
-            if (queueStore.get(storageKey).isEmpty()) {
-                throw new AwsException("AWS.SimpleQueueService.NonExistentQueue",
-                        "The specified queue does not exist.", 400);
+            try (Lease lease = queueLifecycle.enter(storageKey)) {
+                if (queueStore.get(storageKey).isEmpty()) {
+                    throw new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                            "The specified queue does not exist.", 400);
+                }
+                queueStore.delete(storageKey);
+                GuardedMessageQueue removed;
+                synchronized (messagesByQueue) {
+                    pendingQueueLookups.remove(storageKey);
+                    removed = messagesByQueue.remove(storageKey);
+                }
+                if (removed != null) {
+                    removed.close();
+                }
+                deduplicationCache.remove(storageKey);
+                deduplicationIdentityCache.remove(storageKey);
+                deduplicationLocks.remove(storageKey);
+                if (messageStore != null) {
+                    messageStore.delete(storageKey);
+                }
+                if (dedupStore != null) {
+                    dedupStore.delete(storageKey);
+                }
+                if (dedupIdentityStore != null) {
+                    dedupIdentityStore.delete(storageKey);
+                }
+                LOG.infov("Deleted queue: {0}", queueUrl);
             }
-            queueStore.delete(storageKey);
-            GuardedMessageQueue removed;
-            synchronized (messagesByQueue) {
-                pendingQueueLookups.remove(storageKey);
-                removed = messagesByQueue.remove(storageKey);
-            }
-            if (removed != null) {
-                removed.close();
-            }
-            deduplicationCache.remove(storageKey);
-            deduplicationIdentityCache.remove(storageKey);
-            deduplicationLocks.remove(storageKey);
-            if (messageStore != null) {
-                messageStore.delete(storageKey);
-            }
-            if (dedupStore != null) {
-                dedupStore.delete(storageKey);
-            }
-            if (dedupIdentityStore != null) {
-                dedupIdentityStore.delete(storageKey);
-            }
-            LOG.infov("Deleted queue: {0}", queueUrl);
         }
     }
 
