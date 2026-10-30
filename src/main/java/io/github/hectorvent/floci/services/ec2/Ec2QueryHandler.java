@@ -827,6 +827,8 @@ public class Ec2QueryHandler {
         // the instance's primary interface (network_interface { network_interface_id = ... }).
         String networkInterfaceId = p.getFirst("NetworkInterface.1.NetworkInterfaceId");
         int networkInterfaceDeviceIndex = parseIntParam(p, "NetworkInterface.1.DeviceIndex", 0);
+        Boolean networkInterfaceDeleteOnTermination = parseOptionalBoolean(
+                p.getFirst("NetworkInterface.1.DeleteOnTermination"), "NetworkInterface.1.DeleteOnTermination");
         String clientToken = p.getFirst("ClientToken");
         List<String> sgIds = getList(p, "SecurityGroupId");
 
@@ -878,6 +880,7 @@ public class Ec2QueryHandler {
                 if (primary != null) {
                     subnetId = primary.getSubnetId();
                     privateIpAddress = primary.getPrivateIpAddress();
+                    networkInterfaceDeleteOnTermination = primary.getDeleteOnTermination();
                     if (associatePublicIp == null) {
                         associatePublicIp = primary.getAssociatePublicIpAddress();
                     }
@@ -939,7 +942,8 @@ public class Ec2QueryHandler {
                 associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, null, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, Boolean.parseBoolean(p.getFirst("DryRun")),
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
-                "spot".equals(marketType), privateIpAddress, capacitySpecification);
+                "spot".equals(marketType), privateIpAddress, capacitySpecification,
+                networkInterfaceDeleteOnTermination);
 
         if (!networkInterfaceTags.isEmpty()) {
             List<String> eniIds = new ArrayList<>();
@@ -5356,7 +5360,7 @@ public class Ec2QueryHandler {
             if (eni.getAttachTime() != null) {
                 xml.elem("attachTime", eni.getAttachTime());
             }
-            xml.elem("deleteOnTermination", "true")
+            xml.elem("deleteOnTermination", String.valueOf(eni.isDeleteOnTermination()))
                     .end("attachment")
                     .start("privateIpAddressesSet")
                     .start("item")
