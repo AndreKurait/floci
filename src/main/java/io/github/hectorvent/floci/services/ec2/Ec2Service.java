@@ -331,6 +331,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // released between the launch's availability check and the store of its instance.
     private final Object hostLock = new Object();
     private final Set<String> seededAccountRegions = ConcurrentHashMap.newKeySet();
+    // References held while a group assignment applies firewall state before publishing its instance.
+    private final Map<String, Integer> pendingSecurityGroupAssignments = new ConcurrentHashMap<>();
     // region::subnetId → offset the next synthesised address is tried at. Only an ordering hint:
     // restart forgets it, and privateIpsInUse is what keeps addresses from being handed out twice.
     private final Map<String, Long> subnetIpCursors = new HashMap<>();
@@ -5868,34 +5870,46 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         Instance inst = getRequiredInstance(region, instanceId);
 
         List<GroupIdentifier> identifiers = new ArrayList<>();
-        for (String groupId : groupIds) {
-            SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
-            if (!Objects.equals(inst.getVpcId(), sg.getVpcId())) {
-                throw new AwsException("InvalidGroup.NotFound", "Security group is not in the instance VPC", 400);
+        List<String> protectedGroups = new ArrayList<>();
+        synchronized (attachmentTopologyLock(region)) {
+            for (String groupId : groupIds) {
+                SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
+                if (!Objects.equals(inst.getVpcId(), sg.getVpcId())) {
+                    throw new AwsException("InvalidGroup.NotFound", "Security group is not in the instance VPC", 400);
+                }
+                identifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
+                protectedGroups.add(callerAccountId() + "::" + key(region, sg.getGroupId()));
             }
-            identifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
+            protectedGroups.forEach(group -> pendingSecurityGroupAssignments.merge(group, 1, Integer::sum));
         }
 
-        if (securityGroupEnforcementEnabled() && !config.services().ec2().mock()
-                && inst.getState() != null && "running".equals(inst.getState().getName())
-                && inst.getNetworkInterfaces() != null && !inst.getNetworkInterfaces().isEmpty()) {
-            List<SecurityGroup> current = securityGroups.scan(k -> k.startsWith(region + "::"));
-            Map<String, SecurityGroup> byId = current.stream().collect(Collectors.toMap(
-                    SecurityGroup::getGroupId, Function.identity()));
-            containerManager.updateSecurityGroups(inst.getNetworkInterfaces().getFirst().getNetworkInterfaceId(),
-                    new HashSet<>(groupIds), byId, policyPrefixLists(region, current));
-        }
+        try {
+            if (securityGroupEnforcementEnabled() && !config.services().ec2().mock()
+                    && inst.getState() != null && "running".equals(inst.getState().getName())
+                    && inst.getNetworkInterfaces() != null && !inst.getNetworkInterfaces().isEmpty()) {
+                List<SecurityGroup> current = securityGroups.scan(k -> k.startsWith(region + "::"));
+                Map<String, SecurityGroup> byId = current.stream().collect(Collectors.toMap(
+                        SecurityGroup::getGroupId, Function.identity()));
+                containerManager.updateSecurityGroups(inst.getNetworkInterfaces().getFirst().getNetworkInterfaceId(),
+                        new HashSet<>(groupIds), byId, policyPrefixLists(region, current));
+            }
 
-        inst.setSecurityGroups(new ArrayList<>(identifiers));
-        if (inst.getNetworkInterfaces() != null) {
-            inst.getNetworkInterfaces().forEach(eni -> eni.setGroups(new ArrayList<>(identifiers)));
-        }
-        instances.put(key(region, instanceId), inst);
+            inst.setSecurityGroups(new ArrayList<>(identifiers));
+            if (inst.getNetworkInterfaces() != null) {
+                inst.getNetworkInterfaces().forEach(eni -> eni.setGroups(new ArrayList<>(identifiers)));
+            }
+            instances.put(key(region, instanceId), inst);
 
-        if (config.services().ec2().publishSecurityGroupPorts() && !config.services().ec2().mock()
-                && inst.getDockerContainerId() != null
-                && inst.getState() != null && "running".equals(inst.getState().getName())) {
-            portForwardManager.reconcile(inst, desiredPublishedPorts(region, inst));
+            if (config.services().ec2().publishSecurityGroupPorts() && !config.services().ec2().mock()
+                    && inst.getDockerContainerId() != null
+                    && inst.getState() != null && "running".equals(inst.getState().getName())) {
+                portForwardManager.reconcile(inst, desiredPublishedPorts(region, inst));
+            }
+        } finally {
+            synchronized (attachmentTopologyLock(region)) {
+                protectedGroups.forEach(group -> pendingSecurityGroupAssignments.computeIfPresent(
+                        group, (ignored, count) -> count == 1 ? null : count - 1));
+            }
         }
     }
 
@@ -7930,6 +7944,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private boolean hasSecurityGroupDependencies(String region, SecurityGroup selected) {
         String groupId = selected.getGroupId();
+        if (pendingSecurityGroupAssignments.containsKey(callerAccountId() + "::" + key(region, groupId))) {
+            return true;
+        }
         if (networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
                 .anyMatch(eni -> eni.getGroups().stream().anyMatch(group -> groupId.equals(group.getGroupId())))) {
             return true;
