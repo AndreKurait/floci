@@ -42,6 +42,7 @@ import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import io.github.hectorvent.floci.core.common.docker.UserDataPipeline;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
@@ -210,8 +211,9 @@ class Ec2ContainerManagerTest {
         assertEquals("10.82.32.10", networkInterface.getPrivateIpAddress());
     }
 
-    @Test
-    void restoreMetadataRegistrationRegistersRunningPersistedContainer() {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void restoreMetadataRegistrationRegistersRunningPersistedContainer(boolean missingState) {
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
         when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
 
@@ -240,6 +242,7 @@ class Ec2ContainerManagerTest {
 
         Instance instance = new Instance();
         instance.setInstanceId("i-restored");
+        instance.setState(missingState ? null : InstanceState.running());
         instance.setDockerContainerId(TEST_CONTAINER_ID);
         instance.setContainerBridgeIp("192.168.215.7");
 

@@ -1036,7 +1036,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             Optional<Instance> stored = instances instanceof AccountAwareStorageBackend<Instance> aware
                     ? aware.getForAccount(accountId, key(region, instance.getInstanceId()))
                     : instances.get(key(region, instance.getInstanceId()));
-            if (instance.getState() == null || "terminated".equals(instance.getState().getName()) || stored.isEmpty()) {
+            if (isMissingOrTerminated(instance) || stored.isEmpty()) {
                 return;
             }
             for (InstanceNetworkInterface attached : instance.getNetworkInterfaces()) {
@@ -15102,7 +15102,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private static boolean isMissingOrTerminated(Instance host) {
-        return host == null || host.getState() == null || "terminated".equals(host.getState().getName());
+        return host == null || (host.getState() == null ? !needsMetadataRegistration(host)
+                : "terminated".equals(host.getState().getName()));
     }
 
     /**

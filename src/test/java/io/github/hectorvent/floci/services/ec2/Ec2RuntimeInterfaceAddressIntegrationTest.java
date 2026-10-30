@@ -81,7 +81,7 @@ class Ec2RuntimeInterfaceAddressIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"start", "restore", "reboot"})
+    @ValueSource(strings = {"start", "restore", "reboot", "restore-null-state", "restore-null-state-direct"})
     void sdkDescribesTheCurrentRuntimeAddressAfterLifecycleCompletion(String operation) throws Exception {
         String account = "111122223333";
         try (Ec2Client client = Ec2Client.builder()
@@ -110,7 +110,16 @@ class Ec2RuntimeInterfaceAddressIntegrationTest {
                                     .networkInterfaces().getFirst().privateIpAddress());
                             if ("reboot".equals(operation)) {
                                 client.rebootInstances(b -> b.instanceIds(host));
-                            } else if ("restore".equals(operation)) {
+                            } else if (operation.startsWith("restore")) {
+                                if (operation.startsWith("restore-null-state")) {
+                                    service.findInstanceForAccount(account, "us-east-1", host).orElseThrow().setState(null);
+                                    if ("restore-null-state".equals(operation)) {
+                                        assertEquals("in-use", client.describeNetworkInterfaces(b -> b.networkInterfaceIds(eni))
+                                                .networkInterfaces().getFirst().statusAsString());
+                                        assertEquals(host, client.describeNetworkInterfaces(b -> b.networkInterfaceIds(eni))
+                                                .networkInterfaces().getFirst().attachment().instanceId());
+                                    }
+                                }
                                 service.restoreMetadataRegistrations();
                             } else {
                                 service.findInstanceForAccount(account, "us-east-1", host).orElseThrow()

@@ -2212,6 +2212,47 @@ class Ec2ServiceTest {
     }
 
     @ParameterizedTest
+    @CsvSource({"true,false", "true,true", "false,false", "false,true"})
+    void nullStateReconciliationPreservesRestorableContainer(boolean containerPresent, boolean addressFirst) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.234.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, "10.234.0.10",
+                List.of(), List.of(), List.of());
+        Instance host = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        service.associateAddress(region, address.getAllocationId(), host.getInstanceId(), null);
+        String association = address.getAssociationId();
+        String attachment = retained.getAttachment().getAttachmentId();
+        host.setState(null);
+        host.setDockerContainerId(containerPresent ? "restorable-container" : null);
+
+        if (addressFirst) {
+            service.describeAddresses(region, List.of(address.getAllocationId()), Map.of());
+        }
+        service.describeNetworkInterfaces(region, List.of(retained.getNetworkInterfaceId()), Map.of());
+        Address observed = service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).getFirst();
+
+        assertEquals(containerPresent ? host.getInstanceId() : null, observed.getInstanceId());
+        assertEquals(association, observed.getAssociationId());
+        assertEquals(retained.getNetworkInterfaceId(), observed.getNetworkInterfaceId());
+        assertEquals(containerPresent ? "in-use" : "available", retained.getStatus());
+        if (containerPresent) {
+            assertEquals(attachment, retained.getAttachment().getAttachmentId());
+            assertEquals(retained.getNetworkInterfaceId(), host.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+            AwsException failure = assertThrows(AwsException.class, () -> service.runInstances(region,
+                    "ami-1234567890abcdef0", "t3.micro", 1, 1, null, List.of(), subnet, null,
+                    List.of(), null, null, null, retained.getNetworkInterfaceId(), 0));
+            assertEquals("InvalidNetworkInterface.InUse", failure.getErrorCode());
+        } else {
+            assertNull(retained.getAttachment());
+            assertTrue(host.getNetworkInterfaces().isEmpty());
+        }
+    }
+
+    @ParameterizedTest
     @CsvSource({"terminated,false", "terminated,true", "missing,false", "missing,true",
             "shutting-down,false", "shutting-down,true", "running,false", "stopped,true"})
     void directAddressReadReconcilesDeadHost(String state, boolean secondaryAddress) {
