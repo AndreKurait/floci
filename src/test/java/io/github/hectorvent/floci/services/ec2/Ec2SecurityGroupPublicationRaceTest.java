@@ -1,16 +1,14 @@
 package io.github.hectorvent.floci.services.ec2;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
-import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
+import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import io.github.hectorvent.floci.testing.ParkingStore;
 import org.junit.jupiter.api.Test;
 
@@ -31,7 +29,7 @@ import static org.mockito.Mockito.*;
 class Ec2SecurityGroupPublicationRaceTest {
     @Test
     void publishedInterfaceCannotReferenceSuccessfullyDeletedGroup() throws Exception {
-        MemoryFactory factory = new MemoryFactory();
+        TestStores factory = new TestStores();
         Ec2Service service = service(factory);
         String region = "us-east-1";
         String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
@@ -71,7 +69,7 @@ class Ec2SecurityGroupPublicationRaceTest {
 
     @Test
     void existingInterfacePreventsDeletion() {
-        Ec2Service service = service(new MemoryFactory());
+        Ec2Service service = service(new TestStores());
         String region = "us-east-1";
         String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
         String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
@@ -84,7 +82,7 @@ class Ec2SecurityGroupPublicationRaceTest {
 
     @Test
     void creationAfterDeletionRejectsMissingGroup() {
-        Ec2Service service = service(new MemoryFactory());
+        Ec2Service service = service(new TestStores());
         String region = "us-east-1";
         String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
         String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
@@ -97,7 +95,7 @@ class Ec2SecurityGroupPublicationRaceTest {
 
     @Test
     void publishedInstanceCannotReferenceSuccessfullyDeletedGroup() throws Exception {
-        MemoryFactory factory = new MemoryFactory();
+        TestStores factory = new TestStores();
         Ec2Service service = service(factory);
         String region = "us-east-1";
         String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
@@ -137,7 +135,7 @@ class Ec2SecurityGroupPublicationRaceTest {
 
     @Test
     void launchRechecksGroupDeletedAfterInitialResolutionBeforeAllocating() throws Exception {
-        MemoryFactory factory = new MemoryFactory();
+        TestStores factory = new TestStores();
         Ec2Service service = service(factory);
         String region = "us-east-1";
         String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
@@ -175,7 +173,7 @@ class Ec2SecurityGroupPublicationRaceTest {
 
     @Test
     void existingInstancePreventsDeletionUntilTerminated() {
-        Ec2Service service = service(new MemoryFactory());
+        Ec2Service service = service(new TestStores());
         String region = "us-east-1";
         String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
         String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
@@ -192,7 +190,7 @@ class Ec2SecurityGroupPublicationRaceTest {
 
     @Test
     void modifyRejectsGroupDeletedAfterCapturedRead() throws Exception {
-        MemoryFactory factory = new MemoryFactory();
+        TestStores factory = new TestStores();
         Ec2Service service = service(factory);
         String region = "us-east-1";
         String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
@@ -249,7 +247,7 @@ class Ec2SecurityGroupPublicationRaceTest {
 
     @Test
     void modifyExistingGroupMovesDependencyToReplacement() {
-        Ec2Service service = service(new MemoryFactory());
+        Ec2Service service = service(new TestStores());
         String region = "us-east-1";
         String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
         String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
@@ -267,7 +265,7 @@ class Ec2SecurityGroupPublicationRaceTest {
 
     @Test
     void modifyMissingGroupPreservesOriginalDependency() {
-        Ec2Service service = service(new MemoryFactory());
+        Ec2Service service = service(new TestStores());
         String region = "us-east-1";
         String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
         String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
@@ -282,11 +280,11 @@ class Ec2SecurityGroupPublicationRaceTest {
 
     @Test
     void pendingFirewallAssignmentBlocksOnlyItsGroupAndReleasesOnFailure() throws Exception {
-        MemoryFactory factory = new MemoryFactory();
+        TestStores factory = new TestStores();
         EmulatorConfig config = mockConfig();
         Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
         Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
-                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), factory);
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), factory.storage);
         String region = "us-east-1";
         String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
         String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
@@ -335,11 +333,11 @@ class Ec2SecurityGroupPublicationRaceTest {
 
     @Test
     void concurrentFailedAssignmentsReleaseOnlyTheirOwnPendingReference() throws Exception {
-        MemoryFactory factory = new MemoryFactory();
+        TestStores factory = new TestStores();
         EmulatorConfig config = mockConfig();
         Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
         Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
-                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), factory);
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), factory.storage);
         String region = "us-east-1";
         String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
         String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
@@ -389,9 +387,9 @@ class Ec2SecurityGroupPublicationRaceTest {
         }
     }
 
-    private static Ec2Service service(MemoryFactory factory) {
+    private static Ec2Service service(TestStores factory) {
         return new Ec2Service(mockConfig(), mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
-                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), factory);
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), factory.storage);
     }
 
     private static EmulatorConfig mockConfig() {
@@ -406,29 +404,13 @@ class Ec2SecurityGroupPublicationRaceTest {
         return config;
     }
 
-    private static final class MemoryFactory extends StorageFactory {
+    private static final class TestStores {
         private final ParkingStore<NetworkInterface> interfaces = new ParkingStore<>();
         private final ParkingStore<Instance> instances = new ParkingStore<>();
         private final ParkingStore<SecurityGroup> groups = new ParkingStore<>();
-
-        private MemoryFactory() {
-            super(null, null);
-        }
-
-        @Override
-        @SuppressWarnings("unchecked")
-        public <V> AccountAwareStorageBackend<V> create(String service, String file,
-                                                        TypeReference<Map<String, V>> type) {
-            if ("ec2-network-interfaces.json".equals(file)) {
-                return (AccountAwareStorageBackend<V>) new AccountAwareStorageBackend<>(interfaces, null, "000000000000");
-            }
-            if ("ec2-instances.json".equals(file)) {
-                return (AccountAwareStorageBackend<V>) new AccountAwareStorageBackend<>(instances, null, "000000000000");
-            }
-            if ("ec2-security-groups.json".equals(file)) {
-                return (AccountAwareStorageBackend<V>) new AccountAwareStorageBackend<>(groups, null, "000000000000");
-            }
-            return AccountAwareStorageBackend.inMemory("000000000000");
-        }
+        private final InMemoryStorageFactory storage = new InMemoryStorageFactory("000000000000")
+                .withStore("ec2-network-interfaces.json", interfaces)
+                .withStore("ec2-instances.json", instances)
+                .withStore("ec2-security-groups.json", groups);
     }
 }
