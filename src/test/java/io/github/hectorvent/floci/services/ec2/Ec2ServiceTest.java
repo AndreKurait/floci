@@ -3478,6 +3478,109 @@ class Ec2ServiceTest {
                 "us-east-1", null, "absent-template", List.of()).isEmpty());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"create", "modify"})
+    void launchTemplateMutationCannotRestoreADeletedTemplate(String operation) throws Exception {
+        ParkingStore<LaunchTemplate> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<LaunchTemplate> store =
+                new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-launch-templates.json", store)));
+        LaunchTemplate template = service.createLaunchTemplate(
+                "us-east-1", "deleted-while-resolving", new LaunchTemplateData(), List.of());
+        String id = template.getLaunchTemplateId();
+        parking.parkNextRead();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<LaunchTemplate> mutation = worker.submit(() -> "create".equals(operation)
+                    ? service.createLaunchTemplateVersion("us-east-1", id, null, "1", new LaunchTemplateData())
+                    : service.modifyLaunchTemplate("us-east-1", id, null, "1"));
+            assertTrue(parking.awaitParked(), "mutation must have read the original template before deletion");
+            service.deleteLaunchTemplate("us-east-1", id, null);
+            assertTrue(service.describeLaunchTemplates("us-east-1", List.of(), List.of(), Map.of()).isEmpty());
+            parking.release();
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> mutation.get(10, TimeUnit.SECONDS));
+            AwsException missing = assertInstanceOf(AwsException.class, failure.getCause());
+            assertEquals("InvalidLaunchTemplateId.NotFound", missing.getErrorCode());
+            assertEquals(400, missing.getHttpStatus());
+            assertTrue(service.describeLaunchTemplates("us-east-1", List.of(), List.of(), Map.of()).isEmpty(),
+                    "the rejected operation must not resurrect a deleted template");
+            assertEquals("1", template.getLatestVersionNumber(), "rejection must precede object mutation");
+        } finally {
+            parking.release();
+            worker.shutdownNow();
+            assertTrue(worker.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"create", "modify"})
+    void launchTemplateMutationByNameCannotReplaceANewTemplate(String operation) throws Exception {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String name = "reused-template-name";
+        LaunchTemplate original = service.createLaunchTemplate(
+                "us-east-1", name, new LaunchTemplateData(), List.of());
+        AtomicReference<Thread> mutationThread = new AtomicReference<>();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<LaunchTemplate> mutation;
+            LaunchTemplate replacement;
+            synchronized (original) {
+                mutation = worker.submit(() -> {
+                    mutationThread.set(Thread.currentThread());
+                    return "create".equals(operation)
+                            ? service.createLaunchTemplateVersion("us-east-1", null, name, "1", new LaunchTemplateData())
+                            : service.modifyLaunchTemplate("us-east-1", null, name, "1");
+                });
+                Thread owner = Thread.currentThread();
+                String method = "create".equals(operation) ? "createLaunchTemplateVersion" : "modifyLaunchTemplate";
+                Awaitility.await("mutation has resolved the original name and waits for its monitor")
+                        .atMost(Duration.ofSeconds(10))
+                        .until(() -> isBlockedIn(mutationThread.get(), method, owner));
+                service.deleteLaunchTemplate("us-east-1", original.getLaunchTemplateId(), null);
+                replacement = service.createLaunchTemplate("us-east-1", name, new LaunchTemplateData(), List.of());
+            }
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> mutation.get(10, TimeUnit.SECONDS));
+            AwsException missing = assertInstanceOf(AwsException.class, failure.getCause());
+            assertEquals("InvalidLaunchTemplateName.NotFoundException", missing.getErrorCode());
+            assertEquals(400, missing.getHttpStatus());
+            assertEquals(List.of(replacement.getLaunchTemplateId()), service.describeLaunchTemplates(
+                    "us-east-1", List.of(), List.of(name), Map.of()).stream()
+                    .map(LaunchTemplate::getLaunchTemplateId).toList());
+            assertEquals("1", original.getLatestVersionNumber());
+            assertEquals("1", replacement.getLatestVersionNumber());
+        } finally {
+            worker.shutdownNow();
+            assertTrue(worker.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"create", "modify"})
+    void launchTemplateMutationStillWorksWhileTemplateExists(String operation) {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        LaunchTemplate template = service.createLaunchTemplate(
+                "us-east-1", "existing-template", new LaunchTemplateData(), List.of());
+        String id = template.getLaunchTemplateId();
+        service.createLaunchTemplateVersion("us-east-1", id, null, "1", new LaunchTemplateData());
+        if ("create".equals(operation)) {
+            assertEquals("3", service.createLaunchTemplateVersion(
+                    "us-east-1", id, null, "2", new LaunchTemplateData()).getLatestVersionNumber());
+        } else {
+            assertEquals("2", service.modifyLaunchTemplate("us-east-1", id, null, "2").getDefaultVersionNumber());
+        }
+
+        assertEquals(1, service.describeLaunchTemplates("us-east-1", List.of(), List.of(), Map.of()).size());
+    }
+
     @Test
     void missingLaunchTemplateIdReportsTheSameCodeWhicheverCallLooksItUp() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),

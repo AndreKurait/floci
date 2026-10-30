@@ -9799,6 +9799,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         validateLaunchTemplateData(region, data);
         LaunchTemplate launchTemplate = findLaunchTemplate(region, id, name);
         synchronized (launchTemplate) {
+            ensureLaunchTemplatePresent(region, launchTemplate, id);
             ensureLaunchTemplateVersions(launchTemplate);
             int latestVersion = lastIssuedLaunchTemplateVersion(launchTemplate) + 1;
             LaunchTemplateData source;
@@ -9881,6 +9882,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ensureDefaultResources(region);
         LaunchTemplate launchTemplate = findLaunchTemplate(region, id, name);
         synchronized (launchTemplate) {
+            ensureLaunchTemplatePresent(region, launchTemplate, id);
             ensureLaunchTemplateVersions(launchTemplate);
             if (defaultVersion != null && !defaultVersion.isBlank()) {
                 String resolved = switch (defaultVersion) {
@@ -10118,6 +10120,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // Older records have no counter; preserve their latest version before deleting it.
         return Math.max(template.getLastIssuedVersionNumber(),
                 parseLaunchTemplateVersion(template.getLatestVersionNumber()));
+    }
+
+    private void ensureLaunchTemplatePresent(String region, LaunchTemplate template, String requestedId) {
+        if (launchTemplates.get(key(region, template.getLaunchTemplateId())).isEmpty()) {
+            String errorCode = isSet(requestedId)
+                    ? "InvalidLaunchTemplateId.NotFound" : "InvalidLaunchTemplateName.NotFoundException";
+            throw new AwsException(errorCode, "The specified launch template does not exist.", 400);
+        }
     }
 
     /**
