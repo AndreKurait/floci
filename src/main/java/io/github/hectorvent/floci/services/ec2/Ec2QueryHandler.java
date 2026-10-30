@@ -937,6 +937,15 @@ public class Ec2QueryHandler {
             }
         }
 
+        if (launchTemplateData != null && !isSet(networkInterfaceId)) {
+            Ec2Service.validateNewResourceTags(launchTemplateData.tagsForResource("network-interface"));
+            Map<String, Tag> primaryInterfaceTags = new LinkedHashMap<>();
+            launchTemplateData.tagsForResource("network-interface")
+                    .forEach(tag -> primaryInterfaceTags.put(tag.getKey(), tag));
+            networkInterfaceTags.forEach(tag -> primaryInterfaceTags.put(tag.getKey(), tag));
+            Ec2Service.validateNewResourceTags(new ArrayList<>(primaryInterfaceTags.values()));
+        }
+
         Reservation res = service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
                 associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, null, metadataOptions,
