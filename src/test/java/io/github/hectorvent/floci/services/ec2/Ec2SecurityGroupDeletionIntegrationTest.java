@@ -7,9 +7,11 @@ import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.util.List;
 import java.util.Map;
@@ -27,6 +29,9 @@ class Ec2SecurityGroupDeletionIntegrationTest {
 
     @Inject
     Ec2Service service;
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
 
     @Test
     void defaultGroupCannotBeDeleted() {
@@ -57,20 +62,18 @@ class Ec2SecurityGroupDeletionIntegrationTest {
                 service.deleteInternetGateway(REGION, gateway.getInternetGatewayId());
             }
             service.deleteVpc(REGION, defaultVpc);
+            cleanup.register(() -> RequestScopes.runAs(ACCOUNT, () -> service.createDefaultVpc(REGION)));
             String customVpc = service.createVpc(REGION, "10.229.0.0/24", false).getVpcId();
+            cleanup.register(() -> RequestScopes.runAs(ACCOUNT, () -> service.deleteVpc(REGION, customVpc)));
             SecurityGroup group = service.createSecurityGroup(
                     REGION, "without-default-" + UUID.randomUUID(), "owned test group", customVpc);
-            try {
-                AwsException error = assertThrows(AwsException.class, () ->
-                        service.deleteSecurityGroup(REGION, null, group.getGroupName(), false));
-                assertEquals("VPCIdNotSpecified", error.getErrorCode());
-                assertEquals(group.getGroupId(), service.describeSecurityGroups(
-                        REGION, List.of(group.getGroupId()), List.of(), Map.of()).getFirst().getGroupId());
-            } finally {
-                service.deleteSecurityGroup(REGION, group.getGroupId());
-                service.deleteVpc(REGION, customVpc);
-                service.createDefaultVpc(REGION);
-            }
+            cleanup.register(() -> RequestScopes.runAs(ACCOUNT,
+                    () -> service.deleteSecurityGroup(REGION, group.getGroupId())));
+            AwsException error = assertThrows(AwsException.class, () ->
+                    service.deleteSecurityGroup(REGION, null, group.getGroupName(), false));
+            assertEquals("VPCIdNotSpecified", error.getErrorCode());
+            assertEquals(group.getGroupId(), service.describeSecurityGroups(
+                    REGION, List.of(group.getGroupId()), List.of(), Map.of()).getFirst().getGroupId());
         });
     }
 
@@ -78,27 +81,26 @@ class Ec2SecurityGroupDeletionIntegrationTest {
     void selfReferenceAllowsDeletionAndOwnRulesAreRemoved() {
         RequestScopes.runAs(ACCOUNT, () -> {
             String vpc = service.createVpc(REGION, "10.230.0.0/24", false).getVpcId();
+            cleanup.register(() -> RequestScopes.runAs(ACCOUNT, () -> service.deleteVpc(REGION, vpc)));
             SecurityGroup group = service.createSecurityGroup(
                     REGION, "self-reference-" + UUID.randomUUID(), "owned test group", vpc);
-            try {
-                UserIdGroupPair pair = new UserIdGroupPair();
-                pair.setGroupId(group.getGroupId());
-                IpPermission permission = new IpPermission();
-                permission.setIpProtocol("-1");
-                permission.getUserIdGroupPairs().add(pair);
-                service.authorizeSecurityGroupIngress(REGION, group.getGroupId(), List.of(permission));
-                assertFalse(service.describeSecurityGroupRules(
-                        REGION, List.of(group.getGroupId()), List.of()).isEmpty());
-                service.deleteSecurityGroup(REGION, group.getGroupId());
-                assertTrue(service.describeSecurityGroupRules(
-                        REGION, List.of(group.getGroupId()), List.of()).isEmpty());
-            } finally {
+            cleanup.register(() -> RequestScopes.runAs(ACCOUNT, () -> {
                 if (!service.describeSecurityGroups(
                         REGION, List.of(group.getGroupId()), List.of(), Map.of()).isEmpty()) {
                     service.deleteSecurityGroup(REGION, group.getGroupId());
                 }
-                service.deleteVpc(REGION, vpc);
-            }
+            }));
+            UserIdGroupPair pair = new UserIdGroupPair();
+            pair.setGroupId(group.getGroupId());
+            IpPermission permission = new IpPermission();
+            permission.setIpProtocol("-1");
+            permission.getUserIdGroupPairs().add(pair);
+            service.authorizeSecurityGroupIngress(REGION, group.getGroupId(), List.of(permission));
+            assertFalse(service.describeSecurityGroupRules(
+                    REGION, List.of(group.getGroupId()), List.of()).isEmpty());
+            service.deleteSecurityGroup(REGION, group.getGroupId());
+            assertTrue(service.describeSecurityGroupRules(
+                    REGION, List.of(group.getGroupId()), List.of()).isEmpty());
         });
     }
 }
