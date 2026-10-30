@@ -1,0 +1,107 @@
+package io.github.hectorvent.floci.services.sqs;
+
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.services.sqs.model.Message;
+import io.github.hectorvent.floci.services.sqs.model.Queue;
+import org.junit.jupiter.api.Test;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.*;
+
+class SqsNotificationWaitTest {
+    private static final String REGION = "us-east-1";
+
+    @Test
+    void anIdleLongPollDoesNotReadStorageOncePerSecond() throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        InMemoryStorage<String, Queue> storage = new InMemoryStorage<>() {
+            @Override
+            public Optional<Queue> get(String key) {
+                reads.incrementAndGet();
+                return super.get(key);
+            }
+        };
+        SqsService service = new SqsService(storage, 30, 1048576, "http://localhost:4566", Clock.systemUTC());
+        Queue queue = service.createQueue("idle-signal", null, REGION);
+        reads.set(0);
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<List<Message>> receive = executor.submit(
+                    () -> service.receiveMessage(queue.getQueueUrl(), 1, 30, 2, REGION));
+            await().atMost(Duration.ofSeconds(1)).until(() -> reads.get() == 2);
+            await().during(Duration.ofMillis(1200)).atMost(Duration.ofMillis(1800))
+                    .untilAsserted(() -> assertEquals(2, reads.get(), "Empty poll rescanned without a change"));
+            assertTrue(receive.get(2, TimeUnit.SECONDS).isEmpty());
+            assertEquals(3, reads.get(), "Only initial lookup, first claim and deadline claim are needed");
+        } finally {
+            service.stop();
+        }
+    }
+
+    @Test
+    void deliveryBetweenEmptyClaimAndWaitDoesNotLoseItsNotification() throws Exception {
+        GuardedMessageQueue queue = new GuardedMessageQueue(null, null);
+        long observed = queue.changeVersion();
+        assertTrue(queue.claimVisibleMessages(1, 30, false, -1, null).claimed().isEmpty());
+        queue.addMessage(new Message("arrived in the scan-to-wait gap"));
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            executor.submit(() -> {
+                queue.awaitChange(observed, TimeUnit.SECONDS.toNanos(20));
+                return null;
+            }).get(1, TimeUnit.SECONDS);
+        }
+        assertEquals(1, queue.claimVisibleMessages(1, 30, false, -1, null).claimed().size());
+    }
+
+    @Test
+    void redriveDeliverySignalsAnEmptyDestination() throws Exception {
+        GuardedMessageQueue destination = new GuardedMessageQueue(null, null);
+        long observed = destination.changeVersion();
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> waiter = executor.submit(() -> {
+                destination.awaitChange(observed, TimeUnit.SECONDS.toNanos(20));
+                return null;
+            });
+            destination.addAll(List.of(new Message("redriven")));
+            waiter.get(1, TimeUnit.SECONDS);
+        }
+        assertEquals(1, destination.claimVisibleMessages(1, 30, false, -1, null).claimed().size());
+    }
+
+    @Test
+    void closingAnIncarnationReleasesWaitersAndPreventsFurtherClaims() throws Exception {
+        GuardedMessageQueue queue = new GuardedMessageQueue(null, null);
+        long observed = queue.changeVersion();
+        queue.close();
+        queue.addMessage(new Message("late producer still holds the old incarnation"));
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            executor.submit(() -> {
+                queue.awaitChange(observed, TimeUnit.SECONDS.toNanos(20));
+                return null;
+            }).get(1, TimeUnit.SECONDS);
+        }
+        assertTrue(queue.isClosed());
+        assertTrue(queue.claimVisibleMessages(1, 30, false, -1, null).claimed().isEmpty());
+    }
+
+    @Test
+    void anUnresolvedRedriveClaimDoesNotSignalAnImmediateRetry() {
+        GuardedMessageQueue queue = new GuardedMessageQueue(null, null);
+        queue.addMessage(new Message("unresolved-dlq"));
+        queue.claimVisibleMessages(1, 0, false, 1, "missing-dlq");
+        long observed = queue.changeVersion();
+        GuardedMessageQueue.ClaimResult claimed = queue.claimVisibleMessages(1, 0, false, 1, "missing-dlq");
+        assertTrue(claimed.claimed().isEmpty());
+        assertEquals(1, claimed.dlqCandidates().size());
+        assertEquals(observed, queue.changeVersion());
+    }
+}
