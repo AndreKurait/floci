@@ -492,6 +492,8 @@ floci:
       issued-session-verification-enabled: false
       lambda-identity-verification-enabled: false
       seed-deployer-principal: false
+      # service-principal-memberships-path: /config/service-principals.json
+      # FLOCI_SERVICES_IAM_SERVICE_PRINCIPAL_MEMBERSHIPS_PATH; optional local fixture, read at startup.
       # account-alias: ""  # When set, seeds the account alias at startup so callers can read one
                            # without creating it first. Unset means the account has no alias,
                            # matching AWS. Example: FLOCI_SERVICES_IAM_ACCOUNT_ALIAS=my-account

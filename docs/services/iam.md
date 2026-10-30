@@ -341,6 +341,45 @@ no effect on later starts — the skip is logged at debug with both values. `/_f
 clears the alias without re-seeding it, as it does the optional deployer principal; the seed
 returns on restart.
 
+### Local service-account memberships
+
+Floci already evaluates `Principal.Service` for calls its emulated services generate.
+To test a service running as an IAM user or role in a local account, supply a JSON file
+mapping account-root ARNs to service-principal names:
+
+```json
+{
+  "arn:aws:iam::111122223333:root": ["example.amazonaws.com"],
+  "arn:aws:iam::444455556666:root": ["example.amazonaws.com"]
+}
+```
+
+Mount the file read-only into Floci and set
+`FLOCI_SERVICES_IAM_SERVICE_PRINCIPAL_MEMBERSHIPS_PATH` to its container path
+(`floci.services.iam.service-principal-memberships-path` in YAML).
+Enable IAM policy enforcement and SigV4 verification with
+`FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true` and `FLOCI_AUTH_VALIDATE_SIGNATURES=true`.
+
+The fixture is optional and read once at startup. Missing or malformed configured files
+prevent startup; the size limit is 1 MiB. An unset path supplies no memberships.
+An account may have multiple names, and a name may cover multiple accounts. Account roots
+include their partition; names match exactly, without wildcard, case or regional folding.
+
+A matching `Principal.Service` delegates to the authenticated caller's account in resource
+and role-trust policies. It does not issue credentials or grant an action by itself:
+identity permissions, session policies, boundaries, SCPs and explicit denies still apply.
+EC2 instance-role credentials obtained through IMDS can use the membership. Assuming a
+role in another account uses that new account's memberships, not the original caller's.
+Existing generated service calls retain their behavior.
+
+This is local fixture configuration, not an AWS API or an IAM account alias. Public AWS
+customers cannot turn an account alias into an arbitrary service principal. The fixture
+models policy principal matching only: it does not model account opt-in region filtering,
+service-principal visibility, forwarded access sessions, or populate service-specific
+condition keys for IAM callers. It does not replace the credentials of customer service roles.
+See [AWS service principals](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_principal.html#principal-services)
+and [account aliases](https://docs.aws.amazon.com/IAM/latest/UserGuide/console_account-alias.html).
+
 ### Account Password Policy
 
 | Action | Description |

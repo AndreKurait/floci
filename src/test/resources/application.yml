@@ -187,6 +187,7 @@ floci:
       issued-session-verification-enabled: false
       lambda-identity-verification-enabled: false
       seed-deployer-principal: false
+      # service-principal-memberships-path: unset; tests explicitly select their local fixture.
     msk:
       enabled: true
       mock: true

@@ -1593,6 +1593,9 @@ public interface EmulatorConfig {
          * is the AWS default.
          */
         Optional<String> accountAlias();
+
+        /** Optional local account-root ARN to service-principal membership JSON file, read at startup. */
+        Optional<String> servicePrincipalMembershipsPath();
     }
 
     interface MskServiceConfig {
