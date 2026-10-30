@@ -39,14 +39,20 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     private static final String LISTENER_RULE = "AWS::ElasticLoadBalancingV2::ListenerRule";
     /** Prefixes one uses attribute per subnet a load balancer is on, numbered from 1. */
     private static final String USED_SUBNET_ATTR_PREFIX = CfnRollback.USES_ATTR_PREFIX + "Subnet.";
+    private static final List<String> UPDATE_SNAPSHOTS = List.of(
+            CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR,
+            CfnRollback.LOAD_BALANCER_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR,
+            CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
 
     private final ElbV2Service elbV2Service;
     private final ElbV2CfnTargets targets;
+    private final ElbV2CfnLoadBalancerAttributes loadBalancerAttributes;
 
     @Inject
     public ElbV2CfnProvisioner(ElbV2Service elbV2Service) {
         this.elbV2Service = elbV2Service;
         this.targets = new ElbV2CfnTargets(elbV2Service);
+        this.loadBalancerAttributes = new ElbV2CfnLoadBalancerAttributes(elbV2Service);
     }
 
     @Override
@@ -56,8 +62,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
-        r.getAttributes().remove(CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR);
-        r.getAttributes().remove(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
+        UPDATE_SNAPSHOTS.forEach(r.getAttributes()::remove);
         Map<String, String> attributesBefore = Map.copyOf(r.getAttributes());
         switch (r.getResourceType()) {
             case LOAD_BALANCER -> provisionLoadBalancer(r, props, ctx);
@@ -108,30 +113,30 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
         if ("UPDATE_COMPLETE".equals(resource.getStatus())) {
-            resource.getAttributes().remove(CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR);
-            resource.getAttributes().remove(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
+            UPDATE_SNAPSHOTS.forEach(resource.getAttributes()::remove);
         }
         return ReplacementCleanup.complete(resource, this::delete);
     }
 
     @Override
     public void clearUpdate(StackResource resource) {
-        resource.getAttributes().remove(CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR);
-        resource.getAttributes().remove(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
+        UPDATE_SNAPSHOTS.forEach(resource.getAttributes()::remove);
         ReplacementCleanup.clear(resource);
     }
 
     @Override
     public boolean requiresUpdateRecovery(StackResource resource) {
         return "UPDATE_FAILED".equals(resource.getStatus())
-                && resource.getAttributes().containsKey(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
+                && UPDATE_SNAPSHOTS.stream().anyMatch(resource.getAttributes()::containsKey);
     }
 
     @Override
     public void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
-        String snapshot = attempted.getAttributes().get(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
-        if (snapshot != null) {
-            previous.getAttributes().put(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR, snapshot);
+        for (String attribute : UPDATE_SNAPSHOTS) {
+            String snapshot = attempted.getAttributes().get(attribute);
+            if (snapshot != null) {
+                previous.getAttributes().put(attribute, snapshot);
+            }
         }
     }
 
@@ -148,6 +153,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
             return true;
         }
         if (LOAD_BALANCER.equals(resource.getResourceType())) {
+            loadBalancerAttributes.restore(resource);
             return restorePriorSubnets(resource);
         }
         return TARGET_GROUP.equals(resource.getResourceType()) && targets.restore(resource);
@@ -178,6 +184,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
      * creates the replacement and hands the displaced balancer to the replacement cleanup.
      */
     private void provisionLoadBalancer(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Map<String, String> declaredAttributes = ElbV2CfnLoadBalancerAttributes.declared(props, ctx);
         String name = nameOrPrior(ctx.resolveOptional(props, "Name"), r.getAttributes().get("LoadBalancerName"),
                 ctx, r.getLogicalId());
         String scheme = ctx.resolveOptional(props, "Scheme");
@@ -189,10 +196,12 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
 
         LoadBalancer lb;
         List<String> onSubnets;
+        boolean created;
         try {
             lb = elbV2Service.createLoadBalancer(ctx.region(), name, scheme, type, ipAddressType,
                     subnets, securityGroups, tags);
             onSubnets = subnetIds(lb);
+            created = true;
         } catch (AwsException e) {
             if (!"DuplicateLoadBalancerName".equals(e.getErrorCode())) {
                 throw e;
@@ -201,6 +210,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
             onSubnets = ctx.reusesPriorEntity(lb.getLoadBalancerArn())
                     ? moveToTemplateSubnets(r, lb, subnets, ctx)
                     : subnetIds(lb);
+            created = false;
         }
 
         r.setPhysicalId(lb.getLoadBalancerArn());
@@ -210,6 +220,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().put("LoadBalancerName", lb.getLoadBalancerName());
         r.getAttributes().put("LoadBalancerFullName", loadBalancerFullName(lb.getLoadBalancerArn()));
         recordUsedSubnets(r, onSubnets);
+        loadBalancerAttributes.apply(r, declaredAttributes, ctx, created, () -> restorePriorSubnets(r));
     }
 
     private static List<String> subnetIds(LoadBalancer lb) {

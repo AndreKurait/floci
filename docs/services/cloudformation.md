@@ -40,6 +40,11 @@ A failed update restores the affected registrations; deleting the target group
 removes all of its registrations. Registration does not force a target healthy:
 the load balancer's health checks still determine whether it can serve traffic.
 
+`AWS::ElasticLoadBalancingV2::LoadBalancer` applies `LoadBalancerAttributes` on
+creation and update. Attributes omitted by an update retain their current values.
+A failed stack update restores only the attributes changed by that update,
+preserving changes to other attributes.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
