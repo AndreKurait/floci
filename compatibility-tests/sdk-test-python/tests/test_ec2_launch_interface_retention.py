@@ -135,6 +135,21 @@ def test_primary_interface_retention(ec2_client, via_template, supplied_interfac
             assert reused["NetworkInterfaces"][0]["NetworkInterfaceId"] == eni_id
             assert interfaces()[0]["Attachment"]["InstanceId"] == reused["InstanceId"]
             assert interfaces()[0]["Attachment"]["DeleteOnTermination"] is False
+            carried = ec2.describe_addresses(AllocationIds=[allocation])["Addresses"][0]
+            assert carried["InstanceId"] == reused["InstanceId"]
+            assert carried["AssociationId"] == association
+            assert carried["NetworkInterfaceId"] == eni_id
+            assert ec2.describe_addresses(AllocationIds=[allocation], Filters=[{
+                "Name": "instance-id", "Values": [reused["InstanceId"]],
+            }])["Addresses"] == [carried]
+            assert not ec2.describe_addresses(AllocationIds=[allocation], Filters=[{
+                "Name": "instance-id", "Values": [instance_id],
+            }])["Addresses"]
+            with pytest.raises(ClientError):
+                ec2.run_instances(
+                    ImageId=image, InstanceType="t3.nano", MinCount=1, MaxCount=1,
+                    NetworkInterfaces=[{"DeviceIndex": 0, "NetworkInterfaceId": eni_id}])
+            assert ec2.describe_addresses(AllocationIds=[allocation])["Addresses"] == [carried]
 
 
 @pytest.mark.parametrize("delete", [False, True])

@@ -4276,6 +4276,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         }
 
                         instances.put(key(region, instanceId), inst);
+                        if (suppliedEni != null) {
+                            for (Address address : addresses.scan(k -> k.startsWith(region + "::"))) {
+                                if (address.getAssociationId() != null
+                                        && suppliedEni.getNetworkInterfaceId().equals(address.getNetworkInterfaceId())) {
+                                    address.setInstanceId(instanceId);
+                                    addresses.put(key(region, address.getAllocationId()), address);
+                                }
+                            }
+                        }
                         if (suppliedEni == null && !eni.isDeleteOnTermination()) {
                             networkInterfaces.put(key(region, eni.getNetworkInterfaceId()),
                                     instanceNetworkInterface(callerAccountId(), region, inst, eni));

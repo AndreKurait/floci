@@ -1882,6 +1882,49 @@ class Ec2ServiceTest {
         assertTrue(service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).isEmpty());
     }
 
+    @ParameterizedTest
+    @CsvSource({"false", "true"})
+    void retainedInterfaceAddressTracksItsNewInstanceBeforeDescribe(boolean secondaryAddress) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.236.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, "10.236.0.10",
+                List.of("10.236.0.11"), List.of(), List.of());
+        Instance first = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        String privateIp = secondaryAddress ? "10.236.0.11" : "10.236.0.10";
+        service.associateAddress(region, address.getAllocationId(), first.getInstanceId(), privateIp);
+        String association = address.getAssociationId();
+        service.terminateInstances(region, List.of(first.getInstanceId()));
+        assertNull(address.getInstanceId());
+        assertEquals(association, address.getAssociationId());
+        assertEquals(privateIp, address.getPrivateIpAddress());
+
+        Instance second = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+
+        assertEquals(second.getInstanceId(), address.getInstanceId());
+        assertEquals(association, address.getAssociationId());
+        assertEquals(privateIp, address.getPrivateIpAddress());
+        assertEquals(1, service.describeAddresses(region, List.of(address.getAllocationId()),
+                Map.of("instance-id", List.of(second.getInstanceId()))).size());
+        assertTrue(service.describeAddresses(region, List.of(address.getAllocationId()),
+                Map.of("instance-id", List.of(first.getInstanceId()))).isEmpty());
+        assertThrows(AwsException.class, () -> service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0));
+        assertEquals(second.getInstanceId(), address.getInstanceId());
+        assertEquals(association, address.getAssociationId());
+        service.terminateInstances(region, List.of(second.getInstanceId()));
+        assertNull(address.getInstanceId());
+        service.disassociateAddress(region, association);
+        service.releaseAddress(region, address.getAllocationId());
+        service.deleteNetworkInterface(region, retained.getNetworkInterfaceId());
+    }
+
     @Test
     void elasticIpOnASecondaryAddressLeavesAReachableInstancesPublicAddressAlone() {
         Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
