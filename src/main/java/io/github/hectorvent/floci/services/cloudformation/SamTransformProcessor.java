@@ -1012,6 +1012,10 @@ class SamTransformProcessor {
         JsonNode aliasName = properties.path("AutoPublishAlias");
         if (aliasName.isMissingNode() || aliasName.isNull()
                 || (aliasName.isTextual() && aliasName.asText().isBlank())) {
+            if (isTruthy(properties.path("ProvisionedConcurrencyConfig"))) {
+                throw invalidResource(functionLogicalId,
+                        "'ProvisionedConcurrencyConfig' requires 'AutoPublishAlias'.");
+            }
             return null;
         }
 
@@ -1044,6 +1048,10 @@ class SamTransformProcessor {
         aliasProps.set("FunctionName", ref(functionLogicalId));
         aliasProps.set("Name", aliasName.deepCopy());
         aliasProps.set("FunctionVersion", getAtt(versionId, "Version"));
+        if (isTruthy(properties.path("ProvisionedConcurrencyConfig"))) {
+            aliasProps.set("ProvisionedConcurrencyConfig",
+                    properties.get("ProvisionedConcurrencyConfig").deepCopy());
+        }
         aliasDef.set("Properties", aliasProps);
         aliasDef.setAll(passthrough.deepCopy());
         resources.set(aliasId, aliasDef);
