@@ -15,6 +15,7 @@ import io.restassured.specification.RequestSpecification;
 import io.vertx.core.http.ServerWebSocket;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -29,13 +30,17 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Supplier;
 
 import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.*;
 
 @QuarkusTest
 @TestProfile(SignedIamEnforcementProfile.class)
 class ManageConnectionsIamIntegrationTest {
+    Supplier<String> roleNames = () -> "connections-role-" + UUID.randomUUID();
+
     private static final String OWNER = "000000000000";
 
     @TestHTTPResource("/")
@@ -84,13 +89,13 @@ class ManageConnectionsIamIntegrationTest {
     @Test
     void issuedSessionPolicyAndTokenAreEnforced() throws Exception {
         Fixture fixture = fixture();
-        String name = "connections-role-" + UUID.randomUUID();
+        String name = roleNames.get();
         String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
                 + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
-        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
                 "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
                 .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
         SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
                 "PolicyDocument", policy(fixture.arn("POST")))).then().statusCode(200);
@@ -126,6 +131,42 @@ class ManageConnectionsIamIntegrationTest {
                     .post(path).then().statusCode(410);
         }
         verifyNoInteractions(first.socket(), second.socket());
+    }
+
+    @Test
+    void rejectedRoleCreationPreservesPreexistingRole() throws Exception {
+        String name = "connections-existing-" + UUID.randomUUID();
+        SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
+                "AssumeRolePolicyDocument", "{\"Statement\":[]}")).then().statusCode(200);
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        ManageConnectionsIamIntegrationTest fixture = nestedFixture(name);
+        try {
+            assertThrows(AssertionError.class,
+                    fixture::issuedSessionPolicyAndTokenAreEnforced);
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(200);
+    }
+
+    @Test
+    void successfulRoleScenarioRemovesOwnedRoleAndPolicy() throws Exception {
+        String name = "connections-owned-" + UUID.randomUUID();
+        ManageConnectionsIamIntegrationTest fixture = nestedFixture(name);
+        try {
+            fixture.issuedSessionPolicyAndTokenAreEnforced();
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(404);
+    }
+
+    private ManageConnectionsIamIntegrationTest nestedFixture(String name) {
+        ManageConnectionsIamIntegrationTest fixture = new ManageConnectionsIamIntegrationTest();
+        fixture.endpoint = endpoint;
+        fixture.connections = connections;
+        fixture.roleNames = () -> name;
+        return fixture;
     }
 
     private void cleanupIam(String action, Map<String, String> parameters) {
