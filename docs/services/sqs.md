@@ -84,6 +84,17 @@ curl -X DELETE "http://localhost:4566/_aws/sqs/messages?QueueUrl=$QUEUE_URL"
 
 `ReceiveMessage` waits up to `WaitTimeSeconds` (0 to 20) for a message to arrive and returns as soon as one is available. Values outside that range are rejected with `InvalidParameterValue`. When the request omits `WaitTimeSeconds`, the queue's `ReceiveMessageWaitTimeSeconds` attribute applies (default `0`, short polling), matching AWS.
 
+Empty long polls wait on a versioned notification owned by that queue incarnation,
+without repeating a storage scan every second. Successful mutations that add or release messages
+wake receivers, including internal redrive delivery and visibility changes. A notification
+between an empty scan and parking is retained. Nonempty queues retain periodic
+checks for visibility and retention expiry. Deletion, reset and shutdown wake old
+receivers; they cannot claim messages from a replacement queue.
+Reset also fences message-store writes across queue generations. An old write
+that finishes after reset cannot overwrite a replacement queue's persisted messages.
+Queue creation retains the message queue already opened by a concurrent receive or send
+after metadata becomes visible, preserving waiting receivers and their messages.
+
 ```bash
 # Enable long polling for every consumer of the queue
 aws sqs set-queue-attributes \

@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.sqs;
 
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.concurrent.VersionedSignal;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.sqs.model.Message;
@@ -10,7 +12,9 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -22,10 +26,13 @@ import java.util.stream.Collectors;
 class GuardedMessageQueue {
 
     private final ReentrantLock lock = new ReentrantLock();
+    private final VersionedSignal changes = new VersionedSignal();
     private final List<Message> messages;
     private final StorageBackend<String, List<Message>> messageStore;
     private final String storageKey;
     private final String receiptHandleSecret;
+    private final Object persistenceLock;
+    private final BooleanSupplier currentGeneration;
     private final SqsQueueActivity activity = new SqsQueueActivity();
     private volatile boolean closed;
 
@@ -50,6 +57,13 @@ class GuardedMessageQueue {
 
     GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
                         String receiptHandleSecret) {
+        this(initial, messageStore, storageKey, receiptHandleSecret, new Object(), () -> true);
+    }
+
+    GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
+                        String receiptHandleSecret, Object persistenceLock, BooleanSupplier currentGeneration) {
+        this.persistenceLock = persistenceLock;
+        this.currentGeneration = currentGeneration;
         this.messages = new ArrayList<>(initial);
         this.messageStore = messageStore;
         this.storageKey = storageKey;
@@ -61,6 +75,7 @@ class GuardedMessageQueue {
 
     void addMessage(Message message) {
         try (Guard _ = hold()) {
+            requireOpen();
             int mark = messages.size();
             messages.add(message);
             try {
@@ -76,6 +91,7 @@ class GuardedMessageQueue {
      *  caller that compensates on the source side does not leave a duplicate here. */
     void addAll(List<Message> toAdd) {
         try (Guard _ = hold()) {
+            requireOpen();
             int mark = messages.size();
             messages.addAll(toAdd);
             try {
@@ -87,10 +103,20 @@ class GuardedMessageQueue {
         }
     }
 
+    private void requireOpen() {
+        if (closed) {
+            throw new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                    "The specified queue does not exist.", 400);
+        }
+    }
+
     ClaimResult claimVisibleMessages(int maxMessages, int effectiveTimeout,
                                      boolean fifo, int maxReceiveCount,
                                      String deadLetterTargetArn) {
         try (Guard _ = hold()) {
+            if (closed) {
+                return new ClaimResult(List.of(), List.of());
+            }
             List<Message> claimed = new ArrayList<>();
             List<Message> dlqCandidates = new ArrayList<>();
 
@@ -103,7 +129,9 @@ class GuardedMessageQueue {
             }
 
             if (!claimed.isEmpty() || !dlqCandidates.isEmpty()) {
-                persist();
+                // A claim does not make new work available. In particular, an unresolved DLQ
+                // must not wake the same empty receiver into an immediate redrive retry loop.
+                persist(false);
             }
 
             return new ClaimResult(claimed, dlqCandidates);
@@ -274,6 +302,16 @@ class GuardedMessageQueue {
         }
     }
 
+    /** Restore a rejected automatic redrive in its original order without reviving a deleted queue. */
+    void restoreFirst(List<Message> rejected) {
+        try (Guard _ = hold()) {
+            requireOpen();
+            messages.addAll(0, rejected);
+            // Keep the in-memory recovery even if storage remains unavailable, as for restoreFirst(Message).
+            persist();
+        }
+    }
+
     record MessageCounts(long visible, long inFlight, long delayed) {
     }
 
@@ -366,21 +404,63 @@ class GuardedMessageQueue {
     }
 
     void close() {
-        closed = true;
+        try (Guard _ = hold()) {
+            closed = true;
+            changes.signal();
+        }
+    }
+
+    boolean isClosed() {
+        return closed;
+    }
+
+    void signalChange() {
+        changes.signal();
+    }
+
+    long changeVersion() {
+        return changes.version();
+    }
+
+    void awaitChange(long observed, long timeoutNanos) throws InterruptedException {
+        long pause;
+        try (Guard _ = hold()) {
+            // Empty queues need no clock-driven scans. Nonempty queues retain recovery for
+            // visibility/retention expiry and failed redrive attempts, which may enable work.
+            pause = messages.isEmpty() ? timeoutNanos : Math.min(timeoutNanos, TimeUnit.SECONDS.toNanos(1));
+        }
+        changes.awaitChange(observed, pause);
     }
 
     private void persist() {
-        if (closed || messageStore == null || storageKey == null) {
-            return;
-        }
-        if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware) {
-            String accountId = extractAccountFromStorageKey(storageKey);
-            if (accountId != null) {
-                aware.putForAccount(accountId, storageKey, new ArrayList<>(messages));
+        persist(true);
+    }
+
+    private void persist(boolean notifyReceivers) {
+        // Reset detaches before waiting for queue locks. Serialize old and new generations'
+        // writes on a stable storage-key stripe without reacquiring the queue registry monitor.
+        synchronized (persistenceLock) {
+            if (closed || !currentGeneration.getAsBoolean()) {
                 return;
             }
+            if (messageStore != null && storageKey != null) {
+                String accountId = extractAccountFromStorageKey(storageKey);
+                if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware && accountId != null) {
+                    aware.putForAccount(accountId, storageKey, new ArrayList<>(messages));
+                    if (!currentGeneration.getAsBoolean()) {
+                        aware.deleteForAccount(accountId, storageKey);
+                    }
+                } else {
+                    messageStore.put(storageKey, new ArrayList<>(messages));
+                    if (!currentGeneration.getAsBoolean()) {
+                        messageStore.delete(storageKey);
+                    }
+                }
+            }
         }
-        messageStore.put(storageKey, new ArrayList<>(messages));
+        if (notifyReceivers) {
+            changes.signal();
+        }
     }
 
     /**
