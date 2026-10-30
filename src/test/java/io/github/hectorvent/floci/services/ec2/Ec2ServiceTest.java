@@ -1992,6 +1992,73 @@ class Ec2ServiceTest {
                 .networkInterfaces().getFirst().getMacAddress());
     }
 
+    @Test
+    void deletingStandaloneInterfaceRemovesOnlyItsRegionalTags() {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.233.0.0/24");
+        NetworkInterface deleted = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of(new Tag("lifetime", "deleted")));
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of(new Tag("lifetime", "retained")));
+        String otherSubnet = privateSubnet(service, "us-west-2", "10.233.0.0/24");
+        NetworkInterface otherRegion = service.createNetworkInterface("us-west-2", otherSubnet, null, null,
+                List.of(), List.of(), List.of(new Tag("lifetime", "other-region")));
+
+        service.createTags(region, List.of(deleted.getNetworkInterfaceId()), deleted.getTagSet());
+        service.createTags(region, List.of(retained.getNetworkInterfaceId()), retained.getTagSet());
+        service.createTags("us-west-2", List.of(otherRegion.getNetworkInterfaceId()), otherRegion.getTagSet());
+        assertEquals(1, service.resourceTags(region, deleted.getNetworkInterfaceId()).size());
+
+        service.deleteNetworkInterface(region, deleted.getNetworkInterfaceId());
+
+        assertTrue(service.resourceTags(region, deleted.getNetworkInterfaceId()).isEmpty());
+        assertTrue(service.describeTags(region,
+                Map.of("resource-id", List.of(deleted.getNetworkInterfaceId()))).isEmpty());
+        assertEquals("retained", service.resourceTags(region, retained.getNetworkInterfaceId()).getFirst().getValue());
+        assertEquals("other-region", service.resourceTags("us-west-2", otherRegion.getNetworkInterfaceId())
+                .getFirst().getValue());
+        assertEquals("InvalidNetworkInterfaceID.NotFound", assertThrows(AwsException.class,
+                () -> service.deleteNetworkInterface(region, deleted.getNetworkInterfaceId())).getErrorCode());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,true", "false,false", "true,true", "true,false"})
+    void terminationRemovesTagsOnlyForDeletedInterfaces(boolean suppliedInterface, boolean deleteOnTermination) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.233.0.0/24");
+        NetworkInterface supplied = suppliedInterface ? service.createNetworkInterface(region, subnet,
+                null, null, List.of(), List.of(), List.of()) : null;
+        Instance instance = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, supplied != null ? supplied.getNetworkInterfaceId() : null, 0, null,
+                null, null, null, false, null, null, List.of(), false, null, null, suppliedInterface ? null : deleteOnTermination)
+                .getInstances().getFirst();
+        String interfaceId = instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        NetworkInterface stored = service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of(), 0, null)
+                .networkInterfaces().getFirst();
+        if (suppliedInterface) {
+            supplied.getAttachment().setDeleteOnTermination(deleteOnTermination);
+        }
+        assertEquals(deleteOnTermination, stored.getAttachment().isDeleteOnTermination());
+        service.createTags(region, List.of(interfaceId), List.of(new Tag("lifetime", "interface")));
+        assertEquals(!suppliedInterface && deleteOnTermination
+                ? "InvalidNetworkInterfaceID.NotFound" : "InvalidParameterValue", assertThrows(AwsException.class,
+                () -> service.deleteNetworkInterface(region, interfaceId)).getErrorCode());
+        assertEquals("interface", service.resourceTags(region, interfaceId).getFirst().getValue());
+
+        service.terminateInstances(region, List.of(instance.getInstanceId()));
+
+        assertEquals(deleteOnTermination, service.resourceTags(region, interfaceId).isEmpty());
+        assertEquals(deleteOnTermination, service.describeTags(region,
+                Map.of("resource-id", List.of(interfaceId))).isEmpty());
+        if (!deleteOnTermination) {
+            assertEquals("available", service.describeNetworkInterfaces(region, List.of(interfaceId),
+                    Map.of(), 0, null).networkInterfaces().getFirst().getStatus());
+        }
+    }
+
     @ParameterizedTest
     @CsvSource({"false,false,true", "false,true,true", "true,false,true",
             "true,true,true", "true,false,false", "true,true,false"})

@@ -14854,6 +14854,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         releaseInterfaceAddresses(region, networkInterfaceId, true);
         networkInterfaces.delete(key(region, networkInterfaceId));
+        removeTags(region, networkInterfaceId);
     }
 
     /**
@@ -15008,11 +15009,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             boolean deleted = ni == null || (att != null && att.isDeleteOnTermination());
             releaseInterfaceAddresses(region, e.getNetworkInterfaceId(), deleted);
             inst.getNetworkInterfaces().remove(e);
-            if (ni == null) {
-                continue;
-            }
             if (deleted) {
-                networkInterfaces.delete(key(region, ni.getNetworkInterfaceId()));
+                if (ni != null) {
+                    networkInterfaces.delete(key(region, ni.getNetworkInterfaceId()));
+                }
+                removeTags(region, e.getNetworkInterfaceId());
                 continue;
             }
             ni.setAttachment(null);
