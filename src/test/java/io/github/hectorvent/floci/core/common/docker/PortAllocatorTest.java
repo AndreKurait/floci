@@ -7,7 +7,11 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -50,9 +54,19 @@ class PortAllocatorTest {
         int base = 19900;
         int max = base + threads - 1;
         Set<Integer> ports = ConcurrentHashMap.newKeySet();
+        CyclicBarrier ready = new CyclicBarrier(threads);
         try {
-            StartGate.Results<Boolean> results = StartGate.runConcurrently(threads,
-                    index -> ports.add(allocator.allocate(base, max)));
+            StartGate.Results<Boolean> results = StartGate.runConcurrently(threads, index -> {
+                try {
+                    ready.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("Allocation worker interrupted before all workers were ready", e);
+                } catch (BrokenBarrierException | TimeoutException e) {
+                    throw new AssertionError("Allocation workers did not all reach the readiness barrier", e);
+                }
+                return ports.add(allocator.allocate(base, max));
+            });
             assertTrue(results.errors().isEmpty(), () -> "Allocation workers failed: " + results.errors());
             assertEquals(threads, ports.size(),
                     "Concurrent allocations must all return unique ports; got duplicates: " + ports);
