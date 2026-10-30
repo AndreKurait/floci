@@ -313,6 +313,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
                             Map<String, Object> integrationRequest = new HashMap<>();
                             integrationRequest.put("integrationType", integrationType.toUpperCase(Locale.ROOT));
                             putOpenApiIntegrationValue(integrationRequest, "integrationUri", integration, "uri");
+                            putOpenApiIntegrationValue(integrationRequest, "credentialsArn", integration, "credentials");
                             putOpenApiIntegrationValue(integrationRequest, "integrationMethod", integration,
                                     "httpMethod");
                             putOpenApiIntegrationValue(integrationRequest, "payloadFormatVersion", integration,
@@ -378,6 +379,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
             request.put("authorizerType", authorizerType);
             putOpenApiAuthorizerIdentitySource(request, definition);
             putOpenApiAuthorizerValue(request, "authorizerUri", definition, "authorizerUri");
+            putOpenApiAuthorizerValue(request, "authorizerCredentialsArn", definition, "authorizerCredentials");
             putOpenApiAuthorizerValue(request, "authorizerPayloadFormatVersion", definition,
                     "authorizerPayloadFormatVersion");
             putOpenApiAuthorizerValue(request, "authorizerResultTtlInSeconds", definition,

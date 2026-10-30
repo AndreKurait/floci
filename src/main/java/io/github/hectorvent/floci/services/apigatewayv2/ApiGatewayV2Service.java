@@ -143,11 +143,15 @@ public class ApiGatewayV2Service {
         String target = targetValue != null ? String.valueOf(targetValue) : null;
         if ("HTTP".equals(protocolType) && target != null && !target.isBlank()) {
             boolean isLambdaTarget = AwsArnUtils.looksLikeArn(target);
-            Integration integration = createIntegration(region, apiId, Map.of(
+            Map<String, Object> integrationRequest = new HashMap<>(Map.of(
                     "integrationType", isLambdaTarget ? "AWS_PROXY" : "HTTP_PROXY",
                     "integrationUri", target,
                     "integrationMethod", isLambdaTarget ? "POST" : "ANY",
                     "payloadFormatVersion", "2.0"));
+            if (isLambdaTarget) {
+                integrationRequest.put("credentialsArn", request.get("credentialsArn"));
+            }
+            Integration integration = createIntegration(region, apiId, integrationRequest);
             createRoute(region, apiId, Map.of(
                     "routeKey", "$default",
                     "target", "integrations/" + integration.getIntegrationId()));
@@ -381,6 +385,7 @@ public class ApiGatewayV2Service {
             auth.setJwtConfiguration(new Authorizer.JwtConfiguration(audience, issuer));
         }
 
+        auth.setAuthorizerCredentialsArn((String) request.get("authorizerCredentialsArn"));
         auth.setAuthorizerUri((String) request.get("authorizerUri"));
         auth.setAuthorizerPayloadFormatVersion((String) request.get("authorizerPayloadFormatVersion"));
         auth.setAuthorizerResultTtlInSeconds(authorizerResultTtl(request.get("authorizerResultTtlInSeconds")));
@@ -418,6 +423,7 @@ public class ApiGatewayV2Service {
         restored.setName(authorizer.getName());
         restored.setJwtConfiguration(authorizer.getJwtConfiguration());
         restored.setIdentitySource(authorizer.getIdentitySource());
+        restored.setAuthorizerCredentialsArn(authorizer.getAuthorizerCredentialsArn());
         restored.setAuthorizerUri(authorizer.getAuthorizerUri());
         restored.setAuthorizerPayloadFormatVersion(authorizer.getAuthorizerPayloadFormatVersion());
         restored.setAuthorizerResultTtlInSeconds(authorizer.getAuthorizerResultTtlInSeconds());
@@ -433,6 +439,9 @@ public class ApiGatewayV2Service {
 
         if (request.containsKey("name") && request.get("name") != null) {
             auth.setName((String) request.get("name"));
+        }
+        if (request.get("authorizerCredentialsArn") != null) {
+            auth.setAuthorizerCredentialsArn((String) request.get("authorizerCredentialsArn"));
         }
         if (request.containsKey("authorizerType") && request.get("authorizerType") != null) {
             auth.setAuthorizerType((String) request.get("authorizerType"));
@@ -691,6 +700,7 @@ public class ApiGatewayV2Service {
         Integration integration = new Integration();
         integration.setIntegrationId(shortId(8));
         integration.setIntegrationType((String) request.get("integrationType"));
+        integration.setCredentialsArn((String) request.get("credentialsArn"));
         integration.setIntegrationUri((String) request.get("integrationUri"));
         integration.setConnectionType((String) request.get("connectionType"));
         integration.setPayloadFormatVersion((String) request.getOrDefault("payloadFormatVersion", "2.0"));
@@ -746,6 +756,9 @@ public class ApiGatewayV2Service {
                                          Map<String, Object> request) {
         Integration integration = getIntegration(region, apiId, integrationId);
 
+        if (request.get("credentialsArn") != null) {
+            integration.setCredentialsArn((String) request.get("credentialsArn"));
+        }
         if (request.containsKey("integrationType") && request.get("integrationType") != null) {
             integration.setIntegrationType((String) request.get("integrationType"));
         }

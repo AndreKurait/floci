@@ -17,6 +17,8 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudForm
 import io.github.hectorvent.floci.services.s3.S3Service;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 
 import java.util.HashMap;
@@ -322,6 +324,43 @@ class ApiGatewayV2CfnProvisionerTest {
         String record = previous.getAttributes().get("__FlociReplacementCleanup");
         assertTrue(record != null && record.contains("subnet-replacement") && record.contains("\"cleanupAttempts\":1"),
                 "the orphan the attempt could not remove is owed on the restored resource: " + record);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void bodyMapsIntegrationAndRequestAuthorizerCredentials(boolean integrationCredentials) throws Exception {
+        Authorizer authorizer = new Authorizer();
+        authorizer.setAuthorizerId("body-authorizer");
+        when(apiGatewayV2Service.createAuthorizer(eq(REGION), eq(API_ID), anyMap())).thenReturn(authorizer);
+        Integration integration = new Integration();
+        integration.setIntegrationId("body-integration");
+        when(apiGatewayV2Service.createIntegration(eq(REGION), eq(API_ID), anyMap())).thenReturn(integration);
+        when(apiGatewayV2Service.createRoute(eq(REGION), eq(API_ID), anyMap()))
+                .thenReturn(route("body-route", "GET /items"));
+
+        StackResource resource = provision(body("""
+                {"components":{"securitySchemes":{"RequestAuth":{
+                  "type":"apiKey","name":"Authorization","in":"header",
+                  "x-amazon-apigateway-authorizer":{"type":"request",
+                    "authorizerUri":"arn:aws:lambda:us-east-1:000000000000:function:auth",
+                    "authorizerCredentials":"arn:aws:iam::000000000000:role/authorizer",
+                    "identitySource":"$request.header.Authorization",
+                    "authorizerPayloadFormatVersion":"2.0"}}}},
+                 "paths":{"/items":{"get":{"security":[{"RequestAuth":[]}],
+                  "x-amazon-apigateway-integration":{"type":"aws_proxy",
+                    "uri":"arn:aws:lambda:us-east-1:000000000000:function:target",
+                    "credentials":"arn:aws:iam::000000000000:role/integration",
+                    "httpMethod":"POST","payloadFormatVersion":"2.0"}}}}}
+                """), null, Map.of());
+
+        assertEquals("CREATE_COMPLETE", resource.getStatus());
+        if (integrationCredentials) {
+            verify(apiGatewayV2Service).createIntegration(eq(REGION), eq(API_ID), argThat(request ->
+                    "arn:aws:iam::000000000000:role/integration".equals(request.get("credentialsArn"))));
+        } else {
+            verify(apiGatewayV2Service).createAuthorizer(eq(REGION), eq(API_ID), argThat(request ->
+                    "arn:aws:iam::000000000000:role/authorizer".equals(request.get("authorizerCredentialsArn"))));
+        }
     }
 
     @Test
