@@ -13177,9 +13177,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // a call with no associated address does not wait for it.
         if (candidates.stream().anyMatch(addr -> addr.getAssociationId() != null)) {
             synchronized (privateIpAllocationLock) {
+                candidates = candidates.stream()
+                        .map(addr -> addresses.get(key(region, addr.getAllocationId())).orElse(null))
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toList());
                 for (Address addr : candidates) {
                     String holder = addr.getAssociationId() == null ? null : addressHolder(region, addr);
                     if (holder != null) {
+                        Instance host = instances.get(key(region, holder)).orElse(null);
+                        if (isMissingOrTerminated(host) || "shutting-down".equals(host.getState().getName())) {
+                            if (addr.getInstanceId() != null) {
+                                addr.setInstanceId(null);
+                                addresses.put(key(region, addr.getAllocationId()), addr);
+                            }
+                            continue;
+                        }
                         String before = addr.getPublicIp();
                         pointAddressAtInstance(addr, region, holder);
                         if (!Objects.equals(before, addr.getPublicIp())) {
@@ -15063,6 +15075,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return releaseIfHostIsGone(region, ni);
     }
 
+    private static boolean isMissingOrTerminated(Instance host) {
+        return host == null || host.getState() == null || "terminated".equals(host.getState().getName());
+    }
+
     /**
      * Clears an attachment whose instance no longer exists. TerminateInstances is not the only way
      * an instance reaches "terminated": a container-backed launch that fails or is cancelled ends
@@ -15085,8 +15101,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             Instance host = instances instanceof AccountAwareStorageBackend<Instance> aware
                     ? aware.getForAccount(safeAccount, key(region, attachment.getInstanceId())).orElse(null)
                     : instances.get(key(region, attachment.getInstanceId())).orElse(null);
-            boolean hostIsGone = host == null || host.getState() == null
-                    || "terminated".equals(host.getState().getName());
+            boolean hostIsGone = isMissingOrTerminated(host);
             if (!hostIsGone) {
                 return ni;
             }
