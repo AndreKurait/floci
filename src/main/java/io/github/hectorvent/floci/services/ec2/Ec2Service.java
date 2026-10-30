@@ -4109,6 +4109,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
             }
             synchronized (attachmentTopologyLock(region)) {
+                if (finalSubnetId != null) {
+                    requireSubnet(region, finalSubnetId);
+                }
                 for (GroupIdentifier group : sgIdentifiers) {
                     getRequiredSecurityGroup(region, group.getGroupId());
                 }

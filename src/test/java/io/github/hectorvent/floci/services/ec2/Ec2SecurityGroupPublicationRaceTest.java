@@ -259,6 +259,76 @@ class Ec2SecurityGroupPublicationRaceTest {
     }
 
     @Test
+    void launchRejectsSubnetDeletedAfterResolutionBeforeAllocating() throws Exception {
+        TestStores factory = new TestStores();
+        Ec2Service service = service(factory);
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
+        String group = service.createSecurityGroup(region, "deleted-subnet", "launch", vpc).getGroupId();
+        factory.groups.parkNextRead();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<AwsException> created = executor.submit(() -> {
+                try {
+                    service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                            List.of(group), subnet, null, List.of(), null, null);
+                    return null;
+                } catch (AwsException error) {
+                    return error;
+                }
+            });
+            assertTrue(factory.groups.awaitParked(), "Launch must resolve its subnet before reading the group");
+            service.deleteSubnet(region, subnet);
+            factory.groups.release();
+            AwsException error = created.get(5, TimeUnit.SECONDS);
+            assertNotNull(error, "Launch must reject the subnet deleted after its initial resolution");
+            assertEquals("InvalidSubnetID.NotFound", error.getErrorCode());
+            assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
+            assertTrue(service.describeVolumes(region, List.of(), Map.of()).isEmpty());
+            assertTrue(service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().isEmpty());
+            assertTrue(service.describeSubnets(region, List.of(subnet), Map.of()).isEmpty());
+        } finally {
+            factory.groups.release();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void subnetDeletionWaitsForLaunchPublicationAndRetainsResidentSubnet() throws Exception {
+        TestStores factory = new TestStores();
+        Ec2Service service = service(factory);
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
+        String group = service.createSecurityGroup(region, "resident-subnet", "launch", vpc).getGroupId();
+        factory.instances.parkNextWrite();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<Reservation> created = executor.submit(() -> service.runInstances(region, "ami-test", "t3.micro",
+                    1, 1, null, List.of(group), subnet, null, List.of(), null, null));
+            assertTrue(factory.instances.awaitParked(), "Launch must reach instance publication");
+            AtomicReference<Thread> deletingThread = new AtomicReference<>();
+            Future<AwsException> deleted = executor.submit(() -> {
+                deletingThread.set(Thread.currentThread());
+                return assertThrows(AwsException.class, () -> service.deleteSubnet(region, subnet));
+            });
+            awaitBlockedOrDone(deletingThread, deleted);
+            assertFalse(deleted.isDone(), "Deletion must wait for launch publication");
+            factory.instances.release();
+            Reservation reservation = created.get(5, TimeUnit.SECONDS);
+            assertEquals("DependencyViolation", deleted.get(5, TimeUnit.SECONDS).getErrorCode());
+            assertEquals(subnet, reservation.getInstances().getFirst().getSubnetId());
+            assertEquals(1, service.describeSubnets(region, List.of(subnet), Map.of()).size());
+        } finally {
+            factory.instances.release();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
     void existingInstancePreventsDeletionUntilTerminated() {
         Ec2Service service = service(new TestStores());
         String region = "us-east-1";
