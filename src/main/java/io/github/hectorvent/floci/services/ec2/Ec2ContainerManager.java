@@ -588,7 +588,17 @@ public class Ec2ContainerManager {
         String instanceId = instance.getInstanceId();
         String containerName = ContainerStorageHelper.resourceName(config, "ec2", null, instanceId);
         GuestOptions options = guestOptions(config.services().ec2());
-        String serviceEndpoint = reachableEndpoint.baseUrl();
+        if (image.systemd()) {
+            for (Mount mount : options.mounts()) {
+                if (Set.of("/run", "/run/lock", "/sys/fs/cgroup").contains(mount.getTarget())) {
+                    throw new IllegalArgumentException("Read-only bind target is reserved for systemd: "
+                            + mount.getTarget());
+                }
+            }
+        }
+        boolean customResolver = options.mounts().stream().anyMatch(mount ->
+                "/etc".equals(mount.getTarget()) || "/etc/resolv.conf".equals(mount.getTarget()));
+        String serviceEndpoint = customResolver ? reachableEndpoint.baseUrl(false) : reachableEndpoint.baseUrl();
 
         return portAllocator.allocateAndStart(
                 config.services().ec2().sshPortRangeStart(),
@@ -721,6 +731,7 @@ public class Ec2ContainerManager {
                 .withPrivileged(config.services().ec2().privileged() && !enforceSecurityGroups);
         config.services().ec2().capDrop().orElse(List.of()).forEach(specBuilder::withCapDrop);
         options.ulimits().forEach((name, limit) -> specBuilder.withUlimit(name, limit.soft(), limit.hard()));
+        options.mounts().forEach(specBuilder::withMount);
         if (!image.imageRuntime()) {
             specBuilder.withCmd(image.systemd() ? List.of("/sbin/init") : List.of("tail", "-f", "/dev/null"));
         }
@@ -748,7 +759,8 @@ public class Ec2ContainerManager {
         return specBuilder.build();
     }
 
-    private record GuestOptions(List<String> environment, Map<String, ContainerSpec.ResourceLimit> ulimits) {}
+    private record GuestOptions(List<String> environment, Map<String, ContainerSpec.ResourceLimit> ulimits,
+                                List<Mount> mounts) {}
 
     private static GuestOptions guestOptions(EmulatorConfig.Ec2ServiceConfig ec2) {
         Map<String, String> environment = new LinkedHashMap<>();
@@ -785,8 +797,37 @@ public class Ec2ContainerManager {
                 throw new IllegalArgumentException("EC2 ulimits contains a duplicate name: " + matcher.group(1));
             }
         }
+        Map<String, Mount> mounts = new LinkedHashMap<>();
+        for (EmulatorConfig.Ec2ServiceConfig.GuestReadOnlyBind bind : ec2.readOnlyBinds()) {
+            String source = guestMountPath(bind.source());
+            String target = guestMountPath(bind.target());
+            if ("/".equals(target)) {
+                throw new IllegalArgumentException("EC2 read-only bind cannot replace the guest root");
+            }
+            Mount mount = new Mount().withType(MountType.BIND).withSource(source).withTarget(target)
+                    .withReadOnly(true);
+            if (mounts.putIfAbsent(target, mount) != null) {
+                throw new IllegalArgumentException("EC2 read-only binds contain a duplicate target: " + target);
+            }
+        }
         return new GuestOptions(environment.entrySet().stream()
-                .map(entry -> entry.getKey() + "=" + entry.getValue()).toList(), Map.copyOf(limits));
+                .map(entry -> entry.getKey() + "=" + entry.getValue()).toList(), Map.copyOf(limits),
+                List.copyOf(mounts.values()));
+    }
+
+    private static String guestMountPath(String value) {
+        if (value == null || !value.startsWith("/") || value.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException("EC2 read-only binds require normalized absolute paths");
+        }
+        // These paths belong to a Linux daemon even when Floci runs on Windows.
+        if (!"/".equals(value)) {
+            for (String part : value.substring(1).split("/", -1)) {
+                if (part.isEmpty() || ".".equals(part) || "..".equals(part)) {
+                    throw new IllegalArgumentException("EC2 read-only binds require normalized absolute paths");
+                }
+            }
+        }
+        return value;
     }
 
     private void failLaunch(Instance instance) {
