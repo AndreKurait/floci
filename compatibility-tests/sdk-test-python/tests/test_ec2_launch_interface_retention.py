@@ -182,3 +182,56 @@ def test_request_interface_replaces_template_retention(ec2_client, delete):
         retained = ec2.describe_network_interfaces(
             Filters=[{"Name": "network-interface-id", "Values": [eni_id]}])["NetworkInterfaces"]
         assert bool(retained) != delete
+
+
+@pytest.mark.parametrize("supplied_interface", [False, True])
+@pytest.mark.parametrize("request_override", [False, True])
+def test_template_primary_interface_tags(ec2_client, supplied_interface, request_override):
+    ec2 = ec2_client
+    name = "template-interface-tags-" + uuid.uuid4().hex
+    with ExitStack() as cleanup:
+        vpc = ec2.create_vpc(CidrBlock="10.239.0.0/24")["Vpc"]["VpcId"]
+        cleanup.callback(ec2.delete_vpc, VpcId=vpc)
+        subnet = ec2.create_subnet(VpcId=vpc, CidrBlock="10.239.0.0/26")["Subnet"]["SubnetId"]
+        cleanup.callback(ec2.delete_subnet, SubnetId=subnet)
+        image = ec2.register_image(Name=name, Architecture="x86_64", RootDeviceName="/dev/sda1")["ImageId"]
+        cleanup.callback(ec2.deregister_image, ImageId=image)
+        interface_ids = []
+        cleanup.callback(_delete_interfaces, ec2, interface_ids)
+        network = {"DeviceIndex": 0, "DeleteOnTermination": False}
+        if supplied_interface:
+            interface_id = ec2.create_network_interface(SubnetId=subnet)["NetworkInterface"]["NetworkInterfaceId"]
+            interface_ids.append(interface_id)
+            network["NetworkInterfaceId"] = interface_id
+            ec2.create_tags(Resources=[interface_id], Tags=[{"Key": "existing", "Value": "preserved"}])
+        else:
+            network["SubnetId"] = subnet
+        template = ec2.create_launch_template(LaunchTemplateName=name, LaunchTemplateData={
+            "ImageId": image, "InstanceType": "t3.nano", "NetworkInterfaces": [network],
+            "TagSpecifications": [
+                {"ResourceType": "network-interface", "Tags": [
+                    {"Key": "template-only", "Value": "interface"}, {"Key": "shared", "Value": "template"}]},
+                {"ResourceType": "instance", "Tags": [{"Key": "instance-only", "Value": "instance"}]}]
+        })["LaunchTemplate"]["LaunchTemplateId"]
+        cleanup.callback(ec2.delete_launch_template, LaunchTemplateId=template)
+        launch = {"LaunchTemplate": {"LaunchTemplateId": template}, "MinCount": 1, "MaxCount": 1}
+        if request_override:
+            launch["TagSpecifications"] = [{"ResourceType": "network-interface", "Tags": [
+                {"Key": "shared", "Value": "request"}, {"Key": "request-only", "Value": "interface"}]}]
+        instance = ec2.run_instances(**launch)["Instances"][0]
+        cleanup.callback(_terminate, ec2, instance["InstanceId"])
+        interface_id = instance["NetworkInterfaces"][0]["NetworkInterfaceId"]
+        if interface_id not in interface_ids:
+            interface_ids.append(interface_id)
+        expected = {"existing": "preserved"} if supplied_interface else {
+            "template-only": "interface", "shared": "template"}
+        if request_override:
+            expected.update({"shared": "request", "request-only": "interface"})
+        def assert_tags():
+            interface = ec2.describe_network_interfaces(NetworkInterfaceIds=[interface_id])["NetworkInterfaces"][0]
+            assert {t["Key"]: t["Value"] for t in interface.get("TagSet", [])} == expected
+            tags = ec2.describe_tags(Filters=[{"Name": "resource-id", "Values": [interface_id]}])["Tags"]
+            assert {t["Key"]: t["Value"] for t in tags} == expected
+        assert_tags()
+        _terminate(ec2, instance["InstanceId"])
+        assert_tags()

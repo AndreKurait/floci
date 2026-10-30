@@ -1248,6 +1248,11 @@ keeps the attachment; termination deletes an interface marked for deletion and r
 a retained interface to `available`, preserving its private address, groups, tags, and
 Elastic IP association. A retained interface can be reused by a later launch.
 
+Launch-template `network-interface` tags apply to the primary interface created by
+the launch. Request tags override matching template keys. Template interface tags
+do not retag a supplied interface or propagate to secondary interfaces. Tags stay
+visible through `DescribeTags` and `DescribeNetworkInterfaces` after retention.
+
 `ModifyNetworkInterfaceAttribute` is not implemented: no example in the corpus that needed `CreateNetworkInterface` was found to need it. A route table's `CreateRoute` with a `NetworkInterfaceId` target is accepted but not recorded, since `Route` does not yet model an ENI target; a subsequent `plan` against such a route may show drift.
 
 ### Volumes

@@ -945,6 +945,20 @@ public class Ec2QueryHandler {
                 "spot".equals(marketType), privateIpAddress, capacitySpecification,
                 networkInterfaceDeleteOnTermination);
 
+        if (launchTemplateData != null && !isSet(networkInterfaceId)) {
+            List<Tag> templateInterfaceTags = launchTemplateData.tagsForResource("network-interface");
+            if (!templateInterfaceTags.isEmpty()) {
+                List<String> primaryIds = res.getInstances().stream()
+                        .flatMap(instance -> instance.getNetworkInterfaces().stream())
+                        .filter(networkInterface -> networkInterface.getDeviceIndex() == 0)
+                        .map(InstanceNetworkInterface::getNetworkInterfaceId)
+                        .toList();
+                if (!primaryIds.isEmpty()) {
+                    service.createTags(region, primaryIds, templateInterfaceTags);
+                }
+            }
+        }
+
         if (!networkInterfaceTags.isEmpty()) {
             List<String> eniIds = new ArrayList<>();
             for (Instance inst : res.getInstances()) {
