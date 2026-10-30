@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Authorizer;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Integration;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Route;
+import io.github.hectorvent.floci.services.iam.PassedRoleLookup;
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.Operation;
 import io.swagger.v3.oas.models.PathItem;
@@ -35,7 +36,7 @@ import java.util.function.BiConsumer;
  * {@code x-amazon-apigateway-any-method} and {@code x-amazon-apigateway-cors}.
  */
 @ApplicationScoped
-public class ApiGatewayV2OpenApiImporter {
+public class ApiGatewayV2OpenApiImporter implements PassedRoleLookup {
 
     private static final Logger LOG = Logger.getLogger(ApiGatewayV2OpenApiImporter.class);
 
@@ -49,6 +50,38 @@ public class ApiGatewayV2OpenApiImporter {
     @Inject
     public ApiGatewayV2OpenApiImporter(ApiGatewayV2Service service) {
         this.service = service;
+    }
+
+    @Override
+    public List<String> importedHttpApiRoles(String document, String region) {
+        ImportPlan importPlan;
+        try {
+            importPlan = plan(document, null, false);
+        } catch (AwsException expected) {
+            // The normal importer reports invalid definitions before assigning any credentials.
+            LOG.debugv(expected, "Invalid HTTP API import has no role assignments");
+            return List.of();
+        }
+        List<String> roles = new ArrayList<>();
+        for (AuthorizerSpec spec : importPlan.authorizerSpecs()) {
+            if ("CUSTOM".equals(spec.authorizationType()) && spec.request() != null
+                    && spec.request().get("authorizerCredentialsArn") instanceof String role) {
+                roles.add(role);
+            }
+        }
+        forEachImportedOperation(importPlan.openAPI(), (method, path, operation) -> {
+            Map<String, Object> definition = extensionAsMap(
+                    operation == null ? null : operation.getExtensions(), EXT_INTEGRATION);
+            if (definition != null) {
+                Map<String, Object> request = toIntegrationRequest(definition);
+                if (("AWS".equals(request.get("integrationType"))
+                        || "AWS_PROXY".equals(request.get("integrationType")))
+                        && request.get("credentialsArn") instanceof String role) {
+                    roles.add(role);
+                }
+            }
+        });
+        return roles;
     }
 
     // ──────────────────────────── Entry points ────────────────────────────
@@ -522,6 +555,7 @@ public class ApiGatewayV2OpenApiImporter {
             if (!identitySource.isEmpty()) {
                 request.put("identitySource", identitySource);
             }
+            putIfPresent(request, "authorizerCredentialsArn", stringValue(authDef.get("authorizerCredentials")));
             putIfPresent(request, "authorizerUri", stringValue(authDef.get("authorizerUri")));
             putIfPresent(request, "authorizerPayloadFormatVersion",
                     stringValue(authDef.get("authorizerPayloadFormatVersion")));
@@ -661,6 +695,7 @@ public class ApiGatewayV2OpenApiImporter {
         if (type != null) {
             request.put("integrationType", type.toUpperCase(Locale.ROOT));
         }
+        putIfPresent(request, "credentialsArn", stringValue(definition.get("credentials")));
         putIfPresent(request, "integrationUri", stringValue(definition.get("uri")));
         putIfPresent(request, "integrationMethod", stringValue(definition.get("httpMethod")));
         putIfPresent(request, "connectionType", upper(stringValue(definition.get("connectionType"))));

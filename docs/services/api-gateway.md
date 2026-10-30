@@ -697,6 +697,19 @@ Gateway v1 (`AWS`/Lambda mapping templates) and the AppSync resolver templates d
 
 ## API Gateway v2 (HTTP and WebSocket APIs) {#v2}
 
+### HTTP and WebSocket integration credentials
+
+V2 management APIs retain `credentialsArn` for integrations and
+`authorizerCredentialsArn` for REQUEST authorizers through create, update, get and
+list. Omitting either member on update preserves its stored value. HTTP API quick
+create retains its integration credentials. OpenAPI import maps the integration
+`credentials` and authorizer `authorizerCredentials` extensions to these fields.
+Integration copies and authorizer restore paths retain them too.
+
+This models credential selection; execution-role assumption and credential-based
+Lambda invocation authorization are not implemented by this change. Dedicated
+CloudFormation credential properties remain outside this support.
+
 **Protocol:** REST JSON
 **Endpoint:** `http://localhost:4566/v2/apis/...`
 
@@ -981,3 +994,10 @@ aws apigatewayv2 create-stage \
 ```
 
 REST Lambda authorizers retain `authorizerCredentials` through management, OpenAPI import/export and CloudFormation provisioning. The credential patch path supports `replace`; a null replacement clears the configured role. Omitted credential updates preserve the stored value. Credential retention does not itself enforce invocation permissions or assume the configured role.
+
+HTTP API import and reimport check `iam:PassRole` for assigned AWS integration and REQUEST
+Lambda authorizer execution roles when IAM enforcement is enabled. The check uses the same
+normalized OpenAPI plan as the importer, including YAML and ANY-method operations, before
+creating or replacing API resources. Caller credentials, omitted or null credentials, HTTP
+integration credentials and JWT authorizer fields do not pass an execution role. This check
+does not add OpenAPI reference resolution or AWS-variable substitution beyond the existing importer.
