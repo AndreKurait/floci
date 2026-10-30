@@ -638,10 +638,12 @@ floci:
       allow-plaintext-http: false
       mock-config-file: ${SFN_MOCK_CONFIG:}
       max-wait-seconds: 30
+      max-wait-millis: 0                     # Positive values override max-wait-seconds, without changing execution or task deadlines
     swf:
       enabled: true
       timeout-sweep-enabled: true
       timeout-sweep-interval-seconds: 1
+      timeout-sweep-interval-millis: 0        # Positive values override the seconds interval, without shortening timeouts
     cloudformation:
       enabled: true
       # How long a deleted stack stays describable by its stack id (ARN) and listed as

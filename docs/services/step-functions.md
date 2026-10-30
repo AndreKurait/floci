@@ -277,7 +277,8 @@ workflows converge: the `framework-isComplete-task` throws on every not-yet-comp
 `JitterStrategy` supports `NONE` (the default) and `FULL`. `FULL` draws the delay
 uniformly between zero and the computed delay, as on AWS. One deviation. The delay
 between attempts is capped at `floci.services.stepfunctions.max-wait-seconds`
-(default 30), the same ceiling Floci applies to `Wait` states, so emulated runs stay fast.
+(default 30), unless a positive `max-wait-millis` replaces that ceiling.
+The same ceiling applies to `Wait` states, so emulated runs stay fast.
 
 ## Wait states
 
@@ -288,7 +289,15 @@ unparseable timestamp fails the execution with `States.Runtime`. In a JSONata st
 `Seconds` and `Timestamp` each accept a literal or a JSONata expression that produces the value.
 
 One deviation. Every pause is capped at `floci.services.stepfunctions.max-wait-seconds`
-(default 30) so emulated runs stay fast, where AWS sleeps the full duration.
+(default 30), unless a positive `max-wait-millis` replaces that ceiling.
+This keeps emulated runs fast, where AWS sleeps the full duration.
+
+For subsecond local waits, set `floci.services.stepfunctions.max-wait-millis`, for
+example `FLOCI_SERVICES_STEPFUNCTIONS_MAX_WAIT_MILLIS=100`. A positive value overrides
+the seconds ceiling for every Wait form and Retry backoff. Its default, `0`, keeps
+the existing seconds setting. Non-positive values also use the seconds setting.
+This local acceleration does not change the host clock, execution or task deadlines,
+heartbeat timeouts, or the polling interval of an external workflow worker.
 
 ## Timeouts
 
@@ -990,7 +999,8 @@ unsupported resource.
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_STEPFUNCTIONS_ENABLED` | `true` | Enable or disable the service |
-| `FLOCI_SERVICES_STEPFUNCTIONS_MAX_WAIT_SECONDS` | `30` | Ceiling in seconds on a `Wait` state pause and a `Retry` backoff |
+| `FLOCI_SERVICES_STEPFUNCTIONS_MAX_WAIT_SECONDS` | `30` | Ceiling in seconds on a `Wait` state pause and a `Retry` backoff when `max-wait-millis` is non-positive |
+| `FLOCI_SERVICES_STEPFUNCTIONS_MAX_WAIT_MILLIS` | `0` | Positive values replace the seconds ceiling for `Wait` states and `Retry` backoff; non-positive values retain it |
 | `SFN_MOCK_CONFIG` | unset | Path to a Step Functions Local compatible mock configuration file (alias: `FLOCI_SERVICES_STEPFUNCTIONS_MOCK_CONFIG_FILE`) |
 
 ## Examples

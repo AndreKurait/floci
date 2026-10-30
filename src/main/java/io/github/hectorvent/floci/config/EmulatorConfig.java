@@ -2180,6 +2180,14 @@ public interface EmulatorConfig {
          */
         @WithDefault("30")
         int maxWaitSeconds();
+
+        /**
+         * Positive millisecond ceiling for Wait states and Retry backoffs. Overrides
+         * {@code max-wait-seconds}; non-positive values keep the seconds setting.
+         * Execution, task and heartbeat deadlines are not shortened.
+         */
+        @WithDefault("0")
+        long maxWaitMillis();
     }
 
     interface SwfServiceConfig {
@@ -2200,6 +2208,13 @@ public interface EmulatorConfig {
          */
         @WithDefault("1")
         long timeoutSweepIntervalSeconds();
+
+        /**
+         * Positive millisecond sweep interval, overriding {@code timeout-sweep-interval-seconds}.
+         * Changes when expired timeouts are observed, not the recorded timeout deadlines.
+         */
+        @WithDefault("0")
+        long timeoutSweepIntervalMillis();
     }
 
     interface CloudFormationServiceConfig {

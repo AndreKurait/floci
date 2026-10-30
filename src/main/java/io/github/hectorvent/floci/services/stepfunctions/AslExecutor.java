@@ -841,7 +841,7 @@ public class AslExecutor {
     private void sleepBeforeRetry(JsonNode retrier, int attemptsUsed, long executionDeadlineNanos)
             throws InterruptedException {
         double delaySeconds = retryDelaySeconds(retrier, attemptsUsed, ThreadLocalRandom.current().nextDouble(),
-                maxWaitSeconds());
+                maxWaitNanos() / 1_000_000_000.0);
         sleepOrTimeOutExecution((long) (delaySeconds * 1_000_000_000L), executionDeadlineNanos);
     }
 
@@ -850,7 +850,7 @@ public class AslExecutor {
      * the retrier declares {@code JitterStrategy: FULL}, which draws the delay uniformly between
      * zero and the computed delay. Jitter applies after the caps, matching AWS.
      */
-    static double retryDelaySeconds(JsonNode retrier, int attemptsUsed, double random, int maxWaitSeconds) {
+    static double retryDelaySeconds(JsonNode retrier, int attemptsUsed, double random, double maxWaitSeconds) {
         double interval = retrier.path("IntervalSeconds").asDouble(1.0);
         double backoffRate = retrier.path("BackoffRate").asDouble(2.0);
         double delaySeconds = interval * Math.pow(backoffRate, attemptsUsed - 1.0);
@@ -2918,17 +2918,21 @@ public class AslExecutor {
         return new StateResult(output, stateDef.path("Next").asText(null));
     }
 
-    private int maxWaitSeconds() {
-        return maxWaitSecondsOverride != null
-                ? maxWaitSecondsOverride
-                : config.services().stepfunctions().maxWaitSeconds();
+    private long maxWaitNanos() {
+        if (maxWaitSecondsOverride != null) {
+            return TimeUnit.SECONDS.toNanos(maxWaitSecondsOverride);
+        }
+        long millis = config.services().stepfunctions().maxWaitMillis();
+        return millis > 0
+                ? TimeUnit.MILLISECONDS.toNanos(millis)
+                : TimeUnit.SECONDS.toNanos(config.services().stepfunctions().maxWaitSeconds());
     }
 
     private long secondsToNanos(long seconds) {
         if (seconds <= 0) {
             return 0;
         }
-        return TimeUnit.SECONDS.toNanos(Math.min(seconds, maxWaitSeconds()));
+        return Math.min(TimeUnit.SECONDS.toNanos(seconds), maxWaitNanos());
     }
 
     /**
@@ -2948,7 +2952,7 @@ public class AslExecutor {
         if (remainingNanos <= 0) {
             return 0;
         }
-        return Math.min(remainingNanos, TimeUnit.SECONDS.toNanos(maxWaitSeconds()));
+        return Math.min(remainingNanos, maxWaitNanos());
     }
 
     /**
