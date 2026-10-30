@@ -26,6 +26,7 @@ import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.CookieHeaders;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
+import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
 import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.ApiKey;
@@ -48,6 +49,7 @@ import io.github.hectorvent.floci.services.apigatewayv2.websocket.WebSocketConne
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -120,6 +122,7 @@ public class ApiGatewayExecuteController {
     private final CognitoUserPoolAuthorizer cognitoAuthorizer;
     private final ApiGatewayV2Service apiGatewayV2Service;
     private final LambdaService lambdaService;
+    private final ServiceCallAuthorizer serviceCallAuthorizer;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
     private final Configuration jsonPathConfiguration;
@@ -148,11 +151,13 @@ public class ApiGatewayExecuteController {
                                        JwtSignatureVerifier jwtSignatureVerifier,
                                        RequestContext requestContext,
                                        ExecuteApiSigV4Authorizer sigV4Authorizer, RestLambdaAuthorizer restLambdaAuthorizer,
-                                       AuthorizerPolicyEvaluator authorizerPolicyEvaluator) {
+                                       AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
+                                       ServiceCallAuthorizer serviceCallAuthorizer) {
         this.apiGatewayService = apiGatewayService;
         this.cognitoAuthorizer = cognitoAuthorizer;
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.lambdaService = lambdaService;
+        this.serviceCallAuthorizer = serviceCallAuthorizer;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
         this.jsonPathConfiguration = Configuration.builder()
@@ -1064,6 +1069,16 @@ public class ApiGatewayExecuteController {
                     auth.getIdentitySource(), ttl, identities != null ? identities : List.of());
             RestLambdaAuthorizer.Result verified = restLambdaAuthorizer.get(key);
             if (verified == null) {
+                if (auth.getAuthorizerCredentials() == null || auth.getAuthorizerCredentials().isBlank()) {
+                    String functionArn = LambdaArnUtils.functionArn(function, regionResolver.getPartition(),
+                            region, regionResolver.getAccountId());
+                    String sourceArn = AwsArnUtils.Arn.of("execute-api", region, regionResolver.getAccountId(),
+                            apiId + "/authorizers/" + auth.getId()).toString();
+                    if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                            sourceArn, regionResolver.getAccountId()) == Decision.DENY) {
+                        return authorizerError(scope, GatewayResponseType.AUTHORIZER_CONFIGURATION_ERROR, 500);
+                    }
+                }
                 try (RestLambdaAuthorizer.Invocation pending = restLambdaAuthorizer.beginInvocation(key)) {
                     InvokeResult invocation = lambdaService.invokeTarget(region, function,
                             event.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
@@ -1082,7 +1097,7 @@ public class ApiGatewayExecuteController {
             }
             return new AuthorizerResult(null, verified.principalId(), verified.context());
         } catch (Exception exception) {
-            LOG.warnv("Authorizer failure: {0}", exception.getMessage());
+            LOG.warnv(exception, "Authorizer failure: {0}", exception.getMessage());
             return authorizerError(scope, GatewayResponseType.AUTHORIZER_FAILURE, 500);
         }
     }

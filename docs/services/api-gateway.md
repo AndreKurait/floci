@@ -981,3 +981,13 @@ aws apigatewayv2 create-stage \
 ```
 
 REST Lambda authorizers retain `authorizerCredentials` through management, OpenAPI import/export and CloudFormation provisioning. The credential patch path supports `replace`; a null replacement clears the configured role. Omitted credential updates preserve the stored value. Credential retention does not itself enforce invocation permissions or assume the configured role.
+
+REST Lambda authorizers without `authorizerCredentials` check the Lambda resource
+policy when IAM enforcement is enabled. TOKEN and REQUEST authorizers use the API
+owner, the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
+qualified Lambda target. Missing permission returns an authorizer configuration
+error before invoking Lambda. Cached authorizer results do not invoke Lambda; a
+cache miss or stage cache flush makes the next invocation check permission again.
+Configured authorizer roles retain their existing execution path; this check does
+not implement role assumption, HTTP/WebSocket authorizer permissions, or prove
+live AWS or native-image parity.
