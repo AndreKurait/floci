@@ -69,7 +69,7 @@ Floci resolves private hosted zone DNS records directly through its embedded DNS
 
 ## Public Authoritative DNS
 
-The same embedded UDP server serves stored public `TXT`, `NS`, and `SOA` records with authoritative answers and their configured TTLs. DNS clients must be able to reach Floci on UDP port 53. The HTTP endpoint published by Testcontainers wrappers does not publish this UDP listener. Host clients need an explicit UDP port mapping; containers on the same network can query Floci's container address directly.
+The same embedded UDP server serves stored public `A`, `AAAA`, `TXT`, `NS`, and `SOA` records with authoritative answers and their configured TTLs. Explicit public address records take precedence over broad AWS endpoint suffix spoofing, so a local fixture can route one hostname to its own listener. DNS clients must be able to reach Floci on UDP port 53. The HTTP endpoint published by Testcontainers wrappers does not publish this UDP listener. Host clients need an explicit UDP port mapping; containers on the same network can query Floci's container address directly.
 
 For a Floci container attached to multiple Docker networks, set `FLOCI_SERVICES_DOCKER_NETWORK` to the network name or ID shared with its service containers. Embedded DNS advertises Floci's address on that network, including the default Route53 nameserver names. Private CNAMEs targeting emulator names use the same address. An explicitly configured network that cannot be inspected or is not attached prevents DNS initialization instead of advertising an unrelated interface. Without an explicit network, Floci uses its detected container network, retaining the system-hostname fallback when Docker inspection is unavailable.
 
@@ -77,7 +77,7 @@ For a Docker host client, publish UDP separately from HTTP, for example `-p 5353
 
 The longest matching public zone answers. Missing names return NXDOMAIN; existing names without the requested supported type return NOERROR with no answers. Both include the zone SOA with the smaller of its TTL and minimum field for negative caching. Changes and deletes affect DNS through the same stored record sets as the Route 53 API.
 
-Public address routing, aliases, CNAME chasing, health-based or weighted record selection, and delegation referrals are not implemented. Queries for supported types that require these features, ambiguous duplicate public zones, or malformed stored records return REFUSED without claiming authority. Other query types retain the existing emulator-name and upstream resolution paths. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary; TCP fallback is not implemented.
+Public aliases, CNAME chasing, health-based or weighted record selection, and delegation referrals are not implemented. Queries for supported types that require these features, ambiguous duplicate public zones, or malformed stored records return REFUSED without claiming authority. Other query types retain the existing emulator-name and upstream resolution paths. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary; TCP fallback is not implemented.
 
 ## Default Nameservers
 
@@ -185,4 +185,4 @@ the record. DELETE still requires matching record values and routing properties.
 - Query logging configs
 - DNSSEC (key signing keys, enabling/disabling)
 - `TestDNSAnswer`
-- Public authoritative record types other than simple TXT, NS, and SOA; public routing policies, delegation referrals, and DNS-over-TCP
+- Public authoritative record types other than simple A, AAAA, TXT, NS, and SOA; public routing policies, delegation referrals, and DNS-over-TCP

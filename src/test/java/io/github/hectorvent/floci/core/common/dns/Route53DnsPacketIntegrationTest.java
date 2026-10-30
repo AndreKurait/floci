@@ -13,6 +13,8 @@ import io.vertx.core.datagram.DatagramSocketOptions;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -55,30 +57,34 @@ class Route53DnsPacketIntegrationTest {
         }
     }
 
-    @Test
-    void apiChangesAndDeletesReachAuthoritativeTxtDespiteAwsEndpointSpoofing() throws Exception {
+    @ParameterizedTest
+    @CsvSource({"TXT,16,\"first\",\"second\"", "A,1,192.0.2.10,192.0.2.11", "AAAA,28,2001:db8::10,2001:db8::11"})
+    void apiChangesAndDeletesReachAuthoritativeRecordsDespiteAwsEndpointSpoofing(
+            String recordType, int type, String first, String second) throws Exception {
         String name = uniqueName() + ".amazonaws.com";
         String id = createZone(name);
         String endpoint = "version." + name;
-        for (String value : List.of("first", "second")) {
+        for (String value : List.of(first, second)) {
             given().contentType("application/xml").body("""
                     <ChangeResourceRecordSetsRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">
                       <ChangeBatch><Changes><Change><Action>UPSERT</Action><ResourceRecordSet>
-                        <Name>%s</Name><Type>TXT</Type><TTL>17</TTL>
-                        <ResourceRecords><ResourceRecord><Value>"%s"</Value></ResourceRecord></ResourceRecords>
+                        <Name>%s</Name><Type>%s</Type><TTL>17</TTL>
+                        <ResourceRecords><ResourceRecord><Value>%s</Value></ResourceRecord></ResourceRecords>
                       </ResourceRecordSet></Change></Changes></ChangeBatch>
                     </ChangeResourceRecordSetsRequest>
-                    """.formatted(endpoint, value))
+                    """.formatted(endpoint, recordType, value))
                     .post("/2013-04-01/hostedzone/" + id + "/rrset").then().statusCode(200);
-            byte[] request = request(endpoint, 16);
+            byte[] request = request(endpoint, type);
             byte[] response = query(request);
             assertHeader(response, 0, true, 1, 0);
             assertEquals(17, ByteBuffer.wrap(response).getInt(request.length + 6));
-            assertArrayEquals(new DnsRecord.Txt("\"" + value + "\"").data(),
+            DnsRecord expected = type == 16 ? new DnsRecord.Txt(value) : new DnsRecord.Address(type, value);
+            assertArrayEquals(expected.data(),
                     Arrays.copyOfRange(response, request.length + 12, response.length));
         }
-        change(id, "DELETE", record(endpoint, "TXT", 17, "\"second\""));
-        assertNegative(query(request(endpoint, 16)), name, 3, 900);
+        assertNegative(query(request(endpoint, type == 1 ? 28 : 1)), name, 0, 900);
+        change(id, "DELETE", record(endpoint, recordType, 17, second));
+        assertNegative(query(request(endpoint, type)), name, 3, 900);
     }
 
     @Test
@@ -148,14 +154,12 @@ class Route53DnsPacketIntegrationTest {
         change(id, "CREATE", weighted);
         change(id, "CREATE", record("alias." + name, "CNAME", 60, "target.example."));
         change(id, "CREATE", record("delegated." + name, "NS", 60, "other.example."));
-        for (int type : List.of(1, 28, 15, 5)) {
+        for (int type : List.of(15, 5)) {
             assertTrue(source.resolveAuthoritative(name, type).isEmpty());
         }
         String awsName = uniqueName() + ".amazonaws.com";
         createZone(awsName);
-        byte[] address = query(request(awsName, 1));
-        assertArrayEquals(new byte[]{127, 0, 0, 1},
-                Arrays.copyOfRange(address, address.length - 4, address.length));
+        assertNegative(query(request(awsName, 1)), awsName, 0, 900);
         for (String label : List.of("weighted", "alias", "leaf.delegated")) {
             assertHeader(query(request(label + "." + name, 16)), 5, false, 0, 0);
         }
@@ -190,10 +194,12 @@ class Route53DnsPacketIntegrationTest {
     void malformedStoredValuesAndTtlsStayRefused() throws Exception {
         String name = uniqueName() + ".example";
         String id = createZone(name);
-        for (String type : List.of("TXT", "NS", "SOA")) {
+        for (String type : List.of("A", "AAAA", "TXT", "NS", "SOA")) {
             String owner = "bad-" + type.toLowerCase() + "." + name;
             change(id, "UPSERT", record(owner, type, 60, null));
             int queryType = switch (type) {
+                case "A" -> 1;
+                case "AAAA" -> 28;
                 case "NS" -> 2;
                 case "SOA" -> 6;
                 default -> 16;

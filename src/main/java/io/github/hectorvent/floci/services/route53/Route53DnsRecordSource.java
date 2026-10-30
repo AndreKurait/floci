@@ -27,7 +27,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Resolves private IPv4 records and public TXT/NS/SOA records for the embedded DNS server.
+ * Resolves private IPv4 records and public A/AAAA/TXT/NS/SOA records for the embedded DNS server.
  *
  * <p>Discovered via CDI as a {@link DnsRecordSource} implementation, keeping
  * the embedded DNS server decoupled from Route 53 service classes.
@@ -77,7 +77,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
 
     @Override
     public Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
-        if (name == null || name.isBlank() || (type != 2 && type != 6 && type != 16)) {
+        if (name == null || name.isBlank() || (type != 1 && type != 2 && type != 6 && type != 16 && type != 28)) {
             return Optional.empty();
         }
         if (route53Service.isCoveredByPrivateZone(name)) {
@@ -113,6 +113,8 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         try {
             for (ResourceRecordSet record : zone.matchingRecords()) {
                 if (!record.getType().equals(switch (type) {
+                    case 1 -> "A";
+                    case 28 -> "AAAA";
                     case 2 -> "NS";
                     case 6 -> "SOA";
                     default -> "TXT";
@@ -130,6 +132,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
                         return Optional.of(DnsAnswer.refused());
                     }
                     DnsRecord answer = switch (type) {
+                        case 1, 28 -> new DnsRecord.Address(type, value.getValue());
                         case 2 -> new DnsRecord.Ns(value.getValue());
                         case 6 -> new DnsRecord.Soa(value.getValue());
                         default -> new DnsRecord.Txt(value.getValue());
