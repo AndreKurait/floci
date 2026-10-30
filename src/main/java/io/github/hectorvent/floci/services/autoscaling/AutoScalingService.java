@@ -17,6 +17,8 @@ import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
+import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.iam.PassedRoleLookup;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -125,6 +127,17 @@ public class AutoScalingService implements PassedRoleLookup {
 
     @Inject
     Ec2Service ec2Service;
+
+    private final ElbV2Service elbV2Service;
+
+    @Inject
+    public AutoScalingService(ElbV2Service elbV2Service) {
+        this.elbV2Service = elbV2Service;
+    }
+
+    AutoScalingService() {
+        this(null);
+    }
 
     // region :: name → resource
     private Map<String, LaunchConfiguration> launchConfigs = new ConcurrentHashMap<>();
@@ -959,6 +972,14 @@ public class AutoScalingService implements PassedRoleLookup {
             List<String> detached = asg.getInstances().stream().map(AsgInstance::getInstanceId)
                     .filter(instanceIds::contains).toList();
             if (!detached.isEmpty()) {
+                List<TargetDescription> targets = detached.stream().map(id -> {
+                    TargetDescription target = new TargetDescription();
+                    target.setId(id);
+                    return target;
+                }).toList();
+                for (String targetGroup : asg.getTargetGroupARNs()) {
+                    elbV2Service.deregisterTargets(region, targetGroup, targets);
+                }
                 // Detaching removes only the group-name tag, and only where it still names this group.
                 ec2Service.deleteSystemTag(region, detached, GROUP_NAME_TAG, name);
             }
