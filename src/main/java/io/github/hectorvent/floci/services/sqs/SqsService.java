@@ -47,6 +47,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -91,6 +92,8 @@ public class SqsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, Map<String, Long>> dedupStore;
     private final StorageBackend<String, Map<String, Map<String, String>>> dedupIdentityStore;
     private final ConcurrentHashMap<String, GuardedMessageQueue> messagesByQueue = new ConcurrentHashMap<>();
+    // Only active metadata lookups are retained; deletion invalidates this queue's pending captures.
+    private final Map<String, Set<Object>> pendingQueueLookups = new HashMap<>();
     private volatile long queueResetGeneration;
     private final Object[] messagePersistenceLocks = new Object[MESSAGE_PERSISTENCE_LOCK_STRIPES];
     private final ConcurrentHashMap<String, RedrivePolicy> redrivePolicyCache = new ConcurrentHashMap<>();
@@ -467,6 +470,7 @@ public class SqsService implements Resettable, ResourceProvider {
             queueResetGeneration++;
             removed = new ArrayList<>(messagesByQueue.values());
             messagesByQueue.clear();
+            pendingQueueLookups.clear();
         }
         removed.forEach(GuardedMessageQueue::close);
         redrivePolicyCache.clear();
@@ -838,7 +842,11 @@ public class SqsService implements Resettable, ResourceProvider {
                     "The specified queue does not exist.", 400);
         }
         queueStore.delete(storageKey);
-        GuardedMessageQueue removed = messagesByQueue.remove(storageKey);
+        GuardedMessageQueue removed;
+        synchronized (messagesByQueue) {
+            pendingQueueLookups.remove(storageKey);
+            removed = messagesByQueue.remove(storageKey);
+        }
         if (removed != null) {
             removed.close();
         }
@@ -1436,30 +1444,46 @@ public class SqsService implements Resettable, ResourceProvider {
                                         Integer waitTimeSeconds, String region) {
         long resetGeneration = queueResetGeneration;
         String storageKey = regionKey(region, queueUrl);
-        Queue queue = getQueueByUrl(storageKey, queueUrl)
-                .orElseThrow(() -> new AwsException("AWS.SimpleQueueService.NonExistentQueue",
-                        "The specified queue does not exist.", 400));
-
-        if (maxMessages < 1 || maxMessages > 10) {
-            maxMessages = 1;
-        }
-        if (waitTimeSeconds != null && (waitTimeSeconds < 0 || waitTimeSeconds > MAX_RECEIVE_WAIT_TIME_SECONDS)) {
-            throw new AwsException("InvalidParameterValue",
-                    "Value " + waitTimeSeconds + " for parameter WaitTimeSeconds is invalid. "
-                            + "Reason: Must be >= 0 and <= " + MAX_RECEIVE_WAIT_TIME_SECONDS + ".", 400);
-        }
-
-        long maxWait = TimeUnit.SECONDS.toNanos(resolveWaitTimeSeconds(queue, waitTimeSeconds));
-        long deadline = System.nanoTime() + maxWait;
-        // The queue incarnation this call polls against. DeleteQueue removes it
-        // from messagesByQueue (and CreateQueue registers a fresh instance), so
-        // an identity change tells a parked long poll that its queue is gone.
-        GuardedMessageQueue polledQueue;
+        Object lookup = new Object();
         synchronized (messagesByQueue) {
-            if (resetGeneration != queueResetGeneration) {
-                return Collections.emptyList();
+            pendingQueueLookups.computeIfAbsent(storageKey, key -> new HashSet<>()).add(lookup);
+        }
+        long maxWait;
+        long deadline;
+        GuardedMessageQueue polledQueue;
+        try {
+            Queue queue = getQueueByUrl(storageKey, queueUrl)
+                    .orElseThrow(() -> new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                            "The specified queue does not exist.", 400));
+
+            if (maxMessages < 1 || maxMessages > 10) {
+                maxMessages = 1;
             }
-            polledQueue = getOrCreateQueue(storageKey);
+            if (waitTimeSeconds != null && (waitTimeSeconds < 0 || waitTimeSeconds > MAX_RECEIVE_WAIT_TIME_SECONDS)) {
+                throw new AwsException("InvalidParameterValue",
+                        "Value " + waitTimeSeconds + " for parameter WaitTimeSeconds is invalid. "
+                                + "Reason: Must be >= 0 and <= " + MAX_RECEIVE_WAIT_TIME_SECONDS + ".", 400);
+            }
+
+            maxWait = TimeUnit.SECONDS.toNanos(resolveWaitTimeSeconds(queue, waitTimeSeconds));
+            deadline = System.nanoTime() + maxWait;
+            synchronized (messagesByQueue) {
+                Set<Object> lookups = pendingQueueLookups.get(storageKey);
+                if (resetGeneration != queueResetGeneration || lookups == null || !lookups.contains(lookup)) {
+                    return Collections.emptyList();
+                }
+                polledQueue = getOrCreateQueue(storageKey);
+            }
+        } finally {
+            synchronized (messagesByQueue) {
+                Set<Object> lookups = pendingQueueLookups.get(storageKey);
+                if (lookups != null) {
+                    lookups.remove(lookup);
+                    if (lookups.isEmpty()) {
+                        pendingQueueLookups.remove(storageKey);
+                    }
+                }
+            }
         }
 
         while (true) {
