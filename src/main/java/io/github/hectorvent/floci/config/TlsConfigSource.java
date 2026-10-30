@@ -263,9 +263,9 @@ public class TlsConfigSource implements ConfigSource {
         return result;
     }
 
-    /** Service infixes that AWS virtual-hosts with an extra resource-id label before the region. */
+    /** Service infixes preceded by an extra label in AWS regional hostnames. */
     private static final List<String> MULTI_LABEL_REGIONAL_SERVICE_INFIXES = List.of(
-            "execute-api", "dkr.ecr", "s3-control", "s3.dualstack", "s3-website",
+            "execute-api", "ecr", "ecr-fips", "dkr.ecr", "s3-control", "s3.dualstack", "s3-website",
             "s3-fips", "s3-fips.dualstack");
 
     /**
@@ -290,9 +290,10 @@ public class TlsConfigSource implements ConfigSource {
      * DescribeRegions); DNS spoofing routes it to Floci regardless of region, so every
      * {@link AwsRegions#KNOWN_IDS published region id} gets a SAN, not just the configured default.
      *
-     * <p>A single wildcard label also cannot cover multi-label endpoints, where a resource id
-     * contributes an extra label before the service name:
+     * <p>A single wildcard label also cannot cover multi-label endpoints, where a prefix or
+     * resource id contributes an extra label before the service name:
      * {@code <api-id>.execute-api.<region>.amazonaws.com},
+     * {@code api.ecr.<region>.amazonaws.com} (and its {@code ecr-fips} form),
      * {@code <account>.dkr.ecr.<region>.amazonaws.com},
      * {@code <account>.s3-control.<region>.amazonaws.com}, and
      * {@code <bucket>.s3.dualstack.<region>.amazonaws.com}. Each needs its own
