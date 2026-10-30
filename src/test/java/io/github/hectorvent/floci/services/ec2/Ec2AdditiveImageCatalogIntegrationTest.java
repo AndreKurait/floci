@@ -94,20 +94,28 @@ class Ec2AdditiveImageCatalogIntegrationTest {
                 assertEquals(copy, ec2.describeInstances(request -> request.instanceIds(ownedInstance))
                         .reservations().getFirst().instances().getFirst().imageId());
             } finally {
-                if (instanceId != null) {
-                    String ownedInstance = instanceId;
-                    ec2.terminateInstances(request -> request.instanceIds(ownedInstance));
+                String ownedCopy = copy;
+                try (Cleanup sourceCleanup = () -> ec2.deregisterImage(request -> request.imageId(source));
+                     Cleanup copyCleanup = () -> {
+                         if (ownedCopy != null) {
+                             ec2.deregisterImage(request -> request.imageId(ownedCopy));
+                         }
+                     }) {
+                    if (instanceId != null) {
+                        String ownedInstance = instanceId;
+                        ec2.terminateInstances(request -> request.instanceIds(ownedInstance));
+                    }
                 }
-                if (copy != null) {
-                    String ownedCopy = copy;
-                    ec2.deregisterImage(request -> request.imageId(ownedCopy));
-                }
-                ec2.deregisterImage(request -> request.imageId(source));
             }
         }
     }
 
-    private Ec2Client ec2() {
+    private interface Cleanup extends AutoCloseable {
+        @Override
+        void close();
+    }
+
+    Ec2Client ec2() {
         return Ec2Client.builder().endpointOverride(URI.create("http://localhost:" + RestAssured.port))
                 .region(Region.US_EAST_1).httpClientBuilder(UrlConnectionHttpClient.builder())
                 .credentialsProvider(StaticCredentialsProvider.create(
