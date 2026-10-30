@@ -2,12 +2,24 @@ package io.github.hectorvent.floci.services.ec2;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.ListNetworksCmd;
+import com.github.dockerjava.api.command.StartContainerCmd;
+import com.github.dockerjava.api.model.ContainerNetwork;
+import com.github.dockerjava.api.model.NetworkSettings;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
+import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
+import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -132,7 +144,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
@@ -152,6 +166,162 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 class Ec2ServiceTest {
+
+    @ParameterizedTest
+    @CsvSource({"false,false,false,false", "true,false,false,false", "false,true,false,false",
+            "true,true,false,false", "false,false,true,false", "false,false,false,true",
+            "true,false,false,true", "false,true,false,true", "true,true,false,true"})
+    void runtimeRestartSynchronizesRetainedInterfaceAddresses(boolean supplied, boolean faithful,
+                                                              boolean deleteOnTermination, boolean restore) {
+        EmulatorConfig config = mockConfig(true);
+        when(config.services().ec2().awsFaithfulPrivateIp()).thenReturn(faithful);
+        DockerClient docker = mock(DockerClient.class);
+        when(docker.startContainerCmd("runtime-sync")).thenReturn(mock(StartContainerCmd.class, RETURNS_SELF));
+        InspectContainerResponse response = mock(InspectContainerResponse.class);
+        NetworkSettings settings = mock(NetworkSettings.class);
+        ContainerNetwork bridge = mock(ContainerNetwork.class);
+        when(bridge.getIpAddress()).thenReturn("172.17.0.99");
+        when(settings.getNetworks()).thenReturn(Map.of("bridge", bridge));
+        when(response.getNetworkSettings()).thenReturn(settings);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(docker.inspectContainerCmd("runtime-sync")).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(response);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        when(lifecycle.isContainerRunning("runtime-sync")).thenReturn(true);
+        List<Runnable> tasks = new ArrayList<>();
+        ExecutorService executor = mock(ExecutorService.class);
+        doAnswer(call -> { tasks.add(call.getArgument(0)); return null; }).when(executor).submit(any(Runnable.class));
+        Ec2ContainerManager manager = new Ec2ContainerManager(mock(ContainerBuilder.class), lifecycle,
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class), mock(DockerHostResolver.class),
+                docker, mock(PortAllocator.class), config, mock(Ec2MetadataServer.class),
+                mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class), executor, Duration.ofSeconds(1));
+        RequestContext context = new RequestContext();
+        context.setAccountId("111111111111");
+        // The model Instance is imported; this is CDI's Instance type.
+        jakarta.enterprise.inject.Instance<RequestContext> contexts = requestContexts(context);
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(contexts), contexts);
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        String suppliedId = supplied ? service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of("172.31.0.222"), List.of(), List.of(new Tag("retained", "yes"))).getNetworkInterfaceId() : null;
+        Instance host = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), supplied ? null : subnet.getSubnetId(), null, List.of(), null, null,
+                null, suppliedId, 0, null, null, null, null, false, null, null, List.of(), false,
+                null, null, deleteOnTermination).getInstances().getFirst();
+        String eniId = host.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        NetworkInterface before = service.describeNetworkInterfaces(region, List.of(eniId), Map.of())
+                .networkInterfaces().getFirst();
+        String allocated = before.getPrivateIpAddress();
+        String attachment = before.getAttachment().getAttachmentId();
+        List<GroupIdentifier> groups = List.copyOf(before.getGroups());
+        List<Tag> interfaceTags = List.copyOf(before.getTagSet());
+        List<String> secondaryAddresses = before.getPrivateIpAddresses().stream().filter(ip -> !ip.isPrimary())
+                .map(NetworkInterfacePrivateIpAddress::getPrivateIpAddress).toList();
+        host.setDockerContainerId("runtime-sync");
+        host.setState(restore ? InstanceState.running() : InstanceState.stopped());
+        when(config.services().ec2().mock()).thenReturn(false);
+
+        if (restore) {
+            context.setAccountId("222222222222");
+            service.restoreMetadataRegistrations();
+            assertTrue(tasks.isEmpty());
+        } else {
+            service.startInstances(region, List.of(host.getInstanceId()));
+            assertEquals(1, tasks.size());
+            context.setAccountId("222222222222");
+            tasks.removeFirst().run();
+        }
+
+        assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
+        context.setAccountId("111111111111");
+        assertEquals("running", host.getState().getName());
+        String expected = faithful ? allocated : "172.17.0.99";
+        assertEquals(expected, host.getPrivateIpAddress());
+        NetworkInterface after = service.describeNetworkInterfaces(region, List.of(eniId), Map.of())
+                .networkInterfaces().getFirst();
+        assertEquals(expected, after.getPrivateIpAddress());
+        assertEquals(host.getPrivateDnsName(), after.getPrivateDnsName());
+        assertEquals(expected, after.getPrivateIpAddresses().stream().filter(NetworkInterfacePrivateIpAddress::isPrimary)
+                .findFirst().orElseThrow().getPrivateIpAddress());
+        assertEquals(attachment, after.getAttachment().getAttachmentId());
+        assertEquals(groups, after.getGroups());
+        assertEquals(interfaceTags, after.getTagSet());
+        assertEquals(secondaryAddresses, after.getPrivateIpAddresses().stream().filter(ip -> !ip.isPrimary())
+                .map(NetworkInterfacePrivateIpAddress::getPrivateIpAddress).toList());
+        if (restore) {
+            verify(docker, never()).startContainerCmd("runtime-sync");
+        } else {
+            verify(docker.startContainerCmd("runtime-sync")).exec();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void launchCallbackSynchronizesRetainedInterfaceAddresses(boolean supplied) {
+        EmulatorConfig config = mockConfig(false);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        String suppliedId = supplied ? service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of(), List.of(), List.of()).getNetworkInterfaceId() : null;
+        Instance host = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), supplied ? null : subnet.getSubnetId(), null, List.of(), null, null,
+                null, suppliedId, 0, null, null, null, null, false, null, null, List.of(), false,
+                null, null, false).getInstances().getFirst();
+        ArgumentCaptor<Runnable> callback = ArgumentCaptor.forClass(Runnable.class);
+        verify(manager).launch(eq(host), any(), any(), eq(region), anySet(), anyList(), anyMap(), callback.capture());
+        // Exercise the service's launch completion hook after the manager's real address transform.
+        Ec2ContainerManager.exposeReachablePrivateAddress(host, "172.17.0.88", false);
+        host.setState(InstanceState.running());
+        callback.getValue().run();
+        NetworkInterface retained = service.describeNetworkInterfaces(region,
+                List.of(host.getNetworkInterfaces().getFirst().getNetworkInterfaceId()), Map.of())
+                .networkInterfaces().getFirst();
+        assertEquals("172.17.0.88", retained.getPrivateIpAddress());
+        assertEquals(host.getPrivateDnsName(), retained.getPrivateDnsName());
+    }
+
+    @Test
+    void lateRuntimeAddressCallbackDoesNotRewriteAReusedInterface() {
+        EmulatorConfig config = mockConfig(true);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        String eni = service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        Instance host = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null, List.of(),
+                null, null, List.of(), null, null, null, eni, 0).getInstances().getFirst();
+        host.setState(InstanceState.stopped());
+        when(config.services().ec2().mock()).thenReturn(false);
+        service.startInstances(region, List.of(host.getInstanceId()));
+        ArgumentCaptor<Runnable> callback = ArgumentCaptor.forClass(Runnable.class);
+        verify(manager).start(eq(host), callback.capture());
+        when(config.services().ec2().mock()).thenReturn(true);
+        service.terminateInstances(region, List.of(host.getInstanceId()));
+        Instance replacement = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null, List.of(),
+                null, null, List.of(), null, null, null, eni, 0).getInstances().getFirst();
+        NetworkInterface current = service.describeNetworkInterfaces(region, List.of(eni), Map.of())
+                .networkInterfaces().getFirst();
+        String attachment = current.getAttachment().getAttachmentId();
+        String privateIp = current.getPrivateIpAddress();
+        callback.getValue().run();
+        NetworkInterface after = service.describeNetworkInterfaces(region, List.of(eni), Map.of())
+                .networkInterfaces().getFirst();
+        assertEquals(replacement.getInstanceId(), after.getAttachment().getInstanceId());
+        assertEquals(attachment, after.getAttachment().getAttachmentId());
+        assertEquals(privateIp, after.getPrivateIpAddress());
+        assertEquals("terminated", host.getState().getName());
+    }
 
     @ParameterizedTest
     @CsvSource({"false, false", "false, true", "true, false"})

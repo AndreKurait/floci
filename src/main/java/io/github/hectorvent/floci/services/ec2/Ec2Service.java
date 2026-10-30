@@ -1022,12 +1022,56 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (!containerManager.restoreMetadataRegistration(instance)) {
             return false;
         }
+        synchronizeRuntimeInterfaceAddresses(entry.accountId(), instance.getRegion(), instance);
         putForOwner(instances, entry, instance);
         // Container is running: re-reserve host ports and recreate any missing socat sidecars.
         if (portForwardManager != null) {
             portForwardManager.restore(instance);
         }
         return true;
+    }
+
+    private void synchronizeRuntimeInterfaceAddresses(String accountId, String region, Instance instance) {
+        synchronized (privateIpAllocationLock) {
+            Optional<Instance> stored = instances instanceof AccountAwareStorageBackend<Instance> aware
+                    ? aware.getForAccount(accountId, key(region, instance.getInstanceId()))
+                    : instances.get(key(region, instance.getInstanceId()));
+            if (instance.getState() == null || "terminated".equals(instance.getState().getName()) || stored.isEmpty()) {
+                return;
+            }
+            for (InstanceNetworkInterface attached : instance.getNetworkInterfaces()) {
+                NetworkInterface standalone = networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware
+                        ? aware.getForAccount(accountId, key(region, attached.getNetworkInterfaceId())).orElse(null)
+                        : networkInterfaces.get(key(region, attached.getNetworkInterfaceId())).orElse(null);
+                if (standalone == null || standalone.getAttachment() == null
+                        || !instance.getInstanceId().equals(standalone.getAttachment().getInstanceId())
+                        || !Objects.equals(attached.getAttachmentId(), standalone.getAttachment().getAttachmentId())) {
+                    continue;
+                }
+                if (Objects.equals(standalone.getPrivateIpAddress(), attached.getPrivateIpAddress())
+                        && Objects.equals(standalone.getPrivateDnsName(), attached.getPrivateDnsName())) {
+                    continue;
+                }
+                standalone.setPrivateIpAddress(attached.getPrivateIpAddress());
+                standalone.setPrivateDnsName(attached.getPrivateDnsName());
+                for (NetworkInterfacePrivateIpAddress address : standalone.getPrivateIpAddresses()) {
+                    if (address.isPrimary()) {
+                        address.setPrivateIpAddress(attached.getPrivateIpAddress());
+                        address.setPrivateDnsName(attached.getPrivateDnsName());
+                    }
+                }
+                if (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware) {
+                    aware.putForAccount(accountId, key(region, standalone.getNetworkInterfaceId()), standalone);
+                } else {
+                    networkInterfaces.put(key(region, standalone.getNetworkInterfaceId()), standalone);
+                }
+            }
+            if (instances instanceof AccountAwareStorageBackend<Instance> aware) {
+                aware.putForAccount(accountId, key(region, instance.getInstanceId()), instance);
+            } else {
+                instances.put(key(region, instance.getInstanceId()), instance);
+            }
+        }
     }
 
     private void restoreAttachedVolumesOnStartup() {
@@ -4326,7 +4370,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 String accountId = callerAccountId();
                 containerManager.launch(inst, dockerImage, publicKey, region, desiredPublishedPorts(region, inst),
                         policyGroups, policyPrefixLists(region, policyGroups), () ->
-                                RequestScopes.runAs(accountId, region, () -> restoreAttachedVolumesForInstance(region, inst)));
+                                RequestScopes.runAs(accountId, region, () -> {
+                                    synchronizeRuntimeInterfaceAddresses(accountId, region, inst);
+                                    restoreAttachedVolumesForInstance(region, inst);
+                                }));
             }
         }
 
@@ -5496,7 +5543,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 restoreInstanceFirewall(inst);
                 String accountId = callerAccountId();
                 containerManager.start(inst, () ->
-                        RequestScopes.runAs(accountId, region, () -> restoreAttachedVolumesForInstance(region, inst)));
+                        RequestScopes.runAs(accountId, region, () -> {
+                            synchronizeRuntimeInterfaceAddresses(accountId, region, inst);
+                            restoreAttachedVolumesForInstance(region, inst);
+                        }));
             }
             instances.put(key(region, id), inst);
             Map<String, String> entry = new LinkedHashMap<>();

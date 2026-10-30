@@ -1246,7 +1246,11 @@ Setting it to `true` for an existing interface is rejected before launch.
 Both instance and interface descriptions report the selected value. Stopping an instance
 keeps the attachment; termination deletes an interface marked for deletion and returns
 a retained interface to `available`, preserving its private address, groups, tags, and
-Elastic IP association. A retained interface can be reused by a later launch.
+Elastic IP association. A retained interface can be reused by a later launch. In container mode,
+launch, start, and metadata restoration also synchronize its primary private address and
+DNS name with the attached instance interface. AWS-faithful private-address mode keeps the
+allocated address. Secondary private-address entries, tags, groups, and attachment identity
+are preserved.
 
 Launch-template `network-interface` tags apply to the primary interface created by
 the launch. Request tags override matching template keys. Template interface tags
