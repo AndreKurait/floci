@@ -7933,9 +7933,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             "Request would have succeeded, but DryRun flag is set.", 412);
                 }
                 securityGroups.delete(key(region, selectedId));
+                removeTags(region, selectedId);
                 securityGroupRules.scan(k -> k.startsWith(region + "::")).stream()
                         .filter(rule -> selected.getGroupId().equals(rule.getGroupId()))
-                        .forEach(rule -> securityGroupRules.delete(key(region, rule.getSecurityGroupRuleId())));
+                        .forEach(rule -> {
+                            securityGroupRules.delete(key(region, rule.getSecurityGroupRuleId()));
+                            removeTags(region, rule.getSecurityGroupRuleId());
+                        });
             }
         }
         return selectedId;
