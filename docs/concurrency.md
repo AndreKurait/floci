@@ -14,9 +14,11 @@ pass; dirty keys return at the tail so one busy resource does not monopolize wor
 Submission never runs the action on the caller's thread. A duplicate can be accepted
 when the queue is full; a new key is rejected. Callers must retain authoritative
 state and a fair periodic recovery path for rejected or externally missed changes.
-Worker failures release admission and are logged; they do not cause immediate
-error-retry loops. A snapshot exposes retained keys, active workers, completed
-passes, coalescing, rejection and failure counts.
+Worker failures release admission and are counted; runtime exceptions are logged,
+and errors propagate to the worker thread's uncaught exception handler. They do not
+cause immediate error-retry loops. A snapshot exposes retained keys, active workers,
+completed admitted passes (including failed passes), coalescing, rejection and failure
+counts. Work discarded before admission does not count as a completed pass.
 
 Close rejects new work, discards queued notifications and interrupts admitted work.
 The owning service still implements its resource-drain and cancellation contract.
