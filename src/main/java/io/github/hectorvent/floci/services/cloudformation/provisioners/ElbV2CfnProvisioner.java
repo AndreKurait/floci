@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import io.github.hectorvent.floci.services.elbv2.model.Rule;
 import io.github.hectorvent.floci.services.elbv2.model.RuleCondition;
+import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -40,10 +41,12 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     private static final String USED_SUBNET_ATTR_PREFIX = CfnRollback.USES_ATTR_PREFIX + "Subnet.";
 
     private final ElbV2Service elbV2Service;
+    private final ElbV2CfnTargets targets;
 
     @Inject
     public ElbV2CfnProvisioner(ElbV2Service elbV2Service) {
         this.elbV2Service = elbV2Service;
+        this.targets = new ElbV2CfnTargets(elbV2Service);
     }
 
     @Override
@@ -54,6 +57,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
         r.getAttributes().remove(CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR);
+        r.getAttributes().remove(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
         Map<String, String> attributesBefore = Map.copyOf(r.getAttributes());
         switch (r.getResourceType()) {
             case LOAD_BALANCER -> provisionLoadBalancer(r, props, ctx);
@@ -105,6 +109,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     public UpdateCleanupResult completeUpdate(StackResource resource) {
         if ("UPDATE_COMPLETE".equals(resource.getStatus())) {
             resource.getAttributes().remove(CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR);
+            resource.getAttributes().remove(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
         }
         return ReplacementCleanup.complete(resource, this::delete);
     }
@@ -112,13 +117,28 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     @Override
     public void clearUpdate(StackResource resource) {
         resource.getAttributes().remove(CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR);
+        resource.getAttributes().remove(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
         ReplacementCleanup.clear(resource);
+    }
+
+    @Override
+    public boolean requiresUpdateRecovery(StackResource resource) {
+        return "UPDATE_FAILED".equals(resource.getStatus())
+                && resource.getAttributes().containsKey(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
+    }
+
+    @Override
+    public void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
+        String snapshot = attempted.getAttributes().get(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
+        if (snapshot != null) {
+            previous.getAttributes().put(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR, snapshot);
+        }
     }
 
     /**
      * A replacement is undone through the cleanup record. Without one, a load balancer is moved
-     * back to the subnets an update took it off, and otherwise it and a target group have nothing to
-     * put back: an update that kept the name changed nothing else, the way the switch did. A listener
+     * back to the subnets an update took it off, and a target group's affected registrations are
+     * restored from its snapshot. A listener
      * or rule without a record was modified in place, and putting that back needs a snapshot this
      * provisioner does not keep, so the engine reports it as not rolled back, as it did for the switch.
      */
@@ -130,7 +150,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         if (LOAD_BALANCER.equals(resource.getResourceType())) {
             return restorePriorSubnets(resource);
         }
-        return TARGET_GROUP.equals(resource.getResourceType());
+        return TARGET_GROUP.equals(resource.getResourceType()) && targets.restore(resource);
     }
 
     /**
@@ -258,6 +278,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void provisionTargetGroup(StackResource r, JsonNode props, ProvisionContext ctx) {
+        List<TargetDescription> requestedTargets = ElbV2CfnTargets.declared(props, ctx);
         String name = nameOrPrior(ctx.resolveOptional(props, "Name"), r.getAttributes().get("TargetGroupName"),
                 ctx, r.getLogicalId());
         String protocol = ctx.resolveOptional(props, "Protocol");
@@ -278,15 +299,18 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         Map<String, String> tags = ctx.resolveTags(props, "Tags");
 
         TargetGroup tg;
+        boolean created;
         try {
             tg = elbV2Service.createTargetGroup(ctx.region(), name, protocol, protocolVersion, port, vpcId, targetType,
                     hcProtocol, hcPort, hcEnabled, hcPath, hcInterval, hcTimeout,
                     healthyThreshold, unhealthyThreshold, matcher, ipAddressType, tags);
+            created = true;
         } catch (AwsException e) {
             if (!"DuplicateTargetGroupName".equals(e.getErrorCode())) {
                 throw e;
             }
             tg = elbV2Service.describeTargetGroups(ctx.region(), null, null, List.of(name)).get(0);
+            created = false;
         }
 
         r.setPhysicalId(tg.getTargetGroupArn());
@@ -296,6 +320,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         // A list-valued attribute, joined the way Route53's NameServers is. Empty until a listener
         // forwards to the group, as on AWS.
         r.getAttributes().put("LoadBalancerArns", String.join(",", tg.getLoadBalancerArns()));
+        targets.apply(r, tg, requestedTargets, ctx, created);
     }
 
     /**

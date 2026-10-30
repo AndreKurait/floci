@@ -30,6 +30,16 @@ Generated Ed25519 keys and PPK output are currently rejected before any resource
 created. The CloudFormation strict unsupported-resource policy remains enabled by
 callers that require it.
 
+## Load balancer target registrations
+
+`AWS::ElasticLoadBalancingV2::TargetGroup` registers its declared `Targets` through
+the ELB service, including resolved instance IDs, ports, and availability zones.
+Updates reconcile the registrations declared by the stack and preserve other
+registrations. Removing `Targets` deregisters the stack's previous targets.
+A failed update restores the affected registrations; deleting the target group
+removes all of its registrations. Registration does not force a target healthy:
+the load balancer's health checks still determine whether it can serve traffic.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->

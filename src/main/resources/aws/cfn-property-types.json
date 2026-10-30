@@ -2,7 +2,7 @@
   "_source": {
     "generator": "tools/aws/regen_cfn_property_types.py",
     "schemas": "https://schema.cloudformation.us-east-1.amazonaws.com/CloudformationSchema.zip",
-    "retrieved": "2026-10-20",
+    "retrieved": "2026-10-30",
     "note": "make cfn-property-types-verify checks the file against AWS."
   },
   "operations": {
@@ -11,6 +11,7 @@
     "AWS::EC2::Instance": "AWS::EC2::Instance",
     "AWS::EC2::LaunchTemplate": "AWS::EC2::LaunchTemplate",
     "AWS::ECS::TaskDefinition": "AWS::ECS::TaskDefinition",
+    "AWS::ElasticLoadBalancingV2::TargetGroup": "AWS::ElasticLoadBalancingV2::TargetGroup",
     "AWS::Events::Rule": "AWS::Events::Rule",
     "AWS::Lambda::Function": "AWS::Lambda::Function",
     "AWS::Lambda::LayerVersion": "AWS::Lambda::LayerVersion"
@@ -1518,6 +1519,88 @@
       "members": {
         "ReadOnly": "Boolean",
         "SourceContainer": "String"
+      }
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup": {
+      "type": "structure",
+      "members": {
+        "IpAddressType": "String",
+        "HealthCheckIntervalSeconds": "Integer",
+        "LoadBalancerArns": "AWS::ElasticLoadBalancingV2::TargetGroup.LoadBalancerArns",
+        "Matcher": "AWS::ElasticLoadBalancingV2::TargetGroup/Matcher",
+        "HealthCheckPath": "String",
+        "Port": "Integer",
+        "Targets": "AWS::ElasticLoadBalancingV2::TargetGroup.Targets",
+        "HealthCheckEnabled": "Boolean",
+        "ProtocolVersion": "String",
+        "UnhealthyThresholdCount": "Integer",
+        "HealthCheckTimeoutSeconds": "Integer",
+        "Name": "String",
+        "VpcId": "String",
+        "TargetGroupFullName": "String",
+        "HealthyThresholdCount": "Integer",
+        "HealthCheckProtocol": "String",
+        "TargetGroupAttributes": "AWS::ElasticLoadBalancingV2::TargetGroup.TargetGroupAttributes",
+        "TargetType": "String",
+        "HealthCheckPort": "String",
+        "TargetGroupArn": "String",
+        "Protocol": "String",
+        "TargetGroupName": "String",
+        "Tags": "AWS::ElasticLoadBalancingV2::TargetGroup.Tags",
+        "TargetControlPort": "Integer"
+      }
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup.LoadBalancerArns": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup.Tags": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::TargetGroup/Tag"
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup.TargetGroupAttributes": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::TargetGroup/TargetGroupAttribute"
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup.Targets": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription"
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup/Matcher": {
+      "type": "structure",
+      "members": {
+        "GrpcCode": "String",
+        "HttpCode": "String"
+      }
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup/Tag": {
+      "type": "structure",
+      "members": {
+        "Value": "String",
+        "Key": "String"
+      },
+      "required": [
+        "Value",
+        "Key"
+      ]
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription": {
+      "type": "structure",
+      "members": {
+        "AvailabilityZone": "String",
+        "Id": "String",
+        "Port": "Integer",
+        "QuicServerId": "String"
+      },
+      "required": [
+        "Id"
+      ]
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup/TargetGroupAttribute": {
+      "type": "structure",
+      "members": {
+        "Value": "String",
+        "Key": "String"
       }
     },
     "AWS::Events::Rule": {
