@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.sqs;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.concurrent.VersionedSignal;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -74,6 +75,7 @@ class GuardedMessageQueue {
 
     void addMessage(Message message) {
         try (Guard _ = hold()) {
+            requireOpen();
             int mark = messages.size();
             messages.add(message);
             try {
@@ -89,6 +91,7 @@ class GuardedMessageQueue {
      *  caller that compensates on the source side does not leave a duplicate here. */
     void addAll(List<Message> toAdd) {
         try (Guard _ = hold()) {
+            requireOpen();
             int mark = messages.size();
             messages.addAll(toAdd);
             try {
@@ -97,6 +100,13 @@ class GuardedMessageQueue {
                 messages.subList(mark, messages.size()).clear();
                 throw e;
             }
+        }
+    }
+
+    private void requireOpen() {
+        if (closed) {
+            throw new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                    "The specified queue does not exist.", 400);
         }
     }
 

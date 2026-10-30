@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.sqs;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.Queue;
@@ -188,7 +189,8 @@ class SqsNotificationWaitTest {
         GuardedMessageQueue queue = new GuardedMessageQueue(null, null);
         long observed = queue.changeVersion();
         queue.close();
-        queue.addMessage(new Message("late producer still holds the old incarnation"));
+        assertThrows(AwsException.class,
+                () -> queue.addMessage(new Message("late producer still holds the old incarnation")));
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             executor.submit(() -> {
                 queue.awaitChange(observed, TimeUnit.SECONDS.toNanos(20));
