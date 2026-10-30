@@ -3445,6 +3445,8 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200);
 
+        awaitStackStatus("ECR-Upper-Stack", "CREATE_COMPLETE");
+
         // ECR auto-name should be lowercase
         given()
             .contentType("application/x-www-form-urlencoded")

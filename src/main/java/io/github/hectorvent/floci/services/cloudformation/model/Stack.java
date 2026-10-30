@@ -72,6 +72,7 @@ public class Stack {
     private Map<String, ChangeSet> changeSets = orderedMap();
     private Map<String, String> tags = orderedMap();
     private boolean enableTerminationProtection = false;
+    private boolean disableRollback = false;
     /**
      * Set when an update rollback fails, and kept until a rollback completes or the stack is
      * deleted: the state from before the failed update, and the logical ids whose rollback has not
@@ -91,6 +92,8 @@ public class Stack {
     public void setRegion(String region) { this.region = region; }
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
+    public boolean isDisableRollback() { return disableRollback; }
+    public void setDisableRollback(boolean disableRollback) { this.disableRollback = disableRollback; }
     public String getStatusReason() { return statusReason; }
     public void setStatusReason(String statusReason) { this.statusReason = statusReason; }
     public Instant getCreationTime() { return creationTime; }

@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -38,6 +39,7 @@ class CloudFormationStackPersistenceTest {
         stack.setStackName("my-stack");
         stack.setRegion("us-east-1");
         stack.setStatus("CREATE_COMPLETE");
+        stack.setDisableRollback(true);
         stack.setTemplateBody("{\"Resources\":{}}");
         stack.getParameters().put("Env", "prod");
         stack.getOutputs().put("BucketArn", "arn:aws:s3:::my-bucket");
@@ -80,6 +82,7 @@ class CloudFormationStackPersistenceTest {
         assertEquals("my-stack", loaded.getStackName());
         assertEquals("us-east-1", loaded.getRegion());
         assertEquals("CREATE_COMPLETE", loaded.getStatus());
+        assertTrue(loaded.isDisableRollback());
         assertEquals("arn:aws:cloudformation:us-east-1:000000000000:stack/my-stack/abc123", loaded.getStackId());
         assertNotNull(loaded.getCreationTime(), "Instant fields must round-trip");
         assertEquals("prod", loaded.getParameters().get("Env"));
@@ -125,5 +128,6 @@ class CloudFormationStackPersistenceTest {
         assertTrue(loaded.isPresent(), "Stacks with unknown extra fields should still load");
         assertEquals("legacy-stack", loaded.get().getStackName());
         assertEquals("CREATE_COMPLETE", loaded.get().getStatus());
+        assertFalse(loaded.get().isDisableRollback(), "Legacy records retain default creation rollback");
     }
 }
