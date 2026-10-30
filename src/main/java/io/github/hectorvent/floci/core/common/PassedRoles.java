@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+import io.github.hectorvent.floci.services.iam.IamActionRegistry;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
@@ -122,6 +123,16 @@ final class PassedRoles {
 
     /** An IAM role ARN, the only resource {@code iam:PassRole} acts on. */
     private static final Pattern ROLE_ARN = Pattern.compile("^arn:[a-z0-9-]+:iam::\\d{12}:role/.+");
+
+    private static final Pattern REST_INTEGRATION = Pattern.compile(
+            "^/restapis/[^/]+/resources/[^/]+/methods/[^/]+/integration$");
+    private static final Pattern REST_AUTHORIZERS = Pattern.compile("^/restapis/[^/]+/authorizers$");
+    private static final Pattern REST_AUTHORIZER = Pattern.compile("^/restapis/[^/]+/authorizers/[^/]+$");
+    private static final Pattern V2_INTEGRATIONS = Pattern.compile("^/v2/apis/[^/]+/integrations$");
+    private static final Pattern V2_INTEGRATION = Pattern.compile("^/v2/apis/[^/]+/integrations/[^/]+$");
+    private static final Pattern V2_AUTHORIZERS = Pattern.compile("^/v2/apis/[^/]+/authorizers$");
+    private static final Pattern V2_AUTHORIZER = Pattern.compile("^/v2/apis/[^/]+/authorizers/[^/]+$");
+    private static final String API_GATEWAY = ServicePrincipals.of("apigateway");
 
     private static final String LAMBDA = ServicePrincipals.of("lambda");
     private static final String EC2 = ServicePrincipals.of("ec2");
@@ -263,6 +274,7 @@ final class PassedRoles {
      */
     static List<PassedRole> byHand(String action, ContainerRequestContext ctx, Lookups lookups) {
         return switch (action) {
+            case "apigateway:POST", "apigateway:PUT", "apigateway:PATCH" -> apiGatewayRoles(action, ctx);
             case "lambda:CreateFunction", "lambda:UpdateFunctionConfiguration" -> fromJson(ctx, LAMBDA, "Role");
             case "lambda:CreateWebFunction" ->
                     fromJson(ctx, LAMBDA, "revisionConfig", "serviceConfig", "executionRoleArn");
@@ -527,6 +539,56 @@ final class PassedRoles {
             LOG.debugv(e, "Embedded document is not JSON, so it passes no role");
             return null;
         }
+    }
+
+    /** Direct integration and authorizer credential assignments, as the API Gateway service references list. */
+    private static List<PassedRole> apiGatewayRoles(String action, ContainerRequestContext ctx) {
+        String path = IamActionRegistry.routedPath(ctx.getUriInfo());
+        return switch (action) {
+            case "apigateway:PUT" -> REST_INTEGRATION.matcher(path).matches()
+                    ? fromJson(ctx, API_GATEWAY, "credentials") : List.of();
+            case "apigateway:POST" -> {
+                if (REST_AUTHORIZERS.matcher(path).matches()) {
+                    yield fromJson(ctx, API_GATEWAY, "authorizerCredentials");
+                }
+                if (V2_INTEGRATIONS.matcher(path).matches()) {
+                    yield fromJson(ctx, API_GATEWAY, "credentialsArn");
+                }
+                yield V2_AUTHORIZERS.matcher(path).matches()
+                        ? fromJson(ctx, API_GATEWAY, "authorizerCredentialsArn") : List.of();
+            }
+            case "apigateway:PATCH" -> {
+                if (REST_INTEGRATION.matcher(path).matches()) {
+                    yield patchedRoles(ctx, "/credentials");
+                }
+                if (REST_AUTHORIZER.matcher(path).matches()) {
+                    yield patchedRoles(ctx, "/authorizerCredentials");
+                }
+                if (V2_INTEGRATION.matcher(path).matches()) {
+                    yield fromJson(ctx, API_GATEWAY, "credentialsArn");
+                }
+                yield V2_AUTHORIZER.matcher(path).matches()
+                        ? fromJson(ctx, API_GATEWAY, "authorizerCredentialsArn") : List.of();
+            }
+            default -> List.of();
+        };
+    }
+
+    private static List<PassedRole> patchedRoles(ContainerRequestContext ctx, String credentialPath) {
+        JsonNode body = jsonBody(ctx);
+        JsonNode operations = body == null ? null : body.get("patchOperations");
+        if (operations == null || !operations.isArray()) {
+            return List.of();
+        }
+        List<String> roles = new ArrayList<>();
+        for (JsonNode operation : operations) {
+            String op = operation.path("op").asText();
+            if (("add".equals(op) || "replace".equals(op))
+                    && credentialPath.equals(operation.path("path").asText())) {
+                roles.addAll(values(operation, "value"));
+            }
+        }
+        return passed(roles, API_GATEWAY);
     }
 
     /**

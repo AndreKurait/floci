@@ -1654,6 +1654,13 @@ permissions to pass the role to the service." It is checked with `iam:PassedToSe
 service the role goes to, the value AWS's Service Reference gives for the operation, so a grant to
 pass a role to EC2 does not let the same role be passed to Lambda. The operations checked, and the
 role each passes:
+- **API Gateway:** direct REST `PutIntegration`, `UpdateIntegration`, `CreateAuthorizer` and
+  `UpdateAuthorizer`, and V2 `CreateIntegration`, `UpdateIntegration`, `CreateAuthorizer` and
+  `UpdateAuthorizer` pass assigned credential role ARNs to `apigateway.amazonaws.com`. REST patch
+  operations check each `add` or `replace` of `/credentials` or `/authorizerCredentials` before
+  mutation. Role removal, omitted credentials and the integration caller-identity sentinel do
+  not pass a role. OpenAPI imports, quick-create API credentials and account settings are not
+  covered by this check.
 - **Lambda:** `CreateFunction` and `UpdateFunctionConfiguration` (`Role`, when the request sets
   it), `CreateWebFunction` and `CreateWebFunctionRevision` (the service configuration's
   `executionRoleArn`), `CreateMicrovmImage` and `UpdateMicrovmImage` (`buildRoleArn`),
