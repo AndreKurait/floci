@@ -93,6 +93,7 @@ import java.util.zip.GZIPOutputStream;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -2780,6 +2781,15 @@ class Ec2ContainerManagerTest {
         assertEquals(List.of("/public/ca.pem", "/etc/resolv.conf"),
                 binds.stream().map(Mount::getTarget).toList());
         assertTrue(binds.stream().allMatch(mount -> Boolean.TRUE.equals(mount.getReadOnly())));
+        HostConfig hostConfig = createGuestHostConfig(spec);
+        assertNotNull(hostConfig.getMounts());
+        List<Mount> hostBinds = hostConfig.getMounts().stream()
+                .filter(mount -> mount.getType() == MountType.BIND).toList();
+        assertEquals(List.of("/host/input files,one/ca.pem", "/host/literal\\resolver"),
+                hostBinds.stream().map(Mount::getSource).toList());
+        assertEquals(List.of("/public/ca.pem", "/etc/resolv.conf"),
+                hostBinds.stream().map(Mount::getTarget).toList());
+        assertTrue(hostBinds.stream().allMatch(mount -> Boolean.TRUE.equals(mount.getReadOnly())));
         assertEquals(1024L * 1024 * 1024, spec.memoryBytes());
         assertEquals(2_000_000_000L, spec.nanoCpus());
         assertNull(spec.entrypoint());
@@ -2943,6 +2953,33 @@ class Ec2ContainerManagerTest {
                 "example/worker:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"),
                 Map.of("FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", source,
                         "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), true, false, true));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/run", "/run/lock", "/sys/fs/cgroup"})
+    void systemdMountTargetsRefuseBeforePortsHelpersOrWorkload(String target) throws Exception {
+        assertNull(launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", ResolvedAmiImage.SYSTEMD_RUNTIME, true, "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), true, false, true));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "minimal,/run", "minimal,/run/lock", "minimal,/sys/fs/cgroup",
+            "image,/run", "image,/run/lock", "image,/sys/fs/cgroup",
+            "systemd,/run/custom", "systemd,/run/lockfile", "systemd,/sys/fs/cgroup-extra"
+    })
+    void otherRuntimeMountTargetsRemainAvailable(String runtime, String target) throws Exception {
+        ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", runtime, "systemd".equals(runtime), "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), false, false, false);
+
+        Mount bind = spec.mounts().stream().filter(mount -> mount.getType() == MountType.BIND)
+                .findFirst().orElseThrow();
+        assertEquals(target, bind.getTarget());
+        assertTrue(bind.getReadOnly());
     }
 
     @Test

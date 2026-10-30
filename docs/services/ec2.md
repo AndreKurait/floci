@@ -1531,7 +1531,8 @@ Both paths must be normalized absolute Linux paths, including when the Floci
 process runs on Windows. Sources must already exist on the Docker daemon host.
 Docker refuses a missing source without creating it.
 Duplicate targets and replacing the guest root are rejected before guest
-resources are allocated.
+resources are allocated. For systemd images, `/run`, `/run/lock`, and
+`/sys/fs/cgroup` are reserved for the runtime and cannot be bind targets.
 
 These mounts apply to EC2 guest containers. Helpers retain their own
 configuration. Process limits, metadata and credential selection keep their

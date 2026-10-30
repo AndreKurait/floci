@@ -588,6 +588,14 @@ public class Ec2ContainerManager {
         String instanceId = instance.getInstanceId();
         String containerName = ContainerStorageHelper.resourceName(config, "ec2", null, instanceId);
         GuestOptions options = guestOptions(config.services().ec2());
+        if (image.systemd()) {
+            for (Mount mount : options.mounts()) {
+                if (Set.of("/run", "/run/lock", "/sys/fs/cgroup").contains(mount.getTarget())) {
+                    throw new IllegalArgumentException("Read-only bind target is reserved for systemd: "
+                            + mount.getTarget());
+                }
+            }
+        }
         boolean customResolver = options.mounts().stream().anyMatch(mount ->
                 "/etc".equals(mount.getTarget()) || "/etc/resolv.conf".equals(mount.getTarget()));
         String serviceEndpoint = customResolver ? reachableEndpoint.baseUrl(false) : reachableEndpoint.baseUrl();
