@@ -962,6 +962,12 @@ through `payment-pending`/`assessing`. `DescribeCapacityReservations` supports t
 `instance-type`, `state` and `tenancy` filters alongside the shared `tag:`, `tag-key` and
 `tag-value` filters.
 
+`CreateCapacityReservation` retries with the same nonempty `ClientToken` and
+creation parameters return the existing reservation. Reusing the token with
+different parameters returns `IdempotentParameterMismatch`. Tokens are scoped to
+the caller's account and region and survive storage recovery. A replay preserves
+later changes to the reservation's count, expiry, and tags.
+
 On-demand launches consume matching open reservation capacity unless their preference is
 `none`. RunInstances also honors an explicit reservation target, including one supplied by
 its launch template. `capacity-reservations-only` requires matching reservation capacity and

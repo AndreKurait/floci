@@ -4597,12 +4597,8 @@ public class Ec2QueryHandler {
                 instantOrNull(p, "EndDate"),
                 p.getFirst("InstanceMatchCriteria"),
                 p.getFirst("OutpostArn"),
-                p.getFirst("PlacementGroupArn"));
-        applyResourceTags(resourceTags, region, reservation.getCapacityReservationId());
-        if (!resourceTags.isEmpty()) {
-            reservation = service.describeCapacityReservations(
-                    region, List.of(reservation.getCapacityReservationId()), Map.of()).getFirst();
-        }
+                p.getFirst("PlacementGroupArn"),
+                p.getFirst("ClientToken"), resourceTags);
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateCapacityReservationResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())

@@ -11238,6 +11238,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             String instancePlatform, String availabilityZone, String availabilityZoneId, Integer instanceCount,
             String tenancy, Boolean ebsOptimized, Boolean ephemeralStorage, String endDateType,
             java.time.Instant endDate, String instanceMatchCriteria, String outpostArn, String placementGroupArn) {
+        return createCapacityReservation(region, instanceType, instancePlatform, availabilityZone,
+                availabilityZoneId, instanceCount, tenancy, ebsOptimized, ephemeralStorage,
+                endDateType, endDate, instanceMatchCriteria, outpostArn, placementGroupArn, null, List.of());
+    }
+
+    public CapacityReservation createCapacityReservation(String region, String instanceType,
+            String instancePlatform, String availabilityZone, String availabilityZoneId, Integer instanceCount,
+            String tenancy, Boolean ebsOptimized, Boolean ephemeralStorage, String endDateType,
+            Instant endDate, String instanceMatchCriteria, String outpostArn, String placementGroupArn,
+            String clientToken, List<Tag> resourceTags) {
+        validateNewResourceTags(resourceTags);
         ensureDefaultResources(region);
         if (instanceType == null || instanceType.isBlank()) {
             throw new AwsException("MissingParameter",
@@ -11284,8 +11295,27 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         reservation.setInstanceMatchCriteria(instanceMatchCriteria != null ? instanceMatchCriteria : "open");
         reservation.setOutpostArn(outpostArn);
         reservation.setPlacementGroupArn(placementGroupArn);
+        String token = clientToken != null && !clientToken.isBlank() ? clientToken : null;
+        reservation.setClientToken(token);
+        List<Tag> initialTags = tagMap(resourceTags).entrySet().stream()
+                .map(entry -> new Tag(entry.getKey(), entry.getValue())).toList();
+        reservation.setTags(new ArrayList<>(initialTags));
+        if (token != null) {
+            reservation.setCreationParameters(capacityReservationCreationParameters(reservation));
+        }
         synchronized (capacityReservationLock) {
             reconcileCapacityMembership(region);
+            if (token != null) {
+                for (CapacityReservation existing : capacityReservations.scan(k -> k.startsWith(region + "::"))) {
+                    if (token.equals(existing.getClientToken())) {
+                        if (!reservation.getCreationParameters().equals(existing.getCreationParameters())) {
+                            throw new AwsException("IdempotentParameterMismatch",
+                                    "The client token was already used with different parameters.", 400);
+                        }
+                        return existing;
+                    }
+                }
+            }
             if ("open".equals(reservation.getInstanceMatchCriteria())) {
                 Set<String> associated = capacityReservations.scan(k -> k.startsWith(region + "::")).stream()
                         .flatMap(existing -> existing.getInstanceIds().stream()).collect(Collectors.toSet());
@@ -11304,9 +11334,34 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     }
                 }
             }
+            if (!initialTags.isEmpty()) {
+                putTags(region, reservation.getCapacityReservationId(), new ArrayList<>(initialTags));
+            }
             capacityReservations.put(key(region, reservation.getCapacityReservationId()), reservation);
         }
         return reservation;
+    }
+
+    private static Map<String, String> capacityReservationCreationParameters(CapacityReservation reservation) {
+        Map<String, String> parameters = new LinkedHashMap<>();
+        parameters.put("InstanceType", reservation.getInstanceType());
+        parameters.put("InstancePlatform", reservation.getInstancePlatform());
+        parameters.put("AvailabilityZone", reservation.getAvailabilityZone());
+        parameters.put("AvailabilityZoneId", reservation.getAvailabilityZoneId());
+        parameters.put("InstanceCount", Integer.toString(reservation.getTotalInstanceCount()));
+        parameters.put("Tenancy", reservation.getTenancy());
+        parameters.put("EbsOptimized", Boolean.toString(reservation.isEbsOptimized()));
+        parameters.put("EphemeralStorage", Boolean.toString(reservation.isEphemeralStorage()));
+        parameters.put("EndDateType", reservation.getEndDateType());
+        parameters.put("EndDate", reservation.getEndDate() != null ? reservation.getEndDate().toString() : null);
+        parameters.put("InstanceMatchCriteria", reservation.getInstanceMatchCriteria());
+        parameters.put("OutpostArn", reservation.getOutpostArn());
+        parameters.put("PlacementGroupArn", reservation.getPlacementGroupArn());
+        parameters.values().removeIf(Objects::isNull);
+        for (Tag tag : reservation.getTags()) {
+            parameters.put("Tag." + tag.getKey(), Objects.toString(tag.getValue(), ""));
+        }
+        return parameters;
     }
 
     public List<CapacityReservation> describeCapacityReservations(String region, List<String> ids,

@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.model.CapacityReservation;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.resourcegroups.ResourceGroupsService;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -34,6 +35,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -59,6 +61,29 @@ class Ec2CapacityReservationAssociationServiceTest {
 
     @TempDir
     Path directory;
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void clientTokenReplaySurvivesChangesAndRestartWithinItsAccountAndRegion(String mode) {
+        String originalId;
+        try (Fixture fixture = new Fixture(mode, directory)) {
+            originalId = fixture.createWithToken(REGION).getCapacityReservationId();
+            fixture.service.modifyCapacityReservation(REGION, originalId, 3, null, null, null);
+            fixture.service.createTags(REGION, List.of(originalId), List.of(new Tag("purpose", "updated")));
+        }
+        try (Fixture otherAccount = new Fixture(mode, directory, "222222222222")) {
+            CapacityReservation other = otherAccount.createWithToken(REGION);
+            assertNotEquals(originalId, other.getCapacityReservationId());
+            assertEquals("222222222222", other.getOwnerId());
+        }
+        try (Fixture recovered = new Fixture(mode, directory)) {
+            CapacityReservation replay = recovered.createWithToken(REGION);
+            assertEquals(originalId, replay.getCapacityReservationId());
+            assertEquals(3, replay.getTotalInstanceCount());
+            assertEquals(List.of("updated"), replay.getTags().stream().map(Tag::getValue).toList());
+            assertNotEquals(originalId, recovered.createWithToken("eu-west-1").getCapacityReservationId());
+        }
+    }
 
     @Test
     void unknownZoneIdIsRejectedBeforeReservationPublication() {
@@ -698,8 +723,12 @@ class Ec2CapacityReservationAssociationServiceTest {
         private final ResourceGroupsService groups;
 
         private Fixture(String mode, Path path) {
+            this(mode, path, ACCOUNT);
+        }
+
+        private Fixture(String mode, Path path, String account) {
             config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-            when(config.defaultAccountId()).thenReturn(ACCOUNT);
+            when(config.defaultAccountId()).thenReturn(account);
             when(config.services().ec2().mock()).thenReturn(true);
             when(config.services().ec2().mockPublicAddresses())
                     .thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.NONE);
@@ -781,6 +810,12 @@ class Ec2CapacityReservationAssociationServiceTest {
         private CapacityReservation create(int count) {
             return service.createCapacityReservation(REGION, "t3.micro", "Linux/UNIX", REGION + "a",
                     null, count, null, null, null, null, null, null, null, null);
+        }
+
+        private CapacityReservation createWithToken(String region) {
+            return service.createCapacityReservation(region, "t3.micro", "Linux/UNIX", region + "a",
+                    null, 2, null, null, null, null, null, "targeted", null, null,
+                    "retry-token", List.of(new Tag("purpose", "original")));
         }
 
         private CapacityReservation describe(CapacityReservation reservation) {
