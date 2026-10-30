@@ -55,7 +55,7 @@ public class IssuedSessionVerifier {
                            String principalArn, String principalId, String expiresAt, boolean sessionPolicyPresent,
                            @JsonInclude(JsonInclude.Include.NON_NULL) String accessKeyId) {}
 
-    record Snapshot(String accessKey, String secret, String token, String account, String origin,
+    record Snapshot(String kind, String accessKey, String secret, String token, String account, String origin,
                             String roleArn, String roleId, String sessionName, String principalArn,
                             String principalId, Instant expiry, boolean policyPresent) {
         @Override
@@ -64,7 +64,7 @@ public class IssuedSessionVerifier {
         }
 
         Identity identity(String correlation, String operation, Instant expiration, boolean includeAccessKey) {
-            return new Identity(correlation, operation, "ASSUMED_ROLE", account, origin, roleArn, roleId,
+            return new Identity(correlation, operation, kind, account, origin, roleArn, roleId,
                     sessionName, principalArn, principalId, expiration.toString(), policyPresent,
                     includeAccessKey ? accessKey : null);
         }
@@ -151,16 +151,23 @@ public class IssuedSessionVerifier {
     }
 
     Snapshot snapshot(SessionCredential session, boolean lambdaRoot) {
-        if (lambdaRoot ? !session.isLambdaExecutionRole() || session.getLambdaExecution() == null
-                : !session.isAssumeRoleIssued() || session.isLambdaExecutionRole()) {
+        boolean ec2 = !lambdaRoot && session.getEc2InstanceId() != null;
+        if (ec2 && (!session.getEc2InstanceId().matches("i-(?:[0-9a-f]{8}|[0-9a-f]{17})")
+                || session.isAssumeRoleIssued() || session.isLambdaExecutionRole()
+                || session.getLambdaParentSession() != null)) {
             return null;
         }
-        if (session.getEc2InstanceId() != null || session.getEcsTaskArn() != null
+        if (lambdaRoot ? !session.isLambdaExecutionRole() || session.getLambdaExecution() == null
+                : !ec2 && (!session.isAssumeRoleIssued() || session.isLambdaExecutionRole())) {
+            return null;
+        }
+        String sessionName = ec2 ? session.getEc2InstanceId() : session.getRoleSessionName();
+        if ((lambdaRoot && session.getEc2InstanceId() != null) || session.getEcsTaskArn() != null
                 || session.getPresignedAction() != null || session.getIssuerArn() != null
                 || (!lambdaRoot && session.getExpiration() == null)
                 || (session.getExpiration() != null && !session.getExpiration().isAfter(clock.instant()))
                 || !nonempty(session.getSecretAccessKey()) || !nonempty(session.getSessionToken())
-                || !nonempty(session.getRoleArn()) || !nonempty(session.getRoleSessionName())
+                || !nonempty(session.getRoleArn()) || !nonempty(sessionName)
                 || !nonempty(session.getAssumedRoleId()) || !nonempty(session.getOriginAccountId())
                 || !session.getOriginAccountId().matches("[0-9]{12}")) {
             return null;
@@ -180,14 +187,20 @@ public class IssuedSessionVerifier {
         IamRole role = iam.findRole(arn.accountId(), roleName).orElse(null);
         if (role == null || !Objects.equals(role.getArn(), session.getRoleArn())
                 || !nonempty(role.getRoleId()) || !session.getAssumedRoleId().equals(
-                role.getRoleId() + ":" + session.getRoleSessionName())) {
+                role.getRoleId() + ":" + sessionName)) {
+            return null;
+        }
+        if (ec2 && (!role.getRoleId().equals(session.getEc2RoleId())
+                || !arn.accountId().equals(session.getOriginAccountId())
+                || session.getSessionPolicyDocument() != null || session.isManagedSessionPolicyPresent())) {
             return null;
         }
         String principalArn = AwsArnUtils.Arn.global(arn.partition(), "sts", arn.accountId(),
-                "assumed-role/" + roleName + "/" + session.getRoleSessionName()).toString();
-        return new Snapshot(session.getAccessKeyId(), session.getSecretAccessKey(), session.getSessionToken(),
+                "assumed-role/" + roleName + "/" + sessionName).toString();
+        return new Snapshot(ec2 ? "EC2_INSTANCE_PROFILE" : "ASSUMED_ROLE",
+                session.getAccessKeyId(), session.getSecretAccessKey(), session.getSessionToken(),
                 arn.accountId(), session.getOriginAccountId(), role.getArn(), role.getRoleId(),
-                session.getRoleSessionName(), principalArn, session.getAssumedRoleId(),
+                sessionName, principalArn, session.getAssumedRoleId(),
                 session.getExpiration() == null ? Instant.MAX : session.getExpiration(),
                 session.getSessionPolicyDocument() != null || session.isManagedSessionPolicyPresent());
     }

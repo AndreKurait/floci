@@ -2657,7 +2657,7 @@ Both accept JSON over POST, reject unknown/duplicate fields, and return
   and restriction presence; the earliest current expiry is returned.
 
 Success returns `correlationId`, `operation` (`Verify` or `Lookup`),
-`kind` (`ASSUMED_ROLE`), `accountId`, `originAccountId`, `roleArn`, `roleId`,
+`kind` (`ASSUMED_ROLE` or `EC2_INSTANCE_PROFILE`), `accountId`, `originAccountId`, `roleArn`, `roleId`,
 `roleSessionName`, `principalArn`, `principalId`, `expiresAt` and the explicit
 boolean `sessionPolicyPresent`. Only `Lookup` selected by `accessKeyId` also returns
 `accessKeyId`, bound to the current selected issuer record. `Verify` and principal
@@ -2666,8 +2666,12 @@ present; this flag does not claim those policies were evaluated. Consumers must
 apply their own authorization and inspect current public IAM policies and
 permissions boundaries.
 
-Only normal AssumeRole sessions issued in this process qualify. Their provenance
-marker is not persisted; restored sessions, WebIdentity, SAML, workload credentials,
+Normal AssumeRole sessions and EC2 instance-profile sessions issued in this process qualify.
+An EC2 response keeps its distinct kind, instance ID as session name, and instance-profile
+principal ID. The stored EC2 role ID and origin account must match the current IAM role.
+Instance identity-role credentials do not qualify. EC2 sessions are removed when the instance
+is unregistered and are discarded on process restart.
+The AssumeRole provenance marker is not persisted; restored sessions, WebIdentity, SAML, other workload credentials,
 GetSessionToken, federation and long-term credentials refuse. Removing or replacing
 the issuer role invalidates admission. The role and registry are checked again
 before returning. Registry scans are bounded to 4,096 entries and 128 matches.
