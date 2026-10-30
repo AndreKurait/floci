@@ -667,9 +667,10 @@ class AppConfigTest {
             assertThat(deployment.configurationName()).isEqualTo("service-settings");
             assertThat(deployment.configurationLocationUri()).isEqualTo("ssm-parameter://service-settings");
 
-            // AWS documents no default Type: a profile created without one reports none.
+            // A hosted profile without an explicit Type defaults to freeform.
             assertThat(appConfig.createConfigurationProfile(CreateConfigurationProfileRequest.builder()
-                    .applicationId(monitoredAppId).name("untyped").locationUri("hosted").build()).type()).isNull();
+                    .applicationId(monitoredAppId).name("untyped").locationUri("hosted").build()).type())
+                    .isEqualTo("AWS.Freeform");
         } finally {
             try {
                 appConfig.deleteApplication(DeleteApplicationRequest.builder().applicationId(monitoredAppId).build());
