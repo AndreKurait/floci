@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
@@ -78,9 +79,10 @@ public class AlarmEvaluator {
      */
     void evaluateAll() {
         try {
-            for (MetricAlarm alarm : metricsService.allAlarms()) {
+            for (CloudWatchMetricsService.OwnedAlarm owned : metricsService.allOwnedAlarms()) {
+                MetricAlarm alarm = owned.alarm();
                 try {
-                    evaluate(alarm);
+                    RequestScopes.runAs(owned.accountId(), alarm.getRegion(), () -> evaluate(alarm));
                 } catch (Exception e) {
                     LOG.warnv("Alarm evaluation failed for {0}: {1}", alarm.getAlarmName(), e.getMessage());
                 }

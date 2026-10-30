@@ -29,7 +29,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class ApplicationAutoScalingServiceTest {
 
@@ -40,6 +43,7 @@ class ApplicationAutoScalingServiceTest {
 
     private ApplicationAutoScalingService service;
     private CloudWatchMetricsService cloudWatch;
+    private final LambdaCapacityAdjuster lambdaCapacity = mock(LambdaCapacityAdjuster.class);
 
     /** Alarm names currently registered in the stubbed CloudWatch. */
     private final Set<String> alarmsInCloudWatch = new LinkedHashSet<>();
@@ -63,12 +67,46 @@ class ApplicationAutoScalingServiceTest {
 
         service = new ApplicationAutoScalingService(
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
-                regionResolver, cloudWatch);
+                regionResolver, cloudWatch, lambdaCapacity);
     }
 
     private ScalableTarget register() {
         return service.registerScalableTarget(NAMESPACE, RESOURCE_ID, DIMENSION, 1, 10,
                 null, null, Map.of("Environment", "dev"), REGION);
+    }
+
+    @Test
+    void lambdaRegistrationReconcilesRetainedBoundsWhenTheRequestOmitsThem() {
+        String dimension = "lambda:function:ProvisionedConcurrency";
+        when(lambdaCapacity.supports(dimension)).thenReturn(true);
+        service.registerScalableTarget("lambda", "function:worker:live", dimension, 1, 3,
+                null, null, null, REGION);
+        service.registerScalableTarget("lambda", "function:worker:live", dimension, null, 4,
+                null, null, null, REGION);
+        verify(lambdaCapacity).reconcileRegistration("function:worker:live", 1, 4, REGION);
+    }
+
+    @Test
+    void failedCapacityAdjustmentPreservesTheExistingTargetBounds() {
+        String dimension = "lambda:function:ProvisionedConcurrency";
+        when(lambdaCapacity.supports(dimension)).thenReturn(true);
+        service.registerScalableTarget("lambda", "function:worker:live", dimension, 1, 3,
+                null, null, null, REGION);
+        doThrow(new AwsException("ServiceException", "capacity unavailable", 500))
+                .when(lambdaCapacity).reconcileRegistration("function:worker:live", 2, 4, REGION);
+        assertThrows(AwsException.class, () -> service.registerScalableTarget(
+                "lambda", "function:worker:live", dimension, 2, 4, null, null, null, REGION));
+        ScalableTarget stored = service.describeScalableTargets(
+                "lambda", List.of("function:worker:live"), dimension, REGION).getFirst();
+        assertEquals(1, stored.getMinCapacity());
+        assertEquals(3, stored.getMaxCapacity());
+    }
+
+    @Test
+    void lambdaRejectsUnsupportedStepScalingBeforeCreatingAPolicy() {
+        assertThrows(AwsException.class, () -> service.putScalingPolicy("unsupported", "StepScaling",
+                "lambda", "function:worker:live", "lambda:function:ProvisionedConcurrency",
+                null, null, REGION));
     }
 
     private TargetTrackingConfiguration targetTracking(double value, String metricType, String resourceLabel) {

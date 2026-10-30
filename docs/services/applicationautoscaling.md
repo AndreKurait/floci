@@ -79,7 +79,28 @@ dimensions real AWS attaches to the metric, so a metric you push with
 `cloudwatch:PutMetricData` using those dimensions is what the control loop below
 evaluates against.
 
-## Control loop (ECS only)
+## Lambda provisioned capacity
+
+Registering `lambda:function:ProvisionedConcurrency` reconciles the alias or published
+version's requested capacity into `MinCapacity` and `MaxCapacity`. Updating the target
+does the same even when the request omits the bounds. This also applies to
+`AWS::ApplicationAutoScaling::ScalableTarget` resources in CloudFormation.
+
+The existing Lambda provisioned-concurrency pool owns initialization and reports
+`IN_PROGRESS`, `READY`, or `FAILED` through the Lambda API. Registration does not imply
+that initialization has finished. Inactive resources can be registered without changing
+capacity. Deregistering the scalable target removes its policies and alarms but preserves
+the Lambda allocation; delete that allocation or function separately when it is no longer
+needed.
+
+Lambda target tracking uses `LambdaProvisionedConcurrencyUtilization`, mapped to
+`AWS/Lambda`'s `ProvisionedConcurrencyUtilization` metric with the `FunctionName` and
+qualified `Resource` dimensions. Policies use the existing pool to change real
+provisioned environments. A zero capacity removes the allocation. Lambda supports
+target tracking, and rejects step-scaling policies. The lower alarm uses 90 percent
+of the target utilization, matching Lambda's scale-in threshold.
+
+## Control loop (ECS and Lambda)
 
 A background evaluator (ticking every ~10s) evaluates every CloudWatch alarm with
 metric-math configuration — the two alarms above, and any hand-created alarm behind a
@@ -90,8 +111,10 @@ current period is never counted, matching real CloudWatch). While an alarm is in
 its policy fires on every tick, not only the first transition — a scale-out blocked by
 cooldown on one tick is retried on a later one instead of being dropped. For
 `ScalableDimension=ecs:service:DesiredCount`, Floci calls the ECS `UpdateService` action
-to actually change `desiredCount`, respecting `MinCapacity`/`MaxCapacity` and
-`SuspendedState`.
+to change `desiredCount`. For `lambda:function:ProvisionedConcurrency`, it changes the
+Lambda provisioned-capacity request. Both respect `MinCapacity`/`MaxCapacity` and
+`SuspendedState`. Background evaluation reads metrics and dispatches actions in each
+alarm's stored account and region.
 
 - `TargetTrackingScaling` computes the new capacity as
   `ceil(current * metricValue / TargetValue)`. `DisableScaleIn` suppresses the scale-in
@@ -101,7 +124,7 @@ to actually change `desiredCount`, respecting `MinCapacity`/`MaxCapacity` and
   `AdjustmentType` (`ChangeInCapacity`, `PercentChangeInCapacity` with
   `MinAdjustmentMagnitude`, or `ExactCapacity`).
 - **Cooldown** (`ScaleInCooldown`/`ScaleOutCooldown` for target tracking, `Cooldown` for
-  step scaling) defaults to AWS's documented 300s ECS default when unset, not `0`. Per
+  step scaling) defaults to 300 seconds for ECS and zero for Lambda. Per
   AWS's own cooldown semantics, a scale-out blocked by cooldown still proceeds immediately
   if the newly computed capacity is *larger* than what the last scale-out already applied
   — cooldown exists to stop flapping on small repeated moves, not to cap a sustained
@@ -120,8 +143,8 @@ to actually change `desiredCount`, respecting `MinCapacity`/`MaxCapacity` and
   Floci does not synthesize ECS CPU/memory metrics itself, so an operator (or a compat
   test) has to push them to exercise the loop, the same way a real CloudWatch agent
   would against real AWS.
-- Scalable dimensions other than `ecs:service:DesiredCount` (MSK broker storage,
-  DynamoDB capacity, Lambda provisioned concurrency, ...) remain stored but inert, as
+- Scalable dimensions other than ECS desired count and Lambda provisioned concurrency
+  (MSK broker storage, DynamoDB capacity, ...) remain stored but inert, as
   described below.
 
 ## Service-linked roles
@@ -135,12 +158,13 @@ arn:aws:iam::<account>:role/aws-service-role/<namespace>.application-autoscaling
 
 ## Limitations
 
-- **Only `ecs:service:DesiredCount` is driven by the control loop above.** Every other
-  scalable dimension (MSK broker storage, DynamoDB capacity, Lambda provisioned
-  concurrency, EC2 Spot Fleet, ...) is stored and described faithfully, but nothing
-  evaluates its policies or adjusts its capacity. This matches the existing behavior of
-  EC2 Auto Scaling's `PutScalingPolicy` in Floci for those dimensions. The control plane
-  is faithful for all dimensions; the control loop is only emulated for ECS.
+- **The control loop drives ECS desired count and Lambda provisioned concurrency.**
+  Other scalable dimensions remain stored but do not adjust underlying capacity.
+  ECS registration retains its existing control-plane behavior; immediate registration
+  reconciliation is implemented for Lambda.
+- The loop consumes CloudWatch metric data; it does not synthesize Lambda utilization
+  from invocations. Tests or applications must publish the metric to exercise target
+  tracking.
 - `PutScheduledAction`, `DescribeScheduledActions`, and `DeleteScheduledAction` are not
   implemented.
 - `PredictiveScalingPolicyConfiguration` is accepted only insofar as `PolicyType` is

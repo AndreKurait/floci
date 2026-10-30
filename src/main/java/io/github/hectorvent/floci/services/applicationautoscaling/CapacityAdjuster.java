@@ -6,7 +6,7 @@ package io.github.hectorvent.floci.services.applicationautoscaling;
  * <p>{@link ScalingPolicyAlarmActionHandler} discovers every CDI bean implementing this
  * interface and delegates to the one whose {@link #supports(String)} matches a scalable
  * target's dimension. A dimension with no adjuster stays exactly as inert as it is today —
- * this is the seam a future DynamoDB/Lambda/etc. adjuster plugs into without touching the
+ * this is the seam a future DynamoDB or other adjuster plugs into without touching the
  * alarm-evaluation or scaling-math code.</p>
  */
 public interface CapacityAdjuster {
