@@ -1239,6 +1239,24 @@ The `client-token` instance filter selects only matching launches.
 
 A standalone ENI created via `CreateNetworkInterface` can also be handed to `RunInstances` as an instance's primary interface (`NetworkInterface.1.NetworkInterfaceId` / `NetworkInterface.1.DeviceIndex`) instead of letting the instance create its own implicit one, the pattern Terraform's `aws_instance` resource uses for `network_interface { network_interface_id = ... }`. AWS only allows this for a single instance per launch call; `RunInstances` rejects it otherwise with `InvalidParameterCombination`.
 
+The primary interface's `DeleteOnTermination` comes from the request's network-interface
+specification or, when that specification is absent, the launch template. The default is
+`true` for an interface created by the launch and `false` for an existing interface.
+Setting it to `true` for an existing interface is rejected before launch.
+Both instance and interface descriptions report the selected value. Stopping an instance
+keeps the attachment; termination deletes an interface marked for deletion and returns
+a retained interface to `available`, preserving its private address, groups, tags, and
+Elastic IP association. A retained interface can be reused by a later launch. In container mode,
+launch, start, and metadata restoration also synchronize its primary private address and
+DNS name with the attached instance interface. AWS-faithful private-address mode keeps the
+allocated address. Secondary private-address entries, tags, groups, and attachment identity
+are preserved.
+
+Launch-template `network-interface` tags apply to the primary interface created by
+the launch. Request tags override matching template keys. Template interface tags
+do not retag a supplied interface or propagate to secondary interfaces. Tags stay
+visible through `DescribeTags` and `DescribeNetworkInterfaces` after retention.
+
 `ModifyNetworkInterfaceAttribute` is not implemented: no example in the corpus that needed `CreateNetworkInterface` was found to need it. A route table's `CreateRoute` with a `NetworkInterfaceId` target is accepted but not recorded, since `Route` does not yet model an ENI target; a subsequent `plan` against such a route may show drift.
 
 ### Volumes

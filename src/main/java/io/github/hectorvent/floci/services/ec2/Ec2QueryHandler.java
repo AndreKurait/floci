@@ -827,6 +827,8 @@ public class Ec2QueryHandler {
         // the instance's primary interface (network_interface { network_interface_id = ... }).
         String networkInterfaceId = p.getFirst("NetworkInterface.1.NetworkInterfaceId");
         int networkInterfaceDeviceIndex = parseIntParam(p, "NetworkInterface.1.DeviceIndex", 0);
+        Boolean networkInterfaceDeleteOnTermination = parseOptionalBoolean(
+                p.getFirst("NetworkInterface.1.DeleteOnTermination"), "NetworkInterface.1.DeleteOnTermination");
         String clientToken = p.getFirst("ClientToken");
         List<String> sgIds = getList(p, "SecurityGroupId");
 
@@ -878,6 +880,7 @@ public class Ec2QueryHandler {
                 if (primary != null) {
                     subnetId = primary.getSubnetId();
                     privateIpAddress = primary.getPrivateIpAddress();
+                    networkInterfaceDeleteOnTermination = primary.getDeleteOnTermination();
                     if (associatePublicIp == null) {
                         associatePublicIp = primary.getAssociatePublicIpAddress();
                     }
@@ -934,12 +937,36 @@ public class Ec2QueryHandler {
             }
         }
 
+        if (launchTemplateData != null && !isSet(networkInterfaceId)) {
+            Ec2Service.validateNewResourceTags(launchTemplateData.tagsForResource("network-interface"));
+            Map<String, Tag> primaryInterfaceTags = new LinkedHashMap<>();
+            launchTemplateData.tagsForResource("network-interface")
+                    .forEach(tag -> primaryInterfaceTags.put(tag.getKey(), tag));
+            networkInterfaceTags.forEach(tag -> primaryInterfaceTags.put(tag.getKey(), tag));
+            Ec2Service.validateNewResourceTags(new ArrayList<>(primaryInterfaceTags.values()));
+        }
+
         Reservation res = service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
                 associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, null, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, Boolean.parseBoolean(p.getFirst("DryRun")),
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
-                "spot".equals(marketType), privateIpAddress, capacitySpecification);
+                "spot".equals(marketType), privateIpAddress, capacitySpecification,
+                networkInterfaceDeleteOnTermination);
+
+        if (launchTemplateData != null && !isSet(networkInterfaceId)) {
+            List<Tag> templateInterfaceTags = launchTemplateData.tagsForResource("network-interface");
+            if (!templateInterfaceTags.isEmpty()) {
+                List<String> primaryIds = res.getInstances().stream()
+                        .flatMap(instance -> instance.getNetworkInterfaces().stream())
+                        .filter(networkInterface -> networkInterface.getDeviceIndex() == 0)
+                        .map(InstanceNetworkInterface::getNetworkInterfaceId)
+                        .toList();
+                if (!primaryIds.isEmpty()) {
+                    service.createTags(region, primaryIds, templateInterfaceTags);
+                }
+            }
+        }
 
         if (!networkInterfaceTags.isEmpty()) {
             List<String> eniIds = new ArrayList<>();
@@ -5356,7 +5383,7 @@ public class Ec2QueryHandler {
             if (eni.getAttachTime() != null) {
                 xml.elem("attachTime", eni.getAttachTime());
             }
-            xml.elem("deleteOnTermination", "true")
+            xml.elem("deleteOnTermination", String.valueOf(eni.isDeleteOnTermination()))
                     .end("attachment")
                     .start("privateIpAddressesSet")
                     .start("item")

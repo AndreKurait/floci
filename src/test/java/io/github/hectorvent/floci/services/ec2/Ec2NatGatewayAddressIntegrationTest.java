@@ -277,38 +277,58 @@ class Ec2NatGatewayAddressIntegrationTest {
                     equalTo("Elastic IP address " + heldByGateway + " is already associated"))
             .body(not(containsString("<networkInterfaceId>")));
 
-        String heldByInstance = allocate();
-        given()
-            .formParam("Action", "AssociateAddress")
-            .formParam("AllocationId", heldByInstance)
-            .formParam("InstanceId", "i-0123456789abcdef0")
-            .header("Authorization", AUTH_HEADER)
-        .when().post("/")
-        .then().statusCode(200);
-        createNat(heldByInstance).then().statusCode(200)
-            .body("CreateNatGatewayResponse.natGateway.state", equalTo("failed"))
-            .body("CreateNatGatewayResponse.natGateway.failureCode", equalTo("Resource.AlreadyAssociated"));
-        String instanceAssociation = given()
-            .formParam("Action", "DescribeAddresses")
-            .formParam("AllocationId.1", heldByInstance)
+        String instanceId = given()
+            .formParam("Action", "RunInstances")
+            .formParam("ImageId", "ami-amazonlinux2023")
+            .formParam("InstanceType", "t3.micro")
+            .formParam("MinCount", "1")
+            .formParam("MaxCount", "1")
+            .formParam("SubnetId", subnetId())
             .header("Authorization", AUTH_HEADER)
         .when().post("/")
         .then().statusCode(200)
-            .body("DescribeAddressesResponse.addressesSet.item.instanceId", equalTo("i-0123456789abcdef0"))
-            .extract().path("DescribeAddressesResponse.addressesSet.item.associationId");
-        // The failed gateway does not hold the address: once the instance lets go it can be released.
-        given()
-            .formParam("Action", "DisassociateAddress")
-            .formParam("AssociationId", instanceAssociation)
-            .header("Authorization", AUTH_HEADER)
-        .when().post("/")
-        .then().statusCode(200);
-        given()
-            .formParam("Action", "ReleaseAddress")
-            .formParam("AllocationId", heldByInstance)
-            .header("Authorization", AUTH_HEADER)
-        .when().post("/")
-        .then().statusCode(200);
+            .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
+        try {
+            String heldByInstance = allocate();
+            given()
+                .formParam("Action", "AssociateAddress")
+                .formParam("AllocationId", heldByInstance)
+                .formParam("InstanceId", instanceId)
+                .header("Authorization", AUTH_HEADER)
+            .when().post("/")
+            .then().statusCode(200);
+            createNat(heldByInstance).then().statusCode(200)
+                .body("CreateNatGatewayResponse.natGateway.state", equalTo("failed"))
+                .body("CreateNatGatewayResponse.natGateway.failureCode", equalTo("Resource.AlreadyAssociated"));
+            String instanceAssociation = given()
+                .formParam("Action", "DescribeAddresses")
+                .formParam("AllocationId.1", heldByInstance)
+                .header("Authorization", AUTH_HEADER)
+            .when().post("/")
+            .then().statusCode(200)
+                .body("DescribeAddressesResponse.addressesSet.item.instanceId", equalTo(instanceId))
+                .extract().path("DescribeAddressesResponse.addressesSet.item.associationId");
+            // The failed gateway does not hold the address: once the instance lets go it can be released.
+            given()
+                .formParam("Action", "DisassociateAddress")
+                .formParam("AssociationId", instanceAssociation)
+                .header("Authorization", AUTH_HEADER)
+            .when().post("/")
+            .then().statusCode(200);
+            given()
+                .formParam("Action", "ReleaseAddress")
+                .formParam("AllocationId", heldByInstance)
+                .header("Authorization", AUTH_HEADER)
+            .when().post("/")
+            .then().statusCode(200);
+        } finally {
+            given()
+                .formParam("Action", "TerminateInstances")
+                .formParam("InstanceId.1", instanceId)
+                .header("Authorization", AUTH_HEADER)
+            .when().post("/")
+            .then().statusCode(200);
+        }
 
         // The failed gateway claimed nothing, and deleting it leaves the first gateway's association alone.
         String held = given()

@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.ec2.model.DhcpOptions;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
@@ -69,6 +70,60 @@ import static org.mockito.Mockito.when;
 class Ec2ServicePersistenceTest {
 
     private static final String REGION = "us-east-1";
+
+    @Test
+    void retainedInterfaceAddressInstanceSurvivesRestart(@TempDir Path dir) {
+        Ec2Service service = newService(dir);
+        String subnet = service.createSubnet(REGION, service.createVpc(REGION, "10.235.0.0/24", false).getVpcId(),
+                "10.235.0.0/24", REGION + "a").getSubnetId();
+        String networkInterface = service.createNetworkInterface(REGION, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        Instance first = service.runInstances(REGION, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, networkInterface, 0).getInstances().getFirst();
+        Address address = service.allocateAddress(REGION);
+        service.associateAddress(REGION, address.getAllocationId(), first.getInstanceId());
+        String association = address.getAssociationId();
+        service.terminateInstances(REGION, List.of(first.getInstanceId()));
+        assertNull(newService(dir).describeAddresses(REGION, List.of(address.getAllocationId()), Map.of())
+                .getFirst().getInstanceId());
+        Instance second = service.runInstances(REGION, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, networkInterface, 0).getInstances().getFirst();
+
+        Ec2Service restarted = newService(dir);
+        Address restored = restarted.describeAddresses(REGION, List.of(address.getAllocationId()), Map.of())
+                .getFirst();
+        assertEquals(second.getInstanceId(), restored.getInstanceId());
+        assertEquals(association, restored.getAssociationId());
+        assertEquals(networkInterface, restored.getNetworkInterfaceId());
+        assertTrue(restarted.describeAddresses(REGION, List.of(address.getAllocationId()),
+                Map.of("instance-id", List.of(first.getInstanceId()))).isEmpty());
+    }
+
+    @Test
+    void deadHostAddressReconciliationSurvivesRestart(@TempDir Path dir) throws IOException {
+        Ec2Service service = newService(dir);
+        String subnet = service.createSubnet(REGION, service.createVpc(REGION, "10.232.0.0/24", false).getVpcId(),
+                "10.232.0.0/24", REGION + "a").getSubnetId();
+        String networkInterface = service.createNetworkInterface(REGION, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        Instance host = service.runInstances(REGION, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, networkInterface, 0).getInstances().getFirst();
+        Address address = service.allocateAddress(REGION);
+        service.associateAddress(REGION, address.getAllocationId(), host.getInstanceId());
+        String association = address.getAssociationId();
+        // Reconcile the asynchronous terminal state, then reopen the persisted address store.
+        host.setState(InstanceState.terminated());
+        assertNull(service.describeNetworkInterfaces(REGION, List.of(networkInterface), Map.of(), 0, null)
+                .networkInterfaces().getFirst().getAttachment());
+        Address persisted = newService(dir).describeAddresses(REGION, List.of(address.getAllocationId()), Map.of())
+                .getFirst();
+        assertNull(persisted.getInstanceId());
+        assertEquals(association, persisted.getAssociationId());
+        assertEquals(networkInterface, persisted.getNetworkInterfaceId());
+    }
 
     @Test
     void dhcpOptionsSurviveRestart(@TempDir Path dir) {
@@ -775,7 +830,7 @@ class Ec2ServicePersistenceTest {
         when(ec2.mock()).thenReturn(true);
         when(ec2.mockPublicAddresses()).thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.NONE);
         Ec2ImageCatalog imageCatalog = new Ec2ImageCatalog();
-        return new Ec2Service(config, null, mock(Ec2PortForwardManager.class),
+        return new Ec2Service(config, mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
                 new AmiImageResolver(imageCatalog), imageCatalog,
                 new Ec2InstanceTypeCatalog(),
                 load(dir, "ec2-vpcs.json", new TypeReference<Map<String, Vpc>>() {}),
