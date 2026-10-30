@@ -41,11 +41,11 @@ import static org.mockito.Mockito.mock;
 @TestProfile(SignedIamEnforcementProfile.class)
 class HttpRouteIamIntegrationTest {
 
-    Function<String, String> roleNames = prefix -> prefix + UUID.randomUUID();
-
     private static final Logger LOG = Logger.getLogger(HttpRouteIamIntegrationTest.class);
 
     private static final String OWNER = "000000000000";
+
+    Function<String, String> roleNames = prefix -> prefix + UUID.randomUUID();
 
     @TestHTTPResource("/")
     URI endpoint;
@@ -114,26 +114,77 @@ class HttpRouteIamIntegrationTest {
     }
 
     @Test
-    void rejectedRoleCreationPreservesPreexistingRole() throws Exception {
+    void signedCallerTransportConditionsUseConnectionInsteadOfForwardedHeaders() throws Exception {
+        Fixture fixture = fixture("GET /items");
+        String conditions = "\"IpAddress\":{\"aws:SourceIp\":\"127.0.0.0/8\"},"
+                + "\"Bool\":{\"aws:SecureTransport\":\"false\"}";
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "http-transport-", "invoke",
+                conditionedPolicy(fixture.arn(), conditions))) {
+            Key key = new Key(user.accessKeyId(), user.secretAccessKey(), null);
+            invoke(fixture, key, 200, Map.of("X-Forwarded-For", "192.0.2.1", "X-Forwarded-Proto", "https"));
+            putPolicy(user, conditionedPolicy(fixture.arn(), conditions.replace("127.0.0.0/8", "192.0.2.0/24")));
+            invoke(fixture, key, 403, Map.of("X-Forwarded-For", "192.0.2.1"));
+            assertEquals(1, fixture.hits().get());
+        }
+    }
+
+    @Test
+    void signedCallerTransportDenyStopsHttpBackend() throws Exception {
+        Fixture fixture = fixture("GET /items");
+        String allow = policy(fixture.arn());
+        String deny = conditionedPolicy(fixture.arn(), "\"Bool\":{\"aws:SecureTransport\":\"false\"}")
+                .replace("\"Effect\":\"Allow\"", "\"Effect\":\"Deny\"");
+        String document = "{\"Statement\":[" + allow.substring(13, allow.length() - 1) + ","
+                + deny.substring(13, deny.length() - 1) + "]}";
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "http-transport-deny-", "invoke", document)) {
+            invoke(fixture, new Key(user.accessKeyId(), user.secretAccessKey(), null), 403,
+                    Map.of("X-Forwarded-Proto", "https"));
+            assertEquals(0, fixture.hits().get());
+        }
+    }
+
+    @Test
+    void issuedSessionEvaluatesTransportConditionsAlongsideRolePolicy() throws Exception {
+        Fixture fixture = fixture("GET /items");
+        String name = roleNames.apply("http-transport-session-");
+        String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
+                + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
+        String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
+                "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
+                .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+        SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
+                "PolicyDocument", policy(fixture.arn()))).then().statusCode(200);
+        String sessionPolicy = conditionedPolicy(fixture.arn(), "\"IpAddress\":{\"aws:SourceIp\":\"127.0.0.0/8\"}");
+        invoke(fixture, assume(role, sessionPolicy), 200);
+        invoke(fixture, assume(role, sessionPolicy.replace("127.0.0.0/8", "192.0.2.0/24")), 403);
+        assertEquals(1, fixture.hits().get());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rejectedRoleCreationPreservesPreexistingRole(boolean transport) throws Exception {
         String name = "http-existing-" + UUID.randomUUID();
         SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
                 "AssumeRolePolicyDocument", "{\"Statement\":[]}")).then().statusCode(200);
         cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         HttpRouteIamIntegrationTest nested = nestedFixture(name);
         try {
-            assertThrows(AssertionError.class, () -> nested.issuedRoleSessionsRetainPolicyTokenAndRevocationChecks());
+            assertThrows(AssertionError.class, () -> runRoleScenario(nested, transport));
         } finally {
             nested.cleanup.afterEach(mock(ExtensionContext.class));
         }
         SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(200);
     }
 
-    @Test
-    void successfulRoleScenarioRemovesOwnedRoleAndPolicy() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void successfulRoleScenarioRemovesOwnedRoleAndPolicy(boolean transport) throws Exception {
         String name = "http-owned-" + UUID.randomUUID();
         HttpRouteIamIntegrationTest nested = nestedFixture(name);
         try {
-            nested.issuedRoleSessionsRetainPolicyTokenAndRevocationChecks();
+            runRoleScenario(nested, transport);
         } finally {
             nested.cleanup.afterEach(mock(ExtensionContext.class));
         }
@@ -145,6 +196,18 @@ class HttpRouteIamIntegrationTest {
         nested.endpoint = endpoint;
         nested.roleNames = prefix -> name;
         return nested;
+    }
+
+    private static void runRoleScenario(HttpRouteIamIntegrationTest nested, boolean transport) throws Exception {
+        if (transport) {
+            nested.issuedSessionEvaluatesTransportConditionsAlongsideRolePolicy();
+        } else {
+            nested.issuedRoleSessionsRetainPolicyTokenAndRevocationChecks();
+        }
+    }
+
+    private static String conditionedPolicy(String arn, String conditions) {
+        return policy(arn).replace("}}", ",\"Condition\":{" + conditions + "}}}");
     }
 
     private void cleanupIam(String action, Map<String, String> parameters) {
@@ -211,11 +274,15 @@ class HttpRouteIamIntegrationTest {
     }
 
     private void invoke(Fixture fixture, Key key, int status) throws Exception {
+        invoke(fixture, key, status, Map.of());
+    }
+
+    private void invoke(Fixture fixture, Key key, int status, Map<String, String> extraHeaders) throws Exception {
         String path = "/execute-api/" + fixture.apiId() + "/prod/items";
         String host = endpoint.getHost() + ":" + endpoint.getPort();
         Map<String, String> headers = ExecuteApiRequestSigner.signedHeaders("GET", path, Map.of(), host,
                 new byte[0], key.accessKey(), key.secret(), "us-east-1", Instant.now());
-        RequestSpecification request = given().headers(headers);
+        RequestSpecification request = given().headers(headers).headers(extraHeaders);
         if (key.token() != null) {
             request.header("X-Amz-Security-Token", key.token());
         }
