@@ -145,6 +145,7 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
@@ -224,7 +225,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // A first launch may need to pull a large AMI-backed image. Keep a finite CloudFormation
     // bound, but allow enough time for that legitimate cold-start path before cancellation.
     private static final Duration CONTAINER_LAUNCH_TIMEOUT = Duration.ofMinutes(5);
-    private static final long CONTAINER_LAUNCH_POLL_MILLIS = 50;
     private static final Set<String> VPN_GATEWAY_FILTERS = Set.of(
             "amazon-side-asn", "attachment.state", "attachment.vpc-id", "availability-zone",
             "state", "tag-key", "tag-value", "type", "vpn-gateway-id");
@@ -4318,24 +4318,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
         long deadline = System.nanoTime() + timeout.toNanos();
         while (true) {
-            String state = instance.getState() != null ? instance.getState().getName() : null;
-            if ("running".equals(state)) {
-                return;
-            }
-            if ("terminated".equals(state)) {
-                throw launchFailure(instance, "its container terminated during launch");
-            }
-            if (System.nanoTime() - deadline >= 0) {
-                if (containerManager.cancelLaunch(instance)) {
-                    throw launchFailure(instance, "it did not reach running state before the launch timeout");
+            synchronized (instance) {
+                String state = instance.getState() != null ? instance.getState().getName() : null;
+                if ("running".equals(state)) {
+                    return;
+                }
+                if ("terminated".equals(state)) {
+                    throw launchFailure(instance, "its container terminated during launch");
+                }
+                long remaining = deadline - System.nanoTime();
+                if (remaining > 0) {
+                    try {
+                        TimeUnit.NANOSECONDS.timedWait(instance, remaining);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AwsException("InternalError", "Interrupted while waiting for EC2 instance "
+                                + instance.getInstanceId() + " to launch", 500);
+                    }
+                    continue;
                 }
             }
-            try {
-                Thread.sleep(CONTAINER_LAUNCH_POLL_MILLIS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AwsException("InternalError", "Interrupted while waiting for EC2 instance "
-                        + instance.getInstanceId() + " to launch", 500);
+            // Cleanup can block in Docker; never hold the instance monitor while removing it.
+            if (containerManager.cancelLaunch(instance)) {
+                throw launchFailure(instance, "it did not reach running state before the launch timeout");
             }
         }
     }

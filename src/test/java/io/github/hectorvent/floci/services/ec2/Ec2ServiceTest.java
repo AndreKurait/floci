@@ -2553,6 +2553,23 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void awaitContainerLaunchWakesAllWaitersOnRunningWithoutPolling() throws Exception {
+        Ec2Service service = new Ec2Service(mockConfig(false), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Instance instance = new Instance();
+        instance.setInstanceId("i-signalled");
+        instance.setState(InstanceState.pending());
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> first = executor.submit(() -> service.awaitContainerLaunch(instance));
+            Future<?> second = executor.submit(() -> service.awaitContainerLaunch(instance));
+            instance.setState(InstanceState.running());
+            first.get(2, TimeUnit.SECONDS);
+            second.get(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void awaitContainerLaunchReportsTerminatedContainer() {
         Ec2Service service = new Ec2Service(mockConfig(false), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
