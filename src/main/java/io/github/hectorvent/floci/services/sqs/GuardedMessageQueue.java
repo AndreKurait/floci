@@ -302,6 +302,16 @@ class GuardedMessageQueue {
         }
     }
 
+    /** Restore a rejected automatic redrive in its original order without reviving a deleted queue. */
+    void restoreFirst(List<Message> rejected) {
+        try (Guard _ = hold()) {
+            requireOpen();
+            messages.addAll(0, rejected);
+            // Keep the in-memory recovery even if storage remains unavailable, as for restoreFirst(Message).
+            persist();
+        }
+    }
+
     record MessageCounts(long visible, long inFlight, long delayed) {
     }
 

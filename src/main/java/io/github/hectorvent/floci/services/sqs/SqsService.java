@@ -1646,23 +1646,49 @@ public class SqsService implements Resettable, ResourceProvider {
             if (dlqUrl != null) {
                 List<Message> dlqCandidates = claimResult.dlqCandidates();
                 guardedQueue.removeMessages(dlqCandidates);
-                for (Message msg : dlqCandidates) {
-                    msg.setVisibleAt(null);
-                    msg.setReceiptHandle(null);
-                    // Remember where the message came from so StartMessageMoveTask
-                    // with no DestinationArn can put it back.
-                    msg.setOriginalSourceQueueUrl(queue.getQueueUrl());
-                    if (queue.isFifo()) {
-                        msg.setRetentionStartTimestamp(Instant.now());
+                List<DlqMessageState> originalStates = dlqCandidates.stream().map(DlqMessageState::new).toList();
+                try {
+                    for (Message msg : dlqCandidates) {
+                        msg.setVisibleAt(null);
+                        msg.setReceiptHandle(null);
+                        msg.setOriginalSourceQueueUrl(queue.getQueueUrl());
+                        if (queue.isFifo()) {
+                            msg.setRetentionStartTimestamp(Instant.now());
+                        }
                     }
+                    String dlqStorageKey = regionKey(region, dlqUrl);
+                    getOrCreateQueue(dlqStorageKey).addAll(dlqCandidates);
+                } catch (RuntimeException failure) {
+                    originalStates.forEach(DlqMessageState::restore);
+                    try {
+                        guardedQueue.restoreFirst(dlqCandidates);
+                    } catch (RuntimeException recoveryFailure) {
+                        if (recoveryFailure != failure) {
+                            failure.addSuppressed(recoveryFailure);
+                        }
+                    }
+                    throw failure;
                 }
-                String dlqStorageKey = regionKey(region, dlqUrl);
-                getOrCreateQueue(dlqStorageKey).addAll(dlqCandidates);
                 LOG.infov("Moved {0} messages to DLQ {1}", dlqCandidates.size(), dlqUrl);
             }
         }
 
         return claimResult.claimed();
+    }
+
+    private record DlqMessageState(Message message, Instant visibleAt, String receiptHandle,
+                                   String originalSourceQueueUrl, Instant retentionStartTimestamp) {
+        DlqMessageState(Message message) {
+            this(message, message.getVisibleAt(), message.getReceiptHandle(),
+                    message.getOriginalSourceQueueUrl(), message.getRetentionStartTimestamp());
+        }
+
+        void restore() {
+            message.setVisibleAt(visibleAt);
+            message.setReceiptHandle(receiptHandle);
+            message.setOriginalSourceQueueUrl(originalSourceQueueUrl);
+            message.setRetentionStartTimestamp(retentionStartTimestamp);
+        }
     }
 
     private String queueUrlFromArn(String arn, String region) {
