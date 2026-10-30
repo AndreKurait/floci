@@ -5,7 +5,10 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.Reservation;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.testing.ParkingStore;
 import org.junit.jupiter.api.Test;
@@ -89,6 +92,101 @@ class Ec2SecurityGroupPublicationRaceTest {
         assertEquals("InvalidSecurityGroupID.NotFound", error.getErrorCode());
     }
 
+    @Test
+    void publishedInstanceCannotReferenceSuccessfullyDeletedGroup() throws Exception {
+        MemoryFactory factory = new MemoryFactory();
+        Ec2Service service = service(factory);
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
+        String group = service.createSecurityGroup(region, "launch", "launch", vpc).getGroupId();
+        factory.instances.parkNextWrite();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<Reservation> created = executor.submit(() -> service.runInstances(region, "ami-test", "t3.micro",
+                    1, 1, null, List.of(group), subnet, null, List.of(), null, null));
+            assertTrue(factory.instances.awaitParked(), "Launch must reach instance publication");
+            AtomicReference<Thread> deletingThread = new AtomicReference<>();
+            Future<AwsException> deleted = executor.submit(() -> {
+                deletingThread.set(Thread.currentThread());
+                try {
+                    service.deleteSecurityGroup(region, group);
+                    return null;
+                } catch (AwsException error) {
+                    return error;
+                }
+            });
+            await().atMost(5, TimeUnit.SECONDS).until(() -> deleted.isDone()
+                    || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED);
+            factory.instances.release();
+            Reservation reservation = created.get(5, TimeUnit.SECONDS);
+            AwsException error = deleted.get(5, TimeUnit.SECONDS);
+            assertNotNull(error, "Deletion must observe the published instance reference");
+            assertEquals("DependencyViolation", error.getErrorCode());
+            assertEquals(group, reservation.getInstances().getFirst().getSecurityGroups().getFirst().getGroupId());
+            assertEquals(1, service.describeSecurityGroups(region, List.of(group), List.of(), Map.of()).size());
+        } finally {
+            factory.instances.release();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void launchRechecksGroupDeletedAfterInitialResolutionBeforeAllocating() throws Exception {
+        MemoryFactory factory = new MemoryFactory();
+        Ec2Service service = service(factory);
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
+        String group = service.createSecurityGroup(region, "deleted-launch", "launch", vpc).getGroupId();
+        int available = service.describeSubnets(region, List.of(subnet), Map.of()).getFirst().getAvailableIpAddressCount();
+        factory.groups.parkNextRead();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<AwsException> created = executor.submit(() -> {
+                try {
+                    service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                            List.of(group), subnet, null, List.of(), null, null);
+                    return null;
+                } catch (AwsException error) {
+                    return error;
+                }
+            });
+            assertTrue(factory.groups.awaitParked(), "Launch must capture its original security group");
+            service.deleteSecurityGroup(region, group);
+            factory.groups.release();
+            AwsException error = created.get(5, TimeUnit.SECONDS);
+            assertNotNull(error, "Launch must reject the now-deleted captured group");
+            assertEquals("InvalidGroup.NotFound", error.getErrorCode());
+            assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
+            assertTrue(service.describeVolumes(region, List.of(), Map.of()).isEmpty());
+            assertEquals(available,
+                    service.describeSubnets(region, List.of(subnet), Map.of()).getFirst().getAvailableIpAddressCount());
+        } finally {
+            factory.groups.release();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void existingInstancePreventsDeletionUntilTerminated() {
+        Ec2Service service = service(new MemoryFactory());
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
+        String group = service.createSecurityGroup(region, "existing-launch", "launch", vpc).getGroupId();
+        String id = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(group), subnet, null, List.of(), null, null).getInstances().getFirst().getInstanceId();
+        assertEquals("DependencyViolation", assertThrows(AwsException.class,
+                () -> service.deleteSecurityGroup(region, group)).getErrorCode());
+        service.terminateInstances(region, List.of(id));
+        service.deleteSecurityGroup(region, group);
+        assertTrue(service.describeSecurityGroups(region, List.of(), List.of(), Map.of()).stream()
+                .noneMatch(value -> group.equals(value.getGroupId())));
+    }
+
     private static Ec2Service service(MemoryFactory factory) {
         return new Ec2Service(mockConfig(), mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
                 mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), factory);
@@ -108,6 +206,8 @@ class Ec2SecurityGroupPublicationRaceTest {
 
     private static final class MemoryFactory extends StorageFactory {
         private final ParkingStore<NetworkInterface> interfaces = new ParkingStore<>();
+        private final ParkingStore<Instance> instances = new ParkingStore<>();
+        private final ParkingStore<SecurityGroup> groups = new ParkingStore<>();
 
         private MemoryFactory() {
             super(null, null);
@@ -119,6 +219,12 @@ class Ec2SecurityGroupPublicationRaceTest {
                                                         TypeReference<Map<String, V>> type) {
             if ("ec2-network-interfaces.json".equals(file)) {
                 return (AccountAwareStorageBackend<V>) new AccountAwareStorageBackend<>(interfaces, null, "000000000000");
+            }
+            if ("ec2-instances.json".equals(file)) {
+                return (AccountAwareStorageBackend<V>) new AccountAwareStorageBackend<>(instances, null, "000000000000");
+            }
+            if ("ec2-security-groups.json".equals(file)) {
+                return (AccountAwareStorageBackend<V>) new AccountAwareStorageBackend<>(groups, null, "000000000000");
             }
             return AccountAwareStorageBackend.inMemory("000000000000");
         }
