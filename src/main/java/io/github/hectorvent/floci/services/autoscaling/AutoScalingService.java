@@ -649,6 +649,11 @@ public class AutoScalingService implements PassedRoleLookup {
         return groupLocks.computeIfAbsent(regionResolver.getAccountId() + "::" + key, ignored -> new Object());
     }
 
+    Map<String, AccountAwareStorageBackend.AccountEntry<AutoScalingGroup>> repairInventoryPage(
+            String afterRawKey, int limit) {
+        return groupsStore == null ? Map.of() : groupsStore.scanAllAccountEntriesAfter(afterRawKey, limit);
+    }
+
     Set<String> autoScalingGroupAccountIds() {
         if (groupsStore == null) {
             return Set.of();

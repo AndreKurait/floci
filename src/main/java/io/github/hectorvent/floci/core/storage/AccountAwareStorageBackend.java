@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -192,6 +193,39 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
             delegate.get(rawKey).ifPresent(value -> result.put(rawKey, value));
         }
         return result;
+    }
+
+    /**
+     * A bounded page in raw-key order for background repair. The key-only scan rejects every
+     * value, retaining at most {@code limit} keys before loading that page's values. It does not
+     * copy the store's complete key set or materialize every account's resource inventory.
+     * A page can be short when selected rows disappear; callers resume after its last raw key.
+     */
+    public Map<String, AccountEntry<V>> scanAllAccountEntriesAfter(String afterRawKey, int limit) {
+        if (limit < 1) {
+            throw new IllegalArgumentException("A repair page requires a positive limit");
+        }
+        TreeSet<String> selected = new TreeSet<>();
+        delegate.scan(rawKey -> {
+            if (afterRawKey == null || rawKey.compareTo(afterRawKey) > 0) {
+                if (selected.size() < limit) {
+                    selected.add(rawKey);
+                } else if (rawKey.compareTo(selected.last()) < 0) {
+                    selected.pollLast();
+                    selected.add(rawKey);
+                }
+            }
+            return false;
+        });
+        Map<String, AccountEntry<V>> page = new LinkedHashMap<>();
+        for (String rawKey : selected) {
+            boolean scoped = hasAccountPrefix(rawKey);
+            String owner = scoped ? rawKey.substring(0, 12) : defaultAccountId;
+            String logicalKey = scoped ? rawKey.substring(13) : rawKey;
+            delegate.get(rawKey).ifPresent(value ->
+                    page.put(rawKey, new AccountEntry<>(owner, logicalKey, value)));
+        }
+        return page;
     }
 
     /**

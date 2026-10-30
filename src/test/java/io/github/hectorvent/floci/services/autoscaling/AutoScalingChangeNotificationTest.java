@@ -35,24 +35,34 @@ class AutoScalingChangeNotificationTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void completedLaunchSignalsOwningGroupWithoutPeriodicReconciliation(boolean compareAndSet) {
+    void completedLaunchSignalsOwningGroupWithoutPeriodicReconciliation(boolean compareAndSet) throws Exception {
         AutoScalingService service = mock(AutoScalingService.class);
         AutoScalingReconciler reconciler = new AutoScalingReconciler(
                 service, mock(Ec2Service.class), mock(ElbV2Service.class));
         AutoScalingGroup group = new AutoScalingGroup();
         group.setRegion(CHANGE.region());
         group.setAutoScalingGroupName(CHANGE.name());
-        Instance instance = new Instance();
+        Instance instance = spy(new Instance());
+        CountDownLatch waiting = new CountDownLatch(1);
+        doAnswer(call -> {
+            assertTrue(Thread.holdsLock(instance));
+            waiting.countDown();
+            return call.callRealMethod();
+        }).when(instance).getState();
         instance.setOwnerId(CHANGE.accountId());
         instance.setInstanceId("i-signalled");
         instance.setState(InstanceState.pending());
         try {
             reconciler.watchPendingLaunch(group, instance);
             reconciler.watchPendingLaunch(group, instance);
-            if (compareAndSet) {
-                assertTrue(instance.compareAndSetState(instance.getState(), InstanceState.running()));
-            } else {
-                instance.setState(InstanceState.running());
+            assertTrue(waiting.await(2, TimeUnit.SECONDS));
+            // The reader still holds this monitor until timedWait releases it.
+            synchronized (instance) {
+                if (compareAndSet) {
+                    assertTrue(instance.compareAndSetState(instance.getState(), InstanceState.running()));
+                } else {
+                    instance.setState(InstanceState.running());
+                }
             }
             await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
                     verify(service).describeAutoScalingGroups(CHANGE.region(), List.of(CHANGE.name())));

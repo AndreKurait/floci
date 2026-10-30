@@ -2557,15 +2557,30 @@ class Ec2ServiceTest {
         Ec2Service service = new Ec2Service(mockConfig(false), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
                 new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
-        Instance instance = new Instance();
+        Instance instance = spy(new Instance());
+        CountDownLatch waiting = new CountDownLatch(2);
+        Set<Thread> readers = new HashSet<>();
+        doAnswer(call -> {
+            assertTrue(Thread.holdsLock(instance));
+            if (readers.add(Thread.currentThread())) {
+                waiting.countDown();
+            }
+            return call.callRealMethod();
+        }).when(instance).getState();
         instance.setInstanceId("i-signalled");
         instance.setState(InstanceState.pending());
-        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
             Future<?> first = executor.submit(() -> service.awaitContainerLaunch(instance));
             Future<?> second = executor.submit(() -> service.awaitContainerLaunch(instance));
+            assertTrue(waiting.await(2, TimeUnit.SECONDS));
+            // Both readers release the instance monitor only when they enter timedWait.
             instance.setState(InstanceState.running());
             first.get(2, TimeUnit.SECONDS);
             second.get(2, TimeUnit.SECONDS);
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS));
         }
     }
 

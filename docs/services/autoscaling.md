@@ -205,7 +205,7 @@ process is resumed and suspended again.
 
 ## Capacity Reconciler (Phase 2)
 
-Floci runs a background reconciler (10 s fixed rate) that keeps each group's InService instance count aligned with `DesiredCapacity`:
+Floci runs a background reconciler (10 s fixed delay after each sweep) that keeps each group's InService instance count aligned with `DesiredCapacity`:
 
 - **Scale-out**: calls `RunInstances` with the group's launch configuration; new instances are tracked as `Pending` until the EC2 state transitions to `running`, at which point they move to `InService` and are registered with all attached ELB v2 target groups.
 - **Scale-in**: selects InService instances not protected from scale-in, deregisters them from target groups, then calls `TerminateInstances`.
