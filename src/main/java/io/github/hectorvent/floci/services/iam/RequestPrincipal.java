@@ -4,7 +4,8 @@ package io.github.hectorvent.floci.services.iam;
  * Who a request comes from, as a resource policy's {@code Principal} element sees it. Each kind is
  * matched only by the principal types that can name it (IAM User Guide, "AWS JSON policy elements:
  * Principal"): an IAM identity by {@code AWS}, a service by {@code Service}, and anyone by
- * {@code "*"}.
+ * {@code "*"}. The optional local service-account fixture also lets {@code Service} name an
+ * IAM caller's account without changing its type or its permissions.
  *
  * @param type             the kind of caller
  * @param arn              an IAM caller's own ARN: the user's, or a role session's assumed-role

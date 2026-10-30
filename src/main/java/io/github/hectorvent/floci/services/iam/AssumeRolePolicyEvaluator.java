@@ -36,9 +36,10 @@ import java.util.regex.Pattern;
  * for every IAM user, and an {@code sts:AssumeRole} request is no exception, so a trust policy
  * condition reads the same principal as an identity or resource policy would.
  *
- * <p>Only AWS principals are modeled (account-root, bare account id, exact principal ARN, and
- * {@code "*"}); {@code Service} and {@code Federated} principals never match a SigV4 caller and are
- * ignored. A caller using assumed-role temporary credentials matches a trust policy that names its
+ * <p>AWS principals are modeled (account-root, bare account id, exact principal ARN, and
+ * {@code "*"}). A {@code Service} principal can also name a SigV4 caller's account through the
+ * optional local service-principal memberships; {@code Federated} entries do not match.
+ * A caller using assumed-role temporary credentials matches a trust policy that names its
  * session ARN or its role: IAM stores a {@code Principal} naming a role as the role's unique ID, so
  * the session matches through the role's own ARN, path included, which the caller passes in.
  */
@@ -476,15 +477,17 @@ public class AssumeRolePolicyEvaluator {
         if (!principalNode.isObject()) {
             return PrincipalMatch.NONE;
         }
-        // Only the AWS principal type can match a SigV4 caller.
+        PrincipalMatch match = anyEntry(principalNode.get("Service"),
+                name -> policyEvaluator.matchesServicePrincipalMembership(callerArn, name))
+                ? PrincipalMatch.ACCOUNT : PrincipalMatch.NONE;
         JsonNode aws = principalNode.get("AWS");
         if (aws == null) {
-            return PrincipalMatch.NONE;
+            return match;
         }
         if (aws.isTextual()) {
-            return matchAwsPrincipal(aws.asText(), callerArn, principalArn, callerAccount);
+            PrincipalMatch awsMatch = matchAwsPrincipal(aws.asText(), callerArn, principalArn, callerAccount);
+            return awsMatch == PrincipalMatch.NONE ? match : awsMatch;
         }
-        PrincipalMatch match = PrincipalMatch.NONE;
         if (aws.isArray()) {
             for (JsonNode entry : aws) {
                 PrincipalMatch entryMatch = entry.isTextual()

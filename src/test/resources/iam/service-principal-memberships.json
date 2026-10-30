@@ -1,0 +1,4 @@
+{
+  "arn:aws:iam::246813579012:root": ["example.aws.internal", "example.amazonaws.com"],
+  "arn:aws:iam::246813579014:root": ["example.aws.internal"]
+}

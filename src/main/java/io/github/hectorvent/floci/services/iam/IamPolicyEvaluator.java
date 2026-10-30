@@ -78,7 +78,8 @@ public class IamPolicyEvaluator {
         ALLOW_DIRECT_IAM_USER,
         /**
          * An Allow that names the caller only through its account: an account ID, the account's
-         * root ARN or, in an S3 bucket policy, its canonical user ID. That "delegates authority to
+         * root ARN, a configured service-principal membership or, in S3, its canonical user ID.
+         * That "delegates authority to
          * the account" (IAM User Guide, "AWS account principals"), so across accounts it is the
          * owner's half of the grant, while within the account it grants nothing on its own and the
          * caller's identity-based policies have to allow the request.
@@ -128,11 +129,21 @@ public class IamPolicyEvaluator {
     private static final Pattern POLICY_VARIABLE = Pattern.compile("\\$\\{\\s*([^,}]+?)\\s*[,}]");
 
     private final ObjectMapper objectMapper;
+    private final ServicePrincipalMemberships servicePrincipalMemberships;
     private final ConcurrentHashMap<String, CachedDocument> cachedDocuments = new ConcurrentHashMap<>();
 
-    @Inject
     public IamPolicyEvaluator(ObjectMapper objectMapper) {
+        this(objectMapper, new ServicePrincipalMemberships());
+    }
+
+    @Inject
+    public IamPolicyEvaluator(ObjectMapper objectMapper, ServicePrincipalMemberships servicePrincipalMemberships) {
         this.objectMapper = objectMapper;
+        this.servicePrincipalMemberships = servicePrincipalMemberships;
+    }
+
+    boolean matchesServicePrincipalMembership(String callerArn, String servicePrincipal) {
+        return servicePrincipalMemberships.contains(callerArn, servicePrincipal);
     }
 
     /**
@@ -238,7 +249,8 @@ public class IamPolicyEvaluator {
     /**
      * Evaluates a resource-based policy standalone for a typed caller. Each principal type in the
      * policy matches only the callers it can name: {@code AWS} an IAM identity, {@code Service} a
-     * service by its exact name, {@code "*"} anyone. Named apart from the String form so a call
+     * service by its exact name or a configured member account, {@code "*"} anyone.
+     * Named apart from the String form so a call
      * passing a literal null caller to that one stays unambiguous.
      */
     public ResourcePolicyDecision evaluateResourcePolicyFor(
@@ -1006,7 +1018,8 @@ public class IamPolicyEvaluator {
      * which policies AWS writes itself rely on (an FIS Deny pausing DynamoDB replication names the
      * replication service that way). Any other {@code AWS} entry names IAM identities only, and a
      * role session matches the role it assumed through that role's own ARN, path included.
-     * {@code Service} names one service exactly; {@code {"Service": "*"}} is not a form AWS accepts
+     * {@code Service} names one service exactly, including its configured local member accounts.
+     * {@code {"Service": "*"}} is not a form AWS accepts
      * and matches nothing. {@code CanonicalUser}, which S3 bucket policies accept, names an account
      * by its S3 canonical user ID, the 64-hex value S3 reports as owner and ACL grantee, and matches
      * the IAM identities of that account as an account principal does. The account ID itself still
@@ -1052,6 +1065,12 @@ public class IamPolicyEvaluator {
                     for (String pattern : patterns) {
                         if (!"*".equals(pattern) && ServicePrincipals.canonical(pattern).equals(wanted)) {
                             return PrincipalMatch.CALLER;
+                        }
+                    }
+                } else if (principal.type() == RequestPrincipal.Type.IAM) {
+                    for (String pattern : patterns) {
+                        if (matchesServicePrincipalMembership(principal.arn(), pattern)) {
+                            strongest = PrincipalMatch.ACCOUNT;
                         }
                     }
                 }
