@@ -26,6 +26,7 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.AbstractSet;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -129,7 +130,7 @@ class Ec2LaunchTemplateVersionsIntegrationTest {
                     case "empty" -> List.of();
                     case "malformed" -> List.of("2", "invalid");
                     case "zero" -> List.of("2", "0");
-                    case "too-many" -> java.util.Collections.nCopies(201, "2");
+                    case "too-many" -> Collections.nCopies(201, "2");
                     default -> List.of("2");
                 };
                 Ec2Exception error = assertThrows(Ec2Exception.class, () ->
