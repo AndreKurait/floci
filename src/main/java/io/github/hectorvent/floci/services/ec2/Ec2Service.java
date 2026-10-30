@@ -5641,7 +5641,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
 
             if (!config.services().ec2().mock()) {
-                containerManager.reboot(inst);
+                String accountId = callerAccountId();
+                containerManager.reboot(inst,
+                        () -> synchronizeRuntimeInterfaceAddresses(accountId, region, inst));
             }
         }
     }

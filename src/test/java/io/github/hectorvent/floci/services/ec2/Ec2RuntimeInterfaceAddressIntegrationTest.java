@@ -64,6 +64,12 @@ class Ec2RuntimeInterfaceAddressIntegrationTest {
         }).when(manager).start(any(), any());
         doAnswer(call -> {
             Instance host = call.getArgument(0);
+            Ec2ContainerManager.exposeReachablePrivateAddress(host, "172.17.0.82", false);
+            call.getArgument(1, Runnable.class).run();
+            return null;
+        }).when(manager).reboot(any(), any());
+        doAnswer(call -> {
+            Instance host = call.getArgument(0);
             host.setState(InstanceState.terminated());
             call.getArgument(1, Runnable.class).run();
             return null;
@@ -75,8 +81,8 @@ class Ec2RuntimeInterfaceAddressIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void sdkDescribesTheCurrentRuntimeAddressAfterStartOrRestore(boolean restore) throws Exception {
+    @ValueSource(strings = {"start", "restore", "reboot"})
+    void sdkDescribesTheCurrentRuntimeAddressAfterLifecycleCompletion(String operation) throws Exception {
         String account = "111122223333";
         try (Ec2Client client = Ec2Client.builder()
                 .endpointOverride(URI.create("http://localhost:" + RestAssured.port))
@@ -102,7 +108,9 @@ class Ec2RuntimeInterfaceAddressIntegrationTest {
                             client.attachNetworkInterface(b -> b.networkInterfaceId(secondary).instanceId(host).deviceIndex(1));
                             assertEquals("172.17.0.81", client.describeNetworkInterfaces(b -> b.networkInterfaceIds(eni))
                                     .networkInterfaces().getFirst().privateIpAddress());
-                            if (restore) {
+                            if ("reboot".equals(operation)) {
+                                client.rebootInstances(b -> b.instanceIds(host));
+                            } else if ("restore".equals(operation)) {
                                 service.restoreMetadataRegistrations();
                             } else {
                                 service.findInstanceForAccount(account, "us-east-1", host).orElseThrow()

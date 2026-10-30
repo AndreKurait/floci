@@ -6,6 +6,7 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.ListNetworksCmd;
+import com.github.dockerjava.api.command.RestartContainerCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.NetworkSettings;
@@ -171,15 +172,20 @@ import static org.mockito.Mockito.withSettings;
 class Ec2ServiceTest {
 
     @ParameterizedTest
-    @CsvSource({"false,false,false,false", "true,false,false,false", "false,true,false,false",
-            "true,true,false,false", "false,false,true,false", "false,false,false,true",
-            "true,false,false,true", "false,true,false,true", "true,true,false,true"})
+    @CsvSource({"false,false,false,start", "true,false,false,start", "false,true,false,start",
+            "true,true,false,start", "false,false,true,start", "false,false,false,restore",
+            "true,false,false,restore", "false,true,false,restore", "true,true,false,restore",
+            "false,false,false,reboot", "true,false,false,reboot",
+            "false,true,false,reboot", "true,true,false,reboot"})
     void runtimeRestartSynchronizesRetainedInterfaceAddresses(boolean supplied, boolean faithful,
-                                                              boolean deleteOnTermination, boolean restore) {
+                                                              boolean deleteOnTermination, String operation) {
+        boolean restore = "restore".equals(operation);
+        boolean reboot = "reboot".equals(operation);
         EmulatorConfig config = mockConfig(true);
         when(config.services().ec2().awsFaithfulPrivateIp()).thenReturn(faithful);
         DockerClient docker = mock(DockerClient.class);
         when(docker.startContainerCmd("runtime-sync")).thenReturn(mock(StartContainerCmd.class, RETURNS_SELF));
+        when(docker.restartContainerCmd("runtime-sync")).thenReturn(mock(RestartContainerCmd.class, RETURNS_SELF));
         InspectContainerResponse response = mock(InspectContainerResponse.class);
         NetworkSettings settings = mock(NetworkSettings.class);
         ContainerNetwork bridge = mock(ContainerNetwork.class);
@@ -231,7 +237,6 @@ class Ec2ServiceTest {
         service.attachNetworkInterface(region, secondaryId, host.getInstanceId(), 1);
         String secondaryIp = secondary.getPrivateIpAddress();
         String secondaryDns = secondary.getPrivateDnsName();
-        List<NetworkInterfacePrivateIpAddress> secondaryIps = List.copyOf(secondary.getPrivateIpAddresses());
         List<GroupIdentifier> secondaryGroups = List.copyOf(secondary.getGroups());
         List<Tag> secondaryTags = List.copyOf(secondary.getTagSet());
         // The primary is selected by device index, not by list position.
@@ -239,7 +244,7 @@ class Ec2ServiceTest {
         InstanceNetworkInterface secondaryView = host.getNetworkInterfaces().getLast();
         host.setNetworkInterfaces(new ArrayList<>(List.of(secondaryView, primaryView)));
         host.setDockerContainerId("runtime-sync");
-        host.setState(restore ? InstanceState.running() : InstanceState.stopped());
+        host.setState(restore || reboot ? InstanceState.running() : InstanceState.stopped());
         when(config.services().ec2().mock()).thenReturn(false);
 
         if (restore) {
@@ -247,7 +252,11 @@ class Ec2ServiceTest {
             service.restoreMetadataRegistrations();
             assertTrue(tasks.isEmpty());
         } else {
-            service.startInstances(region, List.of(host.getInstanceId()));
+            if (reboot) {
+                service.rebootInstances(region, List.of(host.getInstanceId()));
+            } else {
+                service.startInstances(region, List.of(host.getInstanceId()));
+            }
             assertEquals(1, tasks.size());
             context.setAccountId("222222222222");
             tasks.removeFirst().run();
@@ -281,12 +290,18 @@ class Ec2ServiceTest {
                 .networkInterfaces().getFirst();
         assertEquals(secondaryIp, storedSecondary.getPrivateIpAddress());
         assertEquals(secondaryDns, storedSecondary.getPrivateDnsName());
-        assertEquals(secondaryIps, storedSecondary.getPrivateIpAddresses());
+        NetworkInterfacePrivateIpAddress secondaryPrimary = storedSecondary.getPrivateIpAddresses().stream()
+                .filter(NetworkInterfacePrivateIpAddress::isPrimary).findFirst().orElseThrow();
+        assertEquals(secondaryIp, secondaryPrimary.getPrivateIpAddress());
+        assertEquals(secondaryDns, secondaryPrimary.getPrivateDnsName());
         assertEquals("172.31.0.223", storedSecondary.getPrivateIpAddresses().stream()
                 .filter(address -> !address.isPrimary()).findFirst().orElseThrow().getPrivateIpAddress());
         assertEquals(secondaryGroups, storedSecondary.getGroups());
         assertEquals(secondaryTags, storedSecondary.getTagSet());
-        if (restore) {
+        if (reboot) {
+            verify(docker.restartContainerCmd("runtime-sync")).exec();
+            verify(docker, never()).startContainerCmd("runtime-sync");
+        } else if (restore) {
             verify(docker, never()).startContainerCmd("runtime-sync");
         } else {
             verify(docker.startContainerCmd("runtime-sync")).exec();
@@ -6858,11 +6873,11 @@ class Ec2ServiceTest {
         String instanceId = runOne(service, "ami-src");
 
         service.createImage("us-east-1", instanceId, "with-reboot", null, false);
-        verify(containerManager).reboot(argThat(i -> instanceId.equals(i.getInstanceId())));
+        verify(containerManager).reboot(argThat(i -> instanceId.equals(i.getInstanceId())), any(Runnable.class));
 
         service.createImage("us-east-1", instanceId, "without-reboot", null, true);
         // Still one: NoReboot=true opted the second call out.
-        verify(containerManager, times(1)).reboot(argThat(i -> instanceId.equals(i.getInstanceId())));
+        verify(containerManager, times(1)).reboot(argThat(i -> instanceId.equals(i.getInstanceId())), any(Runnable.class));
     }
 
     @Test

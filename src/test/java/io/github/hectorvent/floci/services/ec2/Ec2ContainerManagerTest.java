@@ -15,6 +15,7 @@ import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.command.PingCmd;
 import com.github.dockerjava.api.command.RemoveContainerCmd;
+import com.github.dockerjava.api.command.RestartContainerCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
 import com.github.dockerjava.api.exception.DockerException;
@@ -1333,6 +1334,134 @@ class Ec2ContainerManagerTest {
             assertEquals(instance.getPrivateIpAddress(), primary.getPrivateIpAddress());
             assertEquals("10.0.1.20", secondary.getPrivateIpAddress());
             assertEquals("secondary-dns", secondary.getPrivateDnsName());
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rebootPublishesAddressesOnlyAfterDockerSucceeds(boolean failRestart) throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        RestartContainerCmd restart = mock(RestartContainerCmd.class);
+        when(harness.dockerClient.restartContainerCmd(TEST_CONTAINER_ID)).thenReturn(restart);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(restart.exec()).thenAnswer(call -> {
+            entered.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS));
+            if (failRestart) {
+                throw new IllegalStateException("restart rejected");
+            }
+            return null;
+        });
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse response = inspectResponse("172.18.0.99");
+        when(inspect.exec()).thenReturn(response);
+        Instance guest = instance("i-reboot");
+        guest.setDockerContainerId(TEST_CONTAINER_ID);
+        guest.setPrivateIpAddress("172.18.0.10");
+        AtomicInteger callbacks = new AtomicInteger();
+        AtomicReference<String> published = new AtomicReference<>();
+        try {
+            harness.manager.reboot(guest, () -> {
+                published.set(guest.getPrivateIpAddress());
+                callbacks.incrementAndGet();
+            });
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            assertEquals("172.18.0.10", guest.getPrivateIpAddress());
+            assertEquals(0, callbacks.get());
+            release.countDown();
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            assertEquals(failRestart ? "172.18.0.10" : "172.18.0.99", guest.getPrivateIpAddress());
+            assertEquals(failRestart ? 0 : 1, callbacks.get());
+            assertEquals(failRestart ? null : "172.18.0.99", published.get());
+            if (failRestart) {
+                verify(harness.dockerClient, never()).inspectContainerCmd(TEST_CONTAINER_ID);
+            } else {
+                verify(harness.metadataServer).registerContainer("172.18.0.99", "i-reboot", guest);
+                verify(harness.metadataServer).reconcileContainerAddresses(Set.of("172.18.0.99"), guest);
+            }
+        } finally {
+            release.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            harness.manager.stop();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rebootPreservesLogicalAddressesWithoutWorkloadNetworkDetails(boolean protectedWorkload) {
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 0;
+        List<Runnable> tasks = new ArrayList<>();
+        ExecutorService executor = mock(ExecutorService.class);
+        doAnswer(call -> { tasks.add(call.getArgument(0)); return null; }).when(executor).submit(any(Runnable.class));
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        RestartContainerCmd restart = mock(RestartContainerCmd.class);
+        when(harness.dockerClient.restartContainerCmd(TEST_CONTAINER_ID)).thenReturn(restart);
+        InspectContainerResponse workload = mock(InspectContainerResponse.class);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(workload);
+        if (protectedWorkload) {
+            HostConfig hostConfig = mock(HostConfig.class);
+            when(hostConfig.getNetworkMode()).thenReturn("container:helper-reboot");
+            when(workload.getHostConfig()).thenReturn(hostConfig);
+            InspectContainerResponse helper = inspectResponse("172.17.0.7");
+            ContainerConfig helperConfig = mock(ContainerConfig.class);
+            when(helperConfig.getLabels()).thenReturn(Map.of(
+                    "io.floci.security-group.helper", "true",
+                    "io.floci.service", "ec2",
+                    "io.floci.resource-id", "i-protected-reboot",
+                    "io.floci.owner", "4566"));
+            when(helper.getConfig()).thenReturn(helperConfig);
+            InspectContainerCmd inspectHelper = mock(InspectContainerCmd.class);
+            when(inspectHelper.exec()).thenReturn(helper);
+            when(harness.dockerClient.inspectContainerCmd("helper-reboot")).thenReturn(inspectHelper);
+            when(harness.config.port()).thenReturn(4566);
+            EmulatorConfig.DockerConfig dockerConfig = mock(EmulatorConfig.DockerConfig.class);
+            when(dockerConfig.resourceNamespace()).thenReturn(Optional.empty());
+            when(harness.config.docker()).thenReturn(dockerConfig);
+        }
+        Instance guest = instance("i-protected-reboot");
+        guest.setDockerContainerId(TEST_CONTAINER_ID);
+        guest.setContainerBridgeIp("172.17.0.10");
+        guest.setPrivateIpAddress("10.0.1.10");
+        guest.setPrivateDnsName("logical-dns");
+        AtomicInteger callbacks = new AtomicInteger();
+        try {
+            harness.manager.reboot(guest, callbacks::incrementAndGet);
+            assertEquals(1, tasks.size());
+            tasks.removeFirst().run();
+            assertEquals(1, callbacks.get());
+            assertEquals("10.0.1.10", guest.getPrivateIpAddress());
+            assertEquals("logical-dns", guest.getPrivateDnsName());
+            assertEquals(protectedWorkload ? "172.17.0.7" : "172.17.0.10", guest.getContainerBridgeIp());
+            if (protectedWorkload) {
+                verify(harness.metadataServer).registerContainer("172.17.0.7", "i-protected-reboot", guest);
+            } else {
+                verify(harness.metadataServer, never()).registerContainer(anyString(), anyString(), any());
+                verify(harness.metadataServer, never()).reconcileContainerAddresses(anySet(), any());
+            }
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
+    void rebootWithoutAContainerDoesNotPublishAddresses() {
+        LaunchHarness harness = launchHarness();
+        Instance guest = instance("i-no-reboot-container");
+        AtomicInteger callbacks = new AtomicInteger();
+        try {
+            harness.manager.reboot(guest, callbacks::incrementAndGet);
+            assertEquals(0, callbacks.get());
+            verify(harness.dockerClient, never()).restartContainerCmd(anyString());
         } finally {
             harness.manager.stop();
         }
