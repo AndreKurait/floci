@@ -62,6 +62,7 @@ class ApiGatewayExportIntegrationTest {
                 "responseTemplates", Map.of("application/json", TEMPLATE), "contentHandling", "CONVERT_TO_TEXT"));
         Authorizer authorizer = service.createAuthorizer(REGION, apiId, Map.of("name", "TokenAuth", "type", "TOKEN",
                 "identitySource", "method.request.header.Authorization", "authorizerResultTtlInSeconds", 0,
+                "authorizerCredentials", "arn:aws:iam::000000000000:role/authorizer",
                 "authorizerUri", "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:auth/invocations"));
         service.putMethod(REGION, apiId, rootId, "ANY", Map.of("authorizationType", "CUSTOM", "authorizerId", authorizer.getId()));
         service.putIntegration(REGION, apiId, rootId, "ANY", Map.of("type", "MOCK"));
@@ -115,6 +116,8 @@ class ApiGatewayExportIntegrationTest {
         MethodConfig any = root.getResourceMethods().get("ANY");
         assertEquals("CUSTOM", any.getAuthorizationType());
         assertEquals("TokenAuth", service.getAuthorizer(REGION, restoredId, any.getAuthorizerId()).getName());
+        assertEquals("arn:aws:iam::000000000000:role/authorizer",
+                service.getAuthorizer(REGION, restoredId, any.getAuthorizerId()).getAuthorizerCredentials());
         assertEquals(TEMPLATE, service.getGatewayResponse(REGION, restoredId, "DEFAULT_4XX").getResponseTemplates().get("application/json"));
         service.createDeployment(REGION, restoredId, Map.of("stageName", "dev"));
         given().accept("application/json").get("/restapis/" + restoredId + "/dev/_user_request_/widgets")
