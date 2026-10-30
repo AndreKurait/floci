@@ -235,4 +235,5 @@ nav:
     - Go: testcontainers/go.md
   - Development:
     - Contributing: contributing.md
+    - Historical reconciliation experiment: performance/reconciliation.md
     - Local concurrency primitives: concurrency.md
