@@ -41,11 +41,11 @@ import static org.mockito.Mockito.mock;
 @TestProfile(SignedIamEnforcementProfile.class)
 class HttpRouteIamIntegrationTest {
 
-    Function<String, String> roleNames = prefix -> prefix + UUID.randomUUID();
-
     private static final Logger LOG = Logger.getLogger(HttpRouteIamIntegrationTest.class);
 
     private static final String OWNER = "000000000000";
+
+    Function<String, String> roleNames = prefix -> prefix + UUID.randomUUID();
 
     @TestHTTPResource("/")
     URI endpoint;
@@ -114,40 +114,6 @@ class HttpRouteIamIntegrationTest {
     }
 
     @Test
-    void rejectedRoleCreationPreservesPreexistingRole() throws Exception {
-        String name = "http-existing-" + UUID.randomUUID();
-        SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
-                "AssumeRolePolicyDocument", "{\"Statement\":[]}")).then().statusCode(200);
-        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
-        HttpRouteIamIntegrationTest nested = nestedFixture(name);
-        try {
-            assertThrows(AssertionError.class, () -> nested.issuedRoleSessionsRetainPolicyTokenAndRevocationChecks());
-        } finally {
-            nested.cleanup.afterEach(mock(ExtensionContext.class));
-        }
-        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(200);
-    }
-
-    @Test
-    void successfulRoleScenarioRemovesOwnedRoleAndPolicy() throws Exception {
-        String name = "http-owned-" + UUID.randomUUID();
-        HttpRouteIamIntegrationTest nested = nestedFixture(name);
-        try {
-            nested.issuedRoleSessionsRetainPolicyTokenAndRevocationChecks();
-        } finally {
-            nested.cleanup.afterEach(mock(ExtensionContext.class));
-        }
-        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(404);
-    }
-
-    private HttpRouteIamIntegrationTest nestedFixture(String name) {
-        HttpRouteIamIntegrationTest nested = new HttpRouteIamIntegrationTest();
-        nested.endpoint = endpoint;
-        nested.roleNames = prefix -> name;
-        return nested;
-    }
-
-    @Test
     void signedCallerTransportConditionsUseConnectionInsteadOfForwardedHeaders() throws Exception {
         Fixture fixture = fixture("GET /items");
         String conditions = "\"IpAddress\":{\"aws:SourceIp\":\"127.0.0.0/8\"},"
@@ -180,13 +146,13 @@ class HttpRouteIamIntegrationTest {
     @Test
     void issuedSessionEvaluatesTransportConditionsAlongsideRolePolicy() throws Exception {
         Fixture fixture = fixture("GET /items");
-        String name = "http-transport-session-" + UUID.randomUUID();
+        String name = roleNames.apply("http-transport-session-");
         String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
                 + OWNER + ":root\"},\"Action\":\"sts:AssumeRole\"}}";
-        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
                 "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
                 .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
         SignedIamUsers.iam(endpoint, "PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
                 "PolicyDocument", policy(fixture.arn()))).then().statusCode(200);
@@ -194,6 +160,50 @@ class HttpRouteIamIntegrationTest {
         invoke(fixture, assume(role, sessionPolicy), 200);
         invoke(fixture, assume(role, sessionPolicy.replace("127.0.0.0/8", "192.0.2.0/24")), 403);
         assertEquals(1, fixture.hits().get());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rejectedRoleCreationPreservesPreexistingRole(boolean transport) throws Exception {
+        String name = "http-existing-" + UUID.randomUUID();
+        SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
+                "AssumeRolePolicyDocument", "{\"Statement\":[]}")).then().statusCode(200);
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        HttpRouteIamIntegrationTest nested = nestedFixture(name);
+        try {
+            assertThrows(AssertionError.class, () -> runRoleScenario(nested, transport));
+        } finally {
+            nested.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(200);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void successfulRoleScenarioRemovesOwnedRoleAndPolicy(boolean transport) throws Exception {
+        String name = "http-owned-" + UUID.randomUUID();
+        HttpRouteIamIntegrationTest nested = nestedFixture(name);
+        try {
+            runRoleScenario(nested, transport);
+        } finally {
+            nested.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(404);
+    }
+
+    private HttpRouteIamIntegrationTest nestedFixture(String name) {
+        HttpRouteIamIntegrationTest nested = new HttpRouteIamIntegrationTest();
+        nested.endpoint = endpoint;
+        nested.roleNames = prefix -> name;
+        return nested;
+    }
+
+    private static void runRoleScenario(HttpRouteIamIntegrationTest nested, boolean transport) throws Exception {
+        if (transport) {
+            nested.issuedSessionEvaluatesTransportConditionsAlongsideRolePolicy();
+        } else {
+            nested.issuedRoleSessionsRetainPolicyTokenAndRevocationChecks();
+        }
     }
 
     private static String conditionedPolicy(String arn, String conditions) {
