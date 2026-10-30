@@ -70,6 +70,14 @@ public class Ec2ImageCatalog {
         return Optional.ofNullable(loaded().imagesByIdOrAlias.get(imageId));
     }
 
+    /** Resolves only explicitly declared, exact RegisterImage names. */
+    public Optional<CatalogImage> findByRegistrationName(String name) {
+        if (name == null || name.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(loaded().imagesByRegistrationName.get(name));
+    }
+
     /**
      * Looks up the image published under one of AWS's public SSM parameter names, such as
      * {@code /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}.
@@ -106,16 +114,33 @@ public class Ec2ImageCatalog {
         private final List<CatalogImage> images;
         private final Map<String, CatalogImage> imagesByIdOrAlias;
         private final Map<String, CatalogImage> imagesByPublicParameterName;
+        private final Map<String, CatalogImage> imagesByRegistrationName;
 
         Loaded(Catalog catalog) {
-            this.defaultDockerImage = require(catalog.defaultDockerImage, "defaultDockerImage");
-            this.images = List.copyOf(catalog.images == null ? List.of() : catalog.images);
+            Catalog effective = includeDefaultImages(catalog);
+            this.defaultDockerImage = require(effective.defaultDockerImage, "defaultDockerImage");
+            this.images = List.copyOf(effective.images == null ? List.of() : effective.images);
             if (this.images.isEmpty()) {
                 throw new IllegalStateException("EC2 image catalog has no images: " + CATALOG_RESOURCE_NAME);
             }
             this.imagesByIdOrAlias = indexImages(this.images);
             this.imagesByPublicParameterName = indexPublicParameterNames(this.images);
+            this.imagesByRegistrationName = indexRegistrationNames(this.images);
         }
+    }
+
+    private static Catalog includeDefaultImages(Catalog catalog) {
+        if (!catalog.includeDefaultImages) {
+            return catalog;
+        }
+        Catalog combined = readResource(CATALOG_RESOURCE_NAME, Catalog.class);
+        if (catalog.defaultDockerImage != null) {
+            combined.defaultDockerImage = catalog.defaultDockerImage;
+        }
+        List<CatalogImage> images = new ArrayList<>(combined.images);
+        images.addAll(catalog.images == null ? List.of() : catalog.images);
+        combined.images = images;
+        return combined;
     }
 
     private static Catalog readFile(Path path) {
@@ -169,6 +194,22 @@ public class Ec2ImageCatalog {
         return Collections.unmodifiableMap(index);
     }
 
+    private static Map<String, CatalogImage> indexRegistrationNames(List<CatalogImage> images) {
+        Map<String, CatalogImage> index = new LinkedHashMap<>();
+        for (CatalogImage image : images) {
+            if (image.registrationNames == null) {
+                continue;
+            }
+            for (String name : image.registrationNames) {
+                require(name, "registrationNames");
+                if (index.putIfAbsent(name, image) != null) {
+                    throw new IllegalStateException("Duplicate EC2 image catalog registration name: " + name);
+                }
+            }
+        }
+        return Map.copyOf(index);
+    }
+
     private static void addIndexEntry(Map<String, CatalogImage> index, String imageIdOrAlias, CatalogImage image) {
         CatalogImage previous = index.putIfAbsent(imageIdOrAlias, image);
         if (previous != null) {
@@ -186,6 +227,7 @@ public class Ec2ImageCatalog {
     @JsonIgnoreProperties(ignoreUnknown = true)
     @RegisterForReflection
     public static final class Catalog {
+        public boolean includeDefaultImages;
         public String defaultDockerImage;
         public List<CatalogImage> images = List.of();
     }
@@ -196,6 +238,7 @@ public class Ec2ImageCatalog {
         public String imageId;
         public List<String> aliases = List.of();
         public List<String> publicParameterNames = List.of();
+        public List<String> registrationNames = List.of();
         public String dockerImage;
         public String name;
         public String description;

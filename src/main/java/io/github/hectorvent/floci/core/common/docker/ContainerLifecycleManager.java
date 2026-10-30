@@ -22,6 +22,7 @@ import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.Ports;
+import com.github.dockerjava.api.model.Ulimit;
 import com.github.dockerjava.api.model.Volume;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.ContainerCaBundle;
@@ -361,12 +362,10 @@ public class ContainerLifecycleManager {
      * network-connect endpoint, so the container is reconnected before it starts.
      */
     private void attachNetworkBeforeStart(String containerId, ContainerSpec spec) {
-        if (!spec.hasPortBindings()) {
-            dockerClient.disconnectFromNetworkCmd()
-                    .withContainerId(containerId)
-                    .withNetworkId(spec.networkMode())
-                    .exec();
-        }
+        dockerClient.disconnectFromNetworkCmd()
+                .withContainerId(containerId)
+                .withNetworkId(spec.networkMode())
+                .exec();
         ContainerNetwork endpoint = new ContainerNetwork().withIpamConfig(new LinkLocalIpam(spec.linkLocalIps()));
         dockerClient.connectToNetworkCmd()
                 .withContainerId(containerId)
@@ -480,27 +479,6 @@ public class ContainerLifecycleManager {
     public ContainerInfo startCreated(String containerId, ContainerSpec spec) {
         startContainer(containerId);
         LOG.infov("Started container {0}", containerId);
-
-        if (spec.networkMode() != null && !spec.networkMode().isBlank()
-                && spec.publishesPorts() && !spec.hasNetworkConfiguration()) {
-            try {
-                dockerClient.connectToNetworkCmd()
-                        .withContainerId(containerId)
-                        .withNetworkId(spec.networkMode())
-                        .exec();
-                LOG.debugv("Connected container {0} to network {1}", containerId, spec.networkMode());
-            } catch (NotFoundException e) {
-                // Docker answers 404 when the network does not exist, which fails a container that
-                // joins at creation, or when the container is already gone. Either way it cannot
-                // reach its network, so fail the start instead of leaving it on the default bridge.
-                // Docker's message says which of the two was missing.
-                throw new IllegalStateException("Could not connect container " + containerId
-                        + " to Docker network " + spec.networkMode() + ": " + e.getMessage(), e);
-            } catch (Exception e) {
-                LOG.warnv("Could not connect container {0} to network {1}: {2}",
-                        containerId, spec.networkMode(), e.getMessage());
-            }
-        }
 
         Map<Integer, EndpointInfo> endpoints = resolveEndpoints(containerId, spec);
         return new ContainerInfo(containerId, endpoints);
@@ -1293,9 +1271,8 @@ public class ContainerLifecycleManager {
     /**
      * Like {@link #resolveEndpoint(String, int)}, but prefers the container's address on
      * {@code preferredNetwork}, as {@link #createAndStart} does with the spec's network. A
-     * container that publishes ports is created on the default bridge and connected to its
-     * service network after start, so without a preference the bridge address, which Floci
-     * usually cannot reach, can be returned instead.
+     * container attached to several networks must be reached through its service network,
+     * rather than whichever address Docker happens to list first.
      */
     public EndpointInfo resolveEndpoint(String containerId, int containerPort, String preferredNetwork) {
         InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
@@ -1487,6 +1464,12 @@ public class ContainerLifecycleManager {
         if (spec.hasMemoryLimit()) {
             hostConfig.withMemory(spec.memoryBytes());
         }
+        if (!spec.ulimits().isEmpty()) {
+            hostConfig.withUlimits(spec.ulimits().entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .map(entry -> new Ulimit(entry.getKey(), entry.getValue().soft(), entry.getValue().hard()))
+                    .toArray(Ulimit[]::new));
+        }
         if (linux.memorySwapBytes() != null) {
             hostConfig.withMemorySwap(linux.memorySwapBytes());
         }
@@ -1529,12 +1512,10 @@ public class ContainerLifecycleManager {
                     spec.name(), spec.networkMode(), spec.portBindings().keySet());
         }
 
-        // Network mode: only set during creation when no host ports are published.
-        // withNetworkMode() + port bindings suppresses port publishing on macOS Docker Desktop,
-        // so containers with published ports (e.g. ECR registry) connect to the network
-        // after start via connectToNetworkCmd() instead. host, none and container:<id> publish
-        // nothing and cannot be connected after creation, so they always go on the HostConfig.
-        if (spec.networkMode() != null && !spec.networkMode().isBlank() && !spec.publishesPorts()) {
+        // Apply the declared network at creation, including when ports are published.
+        // Starting on the default bridge and attaching this network afterwards adds an
+        // undeclared external route even when the requested network is internal.
+        if (spec.networkMode() != null && !spec.networkMode().isBlank()) {
             hostConfig.withNetworkMode(spec.networkMode());
         }
 

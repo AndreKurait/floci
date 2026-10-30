@@ -330,6 +330,11 @@ floci:
       proxy-base-port: 9400
       proxy-max-port: 9499
     ec2:
+      extra-env: []
+      ulimits: []
+      metadata-helper-image: floci/network-helper:local
+      privileged: true
+      cap-drop: []
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
       # Optional complete catalog override for locally built guest images.

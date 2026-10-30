@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2.portforward;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.model.ContainerNetwork;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -239,6 +240,38 @@ class Ec2PortForwardManagerTest {
         manager.reconcileNow(instance, Set.of(80));
 
         verify(portAllocator).allocate(30000, 30999);
+    }
+
+    @Test
+    void publishedForwardJoinsTheNetworkOwnedByTheMetadataHelper() {
+        DockerClient dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        when(dockerClient.inspectContainerCmd("guest").exec().getHostConfig().getNetworkMode())
+                .thenReturn("container:metadata-helper");
+        when(dockerClient.inspectContainerCmd("metadata-helper").exec().getNetworkSettings().getNetworks())
+                .thenReturn(Map.of("vpc-network", new ContainerNetwork().withIpv4Address("10.0.1.10")));
+        PortAllocator portAllocator = mock(PortAllocator.class);
+        when(portAllocator.allocate(anyInt(), anyInt())).thenReturn(30000);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        when(lifecycle.create(any())).thenReturn("forward");
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().ec2().socatImage()).thenReturn("alpine/socat");
+        when(config.docker().logMaxSize()).thenReturn("10m");
+        when(config.docker().logMaxFile()).thenReturn("3");
+        Ec2PortForwardManager manager = new Ec2PortForwardManager(dockerClient,
+                new ContainerBuilder(config, mock(DockerHostResolver.class), mock(EmbeddedDnsServer.class)),
+                lifecycle, portAllocator, config);
+        Instance instance = new Instance();
+        instance.setInstanceId("i-network-helper");
+        instance.setDockerContainerId("guest");
+        instance.setState(InstanceState.running());
+
+        manager.reconcileNow(instance, Set.of(80));
+
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
+        verify(lifecycle).create(spec.capture());
+        assertEquals("vpc-network", spec.getValue().networkMode());
+        assertEquals(List.of("TCP-LISTEN:80,fork,reuseaddr,nodelay,backlog=4096", "TCP:10.0.1.10:80,nodelay"),
+                spec.getValue().cmd());
     }
 
     @Test

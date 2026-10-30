@@ -46,6 +46,7 @@ public class Instance {
     private Instant launchTime;
     private int amiLaunchIndex;
     private String clientToken;
+    private boolean replayProtected;
     private String monitoring = "disabled";
     private boolean sourceDestCheck = true;
     private boolean ebsOptimized = false;
@@ -84,6 +85,8 @@ public class Instance {
     // Docker backing fields (not serialised to AWS wire format)
     private String dockerContainerId;
     private String containerBridgeIp;
+    // Separate from IMDS source registration: set only after public routing is prepared.
+    private String containerPublicIp;
     /**
      * The container's default-bridge address, kept alongside {@code containerBridgeIp} when the
      * instance is also attached to its VPC's Docker network. IMDS identifies a caller by the
@@ -110,13 +113,17 @@ public class Instance {
     public void setImageId(String imageId) { this.imageId = imageId; }
 
     public InstanceState getState() { return state; }
-    public synchronized void setState(InstanceState state) { this.state = state; }
+    public synchronized void setState(InstanceState state) {
+        this.state = state;
+        notifyAll();
+    }
 
     public synchronized boolean compareAndSetState(InstanceState expected, InstanceState updated) {
         if (state != expected) {
             return false;
         }
         state = updated;
+        notifyAll();
         return true;
     }
 
@@ -195,6 +202,9 @@ public class Instance {
     public int getAmiLaunchIndex() { return amiLaunchIndex; }
     public void setAmiLaunchIndex(int amiLaunchIndex) { this.amiLaunchIndex = amiLaunchIndex; }
 
+    public boolean isReplayProtected() { return replayProtected; }
+    public void setReplayProtected(boolean replayProtected) { this.replayProtected = replayProtected; }
+
     public String getClientToken() { return clientToken; }
     public void setClientToken(String clientToken) { this.clientToken = clientToken; }
 
@@ -247,6 +257,8 @@ public class Instance {
     public void setTerminatedAt(long terminatedAt) { this.terminatedAt = terminatedAt; }
 
     public String getContainerBridgeIp() { return containerBridgeIp; }
+    public String getContainerPublicIp() { return containerPublicIp; }
+    public void setContainerPublicIp(String containerPublicIp) { this.containerPublicIp = containerPublicIp; }
     public void setContainerBridgeIp(String containerBridgeIp) { this.containerBridgeIp = containerBridgeIp; }
 
     public String getImdsSourceIp() { return imdsSourceIp; }

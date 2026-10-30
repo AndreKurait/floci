@@ -270,6 +270,10 @@ Environment variable: `FLOCI_SERVICES_DOCKER_NETWORK`
 
 Individual services can override the network with their own `docker-network` setting (e.g. `floci.services.lambda.docker-network`).
 
+Spawned containers join the declared network at creation, including when they publish host
+ports. Floci does not add Docker's default bridge as a side effect of publishing ports.
+Services such as EC2 may explicitly attach additional networks, including their VPC network.
+
 A network mode of `host`, `none` or `container:<id>` places the spawned containers in that network namespace instead of on a Docker network. Docker publishes no host ports there, so a container on the host network serves its own port directly on the host (an OpenSearch domain listens on `9200` rather than on a port from its configured range), and Floci reaches it via `localhost`. A container placed in another container's namespace (`container:<id>`) is reached through that container's address instead: its IP on the Docker network, or `localhost` when it is itself on the host network.
 
 !!! tip

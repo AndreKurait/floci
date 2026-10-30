@@ -1266,6 +1266,7 @@ State is reported settled rather than transitional, as elsewhere in this service
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_FALLBACK_PREFIX_LENGTH` | `16` | Prefix length of each block handed out of that pool |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP` | `true` | Remove VPC networks left behind by a previous run of this same emulator. Whatever its value, the network a previous run created for a VPC that still exists is kept, and goes when that VPC is deleted |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_DRIVER` | `bridge` | Docker network driver used for VPC networks |
+| `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL` | `false` | Create internal Docker VPC networks without external connectivity through that network |
 
 ## VPC Docker networks
 
@@ -1280,6 +1281,16 @@ network attachment. This keeps management calls responsive even when the Docker 
 For overlapping VPC CIDRs, the first VPC whose addresses are needed keeps the declared range;
 later VPCs use the fallback pool. Within one emulator run, allocated addresses remain on the
 same effective range.
+
+Set `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL=true` to create internal Docker VPC
+bridges. This deployment setting does not change EC2 request or response fields.
+A retained VPC network with a different internal setting refuses attachment and
+is preserved; use a fresh deployment when changing this option.
+Other guest network attachments retain their own connectivity, so this option
+alone does not isolate a guest attached to an external bridge. Configure the
+guest's primary network accordingly. Docker host access and explicit forwarding
+also remain separate from this network setting.
+Publishing the guest's SSH port does not add Docker's default bridge.
 
 When Floci runs in Docker, deleting a VPC disconnects Floci's own container before removing
 the VPC network. Other endpoints are not forcibly disconnected: removal retries while they
@@ -1498,3 +1509,58 @@ Under `none` the rule still runs, but a mock instance has only the Elastic IP, i
 Otherwise a mock instance's address appears whether DescribeInstances or DescribeInstanceStatus
 observes the launch first. A terminated mock instance has no public address, and stopping it does not bring it
 back.
+
+### Images with their own startup command
+
+Set `guestRuntime: image` on an AMI entry in an external catalog selected with
+`FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH` to run the Docker image's declared
+ENTRYPOINT and CMD without either override:
+
+```yaml
+defaultDockerImage: example/base:1
+images:
+  - imageId: ami-local-worker
+    dockerImage: example/worker:1
+    name: local-worker
+    description: Worker with its own startup command
+    architecture: arm64
+    creationDate: '2026-10-08T00:00:00.000Z'
+    guestRuntime: image
+```
+
+The image must provide a working startup command. This mode does not add the
+systemd mounts, install an init system, or establish application readiness.
+The normal EC2 networking, resource limits, metadata, SSH and UserData behavior
+still applies. Omitted `guestRuntime` and unknown AMI IDs retain the `minimal`
+runtime; selecting `image` on one entry does not change other entries.
+
+
+### Guest privileges
+
+EC2 guest containers use Docker privileged mode by default. Deployments whose
+images do not require it can disable that mode and drop additional Linux
+capabilities:
+
+```yaml
+floci:
+  services:
+    ec2:
+      privileged: false
+      cap-drop: [NET_ADMIN, NET_RAW]
+```
+
+The equivalent environment variables are `FLOCI_SERVICES_EC2_PRIVILEGED=false`
+and `FLOCI_SERVICES_EC2_CAP_DROP=NET_ADMIN,NET_RAW`. Capability names are
+case-insensitive, accept an optional `CAP_` prefix, and support `ALL`.
+Use `privileged: false` for capability restrictions to take effect.
+
+These settings apply to guest containers in every runtime mode. The network
+and volume helpers retain their own privileges. Security-group enforcement
+always disables guest privileged mode and drops `NET_ADMIN` and `NET_RAW`;
+configuration can add restrictions but cannot remove those mandatory ones.
+
+Choose settings the guest image can run with. Disabling privileged mode does
+not grant the permissions needed by systemd or physical block-device mounts.
+Floci does not escalate privileges to make those operations succeed.
+Stop/start retains the existing container's settings; changed settings apply
+to newly launched instances.

@@ -707,6 +707,11 @@ floci:
       proxy-max-port: 9499
       keep-running-on-shutdown: false
     ec2:
+      extra-env: []
+      ulimits: []
+      metadata-helper-image: floci/network-helper:local
+      privileged: true
+      cap-drop: []
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
       # Optional complete catalog override for locally built guest images.
@@ -754,6 +759,7 @@ floci:
         # so Floci instances sharing a daemon never reconcile each other's networks).
         reconcile-on-startup: true                # FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP
         driver: bridge                            # FLOCI_SERVICES_EC2_VPC_NETWORKS_DRIVER
+        internal: false                           # FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL
     ecs:
       enabled: true
       mock: false

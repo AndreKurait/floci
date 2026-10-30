@@ -45,6 +45,7 @@ import java.util.regex.Pattern;
  * @param linkLocalIps Link-local IPv4 addresses assigned to the container's endpoint on the configured network
  * @param portBindingHostIps Host interface each published port binds to, keyed by container port.
  *        A port with no entry here, and not in {@code loopbackPortBindings}, binds every interface
+ * @param ulimits Explicit process resource limits (empty = daemon defaults)
  * @param init Whether Docker runs its init process as PID 1, forwarding signals to the command, for
  *        images whose command does not handle SIGTERM itself
  * @param linuxOptions Capabilities, devices, shared memory, tmpfs and swap
@@ -81,6 +82,7 @@ public record ContainerSpec(
         boolean readonlyRootfs,
         List<String> linkLocalIps,
         Map<Integer, String> portBindingHostIps,
+        Map<String, ResourceLimit> ulimits,
         boolean init,
         LinuxOptions linuxOptions,
         boolean javaTrustStore
@@ -90,6 +92,12 @@ public record ContainerSpec(
     private static final Set<String> NAMESPACE_NETWORK_MODES = Set.of("host", "none");
 
     public ContainerSpec {
+        ulimits = Map.copyOf(ulimits);
+        for (String limitName : ulimits.keySet()) {
+            if (!limitName.matches("[a-z][a-z0-9]*")) {
+                throw new IllegalArgumentException("Invalid container resource limit name: " + limitName);
+            }
+        }
         if (linuxOptions == null) {
             linuxOptions = LinuxOptions.NONE;
         }
@@ -97,6 +105,56 @@ public record ContainerSpec(
             requireUserDefinedNetwork(networkMode);
             linkLocalIps.forEach(ContainerSpec::requireLinkLocalIpv4);
         }
+    }
+
+    /** Soft and hard process limits; -1 means unlimited. */
+    public record ResourceLimit(long soft, long hard) {
+        public ResourceLimit {
+            if (soft < -1 || hard < -1 || (hard != -1 && (soft == -1 || soft > hard))) {
+                throw new IllegalArgumentException("Invalid container resource limit: " + soft + ":" + hard);
+            }
+        }
+    }
+
+    /** Keeps existing callers on daemon-default process resource limits. */
+    public ContainerSpec(
+            String image,
+            String name,
+            List<String> env,
+            List<String> cmd,
+            List<String> entrypoint,
+            Long memoryBytes,
+            Map<Integer, Integer> portBindings,
+            List<Integer> loopbackPortBindings,
+            List<Integer> exposedPorts,
+            String networkMode,
+            List<Mount> mounts,
+            List<Bind> binds,
+            List<VolumesFrom> volumesFrom,
+            List<String> extraHosts,
+            Map<String, String> labels,
+            LogConfig logConfig,
+            boolean privileged,
+            String cgroupnsMode,
+            List<String> dnsServers,
+            String workingDir,
+            String user,
+            List<String> groupAdd,
+            List<DeviceRequest> deviceRequests,
+            Long nanoCpus,
+            Integer cpuShares,
+            boolean readonlyRootfs,
+            List<String> linkLocalIps,
+            Map<Integer, String> portBindingHostIps,
+            boolean init,
+            LinuxOptions linuxOptions,
+            boolean javaTrustStore
+    ) {
+        this(image, name, env, cmd, entrypoint, memoryBytes, portBindings,
+                loopbackPortBindings, exposedPorts, networkMode, mounts, binds, volumesFrom, extraHosts,
+                labels, logConfig, privileged, cgroupnsMode, dnsServers, workingDir, user,
+                groupAdd, deviceRequests, nanoCpus, cpuShares, readonlyRootfs, linkLocalIps, portBindingHostIps,
+                Map.of(), init, linuxOptions, javaTrustStore);
     }
 
     /**
