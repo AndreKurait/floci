@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -433,6 +434,75 @@ class Ec2SecurityGroupPublicationRaceTest {
                 () -> service.modifyInstanceGroups(region, instance, List.of("sg-missing"))).getErrorCode());
         assertEquals("DependencyViolation", assertThrows(AwsException.class,
                 () -> service.deleteSecurityGroup(region, original)).getErrorCode());
+    }
+
+    @Test
+    void successfulSameInstanceUpdatesPublishInFirewallOrder() throws Exception {
+        TestStores factory = new TestStores();
+        EmulatorConfig config = mockConfig();
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), factory.storage);
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        String subnet = service.createSubnet(region, vpc, "10.0.1.0/24", region + "a").getSubnetId();
+        String original = service.createSecurityGroup(region, "ordered-original", "original", vpc).getGroupId();
+        String firstGroup = service.createSecurityGroup(region, "ordered-first", "first", vpc).getGroupId();
+        String secondGroup = service.createSecurityGroup(region, "ordered-second", "second", vpc).getGroupId();
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(original), subnet, null, List.of(), null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        EmulatorConfig.NetworkConfig network = mock(EmulatorConfig.NetworkConfig.class);
+        EmulatorConfig.SecurityGroupEnforcementConfig enforcement = mock(EmulatorConfig.SecurityGroupEnforcementConfig.class);
+        when(config.network()).thenReturn(network);
+        when(network.securityGroupEnforcement()).thenReturn(enforcement);
+        when(enforcement.enabled()).thenReturn(true);
+        when(config.services().ec2().mock()).thenReturn(false);
+        CountDownLatch applied = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Set<String>> firewall = new AtomicReference<>();
+        doAnswer(invocation -> {
+            Set<String> groups = invocation.getArgument(1);
+            firewall.set(Set.copyOf(groups));
+            if (groups.contains(firstGroup)) {
+                applied.countDown();
+                assertTrue(release.await(5, TimeUnit.SECONDS));
+            }
+            return null;
+        }).when(manager).updateSecurityGroups(anyString(), anySet(), anyMap(), anyMap());
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> first = executor.submit(() ->
+                    service.modifyInstanceGroups(region, instance.getInstanceId(), List.of(firstGroup)));
+            assertTrue(applied.await(5, TimeUnit.SECONDS), "First firewall update must precede its publication");
+            AtomicReference<Thread> secondThread = new AtomicReference<>();
+            Future<?> second = executor.submit(() -> {
+                secondThread.set(Thread.currentThread());
+                service.modifyInstanceGroups(region, instance.getInstanceId(), List.of(secondGroup));
+            });
+            awaitBlockedOrDone(secondThread, second);
+            boolean secondOvertook = second.isDone();
+            release.countDown();
+            first.get(5, TimeUnit.SECONDS);
+            second.get(5, TimeUnit.SECONDS);
+            Instance stored = service.describeInstances(region, List.of(instance.getInstanceId()), Map.of())
+                    .getFirst().getInstances().getFirst();
+            assertAll(
+                    () -> assertFalse(secondOvertook, "Same-instance update must wait through firewall publication"),
+                    () -> assertEquals(Set.of(secondGroup), firewall.get()),
+                    () -> assertEquals(secondGroup, stored.getSecurityGroups().getFirst().getGroupId()),
+                    () -> assertEquals(secondGroup, stored.getNetworkInterfaces().getFirst().getGroups().getFirst().getGroupId()),
+                    () -> assertEquals(secondGroup, service.describeNetworkInterfaces(region,
+                            List.of(stored.getNetworkInterfaces().getFirst().getNetworkInterfaceId()), Map.of())
+                            .networkInterfaces().getFirst().getGroups().getFirst().getGroupId()));
+            service.deleteSecurityGroup(region, firstGroup);
+            assertEquals("DependencyViolation", assertThrows(AwsException.class,
+                    () -> service.deleteSecurityGroup(region, secondGroup)).getErrorCode());
+        } finally {
+            release.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
     }
 
     @Test

@@ -333,6 +333,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final Set<String> seededAccountRegions = ConcurrentHashMap.newKeySet();
     // References held while a group assignment applies firewall state before publishing its instance.
     private final Map<String, Integer> pendingSecurityGroupAssignments = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, RefCountedLock> instanceGroupLocks = new ConcurrentHashMap<>();
     // region::subnetId → offset the next synthesised address is tried at. Only an ordering hint:
     // restart forgets it, and privateIpsInUse is what keeps addresses from being handed out twice.
     private final Map<String, Long> subnetIpCursors = new HashMap<>();
@@ -5870,6 +5871,26 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public void modifyInstanceGroups(String region, String instanceId, List<String> groupIds) {
         ensureDefaultResources(region);
+        String instanceKey = callerAccountId() + "::" + key(region, instanceId);
+        RefCountedLock assignment = instanceGroupLocks.compute(instanceKey, (ignored, existing) -> {
+            if (existing == null) {
+                return new RefCountedLock();
+            }
+            existing.refCount.incrementAndGet();
+            return existing;
+        });
+        // This per-instance lock precedes the topology lock; external I/O holds only this lock.
+        assignment.lock.lock();
+        try {
+            modifyInstanceGroupsLocked(region, instanceId, groupIds);
+        } finally {
+            assignment.lock.unlock();
+            instanceGroupLocks.computeIfPresent(instanceKey, (ignored, existing) ->
+                    existing.refCount.decrementAndGet() == 0 ? null : existing);
+        }
+    }
+
+    private void modifyInstanceGroupsLocked(String region, String instanceId, List<String> groupIds) {
         Instance inst = getRequiredInstance(region, instanceId);
 
         List<GroupIdentifier> identifiers = new ArrayList<>();
