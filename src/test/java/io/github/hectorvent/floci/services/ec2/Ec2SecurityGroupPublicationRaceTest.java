@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import io.github.hectorvent.floci.testing.ParkingStore;
@@ -22,11 +23,45 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static io.github.hectorvent.floci.testing.ThreadStates.awaitBlockedOrDone;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class Ec2SecurityGroupPublicationRaceTest {
+    @Test
+    void deletingPublishedGroupWaitsForItsDefaultRule() throws Exception {
+        TestStores factory = new TestStores();
+        Ec2Service service = service(factory);
+        String region = "us-east-1";
+        service.describeSecurityGroups(region, List.of(), List.of(), Map.of());
+        factory.rules.parkNextWrite();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<SecurityGroup> created = executor.submit(() ->
+                    service.createSecurityGroup(region, "default-rule-race", "race", null));
+            assertTrue(factory.rules.awaitParked(), "Creator must reach default-rule publication");
+            AtomicReference<Thread> deletingThread = new AtomicReference<>();
+            Future<String> deleted = executor.submit(() -> {
+                deletingThread.set(Thread.currentThread());
+                return service.deleteSecurityGroup(region, null, "default-rule-race", false);
+            });
+            awaitBlockedOrDone(deletingThread, deleted);
+            assertFalse(deleted.isDone(), "Deletion must wait until the default rule is persisted");
+            factory.rules.release();
+            SecurityGroup group = created.get(5, TimeUnit.SECONDS);
+            assertEquals(group.getGroupId(), deleted.get(5, TimeUnit.SECONDS));
+            assertTrue(service.describeSecurityGroups(region, List.of(group.getGroupId()),
+                    List.of(), Map.of()).isEmpty());
+            assertTrue(service.describeSecurityGroupRules(region, List.of(group.getGroupId()), List.of()).isEmpty(),
+                    "A deleted group must not leave an orphaned default rule");
+        } finally {
+            factory.rules.release();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
     @Test
     void publishedInterfaceCannotReferenceSuccessfullyDeletedGroup() throws Exception {
         TestStores factory = new TestStores();
@@ -407,10 +442,12 @@ class Ec2SecurityGroupPublicationRaceTest {
     private static final class TestStores {
         private final ParkingStore<NetworkInterface> interfaces = new ParkingStore<>();
         private final ParkingStore<Instance> instances = new ParkingStore<>();
+        private final ParkingStore<SecurityGroupRule> rules = new ParkingStore<>();
         private final ParkingStore<SecurityGroup> groups = new ParkingStore<>();
         private final InMemoryStorageFactory storage = new InMemoryStorageFactory("000000000000")
                 .withStore("ec2-network-interfaces.json", interfaces)
                 .withStore("ec2-instances.json", instances)
-                .withStore("ec2-security-groups.json", groups);
+                .withStore("ec2-security-groups.json", groups)
+                .withStore("ec2-security-group-rules.json", rules);
     }
 }

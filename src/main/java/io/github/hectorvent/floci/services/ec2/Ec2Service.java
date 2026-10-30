@@ -7859,10 +7859,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         synchronized (attachmentTopologyLock(region)) {
             getRequiredVpc(region, sg.getVpcId());
             securityGroups.put(key(region, sgId), sg);
+            // Publish the default rule before a concurrent delete can remove this group.
+            createRules(region, sgId, egressAll, true);
         }
-        // Persist the default egress rule as a SecurityGroupRule so that
-        // DescribeSecurityGroupRules can find it immediately (#1093).
-        createRules(region, sgId, egressAll, true);
         return sg;
     }
 
