@@ -15035,6 +15035,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (!hostIsGone) {
             return ni;
         }
+        List<Address> associatedAddresses = addresses instanceof AccountAwareStorageBackend<Address> aware
+                ? aware.scanForAccount(safeAccount, k -> k.startsWith(region + "::"))
+                : addresses.scan(k -> k.startsWith(region + "::"));
+        for (Address address : associatedAddresses) {
+            if (!ni.getNetworkInterfaceId().equals(address.getNetworkInterfaceId())) {
+                continue;
+            }
+            address.setInstanceId(null);
+            if (addresses instanceof AccountAwareStorageBackend<Address> aware) {
+                aware.putForAccount(safeAccount, key(region, address.getAllocationId()), address);
+            } else {
+                addresses.put(key(region, address.getAllocationId()), address);
+            }
+        }
         ni.setAttachment(null);
         ni.setStatus("available");
         if (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware) {

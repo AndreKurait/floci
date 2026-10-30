@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.ec2.model.DhcpOptions;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
@@ -98,6 +99,30 @@ class Ec2ServicePersistenceTest {
         assertEquals(networkInterface, restored.getNetworkInterfaceId());
         assertTrue(restarted.describeAddresses(REGION, List.of(address.getAllocationId()),
                 Map.of("instance-id", List.of(first.getInstanceId()))).isEmpty());
+    }
+
+    @Test
+    void deadHostAddressReconciliationSurvivesRestart(@TempDir Path dir) throws IOException {
+        Ec2Service service = newService(dir);
+        String subnet = service.createSubnet(REGION, service.createVpc(REGION, "10.232.0.0/24", false).getVpcId(),
+                "10.232.0.0/24", REGION + "a").getSubnetId();
+        String networkInterface = service.createNetworkInterface(REGION, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        Instance host = service.runInstances(REGION, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, networkInterface, 0).getInstances().getFirst();
+        Address address = service.allocateAddress(REGION);
+        service.associateAddress(REGION, address.getAllocationId(), host.getInstanceId());
+        String association = address.getAssociationId();
+        // Reconcile the asynchronous terminal state, then reopen the persisted address store.
+        host.setState(InstanceState.terminated());
+        assertNull(service.describeNetworkInterfaces(REGION, List.of(networkInterface), Map.of(), 0, null)
+                .networkInterfaces().getFirst().getAttachment());
+        Address persisted = newService(dir).describeAddresses(REGION, List.of(address.getAllocationId()), Map.of())
+                .getFirst();
+        assertNull(persisted.getInstanceId());
+        assertEquals(association, persisted.getAssociationId());
+        assertEquals(networkInterface, persisted.getNetworkInterfaceId());
     }
 
     @Test

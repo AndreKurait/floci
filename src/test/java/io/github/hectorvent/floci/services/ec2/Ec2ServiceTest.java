@@ -1925,6 +1925,94 @@ class Ec2ServiceTest {
         service.deleteNetworkInterface(region, retained.getNetworkInterfaceId());
     }
 
+    @ParameterizedTest
+    @CsvSource({"terminated,false", "terminated,true", "missing,false", "missing,true",
+            "running,false", "stopped,true"})
+    void retainedInterfaceAddressReconcilesDeadHost(String state, boolean secondaryAddress) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.234.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, "10.234.0.10",
+                List.of("10.234.0.11"), List.of(), List.of());
+        Instance first = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        String privateIp = secondaryAddress ? "10.234.0.11" : "10.234.0.10";
+        service.associateAddress(region, address.getAllocationId(), first.getInstanceId(), privateIp);
+        String association = address.getAssociationId();
+        boolean dead = "terminated".equals(state) || "missing".equals(state);
+        first.setState(dead ? InstanceState.terminated()
+                : "stopped".equals(state) ? InstanceState.stopped() : InstanceState.running());
+        if ("missing".equals(state)) {
+            first.setTerminatedAt(System.currentTimeMillis() - 3_600_001L);
+            service.pruneTerminatedInstances();
+        }
+        for (int read = 0; read < 2; read++) {
+            NetworkInterface observed = service.describeNetworkInterfaces(region,
+                    List.of(retained.getNetworkInterfaceId()), Map.of(), 0, null).networkInterfaces().getFirst();
+            assertEquals(dead ? "available" : "in-use", observed.getStatus());
+            assertEquals(dead ? null : first.getInstanceId(), address.getInstanceId());
+            assertEquals(association, address.getAssociationId());
+            assertEquals(retained.getNetworkInterfaceId(), address.getNetworkInterfaceId());
+            assertEquals(privateIp, address.getPrivateIpAddress());
+            assertEquals(dead ? 0 : 1, service.describeAddresses(region, List.of(address.getAllocationId()),
+                    Map.of("instance-id", List.of(first.getInstanceId()))).size());
+        }
+        if (dead) {
+            Instance second = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                    1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                    null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+            assertEquals(second.getInstanceId(), address.getInstanceId());
+            assertThrows(AwsException.class, () -> service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                    1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                    null, retained.getNetworkInterfaceId(), 0));
+            assertEquals(second.getInstanceId(), address.getInstanceId());
+            assertEquals(association, address.getAssociationId());
+        }
+    }
+
+    @Test
+    void deadHostAddressReconciliationUsesTheExplicitInterfaceOwner() {
+        RequestContext context = new RequestContext();
+        // The EC2 model Instance is already imported; this is the CDI Instance type.
+        jakarta.enterprise.inject.Instance<RequestContext> contexts = requestContexts(context);
+        InMemoryStorageFactory factory = new InMemoryStorageFactory(contexts);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), factory, contexts);
+        String owner = "111111111111";
+        String observer = "222222222222";
+        String region = "us-east-1";
+        context.setAccountId(owner);
+        String subnet = privateSubnet(service, region, "10.233.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        Instance host = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        service.associateAddress(region, address.getAllocationId(), host.getInstanceId());
+        String association = address.getAssociationId();
+        host.setState(InstanceState.terminated());
+        context.setAccountId(observer);
+        Address unrelated = service.allocateAddress(region);
+        // Matching IDs make a caller-scoped scan or write observable, rather than relying on random IDs.
+        unrelated.setNetworkInterfaceId(retained.getNetworkInterfaceId());
+        unrelated.setInstanceId("i-observer");
+        service.describeNetworkInterfaces(owner, region, List.of(retained.getNetworkInterfaceId()), Map.of());
+        assertNull(address.getInstanceId());
+        assertEquals(association, address.getAssociationId());
+        assertEquals("i-observer", unrelated.getInstanceId());
+        assertTrue(service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).isEmpty());
+        context.setAccountId(owner);
+        Address ownerAddress = service.describeAddresses(region, List.of(address.getAllocationId()), Map.of())
+                .getFirst();
+        assertNull(ownerAddress.getInstanceId());
+        assertEquals(association, ownerAddress.getAssociationId());
+        assertEquals(retained.getNetworkInterfaceId(), ownerAddress.getNetworkInterfaceId());
+    }
+
     @Test
     void elasticIpOnASecondaryAddressLeavesAReachableInstancesPublicAddressAlone() {
         Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
