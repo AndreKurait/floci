@@ -30,6 +30,58 @@ import static org.mockito.Mockito.*;
 
 class Ec2SecurityGroupPublicationRaceTest {
     @Test
+    void concurrentSameNameCreationRejectsTheSecondPublication() throws Exception {
+        TestStores factory = new TestStores();
+        Ec2Service service = service(factory);
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        factory.groups.parkNextWrite();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<SecurityGroup> first = executor.submit(() ->
+                    service.createSecurityGroup(region, "same-name", "first", vpc));
+            assertTrue(factory.groups.awaitParked(), "Creator must reach group publication");
+            AtomicReference<Thread> secondThread = new AtomicReference<>();
+            Future<AwsException> second = executor.submit(() -> {
+                secondThread.set(Thread.currentThread());
+                try {
+                    service.createSecurityGroup(region, "same-name", "second", vpc);
+                    return null;
+                } catch (AwsException failure) {
+                    return failure;
+                }
+            });
+            awaitBlockedOrDone(secondThread, second);
+            assertFalse(second.isDone(), "Second creation must wait for the first publication");
+            factory.groups.release();
+            SecurityGroup created = first.get(5, TimeUnit.SECONDS);
+            AwsException duplicate = second.get(5, TimeUnit.SECONDS);
+            assertNotNull(duplicate, "Only one group with the same name and VPC may be published");
+            assertEquals("InvalidGroup.Duplicate", duplicate.getErrorCode());
+            List<SecurityGroup> groups = service.describeSecurityGroups(region, List.of(),
+                    List.of("same-name"), Map.of());
+            assertEquals(List.of(created.getGroupId()), groups.stream().map(SecurityGroup::getGroupId).toList());
+            assertEquals(1, service.describeSecurityGroupRules(region, List.of(created.getGroupId()), List.of()).size());
+        } finally {
+            factory.groups.release();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void sameNameInDifferentVpcsRemainsAllowed() {
+        Ec2Service service = service(new TestStores());
+        String region = "us-east-1";
+        String firstVpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        String secondVpc = service.createVpc(region, "10.1.0.0/16", false).getVpcId();
+        SecurityGroup first = service.createSecurityGroup(region, "same-name", "first", firstVpc);
+        SecurityGroup second = service.createSecurityGroup(region, "same-name", "second", secondVpc);
+        assertNotEquals(first.getGroupId(), second.getGroupId());
+        assertEquals(2, service.describeSecurityGroups(region, List.of(), List.of("same-name"), Map.of()).size());
+    }
+
+    @Test
     void deletingPublishedGroupWaitsForItsDefaultRule() throws Exception {
         TestStores factory = new TestStores();
         Ec2Service service = service(factory);

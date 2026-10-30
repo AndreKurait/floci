@@ -7846,14 +7846,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         } else {
             vpcId = resolveDefaultVpcId(region);
         }
-        // Check duplicate
-        String finalVpcId = vpcId;
-        boolean exists = securityGroups.scan(k -> true).stream()
-                .anyMatch(sg -> sg.getRegion().equals(region) && Objects.equals(sg.getGroupName(), groupName)
-                        && finalVpcId.equals(sg.getVpcId()));
-        if (exists) {
-            throw new AwsException("InvalidGroup.Duplicate", "The security group '" + groupName + "' already exists", 400);
-        }
         String sgId = "sg-" + randomHex(17);
         SecurityGroup sg = new SecurityGroup();
         sg.setGroupId(sgId);
@@ -7869,6 +7861,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         sg.getIpPermissionsEgress().add(egressAll);
         synchronized (attachmentTopologyLock(region)) {
             getRequiredVpc(region, sg.getVpcId());
+            boolean exists = securityGroups.scan(k -> true).stream()
+                    .anyMatch(existing -> existing.getRegion().equals(region)
+                            && Objects.equals(existing.getGroupName(), groupName)
+                            && sg.getVpcId().equals(existing.getVpcId()));
+            if (exists) {
+                throw new AwsException("InvalidGroup.Duplicate",
+                        "The security group '" + groupName + "' already exists", 400);
+            }
             securityGroups.put(key(region, sgId), sg);
             // Publish the default rule before a concurrent delete can remove this group.
             createRules(region, sgId, egressAll, true);
