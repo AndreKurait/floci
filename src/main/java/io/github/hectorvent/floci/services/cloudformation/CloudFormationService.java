@@ -1138,6 +1138,13 @@ public class CloudFormationService implements ResourceProvider {
         return executeChangeSet(stackName, changeSetName, region, regionResolver.getAccountId());
     }
 
+    /** Executes CreateStack's initial change set with its creation rollback policy. */
+    public Future<?> executeCreateChangeSet(String stackName, String changeSetName, String region,
+                                            boolean disableRollback) {
+        return claimAndSubmitExecution(stackName, changeSetName, region, regionResolver.getAccountId(),
+                false, disableRollback);
+    }
+
     /**
      * Entry point for the {@code ExecuteChangeSet} operation itself, as opposed to the execute that
      * {@code CreateStack}/{@code UpdateStack} run internally right after creating their own change
@@ -1152,7 +1159,7 @@ public class CloudFormationService implements ResourceProvider {
      * that failure surfaces on those paths, and floci must still expose it there.
      */
     public Future<?> executeChangeSetForRequest(String stackName, String changeSetName, String region) {
-        return claimAndSubmitExecution(stackName, changeSetName, region, regionResolver.getAccountId(), true);
+        return claimAndSubmitExecution(stackName, changeSetName, region, regionResolver.getAccountId(), true, false);
     }
 
     /**
@@ -1170,21 +1177,21 @@ public class CloudFormationService implements ResourceProvider {
      * refuses one that is already executing or has already executed.
      */
     public Future<?> executeChangeSet(String stackName, String changeSetName, String region, String accountId) {
-        return claimAndSubmitExecution(stackName, changeSetName, region, accountId, false);
+        return claimAndSubmitExecution(stackName, changeSetName, region, accountId, false, false);
     }
 
     private record ClaimedExecution(ChangeSet changeSet, boolean isCreate) {}
 
     private record ChangeSetState(String status, String executionStatus) {}
 
-    private record StackMutationSnapshot(String status, Instant lastUpdatedTime,
+    private record StackMutationSnapshot(String status, Instant lastUpdatedTime, boolean disableRollback,
                                          List<StackEvent> events,
                                          Map<String, ChangeSet> changeSets,
                                          Map<ChangeSet, ChangeSetState> changeSetStates) {}
 
     // compute() holds the stack's per-key lock for the whole claim, so only one racing execution can win.
     private Future<?> claimAndSubmitExecution(String stackNameOrArn, String changeSetName, String region,
-                                              String accountId, boolean requireAvailable) {
+                                              String accountId, boolean requireAvailable, boolean disableCreateRollback) {
         String canonicalStackName = getStackForChangeSet(stackNameOrArn, changeSetName, region,
                 accountId).getStackName();
 
@@ -1210,6 +1217,9 @@ public class CloudFormationService implements ResourceProvider {
             snapshot[0] = snapshot(existing);
             boolean isCreate = "CREATE".equalsIgnoreCase(cs.getChangeSetType()) ||
                     "CREATE_IN_PROGRESS".equals(existing.getStatus());
+            if (isCreate) {
+                existing.setDisableRollback(disableCreateRollback);
+            }
             cs.setExecutionStatus("EXECUTE_IN_PROGRESS");
             if (requireAvailable) {
                 // CloudFormation deletes every other change set on the stack once one of them executes.
@@ -1440,7 +1450,7 @@ public class CloudFormationService implements ResourceProvider {
         for (ChangeSet changeSet : stack.changeSetsSnapshot().values()) {
             states.put(changeSet, new ChangeSetState(changeSet.getStatus(), changeSet.getExecutionStatus()));
         }
-        return new StackMutationSnapshot(stack.getStatus(), stack.getLastUpdatedTime(),
+        return new StackMutationSnapshot(stack.getStatus(), stack.getLastUpdatedTime(), stack.isDisableRollback(),
                 stack.eventsSnapshot(), stack.changeSetsSnapshot(), states);
     }
 
@@ -1448,6 +1458,7 @@ public class CloudFormationService implements ResourceProvider {
         if (snapshot == null) {
             return;
         }
+        stack.setDisableRollback(snapshot.disableRollback());
         stack.setStatus(snapshot.status());
         stack.setLastUpdatedTime(snapshot.lastUpdatedTime());
         stack.setEvents(new ArrayList<>(snapshot.events()));
@@ -2378,7 +2389,7 @@ public class CloudFormationService implements ResourceProvider {
     /**
      * Handles a resource that failed to provision.
      *
-     * <p>On a <b>create</b>, rolls back by deleting resources created by the failed execution. On
+     * <p>On a <b>create</b>, deletes resources created by the failed execution unless rollback is disabled. On
      * an <b>update</b>, restores the prior resource, template, output, and export state.
      */
     void rollbackFailedExecution(
@@ -2390,7 +2401,8 @@ public class CloudFormationService implements ResourceProvider {
             Set<String> attemptedResourceIds) {
         LOG.warnv("Stack {0} resource {1} failed: {2}", stack.getStackName(),
                 failedResource.getLogicalId(), failedResource.getStatusReason());
-        rollbackFailedExecution(stack, region, isCreate, rollbackReason(isCreate, failedResource), previousState,
+        rollbackFailedExecution(stack, region, isCreate,
+                rollbackReason(isCreate && !stack.isDisableRollback(), failedResource), previousState,
                 attemptedResourceIds);
     }
 
@@ -2403,6 +2415,15 @@ public class CloudFormationService implements ResourceProvider {
             StackUpdateSnapshot previousState,
             Set<String> attemptedResourceIds) {
         stack.setStatusReason(reason);
+
+        if (isCreate && stack.isDisableRollback()) {
+            stack.setLastUpdatedTime(now());
+            addEvent(stack, stack.getStackName(), stack.getStackId(),
+                    "AWS::CloudFormation::Stack", "CREATE_FAILED", reason);
+            stack.setStatus("CREATE_FAILED");
+            persistStack(stack);
+            return;
+        }
 
         if (isCreate) {
             addEvent(stack, stack.getStackName(), stack.getStackId(),
@@ -2438,11 +2459,11 @@ public class CloudFormationService implements ResourceProvider {
      * stays on its own event. A resource an update adds failed to create, and only a create
      * rollback says the rollback was requested, the default OnFailure counting as the request.
      */
-    private static String rollbackReason(boolean isCreate, StackResource failedResource) {
+    private static String rollbackReason(boolean rollbackRequested, StackResource failedResource) {
         String operation = "UPDATE_FAILED".equals(failedResource.getStatus()) ? "update" : "create";
         String summary = "The following resource(s) failed to " + operation + ": ["
                 + failedResource.getLogicalId() + "].";
-        return isCreate ? summary + " Rollback requested by user." : summary;
+        return rollbackRequested ? summary + " Rollback requested by user." : summary;
     }
 
     /**

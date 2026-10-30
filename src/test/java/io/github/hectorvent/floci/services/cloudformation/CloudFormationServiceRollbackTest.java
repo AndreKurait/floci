@@ -121,6 +121,29 @@ class CloudFormationServiceRollbackTest {
     }
 
     @Test
+    void disabledCreateRollbackRetainsResourcesAndPublishesTheFailureBeforeItsStatus() {
+        StatusRecordingStack stack = new StatusRecordingStack();
+        stack.setStackName("retained-create-failure");
+        stack.setStackId("stack-id");
+        stack.setRegion(REGION);
+        stack.setDisableRollback(true);
+        StackResource created = resource("Queue", "queue-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        StackResource failed = resource("Failure", null, "AWS::Test::Failure", "CREATE_FAILED");
+        failed.setStatusReason("simulated create failure");
+        stack.getResources().put(created.getLogicalId(), created);
+        stack.getResources().put(failed.getLogicalId(), failed);
+
+        service.rollbackFailedExecution(stack, REGION, true, failed, null, Set.of());
+
+        assertEquals(List.of("CREATE_FAILED"), stack.statuses());
+        assertEquals(List.of("CREATE_FAILED"), stackEventStatuses(stack));
+        stack.assertEachStatusFollowsItsEvent();
+        assertEquals("The following resource(s) failed to create: [Failure].", stack.getStatusReason());
+        assertEquals("CREATE_COMPLETE", created.getStatus());
+        verify(provisioner, never()).delete(any(StackResource.class), eq(REGION));
+    }
+
+    @Test
     void createRollback_withAlreadyDeletedResource_reachesRollbackComplete() {
         Stack stack = new Stack();
         stack.setStackName("rollback-missing-resource");
