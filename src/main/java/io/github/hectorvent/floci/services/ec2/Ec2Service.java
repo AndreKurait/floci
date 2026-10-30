@@ -7880,11 +7880,67 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public void deleteSecurityGroup(String region, String groupId) {
-        ensureDefaultResources(region);
-        if (securityGroups.get(key(region, groupId)).isEmpty()) {
-            throw new AwsException("InvalidGroup.NotFound", "The security group '" + groupId + "' does not exist", 400);
+        deleteSecurityGroup(region, groupId, null, false);
+    }
+
+    public String deleteSecurityGroup(String region, String groupId, String groupName, boolean dryRun) {
+        if ((groupId == null || groupId.isBlank()) && (groupName == null || groupName.isBlank())) {
+            throw new AwsException("MissingParameter", "The request must contain GroupId or GroupName", 400);
         }
-        securityGroups.delete(key(region, groupId));
+        ensureDefaultResources(region);
+        String selectedId = groupId;
+        if (selectedId == null || selectedId.isBlank()) {
+            Vpc defaultVpc = vpcs.scan(k -> k.startsWith(region + "::")).stream()
+                    .filter(Vpc::isDefault).findFirst().orElseThrow(() ->
+                            new AwsException("VPCIdNotSpecified", "No default VPC for this user", 400));
+            selectedId = securityGroups.scan(k -> k.startsWith(region + "::")).stream()
+                    .filter(group -> defaultVpc.getVpcId().equals(group.getVpcId())
+                            && groupName.equals(group.getGroupName()))
+                    .map(SecurityGroup::getGroupId).findFirst().orElseThrow(() ->
+                            new AwsException("InvalidGroup.NotFound",
+                                    "The security group '" + groupName + "' does not exist in the default VPC", 400));
+        }
+        synchronized (lockFor(key(region, selectedId))) {
+            SecurityGroup selected = getRequiredSecurityGroup(region, selectedId);
+            if ("default".equals(selected.getGroupName())) {
+                throw new AwsException("Client.CannotDelete", "The default security group cannot be deleted", 400);
+            }
+            if (hasSecurityGroupDependencies(region, selected)) {
+                throw new AwsException("DependencyViolation",
+                        "The security group '" + selectedId + "' has a dependent object", 400);
+            }
+            if (dryRun) {
+                throw new AwsException("DryRunOperation",
+                        "Request would have succeeded, but DryRun flag is set.", 412);
+            }
+            securityGroups.delete(key(region, selectedId));
+            securityGroupRules.scan(k -> k.startsWith(region + "::")).stream()
+                    .filter(rule -> selected.getGroupId().equals(rule.getGroupId()))
+                    .forEach(rule -> securityGroupRules.delete(key(region, rule.getSecurityGroupRuleId())));
+        }
+        return selectedId;
+    }
+
+    private boolean hasSecurityGroupDependencies(String region, SecurityGroup selected) {
+        String groupId = selected.getGroupId();
+        if (networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
+                .anyMatch(eni -> eni.getGroups().stream().anyMatch(group -> groupId.equals(group.getGroupId())))) {
+            return true;
+        }
+        if (instances.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(instance -> !"terminated".equals(instance.getState().getName()))
+                .anyMatch(instance -> instance.getSecurityGroups().stream()
+                        .anyMatch(group -> groupId.equals(group.getGroupId())))) {
+            return true;
+        }
+        return securityGroups.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(group -> !groupId.equals(group.getGroupId())
+                        && Objects.equals(selected.getVpcId(), group.getVpcId()))
+                .flatMap(group -> Stream.concat(
+                        group.getIpPermissions().stream(), group.getIpPermissionsEgress().stream()))
+                .flatMap(permission -> permission.getUserIdGroupPairs().stream())
+                .anyMatch(pair -> groupId.equals(pair.getGroupId())
+                        && (pair.getUserId() == null || Objects.equals(selected.getOwnerId(), pair.getUserId())));
     }
 
     public List<SecurityGroupRule> authorizeSecurityGroupIngress(String region, String groupId, List<IpPermission> permissions) {
