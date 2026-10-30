@@ -13185,7 +13185,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     String holder = addr.getAssociationId() == null ? null : addressHolder(region, addr);
                     if (holder != null) {
                         Instance host = instances.get(key(region, holder)).orElse(null);
-                        if (isMissingOrTerminated(host) || "shutting-down".equals(host.getState().getName())) {
+                        if (isMissingOrTerminated(host)) {
                             if (addr.getInstanceId() != null) {
                                 addr.setInstanceId(null);
                                 addresses.put(key(region, addr.getAllocationId()), addr);

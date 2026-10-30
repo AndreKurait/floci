@@ -2179,7 +2179,7 @@ class Ec2ServiceTest {
         String privateIp = secondaryAddress ? "10.234.0.11" : "10.234.0.10";
         service.associateAddress(region, address.getAllocationId(), first.getInstanceId(), privateIp);
         String association = address.getAssociationId();
-        boolean dead = "terminated".equals(state) || "missing".equals(state) || "shutting-down".equals(state);
+        boolean dead = "terminated".equals(state) || "missing".equals(state);
         first.setState("shutting-down".equals(state) ? InstanceState.shuttingDown() : dead ? InstanceState.terminated()
                 : "stopped".equals(state) ? InstanceState.stopped() : InstanceState.running());
         if ("missing".equals(state)) {
@@ -2196,7 +2196,7 @@ class Ec2ServiceTest {
             assertEquals(privateIp, observed.getPrivateIpAddress());
             assertEquals(address.getAllocationId(), observed.getAllocationId());
         }
-        if (dead && !"shutting-down".equals(state)) {
+        if (dead) {
             Instance second = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
                     1, 1, null, List.of(), subnet, null, List.of(), null, null,
                     null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();

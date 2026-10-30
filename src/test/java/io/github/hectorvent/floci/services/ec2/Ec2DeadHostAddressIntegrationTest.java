@@ -85,7 +85,7 @@ class Ec2DeadHostAddressIntegrationTest {
     }
     @ParameterizedTest
     @CsvSource({"false,false", "true,false", "false,true", "true,true"})
-    void directAddressReadClearsDeadHost(boolean secondary, boolean shuttingDown) throws Exception {
+    void directAddressReadPreservesAttachedHostUntilTermination(boolean secondary, boolean shuttingDown) throws Exception {
         String account = "000000000000";
         try (Ec2Client client = Ec2Client.builder()
                 .endpointOverride(URI.create("http://localhost:" + RestAssured.port))
@@ -122,12 +122,12 @@ class Ec2DeadHostAddressIntegrationTest {
 
                                     Address address = client.describeAddresses(b -> b.allocationIds(allocation))
                                             .addresses().getFirst();
-                                    assertNull(address.instanceId());
+                                    assertEquals(shuttingDown ? host : null, address.instanceId());
                                     assertEquals(eni, address.networkInterfaceId());
                                     assertEquals(association, address.associationId());
                                     assertEquals(privateIp, address.privateIpAddress());
-                                    assertTrue(client.describeAddresses(b -> b.filters(Filter.builder()
-                                            .name("instance-id").values(host).build())).addresses().isEmpty());
+                                    assertEquals(shuttingDown ? 1 : 0, client.describeAddresses(b -> b.filters(Filter.builder()
+                                            .name("instance-id").values(host).build())).addresses().size());
                                 }
                             }
                         }
