@@ -15022,46 +15022,48 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private NetworkInterface releaseIfHostIsGone(String accountId, String region, NetworkInterface ni) {
-        NetworkInterfaceAttachment attachment = ni.getAttachment();
-        if (attachment == null || attachment.getInstanceId() == null) {
-            return ni;
-        }
-        String safeAccount = accountId != null ? accountId : (ni.getOwnerId() != null ? ni.getOwnerId() : callerAccountId());
-        Instance host = instances instanceof AccountAwareStorageBackend<Instance> aware
-                ? aware.getForAccount(safeAccount, key(region, attachment.getInstanceId())).orElse(null)
-                : instances.get(key(region, attachment.getInstanceId())).orElse(null);
-        boolean hostIsGone = host == null || host.getState() == null
-                || "terminated".equals(host.getState().getName());
-        if (!hostIsGone) {
-            return ni;
-        }
-        List<Address> associatedAddresses = addresses instanceof AccountAwareStorageBackend<Address> aware
-                ? aware.scanForAccount(safeAccount, k -> k.startsWith(region + "::"))
-                : addresses.scan(k -> k.startsWith(region + "::"));
-        for (Address address : associatedAddresses) {
-            if (!ni.getNetworkInterfaceId().equals(address.getNetworkInterfaceId())) {
-                continue;
+        synchronized (privateIpAllocationLock) {
+            NetworkInterfaceAttachment attachment = ni.getAttachment();
+            if (attachment == null || attachment.getInstanceId() == null) {
+                return ni;
             }
-            address.setInstanceId(null);
-            if (addresses instanceof AccountAwareStorageBackend<Address> aware) {
-                aware.putForAccount(safeAccount, key(region, address.getAllocationId()), address);
+            String safeAccount = accountId != null ? accountId : (ni.getOwnerId() != null ? ni.getOwnerId() : callerAccountId());
+            Instance host = instances instanceof AccountAwareStorageBackend<Instance> aware
+                    ? aware.getForAccount(safeAccount, key(region, attachment.getInstanceId())).orElse(null)
+                    : instances.get(key(region, attachment.getInstanceId())).orElse(null);
+            boolean hostIsGone = host == null || host.getState() == null
+                    || "terminated".equals(host.getState().getName());
+            if (!hostIsGone) {
+                return ni;
+            }
+            List<Address> associatedAddresses = addresses instanceof AccountAwareStorageBackend<Address> aware
+                    ? aware.scanForAccount(safeAccount, k -> k.startsWith(region + "::"))
+                    : addresses.scan(k -> k.startsWith(region + "::"));
+            for (Address address : associatedAddresses) {
+                if (!ni.getNetworkInterfaceId().equals(address.getNetworkInterfaceId())) {
+                    continue;
+                }
+                address.setInstanceId(null);
+                if (addresses instanceof AccountAwareStorageBackend<Address> aware) {
+                    aware.putForAccount(safeAccount, key(region, address.getAllocationId()), address);
+                } else {
+                    addresses.put(key(region, address.getAllocationId()), address);
+                }
+            }
+            ni.setAttachment(null);
+            ni.setStatus("available");
+            if (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware) {
+                aware.putForAccount(safeAccount, key(region, ni.getNetworkInterfaceId()), ni);
             } else {
-                addresses.put(key(region, address.getAllocationId()), address);
+                networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
             }
+            // The dead instance has to let go of its copy as well. Releasing only the standalone
+            // record would leave the terminated instance still reporting the interface, so once it is
+            // reused two instance records would claim it, and a real one is not the winner by any
+            // rule DescribeInstances applies.
+            detachFromInstance(safeAccount, region, attachment.getInstanceId(), ni.getNetworkInterfaceId());
+            return ni;
         }
-        ni.setAttachment(null);
-        ni.setStatus("available");
-        if (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware) {
-            aware.putForAccount(safeAccount, key(region, ni.getNetworkInterfaceId()), ni);
-        } else {
-            networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
-        }
-        // The dead instance has to let go of its copy as well. Releasing only the standalone
-        // record would leave the terminated instance still reporting the interface, so once it is
-        // reused two instance records would claim it, and a real one is not the winner by any
-        // rule DescribeInstances applies.
-        detachFromInstance(safeAccount, region, attachment.getInstanceId(), ni.getNetworkInterfaceId());
-        return ni;
     }
 
     /**

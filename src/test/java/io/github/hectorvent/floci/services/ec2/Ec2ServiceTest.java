@@ -1973,6 +1973,61 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void delayedDeadHostReconciliationCannotClearASuccessfulReuse() throws Exception {
+        ParkingStore<Instance> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Instance> instanceStore = new AccountAwareStorageBackend<>(
+                parking, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)));
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.230.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        Instance oldHost = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        service.associateAddress(region, address.getAllocationId(), oldHost.getInstanceId());
+        String association = address.getAssociationId();
+        oldHost.setState(InstanceState.terminated());
+        AtomicReference<Thread> readingThread = new AtomicReference<>();
+        AtomicReference<Thread> launchingThread = new AtomicReference<>();
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        parking.parkNextRead();
+        try {
+            Future<NetworkInterfaceListResult> reading = workers.submit(() -> {
+                readingThread.set(Thread.currentThread());
+                return service.describeNetworkInterfaces(region, List.of(retained.getNetworkInterfaceId()),
+                        Map.of(), 0, null);
+            });
+            assertTrue(parking.awaitParked(), "dead-host read did not reach instance storage");
+            Future<Instance> launching = workers.submit(() -> {
+                launchingThread.set(Thread.currentThread());
+                return service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                        1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                        null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+            });
+            Awaitility.await("reuse completes or waits for the reconciling read")
+                    .atMost(Duration.ofSeconds(10)).until(() -> launching.isDone()
+                    || isBlockedIn(launchingThread.get(), "releaseIfHostIsGone", readingThread.get())
+                    || isBlockedIn(launchingThread.get(), "runInstances", readingThread.get()));
+            parking.release();
+            reading.get(10, TimeUnit.SECONDS);
+            Instance newHost = launching.get(10, TimeUnit.SECONDS);
+            assertEquals(newHost.getInstanceId(), address.getInstanceId());
+            assertNotNull(retained.getAttachment());
+            assertEquals(newHost.getInstanceId(), retained.getAttachment().getInstanceId());
+            assertEquals(association, address.getAssociationId());
+            assertEquals("in-use", retained.getStatus());
+        } finally {
+            parking.release();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
     void deadHostAddressReconciliationUsesTheExplicitInterfaceOwner() {
         RequestContext context = new RequestContext();
         // The EC2 model Instance is already imported; this is the CDI Instance type.
