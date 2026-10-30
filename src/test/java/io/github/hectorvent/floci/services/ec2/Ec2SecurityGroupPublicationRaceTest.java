@@ -8,6 +8,8 @@ import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ec2.model.VpcEndpoint;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import io.github.hectorvent.floci.testing.ParkingStore;
@@ -319,7 +321,9 @@ class Ec2SecurityGroupPublicationRaceTest {
             assertFalse(deleted.isDone(), "Deletion must wait for launch publication");
             factory.instances.release();
             Reservation reservation = created.get(5, TimeUnit.SECONDS);
-            assertEquals("DependencyViolation", deleted.get(5, TimeUnit.SECONDS).getErrorCode());
+            AwsException failure = deleted.get(5, TimeUnit.SECONDS);
+            assertNotNull(failure, "Stored endpoint membership must prevent group deletion");
+            assertEquals("DependencyViolation", failure.getErrorCode());
             assertEquals(subnet, reservation.getInstances().getFirst().getSubnetId());
             assertEquals(1, service.describeSubnets(region, List.of(subnet), Map.of()).size());
         } finally {
@@ -614,6 +618,164 @@ class Ec2SecurityGroupPublicationRaceTest {
         }
     }
 
+    @Test
+    void endpointCreationRechecksAGroupDeletedAfterItsFirstRead() throws Exception {
+        TestStores factory = new TestStores();
+        Ec2Service service = service(factory);
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        String group = service.createSecurityGroup(region, "endpoint-race", "endpoint", vpc).getGroupId();
+        factory.groups.parkNextRead();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<AwsException> created = executor.submit(() -> {
+                try {
+                    service.createVpcEndpoint(region, vpc, "test-service", "Interface",
+                            List.of(), List.of(), List.of(group), false, null,
+                            List.of(new Tag("EndpointRace", "rejected")));
+                    return null;
+                } catch (AwsException failure) {
+                    return failure;
+                }
+            });
+            assertTrue(factory.groups.awaitParked());
+            service.deleteSecurityGroup(region, group);
+            factory.groups.release();
+            AwsException failure = created.get(5, TimeUnit.SECONDS);
+            assertNotNull(failure, "Creation must reject the deleted group");
+            assertEquals("InvalidGroup.NotFound", failure.getErrorCode());
+            assertTrue(service.describeVpcEndpoints(region, List.of(), Map.of()).isEmpty());
+            assertTrue(service.describeTags(region, Map.of("key", List.of("EndpointRace"))).isEmpty());
+        } finally {
+            factory.groups.release();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void endpointPublicationProtectsItsGroupUntilEndpointDeletion() throws Exception {
+        TestStores factory = new TestStores();
+        Ec2Service service = service(factory);
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        String group = service.createSecurityGroup(region, "endpoint-reference", "endpoint", vpc).getGroupId();
+        factory.endpoints.parkNextWrite();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<VpcEndpoint> created = executor.submit(() -> createEndpoint(service, region, vpc, group));
+            assertTrue(factory.endpoints.awaitParked());
+            AtomicReference<Thread> deletingThread = new AtomicReference<>();
+            Future<AwsException> deleted = executor.submit(() -> {
+                deletingThread.set(Thread.currentThread());
+                try {
+                    service.deleteSecurityGroup(region, group);
+                    return null;
+                } catch (AwsException failure) {
+                    return failure;
+                }
+            });
+            awaitBlockedOrDone(deletingThread, deleted);
+            assertFalse(deleted.isDone());
+            factory.endpoints.release();
+            VpcEndpoint endpoint = created.get(5, TimeUnit.SECONDS);
+            AwsException failure = deleted.get(5, TimeUnit.SECONDS);
+            assertNotNull(failure, "Stored endpoint membership must prevent group deletion");
+            assertEquals("DependencyViolation", failure.getErrorCode());
+            service.deleteVpcEndpoints(region, List.of(endpoint.getVpcEndpointId()));
+            service.deleteSecurityGroup(region, group);
+        } finally {
+            factory.endpoints.release();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void endpointGroupModificationProtectsValidatedReferenceFromDeletion() throws Exception {
+        TestStores factory = new TestStores();
+        Ec2Service service = service(factory);
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        String original = service.createSecurityGroup(region, "endpoint-original", "endpoint", vpc).getGroupId();
+        String replacement = service.createSecurityGroup(region, "endpoint-replacement", "endpoint", vpc).getGroupId();
+        VpcEndpoint endpoint = createEndpoint(service, region, vpc, original);
+        factory.groups.parkNextRead();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<VpcEndpoint> modified = executor.submit(() -> service.modifyVpcEndpoint(region,
+                    endpoint.getVpcEndpointId(), List.of(), List.of(), List.of(), List.of(),
+                    List.of(replacement), List.of(original), null, null, null));
+            assertTrue(factory.groups.awaitParked());
+            AtomicReference<Thread> deletingThread = new AtomicReference<>();
+            Future<AwsException> deleted = executor.submit(() -> {
+                deletingThread.set(Thread.currentThread());
+                try {
+                    service.deleteSecurityGroup(region, replacement);
+                    return null;
+                } catch (AwsException failure) {
+                    return failure;
+                }
+            });
+            awaitBlockedOrDone(deletingThread, deleted);
+            assertFalse(deleted.isDone());
+            factory.groups.release();
+            assertEquals(List.of(replacement), modified.get(5, TimeUnit.SECONDS).getSecurityGroupIds());
+            AwsException failure = deleted.get(5, TimeUnit.SECONDS);
+            assertNotNull(failure, "Stored endpoint membership must prevent group deletion");
+            assertEquals("DependencyViolation", failure.getErrorCode());
+            service.deleteSecurityGroup(region, original);
+            service.deleteVpcEndpoints(region, List.of(endpoint.getVpcEndpointId()));
+            service.deleteSecurityGroup(region, replacement);
+        } finally {
+            factory.groups.release();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void endpointDeletionWaitsForModificationWithoutResurrection() throws Exception {
+        TestStores factory = new TestStores();
+        Ec2Service service = service(factory);
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.0.0.0/16", false).getVpcId();
+        String group = service.createSecurityGroup(region, "endpoint-delete", "endpoint", vpc).getGroupId();
+        VpcEndpoint endpoint = createEndpoint(service, region, vpc, group);
+        factory.endpoints.parkNextRead();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<VpcEndpoint> modified = executor.submit(() -> service.modifyVpcEndpoint(region,
+                    endpoint.getVpcEndpointId(), List.of(), List.of(), List.of(), List.of(),
+                    List.of(), List.of(), "replacement-policy", null, null));
+            assertTrue(factory.endpoints.awaitParked());
+            AtomicReference<Thread> deletingThread = new AtomicReference<>();
+            Future<List<VpcEndpoint>> deleted = executor.submit(() -> {
+                deletingThread.set(Thread.currentThread());
+                return service.deleteVpcEndpoints(region, List.of(endpoint.getVpcEndpointId()));
+            });
+            awaitBlockedOrDone(deletingThread, deleted);
+            assertFalse(deleted.isDone());
+            factory.endpoints.release();
+            modified.get(5, TimeUnit.SECONDS);
+            assertEquals(1, deleted.get(5, TimeUnit.SECONDS).size());
+            assertTrue(service.describeVpcEndpoints(region, List.of(), Map.of()).isEmpty());
+            service.deleteSecurityGroup(region, group);
+            assertEquals("InvalidVpcEndpointId.NotFound", assertThrows(AwsException.class,
+                    () -> service.modifyVpcEndpoint(region, endpoint.getVpcEndpointId(), List.of(), List.of(),
+                            List.of(), List.of(), List.of(group), List.of(), null, null, null)).getErrorCode());
+        } finally {
+            factory.endpoints.release();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    private static VpcEndpoint createEndpoint(Ec2Service service, String region, String vpc, String group) {
+        return service.createVpcEndpoint(region, vpc, "test-service", "Interface", List.of(), List.of(),
+                List.of(group), false, null, List.of());
+    }
+
     private static Ec2Service service(TestStores factory) {
         return new Ec2Service(mockConfig(), mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
                 mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), factory.storage);
@@ -632,11 +794,13 @@ class Ec2SecurityGroupPublicationRaceTest {
     }
 
     private static final class TestStores {
+        private final ParkingStore<VpcEndpoint> endpoints = new ParkingStore<>();
         private final ParkingStore<NetworkInterface> interfaces = new ParkingStore<>();
         private final ParkingStore<Instance> instances = new ParkingStore<>();
         private final ParkingStore<SecurityGroupRule> rules = new ParkingStore<>();
         private final ParkingStore<SecurityGroup> groups = new ParkingStore<>();
         private final InMemoryStorageFactory storage = new InMemoryStorageFactory("000000000000")
+                .withStore("ec2-vpc-endpoints.json", endpoints)
                 .withStore("ec2-network-interfaces.json", interfaces)
                 .withStore("ec2-instances.json", instances)
                 .withStore("ec2-security-groups.json", groups)

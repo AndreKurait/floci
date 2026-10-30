@@ -89,12 +89,70 @@ class Ec2SecurityGroupTagDeletionIntegrationTest {
         assertEquals(1, client.describeSecurityGroups(request -> request.groupIds(group)).securityGroups().size());
     }
 
+    @Test
+    void endpointGroupReplacementRetainsReferencesUntilRemovalOrDeletion() {
+        Ec2Client client = client();
+        String vpc = vpc(client);
+        String original = group(client, vpc);
+        String replacement = group(client, vpc);
+        String subnet = client.createSubnet(request -> request.vpcId(vpc).cidrBlock("10.231.1.0/24"))
+                .subnet().subnetId();
+        cleanup.register(() -> client.deleteSubnet(request -> request.subnetId(subnet)));
+        String endpoint = client.createVpcEndpoint(request -> request.vpcId(vpc)
+                .vpcEndpointType("Interface").serviceName("com.amazonaws.us-west-2.ssm")
+                .subnetIds(subnet).securityGroupIds(original)).vpcEndpoint().vpcEndpointId();
+        cleanup.register(() -> client.describeVpcEndpoints(request -> request.filters(
+                Filter.builder().name("vpc-id").values(vpc).build())).vpcEndpoints().stream()
+                .filter(value -> endpoint.equals(value.vpcEndpointId()))
+                .forEach(value -> client.deleteVpcEndpoints(request -> request.vpcEndpointIds(endpoint))));
+        tag(client, List.of(original, replacement, endpoint));
+
+        assertEquals("DependencyViolation", assertThrows(Ec2Exception.class,
+                () -> client.deleteSecurityGroup(request -> request.groupId(original))).awsErrorDetails().errorCode());
+        assertEquals(3, tagCount(client, List.of(original, replacement, endpoint)));
+        assertEquals("InvalidGroup.NotFound", assertThrows(Ec2Exception.class,
+                () -> client.modifyVpcEndpoint(request -> request.vpcEndpointId(endpoint)
+                        .addSecurityGroupIds("sg-00000000000000000").removeSecurityGroupIds(original)
+                        .privateDnsEnabled(false))).awsErrorDetails().errorCode());
+        assertEquals(List.of(original), client.describeVpcEndpoints(request -> request.vpcEndpointIds(endpoint))
+                .vpcEndpoints().getFirst().groups().stream().map(value -> value.groupId()).toList());
+
+        client.modifyVpcEndpoint(request -> request.vpcEndpointId(endpoint)
+                .addSecurityGroupIds(replacement).removeSecurityGroupIds(original));
+        client.deleteSecurityGroup(request -> request.groupId(original));
+        assertEquals("DependencyViolation", assertThrows(Ec2Exception.class,
+                () -> client.deleteSecurityGroup(request -> request.groupId(replacement))).awsErrorDetails().errorCode());
+        client.deleteVpcEndpoints(request -> request.vpcEndpointIds(endpoint));
+        client.deleteSecurityGroup(request -> request.groupId(replacement));
+        assertEquals(0, tagCount(client, List.of(original, replacement, endpoint)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void endpointReferencesCannotResolveGroupsInAnotherAccountOrRegion(boolean foreignAccount) {
+        Ec2Client owner = client();
+        String group = group(owner, vpc(owner));
+        Ec2Client other = client(foreignAccount ? Region.US_WEST_2 : Region.US_EAST_1,
+                foreignAccount ? "555566667790" : "555566667789");
+        String otherVpc = vpc(other);
+        assertEquals("InvalidGroup.NotFound", assertThrows(Ec2Exception.class,
+                () -> other.createVpcEndpoint(request -> request.vpcId(otherVpc).vpcEndpointType("Interface")
+                        .serviceName("test-service").securityGroupIds(group))).awsErrorDetails().errorCode());
+        assertTrue(other.describeVpcEndpoints(request -> request.filters(
+                Filter.builder().name("vpc-id").values(otherVpc).build())).vpcEndpoints().isEmpty());
+        assertEquals(1, owner.describeSecurityGroups(request -> request.groupIds(group)).securityGroups().size());
+    }
+
     private Ec2Client client() {
+        return client(Region.US_WEST_2, "555566667789");
+    }
+
+    private Ec2Client client(Region region, String account) {
         Ec2Client client = Ec2Client.builder()
                 .endpointOverride(URI.create("http://localhost:" + RestAssured.port))
-                .region(Region.US_WEST_2)
+                .region(region)
                 .credentialsProvider(StaticCredentialsProvider.create(
-                        AwsBasicCredentials.create("555566667789", "test")))
+                        AwsBasicCredentials.create(account, "test")))
                 .httpClientBuilder(UrlConnectionHttpClient.builder()).build();
         cleanup.register(client::close);
         return client;
