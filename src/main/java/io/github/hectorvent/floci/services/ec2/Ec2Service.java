@@ -7900,23 +7900,25 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             new AwsException("InvalidGroup.NotFound",
                                     "The security group '" + groupName + "' does not exist in the default VPC", 400));
         }
-        synchronized (lockFor(key(region, selectedId))) {
-            SecurityGroup selected = getRequiredSecurityGroup(region, selectedId);
-            if ("default".equals(selected.getGroupName())) {
-                throw new AwsException("Client.CannotDelete", "The default security group cannot be deleted", 400);
+        synchronized (attachmentTopologyLock(region)) {
+            synchronized (lockFor(key(region, selectedId))) {
+                SecurityGroup selected = getRequiredSecurityGroup(region, selectedId);
+                if ("default".equals(selected.getGroupName())) {
+                    throw new AwsException("Client.CannotDelete", "The default security group cannot be deleted", 400);
+                }
+                if (hasSecurityGroupDependencies(region, selected)) {
+                    throw new AwsException("DependencyViolation",
+                            "The security group '" + selectedId + "' has a dependent object", 400);
+                }
+                if (dryRun) {
+                    throw new AwsException("DryRunOperation",
+                            "Request would have succeeded, but DryRun flag is set.", 412);
+                }
+                securityGroups.delete(key(region, selectedId));
+                securityGroupRules.scan(k -> k.startsWith(region + "::")).stream()
+                        .filter(rule -> selected.getGroupId().equals(rule.getGroupId()))
+                        .forEach(rule -> securityGroupRules.delete(key(region, rule.getSecurityGroupRuleId())));
             }
-            if (hasSecurityGroupDependencies(region, selected)) {
-                throw new AwsException("DependencyViolation",
-                        "The security group '" + selectedId + "' has a dependent object", 400);
-            }
-            if (dryRun) {
-                throw new AwsException("DryRunOperation",
-                        "Request would have succeeded, but DryRun flag is set.", 412);
-            }
-            securityGroups.delete(key(region, selectedId));
-            securityGroupRules.scan(k -> k.startsWith(region + "::")).stream()
-                    .filter(rule -> selected.getGroupId().equals(rule.getGroupId()))
-                    .forEach(rule -> securityGroupRules.delete(key(region, rule.getSecurityGroupRuleId())));
         }
         return selectedId;
     }
@@ -14712,73 +14714,75 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     "The request must contain the parameter SubnetId", 400);
         }
         ensureDefaultResources(region);
-        Subnet subnet = requireSubnet(region, subnetId);
-        List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
-        if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
-            for (String sgId : securityGroupIds) {
-                SecurityGroup sg = securityGroups.get(key(region, sgId)).orElseThrow(() ->
-                        new AwsException("InvalidSecurityGroupID.NotFound",
-                                "The securityGroup ID '" + sgId + "' does not exist", 400));
-                if (!subnet.getVpcId().equals(sg.getVpcId())) {
-                    throw new AwsException("InvalidGroup.NotFound",
-                            "Security group " + sgId + " does not belong to the subnet VPC", 400);
-                }
-                sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
-            }
-        } else {
-            SecurityGroup defaultSg = securityGroups.scan(k -> k.startsWith(region + "::")).stream()
-                    .filter(group -> subnet.getVpcId().equals(group.getVpcId())
-                            && "default".equals(group.getGroupName()))
-                    .findFirst().orElse(null);
-            if (defaultSg != null) {
-                sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
-            }
-        }
-
-        synchronized (privateIpAllocationLock) {
-            String eniId = "eni-" + randomHex(17);
-            String primaryIp = (privateIpAddress != null && !privateIpAddress.isBlank())
-                    ? privateIpAddress : assignPrivateIp(region, subnetId);
-            String primaryDns = AwsRegions.ec2PrivateIpDnsName(primaryIp, region);
-
-            NetworkInterface ni = new NetworkInterface();
-            ni.setNetworkInterfaceId(eniId);
-            ni.setSubnetId(subnetId);
-            ni.setVpcId(subnet.getVpcId());
-            ni.setAvailabilityZone(subnet.getAvailabilityZone());
-            ni.setDescription(description);
-            ni.setOwnerId(callerAccountId());
-            ni.setStatus("available");
-            ni.setMacAddress(randomMac());
-            ni.setPrivateIpAddress(primaryIp);
-            ni.setPrivateDnsName(primaryDns);
-            ni.setGroups(sgIdentifiers);
-            if (tagList != null) {
-                ni.getTagSet().addAll(tagList);
-            }
-
-            List<NetworkInterfacePrivateIpAddress> ipList = new ArrayList<>();
-            NetworkInterfacePrivateIpAddress primary = new NetworkInterfacePrivateIpAddress();
-            primary.setPrivateIpAddress(primaryIp);
-            primary.setPrivateDnsName(primaryDns);
-            primary.setPrimary(true);
-            ipList.add(primary);
-            if (privateIpAddresses != null) {
-                for (String extra : privateIpAddresses) {
-                    if (extra == null || extra.isBlank() || extra.equals(primaryIp)) {
-                        continue;
+        synchronized (attachmentTopologyLock(region)) {
+            Subnet subnet = requireSubnet(region, subnetId);
+            List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
+            if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
+                for (String sgId : securityGroupIds) {
+                    SecurityGroup sg = securityGroups.get(key(region, sgId)).orElseThrow(() ->
+                            new AwsException("InvalidSecurityGroupID.NotFound",
+                                    "The securityGroup ID '" + sgId + "' does not exist", 400));
+                    if (!subnet.getVpcId().equals(sg.getVpcId())) {
+                        throw new AwsException("InvalidGroup.NotFound",
+                                "Security group " + sgId + " does not belong to the subnet VPC", 400);
                     }
-                    NetworkInterfacePrivateIpAddress secondary = new NetworkInterfacePrivateIpAddress();
-                    secondary.setPrivateIpAddress(extra);
-                    secondary.setPrivateDnsName(AwsRegions.ec2PrivateIpDnsName(extra, region));
-                    secondary.setPrimary(false);
-                    ipList.add(secondary);
+                    sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
+                }
+            } else {
+                SecurityGroup defaultSg = securityGroups.scan(k -> k.startsWith(region + "::")).stream()
+                        .filter(group -> subnet.getVpcId().equals(group.getVpcId())
+                                && "default".equals(group.getGroupName()))
+                        .findFirst().orElse(null);
+                if (defaultSg != null) {
+                    sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
                 }
             }
-            ni.setPrivateIpAddresses(ipList);
 
-            networkInterfaces.put(key(region, eniId), ni);
-            return ni;
+            synchronized (privateIpAllocationLock) {
+                String eniId = "eni-" + randomHex(17);
+                String primaryIp = (privateIpAddress != null && !privateIpAddress.isBlank())
+                        ? privateIpAddress : assignPrivateIp(region, subnetId);
+                String primaryDns = AwsRegions.ec2PrivateIpDnsName(primaryIp, region);
+
+                NetworkInterface ni = new NetworkInterface();
+                ni.setNetworkInterfaceId(eniId);
+                ni.setSubnetId(subnetId);
+                ni.setVpcId(subnet.getVpcId());
+                ni.setAvailabilityZone(subnet.getAvailabilityZone());
+                ni.setDescription(description);
+                ni.setOwnerId(callerAccountId());
+                ni.setStatus("available");
+                ni.setMacAddress(randomMac());
+                ni.setPrivateIpAddress(primaryIp);
+                ni.setPrivateDnsName(primaryDns);
+                ni.setGroups(sgIdentifiers);
+                if (tagList != null) {
+                    ni.getTagSet().addAll(tagList);
+                }
+
+                List<NetworkInterfacePrivateIpAddress> ipList = new ArrayList<>();
+                NetworkInterfacePrivateIpAddress primary = new NetworkInterfacePrivateIpAddress();
+                primary.setPrivateIpAddress(primaryIp);
+                primary.setPrivateDnsName(primaryDns);
+                primary.setPrimary(true);
+                ipList.add(primary);
+                if (privateIpAddresses != null) {
+                    for (String extra : privateIpAddresses) {
+                        if (extra == null || extra.isBlank() || extra.equals(primaryIp)) {
+                            continue;
+                        }
+                        NetworkInterfacePrivateIpAddress secondary = new NetworkInterfacePrivateIpAddress();
+                        secondary.setPrivateIpAddress(extra);
+                        secondary.setPrivateDnsName(AwsRegions.ec2PrivateIpDnsName(extra, region));
+                        secondary.setPrimary(false);
+                        ipList.add(secondary);
+                    }
+                }
+                ni.setPrivateIpAddresses(ipList);
+
+                networkInterfaces.put(key(region, eniId), ni);
+                return ni;
+            }
         }
     }
 
