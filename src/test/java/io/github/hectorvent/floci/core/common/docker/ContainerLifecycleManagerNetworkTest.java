@@ -111,11 +111,14 @@ class ContainerLifecycleManagerNetworkTest {
     }
 
     @Test
-    void createKeepsPublishedPortsByConnectingWithoutDisconnecting() {
+    void createReconnectsLinkLocalEndpointWithPublishedPorts() {
         manager().create(specWithLinkLocalIp(Map.of(8080, 18080)));
 
-        verify(disconnectCmd, never()).exec();
-        verify(connectCmd).exec();
+        InOrder order = inOrder(createCmd, disconnectCmd, connectCmd);
+        order.verify(createCmd).exec();
+        order.verify(disconnectCmd).exec();
+        order.verify(connectCmd).exec();
+        assertEquals("test-network", createdHostConfig().getNetworkMode());
     }
 
     @ParameterizedTest
@@ -137,31 +140,33 @@ class ContainerLifecycleManagerNetworkTest {
     }
 
     @Test
-    void createAndStartFailsAndRemovesThePublishingContainerWhenItsNetworkDoesNotExist() {
-        when(dockerClient.startContainerCmd("container-id")).thenReturn(mock(StartContainerCmd.class));
-        RemoveContainerCmd removeCmd = mock(RemoveContainerCmd.class, RETURNS_SELF);
-        when(dockerClient.removeContainerCmd("container-id")).thenReturn(removeCmd);
-        doThrow(new NotFoundException("network floci-nte not found")).when(connectCmd).exec();
+    void createAndStartFailsBeforeStartingWhenItsNetworkDoesNotExist() {
+        doThrow(new NotFoundException("network floci-nte not found")).when(createCmd).exec();
 
-        IllegalStateException e = assertThrows(IllegalStateException.class,
+        NotFoundException e = assertThrows(NotFoundException.class,
                 () -> manager().createAndStart(spec("floci-nte", Map.of(8080, 18080), List.of())));
 
-        assertTrue(e.getMessage().contains("Docker network floci-nte"), e.getMessage());
         assertTrue(e.getMessage().contains("network floci-nte not found"), e.getMessage());
-        verify(removeCmd).exec();
+        assertEquals("floci-nte", createdHostConfig().getNetworkMode());
+        verify(dockerClient, never()).startContainerCmd(any(String.class));
+        verify(connectCmd, never()).exec();
     }
 
     @Test
-    void createAndStartKeepsThePublishingContainerWhenJoiningAnExistingNetworkFails() {
+    void createAndStartPublishesPortsOnTheDeclaredNetworkWithoutAddingDefaultBridge() {
         when(dockerClient.startContainerCmd("container-id")).thenReturn(mock(StartContainerCmd.class));
-        doThrow(new RuntimeException("endpoint already exists")).when(connectCmd).exec();
         NetworkSettings networks = mock(NetworkSettings.class);
         InspectContainerResponse inspect = inspectOf("container-id");
         when(inspect.getNetworkSettings()).thenReturn(networks);
 
         manager().createAndStart(spec("floci-net", Map.of(8080, 18080), List.of()));
 
-        verify(dockerClient, never()).removeContainerCmd(any(String.class));
+        HostConfig hostConfig = createdHostConfig();
+        assertEquals("floci-net", hostConfig.getNetworkMode());
+        assertEquals("18080", hostConfig.getPortBindings().getBindings().get(ExposedPort.tcp(8080))[0]
+                .getHostPortSpec());
+        verify(connectCmd, never()).exec();
+        verify(disconnectCmd, never()).exec();
     }
 
     @Test
@@ -172,12 +177,6 @@ class ContainerLifecycleManagerNetworkTest {
         verify(connectCmd, never()).exec();
     }
 
-    /**
-     * Pins the {@code !spec.hasNetworkConfiguration()} guard in {@code startCreated}: without it,
-     * a container with both published ports and a link-local address would be connected twice,
-     * once by {@code create}'s pre-start attach and again by {@code startCreated}'s post-start
-     * reconnect for port-bound containers (raised in review on #4063).
-     */
     @Test
     void createAndStartConnectsOnceForPortsPlusLinkLocalIp() {
         when(dockerClient.startContainerCmd("container-id")).thenReturn(mock(StartContainerCmd.class));
@@ -192,14 +191,13 @@ class ContainerLifecycleManagerNetworkTest {
         manager().createAndStart(specWithLinkLocalIp(Map.of(8080, 18080)));
 
         verify(connectCmd, times(1)).exec();
-        verify(disconnectCmd, never()).exec();
+        verify(disconnectCmd, times(1)).exec();
     }
 
     /**
      * Docker only honours host, none and container:<id> on the HostConfig at creation, refuses
      * to connect a container to them afterwards, and publishes no host ports through them. A
-     * port-bound spec must therefore still put the mode on the HostConfig instead of taking the
-     * publish-then-connect path, which left such containers on the default bridge.
+     * port-bound spec must therefore put the mode on the HostConfig without publishing ports.
      */
     @ParameterizedTest
     @ValueSource(strings = {"host", "none", "container:sibling"})

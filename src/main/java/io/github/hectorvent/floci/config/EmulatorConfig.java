@@ -3543,6 +3543,14 @@ public interface EmulatorConfig {
         /** Docker network driver for VPC networks. */
         @WithDefault("bridge")
         String driver();
+
+        /**
+         * Create internal Docker VPC networks without external connectivity through that network.
+         * Other guest attachments retain their own connectivity.
+         * Env: {@code FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL}.
+         */
+        @WithDefault("false")
+        boolean internal();
     }
 
     interface AppConfigServiceConfig {
