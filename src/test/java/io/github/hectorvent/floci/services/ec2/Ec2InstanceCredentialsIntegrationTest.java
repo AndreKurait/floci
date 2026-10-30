@@ -62,6 +62,7 @@ class Ec2InstanceCredentialsIntegrationTest {
             assertEquals("AWS-HMAC", credential.getString("Type"));
             assertTrue(Instant.parse(credential.getString("Expiration")).isAfter(Instant.now()));
             String key = credential.getString("AccessKeyId");
+            assertTrue(key.matches("ASIATS5Z4K4C[A-P][A-Z2-7]{7}"));
             String sessionToken = credential.getString("Token");
             assertEquals(credential.getString("SecretAccessKey"), iam.findSecretKey(key, sessionToken).orElseThrow());
             assertEquals(account, iam.resolveAccountId(key).orElseThrow());
@@ -121,6 +122,7 @@ class Ec2InstanceCredentialsIntegrationTest {
             assertTrue(Instant.parse(credential.getString("Expiration")).isAfter(Instant.now()));
             assertNotNull(Instant.parse(credential.getString("LastUpdated")));
             String key = credential.getString("AccessKeyId");
+            assertTrue(key.matches("ASIATS5Z4K4C[A-P][A-Z2-7]{7}"));
             String sessionToken = credential.getString("Token");
             assertEquals(credential.getString("SecretAccessKey"), iam.findSecretKey(key, sessionToken).orElseThrow());
             assertEquals("246813579012", iam.resolveAccountId(key).orElseThrow());

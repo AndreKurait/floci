@@ -559,6 +559,12 @@ Instance identity credentials are served for every instance, with or without an 
 
 Each registered instance receives its own temporary IAM session. Credentials last one hour and refresh on retrieval during the final five minutes; the previous generation remains valid until expiration. Floci revokes tracked sessions when the instance is unregistered or IMDS shuts down, and discards persisted EC2 sessions when Floci restarts. Restored guests obtain fresh credentials after metadata registration is rebuilt.
 
+New instance-profile and instance-identity access-key IDs use the modern `ASIA`
+base32 format described in [public format research](https://awsteele.com/blog/2020/09/26/aws-access-key-format.html).
+They encode the issuing account so clients that decode IDs locally agree with IAM.
+Authentication still requires the registered credential's secret and session token;
+an account encoded in an unknown key grants no access. This changes EC2 issuance only.
+
 Guests with an instance profile receive endpoint and region settings without Floci's static `test` credentials, allowing the standard SDK credential chain to reach IMDS. Guests without an instance profile retain the existing local `test` credential environment. Custom images can still override the SDK chain with their own credentials. This does not add EKS access-entry authorization or change Floci's global IAM enforcement configuration.
 
 ### IMDS and SSM managed instances

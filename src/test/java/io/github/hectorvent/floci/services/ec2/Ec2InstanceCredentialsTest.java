@@ -6,6 +6,10 @@ import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.NullAndEmptySource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Instant;
 import java.util.List;
@@ -28,7 +32,7 @@ class Ec2InstanceCredentialsTest {
     void credentialsAreRegisteredStableAndRotateWithOverlap() {
         Fixture fixture = fixture();
         SessionCredential first = fixture.get(NOW);
-        assertTrue(first.getAccessKeyId().matches("ASIA[A-F0-9]{16}"));
+        assertTrue(first.getAccessKeyId().matches("ASIARZPUZDIK[A-P][A-Z2-7]{7}"));
         assertEquals(40, first.getSecretAccessKey().length());
         assertEquals(ACCOUNT, first.getOriginAccountId());
         assertEquals("i-first", first.getEc2InstanceId());
@@ -42,6 +46,37 @@ class Ec2InstanceCredentialsTest {
         verify(fixture.iam, never()).unregisterSession(ACCOUNT, first.getAccessKeyId());
         fixture.get(NOW.plusSeconds(3600));
         verify(fixture.iam).unregisterSession(ACCOUNT, first.getAccessKeyId());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "'000000000000', QAAAAAAA, [A-P]",
+            "'000000000001', QAAAAAAA, [Q-Z2-7]",
+            "'123456789012', RZPUZDIK, [A-P]",
+            "'123456789013', RZPUZDIK, [Q-Z2-7]",
+            "'609629065308', Y34FZKBO, [A-P]",
+            "'609629065309', Y34FZKBO, [Q-Z2-7]",
+            "'999999999998', 6RVFFB77, [A-P]",
+            "'999999999999', 6RVFFB77, [Q-Z2-7]"
+    })
+    void profileAndIdentityKeysCarryTheirAccountAcrossRotation(String account, String encoded, String parity) {
+        Fixture fixture = fixture(account);
+        String format = "ASIA" + encoded + parity + "[A-Z2-7]{7}";
+        for (Instant time : List.of(NOW, NOW.plusSeconds(3300))) {
+            assertTrue(fixture.get(time).getAccessKeyId().matches(format));
+            assertTrue(fixture.credentials.identity(fixture.instance, account, time)
+                    .orElseThrow().getAccessKeyId().matches(format));
+        }
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {"test", "123", "1000000000000", "-12345678901"})
+    void invalidIdentityAccountDoesNotRegisterCredentials(String account) {
+        Fixture fixture = fixture();
+        assertThrows(IllegalArgumentException.class,
+                () -> fixture.credentials.identity(fixture.instance, account, NOW));
+        verify(fixture.iam, never()).registerEc2InstanceSession(any());
     }
 
     @Test
@@ -107,17 +142,22 @@ class Ec2InstanceCredentialsTest {
     }
 
     private static Fixture fixture() {
+        return fixture(ACCOUNT);
+    }
+
+    private static Fixture fixture(String account) {
         IamService iam = mock(IamService.class);
         InstanceProfile profile = new InstanceProfile();
-        profile.setArn(PROFILE);
+        profile.setArn("arn:aws:iam::" + account + ":instance-profile/path/profile");
         profile.setRoleNames(List.of("worker"));
         IamRole role = new IamRole("AROA-first", "worker", "/nodes/",
-                "arn:aws:iam::123456789012:role/nodes/worker", "{}");
-        when(iam.findInstanceProfile(ACCOUNT, "profile")).thenReturn(Optional.of(profile));
-        when(iam.findRole(ACCOUNT, "worker")).thenReturn(Optional.of(role));
+                "arn:aws:iam::" + account + ":role/nodes/worker", "{}");
+        when(iam.findInstanceProfile(account, "profile")).thenReturn(Optional.of(profile));
+        when(iam.findRole(account, "worker")).thenReturn(Optional.of(role));
         Instance instance = new Instance();
         instance.setInstanceId("i-first");
-        instance.setIamInstanceProfileArn(PROFILE);
+        instance.setRegion("us-east-1");
+        instance.setIamInstanceProfileArn(profile.getArn());
         Ec2InstanceCredentials credentials = new Ec2InstanceCredentials(iam);
         credentials.register(instance);
         return new Fixture(iam, role, instance, credentials);
