@@ -4176,6 +4176,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
             }
             synchronized (privateIpAllocationLock) {
+                if (suppliedEni != null) {
+                    suppliedEni = takeNetworkInterfaceForLaunch(region, networkInterfaceId);
+                }
                 int admitted = !config.services().ec2().enforceVcpuQuotas() || spot || "host".equals(tenancy)
                         ? count : admittedInstanceCount(region, effectiveInstanceType, minCount, capacityMaxCount);
                 synchronized (hostLock) {

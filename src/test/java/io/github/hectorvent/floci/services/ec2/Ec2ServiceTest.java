@@ -4485,6 +4485,70 @@ class Ec2ServiceTest {
         assertTrue(service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().isEmpty());
     }
 
+    @ParameterizedTest
+    @CsvSource({"false,false", "true,false", "false,true"})
+    void suppliedInterfaceAdmissionRechecksAfterConcurrentAttachmentOrDeletion(boolean delete, boolean different) throws Exception {
+        ParkingStore<Subnet> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Subnet> subnetStore = new AccountAwareStorageBackend<>(
+                parking, null, "000000000000");
+        Ec2Service service = tagTestService(new InMemoryStorageFactory(Map.of("ec2-subnets.json", subnetStore)));
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.232.0.0/24");
+        NetworkInterface supplied = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        String interfaceId = supplied.getNetworkInterfaceId();
+        String competingId = different ? service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId() : interfaceId;
+        service.createTags(region, List.of(interfaceId), List.of(new Tag("retained", "value")));
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        parking.parkNextRead();
+        try {
+            Future<Reservation> delayed = worker.submit(() -> service.runInstances(region, "ami-test", "t3.micro",
+                    1, 1, null, List.of(), null, null, List.of(new Tag("delayed", "value")),
+                    null, null, null, interfaceId, 0));
+            assertTrue(parking.awaitParked(), "launch never reached its post-interface subnet lookup");
+            Instance winner = null;
+            if (delete) {
+                service.deleteNetworkInterface(region, interfaceId);
+            } else {
+                winner = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                        List.of(), null, null, List.of(), null, null, null, competingId, 0)
+                        .getInstances().getFirst();
+            }
+            int volumesBeforeRelease = service.describeVolumes(region, List.of(), Map.of()).size();
+            int addressesBeforeRelease = service.describeAddresses(region, List.of(), Map.of()).size();
+            List<Map<String, String>> tagsBeforeRelease = service.describeTags(region, Map.of());
+            parking.release();
+            if (different) {
+                Instance first = delayed.get(10, TimeUnit.SECONDS).getInstances().getFirst();
+                assertEquals(2, service.describeInstances(region, List.of(), Map.of()).size());
+                assertEquals(first.getInstanceId(), supplied.getAttachment().getInstanceId());
+                assertEquals(competingId, winner.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+                assertNotEquals(first.getInstanceId(), winner.getInstanceId());
+                return;
+            }
+            ExecutionException refusal = assertThrows(ExecutionException.class,
+                    () -> delayed.get(10, TimeUnit.SECONDS));
+            AwsException error = assertInstanceOf(AwsException.class, refusal.getCause());
+            assertEquals(delete ? "InvalidNetworkInterfaceID.NotFound" : "InvalidNetworkInterface.InUse",
+                    error.getErrorCode());
+            assertEquals(volumesBeforeRelease, service.describeVolumes(region, List.of(), Map.of()).size());
+            assertEquals(addressesBeforeRelease, service.describeAddresses(region, List.of(), Map.of()).size());
+            assertEquals(tagsBeforeRelease, service.describeTags(region, Map.of()));
+            assertEquals(delete ? 0 : 1, service.describeInstances(region, List.of(), Map.of()).size());
+            if (delete) {
+                assertTrue(service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().isEmpty());
+            } else {
+                assertEquals(winner.getInstanceId(), supplied.getAttachment().getInstanceId());
+                assertEquals(interfaceId, winner.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+            }
+        } finally {
+            parking.release();
+            worker.shutdownNow();
+            assertTrue(worker.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
     @Test
     void suppliedPrimaryInterfaceKeepsItsOwnVpcSecurityGroups() {
         Ec2Service service = tagTestService(new InMemoryStorageFactory());
