@@ -2,6 +2,22 @@
 
 Floci supports both API Gateway v1 (REST APIs) and API Gateway v2 (HTTP APIs).
 
+## REST Lambda integration permissions
+
+With IAM enforcement enabled, REST API `AWS` and `AWS_PROXY` Lambda integrations
+without configured credentials require a matching Lambda resource policy. The
+check uses the `apigateway` service principal, the exact function/version/alias
+ARN, and the API owner's `SourceAccount` and method `SourceArn`. For cross-region
+integrations, the source ARN uses the function's region, as documented by AWS.
+Removing a grant prevents subsequent integration invocations. An existing cached
+API response does not invoke Lambda again.
+
+Configured role or caller-passthrough credentials retain their existing behavior;
+this check does not implement their authorization. HTTP/WebSocket integrations
+and Lambda authorizers are outside this REST integration permission check.
+IAM enforcement disabled retains the existing permissive behavior.
+
+
 ## JWT issuer network policy
 
 HTTP API JWT authorizers fetch the configured issuer's OIDC discovery document and JWKS. Floci
