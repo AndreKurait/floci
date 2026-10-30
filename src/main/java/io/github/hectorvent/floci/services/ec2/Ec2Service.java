@@ -14859,14 +14859,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * behind, so the status is what says the interface is spoken for.
      */
     public void deleteNetworkInterface(String region, String networkInterfaceId) {
-        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
-        if (ni.getAttachment() != null || "in-use".equals(ni.getStatus())) {
-            throw new AwsException("InvalidParameterValue",
-                    "Network interface '" + networkInterfaceId + "' is currently in use", 400);
+        synchronized (privateIpAllocationLock) {
+            NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+            if (ni.getAttachment() != null || "in-use".equals(ni.getStatus())) {
+                throw new AwsException("InvalidParameterValue",
+                        "Network interface '" + networkInterfaceId + "' is currently in use", 400);
+            }
+            releaseInterfaceAddresses(region, networkInterfaceId, true);
+            networkInterfaces.delete(key(region, networkInterfaceId));
+            removeTags(region, networkInterfaceId);
         }
-        releaseInterfaceAddresses(region, networkInterfaceId, true);
-        networkInterfaces.delete(key(region, networkInterfaceId));
-        removeTags(region, networkInterfaceId);
     }
 
     /**
@@ -14882,13 +14884,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * instance in the account to name there.
      */
     public void holdNetworkInterfaceForService(String region, String networkInterfaceId) {
-        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
-        if (ni.getAttachment() != null) {
-            throw new AwsException("InvalidNetworkInterface.InUse",
-                    "Interface: '" + networkInterfaceId + "' is currently in use.", 400);
+        synchronized (privateIpAllocationLock) {
+            NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+            if (ni.getAttachment() != null) {
+                throw new AwsException("InvalidNetworkInterface.InUse",
+                        "Interface: '" + networkInterfaceId + "' is currently in use.", 400);
+            }
+            ni.setStatus("in-use");
+            networkInterfaces.put(key(region, networkInterfaceId), ni);
         }
-        ni.setStatus("in-use");
-        networkInterfaces.put(key(region, networkInterfaceId), ni);
     }
 
     /**
@@ -14898,12 +14902,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * that AttachNetworkInterface owns.
      */
     public void releaseNetworkInterfaceFromService(String region, String networkInterfaceId) {
-        NetworkInterface ni = networkInterfaces.get(key(region, networkInterfaceId)).orElse(null);
-        if (ni == null || ni.getAttachment() != null) {
-            return;
+        synchronized (privateIpAllocationLock) {
+            NetworkInterface ni = networkInterfaces.get(key(region, networkInterfaceId)).orElse(null);
+            if (ni == null || ni.getAttachment() != null) {
+                return;
+            }
+            ni.setStatus("available");
+            networkInterfaces.put(key(region, networkInterfaceId), ni);
         }
-        ni.setStatus("available");
-        networkInterfaces.put(key(region, networkInterfaceId), ni);
     }
 
     /**
@@ -14913,75 +14919,79 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public NetworkInterfaceAttachment attachNetworkInterface(String region, String networkInterfaceId,
                                                               String instanceId, int deviceIndex) {
-        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
-        if (ni.getAttachment() != null) {
-            throw new AwsException("InvalidNetworkInterface.InUse",
-                    "Interface: '" + networkInterfaceId + "' is currently in use.", 400);
-        }
-        Instance inst = getRequiredInstance(region, instanceId);
-        if (!List.of("running", "stopped").contains(inst.getState().getName())) {
-            throw new AwsException("IncorrectInstanceState",
-                    "The instance '" + instanceId + "' is not in a state from which an interface can be attached", 400);
-        }
-        boolean indexTaken = inst.getNetworkInterfaces().stream()
-                .anyMatch(eni -> eni.getDeviceIndex() == deviceIndex);
-        if (indexTaken) {
-            throw new AwsException("InvalidParameterValue",
-                    "Device index " + deviceIndex + " is already in use on instance '" + instanceId + "'", 400);
-        }
+        synchronized (privateIpAllocationLock) {
+            NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+            if (ni.getAttachment() != null || "in-use".equals(ni.getStatus())) {
+                throw new AwsException("InvalidNetworkInterface.InUse",
+                        "Interface: '" + networkInterfaceId + "' is currently in use.", 400);
+            }
+            Instance inst = getRequiredInstance(region, instanceId);
+            if (!List.of("running", "stopped").contains(inst.getState().getName())) {
+                throw new AwsException("IncorrectInstanceState",
+                        "The instance '" + instanceId + "' is not in a state from which an interface can be attached", 400);
+            }
+            boolean indexTaken = inst.getNetworkInterfaces().stream()
+                    .anyMatch(eni -> eni.getDeviceIndex() == deviceIndex);
+            if (indexTaken) {
+                throw new AwsException("InvalidParameterValue",
+                        "Device index " + deviceIndex + " is already in use on instance '" + instanceId + "'", 400);
+            }
 
-        NetworkInterfaceAttachment attachment = new NetworkInterfaceAttachment();
-        attachment.setAttachmentId("eni-attach-" + randomHex(17));
-        attachment.setDeviceIndex(deviceIndex);
-        attachment.setStatus("attached");
-        attachment.setInstanceId(instanceId);
-        attachment.setInstanceOwnerId(callerAccountId());
-        attachment.setAttachTime(ISO_FMT.format(Instant.now()));
-        attachment.setDeleteOnTermination(false);
+            NetworkInterfaceAttachment attachment = new NetworkInterfaceAttachment();
+            attachment.setAttachmentId("eni-attach-" + randomHex(17));
+            attachment.setDeviceIndex(deviceIndex);
+            attachment.setStatus("attached");
+            attachment.setInstanceId(instanceId);
+            attachment.setInstanceOwnerId(callerAccountId());
+            attachment.setAttachTime(ISO_FMT.format(Instant.now()));
+            attachment.setDeleteOnTermination(false);
 
-        ni.setAttachment(attachment);
-        ni.setStatus("in-use");
-        networkInterfaces.put(key(region, networkInterfaceId), ni);
+            ni.setAttachment(attachment);
+            ni.setStatus("in-use");
+            networkInterfaces.put(key(region, networkInterfaceId), ni);
 
-        // The instance must carry it as well, or DescribeInstances would deny an attachment
-        // DescribeNetworkInterfaces reports, and the device-index check above, which reads this
-        // very list, would never see an interface attached by this method.
-        InstanceNetworkInterface attached = new InstanceNetworkInterface();
-        attached.setNetworkInterfaceId(ni.getNetworkInterfaceId());
-        attached.setSubnetId(ni.getSubnetId());
-        attached.setVpcId(ni.getVpcId());
-        attached.setDescription(ni.getDescription());
-        attached.setOwnerId(ni.getOwnerId());
-        attached.setStatus("in-use");
-        attached.setMacAddress(ni.getMacAddress());
-        attached.setPrivateIpAddress(ni.getPrivateIpAddress());
-        attached.setPrivateDnsName(ni.getPrivateDnsName());
-        attached.setGroups(new ArrayList<>(ni.getGroups()));
-        attached.setAttachmentId(attachment.getAttachmentId());
-        attached.setDeviceIndex(deviceIndex);
-        attached.setAttachTime(attachment.getAttachTime());
-        attached.setDeleteOnTermination(attachment.isDeleteOnTermination());
-        inst.getNetworkInterfaces().add(attached);
-        instances.put(key(region, instanceId), inst);
-        return attachment;
+            // The instance must carry it as well, or DescribeInstances would deny an attachment
+            // DescribeNetworkInterfaces reports, and the device-index check above, which reads this
+            // very list, would never see an interface attached by this method.
+            InstanceNetworkInterface attached = new InstanceNetworkInterface();
+            attached.setNetworkInterfaceId(ni.getNetworkInterfaceId());
+            attached.setSubnetId(ni.getSubnetId());
+            attached.setVpcId(ni.getVpcId());
+            attached.setDescription(ni.getDescription());
+            attached.setOwnerId(ni.getOwnerId());
+            attached.setStatus("in-use");
+            attached.setMacAddress(ni.getMacAddress());
+            attached.setPrivateIpAddress(ni.getPrivateIpAddress());
+            attached.setPrivateDnsName(ni.getPrivateDnsName());
+            attached.setGroups(new ArrayList<>(ni.getGroups()));
+            attached.setAttachmentId(attachment.getAttachmentId());
+            attached.setDeviceIndex(deviceIndex);
+            attached.setAttachTime(attachment.getAttachTime());
+            attached.setDeleteOnTermination(attachment.isDeleteOnTermination());
+            inst.getNetworkInterfaces().add(attached);
+            instances.put(key(region, instanceId), inst);
+            return attachment;
+        }
     }
 
     /** Detaches a standalone ENI by attachment id, floci-kt9. */
     public NetworkInterfaceAttachment detachNetworkInterface(String region, String attachmentId, boolean force) {
-        if (attachmentId == null || attachmentId.isBlank()) {
-            throw new AwsException("MissingParameter", "The request must contain the parameter AttachmentId", 400);
+        synchronized (privateIpAllocationLock) {
+            if (attachmentId == null || attachmentId.isBlank()) {
+                throw new AwsException("MissingParameter", "The request must contain the parameter AttachmentId", 400);
+            }
+            NetworkInterface ni = networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
+                    .filter(n -> n.getAttachment() != null && attachmentId.equals(n.getAttachment().getAttachmentId()))
+                    .findFirst()
+                    .orElseThrow(() -> new AwsException("InvalidAttachmentID.NotFound",
+                            "The attachment ID '" + attachmentId + "' does not exist", 400));
+            NetworkInterfaceAttachment detached = ni.getAttachment();
+            ni.setAttachment(null);
+            ni.setStatus("available");
+            networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
+            detachFromInstance(region, detached.getInstanceId(), ni.getNetworkInterfaceId());
+            return detached;
         }
-        NetworkInterface ni = networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
-                .filter(n -> n.getAttachment() != null && attachmentId.equals(n.getAttachment().getAttachmentId()))
-                .findFirst()
-                .orElseThrow(() -> new AwsException("InvalidAttachmentID.NotFound",
-                        "The attachment ID '" + attachmentId + "' does not exist", 400));
-        NetworkInterfaceAttachment detached = ni.getAttachment();
-        ni.setAttachment(null);
-        ni.setStatus("available");
-        networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
-        detachFromInstance(region, detached.getInstanceId(), ni.getNetworkInterfaceId());
-        return detached;
     }
 
     /** Removes an interface from an instance's own list, the mirror of attaching it. */
@@ -15015,22 +15025,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * deleteOnTermination are deleted; retained interfaces return to "available".
      */
     private void releaseStandaloneInterfacesOnTermination(String region, Instance inst) {
-        for (InstanceNetworkInterface e : List.copyOf(inst.getNetworkInterfaces())) {
-            NetworkInterface ni = networkInterfaces.get(key(region, e.getNetworkInterfaceId())).orElse(null);
-            NetworkInterfaceAttachment att = ni != null ? ni.getAttachment() : null;
-            boolean deleted = ni == null || (att != null && att.isDeleteOnTermination());
-            releaseInterfaceAddresses(region, e.getNetworkInterfaceId(), deleted);
-            inst.getNetworkInterfaces().remove(e);
-            if (deleted) {
-                if (ni != null) {
-                    networkInterfaces.delete(key(region, ni.getNetworkInterfaceId()));
+        synchronized (privateIpAllocationLock) {
+            for (InstanceNetworkInterface e : List.copyOf(inst.getNetworkInterfaces())) {
+                NetworkInterface ni = networkInterfaces.get(key(region, e.getNetworkInterfaceId())).orElse(null);
+                NetworkInterfaceAttachment att = ni != null ? ni.getAttachment() : null;
+                if (ni != null && (att == null || !inst.getInstanceId().equals(att.getInstanceId())
+                        || !Objects.equals(e.getAttachmentId(), att.getAttachmentId()))) {
+                    inst.getNetworkInterfaces().remove(e);
+                    continue;
                 }
-                removeTags(region, e.getNetworkInterfaceId());
-                continue;
+                boolean deleted = ni == null || (att != null && att.isDeleteOnTermination());
+                releaseInterfaceAddresses(region, e.getNetworkInterfaceId(), deleted);
+                inst.getNetworkInterfaces().remove(e);
+                if (deleted) {
+                    if (ni != null) {
+                        networkInterfaces.delete(key(region, ni.getNetworkInterfaceId()));
+                    }
+                    removeTags(region, e.getNetworkInterfaceId());
+                    continue;
+                }
+                ni.setAttachment(null);
+                ni.setStatus("available");
+                networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
             }
-            ni.setAttachment(null);
-            ni.setStatus("available");
-            networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
         }
     }
 
@@ -15142,7 +15159,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     NetworkInterface takeNetworkInterfaceForLaunch(String region, String networkInterfaceId) {
         NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
-        if (ni.getAttachment() != null) {
+        if (ni.getAttachment() != null || "in-use".equals(ni.getStatus())) {
             throw new AwsException("InvalidNetworkInterface.InUse",
                     "Interface: '" + networkInterfaceId + "' is currently in use.", 400);
         }

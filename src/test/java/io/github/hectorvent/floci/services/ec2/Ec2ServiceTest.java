@@ -32,6 +32,7 @@ import io.github.hectorvent.floci.services.ec2.model.EgressOnlyInternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.IpRange;
@@ -75,6 +76,7 @@ import io.github.hectorvent.floci.services.ec2.model.VpcEndpointSubnetConfigurat
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.testing.ParkingStore;
+import io.github.hectorvent.floci.testing.ThreadStates;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import org.awaitility.Awaitility;
 import org.bouncycastle.openssl.PEMKeyPair;
@@ -4810,6 +4812,160 @@ class Ec2ServiceTest {
             parking.release();
             worker.shutdownNow();
             assertTrue(worker.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"launch", "delete", "hold"})
+    void attachmentPublicationExcludesCompetingInterfaceOwners(String competitor) throws Exception {
+        ParkingStore<Instance> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Instance> instanceStore = new AccountAwareStorageBackend<>(
+                parking, null, "000000000000");
+        Ec2Service service = tagTestService(new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)));
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.233.0.0/24");
+        Instance owner = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        owner.setState(InstanceState.running());
+        NetworkInterface ni = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        String interfaceId = ni.getNetworkInterfaceId();
+        service.createTags(region, List.of(interfaceId), List.of(new Tag("keep", "value")));
+        int volumes = service.describeVolumes(region, List.of(), Map.of()).size();
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        AtomicReference<Thread> competingThread = new AtomicReference<>();
+        parking.parkNextRead();
+        try {
+            Future<?> attachment = workers.submit(() -> service.attachNetworkInterface(region,
+                    interfaceId, owner.getInstanceId(), 1));
+            assertTrue(parking.awaitParked(), "attach did not reach its post-interface instance lookup");
+            Future<?> competing = workers.submit(() -> {
+                competingThread.set(Thread.currentThread());
+                switch (competitor) {
+                    case "launch" -> service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                            List.of(), null, null, List.of(), null, null, null, interfaceId, 0);
+                    case "delete" -> service.deleteNetworkInterface(region, interfaceId);
+                    case "hold" -> service.holdNetworkInterfaceForService(region, interfaceId);
+                    default -> throw new IllegalArgumentException(competitor);
+                }
+            });
+            ThreadStates.awaitBlockedOrDone(competingThread, competing);
+            parking.release();
+            attachment.get(10, TimeUnit.SECONDS);
+            ExecutionException refusal = assertThrows(ExecutionException.class,
+                    () -> competing.get(10, TimeUnit.SECONDS));
+            AwsException error = assertInstanceOf(AwsException.class, refusal.getCause());
+            assertEquals("delete".equals(competitor) ? "InvalidParameterValue" : "InvalidNetworkInterface.InUse",
+                    error.getErrorCode());
+            assertEquals(owner.getInstanceId(), readInterface(service, interfaceId).getAttachment().getInstanceId());
+            assertEquals(2, owner.getNetworkInterfaces().size());
+            assertEquals(1, service.describeInstances(region, List.of(), Map.of()).size());
+            assertEquals(volumes, service.describeVolumes(region, List.of(), Map.of()).size());
+            assertEquals("value", service.resourceTags(region, interfaceId).getFirst().getValue());
+        } finally {
+            parking.release();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void serviceHeldInterfaceRejectsInstanceClaimsUntilReleased(boolean launch) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.234.0.0/24");
+        Instance owner = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        owner.setState(InstanceState.running());
+        String interfaceId = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        service.holdNetworkInterfaceForService(region, interfaceId);
+        int volumes = service.describeVolumes(region, List.of(), Map.of()).size();
+        Runnable claim = () -> {
+            if (launch) {
+                service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                        List.of(), null, null, List.of(), null, null, null, interfaceId, 0);
+            } else {
+                service.attachNetworkInterface(region, interfaceId, owner.getInstanceId(), 1);
+            }
+        };
+        assertEquals("InvalidNetworkInterface.InUse", assertThrows(AwsException.class, claim::run).getErrorCode());
+        assertNull(readInterface(service, interfaceId).getAttachment());
+        assertEquals("in-use", readInterface(service, interfaceId).getStatus());
+        assertEquals(1, service.describeInstances(region, List.of(), Map.of()).size());
+        assertEquals(volumes, service.describeVolumes(region, List.of(), Map.of()).size());
+        service.releaseNetworkInterfaceFromService(region, interfaceId);
+        assertDoesNotThrow(claim::run);
+        assertNotNull(readInterface(service, interfaceId).getAttachment());
+    }
+
+    @Test
+    void terminationDoesNotReleaseAnInterfaceReattachedAfterItsInstanceSnapshot() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.235.0.0/24");
+        Instance former = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        Instance current = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        former.setState(InstanceState.running());
+        current.setState(InstanceState.running());
+        String interfaceId = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        service.attachNetworkInterface(region, interfaceId, former.getInstanceId(), 1);
+        InstanceNetworkInterface previous = former.getNetworkInterfaces().getLast();
+        service.detachNetworkInterface(region, previous.getAttachmentId(), false);
+        service.attachNetworkInterface(region, interfaceId, current.getInstanceId(), 1);
+        // A separately loaded termination snapshot can still carry the former attachment.
+        former.getNetworkInterfaces().add(previous);
+        service.terminateInstances(region, List.of(former.getInstanceId()));
+        assertNotNull(readInterface(service, interfaceId).getAttachment());
+        assertEquals(current.getInstanceId(), readInterface(service, interfaceId).getAttachment().getInstanceId());
+        assertEquals(2, current.getNetworkInterfaces().size());
+        assertTrue(former.getNetworkInterfaces().isEmpty());
+    }
+
+    @Test
+    void deletionPublicationExcludesConcurrentLaunchClaim() throws Exception {
+        InMemoryStorage<String, NetworkInterface> backing = spy(new InMemoryStorage<>());
+        AccountAwareStorageBackend<NetworkInterface> interfaceStore = new AccountAwareStorageBackend<>(
+                backing, null, "000000000000");
+        Ec2Service service = tagTestService(new InMemoryStorageFactory(Map.of("ec2-network-interfaces.json", interfaceStore)));
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.237.0.0/24");
+        String interfaceId = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        ParkingStore<Boolean> publication = new ParkingStore<>();
+        publication.parkNextWrite();
+        doAnswer(call -> {
+            publication.put("delete", true);
+            return call.callRealMethod();
+        }).when(backing).delete(anyString());
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        AtomicReference<Thread> launchThread = new AtomicReference<>();
+        try {
+            Future<?> deleting = workers.submit(() -> service.deleteNetworkInterface(region, interfaceId));
+            assertTrue(publication.awaitParked(), "delete did not reach standalone storage removal");
+            Future<?> launching = workers.submit(() -> {
+                launchThread.set(Thread.currentThread());
+                return service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                        List.of(), null, null, List.of(), null, null, null, interfaceId, 0);
+            });
+            ThreadStates.awaitBlockedOrDone(launchThread, launching);
+            publication.release();
+            deleting.get(10, TimeUnit.SECONDS);
+            ExecutionException refusal = assertThrows(ExecutionException.class,
+                    () -> launching.get(10, TimeUnit.SECONDS));
+            assertEquals("InvalidNetworkInterfaceID.NotFound",
+                    assertInstanceOf(AwsException.class, refusal.getCause()).getErrorCode());
+            assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
+            assertTrue(service.describeVolumes(region, List.of(), Map.of()).isEmpty());
+            assertTrue(service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().isEmpty());
+        } finally {
+            publication.release();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(10, TimeUnit.SECONDS));
         }
     }
 
