@@ -826,11 +826,7 @@ public class SqsService implements Resettable, ResourceProvider {
         }
 
         queueStore.put(storageKey, queue);
-        synchronized (messagesByQueue) {
-            GuardedMessageQueue messages = newMessageQueue(storageKey, List.of());
-            messages.activity().accessed();
-            messagesByQueue.put(storageKey, messages);
-        }
+        getOrCreateQueue(storageKey).activity().accessed();
         LOG.infov("Created {0} queue: {1} in region {2}", queue.isFifo() ? "FIFO" : "standard", queueName, region);
         return queue;
     }

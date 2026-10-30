@@ -92,6 +92,8 @@ checks for visibility and retention expiry. Deletion, reset and shutdown wake ol
 receivers; they cannot claim messages from a replacement queue.
 Reset also fences message-store writes across queue generations. An old write
 that finishes after reset cannot overwrite a replacement queue's persisted messages.
+Queue creation retains the message queue already opened by a concurrent receive or send
+after metadata becomes visible, preserving waiting receivers and their messages.
 
 ```bash
 # Enable long polling for every consumer of the queue
