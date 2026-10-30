@@ -404,6 +404,10 @@ class GuardedMessageQueue {
         return closed;
     }
 
+    void signalChange() {
+        changes.signal();
+    }
+
     long changeVersion() {
         return changes.version();
     }

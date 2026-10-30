@@ -268,3 +268,12 @@ FLOCI_STORAGE_HOST_PERSISTENT_PATH=/absolute/host/path/data
     `FLOCI_STORAGE_HOST_PERSISTENT_PATH` must be an absolute path (starting with `/`). Volume
     names and relative paths are not supported and will be silently ignored, falling back to
     named-volume mode.
+
+### SQS writes during emulator reset
+
+Emulator reset stops admission of new SQS mutations and wakes long polls before clearing
+storage. It drains complete admitted operations, including queue metadata, message and
+FIFO deduplication writes. New mutations receive `ServiceUnavailable` (HTTP 503) while
+reset is in progress. If an operation cannot drain within five seconds, reset fails before
+its storage wipe and admission resumes. This is local emulator lifecycle behavior, not an
+AWS SQS API operation.
