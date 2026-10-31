@@ -4907,9 +4907,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         }
         if (accountId != null && !accountId.isBlank()
                 && sessions instanceof AccountAwareStorageBackend<SessionCredential> aware) {
-            aware.deleteForAccount(accountId, sessionAccessKeyId);
+            aware.deleteAllAtomicallyForAccounts(Map.of(accountId, Set.of(sessionAccessKeyId)));
         } else {
-            sessions.delete(sessionAccessKeyId);
+            sessions.deleteAllAtomically(Set.of(sessionAccessKeyId));
         }
         LOG.debugv("Unregistered session {0} from account {1}", sessionAccessKeyId, accountId);
     }
