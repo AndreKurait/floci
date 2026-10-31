@@ -59,6 +59,10 @@ public class EcsTaskRoleCredentials {
      */
     public synchronized Optional<String> issue(String taskArn, String roleArn, String accountId, Instant now) {
         Issued current = taskArn == null ? null : byTaskArn.get(taskArn);
+        if (current != null && byPath.get(current.path) != current) {
+            revoke(current);
+            return Optional.empty();
+        }
         if (current != null && (!current.session.getRoleArn().equals(roleArn)
                 || !current.session.getOriginAccountId().equals(accountId))) {
             revoke(current);
@@ -134,12 +138,12 @@ public class EcsTaskRoleCredentials {
     }
 
     private void revoke(Issued issued) {
-        byTaskArn.remove(issued.session.getEcsTaskArn(), issued);
         byPath.remove(issued.path, issued);
         iamService.unregisterSession(issued.session.getOriginAccountId(), issued.session.getAccessKeyId());
         for (SessionCredential previous : issued.previous) {
             iamService.unregisterSession(previous.getOriginAccountId(), previous.getAccessKeyId());
         }
+        byTaskArn.remove(issued.session.getEcsTaskArn(), issued);
     }
 
     private Optional<IamRole> resolveRole(String roleArn, String accountId) {
