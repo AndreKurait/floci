@@ -64,6 +64,20 @@ EC2 launch behavior and counts each member under the requested zone. This permit
 real zones outside the local subnet catalog, such as `us-east-1d`; the underlying
 EC2 instance can use a default subnet in a different zone.
 
+### Tags
+
+For tags sent with `CreateAutoScalingGroup` or `CreateOrUpdateTags`, an omitted
+`PropagateAtLaunch` defaults to `true`. Explicit `true` and `false` values are
+preserved. The [AWS Tag API reference](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_Tag.html)
+marks this field optional without documenting a default. Floci's default for both
+actions is an inferred compatibility choice, not an AWS-documented default.
+Existing tags whose omitted flag was stored as `false` remain
+`false`; stored flags are not automatically migrated. A later `CreateOrUpdateTags`
+replaces the value and flag for that tag, so omitting the flag on an update sets
+it to `true`. Group and tag writes do not automatically retag existing instances.
+A later `AttachInstances` operation applies the propagated group tags as
+described below.
+
 ### Instance Management
 
 | Operation | Notes |
@@ -84,8 +98,8 @@ Member instances carry the tags the
 [EC2 instance tagging lifecycle](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-tagging.html#tag-lifecycle)
 describes. An instance the group launches gets its launch template's instance tags, then the
 group's `PropagateAtLaunch` tags, which win a key both set, then `aws:autoscaling:groupName` with
-the group's name. `CreateAutoScalingGroup` defaults an omitted `PropagateAtLaunch` to `true`;
-an explicit `false` keeps the tag on the group only.
+the group's name. See [Tags](#tags) for Floci's omitted-flag default and stored-tag
+behavior.
 `AttachInstances` adds the same group tags and `aws:autoscaling:groupName`,
 overwriting existing tags with the same keys. `DetachInstances` removes only
 `aws:autoscaling:groupName`, and only while it names the group being detached from.
