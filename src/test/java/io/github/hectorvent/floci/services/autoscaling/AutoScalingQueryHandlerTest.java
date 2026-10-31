@@ -211,7 +211,7 @@ class AutoScalingQueryHandlerTest {
         assertEquals(200, response.getStatus());
         assertTrue(((String) response.getEntity()).contains("<SetInstanceProtectionResponse"));
         assertTrue(service.describeAutoScalingInstances(REGION, List.of("i-protected"))
-                .getFirst().isProtectedFromScaleIn());
+                .getFirst().instance().isProtectedFromScaleIn());
     }
 
     @Test
@@ -237,7 +237,7 @@ class AutoScalingQueryHandlerTest {
         assertEquals(200, response.getStatus());
         assertTrue(((String) response.getEntity()).contains("<SetInstanceHealthResponse"));
         assertEquals("Unhealthy", service.describeAutoScalingInstances(REGION, List.of("i-unhealthy"))
-                .getFirst().getHealthStatus());
+                .getFirst().instance().getHealthStatus());
     }
 
     @Test
@@ -265,7 +265,7 @@ class AutoScalingQueryHandlerTest {
         assertEquals(400, response.getStatus());
         assertTrue(((String) response.getEntity()).contains("ValidationError"));
         assertEquals(false, service.describeAutoScalingInstances(REGION, List.of("i-flagless"))
-                .getFirst().isProtectedFromScaleIn(),
+                .getFirst().instance().isProtectedFromScaleIn(),
                 "a rejected request must not silently strip/apply protection");
     }
 
@@ -293,7 +293,7 @@ class AutoScalingQueryHandlerTest {
 
         assertEquals(400, response.getStatus());
         assertEquals(false, service.describeAutoScalingInstances(REGION, List.of("i-malformed"))
-                .getFirst().isProtectedFromScaleIn(),
+                .getFirst().instance().isProtectedFromScaleIn(),
                 "a malformed boolean must not silently coerce to false and succeed");
     }
 

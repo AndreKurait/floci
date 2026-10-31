@@ -9,7 +9,7 @@ public class AsgInstance {
 
     private String instanceId;
     private String availabilityZone;
-    private String lifecycleState;   // Pending | InService | Terminating | Terminated | Detached
+    private String lifecycleState;   // Pending | InService | EnteringStandby | Standby | Terminating | Terminated | Detached
     private String healthStatus;     // Healthy | Unhealthy
     private String launchConfigurationName;
     private String launchTemplateId;
@@ -17,6 +17,7 @@ public class AsgInstance {
     private String launchTemplateVersion;
     private String instanceType;
     private boolean protectedFromScaleIn;
+    private String standbyActivityId;
 
     public AsgInstance() {}
 
@@ -49,4 +50,7 @@ public class AsgInstance {
 
     public boolean isProtectedFromScaleIn() { return protectedFromScaleIn; }
     public void setProtectedFromScaleIn(boolean v) { this.protectedFromScaleIn = v; }
+
+    public String getStandbyActivityId() { return standbyActivityId; }
+    public void setStandbyActivityId(String v) { this.standbyActivityId = v; }
 }
