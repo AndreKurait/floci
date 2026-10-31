@@ -28,11 +28,11 @@ def test_same_name_lambda_targets_scale_only_in_the_account_with_metrics(
         try:
             for account in accounts:
                 services = clients[account]
+                created.append(account)
                 services["cloudformation"].create_stack(
                     StackName=stack_name, TemplateBody=template(function, False),
                     Capabilities=["CAPABILITY_IAM"],
                 )
-                created.append(account)
                 assert settled(services["cloudformation"], stack_name)["StackStatus"] == "CREATE_COMPLETE"
                 services["application-autoscaling"].register_scalable_target(
                     **target(function), MinCapacity=1, MaxCapacity=2
@@ -66,8 +66,19 @@ def test_same_name_lambda_targets_scale_only_in_the_account_with_metrics(
                 **target(function)
             )["ScalingActivities"]
         finally:
-            for account in reversed(created):
-                try:
-                    deregister(clients[account]["application-autoscaling"], function)
-                finally:
-                    remove_stack(clients[account]["cloudformation"], stack_name)
+            cleanup_accounts(clients, created, function, stack_name)
+
+
+def cleanup_accounts(clients, created, function, stack_name):
+    errors = []
+    for account in reversed(created):
+        for operation, client, resource in (
+            (deregister, clients[account]["application-autoscaling"], function),
+            (remove_stack, clients[account]["cloudformation"], stack_name),
+        ):
+            try:
+                operation(client, resource)
+            except Exception as error:
+                errors.append((account, operation.__name__, error))
+    if errors:
+        raise RuntimeError("Lambda autoscaling account cleanup failed", errors) from errors[0][2]
