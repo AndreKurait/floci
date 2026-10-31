@@ -55,9 +55,9 @@ final class SsmCommandTimeout {
                   wait "$timer"
                   if mkdir "$state/finished" 2>/dev/null; then
                     : > "$state/timed-out"
-                    kill -TERM -- "-$child" 2>/dev/null
+                    kill -TERM "-$child" 2>/dev/null
                     sleep 1
-                    kill -KILL -- "-$child" 2>/dev/null
+                    kill -KILL "-$child" 2>/dev/null
                   fi
                 ) &
                 watchdog=$!

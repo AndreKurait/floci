@@ -14,6 +14,7 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -37,7 +38,7 @@ class SsmTimeoutDockerIntegrationTest {
     EmulatorConfig config;
 
     @ParameterizedTest
-    @ValueSource(strings = {"busybox:stable", "public.ecr.aws/lambda/nodejs:20"})
+    @ValueSource(strings = {"busybox:stable", "public.ecr.aws/lambda/nodejs:20", "ubuntu:24.04"})
     void timeoutPreservesOutputAndTerminatesScriptsOnBothGuestToolchains(String image) {
         String name = ContainerStorageHelper.resourceName(config, "ssm-timeout", null, UUID.randomUUID().toString());
         try {
@@ -81,21 +82,53 @@ class SsmTimeoutDockerIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"busybox:stable", "public.ecr.aws/lambda/nodejs:20"})
+    @ValueSource(strings = {"busybox:stable", "public.ecr.aws/lambda/nodejs:20", "ubuntu:24.04"})
     void executorPreservesNaturalReservedExits(String image) {
         checkExecutor(image, false, false);
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"busybox:stable", "public.ecr.aws/lambda/nodejs:20"})
+    @ValueSource(strings = {"busybox:stable", "public.ecr.aws/lambda/nodejs:20", "ubuntu:24.04"})
     void executorKillsBackgroundDescendants(String image) {
         checkExecutor(image, true, false);
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"busybox:stable", "public.ecr.aws/lambda/nodejs:20"})
+    @ValueSource(strings = {"busybox:stable", "public.ecr.aws/lambda/nodejs:20", "ubuntu:24.04"})
     void executorDoesNotMisreportAnEarlyParentExitAsTimeout(String image) {
         checkExecutor(image, true, true);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"public.ecr.aws/lambda/nodejs:20", "ubuntu:24.04"})
+    void gnuFallbackKillsStartedDescendantAfterDeadline(String image) {
+        String name = ContainerStorageHelper.resourceName(config, "ssm-timeout", null, UUID.randomUUID().toString());
+        try {
+            ContainerInfo container = lifecycle.createAndStartEphemeral(builder.newContainer(image)
+                    .withName(name).withEntrypoint(List.of("sh", "-c"))
+                    .withCmd(List.of("exec sleep 600")).build());
+            ContainerExec.Result setup = ContainerExec.run(docker, container.containerId(), new String[]{"sh", "-c",
+                    "mkdir /tmp/ssm-gnu-tools; for tool in sh mktemp mkdir rmdir rm sleep timeout mkfifo; do "
+                            + "ln -s \"$(command -v $tool)\" /tmp/ssm-gnu-tools/$tool || exit 1; done"}, 3);
+            assertEquals(0, setup.exitCode(), setup.summary());
+            SsmCommandTimeout timeout = new SsmCommandTimeout(4096);
+            String script = "mkfifo /tmp/started; sh -c 'trap \"\" TERM; echo $$ > /tmp/descendant; "
+                    + "echo ready > /tmp/started; exec sleep 600' & read ready < /tmp/started; wait";
+            ContainerExec.Result result = ContainerExec.run(docker, container.containerId(), new String[]{"sh", "-c",
+                    "PATH=/tmp/ssm-gnu-tools; export PATH; " + timeout.wrap(script, 1)}, 8);
+            timeout.writeError(result.stderr().getBytes(StandardCharsets.UTF_8));
+            assertFalse(result.timedOut(), "Guest supervision must finish before the Docker attach deadline");
+            assertEquals(137, result.exitCode(), result.summary());
+            assertTrue(timeout.timedOut(), "GNU escalation must emit the guest deadline marker");
+            assertFalse(timeout.standardError().contains("floci-ssm-timeout-"));
+            ContainerExec.Result state = ContainerExec.run(docker, container.containerId(), new String[]{"sh", "-c",
+                    "test -s /tmp/descendant || exit 1; pid=$(cat /tmp/descendant); if [ -f /proc/$pid/stat ]; then "
+                            + "read p name state rest < /proc/$pid/stat; printf '%s' \"$state\"; else printf absent; fi"}, 3);
+            assertEquals(0, state.exitCode(), "The descendant must have started: " + state.summary());
+            assertTrue(Set.of("absent", "Z").contains(state.stdout()), "Descendant still running: " + state.summary());
+        } finally {
+            lifecycle.removeIfExistsStrict(name, true);
+        }
     }
 
     private void checkExecutor(String image, boolean descendantsOnly, boolean parentExits) {
