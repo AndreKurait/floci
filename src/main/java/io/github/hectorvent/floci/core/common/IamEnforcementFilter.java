@@ -131,11 +131,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * Omitting one makes enforcement refuse a call AWS accepts; adding one that AWS does sign
      * leaves that operation unauthenticated.
      *
-     * <p>Only an operation reachable over a checked protocol needs an entry, since
-     * {@link WireProtocol#REST} is not checked at all. {@code signin}, {@code sso} and
-     * {@code sso-oidc} also carry {@code noAuth} operations and are absent for that reason rather
-     * than by oversight: the SSO portal calls are served on REST routes, and the {@code sso} JSON
-     * target reaches SSO Admin, whose operations AWS does sign.
+     * <p>This list governs RPC protocols. REST routes use explicit catalog authentication ownership;
+     * their public or alternatively authenticated operations are not listed here. The {@code sso}
+     * JSON target reaches SSO Admin, whose operations AWS does sign.
      */
     private static final Map<String, Set<String>> NO_AUTH_OPERATIONS = Map.of(
             "cognito-idp", Set.of(
@@ -345,8 +343,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 ctx.abortWith(accessDeniedForRequest("Unknown", credentialScope, ctx));
                 return;
             }
-            if (!isRpcCall(ctx)) {
-                return; // REST route no rule maps → ALLOW, as an unsigned REST request is
+            if (!isRpcCall(ctx) && restRouteRequiringCredentials() == null
+                    && !sharedRestRouteRequiringCredentials()) {
+                return; // Endpoint-owned REST authentication stays with the resource.
             }
         }
 
@@ -849,18 +848,25 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * or {@code AuthorizationQueryParametersError} for a presigned URL, all 400.
      *
      * <p>Otherwise it is treated as an unsigned request is. An operation AWS serves without
-     * credentials is left alone. A REST request is refused only when it claims SigV4 and its route
-     * maps to an action: AppSync, CodeArtifact's package endpoints, Identity Store's SCIM endpoint
-     * and API Gateway's authorizers take Bearer and Basic tokens of their own, and this filter
-     * cannot tell the API Gateway execute path, Lambda function URLs and the other paths it sees
-     * that are unsigned by design from the rest. A SigV4a scope has no region segment; every
-     * service takes its region from the signed set (see {@link AccountContextFilter}), and the
+     * credentials is left alone. Explicit management-route ownership also refuses empty or
+     * alternative Authorization headers: such a header cannot turn a management API into a public
+     * endpoint. Other REST routes are refused here only when they claim SigV4 and map to an action;
+     * endpoint-owned Bearer and Basic tokens remain with their controllers. A SigV4a scope has no
+     * region segment; every service takes its region from the signed set, and the
      * shared {@link SigV4HeaderSignatureFilter} turns non-S3 ones away when signature validation is on.
      */
     private void refuseUnreadableCredential(ContainerRequestContext ctx, String auth) {
         if (ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY) instanceof ProtocolClaim claim
                 && claim.protocol() != WireProtocol.REST
                 && servesWithoutCredentials(claim, ctx)) {
+            return;
+        }
+        ServiceDescriptor requiredService = restRouteRequiringCredentials();
+        if (requiredService != null || sharedRestRouteRequiringCredentials()) {
+            String message = incompleteSignatureMessage(auth);
+            ctx.abortWith(requiredService != null && requiredService.defaultProtocol() == ServiceProtocol.REST_XML
+                    ? AwsQueryResponse.error("IncompleteSignature", message, catalog.restAuthenticationXmlNamespace(resourceInfo.getResourceClass()), 400)
+                    : incompleteSignatureResponse(requiredService == null ? null : requiredService.externalKey(), ctx, message));
             return;
         }
         ResolvedAuthorization routeAuthorization = claimsSigV4(auth) ? restRouteAuthorization(ctx) : null;
@@ -1947,20 +1953,45 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * {@code Action} parameter, and no public data plane speaks any of those, so an unsigned one is
      * an unauthenticated call on a control-plane API.
      *
-     * <p>REST is deliberately left alone. This single filter also sees the API Gateway execute
-     * path, Lambda function URLs, CloudFront serving, the Cognito OIDC endpoints and Floci's own
-     * health endpoint, all unsigned by design, and a {@code rest()} claim cannot tell those from an
-     * unsigned S3 call. Separating them needs the route to name its service, which the catalog does
-     * not yet carry for the REST services; that half is tracked with the other route-derived gap.
+     * <p>REST authentication ownership comes from explicit matched-resource metadata. A service's
+     * public or alternatively authenticated endpoints remain responsible for their own authentication;
+     * an IAM action mapping or an untrusted signing-scope hint does not establish ownership.
      */
     private void refuseUnsignedManagementCall(ContainerRequestContext ctx) {
-        if (!(ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY) instanceof ProtocolClaim claim)
-                || claim.protocol() == WireProtocol.REST
-                || servesWithoutCredentials(claim, ctx)) {
+        if (!(ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY) instanceof ProtocolClaim claim)) {
+            return;
+        }
+        if (claim.protocol() == WireProtocol.REST) {
+            ServiceDescriptor service = restRouteRequiringCredentials();
+            if (service == null && !sharedRestRouteRequiringCredentials()) {
+                return;
+            }
+            ctx.abortWith(service != null && service.defaultProtocol() == ServiceProtocol.REST_XML
+                    ? AwsQueryResponse.error("MissingAuthenticationToken", MISSING_AUTHENTICATION_TOKEN,
+                            catalog.restAuthenticationXmlNamespace(resourceInfo.getResourceClass()), 403)
+                    : missingAuthenticationTokenResponse(WireProtocol.REST, ctx));
+            return;
+        } else if (servesWithoutCredentials(claim, ctx)) {
             return;
         }
         LOG.debugv("Refusing unsigned {0} request under IAM enforcement", claim.protocol());
         ctx.abortWith(missingAuthenticationTokenResponse(claim.protocol(), ctx));
+    }
+
+    private boolean sharedRestRouteRequiringCredentials() {
+        return resourceInfo != null
+                && catalog.sharedRestRouteRequiresCredentials(resourceInfo.getResourceClass());
+    }
+
+    private ServiceDescriptor restRouteRequiringCredentials() {
+        if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
+            return null;
+        }
+        Class<?> resourceClass = resourceInfo.getResourceClass();
+        return catalog.byResourceClass(resourceClass)
+                .filter(descriptor -> descriptor.requiresRestCredentials(resourceClass,
+                        resourceInfo.getResourceMethod() == null ? "" : resourceInfo.getResourceMethod().getName()))
+                .orElse(null);
     }
 
     /** Whether the operation this request names is one AWS serves without credentials. */

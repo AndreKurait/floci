@@ -2,6 +2,28 @@
 
 **Protocol:** Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 
+## REST management authentication
+
+With `floci.services.iam.enforcement-enabled=true`, registered REST management routes require
+AWS credentials before dispatch. Authentication ownership is explicit controller metadata in the
+service catalog, independent of the route's IAM action mapping. Public or alternatively
+authenticated controllers retain their own authentication, including S3 bucket-policy reads,
+CloudFront serving, CodeArtifact package downloads and Cognito OAuth/discovery.
+
+The declarations cover REST controllers whose AWS operations require signed credentials, including
+Lambda's separate account, layer, concurrency, code-signing, tagging and function-URL management
+controllers. Shared tag and security-admin dispatchers also require credentials. S3 Control uses its
+own XML error namespace. Credential validity is checked even when no IAM action rule maps a required
+management route; the existing permissive authorization for an unmapped action remains unchanged.
+
+Mixed controllers can retain endpoint-owned authentication on specific resource methods. IoT job
+data routes remain separate from IoT management calls. Bedrock bearer authentication, AgentCore
+runtime OAuth, IoT certificate/custom authorization, SSO token flows, function URL invocation and
+application execution routes retain their endpoint-specific contracts. These declarations do not
+establish complete authentication for those alternative transports. Contested paths still follow
+the existing signed-service routing rules; an unsigned path can deliberately resolve to S3.
+Disabling IAM enforcement preserves local unsigned management access.
+
 ## AWS Sign-In login credentials
 
 Floci also implements the AWS Sign-In data-plane flow used by the AWS CLI login credentials
@@ -2444,18 +2466,19 @@ flows and the two web-identity and SAML `AssumeRole` calls. A Cognito `Admin*` o
 The refusal arrives in the encoding the request used: XML for Query, CBOR for a CBOR request, JSON
 otherwise.
 
-**REST requests are not checked.** The same filter sees the API Gateway execute path, Lambda
-function URLs, CloudFront serving, the Cognito OIDC endpoints and Floci's own health endpoint, all
-of which are unsigned by design, and a REST request does not say which service will serve it. An
-unsigned REST call therefore still reaches the service, including an unsigned S3 call.
+**REST management ownership is explicit.** The matched controller and, for mixed controllers, its
+resource method determine whether AWS credentials are required. A declared management request is
+refused before dispatch. Public S3 policy access, API Gateway execution, Lambda function URLs,
+CloudFront serving, Cognito OIDC and local health routes retain their own authentication contracts.
+Neither an IAM action mapping nor a client-supplied signing scope establishes authentication ownership.
 
 **A header with no readable credential does not get around this.** An `Authorization` header that
 names no access key (a Bearer token, SigV2, a credential without the SigV4 scheme or without its
 key), or whose SigV4 scope is missing a part, is refused on the same management calls with
-`400 IncompleteSignature`, the error AWS gives a header it cannot read. A REST request carrying one
-is refused only when the header claims SigV4 and the route maps to an IAM action. Otherwise it is
-treated as unsigned, because AppSync, CodeArtifact's package endpoints, Identity Store's SCIM
-endpoint and API Gateway's authorizers take Bearer and Basic tokens of their own. An empty header
+`400 IncompleteSignature`, the error AWS gives a header it cannot read. A declared REST management request is refused even if the header claims Basic or Bearer.
+Endpoint-owned AppSync execution, CodeArtifact package endpoints, Identity Store SCIM and API
+Gateway authorizers continue to handle their own tokens. Other REST requests claiming SigV4 keep
+the existing mapped-route checks. An empty header
 is refused the same way, unless a presigned URL's `X-Amz-Credential` is there to read instead.
 
 ## Bypass rules
@@ -2465,14 +2488,14 @@ the emulator cannot reason about:
 
 | Case | Behaviour |
 | --- | --- |
-| Unresolvable action | Allowed. An action the registry cannot resolve is not evaluated. The credential is still checked on an RPC call, as in the rows below. A REST request is left alone, as an unsigned one is: the filter cannot tell it from the API Gateway execute path, Lambda function URLs and the other paths it sees that are unsigned by design. |
+| Unresolvable action | Allowed. An action the registry cannot resolve is not evaluated. The credential is still checked on an RPC call, as in the rows below. A credential-required REST management route still checks credential validity. Endpoint-owned execution and public routes retain their existing behavior. |
 | No `Authorization` header, RPC protocol | **Rejected** with `403 MissingAuthenticationToken`, unless the operation is one AWS itself serves without credentials. |
-| No `Authorization` header, REST protocol | Allowed. This filter also sees the API Gateway execute path, Lambda function URLs, CloudFront serving and the Cognito OIDC endpoints, which are unsigned by design. |
+| No `Authorization` header, REST protocol | Refused on explicitly declared management routes unless a presigned credential is supplied. Endpoint-owned public, execution and alternative-authentication routes keep their contracts. |
 | `sts:GetCallerIdentity` | No policy is evaluated: AWS returns caller identity even when a policy denies it. The credential is still checked: a key that exists nowhere or is inactive, an expired session, or a header with no readable credential is refused as below. |
 | Access key that exists nowhere | **Rejected** with `403`, in each protocol's own vocabulary: `InvalidAccessKeyId` for S3, `InvalidClientTokenId` for Query services, `UnrecognizedClientException` for JSON services. Allowing it would let any string authorize the request. A presigned POST is the exception: its credential is in the form body, so a key that exists nowhere, or a credential that cannot be read, is left to S3's own presigned-POST check, and uploads as an unsigned request would when that check is off. An inactive key or an expired session is refused there as everywhere else. |
 | Inactive access key | **Rejected** the same way: a deactivated key can no longer be used by API calls until it is activated again. |
 | Expired session credentials | **Rejected** with `403 ExpiredTokenException`, or `400 ExpiredToken` for S3. Once Floci has removed an expired session it no longer knows the key, and answers as for one that exists nowhere. |
-| `Authorization` header with no readable credential | **Rejected** with `400`, in each protocol's own vocabulary: `AuthorizationHeaderMalformed` for S3 (`AuthorizationQueryParametersError` when the credential is a presigned URL's `X-Amz-Credential`), `IncompleteSignature` for Query services, `IncompleteSignatureException` for JSON services. Without a key or a scope there is nothing to check, so allowing it would skip enforcement altogether. As with no header, an operation AWS serves without credentials is left alone, and a REST request is rejected only when the header claims SigV4. |
+| `Authorization` header with no readable credential | **Rejected** with `400`, in each protocol's own vocabulary: `AuthorizationHeaderMalformed` for S3 (`AuthorizationQueryParametersError` when the credential is a presigned URL's `X-Amz-Credential`), `IncompleteSignature` for Query services, `IncompleteSignatureException` for JSON services. Without a key or a scope there is nothing to check, so allowing it would skip enforcement altogether. As with no header, an operation AWS serves without credentials is left alone, and a declared REST management route also rejects unreadable Basic or Bearer headers. Endpoint-owned alternative authentication remains separate. |
 | Known credential with no mappable caller context | Allowed. A stored session carrying no role ARN is a real credential, so it is not treated as unauthenticated. |
 | Bare account-id key with no SCP ceiling | Allowed. With no organization or SCP enforcement off, the account root keeps the historical bypass. |
 | Bare account-id key **with** an SCP ceiling | Enforced as the account root, bounded by the SCP chain. |
