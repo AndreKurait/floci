@@ -22,7 +22,6 @@ import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
-import io.github.hectorvent.floci.services.elbv2.model.TargetHealth;
 import io.github.hectorvent.floci.services.ssm.SsmCommandService;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
@@ -144,7 +143,6 @@ public class AutoScalingReconciler {
             settleStandbyMoves(asg);
             removeTerminatingInstances(asg);
             removeStaleInstances(asg);
-            removeOrphanedTargetRegistrations(asg);
             promoteReadyInstances(asg);
             reconcileRefreshReplacements(asg);
 
@@ -255,7 +253,7 @@ public class AutoScalingReconciler {
         }
         if (!entering.isEmpty()) {
             List<String> instanceIds = entering.stream().map(AsgInstance::getInstanceId).toList();
-            deregisterFromTargetGroups(asg, instanceIds);
+            AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
             deregisterFromClassicLoadBalancers(asg, instanceIds);
             for (AsgInstance instance : entering) {
                 instance.setLifecycleState("Standby");
@@ -343,7 +341,7 @@ public class AutoScalingReconciler {
                 .map(AsgInstance::getInstanceId)
                 .collect(Collectors.toList());
         failActiveSsmInvocations(asg, instanceIds);
-        deregisterFromTargetGroups(asg, instanceIds);
+        AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
         deregisterFromClassicLoadBalancers(asg, instanceIds);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
@@ -376,7 +374,7 @@ public class AutoScalingReconciler {
             }
         }
         failActiveSsmInvocations(asg, instanceIds);
-        deregisterFromTargetGroups(asg, instanceIds);
+        AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
         deregisterFromClassicLoadBalancers(asg, instanceIds);
         asgService.cancelStandbyMoves(returning);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
@@ -455,39 +453,6 @@ public class AutoScalingReconciler {
         }
     }
 
-    private void removeOrphanedTargetRegistrations(AutoScalingGroup asg) {
-        if (asg.getTargetGroupARNs().isEmpty()) {
-            return;
-        }
-
-        Set<String> activeInstanceIds = asg.getInstances().stream()
-                .filter(instance -> isActiveLifecycleState(instance.getLifecycleState())
-                        || pausedRefreshOwns(asg, instance.getInstanceId()))
-                .map(AsgInstance::getInstanceId)
-                .collect(Collectors.toSet());
-
-        for (String tgArn : asg.getTargetGroupARNs()) {
-            try {
-                List<TargetDescription> orphanedTargets = elbV2Service.describeTargetHealth(
-                                asg.getRegion(), tgArn, List.of()).stream()
-                        .map(TargetHealth::getTarget)
-                        .filter(target -> target != null && target.getId() != null)
-                        .filter(target -> !activeInstanceIds.contains(target.getId()))
-                        .collect(Collectors.toList());
-                if (!orphanedTargets.isEmpty()) {
-                    elbV2Service.deregisterTargets(asg.getRegion(), tgArn, orphanedTargets);
-                    LOG.infov("ASG {0}: deregistered orphaned target(s) {1} from TG {2}",
-                            asg.getAutoScalingGroupName(),
-                            orphanedTargets.stream().map(TargetDescription::getId).collect(Collectors.toList()),
-                            tgArn);
-                }
-            } catch (Exception e) {
-                LOG.debugv("ASG {0}: could not reconcile TG {1}: {2}",
-                        asg.getAutoScalingGroupName(), tgArn, e.getMessage());
-            }
-        }
-    }
-
     private void removeTerminatingInstances(AutoScalingGroup asg) {
         List<AsgInstance> terminatingInstances = asg.getInstances().stream()
                 .filter(instance -> "Terminating".equals(instance.getLifecycleState()))
@@ -522,7 +487,7 @@ public class AutoScalingReconciler {
             return;
         }
 
-        deregisterFromTargetGroups(asg, instanceIds);
+        AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
         deregisterFromClassicLoadBalancers(asg, instanceIds);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
@@ -856,7 +821,7 @@ public class AutoScalingReconciler {
             return;
         }
 
-        deregisterFromTargetGroups(asg, instanceIds);
+        AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
         deregisterFromClassicLoadBalancers(asg, instanceIds);
 
         asg.getInstances().removeIf(i -> instanceIds.contains(i.getInstanceId()));
@@ -907,19 +872,6 @@ public class AutoScalingReconciler {
         return message.substring(0, end) + suffix;
     }
 
-    private void deregisterFromTargetGroups(AutoScalingGroup asg, List<String> instanceIds) {
-        for (String tgArn : asg.getTargetGroupARNs()) {
-            try {
-                List<TargetDescription> targets = instanceIds.stream()
-                        .map(id -> { TargetDescription td = new TargetDescription(); td.setId(id); return td; })
-                        .collect(Collectors.toList());
-                elbV2Service.deregisterTargets(asg.getRegion(), tgArn, targets);
-            } catch (Exception e) {
-                LOG.debugv("ASG {0}: could not deregister from TG {1}: {2}",
-                        asg.getAutoScalingGroupName(), tgArn, e.getMessage());
-            }
-        }
-    }
 
     /**
      * Registers a newly launched instance with every Classic load balancer the group names.
