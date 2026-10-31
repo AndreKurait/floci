@@ -251,7 +251,7 @@ process is resumed and suspended again.
 
 ## Capacity Reconciler (Phase 2)
 
-Floci runs a background reconciler (10 s fixed rate) that keeps each group's InService instance count aligned with `DesiredCapacity`:
+Floci runs a background reconciler (10 s fixed delay after each sweep) that keeps each group's InService instance count aligned with `DesiredCapacity`:
 
 - **Scale-out**: calls `RunInstances` with the group's launch configuration; new instances are tracked as `Pending` until the EC2 state transitions to `running`, at which point they move to `InService` and are registered with all attached ELB v2 target groups.
 - **Scale-in**: selects InService instances not protected from scale-in, deregisters them from target groups, then calls `TerminateInstances`.
@@ -392,3 +392,11 @@ aws autoscaling set-desired-capacity \
 Launch configurations accept an IAM instance profile name or ARN. Unknown and foreign profiles fail creation with `ValidationError`. At launch, the reconciler resolves a stored name to its ARN in the owning account. `CreateAutoScalingGroup` and `UpdateAutoScalingGroup` refuse, with `ValidationError`, a launch template that names both an instance profile name and an ARN, directly or through the mixed instances policy.
 
 Launch-configuration metadata options (`HttpTokens`, `HttpEndpoint`, and `HttpPutResponseHopLimit`) round-trip through Query and CloudFormation and reach EC2 launches. CloudFormation resolves intrinsics inside the block, so `Fn::If` and `AWS::NoValue` can select or omit the block or any of its members. When the structure is omitted it stays absent from `DescribeLaunchConfigurations`; a supplied partial structure reports defaults for unspecified fields. Launch templates, mixed-instance templates and EC2 Fleet launches likewise forward their existing metadata options.
+
+### Reconciliation scheduling
+
+Successful group mutations and completed local EC2 launches request reconciliation
+for the owning account, region and group. Notifications coalesce, each group remains
+serialized, and up to four groups can progress concurrently. A ten-second repair
+sweep covers changes without a local notification. Readiness still requires the
+actual EC2 state; a successful mutation response does not imply capacity is ready.
