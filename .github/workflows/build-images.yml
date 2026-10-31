@@ -286,6 +286,29 @@ jobs:
         if: inputs.publish-native
         run: chmod +x native/amd64/*-runner native/arm64/*-runner
 
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version: '25'
+          distribution: temurin
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: maven
+        with:
+          path: ~/.m2/repository
+          key: maven-image-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            maven-image-${{ runner.os }}-
+            maven-${{ runner.os }}-
+
+      - name: Build shared JVM artifact
+        run: ./mvnw package -Dmaven.test.skip=true -B
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.maven.outputs.cache-hit != 'true'
+        with:
+          path: ~/.m2/repository
+          key: maven-image-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+
       - name: Set build metadata
         id: metadata
         shell: bash
@@ -318,7 +341,7 @@ jobs:
           SOURCE_DATE_EPOCH: ${{ steps.metadata.outputs.source-date-epoch }}
         with:
           context: .
-          file: docker/Dockerfile
+          file: docker/Dockerfile.jvm-package
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.image-tag }}
@@ -429,7 +452,7 @@ jobs:
             --arg jvmRef "$jvm_ref" \
             --arg jvmDigest "$JVM_DIGEST" \
             --arg jvmDigestRef "$jvm_digest_ref" \
-            '{source: {sha: $sourceSha, requestedRef: $requestedSourceRef, repository: $repository}, workflow: {runId: $runId, attempt: $runAttempt, url: $runUrl}, created: $created, imageTag: $imageTag, productVersion: $productVersion, images: {jvm: {ref: $jvmRef, digest: $jvmDigest, digestRef: $jvmDigestRef, dockerfile: "docker/Dockerfile"}}, platforms: ["linux/amd64", "linux/arm64"]}' \
+            '{source: {sha: $sourceSha, requestedRef: $requestedSourceRef, repository: $repository}, workflow: {runId: $runId, attempt: $runAttempt, url: $runUrl}, created: $created, imageTag: $imageTag, productVersion: $productVersion, images: {jvm: {ref: $jvmRef, digest: $jvmDigest, digestRef: $jvmDigestRef, dockerfile: "docker/Dockerfile.jvm-package"}}, platforms: ["linux/amd64", "linux/arm64"]}' \
             > floci-image-provenance.json
 
           if [[ "$PUBLISH_NATIVE" == "true" ]]; then
