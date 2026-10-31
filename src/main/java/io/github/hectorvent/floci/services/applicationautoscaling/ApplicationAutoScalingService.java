@@ -37,10 +37,8 @@ import java.util.UUID;
 /**
  * Application Auto Scaling control plane.
  *
- * <p>Scalable targets and scaling policies are stored and described faithfully, but
- * policies are <strong>inert</strong>: nothing evaluates them and no capacity is ever
- * adjusted. This mirrors the existing EC2 Auto Scaling {@code PutScalingPolicy} behaviour
- * and is documented in {@code docs/services/applicationautoscaling.md}.</p>
+ * <p>ECS desired count and Lambda provisioned concurrency use real capacity adapters.
+ * Other dimensions retain their control-plane records without changing capacity.</p>
  *
  * @see <a href="https://docs.aws.amazon.com/autoscaling/application/APIReference/Welcome.html">Application Auto Scaling API Reference</a>
  */
@@ -90,12 +88,14 @@ public class ApplicationAutoScalingService {
     private final StorageBackend<String, ScalingActivity> activities;
     private final RegionResolver regionResolver;
     private final CloudWatchMetricsService cloudWatchMetricsService;
+    private final LambdaCapacityAdjuster lambdaCapacity;
     private final SignedMarkers pageTokens = new SignedMarkers();
 
     @Inject
     public ApplicationAutoScalingService(StorageFactory factory,
                                          RegionResolver regionResolver,
-                                         CloudWatchMetricsService cloudWatchMetricsService) {
+                                         CloudWatchMetricsService cloudWatchMetricsService,
+                                         LambdaCapacityAdjuster lambdaCapacity) {
         this(factory.create("applicationautoscaling", "application-autoscaling-targets.json",
                         new TypeReference<Map<String, ScalableTarget>>() {}),
                 factory.create("applicationautoscaling", "application-autoscaling-policies.json",
@@ -103,19 +103,21 @@ public class ApplicationAutoScalingService {
                 factory.create("applicationautoscaling", "application-autoscaling-activities.json",
                         new TypeReference<Map<String, ScalingActivity>>() {}),
                 regionResolver,
-                cloudWatchMetricsService);
+                cloudWatchMetricsService, lambdaCapacity);
     }
 
     ApplicationAutoScalingService(StorageBackend<String, ScalableTarget> targets,
                                   StorageBackend<String, ScalingPolicy> policies,
                                   StorageBackend<String, ScalingActivity> activities,
                                   RegionResolver regionResolver,
-                                  CloudWatchMetricsService cloudWatchMetricsService) {
+                                  CloudWatchMetricsService cloudWatchMetricsService,
+                                  LambdaCapacityAdjuster lambdaCapacity) {
         this.targets = targets;
         this.policies = policies;
         this.activities = activities;
         this.regionResolver = regionResolver;
         this.cloudWatchMetricsService = cloudWatchMetricsService;
+        this.lambdaCapacity = lambdaCapacity;
     }
 
     // ---------------------------------------------------------------- scalable targets
@@ -129,12 +131,17 @@ public class ApplicationAutoScalingService {
 
         String key = targetKey(region, serviceNamespace, resourceId, scalableDimension);
         ScalableTarget existing = targets.get(key).orElse(null);
+        if (existing == null && (minCapacity == null || maxCapacity == null)) {
+            throw new AwsException("ValidationException",
+                    "Min and max capacity are required when registering a new scalable target.", 400);
+        }
+        if (lambdaCapacity.supports(scalableDimension)) {
+            lambdaCapacity.reconcileRegistration(resourceId,
+                    minCapacity != null ? minCapacity : existing.getMinCapacity(),
+                    maxCapacity != null ? maxCapacity : existing.getMaxCapacity(), region);
+        }
 
         if (existing == null) {
-            if (minCapacity == null || maxCapacity == null) {
-                throw new AwsException("ValidationException",
-                        "Min and max capacity are required when registering a new scalable target.", 400);
-            }
             ScalableTarget target = new ScalableTarget();
             target.setServiceNamespace(serviceNamespace);
             target.setResourceId(resourceId);
@@ -240,6 +247,10 @@ public class ApplicationAutoScalingService {
         if (policyType != null && !POLICY_TYPES.contains(policyType)) {
             throw new AwsException("ValidationException",
                     "Unsupported policy type: " + policyType, 400);
+        }
+        if ("lambda".equals(serviceNamespace) && !"TargetTrackingScaling".equals(policyType)) {
+            throw new AwsException("ValidationException",
+                    "Lambda provisioned concurrency supports TargetTrackingScaling policies.", 400);
         }
         String targetKey = targetKey(region, serviceNamespace, resourceId, scalableDimension);
         if (targets.get(targetKey).isEmpty()) {
@@ -380,7 +391,7 @@ public class ApplicationAutoScalingService {
     /**
      * Creates the pair of CloudWatch alarms that AWS provisions on behalf of a target
      * tracking policy. The alarms are real: they show up in DescribeAlarms exactly as they
-     * would in AWS, even though nothing evaluates them here.
+     * would in AWS. The background evaluator dispatches their supported capacity adapters.
      */
     private List<Alarm> createTargetTrackingAlarms(ScalingPolicy policy, String region) {
         List<Alarm> alarms = new ArrayList<>();
@@ -397,8 +408,11 @@ public class ApplicationAutoScalingService {
             alarm.setDimensions(resolveDimensions(policy));
             alarm.setStatistic("Average");
             alarm.setPeriod(60);
-            alarm.setEvaluationPeriods("AlarmHigh".equals(suffix) ? 3 : 15);
-            alarm.setThreshold(targetValue(policy));
+            alarm.setEvaluationPeriods("lambda".equals(policy.getServiceNamespace())
+                    || "AlarmHigh".equals(suffix) ? 3 : 15);
+            double target = targetValue(policy);
+            alarm.setThreshold("lambda".equals(policy.getServiceNamespace()) && "AlarmLow".equals(suffix)
+                    ? target * 0.9 : target);
             alarm.setComparisonOperator("AlarmHigh".equals(suffix)
                     ? "GreaterThanThreshold" : "LessThanThreshold");
             alarm.setAlarmActions(List.of(policy.getPolicyArn()));
@@ -426,8 +440,8 @@ public class ApplicationAutoScalingService {
     /**
      * The alarm needs the same dimensions AWS attaches to the real metric, or the evaluator
      * will never find data an operator pushes in the real ECS shape. Real AWS keys ECS
-     * service metrics by {@code ClusterName} + {@code ServiceName}; other namespaces are left
-     * without dimensions, matching their existing "stored but inert" behavior.
+     * service metrics by {@code ClusterName} + {@code ServiceName}. Lambda's alias metrics
+     * use {@code FunctionName} + {@code Resource}.
      */
     private static List<Dimension> resolveDimensions(ScalingPolicy policy) {
         if ("ecs".equals(policy.getServiceNamespace()) && policy.getResourceId() != null) {
@@ -435,6 +449,11 @@ public class ApplicationAutoScalingService {
             if (parts.length == 3 && "service".equals(parts[0])) {
                 return List.of(new Dimension("ClusterName", parts[1]), new Dimension("ServiceName", parts[2]));
             }
+        }
+        if ("lambda".equals(policy.getServiceNamespace())) {
+            LambdaCapacityAdjuster.FunctionTarget target = LambdaCapacityAdjuster.parse(policy.getResourceId());
+            return List.of(new Dimension("FunctionName", target.name()),
+                    new Dimension("Resource", target.name() + ":" + target.qualifier()));
         }
         return List.of();
     }
@@ -455,7 +474,9 @@ public class ApplicationAutoScalingService {
         TargetTrackingConfiguration config = policy.getTargetTrackingConfiguration();
         if (config != null && config.getPredefinedMetricSpecification() != null
                 && config.getPredefinedMetricSpecification().getPredefinedMetricType() != null) {
-            return config.getPredefinedMetricSpecification().getPredefinedMetricType();
+            String type = config.getPredefinedMetricSpecification().getPredefinedMetricType();
+            return "LambdaProvisionedConcurrencyUtilization".equals(type)
+                    ? "ProvisionedConcurrencyUtilization" : type;
         }
         return "CustomizedMetric";
     }
@@ -477,6 +498,10 @@ public class ApplicationAutoScalingService {
             throw new AwsException("ValidationException",
                     "Value '" + scalableDimension + "' at 'scalableDimension' failed to satisfy constraint: "
                             + "Member must satisfy enum value set.", 400);
+        }
+        if (!scalableDimension.startsWith(serviceNamespace + ":")) {
+            throw new AwsException("ValidationException",
+                    "ScalableDimension must belong to ServiceNamespace.", 400);
         }
     }
 

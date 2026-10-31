@@ -136,7 +136,9 @@ class ApplicationAutoScalingIntegrationTest {
         .when().post("/").then().statusCode(200);
 
         String nextToken = call("DescribeScalableTargets")
-            .body("{ \"ServiceNamespace\": \"ecs\", \"MaxResults\": 1 }")
+            .body("""
+                { "ServiceNamespace": "ecs", "ResourceIds": ["%s", "%s"], "MaxResults": 1 }
+                """.formatted(RESOURCE_ID, PAGED_RESOURCE_ID))
         .when().post("/")
         .then().statusCode(200)
             .body("ScalableTargets", hasSize(1))
@@ -144,8 +146,9 @@ class ApplicationAutoScalingIntegrationTest {
             .extract().path("NextToken");
 
         call("DescribeScalableTargets")
-            .body("{ \"ServiceNamespace\": \"ecs\", \"MaxResults\": 1, \"NextToken\": \"%s\" }"
-                .formatted(nextToken))
+            .body("""
+                { "ServiceNamespace": "ecs", "ResourceIds": ["%s", "%s"], "MaxResults": 1, "NextToken": "%s" }
+                """.formatted(RESOURCE_ID, PAGED_RESOURCE_ID, nextToken))
         .when().post("/").then().statusCode(200)
             .body("ScalableTargets", hasSize(1))
             .body("NextToken", nullValue());

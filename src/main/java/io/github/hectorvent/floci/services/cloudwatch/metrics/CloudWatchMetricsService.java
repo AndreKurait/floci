@@ -505,6 +505,19 @@ public class CloudWatchMetricsService {
                 .map(MetricAlarm.class::cast).toList();
     }
 
+    public record OwnedAlarm(String accountId, MetricAlarm alarm) {}
+
+    /** Background evaluation must retain the stored owner instead of using the default account. */
+    public List<OwnedAlarm> allOwnedAlarms() {
+        if (alarmStore instanceof AccountAwareStorageBackend<Alarm> aware) {
+            return aware.scanAllAccountEntries(ignored -> true).stream()
+                    .filter(entry -> entry.value() instanceof MetricAlarm)
+                    .map(entry -> new OwnedAlarm(entry.accountId(), (MetricAlarm) entry.value())).toList();
+        }
+        return allAlarms().stream()
+                .map(alarm -> new OwnedAlarm(regionResolver.getAccountId(), alarm)).toList();
+    }
+
     public List<MetricAlarm> describeAlarms(List<String> names, String prefix, String region) {
         return matchingAlarms(names, prefix, region).stream().filter(MetricAlarm.class::isInstance)
                 .map(MetricAlarm.class::cast).toList();
