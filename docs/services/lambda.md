@@ -1339,3 +1339,10 @@ floci:
 Replace `<digest>` with the image's full SHA-256 digest. The override applies to
 zip-based functions using that runtime; other runtimes retain their default images.
 Custom image URI passthrough and image-package functions are unaffected.
+
+### Provisioned concurrency recovery
+
+Terminal runtime failures, failed leases, alias updates and completed teardown wake
+the serial capacity reconciler. A ten-second repair sweep covers unobserved changes.
+Replacement environments still finish actual initialization and obey account and
+function capacity limits before becoming available.

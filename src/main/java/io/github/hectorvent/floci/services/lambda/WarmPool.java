@@ -494,6 +494,12 @@ public class WarmPool implements ContainerTeardown, Resettable {
         }
     }
 
+    void provisionedAliasUpdated() {
+        if (provisioned != null) {
+            provisioned.requestReconciliation();
+        }
+    }
+
     void validateProvisionedReservation(LambdaFunction fn, Integer reserved) {
         if (provisioned != null) {
             provisioned.validateReservation(fn, reserved);
