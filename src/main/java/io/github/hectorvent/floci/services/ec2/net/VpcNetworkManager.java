@@ -660,6 +660,9 @@ public class VpcNetworkManager {
     /** @return the network name, or null when creation failed */
     private String materialise(VpcBinding vpc) {
         synchronized (vpc) {
+            if (bindings.get(key(vpc.region, vpc.vpcId)) != vpc) {
+                return null;
+            }
             if (vpc.created) {
                 attachCurrentContainer(vpc, null);
                 return vpc.networkName;
@@ -840,8 +843,12 @@ public class VpcNetworkManager {
         synchronized (vpc.declarationLock) {
             vpc.subnetDeclarations.keySet().forEach(subnetId -> subnetOwner.remove(key(region, subnetId)));
         }
-        if (!vpc.created) {
-            return;
+        synchronized (vpc) {
+            // A Docker create already in flight must finish before we decide whether
+            // there is a network to remove. The retired binding cannot create another.
+            if (!vpc.created) {
+                return;
+            }
         }
         String flociContainerId = vpc.flociContainerId;
         if (flociContainerId == null && currentContainerNetworkResolver != null) {
