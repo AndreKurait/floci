@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.testing.AwsTestClients;
 import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -226,7 +227,6 @@ class ApiGatewayV2ReplacementExecutionIntegrationTest {
     }
 
     private CloudFormationClient cfn() {
-        return CloudFormationClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
-                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"))).build();
+        return AwsTestClients.create(CloudFormationClient.builder(), "test", Region.US_EAST_1);
     }
 }

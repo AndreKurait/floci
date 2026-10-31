@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
+import io.github.hectorvent.floci.testing.AwsTestClients;
 import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -52,8 +53,8 @@ class ApiGatewayV2CfnChildDeletionIntegrationTest {
         AssertionError original = new AssertionError("failure after successful stack creation");
         try (ApiGatewayV2Client api = ApiGatewayV2Client.builder().endpointOverride(endpoint)
                 .region(Region.US_EAST_1).credentialsProvider(credentials).build();
-             CloudFormationClient cfn = CloudFormationClient.builder().endpointOverride(endpoint)
-                     .region(Region.US_EAST_1).credentialsProvider(credentials).build()) {
+             CloudFormationClient cfn = AwsTestClients.create(
+                     CloudFormationClient.builder(), "test", Region.US_EAST_1)) {
             String apiId = api.createApi(b -> b.name(name).protocolType("HTTP")).apiId();
             AssertionError observed = assertThrows(AssertionError.class, () -> {
                 try (ChildCleanup cleanup = new ChildCleanup(api, cfn, name, apiId)) {
@@ -80,8 +81,8 @@ class ApiGatewayV2CfnChildDeletionIntegrationTest {
         StaticCredentialsProvider credentials = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
         try (ApiGatewayV2Client api = ApiGatewayV2Client.builder().endpointOverride(endpoint)
                 .region(Region.US_EAST_1).credentialsProvider(credentials).build();
-             CloudFormationClient cfn = CloudFormationClient.builder().endpointOverride(endpoint)
-                     .region(Region.US_EAST_1).credentialsProvider(credentials).build()) {
+             CloudFormationClient cfn = AwsTestClients.create(
+                     CloudFormationClient.builder(), "test", Region.US_EAST_1)) {
             exercise(removeInUpdate, failDelete, api, cfn, "child-delete-" + UUID.randomUUID());
         }
     }
