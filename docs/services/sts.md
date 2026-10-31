@@ -18,6 +18,14 @@
 | `AssumeRoot` | Opens a privileged session on a member account of the organization |
 | `GetWebIdentityToken` | Returns a signed JWT representing the calling identity |
 
+## Account-root token lifetime
+
+`GetSessionToken` and `GetFederationToken` sessions issued to Floci's account-root
+credential default to one hour and are capped at one hour, including larger valid
+`DurationSeconds` requests. IAM users retain the requested duration and the
+12-hour default. Existing input validation and temporary-caller rejection run
+before credentials are registered.
+
 ## Request Constraints
 
 Every operation that models a constraint is held to the one its model declares rather than to a

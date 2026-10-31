@@ -324,7 +324,7 @@ public class StsQueryHandler {
         if (validation != null) {
             return validation;
         }
-        int durationSeconds = getIntParam(params, "DurationSeconds", 43200);
+        int durationSeconds = longTermTokenDuration(params);
         String accessKeyId = "ASIA" + randomId(16);
         String secretKey = randomSecret(40);
         String sessionToken = randomSecret(200);
@@ -610,6 +610,12 @@ public class StsQueryHandler {
         return auth == null ? null : accountResolver.extractAccessKeyId(auth);
     }
 
+    private int longTermTokenDuration(MultivaluedMap<String, String> params) {
+        int requested = getIntParam(params, "DurationSeconds", 43200);
+        // Session registration treats an unheld long-term key as Floci's account-root credential.
+        return iamService.isKnownAccessKey(callerAccessKeyId()) ? requested : Math.min(requested, 3600);
+    }
+
     private Response handleGetFederationToken(MultivaluedMap<String, String> params) {
         if (IamService.isTemporaryAccessKey(callerAccessKeyId())) {
             return AwsQueryResponse.error("AccessDenied", IamService.FEDERATION_TOKEN_SESSION_MESSAGE,
@@ -624,7 +630,7 @@ public class StsQueryHandler {
             return validation;
         }
         String name = getParam(params, "Name");
-        int durationSeconds = getIntParam(params, "DurationSeconds", 43200);
+        int durationSeconds = longTermTokenDuration(params);
 
         String accessKeyId = "ASIA" + randomId(16);
         String secretKey = randomSecret(40);
