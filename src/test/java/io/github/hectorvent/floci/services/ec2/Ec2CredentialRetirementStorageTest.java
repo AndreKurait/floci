@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -15,7 +16,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import java.io.UncheckedIOException;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -41,7 +41,7 @@ class Ec2CredentialRetirementStorageTest {
 
     @ParameterizedTest
     @CsvSource({"false,1", "false,2", "false,3", "false,4", "true,1", "true,2", "true,3", "true,4"})
-    void failedRetirementRetainsAllGenerationsAndBlocksReissue(boolean clear, int failedDeletion) throws Exception {
+    void snapshotFailureDoesNotInterruptRetirementOfAllGenerations(boolean clear, int failedDeletion) throws Exception {
         EmulatorConfig config = StorageFactories.config(directory, ACCOUNT);
         StorageFactory factory = StorageFactories.open(config, "persistent");
         Path obstruction = directory.resolve("iam-sessions.json.tmp");
@@ -76,11 +76,10 @@ class Ec2CredentialRetirementStorageTest {
                 return invocation.callRealMethod();
             }).when(iam).unregisterSession(anyString(), anyString());
 
-            assertThrows(UncheckedIOException.class, () -> retire(credentials, instance, clear));
+            assertDoesNotThrow(() -> retire(credentials, instance, clear));
             assertArrayEquals(beforeFailure.get(), Files.readAllBytes(snapshot));
             assertTrue(iam.findSecretKey(issued.get(failedDeletion - 1).getAccessKeyId(),
-                    issued.get(failedDeletion - 1).getSessionToken()).isPresent());
-            credentials.register(instance);
+                    issued.get(failedDeletion - 1).getSessionToken()).isEmpty());
             assertAll(
                     () -> assertTrue(credentials.get(instance, "worker", NOW).isEmpty()),
                     () -> assertTrue(credentials.identity(instance, ACCOUNT, NOW).isEmpty()),
@@ -88,9 +87,11 @@ class Ec2CredentialRetirementStorageTest {
                     () -> assertTrue(credentials.profile(instance).isEmpty()),
                     () -> {
                         Files.delete(obstruction);
-                        retire(credentials, instance, clear);
-                        retire(credentials, instance, clear);
+                        factory.flushAll();
+                        List<String> persisted = new ObjectMapper().readTree(Files.readAllBytes(snapshot))
+                                .findValuesAsText("accessKeyId");
                         for (SessionCredential session : issued) {
+                            assertFalse(persisted.contains(session.getAccessKeyId()));
                             assertTrue(iam.findSecretKey(session.getAccessKeyId(), session.getSessionToken()).isEmpty());
                         }
                         assertSame(other, unrelated.identity(otherInstance, OTHER_ACCOUNT, NOW).orElseThrow());
@@ -114,7 +115,7 @@ class Ec2CredentialRetirementStorageTest {
 
     @ParameterizedTest
     @ValueSource(ints = {1, 2})
-    void imdsRetirementRetriesProfileAndIdentityAfterPersistentFailure(int failedDeletion) throws Exception {
+    void imdsUnregisterCompletesDespiteSnapshotFailure(int failedDeletion) throws Exception {
         EmulatorConfig config = StorageFactories.config(directory, ACCOUNT);
         StorageFactory factory = StorageFactories.open(config, "persistent");
         Path obstruction = directory.resolve("iam-sessions.json.tmp");
@@ -147,15 +148,14 @@ class Ec2CredentialRetirementStorageTest {
                         }
                         return invocation.callRealMethod();
                     }).when(iam).unregisterSession(anyString(), anyString());
-                    assertThrows(UncheckedIOException.class, () -> fixture.server().unregisterInstance(instance));
-                    assertSame(instance, fixture.server().registeredContainer(Ec2MetadataTestFixture.CALLER_IP).orElseThrow());
+                    assertDoesNotThrow(() -> fixture.server().unregisterInstance(instance));
+                    assertTrue(fixture.server().registeredContainer(Ec2MetadataTestFixture.CALLER_IP).isEmpty());
                     assertEquals(404, fixture.get(profilePath, token).statusCode());
                     assertEquals(404, fixture.get(identityPath, token).statusCode());
                     JsonObject remaining = issued.get(failedDeletion - 1);
-                    assertTrue(iam.findSecretKey(remaining.getString("AccessKeyId"), remaining.getString("Token")).isPresent());
+                    assertTrue(iam.findSecretKey(remaining.getString("AccessKeyId"), remaining.getString("Token")).isEmpty());
                     Files.delete(obstruction);
-                    fixture.server().unregisterInstance(instance);
-                    fixture.server().unregisterInstance(instance);
+                    factory.flushAll();
                     assertTrue(fixture.server().registeredContainer(Ec2MetadataTestFixture.CALLER_IP).isEmpty());
                     assertEquals(404, fixture.get(profilePath, token).statusCode());
                     for (JsonObject session : issued) {
@@ -173,7 +173,7 @@ class Ec2CredentialRetirementStorageTest {
 
     @ParameterizedTest
     @ValueSource(ints = {1, 2})
-    void clearKeepsEveryInstanceRetiringAfterPartialDeletion(int failedDeletion) throws Exception {
+    void clearRevokesEveryInstanceDespiteSnapshotFailure(int failedDeletion) throws Exception {
         EmulatorConfig config = StorageFactories.config(directory, ACCOUNT);
         StorageFactory factory = StorageFactories.open(config, "persistent");
         Path obstruction = directory.resolve("iam-sessions.json.tmp");
@@ -194,15 +194,13 @@ class Ec2CredentialRetirementStorageTest {
                 }
                 return invocation.callRealMethod();
             }).when(iam).unregisterSession(anyString(), anyString());
-            assertThrows(UncheckedIOException.class, credentials::clear);
-            credentials.register(first);
-            credentials.register(second);
+            assertDoesNotThrow(credentials::clear);
             assertAll(
                     () -> assertTrue(credentials.identity(first, ACCOUNT, NOW).isEmpty()),
                     () -> assertTrue(credentials.identity(second, OTHER_ACCOUNT, NOW).isEmpty()),
                     () -> {
                         Files.delete(obstruction);
-                        credentials.clear();
+                        factory.flushAll();
                         assertTrue(iam.findSecretKey(firstSession.getAccessKeyId(), firstSession.getSessionToken()).isEmpty());
                         assertTrue(iam.findSecretKey(secondSession.getAccessKeyId(), secondSession.getSessionToken()).isEmpty());
                     });

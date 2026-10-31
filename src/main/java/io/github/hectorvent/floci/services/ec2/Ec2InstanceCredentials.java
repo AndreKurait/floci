@@ -12,14 +12,12 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Collections;
 import java.util.HexFormat;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 
 /** Owns credentials for the lifetime of each registered EC2 guest. */
 final class Ec2InstanceCredentials {
@@ -29,7 +27,6 @@ final class Ec2InstanceCredentials {
     private final SecureRandom random = new SecureRandom();
     private final Map<Instance, List<Issued>> sessions = new IdentityHashMap<>();
     private final Map<Instance, List<SessionCredential>> identitySessions = new IdentityHashMap<>();
-    private final Set<Instance> retiring = Collections.newSetFromMap(new IdentityHashMap<>());
 
     Ec2InstanceCredentials(IamService iam) {
         this.iam = iam;
@@ -40,28 +37,21 @@ final class Ec2InstanceCredentials {
     }
 
     synchronized void unregister(Instance instance) {
-        retiring.add(instance);
-        List<Issued> issued = sessions.get(instance);
+        List<Issued> issued = sessions.remove(instance);
         if (issued != null) {
             issued.forEach(this::revoke);
         }
-        List<SessionCredential> identities = identitySessions.get(instance);
+        List<SessionCredential> identities = identitySessions.remove(instance);
         if (identities != null) {
             identities.forEach(this::revoke);
         }
-        sessions.remove(instance);
-        identitySessions.remove(instance);
-        retiring.remove(instance);
     }
 
     synchronized void clear() {
-        retiring.addAll(sessions.keySet());
-        retiring.addAll(identitySessions.keySet());
         sessions.values().forEach(issued -> issued.forEach(this::revoke));
-        identitySessions.values().forEach(identities -> identities.forEach(this::revoke));
         sessions.clear();
+        identitySessions.values().forEach(identities -> identities.forEach(this::revoke));
         identitySessions.clear();
-        retiring.clear();
     }
 
     /**
@@ -72,7 +62,7 @@ final class Ec2InstanceCredentials {
      * records for these credentials, {@code <account>:aws:ec2-instance:<instance-id>}.
      */
     synchronized Optional<SessionCredential> identity(Instance instance, String accountId, Instant now) {
-        if (!sessions.containsKey(instance) || retiring.contains(instance)) {
+        if (!sessions.containsKey(instance)) {
             return Optional.empty();
         }
         List<SessionCredential> history = identitySessions.computeIfAbsent(instance, ignored -> new ArrayList<>());
@@ -113,7 +103,7 @@ final class Ec2InstanceCredentials {
 
     private Optional<AttachedProfile> attachedProfile(Instance instance) {
         String arn = instance.getIamInstanceProfileArn();
-        if (!sessions.containsKey(instance) || retiring.contains(instance)) {
+        if (!sessions.containsKey(instance)) {
             return Optional.empty();
         }
         return heldProfile(arn)
@@ -152,7 +142,7 @@ final class Ec2InstanceCredentials {
 
     synchronized Optional<SessionCredential> get(Instance instance, String roleName, Instant now) {
         List<Issued> history = sessions.get(instance);
-        if (history == null || retiring.contains(instance)) {
+        if (history == null) {
             return Optional.empty();
         }
         Optional<IamRole> resolved = role(instance);

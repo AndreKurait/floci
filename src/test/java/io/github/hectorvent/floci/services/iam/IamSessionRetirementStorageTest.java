@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.iam;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -12,7 +13,6 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -22,7 +22,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
@@ -82,7 +83,7 @@ class IamSessionRetirementStorageTest {
     }
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void failedPersistentRetirementPreservesSessionUntilRetry(boolean explicitAccount) throws Exception {
+    void snapshotFailureRevokesImmediatelyAndTheNextWritePersistsRemoval(boolean explicitAccount) throws Exception {
         EmulatorConfig config = StorageFactories.config(directory, DEFAULT_ACCOUNT);
         StorageFactory factory = StorageFactories.open(config, "persistent");
         Path obstruction = directory.resolve("iam-sessions.json.tmp");
@@ -98,13 +99,17 @@ class IamSessionRetirementStorageTest {
             byte[] before = Files.readAllBytes(snapshot);
             Files.createDirectory(obstruction);
 
-            assertThrows(UncheckedIOException.class,
+            assertDoesNotThrow(
                     () -> iam.unregisterSession(explicitAccount ? account : null, ACCESS_KEY));
 
             assertArrayEquals(before, Files.readAllBytes(snapshot));
-            assertTrue(sessions.getForAccount(account, ACCESS_KEY).isPresent());
+            assertTrue(sessions.getForAccount(account, ACCESS_KEY).isEmpty());
+            assertTrue(iam.resolveCallerArns(ACCESS_KEY).isEmpty());
             Files.delete(obstruction);
-            iam.unregisterSession(explicitAccount ? account : null, ACCESS_KEY);
+            iam.registerLambdaExecutionRoleSession(DEFAULT_ACCOUNT, "ASIANEXTWRITE", "fixture-secret",
+                    "arn:aws:iam::000000000000:role/next-write");
+            assertFalse(new ObjectMapper().readTree(Files.readAllBytes(snapshot))
+                    .findValuesAsText("accessKeyId").contains(ACCESS_KEY));
             assertTrue(sessions.getForAccount(account, ACCESS_KEY).isEmpty());
         } finally {
             Files.deleteIfExists(obstruction);
@@ -122,7 +127,7 @@ class IamSessionRetirementStorageTest {
 
     @ParameterizedTest
     @ValueSource(ints = {1, 2})
-    void ecsRetirementRetriesEveryGenerationAfterPersistentFailure(int failedDeletion) throws Exception {
+    void ecsRetirementRevokesEveryGenerationDespiteSnapshotFailure(int failedDeletion) throws Exception {
         EmulatorConfig config = StorageFactories.config(directory, DEFAULT_ACCOUNT);
         when(config.services().ecs().taskRoleCredentials().ttlSeconds()).thenReturn(21600L);
         StorageFactory factory = StorageFactories.open(config, "persistent");
@@ -146,20 +151,13 @@ class IamSessionRetirementStorageTest {
                 return invocation.callRealMethod();
             }).when(iam).unregisterSession(anyString(), anyString());
 
-            assertThrows(UncheckedIOException.class, () -> credentials.revoke(taskArn));
-            assertTrue(credentials.resolveByPath(path, rotatedAt).isEmpty());
-            assertTrue(iam.findSecretKey(first.getAccessKeyId(), first.getSessionToken()).isPresent());
+            assertDoesNotThrow(() -> credentials.revoke(taskArn));
             assertAll(
-                    () -> assertThrows(UncheckedIOException.class,
-                            () -> credentials.issue(taskArn, roleArn, DEFAULT_ACCOUNT, rotatedAt)),
-                    () -> {
-                        Files.delete(obstruction);
-                        credentials.revoke(taskArn);
-                        credentials.revoke(taskArn);
-                        assertTrue(credentials.resolveByPath(path, rotatedAt).isEmpty());
-                        assertTrue(iam.findSecretKey(first.getAccessKeyId(), first.getSessionToken()).isEmpty());
-                        assertTrue(iam.findSecretKey(second.getAccessKeyId(), second.getSessionToken()).isEmpty());
-                    });
+                    () -> assertTrue(credentials.resolveByPath(path, rotatedAt).isEmpty()),
+                    () -> assertTrue(iam.findSecretKey(first.getAccessKeyId(), first.getSessionToken()).isEmpty()),
+                    () -> assertTrue(iam.findSecretKey(second.getAccessKeyId(), second.getSessionToken()).isEmpty()));
+            Files.delete(obstruction);
+            factory.flushAll();
         } finally {
             Files.deleteIfExists(obstruction);
             factory.shutdownAll();
