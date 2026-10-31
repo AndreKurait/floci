@@ -74,6 +74,8 @@ and is answered `ExpiredTradeInTokenException`, the refusal any token that canno
 where the check it replaces called it absent. Nothing published says what AWS answers an empty
 trade-in token, and the model is what is in hand, so the blank is read as the value it is.
 
+SAML role sessions reject `DurationSeconds` above the target role maximum. Accepted requests retain the shorter assertion expiration.
+
 ## Privileged Root Sessions
 
 `AssumeRoot` returns "short term credentials you can use to perform privileged tasks on a member
