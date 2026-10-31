@@ -294,11 +294,18 @@ public class AutoScalingReconciler {
                 }
                 String ec2State = ec2Instances.get(0).getState().getName();
                 if ("running".equals(ec2State)) {
-                    asgInst.setLifecycleState("InService");
-                    registerWithTargetGroups(asg, asgInst);
-                    registerWithClassicLoadBalancers(asg, asgInst);
-                    changed = true;
                     String standbyActivityId = asgInst.getStandbyActivityId();
+                    boolean returningFromStandby = standbyActivityId != null;
+                    if (returningFromStandby) {
+                        registerWithTargetGroups(asg, asgInst, true);
+                        registerWithClassicLoadBalancers(asg, asgInst, true);
+                    }
+                    asgInst.setLifecycleState("InService");
+                    if (!returningFromStandby) {
+                        registerWithTargetGroups(asg, asgInst);
+                        registerWithClassicLoadBalancers(asg, asgInst);
+                    }
+                    changed = true;
                     if (standbyActivityId != null) {
                         // An instance back from standby keeps the health it had there and completes its
                         // ExitStandby activity; nothing was launched.
@@ -930,6 +937,11 @@ public class AutoScalingReconciler {
      * never be satisfied.
      */
     private void registerWithClassicLoadBalancers(AutoScalingGroup asg, AsgInstance asgInst) {
+        registerWithClassicLoadBalancers(asg, asgInst, false);
+    }
+
+    private void registerWithClassicLoadBalancers(AutoScalingGroup asg, AsgInstance asgInst,
+                                                 boolean returningFromStandby) {
         if (elbClassicService == null) {
             return;
         }
@@ -940,6 +952,10 @@ public class AutoScalingReconciler {
                 LOG.debugv("ASG {0}: registered {1} with Classic ELB {2}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), lbName);
             } catch (Exception e) {
+                if (returningFromStandby && !(e instanceof AwsException aws
+                        && "LoadBalancerNotFound".equals(aws.getErrorCode()))) {
+                    throw e;
+                }
                 LOG.warnv("ASG {0}: could not register {1} with Classic ELB {2}: {3}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), lbName, e.getMessage());
             }
@@ -961,6 +977,11 @@ public class AutoScalingReconciler {
     }
 
     private void registerWithTargetGroups(AutoScalingGroup asg, AsgInstance asgInst) {
+        registerWithTargetGroups(asg, asgInst, false);
+    }
+
+    private void registerWithTargetGroups(AutoScalingGroup asg, AsgInstance asgInst,
+                                          boolean returningFromStandby) {
         for (String tgArn : asg.getTargetGroupARNs()) {
             try {
                 TargetDescription td = new TargetDescription();
@@ -969,6 +990,10 @@ public class AutoScalingReconciler {
                 LOG.debugv("ASG {0}: registered {1} with TG {2}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), tgArn);
             } catch (Exception e) {
+                if (returningFromStandby && !(e instanceof AwsException aws
+                        && "TargetGroupNotFound".equals(aws.getErrorCode()))) {
+                    throw e;
+                }
                 LOG.warnv("ASG {0}: could not register {1} with TG {2}: {3}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), tgArn, e.getMessage());
             }
