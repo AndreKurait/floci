@@ -864,6 +864,7 @@ floci:
     elbv2:
       enabled: true
       mock: false
+      max-health-check-interval-millis: 0    # Local acceleration only; probe timeouts and success thresholds are unchanged
     codebuild:
       enabled: true
       # docker-network: floci-network
