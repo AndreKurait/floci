@@ -48,7 +48,6 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
@@ -84,8 +83,6 @@ public class ContainerLifecycleManager {
 
     /** Host interface a port marked loopback-only publishes on. */
     private static final String LOOPBACK_HOST_IP = "127.0.0.1";
-
-    private final Semaphore teardownSlots = new Semaphore(8, true);
 
     private final DockerClient dockerClient;
     private final ImageCacheService imageCacheService;
@@ -513,7 +510,7 @@ public class ContainerLifecycleManager {
      *        SIGTERM before Docker sends SIGKILL. Must be a non-negative integer.
      */
     public void stopAndRemove(String containerId, Closeable logStream, int stopTimeoutSeconds) {
-        withTeardownSlot(() -> stopAndRemoveAdmitted(containerId, logStream, stopTimeoutSeconds));
+        stopAndRemoveAdmitted(containerId, logStream, stopTimeoutSeconds);
     }
 
     private void stopAndRemoveAdmitted(String containerId, Closeable logStream, int stopTimeoutSeconds) {
@@ -546,7 +543,7 @@ public class ContainerLifecycleManager {
      *        SIGTERM before Docker sends SIGKILL. Must be a non-negative integer.
      */
     public void stop(String containerId, int stopTimeoutSeconds) {
-        withTeardownSlot(() -> stopAdmitted(containerId, stopTimeoutSeconds));
+        stopAdmitted(containerId, stopTimeoutSeconds);
     }
 
     private boolean stopAdmitted(String containerId, int stopTimeoutSeconds) {
@@ -592,7 +589,7 @@ public class ContainerLifecycleManager {
     }
 
     public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds) {
-        withTeardownSlot(() -> stopAndRemoveStrictAdmitted(containerId, logStream, stopTimeoutSeconds));
+        stopAndRemoveStrictAdmitted(containerId, logStream, stopTimeoutSeconds);
     }
 
     private void stopAndRemoveStrictAdmitted(String containerId, Closeable logStream, int stopTimeoutSeconds) {
@@ -631,15 +628,6 @@ public class ContainerLifecycleManager {
         // Closed only once the container is stopped and gone, as in stopAndRemove, so the follower
         // can drain the final tail.
         closeLogStreamIfPresent(logStream);
-    }
-
-    private void withTeardownSlot(Runnable stopAndRemove) {
-        teardownSlots.acquireUninterruptibly();
-        try {
-            stopAndRemove.run();
-        } finally {
-            teardownSlots.release();
-        }
     }
 
     private void closeLogStreamIfPresent(Closeable logStream) {
