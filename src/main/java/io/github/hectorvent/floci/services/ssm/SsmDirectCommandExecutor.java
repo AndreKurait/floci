@@ -184,7 +184,7 @@ public class SsmDirectCommandExecutor {
         }
         String timeout = timeoutSeconds + "s";
         return "if command -v timeout >/dev/null 2>&1; then "
-                + "timeout --kill-after=1s " + shellSingleQuote(timeout) + " " + command + "; "
+                + "timeout -k 1s " + shellSingleQuote(timeout) + " " + command + "; "
                 + "else " + command + "; fi";
     }
 

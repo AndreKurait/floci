@@ -83,7 +83,7 @@ class SsmDirectCommandExecutorTest {
         verify(execCreate).withCmd(
                 eq("sh"),
                 eq("-c"),
-                argThat(command -> command.contains("timeout --kill-after=1s '30s' sh -c")
+                argThat(command -> command.contains("timeout -k 1s '30s' sh -c")
                         && !command.contains("floci_ssm_redact")
                         && command.contains("echo stdout")));
     }
@@ -113,7 +113,7 @@ class SsmDirectCommandExecutorTest {
     void timeoutAppliesOnlyToUserScriptBeforeDiagnosticsRun() {
         String command = SsmDirectCommandExecutor.timeoutWrappedScript("sleep 100", 30);
 
-        assertTrue(command.contains("timeout --kill-after=1s '30s' sh -c 'sleep 100'"));
+        assertTrue(command.contains("timeout -k 1s '30s' sh -c 'sleep 100'"));
         assertFalse(command.contains("floci_ssm_redact"));
     }
 
