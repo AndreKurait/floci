@@ -3,9 +3,9 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.AwsTestClients;
 import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
-import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
 import io.restassured.path.json.JsonPath;
@@ -15,12 +15,9 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
 
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -48,9 +45,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @QuarkusTest
 class CloudFormationAppConfigIntegrationTest {
 
-    @TestHTTPResource
-    URI endpoint;
-
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String ALARM = "arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration-errors";
     private static final List<String> RESOURCES = List.of("App", "Env", "Profile", "Strategy");
@@ -64,9 +58,8 @@ class CloudFormationAppConfigIntegrationTest {
     @ValueSource(booleans = {false, true})
     void sdkStackDeletePreservesApplicationNamedAfterItsPhysicalId(boolean removeApplicationFirst) throws Exception {
         String stack = unique("cfn-appconfig-exact-delete");
-        try (CloudFormationClient client = CloudFormationClient.builder().endpointOverride(endpoint)
-                .region(Region.US_EAST_1).credentialsProvider(StaticCredentialsProvider.create(
-                        AwsBasicCredentials.create("test", "test"))).build();
+        try (CloudFormationClient client = AwsTestClients.create(
+                CloudFormationClient.builder(), "test", Region.US_EAST_1);
                 AutoCloseable stackCleanup = () -> {
                     client.deleteStack(request -> request.stackName(stack));
                     CfnStackWaits.awaitStackDeleted(stack);
