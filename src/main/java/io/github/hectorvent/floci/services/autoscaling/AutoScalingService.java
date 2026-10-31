@@ -138,12 +138,8 @@ public class AutoScalingService implements PassedRoleLookup {
         this.elbClassicService = elbClassicService;
     }
 
-    public AutoScalingService(ElbV2Service elbV2Service) {
-        this(elbV2Service, null);
-    }
-
     AutoScalingService() {
-        this(null);
+        this(null, null);
     }
 
     // region :: name → resource
@@ -978,6 +974,21 @@ public class AutoScalingService implements PassedRoleLookup {
         }
     }
 
+    static void deregisterFromClassicLoadBalancers(ElbClassicService elb, AutoScalingGroup asg,
+                                                    List<String> instanceIds) {
+        for (String loadBalancer : asg.getLoadBalancerNames()) {
+            try {
+                elb.deregisterInstances(asg.getRegion(), loadBalancer, instanceIds);
+            } catch (AwsException e) {
+                if (!"LoadBalancerNotFound".equals(e.getErrorCode())) {
+                    throw e;
+                }
+                LOG.debugv("ASG {0}: Classic load balancer {1} is already deleted",
+                        asg.getAutoScalingGroupName(), loadBalancer);
+            }
+        }
+    }
+
     public void detachInstances(String region, String name, List<String> instanceIds,
                                  boolean decrementDesiredCapacity) {
         String key = asgKey(region, name);
@@ -998,16 +1009,7 @@ public class AutoScalingService implements PassedRoleLookup {
                     .filter(instanceIds::contains).toList();
             if (!detached.isEmpty()) {
                 deregisterFromTargetGroups(elbV2Service, asg, detached);
-                for (String loadBalancer : asg.getLoadBalancerNames()) {
-                    try {
-                        elbClassicService.deregisterInstances(region, loadBalancer, detached);
-                    } catch (AwsException e) {
-                        if (!"LoadBalancerNotFound".equals(e.getErrorCode())) {
-                            throw e;
-                        }
-                        LOG.debugv("ASG {0}: Classic load balancer {1} is already deleted", name, loadBalancer);
-                    }
-                }
+                deregisterFromClassicLoadBalancers(elbClassicService, asg, detached);
                 // Detaching removes only the group-name tag, and only where it still names this group.
                 ec2Service.deleteSystemTag(region, detached, GROUP_NAME_TAG, name);
             }

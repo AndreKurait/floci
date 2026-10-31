@@ -114,6 +114,43 @@ class AutoScalingDetachLoadBalancersTest {
         assertEquals(List.of(owned, retained), group.getInstances());
     }
 
+    @Test
+    void detachDeregistersOnlyActualMembersBeforeRemovingOwnership() {
+        group.setTargetGroupARNs(List.of("shared-target-group"));
+
+        service.detachInstances(REGION, "group", List.of("i-owned", "i-other-group"), false);
+
+        verify(targets).deregisterTargets(eq(REGION), eq("shared-target-group"),
+                argThat(values -> values.size() == 1 && "i-owned".equals(values.getFirst().getId())));
+        assertEquals(List.of(retained), group.getInstances());
+    }
+
+    @Test
+    void detachDeregistrationFailurePreservesMembershipForRetry() {
+        group.setTargetGroupARNs(List.of("shared-target-group"));
+        doThrow(new AwsException("Throttling", "retry", 503)).when(targets)
+                .deregisterTargets(eq(REGION), eq("shared-target-group"), anyList());
+
+        assertThrows(AwsException.class,
+                () -> service.detachInstances(REGION, "group", List.of("i-owned"), false));
+
+        assertEquals(List.of(owned, retained), group.getInstances());
+        verifyNoInteractions(classic, service.ec2Service);
+    }
+
+    @Test
+    void detachSkipsDeletedTargetGroupAndCleansTheRemainingGroup() {
+        group.setTargetGroupARNs(List.of("deleted-target-group", "shared-target-group"));
+        doThrow(new AwsException("TargetGroupNotFound", "deleted", 400)).when(targets)
+                .deregisterTargets(eq(REGION), eq("deleted-target-group"), anyList());
+
+        service.detachInstances(REGION, "group", List.of("i-owned"), false);
+
+        verify(targets).deregisterTargets(eq(REGION), eq("shared-target-group"), anyList());
+        verify(classic).deregisterInstances(REGION, "first", List.of("i-owned"));
+        assertEquals(List.of(retained), group.getInstances());
+    }
+
     private static AsgInstance member(String id) {
         AsgInstance member = new AsgInstance();
         member.setInstanceId(id);

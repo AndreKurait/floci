@@ -110,6 +110,50 @@ class AutoScalingReconcilerTest {
         verify(elbV2Service).deregisterTargets(eq("us-east-1"), eq("owned-target-group"), anyList());
     }
 
+    @ParameterizedTest
+    @MethodSource("targetCleanupFailures")
+    void failedClassicCleanupKeepsMembershipUntilRetry(String phase, RuntimeException failure) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbV2Service elbV2Service = mock(ElbV2Service.class);
+        ElbClassicService classic = mock(ElbClassicService.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(
+                asgService, ec2Service, elbV2Service, classic, null);
+        AutoScalingGroup asg = cleanupGroup(phase, ec2Service);
+        asg.setLoadBalancerNames(List.of("first", "second"));
+        when(classic.deregisterInstances("us-east-1", "second", List.of("i-cleanup")))
+                .thenThrow(failure).thenReturn(List.of());
+
+        assertEquals(failure, assertThrows(RuntimeException.class, () -> reconciler.reconcile(asg)));
+
+        assertEquals(List.of("i-cleanup"), asg.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        verify(asgService, never()).saveAutoScalingGroupIfPresent(asg);
+        reconciler.reconcile(asg);
+        assertEquals(List.of(), asg.getInstances());
+        verify(classic, times(2)).deregisterInstances("us-east-1", "first", List.of("i-cleanup"));
+        verify(classic, times(2)).deregisterInstances("us-east-1", "second", List.of("i-cleanup"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"stale", "scale-in", "refresh"})
+    void deletedClassicBalancerDoesNotPreventOwnedCleanup(String phase) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbV2Service elbV2Service = mock(ElbV2Service.class);
+        ElbClassicService classic = mock(ElbClassicService.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(
+                asgService, ec2Service, elbV2Service, classic, null);
+        AutoScalingGroup asg = cleanupGroup(phase, ec2Service);
+        asg.setLoadBalancerNames(List.of("deleted", "remaining"));
+        when(classic.deregisterInstances("us-east-1", "deleted", List.of("i-cleanup")))
+                .thenThrow(new AwsException("LoadBalancerNotFound", "deleted", 400));
+
+        reconciler.reconcile(asg);
+
+        assertEquals(List.of(), asg.getInstances());
+        verify(classic).deregisterInstances("us-east-1", "remaining", List.of("i-cleanup"));
+    }
+
     private static AutoScalingGroup cleanupGroup(String phase, Ec2Service ec2Service) {
         AutoScalingGroup asg = new AutoScalingGroup();
         asg.setRegion("us-east-1");

@@ -254,7 +254,7 @@ public class AutoScalingReconciler {
         if (!entering.isEmpty()) {
             List<String> instanceIds = entering.stream().map(AsgInstance::getInstanceId).toList();
             AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
-            deregisterFromClassicLoadBalancers(asg, instanceIds);
+            AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
             for (AsgInstance instance : entering) {
                 instance.setLifecycleState("Standby");
                 if (instance.getStandbyActivityId() != null) {
@@ -342,7 +342,7 @@ public class AutoScalingReconciler {
                 .collect(Collectors.toList());
         failActiveSsmInvocations(asg, instanceIds);
         AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
-        deregisterFromClassicLoadBalancers(asg, instanceIds);
+        AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
         asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
@@ -375,7 +375,7 @@ public class AutoScalingReconciler {
         }
         failActiveSsmInvocations(asg, instanceIds);
         AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
-        deregisterFromClassicLoadBalancers(asg, instanceIds);
+        AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
         asgService.cancelStandbyMoves(returning);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
@@ -488,7 +488,7 @@ public class AutoScalingReconciler {
         }
 
         AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
-        deregisterFromClassicLoadBalancers(asg, instanceIds);
+        AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
         asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
@@ -822,7 +822,7 @@ public class AutoScalingReconciler {
         }
 
         AutoScalingService.deregisterFromTargetGroups(elbV2Service, asg, instanceIds);
-        deregisterFromClassicLoadBalancers(asg, instanceIds);
+        AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
 
         asg.getInstances().removeIf(i -> instanceIds.contains(i.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
@@ -894,20 +894,6 @@ public class AutoScalingReconciler {
             } catch (Exception e) {
                 LOG.warnv("ASG {0}: could not register {1} with Classic ELB {2}: {3}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), lbName, e.getMessage());
-            }
-        }
-    }
-
-    private void deregisterFromClassicLoadBalancers(AutoScalingGroup asg, List<String> instanceIds) {
-        if (elbClassicService == null) {
-            return;
-        }
-        for (String lbName : asg.getLoadBalancerNames()) {
-            try {
-                elbClassicService.deregisterInstances(asg.getRegion(), lbName, instanceIds);
-            } catch (Exception e) {
-                LOG.debugv("ASG {0}: could not deregister from Classic ELB {1}: {2}",
-                        asg.getAutoScalingGroupName(), lbName, e.getMessage());
             }
         }
     }
