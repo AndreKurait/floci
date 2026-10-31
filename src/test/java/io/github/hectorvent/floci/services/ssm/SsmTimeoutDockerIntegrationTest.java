@@ -121,9 +121,7 @@ class SsmTimeoutDockerIntegrationTest {
             assertEquals(137, result.exitCode(), result.summary());
             assertTrue(timeout.timedOut(), "GNU escalation must emit the guest deadline marker");
             assertFalse(timeout.standardError().contains("floci-ssm-timeout-"));
-            ContainerExec.Result state = ContainerExec.run(docker, container.containerId(), new String[]{"sh", "-c",
-                    "test -s /tmp/descendant || exit 1; pid=$(cat /tmp/descendant); if [ -f /proc/$pid/stat ]; then "
-                            + "read p name state rest < /proc/$pid/stat; printf '%s' \"$state\"; else printf absent; fi"}, 3);
+            ContainerExec.Result state = descendantState(container.containerId());
             assertEquals(0, state.exitCode(), "The descendant must have started: " + state.summary());
             assertTrue(Set.of("absent", "Z").contains(state.stdout()), "Descendant still running: " + state.summary());
         } finally {
@@ -161,9 +159,7 @@ class SsmTimeoutDockerIntegrationTest {
                     : "sh -c 'trap \"\" TERM; echo $$ > /tmp/descendant; exec sleep 600' & wait";
             SsmDirectCommandExecutor.ExecutionResult result = executor.executeIfSupported("i-timeout",
                     "AWS-RunShellScript", Map.of("commands", List.of(script)), 1).orElseThrow();
-            ContainerExec.Result state = ContainerExec.run(docker, container.containerId(), new String[]{"sh", "-c",
-                    "test -s /tmp/descendant || exit 1; pid=$(cat /tmp/descendant); if [ -f /proc/$pid/stat ]; then "
-                            + "read p name state rest < /proc/$pid/stat; printf '%s' \"$state\"; else printf absent; fi"}, 3);
+            ContainerExec.Result state = descendantState(container.containerId());
             assertEquals(0, state.exitCode(), "The descendant must have started: " + state.summary());
             if (parentExits) {
                 assertEquals("Success", result.status(), "Early parent exit must not become a host attach timeout");
@@ -179,6 +175,12 @@ class SsmTimeoutDockerIntegrationTest {
         } finally {
             lifecycle.removeIfExistsStrict(name, true);
         }
+    }
+
+    private ContainerExec.Result descendantState(String container) {
+        return ContainerExec.run(docker, container, new String[]{"sh", "-c",
+                "test -s /tmp/descendant || exit 1; pid=$(cat /tmp/descendant); if [ -f /proc/$pid/stat ]; then "
+                        + "read p name state rest < /proc/$pid/stat; printf '%s' \"$state\"; else printf absent; fi"}, 3);
     }
 
     private ContainerExec.Result execute(String container, String script, int seconds) {

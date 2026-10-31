@@ -181,7 +181,7 @@ public class SsmDirectCommandExecutor {
     }
 
     static String diagnosticWrappedScript(String script) {
-        return "sh -c " + shellSingleQuote(script);
+        return "sh -c " + SsmCommandTimeout.quote(script);
     }
 
     private void logFailureDiagnostics(String containerId) {
@@ -258,10 +258,6 @@ public class SsmDirectCommandExecutor {
             return 0;
         }
         return timeoutSeconds + 2L;
-    }
-
-    private static String shellSingleQuote(String value) {
-        return "'" + value.replace("'", "'\"'\"'") + "'";
     }
 
     private static void closeQuietly(Closeable closeable) {
