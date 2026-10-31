@@ -86,8 +86,10 @@ def test_registration_reconciles_bounds_and_deregistration_preserves_capacity(
         scaling_client.deregister_scalable_target(**target(function))
         capacity(lambda_client, function, 1)
     finally:
-        deregister(scaling_client, function)
-        remove_stack(cloudformation_client, stack)
+        try:
+            deregister(scaling_client, function)
+        finally:
+            remove_stack(cloudformation_client, stack)
 
 
 def test_lambda_metric_alarms_drive_real_capacity(
@@ -151,8 +153,10 @@ def test_lambda_metric_alarms_drive_real_capacity(
         capacity(lambda_client, function, 1)
         invoke_provisioned(lambda_client, function)
     finally:
-        deregister(scaling_client, function)
-        remove_stack(cloudformation_client, stack)
+        try:
+            deregister(scaling_client, function)
+        finally:
+            remove_stack(cloudformation_client, stack)
     assert not cloudwatch_client.describe_alarms(AlarmNames=alarm_names)["MetricAlarms"]
 
 
