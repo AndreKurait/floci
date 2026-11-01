@@ -11,6 +11,8 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.quarkus.test.junit.mockito.InjectSpy;
 import io.restassured.specification.RequestSpecification;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -33,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
@@ -74,11 +77,46 @@ class HttpIntegrationPermissionIntegrationTest {
         verifyInvocations(fixture, 1);
     }
 
+    @Test
+    void failedFunctionCreationDoesNotDeleteExistingFunction() throws Exception {
+        Fixture existing = fixture(OWNER, REGION);
+        PartitionCleanup failedCleanup = new PartitionCleanup();
+        try {
+            AssertionError failure = assertThrows(AssertionError.class,
+                    () -> fixture(OWNER, REGION, existing.name(), failedCleanup));
+            assertTrue(failure.getMessage().contains("409"), failure.getMessage());
+        } finally {
+            failedCleanup.afterEach(mock(ExtensionContext.class));
+        }
+        lambdaRequest(OWNER, REGION).get("/2015-03-31/functions/" + existing.name())
+                .then().statusCode(200);
+    }
+
+    @Test
+    void successfulCreationRegistersFunctionAndApiCleanup() throws Exception {
+        PartitionCleanup ownedCleanup = new PartitionCleanup();
+        Fixture owned;
+        try {
+            owned = fixture(OWNER, REGION, "http-integration-owned-" + UUID.randomUUID(), ownedCleanup);
+        } finally {
+            ownedCleanup.afterEach(mock(ExtensionContext.class));
+        }
+        lambdaRequest(OWNER, REGION).get("/2015-03-31/functions/" + owned.name())
+                .then().statusCode(404);
+        given().header("Authorization", EnforcementFixtures.auth(OWNER, REGION, "apigateway"))
+                .get("/v2/apis/" + owned.apiId()).then().statusCode(404);
+    }
+
     private Fixture fixture(String targetOwner, String targetRegion) throws Exception {
+        return fixture(targetOwner, targetRegion,
+                "http-integration-permission-" + UUID.randomUUID().toString().substring(0, 8), cleanup);
+    }
+
+    private Fixture fixture(String targetOwner, String targetRegion, String name,
+                            PartitionCleanup ownedCleanup) throws Exception {
         ApiGatewayV2Client gateway = ApiGatewayV2Client.builder().endpointOverride(baseUri).region(Region.of(REGION))
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(OWNER, "test"))).build();
-        cleanup.register(gateway::close);
-        String name = "http-integration-permission-" + UUID.randomUUID().toString().substring(0, 8);
+        ownedCleanup.register(gateway::close);
         String arn = "arn:aws:lambda:" + targetRegion + ":" + targetOwner + ":function:" + name + ":live";
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (ZipOutputStream zip = new ZipOutputStream(bytes)) {
@@ -86,18 +124,18 @@ class HttpIntegrationPermissionIntegrationTest {
             zip.write("exports.handler = async () => ({});".getBytes(StandardCharsets.UTF_8));
             zip.closeEntry();
         }
-        cleanup.register(() -> lambdaRequest(targetOwner, targetRegion)
-                .delete("/2015-03-31/functions/" + name).then().statusCode(204));
         lambdaRequest(targetOwner, targetRegion).body(Map.of("FunctionName", name, "Runtime", "nodejs20.x",
                 "Handler", "index.handler", "Role", "arn:aws:iam::" + targetOwner + ":role/lambda-role",
                 "Code", Map.of("ZipFile", Base64.getEncoder().encodeToString(bytes.toByteArray()))))
                 .post("/2015-03-31/functions").then().statusCode(201);
+        ownedCleanup.register(() -> lambdaRequest(targetOwner, targetRegion)
+                .delete("/2015-03-31/functions/" + name).then().statusCode(204));
         lambdaRequest(targetOwner, targetRegion).body("{}")
                 .post("/2015-03-31/functions/" + name + "/versions").then().statusCode(201);
         lambdaRequest(targetOwner, targetRegion).body(Map.of("Name", "live", "FunctionVersion", "1"))
                 .post("/2015-03-31/functions/" + name + "/aliases").then().statusCode(201);
         String api = gateway.createApi(request -> request.name(name).protocolType("HTTP")).apiId();
-        cleanup.register(() -> gateway.deleteApi(request -> request.apiId(api)));
+        ownedCleanup.register(() -> gateway.deleteApi(request -> request.apiId(api)));
         String integration = gateway.createIntegration(request -> request.apiId(api).integrationType("AWS_PROXY")
                 .integrationUri(arn).payloadFormatVersion("2.0")).integrationId();
         gateway.createRoute(request -> request.apiId(api).routeKey("GET /items").authorizationType("NONE").target("integrations/" + integration));
