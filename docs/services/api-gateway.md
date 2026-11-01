@@ -1019,3 +1019,13 @@ SCPs use the shared IAM evaluator. Missing or invalid caller credentials return 
 500 before invocation when IAM enforcement is enabled. The historical bare `*`
 compatibility spelling is preserved separately. Full forwarded condition context and
 issuance of execution-role STS sessions remain outside this behavior.
+
+### WebSocket connection management permissions
+
+With IAM enforcement enabled, GET, POST and DELETE requests to `@connections`
+require a verified SigV4 caller and `execute-api:ManageConnections` permission.
+The resource is the API owner's `api-id/stage/METHOD/@connections` ARN, without
+an individual connection ID. Identity policies, session policies, permissions
+boundaries and SCPs use the shared caller evaluator. Policy changes apply to
+every request, and a permitted endpoint cannot access another API or stage's
+connection. IAM-disabled local connection management remains unsigned.
