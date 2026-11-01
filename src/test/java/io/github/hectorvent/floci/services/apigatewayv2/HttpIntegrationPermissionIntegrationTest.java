@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.apigatewayv2;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -19,6 +20,7 @@ import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
@@ -43,6 +45,8 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doCallRealMethod;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -98,13 +102,11 @@ class HttpIntegrationPermissionIntegrationTest {
         invoke(fixture, 500);
         String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},"
                 + "\"Action\":\"sts:AssumeRole\"}}";
-        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", roleName)));
-        iam("CreateRole", Map.of("RoleName", roleName, "Path", "/service-role/", "AssumeRolePolicyDocument", trust));
+        createRole(roleName, "/service-role/", trust, cleanup);
         invoke(fixture, 500);
         String policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\""
                 + fixture.arn() + "\"}}";
-        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke")));
-        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke", "PolicyDocument", policy));
+        putRolePolicy(roleName, policy, cleanup);
         if (!OWNER.equals(targetOwner)) {
             invoke(fixture, 500);
             lambdaRequest(targetOwner, targetRegion).queryParam("Qualifier", "live")
@@ -124,8 +126,7 @@ class HttpIntegrationPermissionIntegrationTest {
                                                       String targetRegion) throws Exception {
         Fixture fixture = fixture(targetOwner, targetRegion, "arn:aws:iam::*:user/*", type);
         String user = "http-caller-permission-" + UUID.randomUUID().toString().substring(0, 8);
-        cleanup.register(() -> callerIam(callerAccount, "DeleteUser", Map.of("UserName", user)));
-        String principal = callerIam(callerAccount, "CreateUser", Map.of("UserName", user))
+        String principal = createUser(callerAccount, user, cleanup)
                 .xmlPath().getString("CreateUserResponse.CreateUserResult.User.Arn");
         Response created = callerIam(callerAccount, "CreateAccessKey", Map.of("UserName", user));
         CallerKey key = new CallerKey(created.xmlPath().getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId"),
@@ -135,8 +136,7 @@ class HttpIntegrationPermissionIntegrationTest {
         String policy = """
                 {"Statement":{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":"%s"}}"""
                 .formatted(fixture.arn());
-        cleanup.register(() -> callerIam(callerAccount, "DeleteUserPolicy", Map.of("UserName", user, "PolicyName", "invoke")));
-        callerIam(callerAccount, "PutUserPolicy", Map.of("UserName", user, "PolicyName", "invoke", "PolicyDocument", policy));
+        putUserPolicy(callerAccount, user, policy, cleanup);
         if (!callerAccount.equals(targetOwner)) {
             signedInvoke(fixture, key, key.secretAccessKey(), 500);
             lambdaRequest(targetOwner, targetRegion).queryParam("Qualifier", "live")
@@ -161,14 +161,12 @@ class HttpIntegrationPermissionIntegrationTest {
         String trust = """
                 {"Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::%s:root"},
                 "Action":"sts:AssumeRole"}}""".formatted(OWNER);
-        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
-        String role = callerIam(OWNER, "CreateRole", Map.of("RoleName", name, "Path", "/caller-path/",
-                "AssumeRolePolicyDocument", trust)).xmlPath().getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        String role = createRole(name, "/caller-path/", trust, cleanup)
+                .xmlPath().getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
         String policy = """
                 {"Statement":{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":"%s"}}"""
                 .formatted(fixture.arn());
-        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
-        iam("PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke", "PolicyDocument", policy));
+        putRolePolicy(name, policy, cleanup);
         CallerKey denied = assume(role, policy.replace("Allow", "Deny"));
         signedInvoke(fixture, denied, denied.secretAccessKey(), 500);
         CallerKey allowed = assume(role, null);
@@ -195,8 +193,7 @@ class HttpIntegrationPermissionIntegrationTest {
         String trust = """
                 {"Statement":{"Effect":"Allow","Principal":{"Service":"apigateway.amazonaws.com"},
                 "Action":"sts:AssumeRole"}}""";
-        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
-        iam("CreateRole", Map.of("RoleName", name, "Path", "/team/", "AssumeRolePolicyDocument", trust));
+        createRole(name, "/team/", trust, cleanup);
         iam("TagRole", Map.of("RoleName", name, "Tags.member.1.Key", "purpose", "Tags.member.1.Value", "integration"));
         String key = switch (scenario.substring(scenario.indexOf('-') + 1)) {
             case "userid" -> "aws:userid";
@@ -211,14 +208,135 @@ class HttpIntegrationPermissionIntegrationTest {
                 {"Effect":"%s","Action":"lambda:InvokeFunction","Resource":"%s","Condition":{%s}}]}"""
                 .formatted(fixture.arn(), scenario.startsWith("allow") ? ",\"Condition\":{" + condition + "}" : "",
                         scenario.startsWith("deny") ? "Deny" : "Allow", fixture.arn(), condition);
-        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
-        iam("PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke", "PolicyDocument", policy));
+        putRolePolicy(name, policy, cleanup);
         invoke(fixture, scenario.startsWith("allow") ? 200 : 500);
         verifyInvocations(fixture, scenario.startsWith("allow") ? 1 : 0);
         ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
         verify(iamService).registerSessionForAccount(eq(OWNER), keyCaptor.capture(), anyString(), anyString(),
                 eq(roleArn), any(Instant.class), isNull(), anyString(), nullable(String.class));
         assertTrue(iamService.resolveCallerArns(keyCaptor.getValue()).isEmpty());
+    }
+
+    private static Response createRole(String name, String path, String trust, PartitionCleanup ownedCleanup) {
+        Response response = callerIam(OWNER, "CreateRole", Map.of("RoleName", name, "Path", path,
+                "AssumeRolePolicyDocument", trust));
+        ownedCleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
+        return response;
+    }
+
+    private static Response createUser(String account, String name, PartitionCleanup ownedCleanup) {
+        Response response = callerIam(account, "CreateUser", Map.of("UserName", name));
+        ownedCleanup.register(() -> callerIam(account, "DeleteUser", Map.of("UserName", name)));
+        return response;
+    }
+
+    private static void putRolePolicy(String name, String policy, PartitionCleanup ownedCleanup) {
+        iam("PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke", "PolicyDocument", policy));
+        ownedCleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+    }
+
+    private static void putUserPolicy(String account, String name, String policy, PartitionCleanup ownedCleanup) {
+        callerIam(account, "PutUserPolicy", Map.of("UserName", name, "PolicyName", "invoke", "PolicyDocument", policy));
+        ownedCleanup.register(() -> callerIam(account, "DeleteUserPolicy", Map.of("UserName", name, "PolicyName", "invoke")));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Role", "User"})
+    void duplicateIdentityCreationDoesNotDeleteExistingIdentity(String kind) throws Exception {
+        String name = "http-existing-identity-" + UUID.randomUUID();
+        createIdentity(kind, name, cleanup);
+        PartitionCleanup attempted = new PartitionCleanup();
+        try {
+            AssertionError failure = assertThrows(AssertionError.class, () -> createIdentity(kind, name, attempted));
+            assertTrue(failure.getMessage().contains("409"), failure.getMessage());
+        } finally {
+            attempted.afterEach(mock(ExtensionContext.class));
+        }
+        callerIam(OWNER, "Get" + kind, Map.of(kind + "Name", name));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Role", "User"})
+    void successfulIdentityCreationRegistersCleanup(String kind) throws Exception {
+        String name = "http-owned-identity-" + UUID.randomUUID();
+        PartitionCleanup owned = new PartitionCleanup();
+        try {
+            createIdentity(kind, name, owned);
+        } finally {
+            owned.afterEach(mock(ExtensionContext.class));
+        }
+        assertIamAbsent("Get" + kind, Map.of(kind + "Name", name));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Role", "User"})
+    void rejectedInlinePolicyDoesNotDeleteExistingPolicy(String kind) throws Exception {
+        String name = "http-existing-policy-" + UUID.randomUUID();
+        createIdentity(kind, name, cleanup);
+        String policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\"*\"}}";
+        putIdentityPolicy(kind, name, policy, cleanup);
+        Response before = callerIam(OWNER, "Get" + kind + "Policy", Map.of(kind + "Name", name, "PolicyName", "invoke"));
+        String path = "Get" + kind + "PolicyResponse.Get" + kind + "PolicyResult.PolicyDocument";
+        PartitionCleanup attempted = new PartitionCleanup();
+        AwsException unavailable = new AwsException("ServiceFailure", "simulated policy write failure", 500);
+        if (kind.equals("Role")) {
+            doThrow(unavailable).when(iamService).putRolePolicy(name, "invoke", "failed-write");
+        } else {
+            doThrow(unavailable).when(iamService).putUserPolicy(name, "invoke", "failed-write");
+        }
+        try {
+            AssertionError failure = assertThrows(AssertionError.class,
+                    () -> putIdentityPolicy(kind, name, "failed-write", attempted));
+            assertTrue(failure.getMessage().contains("500"), failure.getMessage());
+        } finally {
+            if (kind.equals("Role")) {
+                doCallRealMethod().when(iamService).putRolePolicy(name, "invoke", "failed-write");
+            } else {
+                doCallRealMethod().when(iamService).putUserPolicy(name, "invoke", "failed-write");
+            }
+            attempted.afterEach(mock(ExtensionContext.class));
+        }
+        Response after = callerIam(OWNER, "Get" + kind + "Policy", Map.of(kind + "Name", name, "PolicyName", "invoke"));
+        assertEquals(before.xmlPath().getString(path), after.xmlPath().getString(path));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Role", "User"})
+    void successfulInlinePolicyRegistersCleanup(String kind) throws Exception {
+        String name = "http-owned-policy-" + UUID.randomUUID();
+        createIdentity(kind, name, cleanup);
+        PartitionCleanup owned = new PartitionCleanup();
+        try {
+            putIdentityPolicy(kind, name,
+                    "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\"*\"}}", owned);
+        } finally {
+            owned.afterEach(mock(ExtensionContext.class));
+        }
+        assertIamAbsent("Get" + kind + "Policy", Map.of(kind + "Name", name, "PolicyName", "invoke"));
+        callerIam(OWNER, "Get" + kind, Map.of(kind + "Name", name));
+    }
+
+    private static void createIdentity(String kind, String name, PartitionCleanup ownedCleanup) {
+        if (kind.equals("Role")) {
+            createRole(name, "/fixture/", "{\"Statement\":{\"Effect\":\"Allow\","
+                    + "\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}}", ownedCleanup);
+        } else {
+            createUser(OWNER, name, ownedCleanup);
+        }
+    }
+
+    private static void putIdentityPolicy(String kind, String name, String policy, PartitionCleanup ownedCleanup) {
+        if (kind.equals("Role")) {
+            putRolePolicy(name, policy, ownedCleanup);
+        } else {
+            putUserPolicy(OWNER, name, policy, ownedCleanup);
+        }
+    }
+
+    private static void assertIamAbsent(String action, Map<String, String> parameters) {
+        given().header("Authorization", EnforcementFixtures.auth(OWNER, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", action)
+                .formParams(parameters).post("/").then().statusCode(404);
     }
 
     private static CallerKey assume(String role, String policy) {
