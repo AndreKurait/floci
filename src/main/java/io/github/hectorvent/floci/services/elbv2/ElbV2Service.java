@@ -401,6 +401,19 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         persistRegion(loadBalancers, region);
     }
 
+    /** Restores only attributes changed by a failed CloudFormation update; null means previously absent. */
+    public void restoreLoadBalancerAttributes(String region, String arn, Map<String, String> previous) {
+        LoadBalancer lb = requireLoadBalancer(region, arn);
+        previous.forEach((key, value) -> {
+            if (value == null) {
+                lb.getAttributes().remove(key);
+            } else {
+                lb.getAttributes().put(key, value);
+            }
+        });
+        persistRegion(loadBalancers, region);
+    }
+
     LoadBalancer getLoadBalancer(String region, String arn) {
         return loadBalancers.getOrDefault(region, Map.of()).get(arn);
     }

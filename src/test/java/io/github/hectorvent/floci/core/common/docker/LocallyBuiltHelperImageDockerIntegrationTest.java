@@ -10,15 +10,26 @@ import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.smallrye.config.SmallRyeConfigBuilder;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
+/**
+ * Opt in only with DOCKER_HOST pointing to a disposable daemon and image cache. The test deliberately
+ * replaces a shared base tag; the caller owns removal of that isolated daemon and its entire cache.
+ */
+@EnabledIfSystemProperty(named = "floci.test.isolated-helper-docker", matches = "true")
 class LocallyBuiltHelperImageDockerIntegrationTest {
     private static final String BASE = "busybox:1.37.0";
 
@@ -26,7 +37,7 @@ class LocallyBuiltHelperImageDockerIntegrationTest {
     void helperBuildReplacesForeignHelperAndBaseWithNativeExecutableImage() throws Exception {
         EmulatorConfig config = new SmallRyeConfigBuilder().withMapping(EmulatorConfig.class)
                 .build().getConfigMapping(EmulatorConfig.class);
-        try (DockerClient docker = new DockerClientProducer(config).dockerClient()) {
+        try (DockerClient docker = spy(new DockerClientProducer(config).dockerClient())) {
             try {
                 docker.pingCmd().exec();
             } catch (RuntimeException e) {
@@ -58,6 +69,7 @@ class LocallyBuiltHelperImageDockerIntegrationTest {
                 LocallyBuiltHelperImage.ensureBuilt(docker, builder, helper, helper,
                         "/docker/native-platform-helper.Dockerfile");
                 assertEquals(builtImage, docker.inspectImageCmd(helper).exec().getId());
+                verify(docker, times(1)).buildImageCmd(any(InputStream.class));
                 containerId = docker.createContainerCmd(helper).exec().getId();
                 docker.startContainerCmd(containerId).exec();
                 try (WaitContainerResultCallback exited = new WaitContainerResultCallback()) {

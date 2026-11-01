@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.apigatewayv2;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -11,7 +12,10 @@ import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.quarkus.test.junit.mockito.InjectSpy;
+import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -41,6 +45,9 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doCallRealMethod;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
@@ -95,13 +102,11 @@ class HttpAuthorizerPermissionIntegrationTest {
         invoke(fixture, 500);
         String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},"
                 + "\"Action\":\"sts:AssumeRole\"}}";
-        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", roleName)));
-        iam("CreateRole", Map.of("RoleName", roleName, "Path", "/service-role/", "AssumeRolePolicyDocument", trust));
+        createRole(roleName, "/service-role/", trust, cleanup);
         invoke(fixture, 500);
         String policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\""
                 + fixture.arn() + "\"}}";
-        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke")));
-        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke", "PolicyDocument", policy));
+        putRolePolicy(roleName, policy, cleanup);
         if (!OWNER.equals(owner)) {
             invoke(fixture, 500);
             lambdaRequest(owner, region).queryParam("Qualifier", "live")
@@ -125,8 +130,7 @@ class HttpAuthorizerPermissionIntegrationTest {
         String trust = """
                 {"Statement":{"Effect":"Allow","Principal":{"Service":"apigateway.amazonaws.com"},
                 "Action":"sts:AssumeRole"}}""";
-        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
-        iam("CreateRole", Map.of("RoleName", name, "Path", "/team/", "AssumeRolePolicyDocument", trust));
+        createRole(name, "/team/", trust, cleanup);
         iam("TagRole", Map.of("RoleName", name, "Tags.member.1.Key", "purpose", "Tags.member.1.Value", "authorizer"));
         String key = switch (scenario.substring(scenario.indexOf('-') + 1)) {
             case "userid" -> "aws:userid";
@@ -141,14 +145,100 @@ class HttpAuthorizerPermissionIntegrationTest {
                 {"Effect":"%s","Action":"lambda:InvokeFunction","Resource":"%s","Condition":{%s}}]}"""
                 .formatted(fixture.arn(), scenario.startsWith("allow") ? ",\"Condition\":{" + condition + "}" : "",
                         scenario.startsWith("deny") ? "Deny" : "Allow", fixture.arn(), condition);
-        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
-        iam("PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke", "PolicyDocument", policy));
+        putRolePolicy(name, policy, cleanup);
         invoke(fixture, scenario.startsWith("allow") ? 200 : 500);
         verifyInvocations(fixture, scenario.startsWith("allow") ? 2 : 0);
         ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
         verify(iamService).registerSessionForAccount(eq(OWNER), keyCaptor.capture(), anyString(), anyString(),
                 eq(roleArn), any(Instant.class), isNull(), anyString(), nullable(String.class));
         assertTrue(iamService.resolveCallerArns(keyCaptor.getValue()).isEmpty());
+    }
+
+    private static void createRole(String name, String path, String trust, PartitionCleanup ownedCleanup) {
+        iam("CreateRole", Map.of("RoleName", name, "Path", path, "AssumeRolePolicyDocument", trust));
+        ownedCleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
+    }
+
+    private static void putRolePolicy(String name, String policy, PartitionCleanup ownedCleanup) {
+        iam("PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke", "PolicyDocument", policy));
+        ownedCleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+    }
+
+    private static void createRole(String name, String path, PartitionCleanup ownedCleanup) {
+        createRole(name, path, "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},"
+                + "\"Action\":\"sts:AssumeRole\"}}", ownedCleanup);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/service-role/", "/team/"})
+    void duplicateRoleCreationDoesNotDeleteExistingRole(String path) throws Exception {
+        String name = "http-existing-role-" + UUID.randomUUID();
+        createRole(name, path, cleanup);
+        PartitionCleanup attempted = new PartitionCleanup();
+        try {
+            AssertionError failure = assertThrows(AssertionError.class, () -> createRole(name, path, attempted));
+            assertTrue(failure.getMessage().contains("409"), failure.getMessage());
+        } finally {
+            attempted.afterEach(mock(ExtensionContext.class));
+        }
+        iam("GetRole", Map.of("RoleName", name));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/service-role/", "/team/"})
+    void successfulRoleCreationRegistersCleanup(String path) throws Exception {
+        String name = "http-owned-role-" + UUID.randomUUID();
+        PartitionCleanup owned = new PartitionCleanup();
+        try {
+            createRole(name, path, owned);
+        } finally {
+            owned.afterEach(mock(ExtensionContext.class));
+        }
+        roleRequest("GetRole", name).then().statusCode(404);
+    }
+
+    @Test
+    void rejectedRolePolicyDoesNotDeleteExistingPolicy() throws Exception {
+        String name = "http-existing-policy-" + UUID.randomUUID();
+        createRole(name, "/service-role/", cleanup);
+        String policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\"*\"}}";
+        putRolePolicy(name, policy, cleanup);
+        String path = "GetRolePolicyResponse.GetRolePolicyResult.PolicyDocument";
+        String before = roleRequest("GetRolePolicy", name).then().statusCode(200).extract().xmlPath().getString(path);
+        PartitionCleanup attempted = new PartitionCleanup();
+        doThrow(new AwsException("ServiceFailure", "simulated policy write failure", 500))
+                .when(iamService).putRolePolicy(name, "invoke", "failed-write");
+        try {
+            AssertionError failure = assertThrows(AssertionError.class,
+                    () -> putRolePolicy(name, "failed-write", attempted));
+            assertTrue(failure.getMessage().contains("500"), failure.getMessage());
+        } finally {
+            doCallRealMethod().when(iamService).putRolePolicy(name, "invoke", "failed-write");
+            attempted.afterEach(mock(ExtensionContext.class));
+        }
+        String after = roleRequest("GetRolePolicy", name).then().statusCode(200).extract().xmlPath().getString(path);
+        assertEquals(before, after);
+    }
+
+    @Test
+    void successfulRolePolicyRegistersCleanup() throws Exception {
+        String name = "http-owned-policy-" + UUID.randomUUID();
+        createRole(name, "/service-role/", cleanup);
+        PartitionCleanup owned = new PartitionCleanup();
+        try {
+            putRolePolicy(name,
+                    "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\"*\"}}", owned);
+        } finally {
+            owned.afterEach(mock(ExtensionContext.class));
+        }
+        roleRequest("GetRolePolicy", name).then().statusCode(404);
+        iam("GetRole", Map.of("RoleName", name));
+    }
+
+    private static Response roleRequest(String action, String name) {
+        return given().header("Authorization", EnforcementFixtures.auth(OWNER, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", action)
+                .formParam("RoleName", name).formParam("PolicyName", "invoke").post("/");
     }
 
     private static void iam(String action, Map<String, String> parameters) {
@@ -163,18 +253,7 @@ class HttpAuthorizerPermissionIntegrationTest {
         cleanup.register(gateway::close);
         String name = "http-permission-" + UUID.randomUUID().toString().substring(0, 8);
         String arn = "arn:aws:lambda:" + targetRegion + ":" + targetOwner + ":function:" + name + ":live";
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        try (ZipOutputStream zip = new ZipOutputStream(bytes)) {
-            zip.putNextEntry(new ZipEntry("index.js"));
-            zip.write("exports.handler = async () => ({});".getBytes(StandardCharsets.UTF_8));
-            zip.closeEntry();
-        }
-        cleanup.register(() -> lambdaRequest(targetOwner, targetRegion)
-                .delete("/2015-03-31/functions/" + name).then().statusCode(204));
-        lambdaRequest(targetOwner, targetRegion).body(Map.of("FunctionName", name, "Runtime", "nodejs20.x",
-                "Handler", "index.handler", "Role", "arn:aws:iam::" + targetOwner + ":role/lambda-role",
-                "Code", Map.of("ZipFile", Base64.getEncoder().encodeToString(bytes.toByteArray()))))
-                .post("/2015-03-31/functions").then().statusCode(201);
+        createFunction(targetOwner, targetRegion, name, cleanup);
         lambdaRequest(targetOwner, targetRegion).body("{}")
                 .post("/2015-03-31/functions/" + name + "/versions").then().statusCode(201);
         lambdaRequest(targetOwner, targetRegion).body(Map.of("Name", "live", "FunctionVersion", "1"))
@@ -204,6 +283,49 @@ class HttpAuthorizerPermissionIntegrationTest {
             return new InvokeResult(200, null, payload.getBytes(StandardCharsets.UTF_8), null, "permission-test");
         }).when(lambda).invokeTarget(eq(REGION), eq(arn), any(byte[].class), eq(InvocationType.RequestResponse));
         return new Fixture(name, api, arn, targetOwner, targetRegion, auth);
+    }
+
+    private void createFunction(String targetOwner, String targetRegion, String name,
+                                PartitionCleanup ownedCleanup) throws Exception {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(bytes)) {
+            zip.putNextEntry(new ZipEntry("index.js"));
+            zip.write("exports.handler = async () => ({});".getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+        }
+        lambdaRequest(targetOwner, targetRegion).body(Map.of("FunctionName", name, "Runtime", "nodejs20.x",
+                "Handler", "index.handler", "Role", "arn:aws:iam::" + targetOwner + ":role/lambda-role",
+                "Code", Map.of("ZipFile", Base64.getEncoder().encodeToString(bytes.toByteArray()))))
+                .post("/2015-03-31/functions").then().statusCode(201);
+        ownedCleanup.register(() -> lambdaRequest(targetOwner, targetRegion)
+                .delete("/2015-03-31/functions/" + name).then().statusCode(204));
+    }
+
+    @Test
+    void duplicateFunctionCreationDoesNotDeleteExistingFunction() throws Exception {
+        String name = "http-authorizer-existing-" + UUID.randomUUID();
+        createFunction(OWNER, REGION, name, cleanup);
+        PartitionCleanup attempted = new PartitionCleanup();
+        try {
+            AssertionError failure = assertThrows(AssertionError.class,
+                    () -> createFunction(OWNER, REGION, name, attempted));
+            assertTrue(failure.getMessage().contains("409"), failure.getMessage());
+        } finally {
+            attempted.afterEach(mock(ExtensionContext.class));
+        }
+        lambdaRequest(OWNER, REGION).get("/2015-03-31/functions/" + name).then().statusCode(200);
+    }
+
+    @Test
+    void successfulFunctionCreationRegistersCleanup() throws Exception {
+        String name = "http-authorizer-owned-" + UUID.randomUUID();
+        PartitionCleanup owned = new PartitionCleanup();
+        try {
+            createFunction(OWNER, REGION, name, owned);
+        } finally {
+            owned.afterEach(mock(ExtensionContext.class));
+        }
+        lambdaRequest(OWNER, REGION).get("/2015-03-31/functions/" + name).then().statusCode(404);
     }
 
     private static void add(Fixture fixture, Grant grant) {
