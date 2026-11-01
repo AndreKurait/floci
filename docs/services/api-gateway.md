@@ -302,7 +302,10 @@ handling; a hand-rolled signer must include it.
 > for the API owner's ARN and the requested stage, HTTP method and path. The `$default`
 > route uses the stage's `/$default` resource instead of a method and path. Identity policies,
 > session policies, permissions boundaries and SCPs are evaluated before dispatch, including
-> for HTTP proxy integrations. HTTP APIs do not support resource policies. IAM-off behavior
+> for HTTP proxy integrations. Inbound checks supply `aws:SourceIp` from the connection and
+> `aws:SecureTransport` from the request URI. Forwarded headers do not override these facts
+> under the default proxy configuration. Downstream Lambda caller checks retain their separate
+> service-call context. HTTP APIs do not support resource policies. IAM-off behavior
 > remains signature-only. The verified local `test` credential retains account-root access,
 > subject to SCPs. REST and WebSocket route policy evaluation remains unimplemented.
 > `principalOrgId` and `cognitoIdentity` are always null; Organizations membership and

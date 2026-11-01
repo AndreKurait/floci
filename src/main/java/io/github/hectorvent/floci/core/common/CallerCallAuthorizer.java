@@ -52,6 +52,22 @@ public class CallerCallAuthorizer {
      */
     public Decision authorize(String accessKey, String account, String callerArn, String action,
                               String resourceArn, String partition) {
+        return authorize(accessKey, account, callerArn, action, resourceArn, partition, Map.of());
+    }
+
+    /** Evaluates an inbound request using transport facts supplied by its endpoint. */
+    public Decision authorizeRequest(String accessKey, String account, String callerArn, String action,
+                                     String resourceArn, String partition, String sourceIp, boolean secureTransport) {
+        Map<String, List<String>> context = new HashMap<>();
+        if (sourceIp != null && !sourceIp.isBlank()) {
+            context.put("aws:SourceIp", List.of(sourceIp));
+        }
+        context.put("aws:SecureTransport", List.of(Boolean.toString(secureTransport)));
+        return authorize(accessKey, account, callerArn, action, resourceArn, partition, context);
+    }
+
+    private Decision authorize(String accessKey, String account, String callerArn, String action,
+                               String resourceArn, String partition, Map<String, List<String>> requestContext) {
         if (!config.services().iam().enforcementEnabled()) {
             return Decision.ALLOW;
         }
@@ -68,11 +84,11 @@ public class CallerCallAuthorizer {
                 || (!localRoot && !iam.resolveAccountId(accessKey).filter(account::equals).isPresent())) {
             return Decision.DENY;
         }
-        return RequestScopes.callAs(account, () -> authorizeCaller(accessKey, callerArn, action, resourceArn, resource, localRoot));
+        return RequestScopes.callAs(account, () -> authorizeCaller(accessKey, callerArn, action, resourceArn, resource, localRoot, requestContext));
     }
 
     private Decision authorizeCaller(String accessKey, String callerArn, String action, String resourceArn,
-                                     AwsArnUtils.Arn resource, boolean localRoot) {
+                                     AwsArnUtils.Arn resource, boolean localRoot, Map<String, List<String>> requestContext) {
         Instant now = Instant.now();
         if (iam.isInactiveAccessKey(accessKey) || iam.isExpiredSession(accessKey, now)) {
             return Decision.DENY;
@@ -92,7 +108,7 @@ public class CallerCallAuthorizer {
                 .filter(document -> document != null && !document.isBlank()).toList();
         List<List<String>> scps = scpProvider.isResolvable()
                 ? scpProvider.get().effectiveScpLevels(account) : null;
-        Map<String, List<String>> context = new HashMap<>();
+        Map<String, List<String>> context = new HashMap<>(requestContext);
         arns.putPrincipalKeys(context);
         context = IamConditionContextResolver.withGlobalContext(context, resourceArn, resource.region(), account, owner);
         ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents.isEmpty() ? null : documents,
