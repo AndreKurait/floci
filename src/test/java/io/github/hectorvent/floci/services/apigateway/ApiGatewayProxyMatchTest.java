@@ -39,7 +39,7 @@ class ApiGatewayProxyMatchTest {
         ctrl = new ApiGatewayExecuteController(apiGatewayService, null, apiGatewayV2Service, lambdaService,
                 new RegionResolver("us-east-1", "000000000000"),
                 new ObjectMapper(), vtlEngine, serviceRouter, webSocketConnectionManager, elbV2Service, null,
-                new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class));
+                new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), null);
     }
 
     private ApiGatewayResource resource(String id, String parentId, String pathPart, String path) {

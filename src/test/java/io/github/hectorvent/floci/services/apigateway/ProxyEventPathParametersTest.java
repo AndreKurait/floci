@@ -52,7 +52,7 @@ class ProxyEventPathParametersTest {
         controller = new ApiGatewayExecuteController(
                 null, null, null, null,
                 regionResolver, MAPPER, null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class));
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), null);
     }
 
     private JsonNode pathParametersFor(String path, String resourcePath) throws Exception {

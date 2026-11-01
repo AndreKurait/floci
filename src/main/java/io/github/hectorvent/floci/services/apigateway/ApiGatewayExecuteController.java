@@ -23,6 +23,7 @@ import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
+import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.CookieHeaders;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
@@ -125,6 +126,7 @@ public class ApiGatewayExecuteController {
     private final LambdaService lambdaService;
     private final ServiceCallAuthorizer serviceCallAuthorizer;
     private final ServiceRoleCallAuthorizer serviceRoleCallAuthorizer;
+    private final CallerCallAuthorizer callerCallAuthorizer;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
     private final Configuration jsonPathConfiguration;
@@ -155,13 +157,14 @@ public class ApiGatewayExecuteController {
                                        ExecuteApiSigV4Authorizer sigV4Authorizer, RestLambdaAuthorizer restLambdaAuthorizer,
                                        AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
                                        ServiceCallAuthorizer serviceCallAuthorizer,
-                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer) {
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer, CallerCallAuthorizer callerCallAuthorizer) {
         this.apiGatewayService = apiGatewayService;
         this.cognitoAuthorizer = cognitoAuthorizer;
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.lambdaService = lambdaService;
         this.serviceCallAuthorizer = serviceCallAuthorizer;
         this.serviceRoleCallAuthorizer = serviceRoleCallAuthorizer;
+        this.callerCallAuthorizer = callerCallAuthorizer;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
         this.jsonPathConfiguration = Configuration.builder()
@@ -2864,7 +2867,7 @@ public class ApiGatewayExecuteController {
         try {
             String credentials = integration.getCredentialsArn();
             if (("AWS_PROXY".equalsIgnoreCase(integrationType) || "AWS".equalsIgnoreCase(integrationType))
-                    && !callerCredentialsPassthrough(credentials)) {
+                    && !"*".equals(credentials)) {
                 String accountId = regionResolver.getAccountId();
                 functionName = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
                         region, accountId);
@@ -2875,6 +2878,18 @@ public class ApiGatewayExecuteController {
                             apiId + "/" + stageName + "/" + httpMethod + path).toString();
                     decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionName,
                             sourceArn, accountId);
+                } else if (callerCredentialsPassthrough(credentials)) {
+                    ExecuteApiSigV4Authorizer.CallerIdentity caller = iamIdentity;
+                    if (caller == null) {
+                        ExecuteApiSigV4Authorizer.Result verified = sigV4Authorizer.authorize(
+                                httpMethod, headers, uriInfo, body, routeContext.signedRequestPath());
+                        if (verified.authorized()) {
+                            caller = verified.identity();
+                        }
+                    }
+                    decision = callerCallAuthorizer.authorize(caller == null ? null : caller.accessKey(),
+                            caller == null ? null : caller.accountId(), caller == null ? null : caller.userArn(),
+                            "lambda:InvokeFunction", functionName, regionResolver.getPartition());
                 } else {
                     decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
                             "lambda:InvokeFunction", functionName, accountId, regionResolver.getPartition());
@@ -2897,9 +2912,6 @@ public class ApiGatewayExecuteController {
     }
 
     private boolean callerCredentialsPassthrough(String credentials) {
-        if ("*".equals(credentials)) {
-            return true;
-        }
         if (!AwsArnUtils.isArnFor(credentials, "iam")) {
             return false;
         }

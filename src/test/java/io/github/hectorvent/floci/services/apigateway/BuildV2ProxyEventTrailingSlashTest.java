@@ -49,7 +49,7 @@ class BuildV2ProxyEventTrailingSlashTest {
                 regionResolver, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null,
                 null, null
-        , null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class));
+        , null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), null);
     }
 
     private JsonNode buildEvent(String normalizedPath, String rawRequestUri, String routeKey) throws Exception {

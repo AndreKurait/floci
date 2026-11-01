@@ -53,7 +53,7 @@ class BuildV2ProxyEventBodyEncodingTest {
                 null, null, null, null,
                 regionResolver, objectMapper, null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null
-        , null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class));
+        , null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), null);
     }
 
     @ParameterizedTest(name = "{0}")

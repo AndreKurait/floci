@@ -1,0 +1,95 @@
+package io.github.hectorvent.floci.core.common;
+
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.ResourceAccountRelationship;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.ResourcePolicyDecision;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.RequestPrincipal;
+import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
+import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider.ResourcePolicy;
+import io.github.hectorvent.floci.services.iam.ResourcePolicyProviders;
+import io.github.hectorvent.floci.services.iam.ScpProvider;
+import io.github.hectorvent.floci.services.iam.model.CallerContext;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
+import jakarta.inject.Inject;
+
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/** Evaluates a downstream call using an already authenticated caller's credentials. */
+@ApplicationScoped
+public class CallerCallAuthorizer {
+
+    private final EmulatorConfig config;
+    private final IamService iam;
+    private final IamPolicyEvaluator evaluator;
+    private final Instance<ResourcePolicyProvider> providers;
+    private final Instance<ScpProvider> scpProvider;
+
+    @Inject
+    public CallerCallAuthorizer(EmulatorConfig config, IamService iam, IamPolicyEvaluator evaluator,
+                                Instance<ResourcePolicyProvider> providers, Instance<ScpProvider> scpProvider) {
+        this.config = config;
+        this.iam = iam;
+        this.evaluator = evaluator;
+        this.providers = providers;
+        this.scpProvider = scpProvider;
+    }
+
+    /**
+     * The entry point must verify the signature before supplying this identity. Re-resolving it
+     * here preserves current policy, session and boundary state without trusting request headers.
+     */
+    public Decision authorize(String accessKey, String account, String callerArn, String action,
+                              String resourceArn, String partition) {
+        if (!config.services().iam().enforcementEnabled()) {
+            return Decision.ALLOW;
+        }
+        if (accessKey == null || account == null || !AwsArnUtils.isArn(callerArn)
+                || !AwsArnUtils.isArn(resourceArn)) {
+            return Decision.DENY;
+        }
+        AwsArnUtils.Arn principal = AwsArnUtils.parse(callerArn);
+        AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
+        if (!principal.partition().equals(partition) || !resource.partition().equals(partition)
+                || !principal.accountId().equals(account)
+                || !iam.resolveAccountId(accessKey).filter(account::equals).isPresent()) {
+            return Decision.DENY;
+        }
+        return RequestScopes.callAs(account, () -> authorizeCaller(accessKey, callerArn, action, resourceArn, resource));
+    }
+
+    private Decision authorizeCaller(String accessKey, String callerArn, String action, String resourceArn,
+                                     AwsArnUtils.Arn resource) {
+        Instant now = Instant.now();
+        if (iam.isInactiveAccessKey(accessKey) || iam.isExpiredSession(accessKey, now)) {
+            return Decision.DENY;
+        }
+        CallerContext caller = iam.resolveCallerContext(accessKey, now);
+        IamService.CallerArns arns = iam.resolveCallerArns(accessKey).orElse(null);
+        if (caller == null || arns == null || !callerArn.equals(arns.callerArn())) {
+            return Decision.DENY;
+        }
+        String account = AwsArnUtils.parse(callerArn).accountId();
+        List<ResourcePolicy> policies = ResourcePolicyProviders.policiesFor(providers, resource.service(), resourceArn);
+        String owner = policies.isEmpty() ? resource.accountId() : policies.getFirst().ownerAccountId();
+        List<String> documents = policies.stream().map(ResourcePolicy::policyDocument)
+                .filter(document -> document != null && !document.isBlank()).toList();
+        List<List<String>> scps = scpProvider.isResolvable()
+                ? scpProvider.get().effectiveScpLevels(account) : null;
+        Map<String, List<String>> context = new HashMap<>();
+        arns.putPrincipalKeys(context);
+        context = IamConditionContextResolver.withGlobalContext(context, resourceArn, resource.region(), account, owner);
+        ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents.isEmpty() ? null : documents,
+                RequestPrincipal.caller(arns), action, resourceArn, context);
+        ResourceAccountRelationship relationship = account.equals(owner)
+                ? ResourceAccountRelationship.SAME_ACCOUNT : ResourceAccountRelationship.CROSS_ACCOUNT;
+        return evaluator.evaluateResolvedResourcePolicy(caller.withPrincipalArn(callerArn).withScpLevels(scps),
+                grant, relationship, action, resourceArn, context);
+    }
+}
