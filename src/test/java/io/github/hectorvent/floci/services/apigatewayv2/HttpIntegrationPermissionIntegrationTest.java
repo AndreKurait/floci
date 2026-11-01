@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.apigatewayv2;
 
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
@@ -10,6 +12,7 @@ import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.quarkus.test.junit.mockito.InjectSpy;
+import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtensionContext;
@@ -35,6 +38,8 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doCallRealMethod;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -49,6 +54,9 @@ class HttpIntegrationPermissionIntegrationTest {
 
     @InjectSpy
     LambdaService lambda;
+
+    @InjectSpy
+    IamService iamService;
 
     @TestHTTPResource("/")
     URI baseUri;
@@ -87,13 +95,11 @@ class HttpIntegrationPermissionIntegrationTest {
         invoke(fixture, 500);
         String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},"
                 + "\"Action\":\"sts:AssumeRole\"}}";
-        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", roleName)));
-        iam("CreateRole", Map.of("RoleName", roleName, "Path", "/service-role/", "AssumeRolePolicyDocument", trust));
+        createRole(roleName, trust, cleanup);
         invoke(fixture, 500);
         String policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\""
                 + fixture.arn() + "\"}}";
-        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke")));
-        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke", "PolicyDocument", policy));
+        putRolePolicy(roleName, policy, cleanup);
         if (!OWNER.equals(targetOwner)) {
             invoke(fixture, 500);
             lambdaRequest(targetOwner, targetRegion).queryParam("Qualifier", "live")
@@ -105,6 +111,91 @@ class HttpIntegrationPermissionIntegrationTest {
                 "PolicyDocument", policy.replace("Allow", "Deny")));
         invoke(fixture, 500);
         verifyInvocations(fixture, 1);
+    }
+
+    private static void createRole(String name, String trust, PartitionCleanup ownedCleanup) {
+        iam("CreateRole", Map.of("RoleName", name, "Path", "/service-role/", "AssumeRolePolicyDocument", trust));
+        ownedCleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
+    }
+
+    private static void putRolePolicy(String name, String policy, PartitionCleanup ownedCleanup) {
+        iam("PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke", "PolicyDocument", policy));
+        ownedCleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke")));
+    }
+
+    private static void createRole(String name, PartitionCleanup ownedCleanup) {
+        createRole(name, "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},"
+                + "\"Action\":\"sts:AssumeRole\"}}", ownedCleanup);
+    }
+
+    @Test
+    void duplicateRoleCreationDoesNotDeleteExistingRole() throws Exception {
+        String name = "http-existing-role-" + UUID.randomUUID();
+        createRole(name, cleanup);
+        PartitionCleanup attempted = new PartitionCleanup();
+        try {
+            AssertionError failure = assertThrows(AssertionError.class, () -> createRole(name, attempted));
+            assertTrue(failure.getMessage().contains("409"), failure.getMessage());
+        } finally {
+            attempted.afterEach(mock(ExtensionContext.class));
+        }
+        iam("GetRole", Map.of("RoleName", name));
+    }
+
+    @Test
+    void successfulRoleCreationRegistersCleanup() throws Exception {
+        String name = "http-owned-role-" + UUID.randomUUID();
+        PartitionCleanup owned = new PartitionCleanup();
+        try {
+            createRole(name, owned);
+        } finally {
+            owned.afterEach(mock(ExtensionContext.class));
+        }
+        roleRequest("GetRole", name).then().statusCode(404);
+    }
+
+    @Test
+    void rejectedRolePolicyDoesNotDeleteExistingPolicy() throws Exception {
+        String name = "http-existing-policy-" + UUID.randomUUID();
+        createRole(name, cleanup);
+        String policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\"*\"}}";
+        putRolePolicy(name, policy, cleanup);
+        String path = "GetRolePolicyResponse.GetRolePolicyResult.PolicyDocument";
+        String before = roleRequest("GetRolePolicy", name).then().statusCode(200).extract().xmlPath().getString(path);
+        PartitionCleanup attempted = new PartitionCleanup();
+        doThrow(new AwsException("ServiceFailure", "simulated policy write failure", 500))
+                .when(iamService).putRolePolicy(name, "invoke", "failed-write");
+        try {
+            AssertionError failure = assertThrows(AssertionError.class,
+                    () -> putRolePolicy(name, "failed-write", attempted));
+            assertTrue(failure.getMessage().contains("500"), failure.getMessage());
+        } finally {
+            doCallRealMethod().when(iamService).putRolePolicy(name, "invoke", "failed-write");
+            attempted.afterEach(mock(ExtensionContext.class));
+        }
+        String after = roleRequest("GetRolePolicy", name).then().statusCode(200).extract().xmlPath().getString(path);
+        assertEquals(before, after);
+    }
+
+    @Test
+    void successfulRolePolicyRegistersCleanup() throws Exception {
+        String name = "http-owned-policy-" + UUID.randomUUID();
+        createRole(name, cleanup);
+        PartitionCleanup owned = new PartitionCleanup();
+        try {
+            putRolePolicy(name,
+                    "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\"*\"}}", owned);
+        } finally {
+            owned.afterEach(mock(ExtensionContext.class));
+        }
+        roleRequest("GetRolePolicy", name).then().statusCode(404);
+        iam("GetRole", Map.of("RoleName", name));
+    }
+
+    private static Response roleRequest(String action, String name) {
+        return given().header("Authorization", EnforcementFixtures.auth(OWNER, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", action)
+                .formParam("RoleName", name).formParam("PolicyName", "invoke").post("/");
     }
 
     private static void iam(String action, Map<String, String> parameters) {
