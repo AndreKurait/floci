@@ -77,13 +77,49 @@ class HttpIntegrationPermissionIntegrationTest {
         verifyInvocations(fixture, 1);
     }
 
+    @ParameterizedTest
+    @CsvSource({"000000000000,us-east-1,1.0", "343434343434,us-west-2,2.0"})
+    void configuredRoleRequiresTrustIdentityAndQualifiedResource(String targetOwner, String targetRegion,
+                                                                String payloadVersion) throws Exception {
+        String roleName = "http-role-" + UUID.randomUUID().toString().substring(0, 8);
+        String roleArn = "arn:aws:iam::" + OWNER + ":role/service-role/" + roleName;
+        Fixture fixture = fixture(targetOwner, targetRegion, roleArn, payloadVersion);
+        invoke(fixture, 500);
+        String trust = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"apigateway.amazonaws.com\"},"
+                + "\"Action\":\"sts:AssumeRole\"}}";
+        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", roleName)));
+        iam("CreateRole", Map.of("RoleName", roleName, "Path", "/service-role/", "AssumeRolePolicyDocument", trust));
+        invoke(fixture, 500);
+        String policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"lambda:InvokeFunction\",\"Resource\":\""
+                + fixture.arn() + "\"}}";
+        cleanup.register(() -> iam("DeleteRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke")));
+        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke", "PolicyDocument", policy));
+        if (!OWNER.equals(targetOwner)) {
+            invoke(fixture, 500);
+            lambdaRequest(targetOwner, targetRegion).queryParam("Qualifier", "live")
+                    .body(Map.of("StatementId", "invoke", "Action", "lambda:InvokeFunction", "Principal", roleArn))
+                    .post("/2015-03-31/functions/" + fixture.name() + "/policy").then().statusCode(201);
+        }
+        invoke(fixture, 200);
+        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke",
+                "PolicyDocument", policy.replace("Allow", "Deny")));
+        invoke(fixture, 500);
+        verifyInvocations(fixture, 1);
+    }
+
+    private static void iam(String action, Map<String, String> parameters) {
+        given().header("Authorization", EnforcementFixtures.auth(OWNER, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", action)
+                .formParams(parameters).post("/").then().statusCode(200);
+    }
+
     @Test
     void failedFunctionCreationDoesNotDeleteExistingFunction() throws Exception {
         Fixture existing = fixture(OWNER, REGION);
         PartitionCleanup failedCleanup = new PartitionCleanup();
         try {
             AssertionError failure = assertThrows(AssertionError.class,
-                    () -> fixture(OWNER, REGION, existing.name(), failedCleanup));
+                    () -> fixture(OWNER, REGION, null, "2.0", existing.name(), failedCleanup));
             assertTrue(failure.getMessage().contains("409"), failure.getMessage());
         } finally {
             failedCleanup.afterEach(mock(ExtensionContext.class));
@@ -97,7 +133,7 @@ class HttpIntegrationPermissionIntegrationTest {
         PartitionCleanup ownedCleanup = new PartitionCleanup();
         Fixture owned;
         try {
-            owned = fixture(OWNER, REGION, "http-integration-owned-" + UUID.randomUUID(), ownedCleanup);
+            owned = fixture(OWNER, REGION, null, "2.0", "http-integration-owned-" + UUID.randomUUID(), ownedCleanup);
         } finally {
             ownedCleanup.afterEach(mock(ExtensionContext.class));
         }
@@ -108,12 +144,17 @@ class HttpIntegrationPermissionIntegrationTest {
     }
 
     private Fixture fixture(String targetOwner, String targetRegion) throws Exception {
-        return fixture(targetOwner, targetRegion,
+        return fixture(targetOwner, targetRegion, null, "2.0");
+    }
+
+    private Fixture fixture(String targetOwner, String targetRegion, String credentials, String payloadVersion)
+            throws Exception {
+        return fixture(targetOwner, targetRegion, credentials, payloadVersion,
                 "http-integration-permission-" + UUID.randomUUID().toString().substring(0, 8), cleanup);
     }
 
-    private Fixture fixture(String targetOwner, String targetRegion, String name,
-                            PartitionCleanup ownedCleanup) throws Exception {
+    private Fixture fixture(String targetOwner, String targetRegion, String credentials, String payloadVersion,
+                            String name, PartitionCleanup ownedCleanup) throws Exception {
         ApiGatewayV2Client gateway = ApiGatewayV2Client.builder().endpointOverride(baseUri).region(Region.of(REGION))
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(OWNER, "test"))).build();
         ownedCleanup.register(gateway::close);
@@ -137,7 +178,7 @@ class HttpIntegrationPermissionIntegrationTest {
         String api = gateway.createApi(request -> request.name(name).protocolType("HTTP")).apiId();
         ownedCleanup.register(() -> gateway.deleteApi(request -> request.apiId(api)));
         String integration = gateway.createIntegration(request -> request.apiId(api).integrationType("AWS_PROXY")
-                .integrationUri(arn).payloadFormatVersion("2.0")).integrationId();
+                .integrationUri(arn).credentialsArn(credentials).payloadFormatVersion(payloadVersion)).integrationId();
         gateway.createRoute(request -> request.apiId(api).routeKey("GET /items").authorizationType("NONE").target("integrations/" + integration));
         gateway.createStage(request -> request.apiId(api).stageName("prod").autoDeploy(true));
         doAnswer(invocation -> {

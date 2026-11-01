@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
@@ -55,7 +56,7 @@ class ApiGatewayExecuteControllerTest {
         return new ApiGatewayExecuteController(
                 null, null, null, null,
                 regionResolver, objectMapper, null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class));
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class));
     }
 
     @Test
@@ -458,7 +459,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class));
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class));
 
         Response response = controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -490,7 +491,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, requestContext, null, null, null, mock(ServiceCallAuthorizer.class));
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, requestContext, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class));
 
         controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -525,7 +526,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class));
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class));
 
         controller.dispatch("GET", "restapi1", "prod", "hello", headers, null, null);
 

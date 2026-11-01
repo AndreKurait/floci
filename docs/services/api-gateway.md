@@ -999,3 +999,10 @@ stage, HTTP method and request path, the Lambda function region, and the exact
 qualified target passed to invocation. Missing permission returns HTTP 500 before
 invocation. Configured roles and caller passthrough retain their separate paths;
 this check does not implement role assumption.
+
+When IAM enforcement is enabled, HTTP API Lambda integrations with an execution role
+require API Gateway role trust and invocation permission through the shared identity,
+resource-policy, permissions-boundary and SCP evaluators. Cross-account targets also
+require a resource-policy grant. Authorization and invocation use one qualified target.
+Caller-identity passthrough remains a separate path; this does not qualify forwarding
+its permissions, full condition context, or issuance of execution-role STS sessions.
