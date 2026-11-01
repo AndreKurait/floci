@@ -25,6 +25,9 @@ import java.util.Map;
 @ApplicationScoped
 public class CallerCallAuthorizer {
 
+    private static final String ROOT_ALLOW_ALL =
+            "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}}";
+
     private final EmulatorConfig config;
     private final IamService iam;
     private final IamPolicyEvaluator evaluator;
@@ -44,6 +47,8 @@ public class CallerCallAuthorizer {
     /**
      * The entry point must verify the signature before supplying this identity. Re-resolving it
      * here preserves current policy, session and boundary state without trusting request headers.
+     * The verified local test credential represents account root; its implicit identity grant
+     * still goes through resource policy and SCP evaluation.
      */
     public Decision authorize(String accessKey, String account, String callerArn, String action,
                               String resourceArn, String partition) {
@@ -56,22 +61,27 @@ public class CallerCallAuthorizer {
         }
         AwsArnUtils.Arn principal = AwsArnUtils.parse(callerArn);
         AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
+        boolean localRoot = "test".equals(accessKey) && "iam".equals(principal.service())
+                && principal.region().isEmpty() && "root".equals(principal.resource());
         if (!principal.partition().equals(partition) || !resource.partition().equals(partition)
                 || !principal.accountId().equals(account)
-                || !iam.resolveAccountId(accessKey).filter(account::equals).isPresent()) {
+                || (!localRoot && !iam.resolveAccountId(accessKey).filter(account::equals).isPresent())) {
             return Decision.DENY;
         }
-        return RequestScopes.callAs(account, () -> authorizeCaller(accessKey, callerArn, action, resourceArn, resource));
+        return RequestScopes.callAs(account, () -> authorizeCaller(accessKey, callerArn, action, resourceArn, resource, localRoot));
     }
 
     private Decision authorizeCaller(String accessKey, String callerArn, String action, String resourceArn,
-                                     AwsArnUtils.Arn resource) {
+                                     AwsArnUtils.Arn resource, boolean localRoot) {
         Instant now = Instant.now();
         if (iam.isInactiveAccessKey(accessKey) || iam.isExpiredSession(accessKey, now)) {
             return Decision.DENY;
         }
-        CallerContext caller = iam.resolveCallerContext(accessKey, now);
-        IamService.CallerArns arns = iam.resolveCallerArns(accessKey).orElse(null);
+        CallerContext caller = localRoot ? CallerContext.of(List.of(ROOT_ALLOW_ALL))
+                : iam.resolveCallerContext(accessKey, now);
+        IamService.CallerArns arns = localRoot
+                ? IamService.CallerArns.accountRoot(callerArn, AwsArnUtils.parse(callerArn).accountId())
+                : iam.resolveCallerArns(accessKey).orElse(null);
         if (caller == null || arns == null || !callerArn.equals(arns.callerArn())) {
             return Decision.DENY;
         }
