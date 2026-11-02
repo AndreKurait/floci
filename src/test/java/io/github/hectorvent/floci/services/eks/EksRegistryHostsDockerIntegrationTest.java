@@ -222,6 +222,9 @@ class EksRegistryHostsDockerIntegrationTest {
             }
             Thread.sleep(1000);
         }
+        if (!ready) {
+            logWorkloadDiagnostics(containerId);
+        }
         assertTrue(ready, "serviceaccount and Ready nodes with renewed Leases must be available within 30 seconds");
 
         String podYaml = """
@@ -248,6 +251,9 @@ class EksRegistryHostsDockerIntegrationTest {
                 break;
             }
             Thread.sleep(2000);
+        }
+        if (!running) {
+            logWorkloadDiagnostics(containerId);
         }
         assertTrue(running, "registry-hosts-pod must reach Running, pulling its image through the configured host");
         execInContainerWithExitCode(containerId, new String[]{"kubectl", "delete", "pod", "registry-hosts-pod", "--now"});
@@ -403,6 +409,34 @@ class EksRegistryHostsDockerIntegrationTest {
                 .body(content)
                 .when().put(location + separator + "digest=" + digest)
                 .then().statusCode(201);
+    }
+
+    void logWorkloadDiagnostics(String containerId) {
+        logDiagnostic(containerId, "pod", new String[]{"kubectl", "--request-timeout=2s", "get", "pod",
+                "registry-hosts-pod", "-o", "jsonpath={.status.phase} {.status.conditions} "
+                + "{.status.containerStatuses[*].state}"});
+        logDiagnostic(containerId, "pod events", new String[]{"kubectl", "--request-timeout=2s", "get", "events",
+                "--field-selector=involvedObject.kind=Pod,involvedObject.name=registry-hosts-pod", "-o",
+                "jsonpath={range .items[*]}{.reason}: {.message}{\"\\n\"}{end}"});
+        logDiagnostic(containerId, "node conditions", new String[]{"kubectl", "--request-timeout=2s", "get",
+                "nodes", "-o", "jsonpath={range .items[*]}{.metadata.name} {.status.conditions}{\"\\n\"}{end}"});
+        logDiagnostic(containerId, "node leases", new String[]{"kubectl", "--request-timeout=2s", "get", "leases",
+                "-n", "kube-node-lease", "-o", "jsonpath={range .items[*]}{.metadata.name} {.spec.renewTime}"
+                + "{\"\\n\"}{end}"});
+    }
+
+    private void logDiagnostic(String containerId, String label, String[] command) {
+        try {
+            ContainerExec.Result result = ContainerExec.run(dockerClient, containerId, command, 5);
+            String output = result.summary();
+            LOG.warnv("EKS failure diagnostic {0}: exit={1}, timedOut={2}, output={3}", label,
+                    result.exitCode(), result.timedOut(), output.substring(0, Math.min(output.length(), 4096)));
+        } catch (RuntimeException e) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw e;
+            }
+            LOG.warnv("EKS failure diagnostic {0} unavailable: {1}", label, e.getClass().getSimpleName());
+        }
     }
 
     private boolean isDockerAvailable() {
