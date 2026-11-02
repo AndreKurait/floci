@@ -65,6 +65,12 @@ without a label filter continue to return the latest version of each parameter.
 
 `SendCommand` supports the `AWS-RunShellScript` document. For EC2 instances launched by Floci in real Docker mode, Floci creates the command invocation, returns the command response, and then runs the script asynchronously inside the target instance container. Callers observe completion through `GetCommandInvocation`. `stdout`, `stderr`, response code, start time, and end time are recorded on the invocation.
 
+Direct execution writes the commands to a private executable script and invokes its
+path through `sh -c`, matching the SSM agent's execution model. A shebang selects the
+guest's interpreter, including its arguments; scripts without one use the shell.
+The invocation keeps the requested working directory and removes its temporary
+script after completion, failure, or the in-container execution timeout.
+
 For public `SendCommand`, set `TimeoutSeconds` to a delivery/start allowance from 30 to
 2,592,000 seconds. The default is 3,600 seconds. Floci does not automatically expire
 commands waiting for an agent, so a command that is never delivered can remain pending

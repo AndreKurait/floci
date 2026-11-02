@@ -172,6 +172,7 @@ public class Ec2ImageCatalog {
             require(image.description, "description");
             require(image.architecture, "architecture");
             require(image.creationDate, "creationDate");
+            image.validateVolumeMounts();
 
             for (String alias : image.aliases()) {
                 addIndexEntry(index, alias, image);
@@ -232,6 +233,26 @@ public class Ec2ImageCatalog {
         public List<CatalogImage> images = List.of();
     }
 
+    @RegisterForReflection
+    public record VolumeMount(String device, String target, String filesystem) {
+        public VolumeMount {
+            require(device, "volumeMounts.device");
+            if (!Ec2Service.validDeviceName(device)) {
+                throw new IllegalStateException("Invalid EC2 image catalog volume device: " + device);
+            }
+            device = Ec2Service.normalizedDevice(device);
+            Path path = Path.of(require(target, "volumeMounts.target")).normalize();
+            if (!path.isAbsolute() || path.equals(Path.of("/"))
+                    || path.startsWith("/dev") || path.startsWith("/proc") || path.startsWith("/sys")) {
+                throw new IllegalStateException("Invalid EC2 image catalog volume target: " + target);
+            }
+            target = path.toString();
+            if (!"ext4".equals(filesystem)) {
+                throw new IllegalStateException("EC2 image catalog volume filesystem must be ext4");
+            }
+        }
+    }
+
     @JsonIgnoreProperties(ignoreUnknown = true)
     @RegisterForReflection
     public static final class CatalogImage {
@@ -259,6 +280,29 @@ public class Ec2ImageCatalog {
         public String guestRuntime;
         public Boolean cloudInit;
         public String provenance;
+        public List<VolumeMount> volumeMounts = List.of();
+
+        public List<VolumeMount> volumeMounts() {
+            return volumeMounts == null ? List.of() : List.copyOf(volumeMounts);
+        }
+
+        private void validateVolumeMounts() {
+            volumeMounts = volumeMounts();
+            if (!volumeMounts.isEmpty() && !ResolvedAmiImage.IMAGE_RUNTIME.equals(guestRuntime)) {
+                throw new IllegalStateException("EC2 image catalog volume mounts require guestRuntime: image");
+            }
+            for (int i = 0; i < volumeMounts.size(); i++) {
+                VolumeMount mount = volumeMounts.get(i);
+                for (int j = 0; j < i; j++) {
+                    VolumeMount previous = volumeMounts.get(j);
+                    if (mount.device().equals(previous.device())
+                            || Path.of(mount.target()).startsWith(previous.target())
+                            || Path.of(previous.target()).startsWith(mount.target())) {
+                        throw new IllegalStateException("Conflicting EC2 image catalog volume mounts");
+                    }
+                }
+            }
+        }
 
         public boolean advertised() {
             return advertised == null || advertised;

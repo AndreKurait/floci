@@ -540,7 +540,8 @@ public class ApiGatewayExecuteController {
                 return restIamRejection(scope, iamResult);
             }
             iamIdentity = iamResult.identity();
-            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod, path);
+            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod,
+                    preserveTrailingSlash(path, uriInfo.getRequestUri().getRawPath()));
             if (callerCallAuthorizer.authorizeRequest(iamIdentity == null ? null : iamIdentity.accessKey(),
                     iamIdentity == null ? null : iamIdentity.accountId(),
                     iamIdentity == null ? null : iamIdentity.userArn(), "execute-api:Invoke", invokeArn,

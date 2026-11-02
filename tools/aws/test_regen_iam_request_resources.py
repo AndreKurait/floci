@@ -143,6 +143,18 @@ def reference(namespace: str, operations: dict[str, list[str]], resources: dict[
                             "SDK": [{"Name": namespace, "Method": name, "Package": "Boto3"}]} for name in operations],
             "Resources": [{"Name": kind, "ARNFormats": [arn]} for kind, arn in resources.items()]}
 
+@pytest.mark.parametrize("upstream,expected", [
+    ("arn:${Partition}:swf::${Account}:/domain/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}"),
+    ("arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}"),
+    ("arn:${Partition}:swf:${Region}:${Account}:different/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:different/${DomainName}"),
+])
+def test_swf_restores_only_the_known_missing_region(upstream, expected):
+    document = reference("swf", {}, {"domain": upstream})
+    assert r.arn_formats([document], {"swf"}) == {"swf": {"domain": expected}}
+
 
 def model(operations: dict[str, dict[str, str]], protocol: str = "json") -> dict:
     """A botocore model whose operations take the members given, each a string or a list of strings."""

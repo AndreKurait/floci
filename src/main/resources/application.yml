@@ -737,7 +737,7 @@ floci:
       max-published-ports-per-instance: 20
       socat-image: alpine/socat
       volume-block-devices: true
-      volume-helper-image: alpine:3.21
+      volume-helper-image: debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
       mock: false
       # Automatic public IPv4 address of a mock instance: none, documentation (203.0.113.0/24,
       # routed nowhere), fixed (mock-public-address, default 127.0.0.1), or pool (configured

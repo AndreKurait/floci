@@ -82,6 +82,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -118,6 +119,45 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 class Ec2ContainerManagerTest {
+
+    @Test
+    void shutdownWaitsForInterruptedLaunchCleanupBeforeReturning() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        ExecutorService stopper = Executors.newSingleThreadExecutor();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        CountDownLatch finishCleanup = new CountDownLatch(1);
+        try {
+            LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+            executor.submit(() -> {
+                entered.countDown();
+                try {
+                    new CountDownLatch(1).await();
+                } catch (InterruptedException expected) {
+                    // Model a launch unwinding a Docker operation after shutdown interrupts it.
+                    interrupted.countDown();
+                    try {
+                        finishCleanup.await();
+                    } catch (InterruptedException secondInterrupt) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            Future<?> stopping = stopper.submit(() -> {
+                harness.manager().stop();
+            });
+            assertTrue(interrupted.await(2, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> stopping.get(100, TimeUnit.MILLISECONDS));
+            finishCleanup.countDown();
+            stopping.get(2, TimeUnit.SECONDS);
+            assertTrue(executor.isTerminated());
+        } finally {
+            finishCleanup.countDown();
+            executor.shutdownNow();
+            stopper.shutdownNow();
+        }
+    }
 
     @Test
     void terminationRetainsFirewallIdentityAfterInterfacesAreReleased() throws Exception {
@@ -1378,6 +1418,56 @@ class Ec2ContainerManagerTest {
         awaitUntil(started::get, Duration.ofSeconds(2));
         verify(harness.builder).withNetworkMode("container:" + TEST_HELPER_ID);
         verify(harness.lifecycleManager).createAndStart(any(ContainerSpec.class));
+    }
+
+    @Test
+    void imageDataMountIsPreparedBeforeCreationWithoutChangingEntrypoint() throws Exception {
+        LaunchHarness harness = launchHarness();
+        Instance instance = instance("i-image-volume");
+        Ec2ImageCatalog.VolumeMount mapping = new Ec2ImageCatalog.VolumeMount("sdf", "/data", "ext4");
+        Ec2VolumeBlockDeviceManager.PreparedMount prepared =
+                new Ec2VolumeBlockDeviceManager.PreparedMount("vol-abc", "/dev/sdf", "/dev/loop42",
+                        "floci-volume", "/data");
+        AtomicBoolean preparedBeforeCreation = new AtomicBoolean();
+        when(harness.lifecycleManager.create(any(ContainerSpec.class))).thenAnswer(invocation -> {
+            assertTrue(preparedBeforeCreation.get(), "The image must never start on an unmounted directory");
+            return TEST_CONTAINER_ID;
+        });
+
+        harness.manager.launch(instance,
+                new ResolvedAmiImage("example/image:1", "image", false, null, List.of(mapping)),
+                null, "us-west-2", Set.of(), List.of(), Map.of(), () -> {
+                    verify(harness.lifecycleManager, never()).create(any(ContainerSpec.class));
+                    preparedBeforeCreation.set(true);
+                    return List.of(prepared);
+                }, null);
+
+        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        verify(harness.builder).withNamedVolume("floci-volume", "/data");
+        verify(harness.builder).withDevice("/dev/loop42", "/dev/sdf", "rw");
+        verify(harness.builder).withDevice("/dev/loop42", "/dev/loop42", "rw");
+        verify(harness.builder).withCapAdd("SYS_RESOURCE");
+        verify(harness.builder).withPrivileged(false);
+        ArgumentCaptor<List<String>> commands = ArgumentCaptor.forClass(List.class);
+        verify(harness.builder).withCmd(commands.capture());
+        assertEquals(List.of("exec sleep 2147483647"), commands.getValue(),
+                "Only the network helper receives a command override");
+    }
+
+    @Test
+    void failedDataPreparationNeverCreatesTheGuest() throws Exception {
+        LaunchHarness harness = launchHarness();
+        Instance instance = instance("i-bad-volume");
+        Ec2ImageCatalog.VolumeMount mapping = new Ec2ImageCatalog.VolumeMount("sdf", "/data", "ext4");
+        harness.manager.launch(instance,
+                new ResolvedAmiImage("example/image:1", "image", false, null, List.of(mapping)),
+                null, "us-west-2", Set.of(), List.of(), Map.of(), () -> {
+                    throw new IllegalStateException("backing file contains unknown data");
+                }, null);
+
+        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        verify(harness.lifecycleManager, never()).create(any(ContainerSpec.class));
+        assertNull(instance.getDockerContainerId());
     }
 
     @Test

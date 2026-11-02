@@ -57,7 +57,8 @@ public class AmiImageResolver {
                         ? ResolvedAmiImage.DEFAULT_RUNTIME
                         : image.guestRuntime,
                 Boolean.TRUE.equals(image.cloudInit),
-                dockerPlatform(image.architecture));
+                dockerPlatform(image.architecture),
+                image.volumeMounts());
     }
 
     private static String dockerPlatform(String architecture) {

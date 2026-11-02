@@ -289,6 +289,13 @@ rewrites it to internally. Both
 placements AWS accepts are honoured: an `Authorization` header and a presigned query string
 (`X-Amz-Algorithm=AWS4-HMAC-SHA256`). The credential must be scoped to the `execute-api` service.
 
+REST `AWS_IAM` permission checks retain a request's trailing slash in the
+execution ARN. A request to `/items/` is evaluated against `.../GET/items/`,
+including identity policies, cross-account API resource grants, and explicit
+denies. Resource routing still matches the `/items` method. This correction is
+limited to REST `AWS_IAM`; custom-authorizer event ARNs and HTTP API permission
+paths retain their existing behavior.
+
 Temporary credentials must also present the session token they were issued with, as
 `X-Amz-Security-Token` (a header, or a query parameter on a presigned request). As on AWS, the
 token is read only from where the signature is, and an empty one counts as sent. The token is

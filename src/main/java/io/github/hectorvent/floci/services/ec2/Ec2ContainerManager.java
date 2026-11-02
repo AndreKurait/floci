@@ -27,6 +27,7 @@ import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.github.hectorvent.floci.core.common.docker.UserDataPipeline;
 import io.github.hectorvent.floci.services.ec2.Ec2InstanceTypeCatalog.CatalogInstanceType;
+import io.github.hectorvent.floci.services.ec2.Ec2VolumeBlockDeviceManager.PreparedMount;
 import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
@@ -34,8 +35,11 @@ import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
+import io.quarkus.runtime.ShutdownEvent;
 import jakarta.annotation.PreDestroy;
+import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -44,6 +48,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -66,6 +71,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -403,6 +409,20 @@ public class Ec2ContainerManager {
         closeActiveUserDataCallbacks();
         executor.shutdownNow();
         closeActiveUserDataCallbacks();
+        try {
+            if (!executor.awaitTermination(15, TimeUnit.SECONDS)) {
+                LOG.warn("EC2 launch workers did not finish before the shutdown drain deadline");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            LOG.warn("EC2 launch worker drain interrupted");
+        }
+    }
+
+    void onStop(@Observes @Priority(1100) ShutdownEvent ignored) {
+        // Helpers can exist before the primary container is recorded. Finish launch cleanup
+        // before EmulatorLifecycle snapshots the instances for container teardown.
+        stop();
     }
 
     /**
@@ -441,6 +461,13 @@ public class Ec2ContainerManager {
     public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region,
                        Set<Integer> appPorts, List<SecurityGroup> groups,
                        Map<String, List<String>> prefixLists, Runnable postLaunch) {
+        launch(instance, image, publicKey, region, appPorts, groups, prefixLists, List::of, postLaunch);
+    }
+
+    public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region,
+                       Set<Integer> appPorts, List<SecurityGroup> groups,
+                       Map<String, List<String>> prefixLists, Supplier<List<PreparedMount>> prepareMounts,
+                       Runnable postLaunch) {
         instance.setState(InstanceState.pending());
 
         // An instance record is metadata: id, addresses, tags and lifecycle state are all
@@ -449,7 +476,7 @@ public class Ec2ContainerManager {
         // instead of dying: Floci in Docker without a mounted socket, or a stopped daemon
         // on the host, would otherwise terminate every instance the moment it launched.
         if (!isDockerAvailable()) {
-            if (firewallManager != null && firewallManager.enabled()) {
+            if (!image.volumeMounts().isEmpty() || firewallManager != null && firewallManager.enabled()) {
                 failLaunch(instance);
             } else {
                 markContainerlessRunning(instance);
@@ -472,7 +499,7 @@ public class Ec2ContainerManager {
                 String flociHost = dockerHostResolver.resolve();
                 int imdsPort = config.services().ec2().imdsPort();
                 StartedContainer started = createAndStartContainer(instance, image, region, flociHost, imdsPort,
-                        leasedPrivateIp, groups, prefixLists);
+                        leasedPrivateIp, groups, prefixLists, prepareMounts);
                 if (started == null) {
                     return;
                 }
@@ -572,10 +599,16 @@ public class Ec2ContainerManager {
     private StartedContainer createAndStartContainer(Instance instance, ResolvedAmiImage image, String region,
                                                      String flociHost, int imdsPort, String leasedPrivateIp,
                                                      List<SecurityGroup> groups,
-                                                     Map<String, List<String>> prefixLists) {
+                                                     Map<String, List<String>> prefixLists,
+                                                     Supplier<List<PreparedMount>> prepareMounts) {
         String instanceId = instance.getInstanceId();
         String containerName = ContainerStorageHelper.resourceName(config, "ec2", null, instanceId);
         GuestOptions options = guestOptions(config.services().ec2());
+        validateMountOptions(image, options);
+        List<PreparedMount> mounts = List.copyOf(prepareMounts.get());
+        if (mounts.size() != image.volumeMounts().size()) {
+            throw new IllegalStateException("EC2 image data-volume mounts were not prepared");
+        }
         boolean customResolver = options.mounts().stream().anyMatch(mount ->
                 "/etc".equals(mount.getTarget()) || "/etc/resolv.conf".equals(mount.getTarget()));
         String serviceEndpoint = customResolver ? reachableEndpoint.baseUrl(false) : reachableEndpoint.baseUrl();
@@ -644,7 +677,7 @@ public class Ec2ContainerManager {
                 }
                 ContainerSpec spec = buildContainerSpec(containerName, image, region, serviceEndpoint,
                         instanceId, helperId, namespace != null, instance.getIamInstanceProfileArn() != null,
-                        instance.getInstanceType(), options);
+                        instance.getInstanceType(), options, mounts);
                 containerId = image.dockerPlatform() == null
                         ? lifecycleManager.create(spec)
                         : lifecycleManager.create(spec, image.dockerPlatform());
@@ -690,7 +723,8 @@ public class Ec2ContainerManager {
     private ContainerSpec buildContainerSpec(String containerName, ResolvedAmiImage image, String region,
                                              String serviceEndpoint, String instanceId,
                                              String helperId, boolean enforceSecurityGroups,
-                                             boolean hasInstanceProfile, String instanceType, GuestOptions options) {
+                                             boolean hasInstanceProfile, String instanceType, GuestOptions options,
+                                             List<PreparedMount> mounts) {
         // Image runtime keeps the image's startup contract; minimal and systemd retain their commands.
         ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image.dockerImage())
                 .withName(containerName)
@@ -708,10 +742,20 @@ public class Ec2ContainerManager {
                 // sibling emulator's live instances off a shared daemon. See LABEL_OWNER.
                 .withLabels(Map.of(LABEL_OWNER, ownerIdentity()))
                 .withNetworkMode("container:" + helperId)
-                .withPrivileged(config.services().ec2().privileged() && !enforceSecurityGroups);
+                .withPrivileged(config.services().ec2().privileged() && !enforceSecurityGroups && mounts.isEmpty());
         config.services().ec2().capDrop().orElse(List.of()).forEach(specBuilder::withCapDrop);
         options.ulimits().forEach((name, limit) -> specBuilder.withUlimit(name, limit.soft(), limit.hard()));
         options.mounts().forEach(specBuilder::withMount);
+        if (!mounts.isEmpty()) {
+            specBuilder.withCapAdd("SYS_RESOURCE");
+            for (PreparedMount mount : mounts) {
+                specBuilder.withNamedVolume(mount.dockerVolume(), mount.target())
+                        .withDevice(mount.loopDevice(), mount.device(), "rw");
+                if (!mount.device().equals(mount.loopDevice())) {
+                    specBuilder.withDevice(mount.loopDevice(), mount.loopDevice(), "rw");
+                }
+            }
+        }
         if (!image.imageRuntime()) {
             specBuilder.withCmd(image.systemd() ? List.of("/sbin/init") : List.of("tail", "-f", "/dev/null"));
         }
@@ -737,6 +781,26 @@ public class Ec2ContainerManager {
                     .withBind("/sys/fs/cgroup", "/sys/fs/cgroup");
         }
         return specBuilder.build();
+    }
+
+    private void validateMountOptions(ResolvedAmiImage image, GuestOptions options) {
+        if (image.volumeMounts().isEmpty()) {
+            return;
+        }
+        if (config.services().ec2().capDrop().orElse(List.of()).stream().anyMatch(capability ->
+                "SYS_RESOURCE".equalsIgnoreCase(capability) || "CAP_SYS_RESOURCE".equalsIgnoreCase(capability)
+                        || "ALL".equalsIgnoreCase(capability))) {
+            throw new IllegalStateException("EC2 data-volume mounts require SYS_RESOURCE");
+        }
+        for (Ec2ImageCatalog.VolumeMount mapping : image.volumeMounts()) {
+            Path target = Path.of(mapping.target());
+            for (Mount mount : options.mounts()) {
+                Path existing = Path.of(mount.getTarget()).normalize();
+                if (target.startsWith(existing) || existing.startsWith(target)) {
+                    throw new IllegalStateException("EC2 data-volume target overlaps a configured mount");
+                }
+            }
+        }
     }
 
     private record GuestOptions(List<String> environment, Map<String, ContainerSpec.ResourceLimit> ulimits,
@@ -1079,8 +1143,15 @@ public class Ec2ContainerManager {
      * Starts a previously stopped container, executing postStart once the container is running.
      */
     public void start(Instance instance, Runnable postStart) {
+        start(instance, null, postStart);
+    }
+
+    public void start(Instance instance, Runnable beforeStart, Runnable postStart) {
         String containerId = instance.getDockerContainerId();
         if (containerId == null) {
+            if (beforeStart != null) {
+                beforeStart.run();
+            }
             instance.setState(InstanceState.running());
             if (postStart != null) {
                 postStart.run();
@@ -1091,6 +1162,9 @@ public class Ec2ContainerManager {
         instance.setState(pending);
         submitLifecycleOperation(containerId, () -> {
             try {
+                if (beforeStart != null) {
+                    beforeStart.run();
+                }
                 ProtectedNamespace namespace = protectedNamespace(instance);
                 if (namespace != null) {
                     if (firewallManager != null && firewallManager.enabled() && !namespace.securityGroupsEnforced()) {

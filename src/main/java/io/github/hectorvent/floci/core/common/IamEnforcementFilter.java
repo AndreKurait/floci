@@ -1294,8 +1294,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         return claimedScope;
     }
 
-    /** The descriptor's own scope, keeping {@code claimedScope} when the descriptor accepts it. */
+    /** The serving service's IAM namespace, which may differ from its signing scope. */
     private String iamServiceScope(ServiceDescriptor descriptor, String claimedScope) {
+        if ("tagging".equals(descriptor.externalKey())) {
+            return "tag";
+        }
         if (descriptor.credentialScopes().contains(claimedScope)) {
             return claimedScope;
         }

@@ -3536,7 +3536,7 @@ public interface EmulatorConfig {
         boolean volumeBlockDevices();
 
         /** Image used for the helper container that manages volume loop devices and storage. */
-        @WithDefault("alpine:3.21")
+        @WithDefault("debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3")
         String volumeHelperImage();
 
         /** When true, instances go straight to RUNNING without launching Docker containers. */

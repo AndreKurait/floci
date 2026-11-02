@@ -174,11 +174,16 @@ public class SsmDirectCommandExecutor {
     }
 
     static String timeoutWrappedScript(String script, int timeoutSeconds) {
-        return userScriptCommand(script, timeoutSeconds);
+        // The SSM agent executes a script file through sh -c, preserving its shebang.
+        return "floci_ssm_dir=$(mktemp -d /tmp/floci-ssm.XXXXXXXXXX) || exit 1; "
+                + "trap 'rm -rf \"$floci_ssm_dir\"' EXIT; "
+                + "printf '%s\\n' " + shellSingleQuote(script) + " > \"$floci_ssm_dir/_script.sh\" || exit 1; "
+                + "chmod 700 \"$floci_ssm_dir/_script.sh\" || exit 1; "
+                + userScriptCommand(timeoutSeconds);
     }
 
-    private static String userScriptCommand(String script, int timeoutSeconds) {
-        String command = "sh -c " + shellSingleQuote(script);
+    private static String userScriptCommand(int timeoutSeconds) {
+        String command = "sh -c '\"$1\"' sh \"$floci_ssm_dir/_script.sh\"";
         if (timeoutSeconds < 1) {
             return command;
         }
