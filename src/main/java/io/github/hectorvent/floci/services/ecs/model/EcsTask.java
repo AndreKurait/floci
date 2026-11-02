@@ -37,6 +37,9 @@ public class EcsTask {
     private String stoppedReason;
     private List<Container> containers;
     private String containerInstanceArn;
+    /** The EC2 instance behind {@link #containerInstanceArn}; Floci's own, not part of the ECS Task shape. */
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    private String ec2InstanceId;
     private boolean protectionEnabled;
     private Instant protectedUntil;
     private Map<String, String> tags = new HashMap<>();
@@ -277,4 +280,10 @@ public class EcsTask {
 
     /** Advances the version AWS bumps on every task state transition. */
     public void bumpVersion() { this.version++; }
+
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    public String getEc2InstanceId() { return ec2InstanceId; }
+
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    public void setEc2InstanceId(String ec2InstanceId) { this.ec2InstanceId = ec2InstanceId; }
 }

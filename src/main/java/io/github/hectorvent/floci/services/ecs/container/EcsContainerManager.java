@@ -28,6 +28,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
+import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
@@ -318,8 +319,14 @@ public class EcsContainerManager {
             for (ContainerDefinition def : launchOrder) {
                 String metadataId = UUID.randomUUID().toString().replace("-", "");
                 metadataIdsByContainer.put(def.getName(), metadataId);
-                envVarsByContainer.put(def, buildEnvVars(def, overridesByName.get(def.getName()), region,
+                List<String> containerEnv = new ArrayList<>(buildEnvVars(def, overridesByName.get(def.getName()), region,
                         metadataId, taskRoleEndpoint.vending()));
+                String imdsEndpoint = instanceMetadataEndpoint(task);
+                if (imdsEndpoint != null && containerEnv.stream()
+                        .noneMatch(kv -> kv.startsWith(INSTANCE_METADATA_ENDPOINT_ENV + "="))) {
+                    containerEnv.add(INSTANCE_METADATA_ENDPOINT_ENV + "=" + imdsEndpoint);
+                }
+                envVarsByContainer.put(def, containerEnv);
                 imagesByContainer.put(def,
                         containerBuilder.resolveImage(ecrRegistryManager.rewriteImageUri(def.getImage())));
             }
@@ -577,6 +584,7 @@ public class EcsContainerManager {
                     ContainerInfo info = lifecycleManager.createAndStartEphemeral(spec, platform);
                     dockerId = info.containerId();
                 }
+                registerInstanceMetadata(task, region, dockerId);
 
                 containerIds.put(def.getName(), dockerId);
 
@@ -1954,6 +1962,88 @@ public class EcsContainerManager {
         if (linkLocalAddresses != null) {
             linkLocalAddresses.releaseAll(taskArn);
         }
+        releaseInstanceMetadata(taskArn);
+    }
+
+    // ── EC2 instance metadata for EC2 launch type tasks ──────────────────────
+
+    static final String INSTANCE_METADATA_ENDPOINT_ENV = "AWS_EC2_METADATA_SERVICE_ENDPOINT";
+
+    /**
+     * Serves an EC2 launch type task's containers the instance metadata of the container instance
+     * the task was placed on, as an ECS-on-EC2 task reaches its host's IMDS. Absent in unit tests
+     * that build this manager by hand.
+     */
+    @Inject
+    Ec2MetadataServer instanceMetadataServer;
+
+    /** ec2InstanceId -> the instance IMDS answers for; one per container instance, shared by its tasks. */
+    private final Map<String, io.github.hectorvent.floci.services.ec2.model.Instance> metadataInstances =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** taskArn -> the container addresses registered for it. */
+    private final Map<String, List<String>> metadataAddressesByTask = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Floci's IMDS server as a task container reaches it, or null when the task is not on an EC2 instance. */
+    String instanceMetadataEndpoint(EcsTask task) {
+        if (instanceMetadataServer == null || task.getEc2InstanceId() == null) {
+            return null;
+        }
+        String base = awsEnv.flociEndpoint();
+        if (base == null) {
+            return null;
+        }
+        java.net.URI uri = java.net.URI.create(base);
+        return "http://" + uri.getHost() + ":" + config.services().ec2().imdsPort();
+    }
+
+    void registerInstanceMetadata(EcsTask task, String region, String dockerId) {
+        if (instanceMetadataServer == null || task.getEc2InstanceId() == null) {
+            return;
+        }
+        String ip = inspectContainerIp(dockerId);
+        if (ip == null) {
+            LOG.warnv("No address for container {0} of task {1}; its instance metadata is not served",
+                    dockerId, task.getTaskArn());
+            return;
+        }
+        io.github.hectorvent.floci.services.ec2.model.Instance instance =
+                metadataInstances.computeIfAbsent(task.getEc2InstanceId(), id -> containerInstanceHost(task, region, ip));
+        instanceMetadataServer.registerContainer(ip, task.getEc2InstanceId(), instance);
+        metadataAddressesByTask.computeIfAbsent(task.getTaskArn(), ignored -> new java.util.concurrent.CopyOnWriteArrayList<>())
+                .add(ip);
+    }
+
+    private void releaseInstanceMetadata(String taskArn) {
+        List<String> addresses = metadataAddressesByTask.remove(taskArn);
+        if (addresses == null || instanceMetadataServer == null) {
+            return;
+        }
+        for (String ip : addresses) {
+            metadataInstances.values().forEach(instance -> instanceMetadataServer.unregisterContainer(ip, instance));
+        }
+    }
+
+    /** The EC2 instance a container instance stands for, as IMDS describes it. */
+    private static io.github.hectorvent.floci.services.ec2.model.Instance containerInstanceHost(
+            EcsTask task, String region, String ip) {
+        io.github.hectorvent.floci.services.ec2.model.Instance instance =
+                new io.github.hectorvent.floci.services.ec2.model.Instance();
+        instance.setInstanceId(task.getEc2InstanceId());
+        instance.setImageId("ami-ecs-optimized");
+        instance.setInstanceType("m5.large");
+        if (task.getAvailabilityZone() != null) {
+            instance.setPlacement(new io.github.hectorvent.floci.services.ec2.model.Placement(task.getAvailabilityZone()));
+        }
+        instance.setRegion(region);
+        instance.setOwnerId(accountOf(task.getTaskArn()));
+        instance.setState(io.github.hectorvent.floci.services.ec2.model.InstanceState.running());
+        instance.setPrivateIpAddress(ip);
+        return instance;
+    }
+
+    private static String accountOf(String arn) {
+        String[] parts = arn.split(":");
+        return parts.length > 4 ? parts[4] : null;
     }
 
     /**

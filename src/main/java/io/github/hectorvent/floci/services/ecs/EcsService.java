@@ -1589,6 +1589,13 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                     "task/" + cluster.getClusterName() + "/" + taskId);
             Placement placement = placements.get(i);
 
+            String placedInstanceArn = containerInstanceArn;
+            ContainerInstance placedInstance = null;
+            if (placement.launchType() == LaunchType.EC2 && placement.capacityProviderName() == null) {
+                placedInstance = placeOnContainerInstance(cluster, containerInstanceArn, i);
+                placedInstanceArn = placedInstance.getContainerInstanceArn();
+            }
+
             EcsTask task = new EcsTask();
             task.setTaskArn(taskArn);
             task.setClusterArn(cluster.getClusterArn());
@@ -1604,7 +1611,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             task.setMemory(effectiveMemory(taskDef, request));
             task.setCreatedAt(Instant.now());
             task.setContainers(List.of());
-            task.setContainerInstanceArn(containerInstanceArn);
+            task.setContainerInstanceArn(placedInstanceArn);
+            if (placedInstance != null) {
+                task.setEc2InstanceId(placedInstance.getEc2InstanceId());
+                String zone = containerInstanceAttribute(placedInstance, AVAILABILITY_ZONE_ATTRIBUTE);
+                if (zone != null) {
+                    task.setAvailabilityZone(zone);
+                }
+            }
             task.setNetworkConfiguration(networkConfiguration);
             task.setOverrides(request.getOverrides());
             task.setEnableExecuteCommand(request.isEnableExecuteCommand());
@@ -1788,6 +1802,38 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         return task;
     }
 
+    /**
+     * The container instance an EC2 task runs on: the one named (StartTask), or one of the
+     * cluster's ACTIVE instances in turn. ECS refuses an EC2 task when the cluster has none.
+     */
+    private ContainerInstance placeOnContainerInstance(EcsCluster cluster, String requestedArn, int index) {
+        String prefix = containerInstanceKey(cluster.getClusterArn(), "");
+        List<ContainerInstance> active = containerInstances.entrySet().stream()
+                .filter(e -> e.getKey().startsWith(prefix))
+                .map(Map.Entry::getValue)
+                .filter(ci -> STATUS_ACTIVE.equals(ci.getStatus()))
+                .sorted(java.util.Comparator.comparing(ContainerInstance::getContainerInstanceArn))
+                .toList();
+        if (requestedArn != null) {
+            return active.stream().filter(ci -> requestedArn.equals(ci.getContainerInstanceArn())
+                            || requestedArn.endsWith("/" + id(ci.getContainerInstanceArn())))
+                    .findFirst()
+                    .orElseThrow(() -> new AwsException("InvalidParameterException",
+                            "Container instance " + requestedArn + " is not an ACTIVE instance of this cluster.", 400));
+        }
+        if (active.isEmpty()) {
+            throw new AwsException("InvalidParameterException",
+                    "No Container Instances were found in your cluster.", 400);
+        }
+        return active.get(Math.floorMod(placementCursor.getAndIncrement() + index, active.size()));
+    }
+
+    private static String id(String arn) {
+        return arn.substring(arn.lastIndexOf('/') + 1);
+    }
+
+    private final java.util.concurrent.atomic.AtomicInteger placementCursor = new java.util.concurrent.atomic.AtomicInteger();
+
     /** Where a task runs: a launch type, or the capacity provider that chose one for it. */
     private record Placement(LaunchType launchType, String capacityProviderName) {}
 
@@ -1821,8 +1867,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
      *
      * <p>A capacity provider strategy wins over a launch type (the two are mutually exclusive on
      * the wire), and an absent strategy falls back to the cluster's default one. With neither,
-     * the task keeps Floci's FARGATE default: a local cluster has no container instances, so EC2
-     * would have nowhere to place it.
+     * the task is an EC2 task, as on ECS, and is placed on a registered container instance.
      */
     private List<Placement> resolvePlacements(EcsCluster cluster, RunTaskRequest request, int count) {
         List<CapacityProviderStrategyItem> strategy = request.getCapacityProviderStrategy();
@@ -1835,7 +1880,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             strategy = clusterDefaultStrategy(cluster);
         }
         if (strategy == null || strategy.isEmpty()) {
-            LaunchType launchType = request.getLaunchType() != null ? request.getLaunchType() : LaunchType.FARGATE;
+            LaunchType launchType = request.getLaunchType() != null ? request.getLaunchType() : LaunchType.EC2;
             return Collections.nCopies(count, new Placement(launchType, null));
         }
         return distribute(strategy, count);
@@ -3130,7 +3175,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     /**
      * The launch type a service's tasks get. An explicit one wins; otherwise the first entry of
      * the service's own capacity provider strategy, then the cluster's default strategy, decides
-     * it, and with neither the service keeps Floci's FARGATE default.
+     * it, and with neither the service is an EC2 service, as on ECS.
      */
     private LaunchType serviceLaunchType(EcsCluster cluster, CreateServiceRequest request) {
         if (request.getLaunchType() != null) {
@@ -3141,7 +3186,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             strategy = clusterDefaultStrategy(cluster);
         }
         if (strategy == null || strategy.isEmpty()) {
-            return LaunchType.FARGATE;
+            return LaunchType.EC2;
         }
         validateCapacityProviderStrategy(strategy);
         return placementFor(strategy.getFirst().capacityProvider()).launchType();
@@ -3698,6 +3743,41 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     private static final Map<String, Object> DEFAULT_VERSION_INFO =
             Map.of("agentVersion", "1.0.0", "agentHash", "floci", "dockerVersion", "DockerVersion: 24.0.0");
 
+    static final String AVAILABILITY_ZONE_ATTRIBUTE = "ecs.availability-zone";
+    static final String INSTANCE_TYPE_ATTRIBUTE = "ecs.instance-type";
+    private static final com.fasterxml.jackson.databind.ObjectMapper IDENTITY_DOCUMENT_MAPPER =
+            new com.fasterxml.jackson.databind.ObjectMapper();
+
+    /** The fields of an EC2 instance identity document, or none for an absent or unreadable one. */
+    static Map<String, Object> parseInstanceIdentityDocument(String document) {
+        if (document == null || document.isBlank()) {
+            return Map.of();
+        }
+        try {
+            Map<String, Object> fields = IDENTITY_DOCUMENT_MAPPER.readValue(document, new TypeReference<>() {});
+            return fields != null ? fields : Map.of();
+        } catch (Exception e) {
+            LOG.warnv("Ignoring an unreadable instance identity document: {0}", e.getMessage());
+            return Map.of();
+        }
+    }
+
+    private static void addDocumentAttribute(List<Attribute> attributes, String name, Object value) {
+        if (value instanceof String text && !text.isBlank()
+                && attributes.stream().noneMatch(a -> name.equals(a.name()))) {
+            attributes.add(new Attribute(name, text, null, null));
+        }
+    }
+
+    /** An instance attribute's value, or null. */
+    static String containerInstanceAttribute(ContainerInstance instance, String name) {
+        if (instance.getAttributes() == null) {
+            return null;
+        }
+        return instance.getAttributes().stream()
+                .filter(a -> name.equals(a.name())).map(Attribute::value).findFirst().orElse(null);
+    }
+
     public ContainerInstance registerContainerInstance(String clusterRef, String instanceIdentityDocument,
                                                         List<Attribute> instanceAttributes, String region) {
         RegisterContainerInstanceRequest request = new RegisterContainerInstanceRequest();
@@ -3715,7 +3795,12 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     public ContainerInstance registerContainerInstance(RegisterContainerInstanceRequest request,
                                                         String region) {
         EcsCluster cluster = resolveClusterOrDefault(request.getCluster(), region);
-        String instanceId = "i-floci-" + UUID.randomUUID().toString().substring(0, 8);
+        // The agent registers with the EC2 instance identity document of the host it runs on, and
+        // ECS records that instance; only a registration without one gets a made-up instance id.
+        Map<String, Object> identity = parseInstanceIdentityDocument(request.getInstanceIdentityDocument());
+        String documentedInstanceId = identity.get("instanceId") instanceof String id && !id.isBlank() ? id : null;
+        String instanceId = documentedInstanceId != null
+                ? documentedInstanceId : "i-floci-" + UUID.randomUUID().toString().substring(0, 8);
         String instanceArn = request.getContainerInstanceArn() != null
                 ? request.getContainerInstanceArn()
                 : regionResolver.buildArn("ecs", region,
@@ -3732,9 +3817,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 ? request.getVersionInfo() : DEFAULT_VERSION_INFO);
         instance.setRegisteredResources(request.getTotalResources());
         instance.setRemainingResources(request.getTotalResources());
+        List<Attribute> attributes = new ArrayList<>();
         if (request.getAttributes() != null) {
-            instance.setAttributes(new ArrayList<>(request.getAttributes()));
+            attributes.addAll(request.getAttributes());
         }
+        // ECS adds these for every instance, from the identity document.
+        addDocumentAttribute(attributes, AVAILABILITY_ZONE_ATTRIBUTE, identity.get("availabilityZone"));
+        addDocumentAttribute(attributes, INSTANCE_TYPE_ATTRIBUTE, identity.get("instanceType"));
+        instance.setAttributes(attributes);
         if (request.getTags() != null && !request.getTags().isEmpty()) {
             instance.setTags(new LinkedHashMap<>(request.getTags()));
         }
