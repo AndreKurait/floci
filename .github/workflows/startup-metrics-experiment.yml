@@ -1,0 +1,55 @@
+name: Test JVM startup metrics experiment
+on:
+  push:
+    branches: [ci/startup-metrics-20261102t141627z-825719]
+permissions:
+  contents: read
+concurrency:
+  group: startup-metrics-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  startup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+        with:
+          java-version: '25'
+          distribution: temurin
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: dependencies
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
+      - name: Record runner and resource baseline
+        run: |
+          mkdir -p startup-runner
+          lscpu > startup-runner/cpu.txt
+          free -b > startup-runner/memory.txt
+          java -version 2> startup-runner/java.txt
+          printf '%s\n' '${{ steps.dependencies.outputs.cache-hit }}' > startup-runner/cache-hit.txt
+          printf '%s\n' '${{ steps.dependencies.outputs.cache-matched-key }}' > startup-runner/cache-matched-key.txt
+          docker ps -aq --no-trunc > startup-runner/docker-before.txt
+          docker volume ls -q > startup-runner/volumes-before.txt
+          docker events --format '{{json .}}' > startup-runner/docker-events.jsonl &
+          echo $! > startup-runner/docker-events.pid
+      - name: Compile full classpath and compare sequential fresh JVM startups
+        run: python3 tools/startup-experiment/run.py
+      - name: Record final resource inventory
+        if: always()
+        run: |
+          docker ps -aq --no-trunc > startup-runner/docker-after.txt
+          docker volume ls -q > startup-runner/volumes-after.txt
+          if [ -f startup-runner/docker-events.pid ]; then kill "$(cat startup-runner/docker-events.pid)" || true; fi
+          diff -u startup-runner/docker-before.txt startup-runner/docker-after.txt
+          diff -u startup-runner/volumes-before.txt startup-runner/volumes-after.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: startup-build-metrics
+          path: |
+            startup-evidence/
+            startup-runner/
+          if-no-files-found: error
