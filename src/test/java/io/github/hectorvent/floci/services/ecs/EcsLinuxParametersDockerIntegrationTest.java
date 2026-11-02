@@ -7,6 +7,7 @@ import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Device;
 import com.github.dockerjava.api.model.HostConfig;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.testing.DockerAvailability;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.github.hectorvent.floci.testing.TestImages;
@@ -117,7 +118,7 @@ class EcsLinuxParametersDockerIntegrationTest {
         clusterName = family;
         ecsService.createCluster(clusterName, REGION);
         EcsTask task = ecsService.runTask(clusterName, taskDefinitionArn, 1,
-                null, null, null, null, null, REGION).getFirst();
+                LaunchType.FARGATE, null, null, null, null, REGION).getFirst();
         taskArn = task.getTaskArn();
         EcsTask described = ecsService.describeTasks(clusterName, List.of(taskArn), REGION).getFirst();
         assertEquals("RUNNING", described.getLastStatus(), "the container must be up: " + described.getStoppedReason());
@@ -164,7 +165,7 @@ class EcsLinuxParametersDockerIntegrationTest {
         clusterName = family;
         ecsService.createCluster(clusterName, REGION);
         EcsTask task = ecsService.runTask(clusterName, taskDefinitionArn, 1,
-                null, null, null, null, null, REGION).getFirst();
+                LaunchType.FARGATE, null, null, null, null, REGION).getFirst();
         taskArn = task.getTaskArn();
         EcsTask described = ecsService.describeTasks(clusterName, List.of(taskArn), REGION).getFirst();
         assertEquals("RUNNING", described.getLastStatus(), "the container must be up: " + described.getStoppedReason());
