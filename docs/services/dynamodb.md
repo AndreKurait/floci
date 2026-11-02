@@ -13,6 +13,18 @@ The decompressed body is limited to 16,000,000 bytes, matching the largest reque
 AWS probe. Floci returns HTTP 413 for larger bodies and HTTP 400 for invalid gzip; that probe received
 HTTP 500 for these cases. DynamoDB Streams and other request formats retain their existing handling.
 
+## ListTables authorization
+
+With IAM enforcement enabled, `ListTables` evaluates the regional table collection
+`arn:<partition>:dynamodb:<region>:<account>:table/*`. A matching allow permits listing;
+a matching explicit deny overrides it. A grant for one table or a table-name prefix
+does not permit listing, and a grant in another account or Region does not apply.
+The listing is not filtered to the caller's individually authorized tables.
+
+This resource matching was checked against live AWS with isolated role sessions.
+Pagination and ignored table selectors do not change the collection being authorized.
+Other DynamoDB operations retain their own authorization resources.
+
 ## Supported Actions
 
 | Action | Description |
