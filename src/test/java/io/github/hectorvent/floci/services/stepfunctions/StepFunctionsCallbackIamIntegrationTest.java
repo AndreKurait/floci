@@ -1,12 +1,16 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.AccessKey;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.github.hectorvent.floci.testing.SignedIamEnforcementProfile;
 import io.github.hectorvent.floci.testing.SignedIamUsers;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -40,6 +44,9 @@ class StepFunctionsCallbackIamIntegrationTest {
     @TestHTTPResource
     URI endpoint;
 
+    @Inject
+    IamService iam;
+
     @RegisterExtension
     final PartitionCleanup cleanup = new PartitionCleanup();
 
@@ -64,7 +71,7 @@ class StepFunctionsCallbackIamIntegrationTest {
                 .build();
         cleanup.register(sqs::close);
         String name = "callback-iam-" + UUID.randomUUID();
-        String role = executionRole(name, "test");
+        String role = executionRole(name);
         String queue = sqs.createQueue(request -> request.queueName(name)).queueUrl();
         cleanup.register(() -> sqs.deleteQueue(request -> request.queueUrl(queue)));
         String activity = admin.createActivity(request -> request.name(name)).activityArn();
@@ -140,9 +147,9 @@ class StepFunctionsCallbackIamIntegrationTest {
     @ParameterizedTest
     @ValueSource(strings = {"matching", "wrong", "wildcard"})
     void foreignCallbacksDoNotRevealTheTokensResource(String policy) throws Exception {
-        SfnClient owner = client("111111111111", "test");
+        SfnClient owner = client("test", "test");
         String name = "foreign-callback-" + UUID.randomUUID();
-        String role = executionRole(name, "111111111111");
+        String role = executionRole(name);
         String activity = owner.createActivity(request -> request.name(name)).activityArn();
         cleanup.register(() -> owner.deleteActivity(request -> request.activityArn(activity)));
         String definition = MAPPER.writeValueAsString(Map.of("StartAt", "Callback", "States", Map.of("Callback",
@@ -155,29 +162,38 @@ class StepFunctionsCallbackIamIntegrationTest {
             case "wrong" -> activity + "-other";
             default -> "*";
         };
-        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "foreign-callback-", "callback",
-                MAPPER.writeValueAsString(Map.of("Version", "2012-10-17",
-                        "Statement", List.of(statement("Allow", resource)))))) {
-            SfnClient foreign = client(user.accessKeyId(), user.secretAccessKey());
-            String execution = owner.startExecution(request -> request.stateMachineArn(machine)).executionArn();
-            cleanup.register(() -> {
-                if ("RUNNING".equals(owner.describeExecution(request -> request.executionArn(execution)).statusAsString())) {
-                    owner.stopExecution(request -> request.executionArn(execution));
-                }
-            });
-            String token = owner.getActivityTask(request -> request.activityArn(activity)).taskToken();
-            for (boolean completed : List.of(false, true)) {
-                if (completed) {
-                    owner.sendTaskSuccess(request -> request.taskToken(token).output("{}"));
-                    assertEquals("SUCCEEDED", terminal(owner, execution));
-                }
-                for (String action : List.of("heartbeat", "success", "failure")) {
-                    SfnException denied = assertThrows(SfnException.class, () -> callback(foreign, action, token));
-                    assertEquals("AccessDeniedException", denied.awsErrorDetails().errorCode());
-                    assertEquals("Not authorized to access this resource.", denied.awsErrorDetails().errorMessage());
-                }
+        AccessKey key = foreignUser(name, MAPPER.writeValueAsString(Map.of("Version", "2012-10-17",
+                "Statement", List.of(statement("Allow", resource)))));
+        SfnClient foreign = client(key.getAccessKeyId(), key.getSecretAccessKey());
+        String execution = owner.startExecution(request -> request.stateMachineArn(machine)).executionArn();
+        cleanup.register(() -> {
+            if ("RUNNING".equals(owner.describeExecution(request -> request.executionArn(execution)).statusAsString())) {
+                owner.stopExecution(request -> request.executionArn(execution));
+            }
+        });
+        String token = owner.getActivityTask(request -> request.activityArn(activity)).taskToken();
+        for (boolean completed : List.of(false, true)) {
+            if (completed) {
+                owner.sendTaskSuccess(request -> request.taskToken(token).output("{}"));
+                assertEquals("SUCCEEDED", terminal(owner, execution));
+            }
+            for (String action : List.of("heartbeat", "success", "failure")) {
+                SfnException denied = assertThrows(SfnException.class, () -> callback(foreign, action, token));
+                assertEquals("AccessDeniedException", denied.awsErrorDetails().errorCode());
+                assertEquals("Not authorized to access this resource.", denied.awsErrorDetails().errorMessage());
             }
         }
+    }
+
+    private AccessKey foreignUser(String name, String policy) {
+        String account = "111111111111";
+        RequestScopes.runAs(account, () -> iam.createUser(name, "/"));
+        cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteUser(name)));
+        RequestScopes.runAs(account, () -> iam.putUserPolicy(name, "callback", policy));
+        cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteUserPolicy(name, "callback")));
+        AccessKey key = RequestScopes.callAs(account, () -> iam.createAccessKey(name));
+        cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteAccessKey(name, key.getAccessKeyId())));
+        return key;
     }
 
     private SfnClient client(String access, String secret) {
@@ -188,10 +204,10 @@ class StepFunctionsCallbackIamIntegrationTest {
         return client;
     }
 
-    private String executionRole(String name, String accessKey) {
+    private String executionRole(String name) {
         IamClient iam = IamClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
                 .httpClientBuilder(UrlConnectionHttpClient.builder())
-                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, "test"))).build();
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"))).build();
         cleanup.register(iam::close);
         String role = iam.createRole(request -> request.roleName(name).assumeRolePolicyDocument("""
                 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
