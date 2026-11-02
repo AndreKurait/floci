@@ -1,14 +1,15 @@
 {
   "_source": {
     "generator": "tools/aws/regen_resource_groups_shapes.py",
-    "botocore": "botocore 1.43.108 (installed package)"
+    "botocore": "botocore 1.43.118 (installed package)"
   },
   "operations": {
     "CreateGroup": "CreateGroupInput",
     "GetGroup": "GetGroupInput",
     "DeleteGroup": "DeleteGroupInput",
     "GroupResources": "GroupResourcesInput",
-    "ListGroupResources": "ListGroupResourcesInput"
+    "ListGroupResources": "ListGroupResourcesInput",
+    "ListGroups": "ListGroupsInput"
   },
   "shapes": {
     "CreateGroupInput": {
@@ -109,6 +110,43 @@
       "max": 40,
       "pattern": "AWS::[a-zA-Z0-9]+::[a-zA-Z0-9]+"
     },
+    "GroupFilter": {
+      "type": "structure",
+      "required": [
+        "Name",
+        "Values"
+      ],
+      "members": {
+        "Name": "GroupFilterName",
+        "Values": "GroupFilterValues"
+      }
+    },
+    "GroupFilterList": {
+      "type": "list",
+      "member": "GroupFilter"
+    },
+    "GroupFilterName": {
+      "type": "string",
+      "enum": [
+        "resource-type",
+        "configuration-type",
+        "owner",
+        "display-name",
+        "criticality"
+      ]
+    },
+    "GroupFilterValue": {
+      "type": "string",
+      "min": 1,
+      "max": 300,
+      "pattern": "AWS::(AllSupported|[a-zA-Z0-9]+::[a-zA-Z0-9]+)|[\\s\\p{L}0-9_\\.-]*"
+    },
+    "GroupFilterValues": {
+      "type": "list",
+      "min": 1,
+      "max": 5,
+      "member": "GroupFilterValue"
+    },
     "GroupName": {
       "type": "string",
       "min": 1,
@@ -142,6 +180,14 @@
         "GroupName": "GroupName",
         "Group": "GroupStringV2",
         "Filters": "ResourceFilterList",
+        "MaxResults": "MaxResults",
+        "NextToken": "NextToken"
+      }
+    },
+    "ListGroupsInput": {
+      "type": "structure",
+      "members": {
+        "Filters": "GroupFilterList",
         "MaxResults": "MaxResults",
         "NextToken": "NextToken"
       }

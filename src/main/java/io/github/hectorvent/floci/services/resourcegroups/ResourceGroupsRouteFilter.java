@@ -15,7 +15,7 @@ import java.util.Set;
 public class ResourceGroupsRouteFilter implements ContainerRequestFilter {
     static final String INTERNAL_PREFIX = "/_rg";
     private static final Set<String> PUBLIC_PATHS = Set.of(
-            "/groups", "/get-group", "/delete-group", "/group-resources", "/list-group-resources");
+            "/groups", "/get-group", "/delete-group", "/group-resources", "/list-group-resources", "/groups-list");
     private final SignedServiceRoute route;
 
     @Inject

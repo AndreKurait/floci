@@ -29,7 +29,8 @@ class ResourceGroupsIamEnforcementIntegrationTest {
             "/get-group", "GetGroup",
             "/delete-group", "DeleteGroup",
             "/group-resources", "GroupResources",
-            "/list-group-resources", "ListGroupResources");
+            "/list-group-resources", "ListGroupResources",
+            "/groups-list", "ListGroups");
 
     @TestHTTPResource("/")
     static URI baseUri;
@@ -81,6 +82,9 @@ class ResourceGroupsIamEnforcementIntegrationTest {
                   {"Effect":"Deny","Action":"resource-groups:*","Resource":"%s"}]}
                 """.formatted(arn));
         for (String path : OPERATIONS.keySet()) {
+            if (path.equals("/groups-list")) {
+                continue; // ListGroups authorizes the account-wide "*" resource.
+            }
             Object body = path.equals("/groups")
                     ? "{\"Name\":\"" + name + "\",\"Configuration\":" + ResourceGroupsServiceTest.CONFIGURATION + "}"
                     : Map.of("Group", name);
@@ -91,6 +95,24 @@ class ResourceGroupsIamEnforcementIntegrationTest {
             }
         }
         call(ACCOUNT, "/get-group", Map.of("Group", name)).statusCode(404);
+    }
+
+    @Test
+    void listingRequiresAnAccountWideGrantAndIgnoresGroupSelectors() {
+        String user = "rg-list-scope-" + UUID.randomUUID();
+        String key = EnforcementFixtures.createUser(cleanup, baseUri.getPort(), auth(ACCOUNT, "iam"), user)
+                .accessKeyId();
+        EnforcementFixtures.putUserPolicy(baseUri.getPort(), auth(ACCOUNT, "iam"), user, "allow", """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"resource-groups:ListGroups",
+                   "Resource":"arn:aws:resource-groups:us-east-1:%s:group/allowed"}]}
+                """.formatted(ACCOUNT));
+        call(key, "/groups-list", Map.of("Group", "allowed")).statusCode(403);
+        EnforcementFixtures.putUserPolicy(baseUri.getPort(), auth(ACCOUNT, "iam"), user, "allow", """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"resource-groups:ListGroups","Resource":"*"}]}
+                """);
+        call(key, "/groups-list", Map.of("Group", "ignored")).statusCode(200);
     }
 
     @ParameterizedTest

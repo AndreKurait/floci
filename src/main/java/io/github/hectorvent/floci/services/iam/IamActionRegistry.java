@@ -538,6 +538,7 @@ public class IamActionRegistry {
         rule("resource-groups", "POST", "^/_rg/delete-group/?$", "resource-groups:DeleteGroup"),
         rule("resource-groups", "POST", "^/_rg/group-resources/?$", "resource-groups:GroupResources"),
         rule("resource-groups", "POST", "^/_rg/list-group-resources/?$", "resource-groups:ListGroupResources"),
+        rule("resource-groups", "POST", "^/_rg/groups-list/?$", "resource-groups:ListGroups"),
 
         // ── Kinesis ────────────────────────────────────────────────────────────
         rule("kinesis", "POST", ".*", "kinesis:*")
