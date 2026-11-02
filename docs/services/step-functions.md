@@ -74,7 +74,8 @@ This distinction was verified with signed SDK calls against AWS using both
 Lambda callback integrations and activities. Recent completed tokens retain
 their resource so a permitted retry receives `TaskTimedOut`. Unknown tokens
 return `InvalidToken` before IAM resource evaluation. Resource lookup
-does not consume the token or bypass the existing account-ownership checks.
+does not consume the token. The caller must own the token before its resource
+is used for IAM evaluation, including for recent completed tokens.
 
 ## Nested task credentials
 

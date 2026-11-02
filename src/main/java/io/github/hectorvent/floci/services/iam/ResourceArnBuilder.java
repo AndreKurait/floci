@@ -194,7 +194,7 @@ public class ResourceArnBuilder {
                 "states:SendTaskFailure", "states:SendTaskHeartbeat").contains(operation)) {
             JsonNode body = readJsonBody(ctx);
             String resource = body == null || stepFunctionsService == null || stepFunctionsService.isUnsatisfied()
-                    ? null : stepFunctionsService.get().callbackResourceArn(body.path("taskToken").asText(null));
+                    ? null : stepFunctionsService.get().callbackResourceArn(body.path("taskToken").asText(null), accountId);
             return List.of(resource == null ? "*" : resource);
         }
         String path = ctx.getUriInfo().getPath();

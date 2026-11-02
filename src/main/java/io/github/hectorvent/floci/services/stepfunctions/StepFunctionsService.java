@@ -1308,13 +1308,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
      * AWS authorizes activity callbacks on the activity and integration callbacks on the state machine.
      * Retain that resource after completion so authorized retries still reach TaskTimedOut.
      */
-    public synchronized String callbackResourceArn(String token) {
+    public synchronized String callbackResourceArn(String token, String callerAccountId) {
         PendingTask pending = token == null ? null : pendingTaskTokens.get(token);
         if (pending != null) {
+            requireTokenOwner(pending.accountId(), callerAccountId);
             return pending.resourceArn();
         }
         ClosedTask closed = token == null ? null : closedTaskTokens.get(token);
         if (closed != null && System.nanoTime() - closed.closedAtNanos() < CLOSED_TOKEN_RETENTION_NANOS) {
+            requireTokenOwner(closed.accountId(), callerAccountId);
             return closed.resourceArn();
         }
         throw new AwsException("InvalidToken", "Invalid Token: 'Invalid token'", 400);

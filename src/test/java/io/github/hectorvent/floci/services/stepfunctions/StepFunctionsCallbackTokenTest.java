@@ -43,21 +43,22 @@ class StepFunctionsCallbackTokenTest {
     void callbackResourceSurvivesCompletionAndRetirementWithoutClaimingTheToken(String resource, String expected) {
         when(resolver.getAccountId()).thenReturn(OWNER);
         CompletableFuture<JsonNode> future = service.registerPendingToken("resource", OWNER, resource);
-        assertEquals(expected, service.callbackResourceArn("resource"));
+        assertEquals(expected, service.callbackResourceArn("resource", OWNER));
         assertFalse(future.isDone());
         service.sendTaskSuccess("resource", "{}");
-        assertEquals(expected, service.callbackResourceArn("resource"));
+        assertEquals(expected, service.callbackResourceArn("resource", OWNER));
         service.discardPendingToken("resource");
-        assertEquals(expected, service.callbackResourceArn("resource"));
+        assertEquals(expected, service.callbackResourceArn("resource", OWNER));
         service.clear();
-        refuses("InvalidToken", () -> service.callbackResourceArn("resource"));
-        refuses("InvalidToken", () -> service.callbackResourceArn(null));
+        refuses("InvalidToken", () -> service.callbackResourceArn("resource", OWNER));
+        refuses("InvalidToken", () -> service.callbackResourceArn(null, OWNER));
     }
 
     @Test
     void foreignCallbacksCannotClaimOrRefreshAnOwnedToken() throws Exception {
         CompletableFuture<JsonNode> future = service.registerPendingToken("owned", OWNER, RESOURCE);
         long heartbeat = service.lastTaskHeartbeatNanos("owned");
+        refuses("AccessDeniedException", () -> service.callbackResourceArn("owned", "222222222222"));
         when(resolver.getAccountId()).thenReturn("222222222222");
         refuses("AccessDeniedException", () -> service.sendTaskSuccess("owned", "{}"));
         refuses("AccessDeniedException", () -> service.sendTaskFailure("owned", "cause", "error"));
@@ -74,6 +75,9 @@ class StepFunctionsCallbackTokenTest {
         refuses("TaskTimedOut", () -> service.sendTaskHeartbeat("owned"));
         when(resolver.getAccountId()).thenReturn("222222222222");
         refuses("AccessDeniedException", () -> service.sendTaskHeartbeat("owned"));
+        refuses("AccessDeniedException", () -> service.callbackResourceArn("owned", "222222222222"));
+        service.discardPendingToken("owned");
+        refuses("AccessDeniedException", () -> service.callbackResourceArn("owned", "222222222222"));
     }
 
     @Test
@@ -186,6 +190,8 @@ class StepFunctionsCallbackTokenTest {
         }
         refuses("InvalidToken", () -> service.sendTaskHeartbeat("closed-0"));
         refuses("TaskTimedOut", () -> service.sendTaskHeartbeat("closed-1024"));
+        refuses("InvalidToken", () -> service.callbackResourceArn("closed-0", OWNER));
+        assertEquals(RESOURCE, service.callbackResourceArn("closed-1024", OWNER));
         service.clear();
         refuses("InvalidToken", () -> service.sendTaskHeartbeat("closed-1024"));
     }
