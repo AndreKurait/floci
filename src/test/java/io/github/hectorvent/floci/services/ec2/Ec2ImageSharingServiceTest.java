@@ -71,7 +71,7 @@ class Ec2ImageSharingServiceTest {
                 null, List.of(), null, null, List.of(), "native user data", null).getInstances().getFirst();
 
         ArgumentCaptor<ResolvedAmiImage> runtime = ArgumentCaptor.forClass(ResolvedAmiImage.class);
-        verify(manager).launch(eq(instance), runtime.capture(), any(), eq(REGION), any(), any(), any(), any());
+        verify(manager).launch(eq(instance), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any());
         assertEquals(new AmiImageResolver(catalog).resolveImage("ami-catalog-worker"), runtime.getValue());
         assertEquals("example/worker:1", runtime.getValue().dockerImage());
         assertEquals("arm64", instance.getArchitecture());

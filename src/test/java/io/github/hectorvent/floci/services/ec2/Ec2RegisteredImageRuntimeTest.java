@@ -178,7 +178,7 @@ class Ec2RegisteredImageRuntimeTest {
     private ResolvedAmiImage launchedImage(String region, String imageId, String instanceType) {
         Instance instance = launch(region, imageId, instanceType);
         ArgumentCaptor<ResolvedAmiImage> resolved = ArgumentCaptor.forClass(ResolvedAmiImage.class);
-        verify(containerManager).launch(eq(instance), resolved.capture(), any(), eq(region), any(), any(), any(), any());
+        verify(containerManager).launch(eq(instance), resolved.capture(), any(), eq(region), any(), any(), any(), any(), any());
         return resolved.getValue();
     }
 
