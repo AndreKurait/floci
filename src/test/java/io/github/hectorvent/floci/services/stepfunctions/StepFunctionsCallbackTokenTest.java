@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.concurrent.CompletableFuture;
@@ -27,14 +28,35 @@ import static org.mockito.Mockito.when;
 
 class StepFunctionsCallbackTokenTest {
     private static final String OWNER = "111111111111";
+    private static final String RESOURCE = "arn:aws:states:us-east-1:" + OWNER + ":stateMachine:callback";
     private final RegionResolver resolver = mock(RegionResolver.class);
     private final StepFunctionsService service = new StepFunctionsService(mock(StorageFactory.class),
             resolver, mock(AslExecutor.class), new ObjectMapper(), mock(SfnMockLoader.class),
             mock(StepFunctionsEventPublisher.class));
 
+    @ParameterizedTest
+    @CsvSource({
+            "arn:aws:states:us-east-1:111111111111:stateMachine:callback,arn:aws:states:us-east-1:111111111111:stateMachine:callback",
+            "arn:aws:states:us-east-1:111111111111:stateMachine:callback:7,arn:aws:states:us-east-1:111111111111:stateMachine:callback",
+            "arn:aws-cn:states:cn-north-1:111111111111:activity:callback,arn:aws-cn:states:cn-north-1:111111111111:activity:callback"
+    })
+    void callbackResourceSurvivesCompletionAndRetirementWithoutClaimingTheToken(String resource, String expected) {
+        when(resolver.getAccountId()).thenReturn(OWNER);
+        CompletableFuture<JsonNode> future = service.registerPendingToken("resource", OWNER, resource);
+        assertEquals(expected, service.callbackResourceArn("resource"));
+        assertFalse(future.isDone());
+        service.sendTaskSuccess("resource", "{}");
+        assertEquals(expected, service.callbackResourceArn("resource"));
+        service.discardPendingToken("resource");
+        assertEquals(expected, service.callbackResourceArn("resource"));
+        service.clear();
+        refuses("InvalidToken", () -> service.callbackResourceArn("resource"));
+        refuses("InvalidToken", () -> service.callbackResourceArn(null));
+    }
+
     @Test
     void foreignCallbacksCannotClaimOrRefreshAnOwnedToken() throws Exception {
-        CompletableFuture<JsonNode> future = service.registerPendingToken("owned", OWNER);
+        CompletableFuture<JsonNode> future = service.registerPendingToken("owned", OWNER, RESOURCE);
         long heartbeat = service.lastTaskHeartbeatNanos("owned");
         when(resolver.getAccountId()).thenReturn("222222222222");
         refuses("AccessDeniedException", () -> service.sendTaskSuccess("owned", "{}"));
@@ -57,11 +79,11 @@ class StepFunctionsCallbackTokenTest {
     @Test
     void failureAndDiscardCloseTokensAndUnknownTokensRefuse() {
         when(resolver.getAccountId()).thenReturn(OWNER);
-        CompletableFuture<JsonNode> failed = service.registerPendingToken("failed", OWNER);
+        CompletableFuture<JsonNode> failed = service.registerPendingToken("failed", OWNER, RESOURCE);
         service.sendTaskFailure("failed", "cause", "error");
         assertTrue(failed.isCompletedExceptionally());
         refuses("TaskTimedOut", () -> service.sendTaskSuccess("failed", "{}"));
-        service.registerPendingToken("expired", OWNER);
+        service.registerPendingToken("expired", OWNER, RESOURCE);
         service.discardPendingToken("expired");
         refuses("TaskTimedOut", () -> service.sendTaskHeartbeat("expired"));
         refuses("InvalidToken", () -> service.sendTaskHeartbeat(null));
@@ -72,7 +94,7 @@ class StepFunctionsCallbackTokenTest {
     @Test
     void racingCallbacksCompleteExactlyOnce() throws Exception {
         when(resolver.getAccountId()).thenReturn(OWNER);
-        CompletableFuture<JsonNode> future = service.registerPendingToken("race", OWNER);
+        CompletableFuture<JsonNode> future = service.registerPendingToken("race", OWNER, RESOURCE);
         CountDownLatch ready = new CountDownLatch(2);
         CountDownLatch start = new CountDownLatch(1);
         AtomicInteger accepted = new AtomicInteger();
@@ -121,8 +143,8 @@ class StepFunctionsCallbackTokenTest {
             assertTrue(finishParsing.await(5, TimeUnit.SECONDS));
             return new ObjectMapper().readTree("{}");
         });
-        CompletableFuture<JsonNode> slow = callbacks.registerPendingToken("slow", OWNER);
-        callbacks.registerPendingToken("other", OWNER);
+        CompletableFuture<JsonNode> slow = callbacks.registerPendingToken("slow", OWNER, RESOURCE);
+        callbacks.registerPendingToken("other", OWNER, RESOURCE);
         try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
             Future<?> success = executor.submit(() -> callbacks.sendTaskSuccess("slow", "{}"));
             try {
@@ -145,7 +167,7 @@ class StepFunctionsCallbackTokenTest {
     @ValueSource(strings = {"{invalid", "", "[1,"})
     void rejectedOutputDoesNotConsumeTheToken(String output) throws Exception {
         when(resolver.getAccountId()).thenReturn(OWNER);
-        CompletableFuture<JsonNode> future = service.registerPendingToken("output", OWNER);
+        CompletableFuture<JsonNode> future = service.registerPendingToken("output", OWNER, RESOURCE);
         refuses("InvalidOutput", () -> service.sendTaskSuccess("output", output));
         assertFalse(future.isDone());
         service.sendTaskHeartbeat("output");
@@ -159,7 +181,7 @@ class StepFunctionsCallbackTokenTest {
         when(resolver.getAccountId()).thenReturn(OWNER);
         for (int index = 0; index <= 1024; index++) {
             String token = "closed-" + index;
-            service.registerPendingToken(token, OWNER);
+            service.registerPendingToken(token, OWNER, RESOURCE);
             service.discardPendingToken(token);
         }
         refuses("InvalidToken", () -> service.sendTaskHeartbeat("closed-0"));
