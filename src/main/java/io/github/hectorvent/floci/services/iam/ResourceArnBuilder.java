@@ -20,6 +20,7 @@ import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
 import io.github.hectorvent.floci.services.s3.S3ControlArnUtils;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -89,6 +90,7 @@ public class ResourceArnBuilder {
      * its service follows with a minted id is stored under.
      */
     private final Instance<StoredResourceArns> storedResourceArns;
+    private final Instance<StepFunctionsService> stepFunctionsService;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -96,7 +98,8 @@ public class ResourceArnBuilder {
                               Instance<LambdaMicrovmsService> microvmsService,
                               Instance<EksService> eksService,
                               Instance<KmsService> kmsService,
-                              Instance<StoredResourceArns> storedResourceArns) {
+                              Instance<StoredResourceArns> storedResourceArns,
+                              Instance<StepFunctionsService> stepFunctionsService) {
         this.objectMapper = objectMapper;
         this.iamService = iamService;
         this.secretsManagerService = secretsManagerService;
@@ -104,6 +107,17 @@ public class ResourceArnBuilder {
         this.eksService = eksService;
         this.kmsService = kmsService;
         this.storedResourceArns = storedResourceArns;
+        this.stepFunctionsService = stepFunctionsService;
+    }
+
+    public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
+                              Instance<SecretsManagerService> secretsManagerService,
+                              Instance<LambdaMicrovmsService> microvmsService,
+                              Instance<EksService> eksService,
+                              Instance<KmsService> kmsService,
+                              Instance<StoredResourceArns> storedResourceArns) {
+        this(objectMapper, iamService, secretsManagerService, microvmsService, eksService, kmsService,
+                storedResourceArns, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -174,6 +188,14 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        // The token names the authorization resource, which the request-resource table cannot resolve.
+        if ("states".equals(credentialScope) && operation != null && Set.of("states:SendTaskSuccess",
+                "states:SendTaskFailure", "states:SendTaskHeartbeat").contains(operation)) {
+            JsonNode body = readJsonBody(ctx);
+            String resource = body == null || stepFunctionsService == null || stepFunctionsService.isUnsatisfied()
+                    ? null : stepFunctionsService.get().callbackResourceArn(body.path("taskToken").asText(null), accountId);
+            return List.of(resource == null ? "*" : resource);
         }
         String path = ctx.getUriInfo().getPath();
         return switch (credentialScope) {
