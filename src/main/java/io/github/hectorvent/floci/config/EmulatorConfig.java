@@ -1283,6 +1283,10 @@ public interface EmulatorConfig {
     interface AutoScalingServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /** Maximum number of direct reservation IDs accepted in an ASG capacity target. */
+        @WithDefault("1")
+        int maxCapacityReservationIds();
     }
 
     interface ApplicationAutoScalingServiceConfig {

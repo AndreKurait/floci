@@ -48,13 +48,25 @@ When `AvailabilityZones` is omitted, group creation and subnet updates derive th
 distinct zones from `VPCZoneIdentifier`. Updates without placement fields retain
 the group's current subnet and zone selection.
 
-Capacity reservation targets remain limited to one reservation ID or one resource
+By default, capacity reservation targets are limited to one reservation ID or one resource
 group ARN. Multiple entries, including duplicates, return `ValidationError`;
 mixing IDs and group ARNs returns a distinct validation message. These messages
 match live AWS comparisons on November 2, 2026 in `us-east-1` and `eu-west-1`
 for create, and `eu-west-1` for update, using zero desired capacity.
-Rejected updates preserve the group's existing configuration. This does not
-enable preview support for multiple reservation targets.
+Rejected updates preserve the group's existing configuration.
+
+To model a workload with a different direct-reservation limit, explicitly set
+`floci.services.autoscaling.max-capacity-reservation-ids` (environment variable
+`FLOCI_SERVICES_AUTOSCALING_MAX_CAPACITY_RESERVATION_IDS`) to a positive integer.
+The default is `1`. This emulator setting does not reproduce account or service
+allowlisting, and an increased value is not a claim of general AWS availability.
+Resource-group ARN targets remain limited to one, and mixing target types is
+always rejected. For accepted direct ID lists, scale-out and instance refresh
+try the supplied reservations using EC2's zone, type, platform, tenancy and
+capacity checks. `capacity-reservations-first` falls back to on-demand only after
+all supplied targets lack matching capacity; `capacity-reservations-only` remains
+under desired capacity until a target can satisfy the launch. Other EC2 errors
+remain failures.
 
 Scale-out follows the [AWS placement rules](https://docs.aws.amazon.com/autoscaling/ec2/userguide/auto-scaling-benefits.html):
 choose the zone with the fewest active instances, then its subnet with the most

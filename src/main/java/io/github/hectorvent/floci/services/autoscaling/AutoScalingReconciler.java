@@ -766,7 +766,7 @@ public class AutoScalingReconciler {
     private Reservation launchWithGroupCapacity(AutoScalingGroup asg, LaunchSource launchSource,
                                                  LaunchPlacement placement, String clientToken) {
         CapacityReservationSpecification groupSpecification = asg.getCapacityReservationSpecification();
-        AutoScalingService.validateCapacityReservationSpecification(groupSpecification);
+        asgService.validateCapacityReservationSpecification(groupSpecification);
         String preference = groupSpecification == null ? null
                 : groupSpecification.getCapacityReservationPreference();
         if (preference == null || "default".equals(preference)) {
@@ -775,36 +775,41 @@ public class AutoScalingReconciler {
         }
         LaunchTemplateData.CapacityReservationSpecification specification =
                 new LaunchTemplateData.CapacityReservationSpecification();
-        if (!"none".equals(preference)) {
-            specification.setCapacityReservationTarget(capacityTarget(groupSpecification,
-                    launchSource.capacityReservationSpecification()));
-        }
         boolean fallback = "capacity-reservations-first".equals(preference);
-        specification.setCapacityReservationPreference(fallback
-                ? specification.getCapacityReservationTarget() == null ? "open" : "capacity-reservations-only"
-                : preference);
-        try {
-            return launchWithCapacity(asg, launchSource, placement, clientToken, specification);
-        } catch (AwsException failure) {
-            if (!fallback || !Set.of("InsufficientInstanceCapacity", "ReservationCapacityExceeded")
-                    .contains(failure.getErrorCode())) {
-                throw failure;
+        int targetCount = Math.max(1, groupSpecification.getCapacityReservationIds().size());
+        for (int index = 0; index < targetCount; index++) {
+            if (!"none".equals(preference)) {
+                specification.setCapacityReservationTarget(capacityTarget(groupSpecification,
+                        launchSource.capacityReservationSpecification(), index));
             }
-            specification.setCapacityReservationPreference("none");
-            specification.setCapacityReservationTarget(null);
-            return launchWithCapacity(asg, launchSource, placement, clientToken, specification);
+            specification.setCapacityReservationPreference(fallback
+                    ? specification.getCapacityReservationTarget() == null ? "open" : "capacity-reservations-only"
+                    : preference);
+            try {
+                return launchWithCapacity(asg, launchSource, placement, clientToken, specification);
+            } catch (AwsException failure) {
+                // EC2 owns zone, type, platform, tenancy and capacity matching for each target.
+                // Try the remaining supplied reservations before considering on-demand capacity.
+                if (!Set.of("InsufficientInstanceCapacity", "ReservationCapacityExceeded")
+                        .contains(failure.getErrorCode()) || (!fallback && index + 1 == targetCount)) {
+                    throw failure;
+                }
+            }
         }
+        specification.setCapacityReservationPreference("none");
+        specification.setCapacityReservationTarget(null);
+        return launchWithCapacity(asg, launchSource, placement, clientToken, specification);
     }
 
     private static LaunchTemplateData.CapacityReservationTarget capacityTarget(
             CapacityReservationSpecification groupSpecification,
-            LaunchTemplateData.CapacityReservationSpecification templateSpecification) {
+            LaunchTemplateData.CapacityReservationSpecification templateSpecification, int index) {
         if (!groupSpecification.hasTarget()) {
             return templateSpecification == null ? null : templateSpecification.getCapacityReservationTarget();
         }
         LaunchTemplateData.CapacityReservationTarget target = new LaunchTemplateData.CapacityReservationTarget();
         if (!groupSpecification.getCapacityReservationIds().isEmpty()) {
-            target.setCapacityReservationId(groupSpecification.getCapacityReservationIds().getFirst());
+            target.setCapacityReservationId(groupSpecification.getCapacityReservationIds().get(index));
         } else {
             target.setCapacityReservationResourceGroupArn(
                     groupSpecification.getCapacityReservationResourceGroupArns().getFirst());
