@@ -4,7 +4,11 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -181,5 +185,71 @@ class Ec2ImageCatalogTest {
     void unknownImageUsesCatalogDefault() {
         assertFalse(imageCatalog.findByIdOrAlias("ami-unknown").isPresent());
         assertEquals(imageCatalog.defaultDockerImage(), amiImageResolver.resolve("ami-unknown"));
+    }
+
+    @Test
+    void imageMountsNormalizeDevicesAndSurviveResolution(@TempDir Path directory) throws Exception {
+        for (String architecture : List.of("x86_64", "arm64")) {
+            Ec2ImageCatalog catalog = mountCatalog(directory, architecture, """
+                    - {device: sdf, target: /data/./engine, filesystem: ext4}
+                    """);
+            ResolvedAmiImage resolved = new AmiImageResolver(catalog).resolveImage("ami-mounted");
+            assertEquals(List.of(new Ec2ImageCatalog.VolumeMount("/dev/sdf", "/data/engine", "ext4")),
+                    resolved.volumeMounts());
+            assertTrue(resolved.imageRuntime());
+            assertEquals("arm64".equals(architecture) ? "linux/arm64" : "linux/amd64",
+                    resolved.dockerPlatform());
+            assertThrows(UnsupportedOperationException.class, () -> resolved.volumeMounts().clear());
+        }
+        List<Ec2ImageCatalog.VolumeMount> mutable = new ArrayList<>(
+                List.of(new Ec2ImageCatalog.VolumeMount("sdf", "/data", "ext4")));
+        ResolvedAmiImage resolved = new ResolvedAmiImage("image", "image", false, null, mutable);
+        mutable.clear();
+        assertEquals(1, resolved.volumeMounts().size());
+        assertTrue(new ResolvedAmiImage("image", "image", false, null).volumeMounts().isEmpty());
+    }
+
+    @Test
+    void mountCatalogRejectsUnknownFieldsAndConflictingBindings(@TempDir Path directory) {
+        for (String entries : List.of(
+                "- {device: sdf, target: /data, filesystem: ext4, format: true}",
+                "- {device: sdf, target: /data, filesystem: xfs}",
+                "- {device: sdf, target: relative, filesystem: ext4}",
+                "- {device: sdf, target: /dev/data, filesystem: ext4}",
+                "- {device: sdf, target: /, filesystem: ext4}",
+                "- {device: sdf, target: /data, filesystem: ext4}\n"
+                        + "- {device: /dev/sdf, target: /other, filesystem: ext4}",
+                "- {device: sdf, target: /data, filesystem: ext4}\n"
+                        + "- {device: sdg, target: /data/child, filesystem: ext4}")) {
+            assertThrows(IllegalStateException.class,
+                    () -> mountCatalog(directory, "x86_64", entries).images(), entries);
+        }
+    }
+
+    @Test
+    void managedMountsRequireTheImagesOwnStartupContract(@TempDir Path directory) throws Exception {
+        Ec2ImageCatalog catalog = mountCatalog(directory, "x86_64",
+                "- {device: sdf, target: /data, filesystem: ext4}");
+        Path file = directory.resolve("catalog.yaml");
+        Files.writeString(file, Files.readString(file).replace("guestRuntime: image", "guestRuntime: minimal"));
+        assertThrows(IllegalStateException.class, catalog::images);
+    }
+
+    private static Ec2ImageCatalog mountCatalog(Path directory, String architecture, String mounts) throws Exception {
+        Path file = directory.resolve("catalog.yaml");
+        Files.writeString(file, """
+                defaultDockerImage: debian:bookworm-slim
+                images:
+                  - imageId: ami-mounted
+                    dockerImage: example/native:1
+                    name: native
+                    description: Native mounted data volume
+                    creationDate: '2026-11-01T00:00:00.000Z'
+                    architecture: %s
+                    guestRuntime: image
+                    volumeMounts:
+                %s
+                """.formatted(architecture, mounts.indent(6)));
+        return new Ec2ImageCatalog(file);
     }
 }

@@ -23,6 +23,7 @@ public class Volume {
     private Instant createTime;
     private Boolean multiAttachEnabled;
     private String region;
+    private String managedFilesystem;
     private List<Tag> tags = new ArrayList<>();
     private List<VolumeAttachment> attachments = new ArrayList<>();
 
@@ -63,6 +64,14 @@ public class Volume {
 
     public String getRegion() { return region; }
     public void setRegion(String region) { this.region = region; }
+
+    public String getManagedFilesystem() { return managedFilesystem; }
+    public void setManagedFilesystem(String managedFilesystem) {
+        if (managedFilesystem != null && !"ext4".equals(managedFilesystem)) {
+            throw new IllegalArgumentException("Managed volume filesystem must be ext4");
+        }
+        this.managedFilesystem = managedFilesystem;
+    }
 
     public List<Tag> getTags() { return tags; }
     public void setTags(List<Tag> tags) { this.tags = tags; }

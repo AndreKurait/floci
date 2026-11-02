@@ -63,6 +63,22 @@ machine: decision tasks, activity tasks, timers, signals, child workflows, and t
 
 All 39 modeled operations are implemented.
 
+## IAM resources
+
+With IAM enforcement enabled, requests naming a domain are checked against
+`arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}`. This includes
+starting and signaling workflows, polling, and inspecting their history. Domain
+tagging uses the request's `resourceArn`. Domain-scoped allows and explicit denies
+apply; `ListDomains` and `RegisterDomain` require `Resource: "*"`.
+
+The generated table restores the Region omitted by AWS's machine-readable Service
+Reference, following the ARN format in the
+[SWF policy guide](https://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-iam.policies.html).
+
+Requests carrying only a task token still use `Resource: "*"`; resolving the
+domain behind those tokens is not implemented by the request-resource table.
+SWF-specific condition keys are not yet evaluated.
+
 ## Decisions
 
 `RespondDecisionTaskCompleted` applies decisions in order:

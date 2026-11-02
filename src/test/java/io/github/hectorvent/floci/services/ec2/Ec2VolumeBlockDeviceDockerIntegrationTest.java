@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.exception.NotFoundException;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -12,20 +13,36 @@ import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
 import io.github.hectorvent.floci.services.ec2.model.VolumeModification;
 import io.github.hectorvent.floci.testing.IndependentServiceSettingsProfile;
 import io.quarkus.test.InjectMock;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import io.quarkus.test.junit.mockito.InjectSpy;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.retry.RetryPolicy;
+import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
+import software.amazon.awssdk.services.autoscaling.model.AutoScalingGroup;
+import software.amazon.awssdk.services.ec2.Ec2Client;
+import software.amazon.awssdk.services.ec2.model.Ec2Exception;
 
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -33,14 +50,20 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.when;
 
 /**
@@ -55,7 +78,7 @@ import static org.mockito.Mockito.when;
 @TestProfile(IndependentServiceSettingsProfile.class)
 class Ec2VolumeBlockDeviceDockerIntegrationTest {
 
-    @Inject
+    @InjectSpy
     Ec2Service ec2Service;
 
     @Inject
@@ -75,6 +98,9 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
 
     @InjectMock
     AmiImageResolver images;
+
+    @TestHTTPResource
+    URI endpoint;
 
     private static final Logger LOG = Logger.getLogger(Ec2VolumeBlockDeviceDockerIntegrationTest.class);
 
@@ -212,6 +238,249 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
     }
 
     @Test
+    void sdkManagedVolumeBootsMountedGrowsAndSurvivesHelperRestart(@TempDir Path directory) throws Exception {
+        Files.writeString(directory.resolve("Dockerfile"), """
+                FROM %s
+                ENTRYPOINT ["sh", "-ec", "test -b /dev/sdf; findmnt -n -o FSTYPE /data | grep -qx ext4; printf mounted > /data/first-boot; exec sleep 2147483647"]
+                """.formatted(config.services().ec2().volumeHelperImage()));
+        String image = dockerClient.buildImageCmd(directory.toFile()).start().awaitImageId();
+        when(images.resolveImage(anyString())).thenReturn(new ResolvedAmiImage(image, "image", false, null,
+                List.of(new Ec2ImageCatalog.VolumeMount("sdf", "/data", "ext4"))));
+        try (Ec2Client sdk = Ec2Client.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .httpClientBuilder(UrlConnectionHttpClient.builder())
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
+                .build()) {
+            String instanceId = sdk.runInstances(request -> request.imageId("ami-managed-volume")
+                    .instanceType("t3.micro").minCount(1).maxCount(1)
+                    .blockDeviceMappings(mapping -> mapping.deviceName("/dev/sdf")
+                            .ebs(ebs -> ebs.volumeType("gp3").volumeSize(1).deleteOnTermination(true))))
+                    .instances().getFirst().instanceId();
+            instancesToClean.add(instanceId);
+            Instance instance = ec2Service.describeInstances("us-east-1", List.of(instanceId), Map.of())
+                    .getFirst().getInstances().getFirst();
+            try {
+                await().atMost(Duration.ofSeconds(90)).untilAsserted(() -> {
+                    assertEquals("running", sdk.describeInstances(request -> request.instanceIds(instanceId))
+                            .reservations().getFirst().instances().getFirst().state().nameAsString());
+                    assertNotNull(instance.getDockerContainerId());
+                    assertEquals("mounted", successfulOutput(instance, "cat /data/first-boot"));
+                });
+                String volumeId = sdk.describeInstances(request -> request.instanceIds(instanceId))
+                        .reservations().getFirst().instances().getFirst().blockDeviceMappings().stream()
+                        .filter(mapping -> "/dev/sdf".equals(mapping.deviceName()))
+                        .findFirst().orElseThrow().ebs().volumeId();
+                String uuid = successfulOutput(instance, "blkid -s UUID -o value /dev/sdf");
+                String before = successfulOutput(instance, "stat -f -c '%b %S' /data");
+                assertFalse(Boolean.TRUE.equals(dockerClient.inspectContainerCmd(instance.getDockerContainerId())
+                        .exec().getHostConfig().getPrivileged()));
+                successfulOutput(instance, "printf retained-data > /data/document");
+
+                assertEquals("completed", sdk.modifyVolume(request -> request.volumeId(volumeId).size(2))
+                        .volumeModification().modificationStateAsString());
+                assertEquals("2147483648", successfulOutput(instance, "blockdev --getsize64 /dev/sdf"));
+                assertEquals(before, successfulOutput(instance, "stat -f -c '%b %S' /data"),
+                        "EC2 block growth must not perform the guest's filesystem resize");
+                ContainerExec.Result denied = execIn(instance.getDockerContainerId(),
+                        "setpriv --bounding-set=-sys_resource resize2fs /dev/sdf");
+                assertTrue(denied.exitCode() != 0, "Online ext4 growth must require SYS_RESOURCE");
+                assertTrue(denied.summary().contains("Permission denied")
+                                || denied.summary().contains("Operation not permitted"),
+                        denied.summary());
+                assertEquals(before, successfulOutput(instance, "stat -f -c '%b %S' /data"));
+                successfulOutput(instance, "resize2fs $(readlink -f /dev/sdf)");
+                assertFalse(before.equals(successfulOutput(instance, "stat -f -c '%b %S' /data")));
+                assertEquals(uuid, successfulOutput(instance, "blkid -s UUID -o value /dev/sdf"));
+                assertEquals("retained-data", successfulOutput(instance, "cat /data/document"));
+
+                sdk.stopInstances(request -> request.instanceIds(instanceId));
+                await().atMost(Duration.ofSeconds(60)).until(() -> "stopped".equals(instance.getState().getName()));
+                volumeBlockDeviceManager.stopManagedContainers();
+                sdk.startInstances(request -> request.instanceIds(instanceId));
+                await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertEquals("running", instance.getState().getName());
+                    assertEquals(uuid, successfulOutput(instance, "blkid -s UUID -o value /dev/sdf"));
+                    assertEquals("retained-data", successfulOutput(instance, "cat /data/document"));
+                });
+
+                sdk.terminateInstances(request -> request.instanceIds(instanceId));
+                await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertEquals("terminated", instance.getState().getName());
+                    Ec2Exception missing = assertThrows(Ec2Exception.class,
+                            () -> sdk.describeVolumes(request -> request.volumeIds(volumeId)));
+                    assertEquals("InvalidVolume.NotFound", missing.awsErrorDetails().errorCode());
+                });
+                String helper = ContainerStorageHelper.resourceName(config, "ec2", null, "volume-helper");
+                assertEquals(0, execIn(helper, "test ! -e /volumes/" + volumeId + ".raw").exitCode());
+                assertThrows(NotFoundException.class,
+                        () -> dockerClient.inspectVolumeCmd(
+                                ContainerStorageHelper.resourceName(config, "ec2", null, volumeId)).exec());
+            } finally {
+                sdk.terminateInstances(request -> request.instanceIds(instanceId));
+                await().atMost(Duration.ofSeconds(60)).until(() -> "terminated".equals(instance.getState().getName()));
+            }
+        } finally {
+            dockerClient.removeImageCmd(image).exec();
+        }
+    }
+
+    private String successfulOutput(Instance instance, String command) {
+        ContainerExec.Result result = execIn(instance.getDockerContainerId(), command);
+        assertEquals(0, result.exitCode(), result.summary());
+        return result.stdout().trim();
+    }
+
+    @Test
+    void sdkRefusedFleetRemovesRetainedVolumesAfterMountedGuestTeardown(@TempDir Path directory) throws Exception {
+        Files.writeString(directory.resolve("Dockerfile"), """
+                FROM %s
+                ENTRYPOINT ["sh", "-ec", "test -b /dev/sdf; findmnt -n /data; exec sleep 2147483647"]
+                """.formatted(config.services().ec2().volumeHelperImage()));
+        String image = dockerClient.buildImageCmd(directory.toFile()).start().awaitImageId();
+        when(images.resolveImage(anyString())).thenReturn(new ResolvedAmiImage(image, "image", false, null,
+                List.of(new Ec2ImageCatalog.VolumeMount("sdf", "/data", "ext4"))));
+        List<Instance> attempted = new CopyOnWriteArrayList<>();
+        List<String> launchVolumes = new CopyOnWriteArrayList<>();
+        doAnswer(call -> {
+            List<Instance> admitted = call.getArgument(1);
+            attempted.addAll(admitted);
+            for (Instance instance : admitted) {
+                launchVolumes.addAll(ec2Service.instanceVolumeAttachments("us-east-1", instance.getInstanceId())
+                        .stream().map(VolumeAttachment::getVolumeId).toList());
+            }
+            if (attempted.size() > 1) {
+                // Model capacity disappearing after the first accepted instance really mounts its volume.
+                Instance first = attempted.getFirst();
+                await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertEquals("running", first.getState().getName());
+                    assertEquals("ext4", successfulOutput(first, "findmnt -n -o FSTYPE /data"));
+                });
+                throw new AwsException("InsufficientInstanceCapacity", "capacity lost during fleet launch", 500);
+            }
+            return call.callRealMethod();
+        }).when(ec2Service).acquireCapacity(anyString(), anyList());
+        try (Ec2Client ec2 = Ec2Client.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
+                .httpClientBuilder(UrlConnectionHttpClient.builder())
+                .overrideConfiguration(options -> options.retryPolicy(RetryPolicy.none())).build()) {
+            String template = ec2.createLaunchTemplate(request -> request
+                    .launchTemplateName("volume-rollback-" + UUID.randomUUID())
+                    .launchTemplateData(data -> data.imageId("ami-managed-rollback-volume").instanceType("t3.micro")
+                            .blockDeviceMappings(mapping -> mapping.deviceName("/dev/sdf")
+                                    .ebs(ebs -> ebs.volumeSize(1).volumeType("gp3").deleteOnTermination(false)))))
+                    .launchTemplate().launchTemplateId();
+            try {
+                Ec2Exception refused = assertThrows(Ec2Exception.class, () -> ec2.createFleet(request ->
+                        request.type("instant").targetCapacitySpecification(capacity ->
+                                        capacity.totalTargetCapacity(2).defaultTargetCapacityType("on-demand"))
+                                .launchTemplateConfigs(launch -> launch.launchTemplateSpecification(spec ->
+                                        spec.launchTemplateId(template).version("1")))));
+                assertEquals("InsufficientInstanceCapacity", refused.awsErrorDetails().errorCode());
+                assertEquals(2, attempted.size());
+                assertEquals(4, launchVolumes.size());
+                await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertTrue(attempted.stream().allMatch(instance ->
+                            "terminated".equals(instance.getState().getName())));
+                    assertTrue(dockerClient.listContainersCmd().withShowAll(true)
+                            .withAncestorFilter(List.of(image)).exec().isEmpty());
+                    for (String volume : launchVolumes) {
+                        Ec2Exception missing = assertThrows(Ec2Exception.class,
+                                () -> ec2.describeVolumes(request -> request.volumeIds(volume)));
+                        assertEquals("InvalidVolume.NotFound", missing.awsErrorDetails().errorCode());
+                        assertThrows(NotFoundException.class, () -> dockerClient.inspectVolumeCmd(
+                                ContainerStorageHelper.resourceName(config, "ec2", null, volume)).exec());
+                    }
+                });
+            } finally {
+                ec2.deleteLaunchTemplate(request -> request.launchTemplateId(template));
+                for (Instance instance : attempted) {
+                    instancesToClean.add(instance.getInstanceId());
+                    ec2.terminateInstances(request -> request.instanceIds(instance.getInstanceId()));
+                }
+                volumesToClean.addAll(launchVolumes);
+                await().atMost(Duration.ofSeconds(60)).until(() -> dockerClient.listContainersCmd()
+                        .withShowAll(true).withAncestorFilter(List.of(image)).exec().isEmpty());
+            }
+        } finally {
+            doCallRealMethod().when(ec2Service).acquireCapacity(anyString(), anyList());
+            dockerClient.removeImageCmd(image).exec();
+        }
+    }
+
+    @Test
+    void sdkForceDeletesAutoScalingGroupWithMountedVolumes(@TempDir Path directory) throws Exception {
+        String name = "volume-delete-" + UUID.randomUUID();
+        Files.writeString(directory.resolve("Dockerfile"), """
+                FROM %s
+                ENTRYPOINT ["sh", "-ec", "test -b /dev/sdf; findmnt -n /data; exec sleep 2147483647"]
+                """.formatted(config.services().ec2().volumeHelperImage()));
+        String image = dockerClient.buildImageCmd(directory.toFile()).start().awaitImageId();
+        when(images.resolveImage(anyString())).thenReturn(new ResolvedAmiImage(image, "image", false, null,
+                List.of(new Ec2ImageCatalog.VolumeMount("sdf", "/data", "ext4"))));
+        StaticCredentialsProvider credentials = StaticCredentialsProvider.create(
+                AwsBasicCredentials.create("test", "test"));
+        try (Ec2Client ec2 = Ec2Client.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .credentialsProvider(credentials).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
+             AutoScalingClient asg = AutoScalingClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                     .credentialsProvider(credentials).httpClientBuilder(UrlConnectionHttpClient.builder()).build()) {
+            asg.createLaunchConfiguration(request -> request.launchConfigurationName(name)
+                    .imageId("ami-managed-asg-volume").instanceType("t3.micro")
+                    .blockDeviceMappings(mapping -> mapping.deviceName("/dev/sdf")
+                            .ebs(ebs -> ebs.volumeSize(1).volumeType("gp3").deleteOnTermination(true))));
+            try {
+                asg.createAutoScalingGroup(request -> request.autoScalingGroupName(name)
+                        .launchConfigurationName(name).minSize(0).maxSize(4).desiredCapacity(4)
+                        .availabilityZones("us-east-1a"));
+                await().atMost(Duration.ofSeconds(90)).untilAsserted(() -> {
+                    AutoScalingGroup group = asg.describeAutoScalingGroups(request -> request.autoScalingGroupNames(name))
+                            .autoScalingGroups().getFirst();
+                    assertEquals(4, group.instances().size());
+                    assertTrue(group.instances().stream().allMatch(member -> "InService".equals(
+                            member.lifecycleStateAsString())));
+                });
+                List<String> ids = asg.describeAutoScalingGroups(request -> request.autoScalingGroupNames(name))
+                        .autoScalingGroups().getFirst().instances().stream().map(member -> member.instanceId())
+                        .toList();
+                instancesToClean.addAll(ids);
+                List<String> volumes = ec2.describeInstances(request -> request.instanceIds(ids)).reservations()
+                        .stream().flatMap(reservation -> reservation.instances().stream())
+                        .flatMap(instance -> instance.blockDeviceMappings().stream())
+                        .filter(mapping -> "/dev/sdf".equals(mapping.deviceName()))
+                        .map(mapping -> mapping.ebs().volumeId()).toList();
+                assertEquals(4, volumes.size());
+
+                asg.deleteAutoScalingGroup(request -> request.autoScalingGroupName(name).forceDelete(true));
+
+                await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertTrue(asg.describeAutoScalingGroups(request -> request.autoScalingGroupNames(name))
+                            .autoScalingGroups().isEmpty());
+                    assertTrue(ec2.describeInstances(request -> request.instanceIds(ids)).reservations().stream()
+                            .flatMap(reservation -> reservation.instances().stream())
+                            .allMatch(instance -> "terminated".equals(instance.state().nameAsString())));
+                    assertTrue(dockerClient.listContainersCmd().withShowAll(true)
+                            .withAncestorFilter(List.of(image)).exec().isEmpty());
+                    for (String volume : volumes) {
+                        Ec2Exception missing = assertThrows(Ec2Exception.class,
+                                () -> ec2.describeVolumes(request -> request.volumeIds(volume)));
+                        assertEquals("InvalidVolume.NotFound", missing.awsErrorDetails().errorCode());
+                        assertThrows(NotFoundException.class, () -> dockerClient.inspectVolumeCmd(
+                                ContainerStorageHelper.resourceName(config, "ec2", null, volume)).exec());
+                    }
+                });
+            } finally {
+                if (!asg.describeAutoScalingGroups(request -> request.autoScalingGroupNames(name))
+                        .autoScalingGroups().isEmpty()) {
+                    asg.deleteAutoScalingGroup(request -> request.autoScalingGroupName(name).forceDelete(true));
+                }
+                asg.deleteLaunchConfiguration(request -> request.launchConfigurationName(name));
+                await().atMost(Duration.ofSeconds(60)).until(() -> dockerClient.listContainersCmd()
+                        .withShowAll(true).withAncestorFilter(List.of(image)).exec().isEmpty());
+            }
+        } finally {
+            dockerClient.removeImageCmd(image).exec();
+        }
+    }
+
+    @Test
     void runInstancesAttachesDataDevicesBeforeTheFirstUserDataCommand() {
         when(images.resolveImage(anyString())).thenReturn(ResolvedAmiImage.minimal("alpine:3.21"));
         LaunchTemplateData.BlockDeviceMapping data = new LaunchTemplateData.BlockDeviceMapping();
@@ -304,6 +573,131 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
         String helperName = ContainerStorageHelper.resourceName(config, "ec2", null, "volume-helper");
         ContainerExec.Result checkFile = execIn(helperName, "test ! -f /volumes/" + volume.getVolumeId() + ".raw");
         assertEquals(0, checkFile.exitCode(), "Backing file should be removed on volume deletion");
+    }
+
+    @Test
+    void failedLoopDetachPreservesBackingDataAndVolumeUntilDeletionRetry() {
+        Volume volume = ec2Service.createVolume("us-east-1", "us-east-1a", "gp3", 1, false, 3000, 125,
+                null, List.of(new Tag("Owner", "retained")));
+        String volumeId = volume.getVolumeId();
+        volumesToClean.add(volumeId);
+        String helper = ContainerStorageHelper.resourceName(config, "ec2", null, "volume-helper");
+        String raw = "/volumes/" + volumeId + ".raw";
+        String realLosetup = execIn(helper, "command -v losetup").stdout().trim();
+        ContainerExec.Result allocated = execIn(helper,
+                "printf keep-data | dd of=" + raw + " conv=notrunc 2>/dev/null; "
+                        + "loop=$(losetup -f); losetup \"$loop\" " + raw + " && printf '%s' \"$loop\"");
+        assertEquals(0, allocated.exitCode(), allocated.summary());
+        String loop = allocated.stdout().trim();
+        assertTrue(loop.matches("/dev/loop[0-9]+"));
+        String injected = "/usr/local/bin/losetup";
+        boolean removeInjected = false;
+        try {
+            assertEquals(0, execIn(helper, "test ! -e " + injected).exitCode());
+            removeInjected = true;
+            ContainerExec.Result installed = execIn(helper,
+                    "test ! -e " + injected + " && mkdir -p /usr/local/bin && printf '%s\\n' '#!/bin/sh' "
+                            + "'if [ \"$1\" = \"-d\" ]; then exit 1; fi' "
+                            + "'exec " + realLosetup + " \"$@\"' > " + injected + " && chmod 755 " + injected);
+            assertEquals(0, installed.exitCode(), installed.summary());
+            assertEquals(injected, execIn(helper, "command -v losetup").stdout().trim());
+
+            AwsException failure = null;
+            try {
+                ec2Service.deleteVolume("us-east-1", volumeId);
+            } catch (AwsException error) {
+                failure = error;
+            }
+            AwsException deletionFailure = failure;
+            ContainerExec.Result retained = execIn(helper, "head -c 9 " + raw);
+            assertAll(
+                    () -> {
+                        assertNotNull(deletionFailure, "A failed loop detach must fail DeleteVolume");
+                        assertEquals("InternalError", deletionFailure.getErrorCode());
+                        assertEquals(500, deletionFailure.getHttpStatus());
+                    },
+                    () -> assertEquals("keep-data", retained.stdout(), retained.summary()),
+                    () -> assertTrue(ec2Service.describeVolumes("us-east-1", List.of(), Map.of()).stream()
+                            .anyMatch(current -> volumeId.equals(current.getVolumeId()))),
+                    () -> assertEquals(1, ec2Service.describeTags("us-east-1",
+                            Map.of("resource-id", List.of(volumeId))).size()));
+
+            assertEquals(0, execIn(helper, "rm " + injected).exitCode());
+            ec2Service.deleteVolume("us-east-1", volumeId);
+            volumesToClean.remove(volumeId);
+            assertEquals(0, execIn(helper, "test ! -e " + raw).exitCode());
+            assertFalse(ec2Service.describeVolumes("us-east-1", List.of(), Map.of()).stream()
+                    .anyMatch(current -> volumeId.equals(current.getVolumeId())));
+            assertTrue(ec2Service.describeTags("us-east-1", Map.of("resource-id", List.of(volumeId))).isEmpty());
+        } finally {
+            if (removeInjected) {
+                execIn(helper, "rm -f " + injected);
+            }
+            ContainerExec.Result binding = execIn(helper, realLosetup + " " + loop);
+            if (binding.stdout().contains(raw)) {
+                assertEquals(0, execIn(helper, realLosetup + " -d " + loop).exitCode());
+            }
+        }
+    }
+
+    @Test
+    void busyLoopDeletionFailsPromptlyAndCannotDeleteDataAfterReturning() {
+        Volume volume = ec2Service.createVolume("us-east-1", "us-east-1a", "gp3", 1, false, 3000, 125,
+                null, List.of(new Tag("Owner", "busy-loop")));
+        String volumeId = volume.getVolumeId();
+        volumesToClean.add(volumeId);
+        String helper = ContainerStorageHelper.resourceName(config, "ec2", null, "volume-helper");
+        String raw = "/volumes/" + volumeId + ".raw";
+        ContainerExec.Result allocated = execIn(helper,
+                "printf keep-data | dd of=" + raw + " conv=notrunc 2>/dev/null; "
+                        + "loop=$(losetup -f); losetup \"$loop\" " + raw + " && printf '%s' \"$loop\"");
+        assertEquals(0, allocated.exitCode(), allocated.summary());
+        String loop = allocated.stdout().trim();
+        assertTrue(loop.matches("/dev/loop[0-9]+"));
+        ContainerExec.Result held = execIn(helper,
+                "sh -c 'exec 9<" + loop + "; exec sleep 180' </dev/null >/dev/null 2>&1 & echo $!");
+        assertEquals(0, held.exitCode(), held.summary());
+        String holder = held.stdout().trim();
+        assertTrue(holder.matches("[0-9]+"));
+        try {
+            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                    assertEquals(loop, execIn(helper, "readlink /proc/" + holder + "/fd/9").stdout().trim()));
+            long started = System.nanoTime();
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> ec2Service.deleteVolume("us-east-1", volumeId));
+            Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
+            assertEquals("InternalError", failure.getErrorCode());
+            assertEquals(500, failure.getHttpStatus());
+            assertEquals("keep-data", execIn(helper, "head -c 9 " + raw).stdout());
+
+            assertEquals(0, execIn(helper, "kill " + holder).exitCode());
+            await().atMost(Duration.ofSeconds(5)).until(() ->
+                    !execIn(helper, "losetup " + loop).stdout().contains(raw));
+            assertAll(
+                    () -> assertTrue(elapsed.compareTo(Duration.ofSeconds(10)) < 0,
+                            "A busy loop must fail without waiting for the 30-second exec timeout: " + elapsed),
+                    () -> await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(3)).untilAsserted(() ->
+                            assertEquals("keep-data", execIn(helper, "head -c 9 " + raw).stdout(),
+                                    "A returned failure must not leave a process that later removes the data")),
+                    () -> assertTrue(ec2Service.describeVolumes("us-east-1", List.of(), Map.of()).stream()
+                            .anyMatch(current -> volumeId.equals(current.getVolumeId()))),
+                    () -> assertEquals(1, ec2Service.describeTags("us-east-1",
+                            Map.of("resource-id", List.of(volumeId))).size()));
+
+            ec2Service.deleteVolume("us-east-1", volumeId);
+            volumesToClean.remove(volumeId);
+            assertEquals(0, execIn(helper, "test ! -e " + raw).exitCode());
+            assertFalse(ec2Service.describeVolumes("us-east-1", List.of(), Map.of()).stream()
+                    .anyMatch(current -> volumeId.equals(current.getVolumeId())));
+            assertTrue(ec2Service.describeTags("us-east-1", Map.of("resource-id", List.of(volumeId))).isEmpty());
+        } finally {
+            if (loop.equals(execIn(helper, "readlink /proc/" + holder + "/fd/9").stdout().trim())) {
+                assertEquals(0, execIn(helper, "kill " + holder).exitCode());
+            }
+            if (execIn(helper, "losetup " + loop).stdout().contains(raw)) {
+                assertEquals(0, execIn(helper, "losetup -d " + loop).exitCode());
+            }
+        }
     }
 
     @Test

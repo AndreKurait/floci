@@ -178,6 +178,7 @@ public class ResourceArnBuilder {
         String path = ctx.getUriInfo().getPath();
         return switch (credentialScope) {
             case "s3"             -> buildS3Resources(operation, path, region);
+            case "ec2"            -> Ec2ImageResourceArns.of(operation, ctx, region, partition);
             case "lambda"         -> List.of(buildLambdaArn(path, ctx, region, accountId));
             case "sqs"            -> List.of(buildSqsArn(ctx, region, accountId));
             case "sns"            -> List.of(buildSnsArn(ctx, region, accountId));

@@ -22,6 +22,9 @@ Memory-only instances are stopped and removed synchronously, including container
 already stopped, because their tracking records disappear with the process.
 Persistent, hybrid and WAL modes retain stopped containers for restart recovery.
 The EC2-specific storage override takes precedence over the global mode.
+Auto Scaling stops scheduling replacements before EC2 interrupts and drains its
+launch workers. Container teardown then also reclaims pending memory-only
+instances' metadata helpers, even if no workload container was recorded yet.
 
 ## RunInstances request replay
 
@@ -372,9 +375,15 @@ Explicit page sizes below five are rejected. gp3 accepts below-baseline performa
 within the size ratio and reports at least 3,000 IOPS and 125 MiB/s.
 IOPS and throughput describe validated API metadata; local backing storage does not enforce
 the provisioned physical performance.
-Permission reads and mutations remain owner-scoped. IAM policy evaluation,
-public/group/organization grants, legacy `OperationType`/`UserId.N` mutation
-forms, encrypted shared copies and KMS are unsupported.
+Permission reads and mutations remain owner-scoped. With IAM enforcement enabled,
+EBS-backed `CopyImage` checks the source AMI in `SourceRegion` and the new image and
+snapshots in the destination region. Image/snapshot attribute operations and
+`CreateTags`/`DeleteTags` check their named image and snapshot ARNs. This permits
+image/snapshot-scoped roles while retaining explicit denies. `DescribeImages`
+and `DescribeTags` require an unscoped grant. Other EC2 resource targets retain
+their existing unscoped evaluation; this does not qualify all EC2 IAM behavior.
+Public/group/organization grants, legacy `OperationType`/`UserId.N` mutation
+forms, encrypted shared copies and KMS remain unsupported.
 
 Container mode refuses foreign sources with unbound runtime ancestry. Captured Docker layers are
 refused in both modes, including captures in source ancestry. Direct shared-image container launches
@@ -1579,12 +1588,13 @@ Elastic IP association. A retained interface can be reused by a later launch.
 | DetachVolume | Detaches a volume from an instance, optionally forced; returns the attachment in `detaching` state. |
 
 When `floci.services.ec2.volume-block-devices` is enabled (the default), attached EBS volumes are backed by real Linux loop devices inside running instance containers and synthesized EKS cluster node containers:
-- **Storage mechanism**: Backing sparse raw image files are allocated in Floci storage under `floci-aws-ec2-volumes` (named volume or host path). A privileged helper container (`floci-aws-ec2-volume-helper`, running `floci.services.ec2.volume-helper-image`, default `alpine:3.21`) manages Linux loop devices via `losetup`. It starts on the first volume operation and is removed when Floci shuts down; the backing files stay in storage.
+- **Storage mechanism**: Backing sparse raw image files are allocated in Floci storage under `floci-aws-ec2-volumes` (named volume or host path). A privileged helper container (`floci-aws-ec2-volume-helper`, running `floci.services.ec2.volume-helper-image`, default `debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3`) manages Linux loop devices via `losetup`. It starts on the first volume operation and is removed when Floci shuts down; the backing files stay in storage.
 - **Target device nodes**: Inside privileged target instance containers, the corresponding device node is created at the requested path (for example `/dev/xvdf` or `/dev/sdf`) using `mknod` or a symlink to the loop device, matching the exact size specified during volume creation. Target containers can format filesystems (such as ext4 or xfs), mount them, and persist data across detach and reattach.
 - **Restart reconciliation**: When an instance container stops and starts, or when Floci restarts, attached volume device nodes are automatically restored inside the target container. Backing raw files remain preserved across reboots in persistent storage.
 - **Graceful degradation**: If Docker is unavailable, the target instance container is not running, or the container is not privileged, volume attachments degrade gracefully to metadata-only tracking without failing the API call.
+- **Deletion failures**: When the block-device manager is available but cannot delete a volume's backing storage, deletion returns `InternalError` and retains the volume record and tags for retry. A failed detach or a loop still held open preserves the backing file. Deletion attempts each detach once and returns while the file is still in use, so closing that handle cannot make a timed-out cleanup process erase data after the API returns. Retry deletion after releasing the handle. Container-backed termination ends volume attachments only after guest teardown, using the original caller's account. If that asynchronous cleanup fails, it logs the failure and preserves the volume for reconciliation or retry. A refused launch also removes its newly created volumes after successful teardown, including volumes whose original deletion policy would retain them. Rollback preserves that policy when termination fails and never deletes a volume still attached elsewhere. Cleanup after a failed launch and launch rollback also preserve storage on deletion failure.
 - **Platform requirements**: Requires a Linux Docker environment (native Linux Docker daemon, or Colima / Docker Desktop with a Linux virtual machine) and privileged instance containers.
-- **Unmodeled aspects**: Multi-attach is tracked at metadata level only. Automated filesystem formatting (volumes start unformatted like real EBS block devices) and volume encryption at the block layer are not modeled. Root volume backing is logical (container rootfs); `ModifyVolume` updates recorded root volume metadata without modifying container storage, while EBS data volume size increases expand the underlying raw backing file and refresh any attached loop device. Volume type, IOPS, and throughput changes remain recorded metadata without altering device characteristics.
+- **Unmodeled aspects**: Multi-attach is tracked at metadata level only. Ordinary volumes start unformatted like real EBS block devices. The opt-in image mount contract below prepares ext4; volume encryption at the block layer is not modeled. Root volume backing is logical (container rootfs); `ModifyVolume` updates recorded root volume metadata without modifying container storage, while EBS data volume size increases expand the underlying raw backing file and refresh any attached loop device. Volume type, IOPS, and throughput changes remain recorded metadata without altering device characteristics.
 
 Validation matches AWS behavior:
 - Unknown volumes are rejected with `InvalidVolume.NotFound`.
@@ -1958,6 +1968,57 @@ names. IDs, aliases, public parameter names and registration names must remain
 unambiguous across the combined catalog; conflicting entries fail instead of
 overriding bundled images. The flag defaults to false, preserving full
 replacement for existing files.
+
+### Image-owned data-volume mounts
+
+An image with `guestRuntime: image` can declare its data mount:
+
+```yaml
+volumeMounts:
+  - device: /dev/sdf
+    target: /data
+    filesystem: ext4
+```
+
+This is a local image boot contract. AWS EBS APIs do not format or mount guest
+filesystems. The image owns its data path, permissions, aliases and startup;
+Floci prepares the declared data volume before Docker starts that image. The
+launch must supply exactly one snapshot-free, non-root EBS mapping for each
+device. Duplicate devices, overlapping targets, unsupported filesystems,
+multi-attach and conflicting configured mounts refuse preparation.
+
+The storage helper formats only a new sparse backing file with no existing
+allocated data. Existing ext4 is reused. A labelled Docker local volume mounts
+that filesystem, and the guest receives both its declared device and the backing
+loop device with read/write access. The guest stays unprivileged and adds only
+`SYS_RESOURCE` for online ext4 resizing; explicit drops of that capability refuse
+launch. Original ENTRYPOINT/CMD, network controls and metadata remain intact.
+
+`ModifyVolume` grows the block device. The guest must run its own `resize2fs`;
+Floci never substitutes that command. Stop/start verifies the retained Docker
+mount and backing inode before starting the same container. A helper restart in
+the same kernel preserves those bindings. Host reboot recovery and foreign-CPU
+filesystem ioctl translation require separate platform qualification.
+
+Managed volumes cannot degrade to metadata-only execution. Failed preparation,
+changed bindings or unavailable storage fail visibly. Docker refuses removal
+while a guest still references the volume; termination releases it after guest
+teardown. `DeleteOnTermination=false` retains the filesystem. Deletion removes
+the Docker volume, releases the verified loop and then removes the raw file;
+failure retains the EC2 record and tags for retry. Live remounting into an existing
+container and snapshot block-data copying are outside this contract.
+
+After termination releases its Docker mount, a retained ext4 volume can be
+attached through the ordinary `AttachVolume` API to a running instance using
+Floci's existing privileged raw-device mode. This exposes the block device;
+the caller mounts its filesystem. Reattachment verifies the existing file,
+filesystem and loop identity and never formats missing or unrecognized data.
+Occupied device paths refuse attachment. Unmount before detaching; a failed
+physical detach preserves the attachment and tags for retry. Stop/start
+revalidates the raw backing storage, and the caller remounts the filesystem.
+This recovery path does not add or replace Docker mounts in an existing native
+unprivileged guest. Initial raw-device reattachment to a stopped guest is not
+supported.
 
 ### Public IPv4 addresses
 

@@ -26,9 +26,11 @@ import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.ssm.SsmCommandService;
+import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
@@ -124,6 +126,11 @@ public class AutoScalingReconciler {
         scheduler.shutdownNow();
         launchWaiters.shutdownNow();
         changes.close();
+    }
+
+    void onStop(@Observes @Priority(1000) ShutdownEvent ignored) {
+        // Stop replacement launches before EC2 drains its workers and removes containers.
+        stop();
     }
 
     void onStart(@Observes StartupEvent event) {
@@ -504,7 +511,8 @@ public class AutoScalingReconciler {
     private boolean isStaleInstance(AutoScalingGroup asg, AsgInstance instance) {
         String lifecycleState = instance.getLifecycleState();
         if ("InService".equals(lifecycleState)) {
-            return !ec2Service.isInstanceContainerRunning(instance.getInstanceId());
+            return !ec2Service.isInstanceContainerRunning(instance.getInstanceId())
+                    && terminateExitedInstance(asg, instance.getInstanceId());
         }
         if ("Pending".equals(lifecycleState)) {
             if (instance.getStandbyActivityId() != null) {
@@ -514,6 +522,32 @@ public class AutoScalingReconciler {
         }
         if ("Terminating".equals(lifecycleState)) {
             return isMissingOrTerminalEc2Instance(asg, instance.getInstanceId(), TERMINATED_STATES);
+        }
+        return false;
+    }
+
+    private boolean terminateExitedInstance(AutoScalingGroup asg, String instanceId) {
+        if (isMissingOrTerminalEc2Instance(asg, instanceId, TERMINATED_STATES)) {
+            return true;
+        }
+        if (asg.getSuspendedProcesses().stream()
+                .anyMatch(Set.of("Terminate", "HealthCheck", "ReplaceUnhealthy")::contains)) {
+            return false;
+        }
+        try {
+            // Container exit alone does not release EC2 identity, ENIs or volumes.
+            // Keep membership until normal EC2 termination succeeds so cleanup can retry.
+            ec2Service.terminateInstances(asg.getRegion(), List.of(instanceId));
+            return true;
+        } catch (AwsException failure) {
+            if ("InvalidInstanceID.NotFound".equals(failure.getErrorCode())) {
+                return true;
+            }
+            LOG.debugv("ASG {0}: keeping exited instance {1} for cleanup retry: {2}",
+                    asg.getAutoScalingGroupName(), instanceId, failure.getMessage());
+        } catch (Exception failure) {
+            LOG.debugv("ASG {0}: keeping exited instance {1} for cleanup retry: {2}",
+                    asg.getAutoScalingGroupName(), instanceId, failure.getMessage());
         }
         return false;
     }

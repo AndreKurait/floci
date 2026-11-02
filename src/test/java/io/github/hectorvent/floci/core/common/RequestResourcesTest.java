@@ -19,6 +19,26 @@ class RequestResourcesTest {
     private static final String MACHINE = "arn:aws:states:us-east-1:000000000000:stateMachine:orders";
 
     @Test
+    void swfDomainOperationsUseTheDomainNameAndTagOperationsUseItsArn() {
+        String domain = "arn:aws:swf:us-east-1:000000000000:/domain/orders";
+        assertEquals(List.of(domain), of("swf:StartWorkflowExecution",
+                json("{\"domain\":\"orders\",\"workflowId\":\"delivery\"}")));
+        assertEquals(List.of(domain), of("swf:SignalWorkflowExecution", json("{\"domain\":\"orders\"}")));
+        assertEquals(List.of(domain), of("swf:DescribeDomain", json("{\"name\":\"orders\"}")));
+        assertEquals(List.of(domain), of("swf:TagResource", json("{\"resourceArn\":\"" + domain + "\"}")));
+        assertEquals(List.of("arn:aws-us-gov:swf:us-gov-west-1:123456789012:/domain/orders"),
+                RequestResources.of("swf:StartWorkflowExecution", json("{\"domain\":\"orders\"}"),
+                        "aws-us-gov", "us-gov-west-1", "123456789012"));
+    }
+
+    @Test
+    void injectingADomainDoesNotScopeGlobalSwfOperationsOrAnUnknownOperation() {
+        for (String operation : List.of("swf:ListDomains", "swf:RegisterDomain", "swf:NoSuchOperation")) {
+            assertEquals(List.of(), of(operation, json("{\"name\":\"orders\",\"domain\":\"orders\"}")));
+        }
+    }
+
+    @Test
     void aMemberHoldingAnArnOfATypeTheActionActsOnNamesThatResource() {
         assertEquals(List.of(MACHINE), of("states:DescribeStateMachine",
                 json("{\"stateMachineArn\":\"" + MACHINE + "\"}")));

@@ -442,12 +442,15 @@ class Ec2ServiceTest {
 
     @Test
     void aRollbackWhoseTerminationFailsKeepsEachVolumesDeleteOnTermination() {
-        Ec2Service service = spy(new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+        AccountAwareStorageBackend<Instance> instanceStore = spy(
+                AccountAwareStorageBackend.inMemory("000000000000"));
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
-                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory()));
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of(
+                        "ec2-instances.json", instanceStore)));
         Reservation launch = launchKeepingADataVolume(service);
-        doThrow(new AwsException("InternalError", "termination failed", 500))
-                .when(service).terminateInstances(anyString(), anyList());
+        doThrow(new AwsException("InternalError", "instance lookup failed", 500)).doCallRealMethod()
+                .when(instanceStore).get("us-east-1::" + launch.getInstances().getFirst().getInstanceId());
 
         assertThrows(AwsException.class, () -> service.rollBackLaunch("us-east-1", launch));
 
@@ -459,10 +462,57 @@ class Ec2ServiceTest {
                         .collect(Collectors.toSet()));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"terminate", "settle", "rollback"})
+    void failedBackingDeletionKeepsVolumeAndTagsForCleanupRetry(String operation) {
+        AccountAwareStorageBackend<Volume> volumeStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        when(devices.isAvailable()).thenReturn(true);
+        when(devices.deleteVolume(anyString())).thenReturn(true);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-volumes.json", volumeStore)),
+                null, null, null, null, devices);
+        Reservation launch = launchWithDataVolume(service, true);
+        Instance instance = launch.getInstances().getFirst();
+        String volumeId = service.describeVolumes("us-east-1", List.of(), Map.of()).stream()
+                .filter(volume -> "/dev/sdf".equals(volume.getAttachments().getFirst().getDevice()))
+                .findFirst().orElseThrow().getVolumeId();
+        service.createTags("us-east-1", List.of(volumeId), List.of(new Tag("Owner", "retained")));
+        when(devices.deleteVolume(volumeId)).thenReturn(false);
+        Runnable cleanup = switch (operation) {
+            case "terminate" -> () -> service.terminateInstances("us-east-1", List.of(instance.getInstanceId()));
+            case "rollback" -> () -> service.rollBackLaunch("us-east-1", launch);
+            case "settle" -> () -> {
+                instance.setState(InstanceState.terminated());
+                service.describeVolumes("us-east-1", List.of(volumeId), Map.of());
+            };
+            default -> throw new IllegalArgumentException(operation);
+        };
+
+        AwsException failure = assertThrows(AwsException.class, cleanup::run);
+
+        assertEquals("InternalError", failure.getErrorCode());
+        assertEquals(500, failure.getHttpStatus());
+        Volume retained = volumeStore.get("us-east-1::" + volumeId).orElseThrow();
+        assertEquals(instance.getInstanceId(), retained.getAttachments().getFirst().getInstanceId());
+        assertTrue(retained.getAttachments().getFirst().isDeleteOnTermination());
+        assertEquals(1, service.describeTags("us-east-1", Map.of("resource-id", List.of(volumeId))).size());
+
+        when(devices.deleteVolume(volumeId)).thenReturn(true);
+        assertTrue(service.describeVolumes("us-east-1", List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(volumeId))).isEmpty());
+        verify(devices, times(2)).deleteVolume(volumeId);
+    }
+
     private static Reservation launchKeepingADataVolume(Ec2Service service) {
+        return launchWithDataVolume(service, false);
+    }
+
+    private static Reservation launchWithDataVolume(Ec2Service service, boolean deleteOnTermination) {
         LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
         ebs.setVolumeSize(5);
-        ebs.setDeleteOnTermination(false);
+        ebs.setDeleteOnTermination(deleteOnTermination);
         LaunchTemplateData.BlockDeviceMapping data = new LaunchTemplateData.BlockDeviceMapping();
         data.setDeviceName("/dev/sdf");
         data.setEbs(ebs);
@@ -6175,7 +6225,7 @@ class Ec2ServiceTest {
     @Test
     void createImageRebootsTheSourceInstanceUnlessNoRebootIsSet() {
         Ec2ContainerManager containerManager = capturingContainerManager();
-        Ec2Service service = liveService(containerManager, mock(AmiImageResolver.class));
+        Ec2Service service = liveService(containerManager, minimalImageResolver());
         String instanceId = runOne(service, "ami-src");
 
         service.createImage("us-east-1", instanceId, "with-reboot", null, false);
@@ -6294,7 +6344,7 @@ class Ec2ServiceTest {
     @Test
     void dryRunValidatesSuppliedEniWithoutAttachingOrProvisioning() {
         Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
-        Ec2Service service = liveService(manager, mock(AmiImageResolver.class));
+        Ec2Service service = liveService(manager, minimalImageResolver());
         String subnetId = service.describeSubnets("us-east-1", List.of(), Map.of()).getFirst().getSubnetId();
         NetworkInterface eni = service.createNetworkInterface("us-east-1", subnetId, null, null,
                 List.of(), List.of(), List.of());
@@ -6341,7 +6391,7 @@ class Ec2ServiceTest {
         source.rootDeviceType = "ebs";
         source.rootDeviceName = "/dev/xvda";
         when(catalog.findByIdOrAlias("ami-src")).thenReturn(Optional.of(source));
-        Ec2Service service = liveService(capturingContainerManager(), mock(AmiImageResolver.class), catalog);
+        Ec2Service service = liveService(capturingContainerManager(), minimalImageResolver(), catalog);
         String instanceId = runOne(service, "ami-src");
 
         Image image = service.createImage("us-east-1", instanceId, "captured", null, true);
@@ -6365,7 +6415,7 @@ class Ec2ServiceTest {
 
     @Test
     void createImageTakesItsOwnSnapshotRatherThanTheSourceAmisOne() {
-        Ec2Service service = liveService(capturingContainerManager(), mock(AmiImageResolver.class));
+        Ec2Service service = liveService(capturingContainerManager(), minimalImageResolver());
         Image source = service.registerImage("us-east-1", "source-image", null, null, "/dev/sda1",
                 List.of(blockDeviceMapping("snap-source", 16)));
 
@@ -6506,6 +6556,25 @@ class Ec2ServiceTest {
         }
         assertEquals(Set.of("111122223333"), instanceStore.scanAllAccountEntries(key -> true).stream()
                 .map(AccountAwareStorageBackend.AccountEntry::accountId).collect(Collectors.toSet()));
+    }
+
+    @Test
+    void shutdownReclaimsPendingMetadataHelpersBeforeTheWorkloadContainerExists() {
+        EmulatorConfig config = mockConfig(false);
+        when(config.storage().mode()).thenReturn("memory");
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance instance = persistedInstance("i-pending-helper", "10.20.1.10", InstanceState.pending());
+        instanceStore.putForAccount("111122223333", "us-east-1::i-pending-helper", instance);
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), mock(VpcNetworkManager.class));
+
+        service.stopManagedContainers();
+
+        verify(containers).terminateForShutdown(instance);
+        verify(containers, never()).stopForShutdown(instance);
+        assertEquals("terminated", instance.getState().getName());
     }
 
     @Test
@@ -6898,6 +6967,12 @@ class Ec2ServiceTest {
         return containerManager;
     }
 
+    private static AmiImageResolver minimalImageResolver() {
+        AmiImageResolver resolver = mock(AmiImageResolver.class);
+        when(resolver.resolveImage(anyString())).thenReturn(ResolvedAmiImage.minimal("guest:test"));
+        return resolver;
+    }
+
     private static Ec2Service liveService(Ec2ContainerManager containerManager, AmiImageResolver resolver) {
         return liveService(containerManager, resolver, mock(Ec2ImageCatalog.class));
     }
@@ -6945,6 +7020,33 @@ class Ec2ServiceTest {
         assertEquals("/dev/sdf", attached.getAttachments().getFirst().getDevice());
         assertEquals("attached", attached.getAttachments().getFirst().getState());
         assertFalse(attached.getAttachments().getFirst().isDeleteOnTermination());
+    }
+
+    @Test
+    void failedManagedAttachmentKeepsTheVolumeAvailableForRetry() {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(),
+                null, null, null, null, devices);
+        Instance instance = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        Volume volume = service.createVolume("us-east-1", instance.getPlacement().getAvailabilityZone(),
+                "gp3", 1, false, 3000, 125, null, List.of(new Tag("Owner", "retained")));
+        volume.setManagedFilesystem("ext4");
+        when(devices.attachVolume(volume, instance, "/dev/sdf"))
+                .thenThrow(new AwsException("InternalError", "retained mount is missing", 500));
+
+        assertThrows(AwsException.class, () -> service.attachVolume(
+                "us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf"));
+
+        Volume retained = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
+        assertEquals("available", retained.getState());
+        assertTrue(retained.getAttachments().isEmpty());
+        assertEquals("ext4", retained.getManagedFilesystem());
+        assertEquals(1, service.describeTags("us-east-1",
+                Map.of("resource-id", List.of(volume.getVolumeId()))).size());
     }
 
     @Test
@@ -7011,6 +7113,42 @@ class Ec2ServiceTest {
         Volume detached = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
         assertEquals("available", detached.getState());
         assertTrue(detached.getAttachments().isEmpty());
+    }
+
+    @Test
+    void failedManagedDetachPreservesTheAttachmentUntilRetry() {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(),
+                null, null, null, null, devices);
+        Instance instance = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        Volume volume = service.createVolume("us-east-1", instance.getPlacement().getAvailabilityZone(),
+                "gp3", 1, false, 3000, 125, null, List.of(new Tag("Owner", "retained")));
+        volume.setManagedFilesystem("ext4");
+        service.attachVolume("us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf");
+        doThrow(new AwsException("InternalError", "Docker volume is still in use", 500)).doNothing()
+                .when(devices).detachVolume(volume, instance, "/dev/sdf");
+
+        assertThrows(AwsException.class, () -> service.detachVolume(
+                "us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf", false));
+
+        Volume retained = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
+        assertEquals("in-use", retained.getState());
+        assertEquals(1, retained.getAttachments().size());
+        assertEquals("attached", retained.getAttachments().getFirst().getState());
+        assertEquals(instance.getInstanceId(), retained.getAttachments().getFirst().getInstanceId());
+        assertEquals("ext4", retained.getManagedFilesystem());
+        assertEquals(1, service.describeTags("us-east-1",
+                Map.of("resource-id", List.of(volume.getVolumeId()))).size());
+        assertEquals("VolumeInUse", assertThrows(AwsException.class, () -> service.deleteVolume(
+                "us-east-1", volume.getVolumeId())).getErrorCode());
+
+        service.detachVolume("us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf", false);
+        assertEquals("available", retained.getState());
+        assertTrue(retained.getAttachments().isEmpty());
     }
 
     @Test

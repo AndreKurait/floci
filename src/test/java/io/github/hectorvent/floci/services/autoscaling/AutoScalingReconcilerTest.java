@@ -77,7 +77,7 @@ class AutoScalingReconcilerTest {
     }
 
     @Test
-    void stopTerminatesReconcilerThread() throws Exception {
+    void shutdownEventTerminatesReconcilerThreadBeforeBeanDestruction() throws Exception {
         AutoScalingService asgService = scalingService();
         Ec2Service ec2Service = mock(Ec2Service.class);
         ElbV2Service elbV2Service = mock(ElbV2Service.class);
@@ -89,7 +89,7 @@ class AutoScalingReconcilerTest {
                 .filter(t -> "asg-reconciler".equals(t.getName()) && !preexisting.contains(t))
                 .findFirst().orElseThrow();
 
-        reconciler.stop();
+        reconciler.onStop(null);
         reconcilerThread.join(5_000);
 
         assertFalse(reconcilerThread.isAlive());
@@ -797,6 +797,60 @@ class AutoScalingReconcilerTest {
 
         assertEquals(0, asg.getInstances().size());
         verify(ssmCommandService).failActiveInvocationsForInstances("us-east-1", Set.of("i-dead"), "Undeliverable");
+    }
+
+    @Test
+    void exitedContainerIsTerminatedBeforeItsAsgReferenceIsRemoved() {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbV2Service elbV2Service = mock(ElbV2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(asgService, ec2Service, elbV2Service);
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        asg.setDesiredCapacity(1);
+        asg.setSuspendedProcesses(List.of("Launch"));
+        asg.getInstances().add(instance("i-exited", "InService"));
+        when(ec2Service.describeInstances("us-east-1", List.of("i-exited"), null))
+                .thenReturn(List.of(reservation(runningEc2Instance("i-exited"))));
+        when(ec2Service.terminateInstances("us-east-1", List.of("i-exited")))
+                .thenThrow(new AwsException("InternalError", "cleanup failed", 500))
+                .thenAnswer(invocation -> {
+                    assertEquals("i-exited", asg.getInstances().getFirst().getInstanceId());
+                    return List.of();
+                });
+
+        reconciler.reconcile(asg);
+
+        assertEquals(1, asg.getInstances().size(), "Failed cleanup must remain retryable");
+        verify(elbV2Service, never()).deregisterTargets(anyString(), anyString(), anyList());
+
+        reconciler.reconcile(asg);
+
+        verify(ec2Service, times(2)).terminateInstances("us-east-1", List.of("i-exited"));
+        assertEquals(0, asg.getInstances().size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Terminate", "HealthCheck", "ReplaceUnhealthy"})
+    void suspendedHealthReplacementKeepsExitedInstance(String suspendedProcess) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(
+                asgService, ec2Service, mock(ElbV2Service.class));
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        asg.setDesiredCapacity(1);
+        asg.setSuspendedProcesses(List.of("Launch", suspendedProcess));
+        asg.getInstances().add(instance("i-exited", "InService"));
+        when(ec2Service.describeInstances("us-east-1", List.of("i-exited"), null))
+                .thenReturn(List.of(reservation(runningEc2Instance("i-exited"))));
+
+        reconciler.reconcile(asg);
+
+        assertEquals(1, asg.getInstances().size());
+        verify(ec2Service, never()).terminateInstances(anyString(), anyList());
     }
 
     @Test

@@ -111,7 +111,7 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 
 # The namespaces read, in batches: each moves here from NOT_COVERED with the tests that show its ARNs
 # are the ones its handlers mint.
-NAMESPACES = ("cognito-idp", "ecr", "elasticloadbalancing", "events", "states")
+NAMESPACES = ("cognito-idp", "ecr", "elasticloadbalancing", "events", "states", "swf")
 
 # SDK clients the reference lists for a namespace's operations whose requests Floci does not serve, and why: their
 # members are not read.
@@ -172,7 +172,8 @@ NOT_COVERED: dict[str, str] = {
     "detective": _REST,
     "dlm": _REST,
     "dms": _LATER,
-    "ec2": _LATER,
+    "ec2": "Ec2ImageResourceArns covers EBS image copies and image/snapshot targets; "
+           "other EC2 resource types are not read yet",
     "ecs": _LATER,
     "elasticache": _LATER,
     "elasticbeanstalk": _LATER,
@@ -220,7 +221,6 @@ NOT_COVERED: dict[str, str] = {
     "signin": _REST,
     "sso": _LATER,
     "sso-oauth": _REST,
-    "swf": _LATER,
     "textract": _LATER,
     "timestream-influxdb": _LATER,
     "transcribe": _LATER,
@@ -341,13 +341,17 @@ def checked_actions(documents: list[dict]) -> dict[str, dict]:
 
 
 def arn_formats(documents: list[dict], namespaces: set[str]) -> dict[str, dict[str, str]]:
-    """Each resource type of the namespaces given, as its first ARN format."""
+    """Each resource type's first ARN format, with the documented SWF Region restored."""
     formats = {}
     for document in documents:
         if document["Name"] in namespaces:
             formats[document["Name"]] = dict(sorted(
                 (resource["Name"], resource["ARNFormats"][0])
                 for resource in document.get("Resources", []) if resource.get("ARNFormats")))
+    # The Service Reference omits SWF's Region; the service's policy guide explicitly includes it:
+    # https://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-iam.policies.html
+    if formats.get("swf", {}).get("domain") == "arn:${Partition}:swf::${Account}:/domain/${DomainName}":
+        formats["swf"]["domain"] = "arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}"
     return dict(sorted(formats.items()))
 
 

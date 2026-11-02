@@ -138,6 +138,48 @@ class RestRouteIamIntegrationTest {
     }
 
     @Test
+    void trailingSlashRemainsSignificantForIdentityPermissionsAndResourceDenies() throws Exception {
+        Fixture fixture = fixture("GET");
+        String trailingArn = fixture.arn() + "/";
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "rest-slash-", "invoke",
+                policy(trailingArn))) {
+            Key key = new Key(user.accessKeyId(), user.secretAccessKey(), null);
+            invokePath(fixture, key, 200, "/items/", Map.of());
+            invoke(fixture, key, 403);
+            putPolicy(user, policy(fixture.arn() + "*"));
+            String deny = policy(trailingArn)
+                    .replace("\"Effect\":\"Allow\"", "\"Effect\":\"Deny\",\"Principal\":\"*\"");
+            fixture.api().updateRestApi(request -> request.restApiId(fixture.apiId()).patchOperations(patch ->
+                    patch.op("replace").path("/policy").value(deny)));
+            invokePath(fixture, key, 403, "/items/", Map.of());
+            invoke(fixture, key, 200);
+            assertEquals(2, fixture.hits().get());
+        }
+    }
+
+    @Test
+    void foreignCallerMatchesTrailingSlashInApiResourceGrant() throws Exception {
+        Fixture fixture = fixture("GET");
+        String account = "444455556666";
+        String name = "rest-foreign-slash-" + UUID.randomUUID();
+        cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteUser(name)));
+        RequestScopes.runAs(account, () -> iam.createUser(name, "/"));
+        AccessKey access = RequestScopes.callAs(account, () -> iam.createAccessKey(name));
+        cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteAccessKey(name, access.getAccessKeyId())));
+        cleanup.register(() -> RequestScopes.runAs(account, () -> iam.deleteUserPolicy(name, "invoke")));
+        RequestScopes.runAs(account, () -> iam.putUserPolicy(name, "invoke", policy(fixture.arn() + "*")));
+        Key key = new Key(access.getAccessKeyId(), access.getSecretAccessKey(), null);
+        String policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::"
+                + account + ":user/" + name + "\"},\"Action\":\"execute-api:Invoke\","
+                + "\"Resource\":\"execute-api:/prod/GET/items/\"}}";
+        fixture.api().updateRestApi(request -> request.restApiId(fixture.apiId()).patchOperations(patch ->
+                patch.op("replace").path("/policy").value(policy)));
+        invokePath(fixture, key, 200, "/items/", Map.of());
+        invoke(fixture, key, 403);
+        assertEquals(1, fixture.hits().get());
+    }
+
+    @Test
     void issuedRoleSessionsRetainPolicyTokenAndRevocationChecks() throws Exception {
         Fixture fixture = fixture("GET");
         String name = "rest-route-role-" + UUID.randomUUID();
@@ -395,7 +437,12 @@ class RestRouteIamIntegrationTest {
     }
 
     private void invoke(Fixture fixture, Key key, int status, Map<String, String> extraHeaders) throws Exception {
-        String path = "/execute-api/" + fixture.apiId() + "/prod/items";
+        invokePath(fixture, key, status, "/items", extraHeaders);
+    }
+
+    private void invokePath(Fixture fixture, Key key, int status, String resourcePath,
+                            Map<String, String> extraHeaders) throws Exception {
+        String path = "/execute-api/" + fixture.apiId() + "/prod" + resourcePath;
         String host = endpoint.getHost() + ":" + endpoint.getPort();
         Map<String, String> headers = ExecuteApiRequestSigner.signedHeaders("GET", path, Map.of(), host,
                 new byte[0], key.accessKey(), key.secret(), "us-east-1", Instant.now());
