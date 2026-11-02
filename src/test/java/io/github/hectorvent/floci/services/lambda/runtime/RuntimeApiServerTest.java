@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.lambda.runtime;
 
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.PendingInvocation;
+import io.vertx.core.Context;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
@@ -36,6 +37,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -806,13 +808,17 @@ class RuntimeApiServerTest {
         // interleaving by ending the ctx from afterEnqueueDispatchLockReleased.
         AtomicInteger sendInvocationCalls =
                 new AtomicInteger();
+        CompletableFuture<Context> dispatchObserved = new CompletableFuture<>();
         installGatedServerWithDispatchObservation(
                 waitingCtx -> {
                     if (!waitingCtx.response().ended()) {
                         waitingCtx.response().setStatusCode(500).end();
                     }
                 },
-                requestId -> sendInvocationCalls.incrementAndGet());
+                requestId -> {
+                    sendInvocationCalls.incrementAndGet();
+                    dispatchObserved.complete(Vertx.currentContext());
+                });
 
         HttpRequest parkedRequest = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
@@ -826,8 +832,12 @@ class RuntimeApiServerTest {
                 new CompletableFuture<>());
         server.enqueue(invocation);
 
-        // Wait for the runOnContext-scheduled dispatch to have fired.
-        Thread.sleep(500);
+        Context dispatchContext = dispatchObserved.get(5, TimeUnit.SECONDS);
+        await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(10))
+                .until(() -> server.pendingQueueSize() == 1 && server.inFlightSize() == 0);
+        CompletableFuture<Void> dispatchReturned = new CompletableFuture<>();
+        dispatchContext.runOnContext(ignored -> dispatchReturned.complete(null));
+        dispatchReturned.get(5, TimeUnit.SECONDS);
 
         assertEquals(1, sendInvocationCalls.get(),
                 "sendInvocation must run exactly once — a zero count means the "
@@ -870,8 +880,8 @@ class RuntimeApiServerTest {
                 new CompletableFuture<>());
         server.enqueue(invocation);
 
-        // Wait for the runOnContext-scheduled dispatch (and its failed write) to fire.
-        Thread.sleep(500);
+        await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(10))
+                .until(() -> server.pendingQueueSize() == 1 && server.inFlightSize() == 0);
 
         assertEquals(1, server.pendingQueueSize(),
                 "invocation must be requeued after write failure — zero means stranded.");
