@@ -1,0 +1,138 @@
+name: CI startup profile experiment
+
+on:
+  push:
+    branches: [ci/startup-profile-20261102-132552]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-startup-profile-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  profile:
+    name: Shard 3 (${{ matrix.invocation }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        invocation: [surefire, lifecycle]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+        with:
+          java-version: '25'
+          distribution: temurin
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: dependencies
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
+      - name: Record runner and owned Docker activity
+        run: |
+          mkdir -p profiling
+          {
+            git rev-parse HEAD
+            nproc
+            free -b
+            java -version
+            cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max 2>/dev/null || true
+            echo 'dependency cache hit: ${{ steps.dependencies.outputs.cache-hit }}'
+          } > profiling/runner.txt 2>&1
+          docker ps -aq --no-trunc > profiling/docker-before.txt
+          docker volume ls -q > profiling/volumes-before.txt
+          docker events --format '{{json .}}' > profiling/docker-events.jsonl &
+          echo $! > profiling/docker-events.pid
+      - name: Compute identical shard inventory
+        run: |
+          cd src/test/java
+          find . \( -name '*Test.java' -o -name 'Test*.java' -o -name '*Tests.java' -o -name '*TestCase.java' \) \
+            | sed 's|^\./||; s|\.java$||' | LC_ALL=C sort > "$GITHUB_WORKSPACE/all-classes.txt"
+          cd "$GITHUB_WORKSPACE"
+          .github/ci/partition.sh all-classes.txt 4 3 > shard.txt
+          test -s shard.txt
+          sha256sum all-classes.txt shard.txt > profiling/inventory.sha256
+      - name: Prefetch shard images
+        run: .github/ci/prefetch-images.sh shard.txt || true
+      - name: Configure startup recording without environment or property events
+        run: |
+          jfr configure --input profile.jfc --output profiling/safe-profile.jfc \
+            'jdk.InitialEnvironmentVariable#enabled=false' \
+            'jdk.InitialSystemProperty#enabled=false' \
+            'jdk.SystemProcess#enabled=false' \
+            'jdk.JVMInformation#enabled=false'
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          p = Path('pom.xml')
+          original = p.read_text()
+          old = '<argLine>@{argLine} -Xmx6g</argLine>'
+          assert original.count(old) == 1
+          options = '-Xlog:jfr*=warning -XX:StartFlightRecording=filename=' + os.environ['RUNNER_TEMP'] + '/floci-tests.jfr,settings=profiling/safe-profile.jfc,dumponexit=true'
+          p.write_text(original.replace(old, '<argLine>@{argLine} -Xmx6g ' + options + '</argLine>'))
+          PY
+      - name: Compile
+        run: |
+          date -u +%FT%TZ > profiling/compile-start.txt
+          set +e
+          ./mvnw test-compile -B 2>&1 | tee profiling/compile.log
+          result=${PIPESTATUS[0]}
+          date -u +%FT%TZ > profiling/compile-end.txt
+          exit "$result"
+      - name: Verify compiled inventory
+        run: |
+          cd target/test-classes
+          find . \( -name '*Test.class' -o -name 'Test*.class' -o -name '*Tests.class' -o -name '*TestCase.class' \) ! -name '*$*' \
+            | sed 's|^\./||; s|\.class$||' | LC_ALL=C sort > "$RUNNER_TEMP/compiled-classes.txt"
+          cd "$GITHUB_WORKSPACE"
+          diff -u all-classes.txt "$RUNNER_TEMP/compiled-classes.txt"
+      - name: Execute identical shard with measured Maven invocation
+        env:
+          INVOCATION: ${{ matrix.invocation }}
+        run: |
+          goal=surefire:test
+          if [ "$INVOCATION" = lifecycle ]; then goal=test; fi
+          date -u +%FT%TZ > profiling/tests-start.txt
+          set +e
+          ./mvnw "$goal" -B -Dsurefire.includesFile="$GITHUB_WORKSPACE/shard.txt" \
+            -Dsurefire.failIfNoTests=true -Dsurefire.timeout=1200 2>&1 | tee profiling/tests.log
+          result=${PIPESTATUS[0]}
+          date -u +%FT%TZ > profiling/tests-end.txt
+          exit "$result"
+      - name: Retain execution and cleanup evidence
+        if: always()
+        run: |
+          docker ps -aq --no-trunc > profiling/docker-after.txt
+          docker volume ls -q > profiling/volumes-after.txt
+          if [ -f profiling/docker-events.pid ]; then kill "$(cat profiling/docker-events.pid)" || true; fi
+          git diff -- pom.xml > profiling/instrumentation.patch
+          if [ -f "$RUNNER_TEMP/floci-tests.jfr" ]; then
+            jfr summary "$RUNNER_TEMP/floci-tests.jfr" > profiling/recording-summary.txt
+            jfr print --json --events jdk.InitialEnvironmentVariable,jdk.InitialSystemProperty,jdk.SystemProcess,jdk.JVMInformation               "$RUNNER_TEMP/floci-tests.jfr" > "$RUNNER_TEMP/disabled-events.json"
+            python3 - <<'PYTHON'
+          import json
+          import os
+          import shutil
+          from pathlib import Path
+          temporary = Path(os.environ['RUNNER_TEMP'])
+          events = json.loads((temporary / 'disabled-events.json').read_text())['recording']['events']
+          if events:
+              raise SystemExit('Sensitive event classes were unexpectedly recorded; recording withheld')
+          shutil.copyfile(temporary / 'floci-tests.jfr', 'profiling/tests.jfr')
+          PYTHON
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: startup-profile-${{ matrix.invocation }}
+          path: |
+            profiling/
+            shard.txt
+            all-classes.txt
+            prefetch-images.log
+            target/surefire-reports/
+          if-no-files-found: error
