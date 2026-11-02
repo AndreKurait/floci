@@ -87,7 +87,7 @@ class ResourceGroupsIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"groups", "get-group", "delete-group", "group-resources", "list-group-resources"})
+    @ValueSource(strings = {"groups", "get-group", "delete-group", "group-resources", "list-group-resources", "groups-list"})
     void s3BucketPostsKeepTheirOwnRoutes(String bucket) {
         String authorization = auth("s3", ACCOUNT);
         given().header("Authorization", authorization).contentType("application/xml")

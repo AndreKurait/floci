@@ -212,7 +212,8 @@ public class ResourceArnBuilder {
             case "ssm"            -> List.of(buildSsmArn(ctx, region, accountId));
             case "iam"            -> buildIamArns(ctx, region, accountId);
             case "elasticloadbalancing" -> buildElbResources(operation, ctx, region, accountId, partition);
-            case "resource-groups" -> List.of(buildResourceGroupArn(ctx, region, accountId));
+            case "resource-groups" -> "resource-groups:ListGroups".equals(operation)
+                    ? List.of("*") : List.of(buildResourceGroupArn(ctx, region, accountId));
             case "scheduler"      -> List.of(buildSchedulerArn(path, ctx, region, accountId, partition));
             case "pipes"          -> List.of(buildPipesArn(path, ctx, region, accountId, partition));
             case "dsql"           -> List.of(buildDsqlArn(path, ctx, region, accountId, partition));

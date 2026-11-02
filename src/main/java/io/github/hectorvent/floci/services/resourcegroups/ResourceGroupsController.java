@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.resourcegroups;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
@@ -12,6 +13,7 @@ import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
@@ -70,6 +72,30 @@ public class ResourceGroupsController {
     @Path("/list-group-resources")
     public Response listGroupResources(@Context HttpHeaders headers, String body) {
         return Response.ok(service.list(regions.resolveRegion(headers), context.getAccountId(), parse(body))).build();
+    }
+
+    @POST
+    @Path("/groups-list")
+    public Response listGroups(@Context HttpHeaders headers, @QueryParam("maxResults") String maximum,
+                               @QueryParam("nextToken") String token, String body) {
+        JsonNode request = parse(body == null || body.isBlank() ? "{}" : body);
+        if (!(request instanceof ObjectNode object)) {
+            throw new AwsException("BadRequestException", "The request must contain a JSON object.", 400);
+        }
+        // These two ListGroups members are query parameters in the AWS REST protocol.
+        object.remove("MaxResults");
+        object.remove("NextToken");
+        if (maximum != null) {
+            try {
+                object.put("MaxResults", Integer.parseInt(maximum));
+            } catch (NumberFormatException error) {
+                throw new AwsException("BadRequestException", "MaxResults must be an integer between 1 and 50.", 400);
+            }
+        }
+        if (token != null) {
+            object.put("NextToken", token);
+        }
+        return Response.ok(service.listGroups(regions.resolveRegion(headers), context.getAccountId(), object)).build();
     }
 
     private Map<String, Object> groupMetadata(ResourceGroup group) {

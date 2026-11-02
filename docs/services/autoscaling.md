@@ -388,8 +388,8 @@ without consuming reservations. `capacity-reservations-only` requires matching r
 `capacity-reservations-first` falls back to unreserved On-Demand capacity on a capacity shortage.
 An omitted group target inherits the template target; with neither target, matching open
 reservations are eligible. Updating the group affects subsequent launches, not existing instances.
-Missing or invalid targets do not trigger On-Demand fallback. Resource group targeting remains
-unsupported, as in EC2, and reports a failed scaling activity without allocating an instance.
+Missing or invalid targets do not trigger On-Demand fallback. Capacity reservation group targets
+select matching available EC2 reservations from the group's members for each launch.
 
 ## Scaling Policy Compatibility
 

@@ -10,7 +10,7 @@ from regen_partitions import resolve_botocore_data, strip_source
 from request_shapes import REPO_ROOT, build_constraints, load_model
 
 OUTPUT = REPO_ROOT / "src/main/resources/aws/resource-groups-request-shapes.json"
-OPERATIONS = ("CreateGroup", "GetGroup", "DeleteGroup", "GroupResources", "ListGroupResources")
+OPERATIONS = ("CreateGroup", "GetGroup", "DeleteGroup", "GroupResources", "ListGroupResources", "ListGroups")
 
 
 def main() -> int:
