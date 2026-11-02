@@ -45,13 +45,25 @@ def main():
     command(["javac", "-d", str(OUT), str(ROOT / "tools/startup-experiment/ForkReceipt.java")], OUT / "agent-compile.log")
     (OUT / "MANIFEST.MF").write_text("Premain-Class: ForkReceipt\n")
     command(["jar", "cfm", str(OUT / "receipt.jar"), str(OUT / "MANIFEST.MF"), "-C", str(OUT), "ForkReceipt.class"], OUT / "agent-jar.log")
-    command(["./mvnw", "-B", "test-compile"], OUT / "compile.log")
-    save(OUT / "compiled.json", {"classes": manifest(ROOT / "target/classes", "*.class"),
-         "tests": manifest(ROOT / "target/test-classes", "*.class")})
     order = ["test"] if args.single else ["test", "surefire:test", "surefire:test", "test"]
     save(OUT / "design.json", {"order": order, "sameRunner": True, "freshJvm": True,
-         "limits": "Filesystem/JIT dependency caches warmed by earlier invocations. ABBA limits order confounding, not independent-host variance. One profile per invocation prevents profile metrics overwrite."})
+         "limits": "Filesystem, Maven metadata and test-index caches warmed by earlier invocations. ABBA limits order confounding, not independent-host variance. One profile per invocation prevents profile metrics overwrite."})
     try:
+        fixed_receipt = OUT / "fork-current.txt"
+        old_argline = "<argLine>@{argLine} -Xmx6g</argLine>"
+        text = original.decode()
+        assert text.count(old_argline) == 1
+        options = f"-Dquarkus.builder.metrics.enabled=true -javaagent:{OUT}/receipt.jar={fixed_receipt}"
+        pom.write_text(text.replace(old_argline, f"<argLine>@{{argLine}} -Xmx6g {options}</argLine>"))
+        instrumented_hash = digest(pom)
+        command(["./mvnw", "-B", "test-compile"], OUT / "instrumented-compile.log")
+        save(OUT / "prepared-compiled.json", {"classes": manifest(ROOT / "target/classes", "*.class"),
+             "tests": manifest(ROOT / "target/test-classes", "*.class")})
+        def index_receipt():
+            path = ROOT / "target/test-classes/test-classes.idx"
+            return {"exists": path.exists(), "sha256": digest(path) if path.exists() else None,
+                    "size": path.stat().st_size if path.exists() else None,
+                    "mtimeNs": path.stat().st_mtime_ns if path.exists() else None}
         for index, goal in enumerate(order):
             dest = OUT / f"{index + 1}-{goal.replace(':', '-')}"
             dest.mkdir()
@@ -60,15 +72,24 @@ def main():
             reports = ROOT / "target/surefire-reports"
             if reports.exists():
                 shutil.rmtree(reports)
-            old = "<argLine>@{argLine} -Xmx6g</argLine>"
-            text = original.decode()
-            assert text.count(old) == 1
-            options = f"-Dquarkus.builder.metrics.enabled=true -javaagent:{OUT}/receipt.jar={dest}/fork.txt"
-            pom.write_text(text.replace(old, f"<argLine>@{{argLine}} -Xmx6g {options}</argLine>"))
-            save(dest / "instrumentation.json", {"originalPom": hashlib.sha256(original).hexdigest(), "instrumentedPom": digest(pom)})
+            fixed_receipt.unlink(missing_ok=True)
+            assert digest(pom) == instrumented_hash
+            before_classes = {"classes": manifest(ROOT / "target/classes", "*.class"),
+                              "tests": manifest(ROOT / "target/test-classes", "*.class")}
+            before_index = index_receipt()
+            save(dest / "instrumentation.json", {"originalPom": hashlib.sha256(original).hexdigest(),
+                 "instrumentedPom": instrumented_hash, "beforeClasses": before_classes,
+                 "beforeIndex": before_index})
             try:
                 command(["./mvnw", "-B", goal, "-Dtest=" + TEST, "-Dsurefire.failIfNoTests=true", "-Dquarkus.http.test-ssl-port=0"], dest / "tests.log")
             finally:
+                assert digest(pom) == instrumented_hash
+                if fixed_receipt.exists():
+                    shutil.move(fixed_receipt, dest / "fork.txt")
+                after_classes = {"classes": manifest(ROOT / "target/classes", "*.class"),
+                                 "tests": manifest(ROOT / "target/test-classes", "*.class")}
+                save(dest / "output-stability.json", {"unchanged": before_classes == after_classes,
+                     "afterClasses": after_classes, "beforeIndex": before_index, "afterIndex": index_receipt()})
                 if reports.exists():
                     shutil.copytree(reports, dest / "reports")
                 if metrics.exists():
