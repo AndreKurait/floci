@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.elbv2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.vertx.core.Future;
@@ -112,6 +113,52 @@ class ElbV2HealthCheckerTest {
                 assertEquals("Request timed out", health.description());
             });
         } finally {
+            close(server);
+        }
+    }
+
+    @Test
+    void timedOutLookupKeepsOneProbeUntilTheLookupActuallyCompletes() throws Exception {
+        HttpServer server = startServer(200);
+        CompletableFuture<Void> entered = new CompletableFuture<>();
+        CompletableFuture<Void> release = new CompletableFuture<>();
+        AtomicInteger lookups = new AtomicInteger();
+        Ec2Service ec2 = mock(Ec2Service.class);
+        Instance instance = new Instance();
+        instance.setContainerBridgeIp("127.0.0.1");
+        when(ec2.findInstanceById("000000000000", "i-blocked")).thenAnswer(ignored -> {
+            lookups.incrementAndGet();
+            entered.complete(null);
+            // Like a native hostname lookup, join does not stop when its thread is interrupted.
+            release.join();
+            return instance;
+        });
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        ElbV2HealthChecker checker = new ElbV2HealthChecker(vertx, config, ec2);
+        checkers.add(checker);
+        TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
+        group.setTargetType("instance");
+        TargetDescription blocked = target("i-blocked", server.actualPort());
+        try {
+            checker.addTargets(group.getTargetGroupArn(), List.of(blocked), group);
+            entered.get(2, TimeUnit.SECONDS);
+            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> assertEquals("Target.Timeout",
+                    checker.getHealth(group.getTargetGroupArn(), blocked.getId(), blocked.getPort()).reason()));
+            checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", server.actualPort())), group);
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
+                    checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort())));
+            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
+                checker.probeAll(group.getTargetGroupArn(), group);
+                assertEquals(1, lookups.get(), "A timed-out lookup still owns its target's probe");
+            });
+            release.complete(null);
+            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
+                checker.probeAll(group.getTargetGroupArn(), group);
+                assertEquals("healthy",
+                        checker.getState(group.getTargetGroupArn(), blocked.getId(), blocked.getPort()));
+            });
+        } finally {
+            release.complete(null);
             close(server);
         }
     }
@@ -377,6 +424,56 @@ class ElbV2HealthCheckerTest {
             await().atMost(Duration.ofSeconds(2)).until(() -> targets.stream().allMatch(target ->
                     "healthy".equals(checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()))));
         } finally {
+            close(server);
+        }
+    }
+
+    @Test
+    void timedOutLookupsRetainTheirSharedProbeSlotsUntilTheyFinish() throws Exception {
+        HttpServer server = startServer(200);
+        CompletableFuture<Void> release = new CompletableFuture<>();
+        AtomicInteger lookups = new AtomicInteger();
+        Ec2Service ec2 = mock(Ec2Service.class);
+        Instance instance = new Instance();
+        instance.setContainerBridgeIp("127.0.0.1");
+        when(ec2.findInstanceById(eq("000000000000"), any())).thenAnswer(invocation -> {
+            if (invocation.<String>getArgument(1).startsWith("i-held-")) {
+                lookups.incrementAndGet();
+                release.join();
+            }
+            return instance;
+        });
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        ElbV2HealthChecker checker = new ElbV2HealthChecker(vertx, config, ec2);
+        checkers.add(checker);
+        TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
+        group.setTargetType("instance");
+        List<TargetDescription> held = new ArrayList<>();
+        for (int i = 0; i < 32; i++) {
+            held.add(target("i-held-" + i, server.actualPort()));
+        }
+        try {
+            checker.addTargets(group.getTargetGroupArn(), held, group);
+            await().atMost(Duration.ofSeconds(3)).until(() -> lookups.get() == 32);
+            await().atMost(Duration.ofSeconds(3)).until(() -> held.stream().allMatch(target ->
+                    "Target.Timeout".equals(checker.getHealth(
+                            group.getTargetGroupArn(), target.getId(), target.getPort()).reason())));
+            checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", server.actualPort())), group);
+            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
+                checker.probeAll(group.getTargetGroupArn(), group);
+                assertEquals(32, lookups.get());
+                assertEquals("initial", checker.getState(
+                        group.getTargetGroupArn(), "127.0.0.1", server.actualPort()),
+                        "An expired caller deadline must not release a still-running worker's slot");
+            });
+            release.complete(null);
+            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
+                checker.probeAll(group.getTargetGroupArn(), group);
+                assertEquals("healthy",
+                        checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()));
+            });
+        } finally {
+            release.complete(null);
             close(server);
         }
     }

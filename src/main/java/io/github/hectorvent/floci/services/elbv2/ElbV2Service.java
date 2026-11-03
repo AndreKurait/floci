@@ -540,6 +540,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                           Integer healthyThreshold, Integer unhealthyThreshold,
                                           String matcher, String ipAddressType,
                                           Map<String, String> initialTags) {
+        validateHealthCheckTimeout(healthCheckTimeout);
         validatePort(port, "port");
         validateName(name, "target group");
         if (port == null && !"lambda".equals(targetType)) {
@@ -638,6 +639,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                    String healthCheckPath, Integer healthCheckInterval,
                                    Integer healthCheckTimeout, Integer healthyThreshold,
                                    Integer unhealthyThreshold, String matcher) {
+        validateHealthCheckTimeout(healthCheckTimeout);
         TargetGroup tg = requireTargetGroup(region, arn);
         validateHealthCheckPort(healthCheckPort);
         if (healthCheckProtocol != null) tg.setHealthCheckProtocol(healthCheckProtocol);
@@ -651,6 +653,15 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (matcher != null)             tg.setMatcher(matcher);
         persistRegion(targetGroups, region);
         healthChecker.startMonitoring(tg);
+    }
+
+    private static void validateHealthCheckTimeout(Integer timeout) {
+        if (timeout != null && (timeout < 2 || timeout > 120)) {
+            String constraint = timeout < 2 ? "greater than or equal to 2" : "less than or equal to 120";
+            throw new AwsException("ValidationError", "1 validation error detected: Value '" + timeout
+                    + "' at 'healthCheckTimeoutSeconds' failed to satisfy constraint: Member must have value "
+                    + constraint, 400);
+        }
     }
 
     public Map<String, String> describeTargetGroupAttributes(String region, String arn) {
