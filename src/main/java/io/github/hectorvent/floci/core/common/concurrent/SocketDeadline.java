@@ -8,6 +8,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** One deadline for socket operations, including peers that continually send incomplete responses. */
 public final class SocketDeadline {
@@ -18,21 +19,37 @@ public final class SocketDeadline {
         return call(timeoutSeconds, operation, () -> {});
     }
 
-    /** Runs the callback after the worker exits, including work that ignores cancellation. */
+    /**
+     * Releases worker ownership before publishing a normal result. Cancelled work retains ownership
+     * until it actually finishes, even when it ignores interruption.
+     */
     public static <T> T call(int timeoutSeconds, Callable<T> operation, Runnable onWorkerExit) throws IOException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
-        FutureTask<T> result = new FutureTask<>(operation);
+        AtomicBoolean exited = new AtomicBoolean();
+        Runnable finish = () -> {
+            if (exited.compareAndSet(false, true)) {
+                onWorkerExit.run();
+            }
+        };
+        FutureTask<T> result = new FutureTask<>(() -> {
+            try {
+                return operation.call();
+            } finally {
+                // Publish an ordinary result only after resource admission is released.
+                finish.run();
+            }
+        });
         // Interrupting a virtual thread closes its blocking java.net sockets.
         try {
             Thread.ofVirtual().name("health-probe").start(() -> {
                 try {
                     result.run();
                 } finally {
-                    onWorkerExit.run();
+                    finish.run();
                 }
             });
         } catch (RuntimeException | Error failure) {
-            onWorkerExit.run();
+            finish.run();
             throw failure;
         }
         try {

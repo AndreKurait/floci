@@ -899,7 +899,7 @@ Nested launch-template tags follow AWS's case-sensitive check: `aws:` is rejecte
 | DeleteRouteTable | Deletes a route table from the local EC2 store. |
 | AssociateRouteTable | Associates a route table with a subnet. |
 | DisassociateRouteTable | Removes a route table association. |
-| CreateRoute | Adds a route to a route table. Accepts `InstanceId`, `NetworkInterfaceId`, and `VpcPeeringConnectionId` as targets (alongside `GatewayId`/`NatGatewayId`/`EgressOnlyInternetGatewayId`) and reports them back on `DescribeRouteTables`. |
+| CreateRoute | Adds a route to a route table. Accepts `InstanceId`, `NetworkInterfaceId`, and `VpcPeeringConnectionId` as targets (alongside `GatewayId`/`NatGatewayId`/`EgressOnlyInternetGatewayId`) and reports them back on `DescribeRouteTables`. NAT targets must exist in the caller's account and region. |
 | ReplaceRoute | Replaces the target of an existing route, accepting `InstanceId`, `NetworkInterfaceId`, and `VpcPeeringConnectionId`. |
 | DeleteRoute | Removes a route from a route table. Refuses the route to the VPC CIDR that `CreateRouteTable` seeds with `InvalidParameterValue`, and reports a destination with no route as `InvalidRoute.NotFound`. |
 
@@ -1157,6 +1157,10 @@ Route table ids follow the live API's own inconsistency: an id that does not exi
 | CreateNatGateway | Creates a NAT gateway record. |
 | DescribeNatGateways | Lists or returns stored NAT gateways. |
 | DeleteNatGateway | Deletes a NAT gateway record and marks routes targeting it as `blackhole`. The routes retain their destination and gateway ID until replaced or deleted. Other routes stay unchanged. |
+
+`CreateRoute` and `ReplaceRoute` reject missing, deleted, other-account or other-region NAT gateway
+targets before changing the route table. Gateway deletion also blackholes a route whose concurrent
+creation or replacement validated the target immediately before deletion.
 
 Every NAT gateway Floci creates is zonal: it sits in the subnet it was created in, and responses
 report `availabilityMode` as `zonal`. Regional NAT gateways are not supported: `CreateNatGateway` with
