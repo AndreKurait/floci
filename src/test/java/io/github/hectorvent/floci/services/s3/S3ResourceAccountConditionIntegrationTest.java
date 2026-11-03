@@ -19,6 +19,8 @@ import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.iam.IamClient;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
+import software.amazon.awssdk.services.s3.model.ObjectOwnership;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.sts.StsClient;
 import software.amazon.awssdk.services.sts.model.Credentials;
@@ -69,7 +71,7 @@ class S3ResourceAccountConditionIntegrationTest {
                       "Principal":{"AWS":"arn:aws:iam::%s:root"}}]}
                     """.formatted(CALLER))).role().arn();
             iam.putRolePolicy(request -> request.roleName(role).policyName("s3").policyDocument(ALLOW_S3));
-            owner.createBucket(request -> request.bucket(bucket));
+            owner.createBucket(request -> request.bucket(bucket).objectOwnership(ObjectOwnership.OBJECT_WRITER));
             String grant = """
                     {"Effect":"Allow","Principal":{"AWS":"%s"},"Action":"s3:*",
                       "Resource":["arn:aws:s3:::%s","arn:aws:s3:::%s/*"]}
@@ -78,8 +80,10 @@ class S3ResourceAccountConditionIntegrationTest {
                     "{\"Version\":\"2012-10-17\",\"Statement\":[" + grant + "]}"));
             try (S3Client matching = session(sts, roleArn, bucket, conditionKey, OWNER);
                  S3Client wrongOwner = session(sts, roleArn, bucket, conditionKey, CALLER)) {
-                matching.putObject(request -> request.bucket(bucket).key("allowed/index-0"),
+                matching.putObject(request -> request.bucket(bucket).key("allowed/index-0").acl(ObjectCannedACL.PRIVATE),
                         RequestBody.fromString("snapshot-data"));
+                denied(() -> matching.putObjectAcl(request -> request.bucket(bucket)
+                        .key("allowed/index-0").acl(ObjectCannedACL.PRIVATE)));
                 assertEquals("snapshot-data", matching.getObjectAsBytes(
                         request -> request.bucket(bucket).key("allowed/index-0")).asUtf8String());
                 assertEquals(1, matching.listObjectsV2(request -> request.bucket(bucket).prefix("allowed/")).keyCount());
