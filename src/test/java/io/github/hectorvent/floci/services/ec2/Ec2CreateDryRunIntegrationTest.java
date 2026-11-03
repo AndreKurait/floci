@@ -18,8 +18,9 @@ import static org.hamcrest.Matchers.equalTo;
 /**
  * DryRun on CreateVpc, CreateSubnet and CreateSecurityGroup is answered with DryRunOperation and HTTP 412,
  * and nothing is created, so the real create that follows can still take the same CIDR block or group
- * name. A subnet or group dry run first needs the VPC it names to exist; Floci then answers it before the
- * CIDR block, tenancy, overlap and group name are checked, an order AWS does not document.
+ * name. These create dry runs precede VPC existence, CIDR block, tenancy, overlap and group name validation.
+ * Corresponding real requests still validate their inputs and referenced resources. RunInstances has
+ * separate validation-order coverage in Ec2RunInstancesDryRunIntegrationTest.
  */
 @QuarkusTest
 class Ec2CreateDryRunIntegrationTest {
