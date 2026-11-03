@@ -1,119 +1,102 @@
-name: Fixture health timing pair
-
-on:
-  workflow_dispatch:
-
+name: Fixture health timing ABBA
+'on':
+  workflow_dispatch: null
 permissions:
   contents: read
-
 jobs:
   measure:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - mode: baseline
-            source: 5058ccc511cca8dd9ee8adffb3a521ff0d97f827
-          - mode: candidate
-            source: 4c7842ac1c1d00c44b3871d54d95e22c4eac245a
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ matrix.source }}
-          fetch-depth: 1
-          persist-credentials: false
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
-        with:
-          java-version: '25'
-          distribution: temurin
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
-          restore-keys: |
-            maven-${{ runner.os }}-
-      - name: Measure compilation and the same two test classes
-        env:
-          PAIR_MODE: ${{ matrix.mode }}
-          PAIR_SOURCE: ${{ matrix.source }}
-        run: |
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
-          import time
-          import xml.etree.ElementTree as ET
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: 5058ccc511cca8dd9ee8adffb3a521ff0d97f827
+        path: baseline
+        fetch-depth: 1
+        persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: 4c7842ac1c1d00c44b3871d54d95e22c4eac245a
+        path: candidate
+        fetch-depth: 1
+        persist-credentials: false
+    - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+      with:
+        java-version: '25'
+        distribution: temurin
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ~/.m2/repository
+        key: maven-${{ runner.os }}-${{ hashFiles('baseline/pom.xml') }}
+        restore-keys: 'maven-${{ runner.os }}-
 
-          result = Path("fixture-pair")
-          result.mkdir()
-          mode = os.environ["PAIR_MODE"]
-          runtime = Path(os.environ["RUNNER_TEMP"]) / ("fixture-pair-" + mode)
-          runtime.mkdir()
-          production = hashlib.sha256()
-          for path in sorted(Path("src/main").rglob("*")):
-              if path.is_file():
-                  production.update(str(path).encode() + b"\0" + path.read_bytes())
-          inventory = sorted(str(path) for path in Path("src/test/java").rglob("*.java"))
-          metrics = {
-              "mode": mode,
-              "source": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-              "pomSha256": hashlib.sha256(Path("pom.xml").read_bytes()).hexdigest(),
-              "productionSha256": production.hexdigest(),
-              "testInventorySha256": hashlib.sha256("\n".join(inventory).encode()).hexdigest(),
-              "runnerImage": os.environ.get("ImageVersion"),
-              "runnerOS": os.environ.get("ImageOS"),
-              "classes": ["ElbV2BackendTlsIntegrationTest", "ElbV2HealthCheckerTest"],
-              "java": subprocess.run(["java", "-version"], capture_output=True, text=True).stderr,
-          }
-          assert metrics["source"] == os.environ["PAIR_SOURCE"]
-          properties = [
-              "-Dquarkus.http.test-port=0",
-              "-Dquarkus.http.test-ssl-port=0",
-              "-Dfloci.docker.resource-namespace=fixture-pair-" + os.environ["GITHUB_RUN_ID"] + "-" + mode,
-              "-Djava.io.tmpdir=" + str(runtime),
-              "-Dvertx.cacheDirBase=" + str(runtime / "vertx-cache"),
-          ]
-          for phase, arguments in (
-              ("compile", ["test-compile", "-DskipTests"]),
-              ("tests", ["surefire:test", "-Dtest=" + ",".join(metrics["classes"])]),
-          ):
-              started = time.monotonic()
-              with (result / (phase + ".log")).open("w") as output:
-                  code = subprocess.run(["./mvnw", "-B"] + arguments + properties,
-                                        stdout=output, stderr=subprocess.STDOUT).returncode
-              metrics[phase] = {"seconds": time.monotonic() - started, "exitCode": code}
-              (result / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
-              if code:
-                  raise SystemExit(code)
-          cases = []
-          totals = {key: 0 for key in ("tests", "failures", "errors", "skipped")}
-          reports = sorted(Path("target/surefire-reports").glob("TEST-*.xml"))
-          assert len(reports) == 2
-          for path in reports:
-              suite = ET.parse(path).getroot()
-              for key in totals:
-                  totals[key] += int(suite.get(key, "0"))
-              for case in suite.findall("testcase"):
-                  outcome = next((kind for kind in ("failure", "error", "skipped")
-                                  if case.find(kind) is not None), "passed")
-                  cases.append({"class": case.get("classname"), "name": case.get("name"),
-                                "outcome": outcome, "seconds": float(case.get("time", "0"))})
-          metrics["counts"] = totals
-          metrics["cases"] = cases
-          (result / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
-          assert totals == {"tests": 38, "failures": 0, "errors": 0, "skipped": 0}
-          PY
-      - name: Retain timing and raw reports
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: fixture-health-${{ matrix.mode }}
-          path: |
-            fixture-pair/
-            target/surefire-reports/
-          if-no-files-found: error
-          retention-days: 7
+          '
+    - name: Measure baseline candidate candidate baseline on the same runner
+      run: "python3 - <<'PY'\n\"\"\"Measure both immutable fixtures on one runner\
+        \ in alternating order.\"\"\"\nimport hashlib\nimport json\nimport os\nfrom\
+        \ pathlib import Path\nimport shutil\nimport subprocess\nimport time\nimport\
+        \ xml.etree.ElementTree as ET\n\nSOURCES = {\n    \"baseline\": \"5058ccc511cca8dd9ee8adffb3a521ff0d97f827\"\
+        ,\n    \"candidate\": \"4c7842ac1c1d00c44b3871d54d95e22c4eac245a\",\n}\nRESULT\
+        \ = Path(\"fixture-abba\")\nRESULT.mkdir()\nCLASSES = [\"ElbV2BackendTlsIntegrationTest\"\
+        , \"ElbV2HealthCheckerTest\"]\nMETRICS = {\n    \"runnerImage\": os.environ.get(\"\
+        ImageVersion\"),\n    \"runnerOS\": os.environ.get(\"ImageOS\"),\n    \"cpuCount\"\
+        : os.cpu_count(),\n    \"java\": subprocess.run([\"java\", \"-version\"],\
+        \ capture_output=True, text=True).stderr,\n    \"inputs\": {},\n    \"compilation\"\
+        : {},\n    \"phases\": [],\n}\n\n\ndef save():\n    (RESULT / \"metrics.json\"\
+        ).write_text(json.dumps(METRICS, indent=2) + \"\\n\")\n\n\ndef run(mode, phase,\
+        \ arguments):\n    runtime = Path(os.environ[\"RUNNER_TEMP\"]) / (\"fixture-abba-\"\
+        \ + phase)\n    runtime.mkdir()\n    properties = [\n        \"-Dquarkus.http.test-port=0\"\
+        ,\n        \"-Dquarkus.http.test-ssl-port=0\",\n        \"-Dfloci.docker.resource-namespace=fixture-abba-\"\
+        \ + os.environ[\"GITHUB_RUN_ID\"] + \"-\" + phase,\n        \"-Djava.io.tmpdir=\"\
+        \ + str(runtime),\n        \"-Dvertx.cacheDirBase=\" + str(runtime / \"vertx-cache\"\
+        ),\n    ]\n    started = time.monotonic()\n    with (RESULT / (phase + \"\
+        .log\")).open(\"w\") as output:\n        code = subprocess.run([\"./mvnw\"\
+        , \"-B\"] + arguments + properties, cwd=mode,\n                          \
+        \    stdout=output, stderr=subprocess.STDOUT).returncode\n    return {\"seconds\"\
+        : time.monotonic() - started, \"exitCode\": code}\n\n\nfor mode, expected\
+        \ in SOURCES.items():\n    checkout = Path(mode)\n    source = subprocess.check_output([\"\
+        git\", \"-C\", mode, \"rev-parse\", \"HEAD\"], text=True).strip()\n    assert\
+        \ source == expected\n    production = hashlib.sha256()\n    for path in sorted((checkout\
+        \ / \"src/main\").rglob(\"*\")):\n        if path.is_file():\n           \
+        \ production.update(str(path.relative_to(checkout)).encode() + b\"\\0\" +\
+        \ path.read_bytes())\n    inventory = sorted(str(path.relative_to(checkout))\n\
+        \                       for path in (checkout / \"src/test/java\").rglob(\"\
+        *.java\"))\n    METRICS[\"inputs\"][mode] = {\n        \"source\": source,\n\
+        \        \"pomSha256\": hashlib.sha256((checkout / \"pom.xml\").read_bytes()).hexdigest(),\n\
+        \        \"productionSha256\": production.hexdigest(),\n        \"testInventorySha256\"\
+        : hashlib.sha256(\"\\n\".join(inventory).encode()).hexdigest(),\n        \"\
+        classes\": CLASSES,\n    }\nfor key in (\"pomSha256\", \"productionSha256\"\
+        , \"testInventorySha256\", \"classes\"):\n    assert METRICS[\"inputs\"][\"\
+        baseline\"][key] == METRICS[\"inputs\"][\"candidate\"][key]\nsave()\n\nfor\
+        \ mode in SOURCES:\n    result = run(mode, \"compile-\" + mode, [\"test-compile\"\
+        , \"-DskipTests\"])\n    METRICS[\"compilation\"][mode] = result\n    save()\n\
+        \    if result[\"exitCode\"]:\n        raise SystemExit(result[\"exitCode\"\
+        ])\n\nfor number, mode in enumerate((\"baseline\", \"candidate\", \"candidate\"\
+        , \"baseline\"), 1):\n    phase = str(number) + \"-\" + mode\n    reports\
+        \ = Path(mode) / \"target/surefire-reports\"\n    if reports.exists():\n \
+        \       shutil.rmtree(reports)\n    result = run(mode, phase, [\"surefire:test\"\
+        , \"-Dtest=\" + \",\".join(CLASSES)])\n    result.update(phase=phase, mode=mode)\n\
+        \    METRICS[\"phases\"].append(result)\n    save()\n    if reports.exists():\n\
+        \        shutil.copytree(reports, RESULT / phase / \"reports\")\n    if result[\"\
+        exitCode\"]:\n        raise SystemExit(result[\"exitCode\"])\n    paths =\
+        \ sorted(reports.glob(\"TEST-*.xml\"))\n    assert len(paths) == 2\n    totals\
+        \ = {key: 0 for key in (\"tests\", \"failures\", \"errors\", \"skipped\")}\n\
+        \    cases = []\n    for path in paths:\n        suite = ET.parse(path).getroot()\n\
+        \        for key in totals:\n            totals[key] += int(suite.get(key,\
+        \ \"0\"))\n        for case in suite.findall(\"testcase\"):\n            outcome\
+        \ = next((kind for kind in (\"failure\", \"error\", \"skipped\")\n       \
+        \                     if case.find(kind) is not None), \"passed\")\n     \
+        \       cases.append({\"class\": case.get(\"classname\"), \"name\": case.get(\"\
+        name\"),\n                          \"outcome\": outcome, \"seconds\": float(case.get(\"\
+        time\", \"0\"))})\n    result.update(counts=totals, cases=cases)\n    save()\n\
+        \    assert totals == {\"tests\": 38, \"failures\": 0, \"errors\": 0, \"skipped\"\
+        : 0}\n    shutil.rmtree(Path(os.environ[\"RUNNER_TEMP\"]) / (\"fixture-abba-\"\
+        \ + phase))\n\nPY\n"
+    - name: Retain all four phases and raw reports
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: fixture-health-abba
+        path: fixture-abba/
+        if-no-files-found: error
+        retention-days: 7
