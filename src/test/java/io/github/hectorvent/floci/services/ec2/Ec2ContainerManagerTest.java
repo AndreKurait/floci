@@ -161,8 +161,9 @@ class Ec2ContainerManagerTest {
         }
     }
 
-    @Test
-    void terminationRetainsFirewallIdentityAfterInterfacesAreReleased() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void terminationRetainsFirewallIdentityAfterInterfacesAreReleased(boolean transientFailure) throws Exception {
         DockerClient docker = mock(DockerClient.class);
         SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
         when(firewall.enabled()).thenReturn(true);
@@ -184,9 +185,13 @@ class Ec2ContainerManagerTest {
         InspectContainerResponse inspected = inspectResponse("172.18.0.12");
         when(inspect.exec()).thenReturn(inspected);
         when(docker.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        AtomicInteger removals = new AtomicInteger();
         doAnswer(invocation -> {
             // The service releases ENIs while container teardown is still in progress.
             instance.getNetworkInterfaces().clear();
+            if (removals.incrementAndGet() == 1 && transientFailure) {
+                throw new DockerException("container removal is still completing", 500);
+            }
             return null;
         }).when(remove).exec();
         CountDownLatch completed = new CountDownLatch(1);
@@ -195,6 +200,7 @@ class Ec2ContainerManagerTest {
             assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
             assertEquals("terminated", instance.getState().getName());
             verify(firewall).unregister("eni-firewall-teardown");
+            assertEquals(transientFailure ? 2 : 1, removals.get());
         } finally {
             manager.stop();
         }
@@ -1724,8 +1730,8 @@ class Ec2ContainerManagerTest {
     @Test
     void failedHelperRemovalRetainsThePortAndSuppressesTeardownCallbackUntilRetry() throws Exception {
         ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
         try {
-            LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
             Instance instance = instance("i-helper-removal");
             harness.manager.launch(instance, "example/image:1", null, "us-west-2");
             executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
@@ -1743,14 +1749,13 @@ class Ec2ContainerManagerTest {
             assertEquals(0, completed.get());
             verify(harness.portAllocator, never()).release(2201);
 
-            harness.manager.terminate(instance, completed::incrementAndGet);
-            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+            awaitUntil(() -> completed.get() == 1, Duration.ofSeconds(5));
 
             assertEquals("terminated", instance.getState().getName());
             assertEquals(1, completed.get());
             verify(harness.portAllocator).release(2201);
         } finally {
-            executor.shutdownNow();
+            harness.manager.stop();
         }
     }
 
@@ -2843,10 +2848,62 @@ class Ec2ContainerManagerTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
+    void transientRemovalFailureCompletesWithoutAnotherTerminationRequest(boolean alreadyAbsent) throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        CountDownLatch failed = new CountDownLatch(1);
+        CountDownLatch allowRemoval = new CountDownLatch(1);
+        try {
+            stubDockerPing(harness.dockerClient(), false);
+            Instance instance = leasedInstance("i-teardown-recovery");
+            harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
+            instance.setDockerContainerId(TEST_CONTAINER_ID);
+            instance.setSshHostPort(2201);
+            RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+            when(harness.dockerClient().removeContainerCmd(TEST_CONTAINER_ID)).thenReturn(remove);
+            AtomicInteger attempts = new AtomicInteger();
+            doAnswer(invocation -> {
+                if (attempts.incrementAndGet() == 1) {
+                    failed.countDown();
+                    throw new DockerException("tried to kill container, but did not receive an exit event", 500);
+                }
+                assertTrue(allowRemoval.await(2, TimeUnit.SECONDS));
+                if (alreadyAbsent) {
+                    throw new NotFoundException("container exited and was removed");
+                }
+                return null;
+            }).when(remove).exec();
+            AtomicInteger callbacks = new AtomicInteger();
+
+            harness.manager().terminate(instance, callbacks::incrementAndGet);
+            assertTrue(failed.await(2, TimeUnit.SECONDS));
+
+            assertEquals("shutting-down", instance.getState().getName());
+            assertEquals(0, callbacks.get());
+            verify(harness.portAllocator(), never()).release(2201);
+            verify(harness.vpcNetworkManager(), never())
+                    .releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+            allowRemoval.countDown();
+
+            awaitUntil(() -> callbacks.get() == 1, Duration.ofSeconds(5));
+
+            assertEquals("terminated", instance.getState().getName());
+            assertEquals(2, attempts.get());
+            verify(harness.portAllocator()).release(2201);
+            verify(harness.vpcNetworkManager())
+                    .releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+        } finally {
+            allowRemoval.countDown();
+            harness.manager().stop();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
     void failedRemovalRetainsInstanceLeasesAndTheSameContainerCanBeRetried(boolean interrupted) throws Exception {
         ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
         try {
-            LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
             stubDockerPing(harness.dockerClient(), false);
             Instance instance = leasedInstance("i-teardown-hook-refused");
             harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
@@ -2887,7 +2944,73 @@ class Ec2ContainerManagerTest {
             verify(harness.metadataServer()).unregisterContainer("192.168.215.7", instance);
             verify(harness.metadataServer()).unregisterInstance(instance);
         } finally {
-            executor.shutdownNow();
+            harness.manager().stop();
+        }
+    }
+
+    @Test
+    void repeatedTerminationDoesNotRemoveTheSameContainerOrReleaseItsPortTwice() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        CountDownLatch removing = new CountDownLatch(1);
+        CountDownLatch finishRemoval = new CountDownLatch(1);
+        try {
+            Instance instance = leasedInstance("i-repeated-termination");
+            instance.setDockerContainerId(TEST_CONTAINER_ID);
+            instance.setSshHostPort(2201);
+            RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+            when(harness.dockerClient().removeContainerCmd(TEST_CONTAINER_ID)).thenReturn(remove);
+            doAnswer(invocation -> {
+                removing.countDown();
+                assertTrue(finishRemoval.await(2, TimeUnit.SECONDS));
+                return null;
+            }).when(remove).exec();
+            AtomicInteger callbacks = new AtomicInteger();
+
+            harness.manager().terminate(instance, callbacks::incrementAndGet);
+            assertTrue(removing.await(2, TimeUnit.SECONDS));
+            harness.manager().terminate(instance, callbacks::incrementAndGet);
+            finishRemoval.countDown();
+            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+            harness.manager().terminate(instance, callbacks::incrementAndGet);
+            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+
+            assertEquals("terminated", instance.getState().getName());
+            assertEquals(1, callbacks.get());
+            verify(remove).exec();
+            verify(harness.portAllocator()).release(2201);
+        } finally {
+            finishRemoval.countDown();
+            harness.manager().stop();
+        }
+    }
+
+    @Test
+    void shutdownCompletesPendingTerminationWithItsOriginalCallback() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        try {
+            Instance instance = leasedInstance("i-pending-shutdown");
+            instance.setDockerContainerId(TEST_CONTAINER_ID);
+            instance.setSshHostPort(2201);
+            RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+            when(harness.dockerClient().removeContainerCmd(TEST_CONTAINER_ID)).thenReturn(remove);
+            doThrow(new DockerException("removal is still completing", 500)).doNothing().when(remove).exec();
+            AtomicInteger callbacks = new AtomicInteger();
+            harness.manager().terminate(instance, callbacks::incrementAndGet);
+            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+            harness.manager().stop();
+
+            assertEquals("shutting-down", instance.getState().getName());
+            assertEquals(0, callbacks.get());
+            harness.manager().terminateForShutdown(instance);
+
+            assertEquals("terminated", instance.getState().getName());
+            assertEquals(1, callbacks.get());
+            verify(remove, times(2)).exec();
+            verify(harness.portAllocator()).release(2201);
+        } finally {
+            harness.manager().stop();
         }
     }
 
