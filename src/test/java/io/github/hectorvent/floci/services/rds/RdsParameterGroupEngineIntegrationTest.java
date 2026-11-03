@@ -6,6 +6,8 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -30,6 +32,7 @@ import static org.hamcrest.Matchers.equalTo;
  */
 @QuarkusTest
 @Tag("docker")
+@Execution(ExecutionMode.CONCURRENT)
 class RdsParameterGroupEngineIntegrationTest {
 
     private static final String MASTER_USER = "admin";
