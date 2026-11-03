@@ -20,6 +20,7 @@ import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.WaitContainerCondition;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
@@ -35,6 +36,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -265,6 +267,91 @@ class ContainerLifecycleManagerVolumeTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"completed", "registration-missed", "transport-failed"})
+    void strictContainerCleanupWaitsForConcurrentDaemonRemoval(String waitOutcome) throws Exception {
+        String id = "auto-removing";
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse response = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        WaitContainerCmd wait = mock(WaitContainerCmd.class, RETURNS_SELF);
+        Closeable logStream = mock(Closeable.class);
+        Closeable waitStream = mock(Closeable.class);
+        when(dockerClient.stopContainerCmd(id)).thenReturn(stop);
+        when(dockerClient.removeContainerCmd(id)).thenReturn(remove);
+        doThrow(new ConflictException("removal already in progress")).when(remove).exec();
+        when(dockerClient.inspectContainerCmd(id)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(response);
+        when(response.getState().getRunning()).thenReturn(false);
+        when(dockerClient.waitContainerCmd(id)).thenReturn(wait);
+        when(wait.exec(any(WaitContainerResultCallback.class))).thenAnswer(call -> {
+            verify(logStream, never()).close();
+            when(inspect.exec()).thenThrow(new NotFoundException("daemon finished removal"));
+            if ("registration-missed".equals(waitOutcome)) {
+                throw new NotFoundException("removed before wait registered");
+            }
+            WaitContainerResultCallback callback = call.getArgument(0);
+            callback.onStart(waitStream);
+            if ("transport-failed".equals(waitOutcome)) {
+                callback.onError(new DockerException("wait response lost", 500));
+            } else {
+                callback.onComplete();
+            }
+            return callback;
+        });
+
+        manager.stopAndRemoveStrict(id, logStream);
+
+        verify(wait).withCondition(WaitContainerCondition.REMOVED);
+        verify(logStream).close();
+        verify(inspect, times(2)).exec();
+        if (!"registration-missed".equals(waitOutcome)) {
+            verify(waitStream, atLeastOnce()).close();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void strictContainerCleanupRetainsOwnershipWhenTheRemovalWaitTimesOutOrIsInterrupted(boolean interrupt)
+            throws Exception {
+        String id = "still-removing";
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse response = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        WaitContainerCmd wait = mock(WaitContainerCmd.class, RETURNS_SELF);
+        Closeable logStream = mock(Closeable.class);
+        Closeable waitStream = mock(Closeable.class);
+        when(dockerClient.stopContainerCmd(id)).thenReturn(stop);
+        when(dockerClient.removeContainerCmd(id)).thenReturn(remove);
+        ConflictException removalFailure = new ConflictException("removal already in progress");
+        doThrow(removalFailure).when(remove).exec();
+        when(dockerClient.inspectContainerCmd(id)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(response);
+        when(response.getState().getRunning()).thenReturn(false);
+        when(dockerClient.waitContainerCmd(id)).thenReturn(wait);
+        when(wait.exec(any(WaitContainerResultCallback.class))).thenAnswer(call -> {
+            WaitContainerResultCallback callback = call.getArgument(0);
+            callback.onStart(waitStream);
+            if (interrupt) {
+                Thread.currentThread().interrupt();
+            }
+            return callback;
+        });
+
+        try {
+            IllegalStateException failure = assertTimeout(Duration.ofSeconds(10), () ->
+                    assertThrows(IllegalStateException.class, () -> manager.stopAndRemoveStrict(id, logStream)));
+            assertSame(removalFailure, failure.getCause());
+            assertEquals(interrupt, Thread.currentThread().isInterrupted());
+            verify(logStream, never()).close();
+            verify(waitStream, atLeastOnce()).close();
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @ParameterizedTest
     @EnumSource(value = ContainerLifecycleManager.ContainerPresence.class,
             names = {"RUNNING", "STOPPED", "UNKNOWN"})
     void strictContainerCleanupPreservesTheRemovalFailureUntilAbsenceIsConfirmed(
@@ -288,6 +375,13 @@ class ContainerLifecycleManagerVolumeTest {
             lenient().when(state.getRunning()).thenReturn(
                     presence == ContainerLifecycleManager.ContainerPresence.RUNNING);
         }
+        WaitContainerCmd wait = mock(WaitContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.waitContainerCmd(id)).thenReturn(wait);
+        when(wait.exec(any(WaitContainerResultCallback.class))).thenAnswer(call -> {
+            WaitContainerResultCallback callback = call.getArgument(0);
+            callback.onComplete();
+            return callback;
+        });
         List<String> operations = new ArrayList<>();
 
         IllegalStateException failure = assertThrows(IllegalStateException.class,

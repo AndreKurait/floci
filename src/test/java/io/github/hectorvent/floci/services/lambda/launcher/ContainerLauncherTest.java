@@ -1673,8 +1673,9 @@ class ContainerLauncherTest {
         verify(executionRoleCredentials).unregister("222233334444", "ASIASTOPSESSION");
     }
 
-    @Test
-    void stopUnregistersExecutionRoleSessionWhenDaemonAlreadyRemovedTheRuntime() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void stopUnregistersExecutionRoleSessionWhenDaemonRemovesTheRuntime(boolean removalInProgress) throws Exception {
         Path codePath = Files.createDirectory(tempDir.resolve("role-session-daemon-removal"));
         LambdaFunction fn = new LambdaFunction();
         fn.setFunctionName("role-session-daemon-removal-fn");
@@ -1694,7 +1695,20 @@ class ContainerLauncherTest {
         when(dockerClient.removeContainerCmd(handle.getContainerId())).thenReturn(remove);
         doThrow(new ConflictException("removal already in progress")).when(remove).exec();
         lenient().when(dockerClient.inspectContainerCmd(handle.getContainerId())).thenReturn(inspect);
-        lenient().when(inspect.exec()).thenThrow(new NotFoundException("daemon removed runtime"));
+        if (removalInProgress) {
+            InspectContainerResponse response = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+            when(response.getState().getRunning()).thenReturn(false);
+            when(inspect.exec()).thenReturn(response).thenThrow(new NotFoundException("daemon removed runtime"));
+            WaitContainerCmd wait = mock(WaitContainerCmd.class, RETURNS_SELF);
+            when(dockerClient.waitContainerCmd(handle.getContainerId())).thenReturn(wait);
+            when(wait.exec(any(WaitContainerResultCallback.class))).thenAnswer(call -> {
+                WaitContainerResultCallback callback = call.getArgument(0);
+                callback.onComplete();
+                return callback;
+            });
+        } else {
+            when(inspect.exec()).thenThrow(new NotFoundException("daemon removed runtime"));
+        }
         doAnswer(call -> {
             actualLifecycle.stopAndRemoveStrict(call.getArgument(0), call.getArgument(1), call.getArgument(2));
             return null;
