@@ -305,18 +305,19 @@ public class EmbeddedDnsServer {
      * hosted zone that matches the same name.
      */
     QueryPlan planQuery(String name, String clientAddress, String myIp, int type) {
-        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true);
+        DnsClientVpcSource.ClientVpc origin = vpcForClient(clientAddress).orElse(null);
+        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, origin);
         Optional<DnsAnswer> emulatorName = resolveEmulatorName(name, myIp, type);
         if (emulatorName.isPresent() && stored.isEmpty()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
         }
         // A rule steers the name whatever the query asks about it, so this is deliberately not
         // gated on the record type: the raw query is relayed to the rule's resolvers as it stands.
-        Optional<DnsForwardingRule> rule = matchingRule(name, clientAddress);
+        Optional<DnsForwardingRule> rule = matchingRule(name, origin);
         if (rule.isPresent() && rule.orElseThrow().forwards()) {
             return QueryPlan.forwardingTo(rule.orElseThrow().targets());
         }
-        return stored.or(() -> resolveFromRecordSources(name, type))
+        return stored.or(() -> resolveFromRecordSources(name, type, false, origin))
                 .map(QueryPlan::answering).orElse(QueryPlan.UPSTREAM);
     }
 
@@ -336,14 +337,13 @@ public class EmbeddedDnsServer {
      * than allowed to fail the query, which is how {@link #resolveFromRecordSources} treats one too.
      */
     Optional<DnsForwardingRule> matchingRule(String name, String clientAddress) {
-        if (forwardingRuleSources == null || name == null || name.isBlank()) {
+        return matchingRule(name, vpcForClient(clientAddress).orElse(null));
+    }
+
+    private Optional<DnsForwardingRule> matchingRule(String name, DnsClientVpcSource.ClientVpc origin) {
+        if (forwardingRuleSources == null || name == null || name.isBlank() || origin == null) {
             return Optional.empty();
         }
-        Optional<DnsClientVpcSource.ClientVpc> clientVpc = vpcForClient(clientAddress);
-        if (clientVpc.isEmpty()) {
-            return Optional.empty();
-        }
-        DnsClientVpcSource.ClientVpc origin = clientVpc.orElseThrow();
         DnsForwardingRule best = null;
         for (DnsForwardingRuleSource source : forwardingRuleSources) {
             try {
@@ -402,6 +402,11 @@ public class EmbeddedDnsServer {
     }
 
     private Optional<DnsAnswer> resolveFromRecordSources(String name, int type, boolean authoritative) {
+        return resolveFromRecordSources(name, type, authoritative, null);
+    }
+
+    private Optional<DnsAnswer> resolveFromRecordSources(String name, int type, boolean authoritative,
+                                                         DnsClientVpcSource.ClientVpc origin) {
         if (recordSources == null) {
             return Optional.empty();
         }
@@ -412,8 +417,8 @@ public class EmbeddedDnsServer {
         Optional<DnsAnswer> empty = Optional.empty();
         for (DnsRecordSource source : recordSources) {
             try {
-                Optional<DnsAnswer> answer = authoritative ? source.resolveAuthoritative(name, type)
-                        : source.resolve(name, type);
+                Optional<DnsAnswer> answer = authoritative ? source.resolveAuthoritative(name, type, origin)
+                        : source.resolve(name, type, origin);
                 if (answer != null && answer.isPresent()) {
                     if (answer.get().isEmpty()) {
                         if (empty.isEmpty() || (!empty.get().nameExists() && answer.get().nameExists())) {

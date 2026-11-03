@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.route53;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.github.hectorvent.floci.core.common.dns.DnsLookupHelper;
 import io.github.hectorvent.floci.services.route53.model.AliasTarget;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecord;
@@ -11,6 +13,8 @@ import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
 
 import java.net.InetAddress;
@@ -29,6 +33,9 @@ class Route53DnsResolutionTest {
 
     @Inject
     Route53Service route53Service;
+
+    @Inject
+    EmulatorConfig config;
 
     @InjectMock
     DnsLookupHelper dnsLookupHelper;
@@ -63,7 +70,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecord(zoneId, "api." + zone, "A", "10.0.1.100");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("api." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("api." + zone);
         assertTrue(result.isPresent());
         assertEquals(List.of("10.0.1.100"), result.get().addresses());
     }
@@ -74,7 +81,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecord(zoneId, "api." + zone, "A", "10.0.1.100", 42L);
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("api." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("api." + zone);
         assertTrue(result.isPresent());
         assertEquals(42, result.get().ttlSeconds());
     }
@@ -87,7 +94,7 @@ class Route53DnsResolutionTest {
         addRecord(zoneId, "short." + zone, "CNAME", "api." + zone + ".", 30L);
         addRecord(zoneId, "long." + zone, "CNAME", "short." + zone + ".", 900L);
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("long." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("long." + zone);
         assertTrue(result.isPresent());
         assertEquals(List.of("10.0.3.50"), result.get().addresses());
         assertEquals(30, result.get().ttlSeconds());
@@ -100,7 +107,7 @@ class Route53DnsResolutionTest {
         addRecord(zoneId, "target." + zone, "A", "10.0.4.99", 120L);
         addAlias(zoneId, "alias." + zone, "A", "target." + zone + ".");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("alias." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("alias." + zone);
         assertTrue(result.isPresent());
         assertEquals(120, result.get().ttlSeconds());
     }
@@ -111,7 +118,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecords(zoneId, "api." + zone, "A", List.of("10.0.1.101", "10.0.1.102"));
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("api." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("api." + zone);
         assertTrue(result.isPresent());
         assertEquals(2, result.get().addresses().size());
         assertTrue(result.get().addresses().contains("10.0.1.101"));
@@ -128,7 +135,7 @@ class Route53DnsResolutionTest {
         }
         addRecords(zoneId, "fleet." + zone, "A", ips);
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("fleet." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("fleet." + zone);
         assertTrue(result.isPresent());
         assertEquals(8, result.get().addresses().size());
     }
@@ -139,7 +146,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecord(zoneId, "api." + zone, "A", "10.0.1.200");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("API." + zone.toUpperCase() + ".");
+        Optional<DnsAnswer> result = resolveFromVpc("API." + zone.toUpperCase() + ".");
         assertTrue(result.isPresent());
         assertEquals(List.of("10.0.1.200"), result.get().addresses());
     }
@@ -152,15 +159,15 @@ class Route53DnsResolutionTest {
         createdZoneIds.add(zoneId);
         addRecord(zoneId, "api." + zone, "A", "1.2.3.4");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("api." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("api." + zone);
         assertTrue(result.isEmpty());
     }
 
     @Test
     void doesNotResolveNameOutsideAnyPrivateZone() {
-        assertTrue(dnsRecordSource.resolveIpv4("example.com").isEmpty());
-        assertTrue(dnsRecordSource.resolveIpv4("").isEmpty());
-        assertTrue(dnsRecordSource.resolveIpv4(null).isEmpty());
+        assertTrue(resolveFromVpc("example.com").isEmpty());
+        assertTrue(resolveFromVpc("").isEmpty());
+        assertTrue(resolveFromVpc(null).isEmpty());
     }
 
     @Test
@@ -169,7 +176,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecord(zoneId, "*." + zone, "A", "10.0.2.1");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("app." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("app." + zone);
         assertTrue(result.isPresent());
         assertEquals(List.of("10.0.2.1"), result.get().addresses());
     }
@@ -182,7 +189,7 @@ class Route53DnsResolutionTest {
         addRecord(zoneId, "b." + zone, "TXT", "\"text-record\"");
 
         // Wildcard should not match a.b.zone because b.zone exists
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("a.b." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("a.b." + zone);
         assertTrue(result.isPresent());
         assertEquals(DnsAnswer.nxDomain(), result.get());
     }
@@ -194,16 +201,16 @@ class Route53DnsResolutionTest {
         addRecord(zoneId, "*." + zone, "A", "10.0.2.1");
         addRecord(zoneId, "api.team." + zone, "A", "10.0.2.2");
 
-        Optional<DnsAnswer> team = dnsRecordSource.resolveIpv4("team." + zone);
+        Optional<DnsAnswer> team = resolveFromVpc("team." + zone);
         assertTrue(team.isPresent());
         assertTrue(team.get().isEmpty());
         assertTrue(team.get().nameExists());
 
-        Optional<DnsAnswer> web = dnsRecordSource.resolveIpv4("web.team." + zone);
+        Optional<DnsAnswer> web = resolveFromVpc("web.team." + zone);
         assertTrue(web.isPresent());
         assertEquals(DnsAnswer.nxDomain(), web.get());
 
-        Optional<DnsAnswer> other = dnsRecordSource.resolveIpv4("other." + zone);
+        Optional<DnsAnswer> other = resolveFromVpc("other." + zone);
         assertTrue(other.isPresent());
         assertEquals(List.of("10.0.2.1"), other.get().addresses());
     }
@@ -215,7 +222,7 @@ class Route53DnsResolutionTest {
         addRecord(zoneId, "*." + zone, "A", "10.0.2.1");
         addRecord(zoneId, "*.team." + zone, "A", "10.0.2.3");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("web.team." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("web.team." + zone);
         assertTrue(result.isPresent());
         assertEquals(List.of("10.0.2.3"), result.get().addresses());
     }
@@ -227,7 +234,7 @@ class Route53DnsResolutionTest {
         addRecord(zoneId, "api." + zone, "A", "10.0.3.50");
         addRecord(zoneId, "service." + zone, "CNAME", "api." + zone + ".");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("service." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("service." + zone);
         assertTrue(result.isPresent());
         assertEquals(List.of("10.0.3.50"), result.get().addresses());
     }
@@ -239,7 +246,7 @@ class Route53DnsResolutionTest {
         addRecord(zoneId, "cname1." + zone, "CNAME", "cname2." + zone);
         addRecord(zoneId, "cname2." + zone, "CNAME", "cname1." + zone);
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("cname1." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("cname1." + zone);
         assertTrue(result.isPresent());
         assertEquals(List.of(), result.get().addresses());
     }
@@ -250,7 +257,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecord(zoneId, "ec2host." + zone, "CNAME", "ip-10-0-5-88.ec2.internal.");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("ec2host." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("ec2host." + zone);
         assertTrue(result.isPresent());
         assertEquals(List.of("10.0.5.88"), result.get().addresses());
     }
@@ -264,7 +271,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecord(zoneId, "ext." + zone, "CNAME", "external.example.com.");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("ext." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("ext." + zone);
         assertTrue(result.isPresent());
         assertEquals(List.of("93.184.216.34"), result.get().addresses());
     }
@@ -276,7 +283,7 @@ class Route53DnsResolutionTest {
         addRecord(zoneId, "target." + zone, "A", "10.0.4.99");
         addAlias(zoneId, "alias." + zone, "A", "target." + zone + ".");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("alias." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("alias." + zone);
         assertTrue(result.isPresent());
         assertEquals(List.of("10.0.4.99"), result.get().addresses());
     }
@@ -286,7 +293,7 @@ class Route53DnsResolutionTest {
         String zone = uniqueZone();
         createPrivateZone(zone);
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("nonexistent." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("nonexistent." + zone);
         assertTrue(result.isPresent());
         assertEquals(DnsAnswer.nxDomain(), result.get());
     }
@@ -297,7 +304,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecord(zoneId, "api.team." + zone, "A", "10.0.6.1");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("team." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("team." + zone);
         assertTrue(result.isPresent());
         assertTrue(result.get().isEmpty());
         assertTrue(result.get().nameExists());
@@ -312,7 +319,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecord(zoneId, "ext." + zone, "CNAME", "external-ttl.example.com.", 3600L);
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("ext." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("ext." + zone);
         assertTrue(result.isPresent());
         assertEquals(List.of("93.184.216.35"), result.get().addresses());
         assertEquals(DnsAnswer.DEFAULT_TTL_SECONDS, result.get().ttlSeconds());
@@ -324,7 +331,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecord(zoneId, "txtonly." + zone, "TXT", "\"only text here\"");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("txtonly." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("txtonly." + zone);
         assertTrue(result.isPresent());
         assertTrue(result.get().isEmpty());
         assertTrue(result.get().nameExists());
@@ -340,7 +347,7 @@ class Route53DnsResolutionTest {
         addRecord(parentId, "api.sub." + parentZone, "A", "10.0.10.1");
         addRecord(childId, "api." + childZone, "A", "10.0.20.1");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("api.sub." + parentZone);
+        Optional<DnsAnswer> result = resolveFromVpc("api.sub." + parentZone);
         assertTrue(result.isPresent());
         assertEquals(List.of("10.0.20.1"), result.get().addresses());
     }
@@ -351,7 +358,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecord(zoneId, "floci-cname." + zone, "CNAME", "s3.localhost.localstack.cloud");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("floci-cname." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("floci-cname." + zone);
         assertTrue(result.isPresent());
         String expectedIp = InetAddress.getLocalHost().getHostAddress();
         assertEquals(List.of(expectedIp), result.get().addresses());
@@ -363,7 +370,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addRecord(zoneId, "floci-cname2." + zone, "CNAME", "sqs.localhost.floci.io");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("floci-cname2." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("floci-cname2." + zone);
         assertTrue(result.isPresent());
         String expectedIp = InetAddress.getLocalHost().getHostAddress();
         assertEquals(List.of(expectedIp), result.get().addresses());
@@ -375,7 +382,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addAlias(zoneId, "floci-alias." + zone, "A", "s3.localhost.localstack.cloud");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("floci-alias." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("floci-alias." + zone);
         assertTrue(result.isPresent());
         String expectedIp = InetAddress.getLocalHost().getHostAddress();
         assertEquals(List.of(expectedIp), result.get().addresses());
@@ -390,7 +397,7 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addAlias(zoneId, "bare-alias." + zone, "A", "s3.localstack.cloud");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("bare-alias." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("bare-alias." + zone);
         assertTrue(result.isPresent());
         String localIp = InetAddress.getLocalHost().getHostAddress();
         assertFalse(result.get().addresses().contains(localIp));
@@ -403,18 +410,53 @@ class Route53DnsResolutionTest {
         String zoneId = createPrivateZone(zone);
         addAlias(zoneId, "ec2-alias." + zone, "A", "ip-10-0-0-5.ec2.internal");
 
-        Optional<DnsAnswer> result = dnsRecordSource.resolveIpv4("ec2-alias." + zone);
+        Optional<DnsAnswer> result = resolveFromVpc("ec2-alias." + zone);
         assertTrue(result.isPresent());
         assertEquals(List.of("10.0.0.5"), result.get().addresses());
     }
 
+    @Test
+    void unknownCallerDoesNotReadPrivateRecords() {
+        String zone = uniqueZone();
+        addRecord(createPrivateZone(zone), "api." + zone, "A", "10.0.1.100");
+
+        assertTrue(dnsRecordSource.resolveIpv4("api." + zone).isEmpty());
+        assertTrue(dnsRecordSource.resolve("api." + zone, 1, null).isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"CNAME", "ALIAS"})
+    void chasingTargetsKeepsTheOriginalVpcVisibility(String type) {
+        String sourceName = uniqueZone();
+        String targetName = "api." + uniqueZone();
+        String sourceZone = createPrivateZone(sourceName);
+        addRecord(createPrivateZone(targetName, "vpc-54321"), targetName, "A", "10.99.1.7");
+        Mockito.when(dnsLookupHelper.resolveIpv4(targetName)).thenReturn(List.of("203.0.113.7"));
+        if ("CNAME".equals(type)) {
+            addRecord(sourceZone, "alias." + sourceName, "CNAME", targetName);
+        } else {
+            addAlias(sourceZone, "alias." + sourceName, "A", targetName);
+        }
+
+        assertEquals(List.of("203.0.113.7"), resolveFromVpc("alias." + sourceName).orElseThrow().addresses());
+        Mockito.verify(dnsLookupHelper).resolveIpv4(targetName);
+    }
+
+    private Optional<DnsAnswer> resolveFromVpc(String name) {
+        return dnsRecordSource.resolve(name, 1, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345"));
+    }
+
     private String createPrivateZone(String name) {
+        return createPrivateZone(name, "vpc-12345");
+    }
+
+    private String createPrivateZone(String name, String vpcId) {
         String zoneName = name.endsWith(".") ? name : name + ".";
         String id = route53Service.createHostedZone(
                 zoneName,
                 UUID.randomUUID().toString(),
                 "test private zone",
-                new VpcAssociation("vpc-12345", "us-east-1")).zone().getId();
+                new VpcAssociation(vpcId, "us-east-1")).zone().getId();
         createdZoneIds.add(id);
         return id;
     }
