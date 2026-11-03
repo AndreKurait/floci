@@ -17,12 +17,18 @@ final class SsmCommandTimeout {
     }
 
     String wrap(String script, int seconds) {
-        String fileCommand = "floci_ssm_dir=$(mktemp -d /tmp/floci-ssm.XXXXXXXXXX) || exit 1; "
-                + "trap 'rm -rf \"$floci_ssm_dir\"' EXIT; "
+        String shellCommand = "sh -c " + quote(script);
+        String fileCommand = "sh -c 'exec \"$1\"' sh \"$floci_ssm_dir/_script.sh\"";
+        return "if ! command -v mktemp >/dev/null 2>&1 || ! command -v chmod >/dev/null 2>&1; then\n"
+                + supervise(shellCommand, seconds) + "\nelse\n"
+                + "floci_ssm_dir=$(mktemp -d /tmp/floci-ssm.XXXXXXXXXX) || exit 1; "
+                + "export floci_ssm_dir; trap 'rm -rf \"$floci_ssm_dir\"' EXIT; "
                 + "printf '%s\\n' " + quote(script) + " > \"$floci_ssm_dir/_script.sh\" || exit 1; "
-                + "chmod 700 \"$floci_ssm_dir/_script.sh\" || exit 1; "
-                + "sh -c '\"$1\"' sh \"$floci_ssm_dir/_script.sh\"";
-        String command = "sh -c " + quote(fileCommand);
+                + "chmod 700 \"$floci_ssm_dir/_script.sh\" || exit 1; (\n"
+                + supervise(fileCommand, seconds) + "\n)\nfi";
+    }
+
+    private String supervise(String command, int seconds) {
         if (seconds < 1) {
             return command;
         }

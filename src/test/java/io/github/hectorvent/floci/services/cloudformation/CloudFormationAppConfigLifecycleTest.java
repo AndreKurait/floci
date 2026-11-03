@@ -61,7 +61,7 @@ class CloudFormationAppConfigLifecycleTest {
     @BeforeEach
     void setUp() {
         storage = new InMemoryStorageFactory(ACCOUNT);
-        appConfig = spy(new AppConfigService(storage, null));
+        appConfig = spy(new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT)));
         CfnResourceDispatcher dispatcher = new CfnResourceDispatcher(MAPPER,
                 new CloudFormationResourceRegistry(List.of(new AppConfigCfnProvisioner(appConfig))), null, null);
         RegionResolver regionResolver = mock(RegionResolver.class);
