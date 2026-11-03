@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.ssm;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -43,9 +45,10 @@ class SsmScriptExecutionTest {
         assertFalse(Files.exists(Path.of(lines[0]).getParent()), "Invocation directory must be removed");
     }
 
-    @Test
-    void timeoutCleansTheExecutableScript() throws Exception {
-        Result result = execute("#!/bin/sh\nprintf '%s\\n' \"$0\"\nsleep 30", 1, null);
+    @ParameterizedTest
+    @ValueSource(strings = {"", "trap '' TERM\n"})
+    void timeoutCleansTheExecutableScript(String signalHandler) throws Exception {
+        Result result = execute("#!/bin/sh\n" + signalHandler + "printf '%s\\n' \"$0\"\nsleep 30", 1, null);
         assertEquals(124, result.exitCode());
         assertFalse(Files.exists(Path.of(result.stdout().strip()).getParent()));
     }

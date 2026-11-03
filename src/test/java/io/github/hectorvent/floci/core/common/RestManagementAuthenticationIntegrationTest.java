@@ -172,6 +172,9 @@ class RestManagementAuthenticationIntegrationTest {
             try {
                 client.putObject(request -> request.bucket(bucket).key("item"),
                         RequestBody.fromString("public body"));
+                client.putPublicAccessBlock(request -> request.bucket(bucket).publicAccessBlockConfiguration(
+                        configuration -> configuration.blockPublicAcls(false).ignorePublicAcls(false)
+                                .blockPublicPolicy(false).restrictPublicBuckets(false)));
                 client.putBucketPolicy(request -> request.bucket(bucket).policy("""
                         {"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":"*",
                         "Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/item"}}

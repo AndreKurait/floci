@@ -193,7 +193,7 @@ public class TargetDispatcher implements Resettable {
                     throw new AwsException("AccessDeniedException", "EventBridge is not authorized to invoke "
                             + targetArn, 403);
                 }
-                invoker.invokeTarget(target, delivery.eventJson(), delivery.region(), delivery.ruleArn());
+                invoker.invokeTarget(target, delivery.eventJson(), delivery.region(), delivery.ruleArn(), targetArn);
             } else {
                 invoker.invokeTarget(target, delivery.eventJson(), delivery.region(), delivery.ruleArn());
             }

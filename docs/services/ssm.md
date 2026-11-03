@@ -71,8 +71,12 @@ without a label filter continue to return the latest version of each parameter.
 Direct execution writes the commands to a private executable script and invokes its
 path through `sh -c`, matching the SSM agent's execution model. A shebang selects the
 guest's interpreter, including its arguments; scripts without one use the shell.
+The script-file path uses `mktemp`, `chmod`, and `rm` in the guest. If `mktemp`
+or `chmod` is unavailable, commands run inline through `sh -c`; selecting an
+interpreter through a shebang requires the script-file path.
 The invocation keeps the requested working directory and removes its temporary
-script after completion, failure, or the in-container execution timeout.
+script after completion, failure, or the in-container execution timeout, including
+when the script ignores termination.
 
 For public `SendCommand`, set `TimeoutSeconds` to a delivery/start allowance from 30 to
 2,592,000 seconds. The default is 3,600 seconds. Floci does not automatically expire

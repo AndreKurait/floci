@@ -332,7 +332,9 @@ class SwfServiceTest {
     void backgroundTimerWakesOnlyTheOwningAccountAndRegion() throws Exception {
         ThreadLocal<RequestContext> contexts = ThreadLocal.withInitial(RequestContext::new);
         Instance<RequestContext> request = Mockito.mock(Instance.class);
-        Mockito.when(request.get()).thenAnswer(call -> contexts.get());
+        RequestContext proxy = Mockito.mock(RequestContext.class);
+        Mockito.when(proxy.getAccountId()).thenAnswer(call -> contexts.get().getAccountId());
+        Mockito.when(request.get()).thenReturn(proxy);
         StorageFactory factory = new StorageFactory(null, null) {
             @Override
             public synchronized <V> AccountAwareStorageBackend<V> create(String serviceName,

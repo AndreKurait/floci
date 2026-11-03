@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -61,11 +62,10 @@ class CloudFormationAppConfigLifecycleTest {
     @BeforeEach
     void setUp() {
         storage = new InMemoryStorageFactory(ACCOUNT);
-        appConfig = spy(new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT)));
+        RegionResolver regionResolver = new RegionResolver(REGION, ACCOUNT);
+        appConfig = spy(new AppConfigService(storage, regionResolver));
         CfnResourceDispatcher dispatcher = new CfnResourceDispatcher(MAPPER,
                 new CloudFormationResourceRegistry(List.of(new AppConfigCfnProvisioner(appConfig))), null, null);
-        RegionResolver regionResolver = mock(RegionResolver.class);
-        when(regionResolver.getAccountId()).thenReturn(ACCOUNT);
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.defaultAccountId()).thenReturn(ACCOUNT);
         cfn = new CloudFormationService(dispatcher, mock(S3Service.class), mock(SsmService.class),
@@ -94,6 +94,10 @@ class CloudFormationAppConfigLifecycleTest {
                 "application/json", null);
         appConfig.startDeployment(oldApp, oldEnv, Map.of("ConfigurationProfileId", oldProfile,
                 "ConfigurationVersion", "1", "DeploymentStrategyId", "AppConfig.AllAtOnce"));
+        assertFalse(store("appconfig-deployments.json", new TypeReference<Map<String, Deployment>>() {})
+                .scan(key -> key.startsWith(REGION + "/" + oldApp + "::")).isEmpty());
+        assertFalse(store("appconfig-versions.json", new TypeReference<Map<String, HostedConfigurationVersion>>() {})
+                .scan(key -> key.startsWith(REGION + "/" + oldApp + "::")).isEmpty());
 
         deploy("moved", "UPDATE", "{\"Resources\":{\"AppB\":{\"Type\":\"AWS::AppConfig::Application\","
                 + "\"Properties\":{\"Name\":\"orders\"}}," + children.formatted("AppB") + "}}");
@@ -105,9 +109,9 @@ class CloudFormationAppConfigLifecycleTest {
         assertTrue(appConfig.findEnvironment(oldEnv).isEmpty(), "the displaced environment is deleted");
         assertTrue(appConfig.findConfigurationProfile(oldProfile).isEmpty(), "the displaced profile is deleted");
         assertTrue(store("appconfig-deployments.json", new TypeReference<Map<String, Deployment>>() {})
-                .scan(key -> key.startsWith(oldApp + "::")).isEmpty(), "with its deployments");
+                .scan(key -> key.startsWith(REGION + "/" + oldApp + "::")).isEmpty(), "with its deployments");
         assertTrue(store("appconfig-versions.json", new TypeReference<Map<String, HostedConfigurationVersion>>() {})
-                .scan(key -> key.startsWith(oldApp + "::")).isEmpty(), "and its hosted configuration versions");
+                .scan(key -> key.startsWith(REGION + "/" + oldApp + "::")).isEmpty(), "and its hosted configuration versions");
     }
 
     /**

@@ -992,7 +992,11 @@ class AutoScalingRefreshStorageTest {
         assertTrue(group.getInstances().isEmpty());
         assertTrue(refresh.getReplacements().isEmpty(), "Detached replacement retained refresh ownership");
         restart(mode);
-        assertTrue(service.activeInstanceRefresh(group).getReplacements().isEmpty());
+        List<InstanceRefresh> retained = service.describeInstanceRefreshes(REGION, "suspended-group",
+                List.of(refresh.getInstanceRefreshId()), null, null).instanceRefreshes();
+        assertEquals(1, retained.size());
+        assertEquals("Successful", retained.getFirst().getStatus());
+        assertTrue(retained.getFirst().getReplacements().isEmpty());
         assertEquals(decrement ? 0 : 1, group.getDesiredCapacity());
     }
 

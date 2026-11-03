@@ -187,7 +187,11 @@ public class EventBridgeInvoker {
 
     /** {@code ruleArn} is the rule that matched, which a role's trust policy may name in {@code aws:SourceArn}. */
     public void invokeTarget(Target target, String eventJson, String region, String ruleArn) {
-        String arn = target.getArn();
+        invokeTarget(target, eventJson, region, ruleArn, target.getArn());
+    }
+
+    /** Uses the ARN captured before authorization, even if the target changes during the policy lookup. */
+    void invokeTarget(Target target, String eventJson, String region, String ruleArn, String arn) {
         String payload;
         if (target.getInput() != null) {
             payload = target.getInput();

@@ -512,12 +512,15 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
      * reads the AWS/ApplicationELB per-target request count keyed by the load balancer and
      * target group inside {@code ResourceLabel}. RequestCountPerTarget's only valid
      * CloudWatch statistic is Sum (the value is already the per-minute average across
-     * targets), so each mapping carries the statistic the alarm must read. Types without a
+     * targets), so each mapping carries the statistic the alarm must read. Lambda uses
+     * AWS/Lambda ProvisionedConcurrencyUtilization for its provisioned-concurrency target. Types without a
      * mapping Floci is certain of
      * are left onto the service namespace's own namespace under the type's name rather than
      * silently pointing at a metric the backing service never publishes.
      */
     private static final Map<String, PredefinedMetric> PREDEFINED_METRICS = Map.of(
+            "LambdaProvisionedConcurrencyUtilization",
+            new PredefinedMetric("AWS/Lambda", "ProvisionedConcurrencyUtilization", "Average"),
             "ECSServiceAverageCPUUtilization", new PredefinedMetric("AWS/ECS", "CPUUtilization", "Average"),
             "ECSServiceAverageMemoryUtilization", new PredefinedMetric("AWS/ECS", "MemoryUtilization", "Average"),
             "ALBRequestCountPerTarget", new PredefinedMetric("AWS/ApplicationELB", "RequestCountPerTarget", "Sum"));
@@ -570,17 +573,6 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             case "elasticache" -> "AWS/ElastiCache";
             default -> "AWS/" + serviceNamespace.toUpperCase(Locale.ROOT);
         };
-    }
-
-    private static String predefinedMetricType(ScalingPolicy policy) {
-        TargetTrackingConfiguration config = policy.getTargetTrackingConfiguration();
-        if (config != null && config.getPredefinedMetricSpecification() != null
-                && config.getPredefinedMetricSpecification().getPredefinedMetricType() != null) {
-            String type = config.getPredefinedMetricSpecification().getPredefinedMetricType();
-            return "LambdaProvisionedConcurrencyUtilization".equals(type)
-                    ? "ProvisionedConcurrencyUtilization" : type;
-        }
-        return "CustomizedMetric";
     }
 
     private static double targetValue(ScalingPolicy policy) {

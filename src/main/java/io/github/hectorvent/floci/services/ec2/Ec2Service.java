@@ -8160,14 +8160,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Subnet createSubnet(String region, String vpcId, String requestedCidrBlock, String availabilityZone,
                                String availabilityZoneId, String ipv6CidrBlock, boolean dryRun) {
-        requireNotDryRun(dryRun);
-        // Canonical form, as AWS stores it; null (an IPv6-only subnet) stays null.
-        String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
         if (vpcId == null || vpcId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter VpcId", 400);
         }
         ensureDefaultResources(region);
         Vpc vpc = getRequiredVpc(region, vpcId);
+        requireNotDryRun(dryRun);
+        // Canonical form, as AWS stores it; null (an IPv6-only subnet) stays null.
+        String cidrBlock = canonicalizeIpv4Cidr(requestedCidrBlock);
         if (ipv6CidrBlock != null && !ipv6CidrBlock.isBlank() && !vpcHasAssociatedIpv6CidrBlock(vpc)) {
             throw new AwsException("InvalidParameterValue",
                     "Ipv6CidrBlock can only be specified for a subnet in a VPC with an associated "
@@ -8413,6 +8413,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public SecurityGroup createSecurityGroup(String region, String groupName, String description, String vpcId,
                                              boolean dryRun) {
+        requireSecurityGroupVpc(region, vpcId);
         requireNotDryRun(dryRun);
         return createSecurityGroup(region, groupName, description, vpcId);
     }
@@ -9696,9 +9697,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             boolean takesIops = volumeType != null && PROVISIONED_IOPS_VOLUME_TYPES.contains(volumeType);
             int iops = takesIops && ebs.getIops() != null ? ebs.getIops() : 0;
             Integer throughput = "gp3".equals(volumeType) ? ebs.getThroughput() : null;
-            if (ebs.getKmsKeyId() != null) {
-                throw new AwsException("UnsupportedOperation", "Launch-time KMS key selection is not supported.", 400);
-            }
             if (snapshot != null && snapshot.isEncrypted() && Boolean.FALSE.equals(ebs.getEncrypted())) {
                 throw new AwsException("InvalidBlockDeviceMapping", "An encrypted snapshot cannot be decrypted at launch.", 400);
             }

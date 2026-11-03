@@ -73,9 +73,13 @@ class SsmTimeoutDockerIntegrationTest {
             assertFalse(terminated.timedOut(), "The guest timeout must finish before Docker attach's deadline");
             assertTrue(Set.of(124L, 137L, 143L).contains(terminated.exitCode()), terminated.summary());
 
-            ContainerExec.Result killed = execute(container.containerId(), "trap '' TERM; exec sleep 20", 1);
+            SsmCommandTimeout timeout = new SsmCommandTimeout(4096);
+            ContainerExec.Result killed = ContainerExec.run(docker, container.containerId(),
+                    new String[]{"sh", "-c", timeout.wrap("trap '' TERM; exec sleep 20", 1)}, 8);
+            timeout.writeError(killed.stderr().getBytes(StandardCharsets.UTF_8));
             assertFalse(killed.timedOut(), "Kill escalation must finish before Docker attach's deadline");
-            assertEquals(137, killed.exitCode(), killed.summary());
+            assertTrue(Set.of(124L, 137L).contains(killed.exitCode()), killed.summary());
+            assertTrue(timeout.timedOut(), "Guest supervision must distinguish the deadline from a user exit");
         } finally {
             lifecycle.removeIfExistsStrict(name, true);
         }
@@ -108,7 +112,7 @@ class SsmTimeoutDockerIntegrationTest {
                     .withName(name).withEntrypoint(List.of("sh", "-c"))
                     .withCmd(List.of("exec sleep 600")).build());
             ContainerExec.Result setup = ContainerExec.run(docker, container.containerId(), new String[]{"sh", "-c",
-                    "mkdir /tmp/ssm-gnu-tools; for tool in sh mktemp mkdir rmdir rm sleep timeout mkfifo; do "
+                    "mkdir /tmp/ssm-gnu-tools; for tool in sh mktemp chmod mkdir rmdir rm sleep timeout mkfifo; do "
                             + "ln -s \"$(command -v $tool)\" /tmp/ssm-gnu-tools/$tool || exit 1; done"}, 3);
             assertEquals(0, setup.exitCode(), setup.summary());
             SsmCommandTimeout timeout = new SsmCommandTimeout(4096);

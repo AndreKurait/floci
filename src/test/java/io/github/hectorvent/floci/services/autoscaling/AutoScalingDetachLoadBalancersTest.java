@@ -7,6 +7,9 @@ import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefresh;
 import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefreshReplacement;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
+import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import org.junit.jupiter.api.Test;
@@ -44,7 +47,7 @@ class AutoScalingDetachLoadBalancersTest {
     void detachCleansBothBalancerKindsAndOnlyActualMembers(String state) {
         owned.setLifecycleState(state);
 
-        service.detachInstances(REGION, "group", List.of("i-owned", "i-other-group"), false);
+        service.detachInstances(REGION, "group", List.of("i-owned"), false);
 
         verify(classic).deregisterInstances(REGION, "first", List.of("i-owned"));
         verify(classic).deregisterInstances(REGION, "second", List.of("i-owned"));
@@ -58,6 +61,12 @@ class AutoScalingDetachLoadBalancersTest {
     @Test
     void failedClassicCleanupPreservesMembershipCapacityTagsAndRefreshUntilRetry() {
         InstanceRefresh refresh = service.startInstanceRefresh(REGION, "group", new InstanceRefresh());
+        Instance running = new Instance();
+        running.setInstanceId("i-owned");
+        running.setState(InstanceState.running());
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(running));
+        when(service.ec2Service.describeInstances(REGION, List.of("i-owned"), null)).thenReturn(List.of(reservation));
         assertEquals(List.of("i-owned", "i-retained"), refresh.getReplacements().stream()
                 .map(InstanceRefreshReplacement::getOriginalInstanceId).toList());
         AwsException failure = new AwsException("Throttling", "retry", 503);
@@ -68,7 +77,8 @@ class AutoScalingDetachLoadBalancersTest {
                 () -> service.detachInstances(REGION, "group", List.of("i-owned"), true)));
         assertEquals(List.of(owned, retained), group.getInstances());
         assertEquals(2, group.getDesiredCapacity());
-        verifyNoInteractions(service.ec2Service);
+        verify(service.ec2Service, never()).deleteSystemTag(anyString(), anyList(), anyString(), anyString());
+        verify(service.ec2Service, never()).terminateInstances(anyString(), anyList());
         assertEquals(List.of("i-owned", "i-retained"), refresh.getReplacements().stream()
                 .map(InstanceRefreshReplacement::getOriginalInstanceId).toList());
 
@@ -106,23 +116,16 @@ class AutoScalingDetachLoadBalancersTest {
         assertEquals(List.of(owned, retained), group.getInstances());
     }
 
-    @Test
-    void nonmemberDetachDoesNotTouchLoadBalancers() {
-        service.detachInstances(REGION, "group", List.of("i-other-group"), false);
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void nonmemberDetachDoesNotTouchLoadBalancers(boolean includesMember) {
+        List<String> requested = includesMember ? List.of("i-owned", "i-other-group") : List.of("i-other-group");
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.detachInstances(REGION, "group", requested, false));
+        assertEquals("ValidationError", failure.getErrorCode());
 
         verifyNoInteractions(classic, targets, service.ec2Service);
         assertEquals(List.of(owned, retained), group.getInstances());
-    }
-
-    @Test
-    void detachDeregistersOnlyActualMembersBeforeRemovingOwnership() {
-        group.setTargetGroupARNs(List.of("shared-target-group"));
-
-        service.detachInstances(REGION, "group", List.of("i-owned", "i-other-group"), false);
-
-        verify(targets).deregisterTargets(eq(REGION), eq("shared-target-group"),
-                argThat(values -> values.size() == 1 && "i-owned".equals(values.getFirst().getId())));
-        assertEquals(List.of(retained), group.getInstances());
     }
 
     @Test
