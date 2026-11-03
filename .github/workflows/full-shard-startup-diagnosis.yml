@@ -1,0 +1,132 @@
+name: Full shard startup diagnosis
+
+on:
+  push:
+    branches: [ci/full-shard-startup-20261103]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-shard-startup-diagnosis-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SHARD_TOTAL: 5
+  BASELINE_REVISION: 076da4ae9b0540599dfcc15bf3576d49572f6e64
+
+jobs:
+  diagnose:
+    name: Full shard 5 (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [plain, profiled]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASELINE_REVISION }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: .ci-diagnostic
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+        with:
+          java-version: '25'
+          distribution: temurin
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: dependencies
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
+      - name: Record comparison inputs and apply identical optional profiling hook
+        env:
+          CACHE_HIT: ${{ steps.dependencies.outputs.cache-hit }}
+          DIAGNOSTIC_MODE: ${{ matrix.mode }}
+        run: |
+          mkdir -p profiling
+          git rev-parse HEAD > profiling/source-revision.txt
+          test "$(cat profiling/source-revision.txt)" = "$BASELINE_REVISION"
+          git apply .ci-diagnostic/.github/ci/startup-profile/pom-profile.patch
+          git diff --exit-code -- src .github/ci/partition.sh .github/ci/prefetch-images.sh
+          sha256sum pom.xml > profiling/pom.sha256
+          python3 - <<'PYTHON'
+          import json, os, pathlib
+          pathlib.Path('profiling/comparison.json').write_text(json.dumps({
+              'mode': os.environ['DIAGNOSTIC_MODE'],
+              'cacheHit': os.environ['CACHE_HIT'],
+              'runnerImage': os.environ.get('ImageOS'),
+              'runnerImageVersion': os.environ.get('ImageVersion'),
+              'cpuCount': os.cpu_count(),
+              'shard': 5, 'shardTotal': 5
+          }, indent=2) + '\n')
+          PYTHON
+      - name: Compute unchanged full shard 5
+        run: |
+          cd src/test/java
+          find . \( -name '*Test.java' -o -name 'Test*.java' -o -name '*Tests.java' -o -name '*TestCase.java' \)             | sed 's|^\./||; s|\.java$||' | LC_ALL=C sort > "$GITHUB_WORKSPACE/all-classes.txt"
+          cd "$GITHUB_WORKSPACE"
+          .github/ci/partition.sh all-classes.txt "$SHARD_TOTAL" 5 > shard.txt
+          test -s shard.txt
+          sha256sum all-classes.txt shard.txt > profiling/inventory.sha256
+      - name: Prefetch unchanged shard images
+        run: .github/ci/prefetch-images.sh shard.txt || true
+      - name: Compile with phase timestamps
+        run: |
+          date -u +%FT%TZ > profiling/compile-start.txt
+          result=0
+          ./mvnw test-compile -B || result=$?
+          date -u +%FT%TZ > profiling/compile-end.txt
+          exit "$result"
+      - name: Verify compiled inventory
+        run: |
+          cd target/test-classes
+          find . \( -name '*Test.class' -o -name 'Test*.class' -o -name '*Tests.class' -o -name '*TestCase.class' \) ! -name '*$*'             | sed 's|^\./||; s|\.class$||' | LC_ALL=C sort > "$RUNNER_TEMP/compiled-classes.txt"
+          cd "$GITHUB_WORKSPACE"
+          diff -u all-classes.txt "$RUNNER_TEMP/compiled-classes.txt"
+      - name: Run identical full shard with phase timestamps
+        env:
+          DIAGNOSTIC_MODE: ${{ matrix.mode }}
+        run: |
+          date -u +%FT%TZ > profiling/tests-start.txt
+          result=0
+          if [ "$DIAGNOSTIC_MODE" = profiled ]; then
+            bash .ci-diagnostic/.github/ci/startup-profile/run-profiled-shard.sh || result=$?
+          else
+            ./mvnw surefire:test -B -Dsurefire.includesFile="$GITHUB_WORKSPACE/shard.txt"               -Dsurefire.failIfNoTests=true -Dsurefire.timeout=1200               -Dquarkus.builder.metrics.enabled=true || result=$?
+          fi
+          date -u +%FT%TZ > profiling/tests-end.txt
+          echo "$result" > profiling/tests-exit-code.txt
+          exit "$result"
+      - name: Summarize recording and remove private artifacts
+        if: always()
+        run: |
+          trap 'rm -f target/ci-profile/*.jfr target/ci-profile/*.json' EXIT
+          if [ -f target/ci-profile/surefire.jfr ]; then
+            python3 .ci-diagnostic/.github/ci/startup-profile/summarize.py               target/ci-profile/surefire.jfr profiling/sanitized-samples.json
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: full-shard-5-${{ matrix.mode }}
+          path: |
+            profiling/source-revision.txt
+            profiling/comparison.json
+            profiling/pom.sha256
+            profiling/inventory.sha256
+            profiling/compile-start.txt
+            profiling/compile-end.txt
+            profiling/tests-start.txt
+            profiling/tests-end.txt
+            profiling/tests-exit-code.txt
+            profiling/sanitized-samples.json
+            shard.txt
+            all-classes.txt
+            target/surefire-reports/TEST-*.xml
+          if-no-files-found: error
