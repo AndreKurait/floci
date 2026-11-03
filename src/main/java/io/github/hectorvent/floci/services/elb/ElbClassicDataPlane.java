@@ -63,7 +63,9 @@ public class ElbClassicDataPlane {
         this.ec2 = ec2;
         this.config = config;
         this.vertx = vertx;
-        this.client = vertx.createHttpClient(new HttpClientOptions().setConnectTimeout(5000).setKeepAlive(true));
+        // Classic backend certificate authentication is optional and its policy APIs are unsupported.
+        this.client = vertx.createHttpClient(new HttpClientOptions().setConnectTimeout(5000).setKeepAlive(true)
+                .setTrustAll(true).setVerifyHost(false));
     }
 
     void register(@Observes Router router) {
@@ -127,7 +129,8 @@ public class ElbClassicDataPlane {
                 .findFirst().orElse(null);
         if (listener == null || !"HTTP".equalsIgnoreCase(listener.getProtocol())
                 && !"HTTPS".equalsIgnoreCase(listener.getProtocol())
-                || listener.getInstanceProtocol() != null && !"HTTP".equalsIgnoreCase(listener.getInstanceProtocol())) {
+                || listener.getInstanceProtocol() != null && !"HTTP".equalsIgnoreCase(listener.getInstanceProtocol())
+                && !"HTTPS".equalsIgnoreCase(listener.getInstanceProtocol())) {
             fail(context, 502);
             return;
         }
@@ -142,6 +145,7 @@ public class ElbClassicDataPlane {
         // Docker bridge IP. Resolve off the event loop, then pin the checked address for this request.
         vertx.executeBlocking(() -> targetAddress(target), false).onSuccess(address -> {
             RequestOptions options = new RequestOptions().setHost(address).setPort(listener.getInstancePort())
+                    .setSsl("HTTPS".equalsIgnoreCase(listener.getInstanceProtocol()))
                     .setURI(context.request().uri()).setMethod(context.request().method())
                     .setTimeout(lb.getAttributes().getIdleTimeout() * 1000L);
             client.request(options).onSuccess(upstream -> forward(context, upstream, originalAuthority))
