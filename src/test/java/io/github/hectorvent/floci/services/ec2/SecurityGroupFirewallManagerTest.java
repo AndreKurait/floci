@@ -4,6 +4,8 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectImageResponse;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.model.Container;
+import com.github.dockerjava.api.model.ContainerNetwork;
+import com.github.dockerjava.api.model.ContainerNetworkSettings;
 import com.github.dockerjava.api.model.Info;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource;
@@ -20,6 +22,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -29,14 +34,143 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class SecurityGroupFirewallManagerTest {
+
+    @Test
+    void dnsLookupDoesNotWaitForTheFirewallMonitor() throws Exception {
+        SecurityGroupFirewallManager manager = dnsManager(mock(DockerClient.class));
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            synchronized (manager) {
+                assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-a")),
+                        executor.submit(() -> manager.vpcForClient("172.18.0.2")).get(2, TimeUnit.SECONDS),
+                        "DNS must not wait for the monitor held during Docker nft execution");
+            }
+        }
+    }
+
+    @Test
+    void dnsRetirementObservesHelperStateAndItsActualTransportAddress() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        ListContainersCmd listing = mock(ListContainersCmd.class, RETURNS_SELF);
+        when(dockerClient.listContainersCmd()).thenReturn(listing);
+        SecurityGroupFirewallManager manager = dnsManager(dockerClient);
+        registerOrigin(manager, "eni-live", "helper-live", "172.18.0.2", "vpc-live");
+        registerOrigin(manager, "eni-stopped", "helper-stopped", "172.18.0.3", "vpc-stopped");
+        registerOrigin(manager, "eni-removed", "helper-removed", "172.18.0.4", "vpc-removed");
+        registerOrigin(manager, "eni-detached", "helper-detached", "172.18.0.5", "vpc-detached");
+        List<Container> observed = List.of(
+                dnsHelper("helper-live", "running", "172.18.0.2"),
+                dnsHelper("helper-stopped", "exited", "172.18.0.3"),
+                dnsHelper("helper-detached", "running", "172.19.0.5"),
+                dnsHelper("unmanaged-replacement", "running", "172.18.0.4"));
+        when(listing.exec()).thenReturn(observed);
+
+        manager.retireDnsOrigins();
+
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-live")),
+                manager.vpcForClient("172.18.0.2"));
+        assertTrue(manager.vpcForClient("172.18.0.3").isEmpty(), "a stopped helper no longer owns queries");
+        assertTrue(manager.vpcForClient("172.18.0.4").isEmpty(), "IP reuse does not inherit another VPC");
+        assertTrue(manager.vpcForClient("172.18.0.5").isEmpty(), "a detached address no longer belongs to the helper");
+        assertTrue(manager.vpcForClient("172.19.0.5").isEmpty(), "Docker changes cannot admit a new origin");
+    }
+
+    @Test
+    void dnsRetirementCannotRemoveAConcurrentReplacement() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        ListContainersCmd listing = mock(ListContainersCmd.class, RETURNS_SELF);
+        when(dockerClient.listContainersCmd()).thenReturn(listing);
+        SecurityGroupFirewallManager manager = dnsManager(dockerClient);
+        registerOrigin(manager, "eni-old", "helper-old", "172.18.0.2", "vpc-old");
+        when(listing.exec()).thenAnswer(ignored -> {
+            manager.unregister("eni-old");
+            registerOrigin(manager, "eni-new", "helper-new", "172.18.0.2", "vpc-new");
+            return List.of();
+        });
+
+        manager.retireDnsOrigins();
+
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-new")),
+                manager.vpcForClient("172.18.0.2"));
+    }
+
+    @Test
+    void dnsRetirementDoesNotWaitForTheFirewallMonitor() throws Exception {
+        DockerClient dockerClient = mock(DockerClient.class);
+        ListContainersCmd listing = mock(ListContainersCmd.class, RETURNS_SELF);
+        when(dockerClient.listContainersCmd()).thenReturn(listing);
+        when(listing.exec()).thenReturn(List.of());
+        SecurityGroupFirewallManager manager = dnsManager(dockerClient);
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            synchronized (manager) {
+                executor.submit(manager::retireDnsOrigins).get(2, TimeUnit.SECONDS);
+                assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+            }
+        }
+    }
+
+    @Test
+    void unregisterRetiresDnsBeforeDockerRemovalCompletes() {
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(mock(DockerClient.class),
+                mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class), mock(EmbeddedDnsServer.class)));
+        doNothing().when(manager).reconcileAll();
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        doAnswer(ignored -> {
+            assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+            return null;
+        }).when(lifecycle).removeIfExists("helper-a");
+
+        manager.unregister("eni-a");
+
+        verify(lifecycle).removeIfExists("helper-a");
+    }
+
+    @Test
+    void emptyDnsRegistryDoesNotQueryDocker() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        SecurityGroupFirewallManager manager = dnsManager(dockerClient);
+        manager.retireDnsOrigins();
+        assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+        verifyNoInteractions(dockerClient);
+    }
+
+    private static SecurityGroupFirewallManager dnsManager(DockerClient dockerClient) {
+        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(dockerClient,
+                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), mock(EmulatorConfig.class),
+                mock(EmbeddedDnsServer.class)));
+        doNothing().when(manager).reconcileAll();
+        return manager;
+    }
+
+    private static void registerOrigin(SecurityGroupFirewallManager manager, String eni, String helper,
+                                       String address, String vpc) {
+        manager.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", vpc,
+                eni, "10.0.1.10", address, Set.of(), List.of()), helper, Map.of());
+    }
+
+    private static Container dnsHelper(String id, String state, String address) {
+        Container helper = mock(Container.class);
+        when(helper.getId()).thenReturn(id);
+        when(helper.getState()).thenReturn(state);
+        ContainerNetwork network = mock(ContainerNetwork.class);
+        when(network.getIpAddress()).thenReturn(address);
+        ContainerNetworkSettings settings = mock(ContainerNetworkSettings.class);
+        when(settings.getNetworks()).thenReturn(Map.of("transport", network));
+        when(helper.getNetworkSettings()).thenReturn(settings);
+        return helper;
+    }
 
     @Test
     void dnsOriginsUseRegisteredTransportAddressesAndTheirCompleteVpcScope() {
