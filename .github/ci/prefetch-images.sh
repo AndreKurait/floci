@@ -138,6 +138,23 @@ REDSHIFT_PG18_TEST="$(find src/test/java -name RedshiftMaxErrorPostgres18Integra
 REDSHIFT_PG18_IMAGE="$(grep -oE '"postgres:[^"]+"' "${REDSHIFT_PG18_TEST:-/dev/null}" | tr -d '"')"
 starts RedshiftMaxErrorPostgres18IntegrationTest \
     && [ -n "$REDSHIFT_PG18_IMAGE" ] && pull "$REDSHIFT_PG18_IMAGE"
+# CodeArtifact's real registry fixtures each use one configured sidecar image.
+# Keep unrelated unit-test shards from pulling all four registries.
+codeartifact_image() {
+    image="$(awk -v key="$1" '/^    codeartifact:/ { in_service=1; next } in_service && /^    [a-z]/ { exit } in_service && $1 == key ":" { gsub(/"/, "", $2); print $2; exit }' src/main/resources/application.yml)"
+    if [ -n "$image" ]; then
+        pull "$image"
+    else
+        echo "$(date -u +%H:%M:%S) prefetch skipped: codeartifact.$1 not readable" >> "$PREFETCH_LOG"
+    fi
+}
+starts CodeArtifactMavenDockerIntegrationTest CodeArtifactMavenExternalConnectionDockerIntegrationTest \
+    && codeartifact_image maven-image
+starts CodeArtifactNpmDockerIntegrationTest CodeArtifactNpmExternalConnectionDockerIntegrationTest \
+    && codeartifact_image npm-image
+starts CodeArtifactNuGetDockerIntegrationTest CodeArtifactNuGetExternalConnectionDockerIntegrationTest \
+    && codeartifact_image nuget-image
+starts CodeArtifactPypiDockerIntegrationTest && codeartifact_image pypi-image
 # The InfluxDB and k3s pins live in application.yml like the sidecars above.
 INFLUX_IMAGE="$(grep -oE 'default-image: *"influxdb:[^"]+"' src/main/resources/application.yml | grep -oE '"[^"]+"' | tr -d '"')"
 grep -q '/timestreaminfluxdb/' "$SHARD_FILE" && [ -n "$INFLUX_IMAGE" ] && pull "$INFLUX_IMAGE"
