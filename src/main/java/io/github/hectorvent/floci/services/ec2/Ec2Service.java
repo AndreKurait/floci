@@ -4401,7 +4401,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         List<SecurityGroup> current = securityGroups.scan(k -> k.startsWith(region + "::"));
         Map<String, SecurityGroup> byId = current.stream()
                 .collect(Collectors.toMap(SecurityGroup::getGroupId, Function.identity()));
-        containerManager.refreshSecurityGroups(region, byId, policyPrefixLists(region, current));
+        containerManager.refreshSecurityGroups(callerAccountId(), region, byId, policyPrefixLists(region, current));
     }
 
     private void restoreInstanceFirewall(Instance instance) {

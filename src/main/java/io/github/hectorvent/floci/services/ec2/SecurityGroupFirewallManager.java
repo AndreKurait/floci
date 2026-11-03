@@ -248,18 +248,21 @@ public class SecurityGroupFirewallManager {
         }
     }
 
-    /** Refreshes every affected EC2 instance and ECS task after a control-plane rule change. */
-    public synchronized void refreshPolicies(String region, Map<String, SecurityGroup> groups,
+    /** Refreshes the caller's EC2 instances and ECS tasks after a control-plane rule change. */
+    public synchronized void refreshPolicies(String accountId, String region, Map<String, SecurityGroup> groups,
                                              Map<String, List<String>> prefixLists) {
         for (Map.Entry<String, ProtectedEndpoint> entry : new ArrayList<>(endpoints.entrySet())) {
             ProtectedEndpoint current = entry.getValue();
             SecurityGroupNftCompiler.Endpoint identity = current.endpoint();
-            if (!region.equals(identity.region())) {
+            if (!accountId.equals(identity.accountId()) || !region.equals(identity.region())) {
                 continue;
             }
             List<SecurityGroup> attached = identity.groupIds().stream().map(groups::get).toList();
             if (attached.stream().anyMatch(group -> group == null)) {
-                endpoints.values().forEach(endpoint -> quarantine(endpoint.helperId()));
+                endpoints.values().stream()
+                        .filter(endpoint -> accountId.equals(endpoint.endpoint().accountId())
+                                && region.equals(endpoint.endpoint().region()))
+                        .forEach(endpoint -> quarantine(endpoint.helperId()));
                 throw new IllegalStateException("A protected endpoint's security group disappeared");
             }
             SecurityGroupNftCompiler.Endpoint updated = new SecurityGroupNftCompiler.Endpoint(
