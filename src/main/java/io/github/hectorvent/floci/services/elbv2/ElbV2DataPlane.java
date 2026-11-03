@@ -225,6 +225,8 @@ public class ElbV2DataPlane {
     @PostConstruct
     void init() {
         proxyClient = vertx.createHttpClient(new HttpClientOptions()
+                .setTrustAll(true)
+                .setVerifyHost(false)
                 .setMaxPoolSize(100)
                 .setConnectTimeout(5000)
                 .setKeepAlive(true)
@@ -1092,14 +1094,15 @@ public class ElbV2DataPlane {
         List<String> cookies = duration > 0 ? stickyCookie.headers(scope, tg, target) : List.of();
         int targetPort = ElbV2HealthChecker.effectivePort(target, tg);
         String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, target);
+        boolean secure = "HTTPS".equals(tg.getProtocol());
         boolean preserveHostHeader = Boolean.parseBoolean(
                 loadBalancerAttribute(listenerArn, region, PRESERVE_HOST_HEADER_ATTRIBUTE));
         if (isWebSocketUpgrade(req)) {
-            proxyUpgrade(req, host, targetPort, preserveHostHeader, forwarded,
+            proxyUpgrade(req, host, targetPort, secure, preserveHostHeader, forwarded,
                     idleTimeoutMillis(listenerArn, region), cookies);
             return;
         }
-        proxyRequest(req, host, targetPort, preserveHostHeader, forwarded, cookies);
+        proxyRequest(req, host, targetPort, secure, preserveHostHeader, forwarded, cookies);
     }
 
     private String loadBalancerAttribute(String listenerArn, String region, String key) {
@@ -1355,20 +1358,21 @@ public class ElbV2DataPlane {
         return tuples.get(tuples.size() - 1).getTargetGroupArn();
     }
 
-    private void proxyRequest(HttpServerRequest req, String host, int port, boolean preserveHostHeader,
+    private void proxyRequest(HttpServerRequest req, String host, int port, boolean secure, boolean preserveHostHeader,
                               ElbV2ForwardedHeaders forwarded, List<String> cookies) {
         req.pause();
         if (ElbV2TargetResolver.isIpLiteral(host)) {
             try {
                 proxyRequestTo(req, ElbV2TargetResolver.resolveCheckedAddress(host), host, port,
-                        preserveHostHeader, forwarded, cookies);
+                        secure, preserveHostHeader, forwarded, cookies);
             } catch (IOException e) {
                 rejectTarget(req, host, e);
             }
             return;
         }
         vertx.<String>executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(host))
-                .onSuccess(address -> proxyRequestTo(req, address, host, port, preserveHostHeader, forwarded, cookies))
+                .onSuccess(address -> proxyRequestTo(req, address, host, port, secure,
+                        preserveHostHeader, forwarded, cookies))
                 .onFailure(err -> rejectTarget(req, host, err));
     }
 
@@ -1378,9 +1382,10 @@ public class ElbV2DataPlane {
         req.response().setStatusCode(503).end("Service unavailable");
     }
 
-    private void proxyRequestTo(HttpServerRequest req, String address, String host, int port,
+    private void proxyRequestTo(HttpServerRequest req, String address, String host, int port, boolean secure,
                                 boolean preserveHostHeader, ElbV2ForwardedHeaders forwarded, List<String> cookies) {
         RequestOptions opts = new RequestOptions()
+                .setSsl(secure)
                 .setHost(address)
                 .setPort(port)
                 .setURI(req.uri())
@@ -1451,20 +1456,20 @@ public class ElbV2DataPlane {
         return WebSocketUpgrades.isHandshake(req);
     }
 
-    private void proxyUpgrade(HttpServerRequest req, String host, int port, boolean preserveHostHeader,
+    private void proxyUpgrade(HttpServerRequest req, String host, int port, boolean secure, boolean preserveHostHeader,
                               ElbV2ForwardedHeaders forwarded, long idleTimeoutMillis, List<String> cookies) {
         req.pause();
         if (ElbV2TargetResolver.isIpLiteral(host)) {
             try {
                 proxyUpgradeTo(req, ElbV2TargetResolver.resolveCheckedAddress(host), host, port,
-                        preserveHostHeader, forwarded, idleTimeoutMillis, cookies);
+                        secure, preserveHostHeader, forwarded, idleTimeoutMillis, cookies);
             } catch (IOException e) {
                 rejectTarget(req, host, e);
             }
             return;
         }
         vertx.<String>executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(host))
-                .onSuccess(address -> proxyUpgradeTo(req, address, host, port, preserveHostHeader,
+                .onSuccess(address -> proxyUpgradeTo(req, address, host, port, secure, preserveHostHeader,
                         forwarded, idleTimeoutMillis, cookies))
                 .onFailure(err -> rejectTarget(req, host, err));
     }
@@ -1474,10 +1479,11 @@ public class ElbV2DataPlane {
      * relays that answer and joins the two connections into a byte tunnel. Any other answer means
      * the target refused the upgrade and is relayed as an ordinary response.
      */
-    private void proxyUpgradeTo(HttpServerRequest req, String address, String host, int port,
+    private void proxyUpgradeTo(HttpServerRequest req, String address, String host, int port, boolean secure,
                                 boolean preserveHostHeader, ElbV2ForwardedHeaders forwarded,
                                 long idleTimeoutMillis, List<String> cookies) {
         RequestOptions opts = new RequestOptions()
+                .setSsl(secure)
                 .setHost(address)
                 .setPort(port)
                 .setURI(req.uri())

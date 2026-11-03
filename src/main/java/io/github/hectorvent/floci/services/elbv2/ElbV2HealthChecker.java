@@ -2,18 +2,24 @@ package io.github.hectorvent.floci.services.elbv2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.concurrent.SocketDeadline;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.vertx.core.Vertx;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -27,6 +33,7 @@ public class ElbV2HealthChecker implements Resettable {
     private final Vertx vertx;
     private final EmulatorConfig config;
     private final Ec2Service ec2Service;
+    private final SSLSocketFactory backendTls = backendTls();
 
     // tgArn → (targetKey → TargetState)
     private final Map<String, Map<String, TargetState>> states = new ConcurrentHashMap<>();
@@ -154,7 +161,7 @@ public class ElbV2HealthChecker implements Resettable {
             int probePort = healthCheckPort(tg, port);
 
             vertx.executeBlocking(() -> {
-                return probe(host, probePort, path, timeout);
+                return probe(host, probePort, path, timeout, tg.getHealthCheckProtocol());
             }).onSuccess(statusCode -> {
                 boolean success = matchesStatusCode(statusCode, matcher);
                 if (success) {
@@ -198,9 +205,18 @@ public class ElbV2HealthChecker implements Resettable {
         }
     }
 
-    private int probe(String host, int port, String path, int timeoutSeconds) throws IOException {
-        URL url = new URL("http", ElbV2TargetResolver.resolveCheckedAddress(host), port, path);
+    private int probe(String host, int port, String path, int timeoutSeconds, String protocol) throws IOException {
+        return SocketDeadline.call(timeoutSeconds, () -> probeOnce(host, port, path, timeoutSeconds, protocol));
+    }
+
+    private int probeOnce(String host, int port, String path, int timeoutSeconds, String protocol) throws IOException {
+        String scheme = "HTTPS".equals(protocol) ? "https" : "http";
+        URL url = new URL(scheme, ElbV2TargetResolver.resolveCheckedAddress(host), port, path);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        if (conn instanceof HttpsURLConnection https) {
+            https.setSSLSocketFactory(backendTls);
+            https.setHostnameVerifier((hostname, session) -> true);
+        }
         conn.setConnectTimeout(timeoutSeconds * 1000);
         conn.setReadTimeout(timeoutSeconds * 1000);
         conn.setRequestMethod("GET");
@@ -210,6 +226,17 @@ public class ElbV2HealthChecker implements Resettable {
             return conn.getResponseCode();
         } finally {
             conn.disconnect();
+        }
+    }
+
+    private static SSLSocketFactory backendTls() {
+        try {
+            // ALB encrypts target connections without validating target certificates.
+            SSLContext context = SSLContext.getInstance("TLS");
+            context.init(null, InsecureTrustManagerFactory.INSTANCE.getTrustManagers(), null);
+            return context.getSocketFactory();
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("Cannot initialize ELBv2 backend TLS", e);
         }
     }
 
