@@ -18,6 +18,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 
 import java.nio.file.Path;
 import java.time.Clock;
@@ -35,6 +36,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -700,18 +702,28 @@ class ProvisionedConcurrencyPoolTest {
         LambdaAliasStore aliasLookup = spy(aliases);
         doThrow(new IllegalStateException("controlled scheduler lookup outage"))
                 .when(aliasLookup).getForAccount(ACCOUNT, REGION, "example", "live");
+        ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
         pool = new ProvisionedConcurrencyPool(launcher, functions, aliasLookup,
-                storage, Clock.systemUTC(), 4, 8, false, 15);
+                storage, Clock.systemUTC(), 4, 8, false, 15, scheduler);
         pool.start();
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
-                verify(aliasLookup, atLeast(2)).getForAccount(ACCOUNT, REGION, "example", "live"));
+        ArgumentCaptor<Runnable> repair = ArgumentCaptor.forClass(Runnable.class);
+        verify(scheduler).scheduleWithFixedDelay(repair.capture(), eq(0L), eq(10L), eq(TimeUnit.SECONDS));
+        repair.getValue().run();
+        await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
+                verify(aliasLookup, times(1)).getForAccount(ACCOUNT, REGION, "example", "live"));
+        repair.getValue().run();
+        await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
+                verify(aliasLookup, times(2)).getForAccount(ACCOUNT, REGION, "example", "live"));
         doCallRealMethod().when(aliasLookup).getForAccount(ACCOUNT, REGION, "example", "live");
-        await().atMost(Duration.ofSeconds(15)).until(() -> !launcher.launched.isEmpty());
+        repair.getValue().run();
+        await().atMost(Duration.ofSeconds(3)).until(() -> !launcher.launched.isEmpty());
         Environment replacement = launched();
         replacement.initialized.complete(null);
         ready();
         assertEquals("READY", get().status());
         assertEquals(1, first.stops.get());
+        pool.shutdown();
+        verify(scheduler).shutdownNow();
     }
 
     @Test
