@@ -128,6 +128,16 @@ grep -q 'RdsAwsIntegrationTest' "$SHARD_FILE" && [ -n "$SQLSERVER_IMAGE" ] && pu
 REDSHIFT_PG_IMAGE="$(grep -oE 'image-version: *postgres:[^ ]+' src/main/resources/application.yml | awk '{print $2}')"
 grep -qE '/redshift/|/cloudformation/' "$SHARD_FILE" && [ -n "$REDSHIFT_PG_IMAGE" ] && pull "$REDSHIFT_PG_IMAGE"
 grep -qE '/rds/|/rdsdata/' "$SHARD_FILE" && pull postgres:16.3-alpine
+# These DSQL fixtures start the configured PostgreSQL sidecar; unit-only shards do not.
+DSQL_IMAGE="$(awk '/^    dsql:/ { in_dsql=1; next } in_dsql && /^    [a-z]/ { exit } in_dsql && /^      image:/ { gsub(/"/, "", $2); print $2; exit }' src/main/resources/application.yml)"
+starts DsqlDataPlaneIntegrationTest DsqlClusterPolicyIntegrationTest DsqlTransactionAgeIntegrationTest \
+    && [ -n "$DSQL_IMAGE" ] && pull "$DSQL_IMAGE"
+# This regression deliberately overrides Redshift's default image to PostgreSQL 18.
+# Read that test's pin so updating its override also updates the prefetch.
+REDSHIFT_PG18_TEST="$(find src/test/java -name RedshiftMaxErrorPostgres18IntegrationTest.java -print -quit)"
+REDSHIFT_PG18_IMAGE="$(grep -oE '"postgres:[^"]+"' "${REDSHIFT_PG18_TEST:-/dev/null}" | tr -d '"')"
+starts RedshiftMaxErrorPostgres18IntegrationTest \
+    && [ -n "$REDSHIFT_PG18_IMAGE" ] && pull "$REDSHIFT_PG18_IMAGE"
 # The InfluxDB and k3s pins live in application.yml like the sidecars above.
 INFLUX_IMAGE="$(grep -oE 'default-image: *"influxdb:[^"]+"' src/main/resources/application.yml | grep -oE '"[^"]+"' | tr -d '"')"
 grep -q '/timestreaminfluxdb/' "$SHARD_FILE" && [ -n "$INFLUX_IMAGE" ] && pull "$INFLUX_IMAGE"
