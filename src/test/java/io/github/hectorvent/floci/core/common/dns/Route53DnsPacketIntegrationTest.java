@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -44,6 +45,45 @@ class Route53DnsPacketIntegrationTest {
     EmulatorConfig config;
 
     private final List<String> zoneIds = new ArrayList<>();
+
+    @ParameterizedTest
+    @CsvSource({"1,1", "2,1", "1,28", "2,28"})
+    void privateCnamePreservesMissingTargetResponseAcrossTheWire(int depth, int type) throws Exception {
+        String name = uniqueName() + ".example";
+        String id = route53.createHostedZone(name, UUID.randomUUID().toString(), null,
+                new VpcAssociation("vpc-cname-negative", "us-east-1")).zone().getId();
+        zoneIds.add(id);
+        DnsClientVpcSource.ClientVpc origin = new DnsClientVpcSource.ClientVpc(
+                config.defaultAccountId(), "us-east-1", "vpc-cname-negative");
+        String missing = "missing." + name;
+        for (int hop = 0; hop < depth; hop++) {
+            String target = hop + 1 == depth ? missing : "alias" + (hop + 1) + "." + name;
+            change(id, "CREATE", record("alias" + hop + "." + name, "CNAME", 30, target + "."));
+        }
+
+        assertEquals(3, ByteBuffer.wrap(query(request(missing, type), origin)).getShort(2) & 15);
+        byte[] response = query(request("alias0." + name, type), origin);
+        assertEquals(3, ByteBuffer.wrap(response).getShort(2) & 15,
+                "A private CNAME must preserve its target's NXDOMAIN response");
+        assertEquals(0, ByteBuffer.wrap(response).getShort(6));
+
+        ResourceRecordSet text = record(missing, "TXT", 60, "\"present\"");
+        change(id, "CREATE", text);
+        byte[] noData = query(request("alias0." + name, type), origin);
+        assertEquals(0, ByteBuffer.wrap(noData).getShort(2) & 15);
+        assertEquals(0, ByteBuffer.wrap(noData).getShort(6));
+        change(id, "DELETE", text);
+        assertEquals(3, ByteBuffer.wrap(query(request("alias0." + name, type), origin)).getShort(2) & 15);
+
+        change(id, "CREATE", record(missing, "A", 600, "192.0.2.17"));
+        byte[] request = request("alias0." + name, 1);
+        byte[] restored = query(request, origin);
+        assertEquals(0, ByteBuffer.wrap(restored).getShort(2) & 15);
+        assertEquals(1, ByteBuffer.wrap(restored).getShort(6));
+        assertEquals(30, ByteBuffer.wrap(restored).getInt(request.length + 6));
+        assertArrayEquals(new DnsRecord.Address(1, "192.0.2.17").data(),
+                Arrays.copyOfRange(restored, restored.length - 4, restored.length));
+    }
 
     @AfterEach
     void deleteOwnedZones() {
@@ -295,7 +335,12 @@ class Route53DnsPacketIntegrationTest {
     }
 
     private byte[] query(byte[] request) throws Exception {
-        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of("amazonaws.com"), List.of(source));
+        return query(request, null);
+    }
+
+    private byte[] query(byte[] request, DnsClientVpcSource.ClientVpc origin) throws Exception {
+        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of("amazonaws.com"), List.of(source),
+                List.of(), List.of(address -> Optional.ofNullable(origin)));
         DatagramSocket server = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
         DatagramSocket client = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
         try {
