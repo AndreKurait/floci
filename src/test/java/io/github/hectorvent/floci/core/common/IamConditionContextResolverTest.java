@@ -22,6 +22,8 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 import java.io.ByteArrayInputStream;
@@ -941,6 +943,7 @@ class IamConditionContextResolverTest {
         assertEquals(List.of("000000000000"), conditions.get("aws:PrincipalAccount"));
         assertEquals(List.of("eu-west-2"), conditions.get("aws:RequestedRegion"));
         assertEquals(List.of("false"), conditions.get("aws:PrincipalIsAWSService"));
+        assertFalse(conditions.containsKey("s3:ResourceAccount"));
     }
 
     @Test
@@ -954,16 +957,19 @@ class IamConditionContextResolverTest {
         assertFalse(conditions.containsKey("aws:SecureTransport"));
     }
 
-    @Test
-    void resourceAccountIsTheBucketOwnerWhenAnS3ArnCarriesNoAccount() {
+    @ParameterizedTest
+    @ValueSource(strings = {"arn:aws:s3:::partner-bucket", "arn:aws:s3:::partner-bucket/report.csv",
+            "arn:aws-cn:s3:::partner-bucket/report.csv", "arn:aws-us-gov:s3:::partner-bucket"})
+    void resourceAccountIsTheBucketOwnerWhenAnS3ArnCarriesNoAccount(String resourceArn) {
         // S3 bucket and object ARNs have an empty account segment by design, so the owner has to
         // come from service state. Falling back to the caller would make a cross-account bucket
         // look like the caller's own.
         Map<String, List<String>> conditions = IamConditionContextResolver.withGlobalContext(
-                null, "arn:aws:s3:::partner-bucket/report.csv", "eu-west-2",
+                null, resourceArn, "eu-west-2",
                 "000000000000", "111111111111");
 
         assertEquals(List.of("111111111111"), conditions.get("aws:ResourceAccount"));
+        assertEquals(List.of("111111111111"), conditions.get("s3:ResourceAccount"));
         assertEquals(List.of("000000000000"), conditions.get("aws:PrincipalAccount"));
     }
 
@@ -974,6 +980,7 @@ class IamConditionContextResolverTest {
 
         assertFalse(conditions.containsKey("aws:ResourceAccount"),
                 "guessing the owner would authorize cross-account access a Condition meant to refuse");
+        assertFalse(conditions.containsKey("s3:ResourceAccount"));
         assertEquals(List.of("000000000000"), conditions.get("aws:PrincipalAccount"));
     }
 
@@ -1016,6 +1023,7 @@ class IamConditionContextResolverTest {
         assertFalse(conditions.containsKey("aws:SourceArn"));
         assertFalse(conditions.containsKey("aws:SourceAccount"));
         assertEquals(List.of("111122223333"), conditions.get("aws:ResourceAccount"));
+        assertEquals(List.of("111122223333"), conditions.get("s3:ResourceAccount"));
     }
 
     private Decision decisionForEveryTarget(String policy, String action, ContainerRequestContext request) {
