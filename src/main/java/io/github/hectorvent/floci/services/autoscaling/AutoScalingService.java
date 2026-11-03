@@ -134,20 +134,19 @@ public class AutoScalingService implements PassedRoleLookup {
     StorageFactory storageFactory;
 
     @Inject
-    EmulatorConfig config;
-
-    @Inject
     Ec2Service ec2Service;
 
     private final ElbV2Service elbV2Service;
+    private final EmulatorConfig config;
 
     @Inject
-    public AutoScalingService(ElbV2Service elbV2Service) {
+    public AutoScalingService(ElbV2Service elbV2Service, EmulatorConfig config) {
         this.elbV2Service = elbV2Service;
+        this.config = config;
     }
 
     AutoScalingService() {
-        this(null);
+        this(null, null);
     }
 
     // region :: name → resource
@@ -1833,7 +1832,8 @@ public class AutoScalingService implements PassedRoleLookup {
     void validateCapacityReservationSpecification(CapacityReservationSpecification specification, String region) {
         int maxCapacityReservationIds = config == null ? 1 : config.services().autoscaling().maxCapacityReservationIds();
         List<String> multipleCapacityReservationScopes = config == null ? List.of()
-                : config.services().autoscaling().multipleCapacityReservationScopes().orElse(List.of());
+                : config.services().autoscaling().multipleCapacityReservationScopes().orElse(List.of()).stream()
+                        .map(String::trim).toList();
         if (!multipleCapacityReservationScopes.isEmpty()
                 && (regionResolver == null || !multipleCapacityReservationScopes.contains(
                         regionResolver.getAccountId() + "/" + region))) {

@@ -50,7 +50,7 @@ class AutoScalingStandbyServiceTest {
     void setUp() {
         elb = mock(ElbV2Service.class);
         classic = mock(ElbClassicService.class);
-        service = new AutoScalingService(elb);
+        service = new AutoScalingService(elb, null);
         service.regionResolver = new RegionResolver(REGION, "000000000000");
         group = service.createAutoScalingGroup(REGION, GROUP, null, "lt-original", null, "1", null,
                 0, 4, 2, 300, List.of(REGION + "a"), List.of(), List.of("target-group"),

@@ -65,7 +65,7 @@ class AutoScalingServiceTest {
     @Test
     void detachDeregistersOnlyActualMembersBeforeRemovingOwnership() {
         ElbV2Service elb = mock(ElbV2Service.class);
-        AutoScalingService selected = new AutoScalingService(elb);
+        AutoScalingService selected = new AutoScalingService(elb, null);
         selected.ec2Service = mock(Ec2Service.class);
         selected.regionResolver = new RegionResolver(REGION, "000000000000");
         AutoScalingGroup group = service.requireGroup(REGION, "test-asg");
@@ -87,7 +87,7 @@ class AutoScalingServiceTest {
     @Test
     void detachDeregistrationFailurePreservesMembershipForRetry() {
         ElbV2Service elb = mock(ElbV2Service.class);
-        AutoScalingService selected = new AutoScalingService(elb);
+        AutoScalingService selected = new AutoScalingService(elb, null);
         selected.ec2Service = mock(Ec2Service.class);
         selected.regionResolver = new RegionResolver(REGION, "000000000000");
         selected.groups = service.groups;
