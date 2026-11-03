@@ -327,7 +327,7 @@ public class EcsContainerManager {
                 String metadataId = UUID.randomUUID().toString().replace("-", "");
                 metadataIdsByContainer.put(def.getName(), metadataId);
                 List<String> containerEnv = new ArrayList<>(buildEnvVars(def, overridesByName.get(def.getName()), region,
-                        metadataId, taskRoleEndpoint.vending(), dockerFlags));
+                        metadataId, taskRoleEndpoint.vending() || usesInstanceRole(task, taskDef), dockerFlags));
                 String imdsEndpoint = instanceMetadataEndpoint(task, dockerFlags);
                 if (imdsEndpoint != null && containerEnv.stream()
                         .noneMatch(kv -> kv.startsWith(INSTANCE_METADATA_ENDPOINT_ENV + "="))) {
@@ -592,6 +592,7 @@ public class EcsContainerManager {
                 if (def == firelensRouter) {
                     dockerId = lifecycleManager.create(spec, platform);
                     try {
+                        registerPendingInstanceMetadata(task, region, dockerId);
                         AdditionalDockerNetworks.attach(lifecycleManager.getDockerClient(), dockerId, joinNetworks);
                         copyFirelensConfig(dockerId, firelensConfig, isFluentdRouter(firelensRouter),
                                 firelensExternalConfig, firelensBackoffMillis);
@@ -601,12 +602,15 @@ public class EcsContainerManager {
                         throw e;
                     }
                     fluentHost = inspectContainerIp(dockerId);
-                } else if (joinNetworks.isEmpty()) {
+                } else if (joinNetworks.isEmpty() && !servesInstanceMetadata(task)) {
                     ContainerInfo info = lifecycleManager.createAndStartEphemeral(spec, platform);
                     dockerId = info.containerId();
                 } else {
-                    ContainerInfo info = lifecycleManager.createAndStartEphemeral(spec, platform, created ->
-                            AdditionalDockerNetworks.attach(lifecycleManager.getDockerClient(), created, joinNetworks));
+                    // IMDS knows the container before its process starts (it may ask at once).
+                    ContainerInfo info = lifecycleManager.createAndStartEphemeral(spec, platform, created -> {
+                        registerPendingInstanceMetadata(task, region, created);
+                        AdditionalDockerNetworks.attach(lifecycleManager.getDockerClient(), created, joinNetworks);
+                    });
                     dockerId = info.containerId();
                 }
                 registerInstanceMetadata(task, region, dockerId);
@@ -1894,6 +1898,12 @@ public class EcsContainerManager {
     }
 
     private String inspectContainerIp(String dockerId) {
+        String ip = inspectContainerIpOrNull(dockerId);
+        return ip != null ? ip : "127.0.0.1";
+    }
+
+    /** The container's address, or null when Docker cannot say (never the loopback fallback). */
+    private String inspectContainerIpOrNull(String dockerId) {
         try {
             InspectContainerResponse inspect = lifecycleManager.getDockerClient().inspectContainerCmd(dockerId).exec();
             Map<String, ContainerNetwork> networks = inspect.getNetworkSettings().getNetworks();
@@ -1916,7 +1926,7 @@ public class EcsContainerManager {
         } catch (Exception e) {
             LOG.warnv("Could not resolve FireLens container IP for {0}: {1}", dockerId, e.getMessage());
         }
-        return "127.0.0.1";
+        return null;
     }
     /**
      * Issues the task's role credentials and makes sure the endpoint that serves them is up,
@@ -1982,6 +1992,7 @@ public class EcsContainerManager {
         if (taskRoleCredentials != null) {
             taskRoleCredentials.revoke(taskArn);
         }
+        releaseInstanceRole(taskArn);
     }
 
     /**
@@ -2015,6 +2026,42 @@ public class EcsContainerManager {
             new java.util.concurrent.ConcurrentHashMap<>();
     /** taskArn -> the container addresses registered for it. */
     private final Map<String, List<String>> metadataAddressesByTask = new java.util.concurrent.ConcurrentHashMap<>();
+    /** ec2InstanceId -> the tasks registered with IMDS as that instance, which share its credentials. */
+    private final Map<String, Set<String>> metadataTasksByInstance = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Whether a task's SDK is meant to find the container instance's instance-profile role through
+     * IMDS, as an ECS-on-EC2 task without a task role does: placed on an instance that carries a
+     * profile, and asking for no task role. Such a task is given no static keys, which the SDK
+     * would otherwise prefer over IMDS. A task with a task role keeps today's behaviour (the
+     * task-role endpoint when enabled, else the baseline keys).
+     */
+    boolean usesInstanceRole(EcsTask task, TaskDefinition taskDef) {
+        return instanceMetadataServer != null && task.getEc2InstanceId() != null
+                && task.getIamInstanceProfileArn() != null && !task.getIamInstanceProfileArn().isBlank()
+                && (taskDef.getTaskRoleArn() == null || taskDef.getTaskRoleArn().isBlank());
+    }
+
+    /**
+     * Revokes the instance-role credentials IMDS issued for a task's container instance once no
+     * task is left on it: the instance stands in for an EC2 host only while it runs tasks, and
+     * IMDS mints fresh credentials for the next task placed there.
+     */
+    private void releaseInstanceRole(String taskArn) {
+        if (instanceMetadataServer == null) {
+            return;
+        }
+        for (Map.Entry<String, Set<String>> entry : metadataTasksByInstance.entrySet()) {
+            if (entry.getValue().remove(taskArn) && entry.getValue().isEmpty()) {
+                String instanceId = entry.getKey();
+                metadataTasksByInstance.remove(instanceId, entry.getValue());
+                io.github.hectorvent.floci.services.ec2.model.Instance instance = metadataInstances.remove(instanceId);
+                if (instance != null) {
+                    instanceMetadataServer.unregisterInstance(instance);
+                }
+            }
+        }
+    }
 
     /** Floci's IMDS server as a task container reaches it, or null when the task is not on an EC2 instance. */
     String instanceMetadataEndpoint(EcsTask task, DockerFlags dockerFlags) {
@@ -2029,6 +2076,26 @@ public class EcsContainerManager {
         return "http://" + uri.getHost() + ":" + config.services().ec2().imdsPort();
     }
 
+    /**
+     * Before Docker starts a task container: IMDS resolves the container's address on its first
+     * request, so a process that asks for credentials as it starts is served.
+     */
+    private boolean servesInstanceMetadata(EcsTask task) {
+        return instanceMetadataServer != null && task.getEc2InstanceId() != null;
+    }
+
+    void registerPendingInstanceMetadata(EcsTask task, String region, String dockerId) {
+        if (!servesInstanceMetadata(task)) {
+            return;
+        }
+        io.github.hectorvent.floci.services.ec2.model.Instance instance =
+                metadataInstances.computeIfAbsent(task.getEc2InstanceId(), id -> containerInstanceHost(task, region, null));
+        metadataTasksByInstance.computeIfAbsent(task.getEc2InstanceId(), ignored -> ConcurrentHashMap.newKeySet())
+                .add(task.getTaskArn());
+        instanceMetadataServer.registerPendingContainer(dockerId, task.getTaskArn(),
+                () -> inspectContainerIpOrNull(dockerId), instance);
+    }
+
     void registerInstanceMetadata(EcsTask task, String region, String dockerId) {
         if (instanceMetadataServer == null || task.getEc2InstanceId() == null) {
             return;
@@ -2041,19 +2108,28 @@ public class EcsContainerManager {
         }
         io.github.hectorvent.floci.services.ec2.model.Instance instance =
                 metadataInstances.computeIfAbsent(task.getEc2InstanceId(), id -> containerInstanceHost(task, region, ip));
-        instanceMetadataServer.registerContainer(ip, task.getEc2InstanceId(), instance);
+        if (instance.getPrivateIpAddress() == null) {
+            instance.setPrivateIpAddress(ip);
+        }
+        instanceMetadataServer.registerContainer(ip, task.getEc2InstanceId(), instance, task.getTaskArn());
+        instanceMetadataServer.forgetPendingContainer(dockerId);
+        metadataTasksByInstance.computeIfAbsent(task.getEc2InstanceId(), ignored -> ConcurrentHashMap.newKeySet())
+                .add(task.getTaskArn());
         metadataAddressesByTask.computeIfAbsent(task.getTaskArn(), ignored -> new java.util.concurrent.CopyOnWriteArrayList<>())
                 .add(ip);
     }
 
     private void releaseInstanceMetadata(String taskArn) {
         List<String> addresses = metadataAddressesByTask.remove(taskArn);
-        if (addresses == null || instanceMetadataServer == null) {
+        if (instanceMetadataServer == null) {
             return;
         }
-        for (String ip : addresses) {
-            metadataInstances.values().forEach(instance -> instanceMetadataServer.unregisterContainer(ip, instance));
+        // Only addresses this task still owns: Docker may have given one to a later task already.
+        for (String ip : addresses == null ? List.<String>of() : addresses) {
+            metadataInstances.values().forEach(instance ->
+                    instanceMetadataServer.unregisterContainer(ip, instance, taskArn));
         }
+        metadataInstances.values().forEach(instance -> instanceMetadataServer.unregisterContainer(null, instance, taskArn));
     }
 
     /** The EC2 instance a container instance stands for, as IMDS describes it. */
@@ -2071,6 +2147,8 @@ public class EcsContainerManager {
         instance.setOwnerId(accountOf(task.getTaskArn()));
         instance.setState(io.github.hectorvent.floci.services.ec2.model.InstanceState.running());
         instance.setPrivateIpAddress(ip);
+        // The profile IMDS serves credentials for; Ec2MetadataServer checks IAM holds it per request.
+        instance.setIamInstanceProfileArn(task.getIamInstanceProfileArn());
         return instance;
     }
 

@@ -118,6 +118,13 @@ class IamServiceTest {
         assertFalse(service.isRoleSession("ASIAUSER", "user-token"));
         assertFalse(service.isRoleSession("ASIAFEDERATED", "federated-token"));
         assertFalse(service.isRoleSession("ASIAUNKNOWN", "token"));
+        // An EC2 instance-profile session is not role chaining: on AWS a process on the instance may
+        // assume a role for longer than an hour (an SDK config session may ask for 8 h).
+        SessionCredential instance = new SessionCredential("ASIAINSTANCE", "secret", "instance-token",
+                role.getArn(), clock.instant().plusSeconds(60), null, "000000000000");
+        instance.setEc2InstanceId("i-0abc000000000001");
+        service.registerEc2InstanceSession(instance);
+        assertFalse(service.isRoleSession("ASIAINSTANCE", "instance-token"));
         clock.advance(Duration.ofSeconds(60));
         assertFalse(service.isRoleSession("ASIACHAIN", "token"));
     }
