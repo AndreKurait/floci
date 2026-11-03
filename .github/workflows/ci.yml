@@ -86,7 +86,7 @@ jobs:
         classes\": CLASSES,\n    }\nfor key in (\"productionSha256\", \"testInventorySha256\"\
         , \"classes\"):\n    assert METRICS[\"inputs\"][\"baseline\"][key] == METRICS[\"\
         inputs\"][\"candidate\"][key]\nsave()\n\nexpected_changes = sorted([\n   \
-        \ \"pom.xml\",\n    \"src/test/java/io/github/hectorvent/floci/services/cognito/RdsParameterGroupEngineIntegrationTest.java\"\
+        \ \"pom.xml\",\n    \"src/test/java/io/github/hectorvent/floci/services/rds/RdsParameterGroupEngineIntegrationTest.java\"\
         ,\n])\nactual_changes = sorted(subprocess.check_output([\n    \"git\", \"\
         -C\", \"candidate\", \"diff\", \"--name-only\", SOURCES[\"baseline\"], \"\
         HEAD\"\n], text=True).splitlines())\nassert actual_changes == expected_changes,\
