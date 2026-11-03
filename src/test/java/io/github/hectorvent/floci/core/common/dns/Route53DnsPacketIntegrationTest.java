@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common.dns;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.route53.Route53DnsRecordSource;
 import io.github.hectorvent.floci.services.route53.Route53Service;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecord;
@@ -39,6 +40,8 @@ class Route53DnsPacketIntegrationTest {
     Route53DnsRecordSource source;
     @Inject
     Vertx vertx;
+    @Inject
+    EmulatorConfig config;
 
     private final List<String> zoneIds = new ArrayList<>();
 
@@ -186,8 +189,10 @@ class Route53DnsPacketIntegrationTest {
                 new VpcAssociation("vpc-dns-packet", "us-east-1")).zone().getId();
         zoneIds.add(privateId);
         change(privateId, "CREATE", record("address." + name, "A", 60, "192.0.2.9"));
-        assertEquals(List.of("192.0.2.9"), source.resolve("address." + name, 1).orElseThrow().addresses());
-        assertFalse(source.resolve("marker." + name, 16).orElseThrow().isPublicAuthorityAnswer());
+        DnsClientVpcSource.ClientVpc origin = new DnsClientVpcSource.ClientVpc(
+                config.defaultAccountId(), "us-east-1", "vpc-dns-packet");
+        assertEquals(List.of("192.0.2.9"), source.resolve("address." + name, 1, origin).orElseThrow().addresses());
+        assertFalse(source.resolve("marker." + name, 16, origin).orElseThrow().isPublicAuthorityAnswer());
     }
 
     @Test
