@@ -11,6 +11,7 @@ import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
+import io.vertx.core.http.UpgradeRejectedException;
 import io.vertx.core.http.WebSocket;
 import io.vertx.core.http.WebSocketConnectOptions;
 import io.vertx.core.net.NetServer;
@@ -35,9 +36,13 @@ import software.amazon.awssdk.services.elasticloadbalancingv2.model.Matcher;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.TargetDescription;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.TargetHealthDescription;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.ProxySelector;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -46,6 +51,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -54,7 +60,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.junit.jupiter.api.Assertions.*;
 
 @QuarkusTest
@@ -136,6 +141,44 @@ class ElbV2BackendTlsIntegrationTest {
         assertFalse(encrypted.get());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void healthProbeConnectsDirectlyDespiteJvmProxyConfiguration(boolean tls) throws Exception {
+        HttpServer health = backend(tls);
+        AtomicInteger proxied = new AtomicInteger();
+        HttpServer proxy = vertx.createHttpServer().requestHandler(request -> {
+            proxied.incrementAndGet();
+            request.response().setStatusCode(503).end();
+        }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        cleanup.add(() -> proxy.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS));
+        ProxySelector previous = ProxySelector.getDefault();
+        ProxySelector.setDefault(new ProxySelector() {
+            @Override
+            public List<Proxy> select(URI uri) {
+                if (uri.getPort() == health.actualPort()) {
+                    return List.of(new Proxy(Proxy.Type.HTTP,
+                            new InetSocketAddress("127.0.0.1", proxy.actualPort())));
+                }
+                return previous == null ? List.of(Proxy.NO_PROXY) : previous.select(uri);
+            }
+
+            @Override
+            public void connectFailed(URI uri, SocketAddress address, IOException failure) {
+                fail("Health checks must connect directly to the target: " + uri, failure);
+            }
+        });
+        try {
+            createTarget("HTTP", health.actualPort(), tls ? "HTTPS" : "HTTP", health.actualPort(), "200");
+            await().atMost(Duration.ofSeconds(5)).until(() -> proxied.get() > 0
+                    || "healthy".equals(elb.describeTargetHealth(r -> r.targetGroupArn(groupArn))
+                            .targetHealthDescriptions().getFirst().targetHealth().stateAsString()));
+            assertEquals(0, proxied.get(), "The JVM proxy must not receive target health probes");
+            awaitHealth("healthy", null);
+        } finally {
+            ProxySelector.setDefault(previous);
+        }
+    }
+
     @Test
     void httpsHealthRejectsAReachablePlaintextServer() throws Exception {
         HttpServer plain = backend(false);
@@ -143,16 +186,44 @@ class ElbV2BackendTlsIntegrationTest {
         awaitHealth("unhealthy", "Target.FailedHealthChecks");
     }
 
-    @Test
-    void httpsTargetNeverFallsBackToPlaintext() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void httpsTargetNeverFallsBackToPlaintext(boolean websocket) throws Exception {
         HttpServer plain = backend(false);
         createTarget("HTTPS", plain.actualPort(), "HTTP", plain.actualPort(), "200");
         awaitHealth("healthy", null);
 
-        given().baseUri("http://127.0.0.1").port(listenerPort).header("Host", dns)
-                .body("must remain encrypted").post("/should-not-arrive")
-                .then().statusCode(greaterThanOrEqualTo(500));
+        assertForwardingFailure(websocket, 502);
         assertNull(received.get(), "The plaintext application must not receive the request");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unansweredBackendTlsHandshakeReturnsGatewayTimeout(boolean websocket) throws Exception {
+        CompletableFuture<Duration> disconnected = new CompletableFuture<>();
+        AtomicBoolean clientHello = new AtomicBoolean();
+        NetServer stalled = vertx.createNetServer().connectHandler(socket -> {
+            long accepted = System.nanoTime();
+            socket.handler(buffer -> {
+                if (buffer.length() > 0 && buffer.getUnsignedByte(0) == 22) {
+                    clientHello.set(true);
+                }
+            });
+            socket.closeHandler(ignored ->
+                    disconnected.complete(Duration.ofNanos(System.nanoTime() - accepted)));
+        }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        cleanup.add(() -> stalled.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS));
+        HttpServer health = backend(false);
+        createTarget("HTTPS", stalled.actualPort(), "HTTP", health.actualPort(), "200");
+        awaitHealth("healthy", null);
+
+        assertForwardingFailure(websocket, 504);
+        assertTrue(clientHello.get(), "The backend must receive the real TLS ClientHello");
+        Duration elapsed = disconnected.get(5, TimeUnit.SECONDS);
+        assertTrue(elapsed.compareTo(Duration.ofSeconds(9)) >= 0
+                        && elapsed.compareTo(Duration.ofSeconds(15)) < 0,
+                "An ALB backend TLS handshake has a ten-second deadline: " + elapsed);
+        assertNull(received.get(), "The native wait must end before an application request is sent");
     }
 
     @Test
@@ -292,6 +363,22 @@ class ElbV2BackendTlsIntegrationTest {
                     "Peer connections exceeded the configured health deadline: " + closed);
         });
         return server;
+    }
+
+    private void assertForwardingFailure(boolean websocket, int status) throws Exception {
+        if (!websocket) {
+            given().baseUri("http://127.0.0.1").port(listenerPort).header("Host", dns)
+                    .body("must remain encrypted").post("/should-not-arrive")
+                    .then().statusCode(status);
+            return;
+        }
+        HttpClient client = vertx.createHttpClient();
+        cleanup.add(() -> client.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS));
+        ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                client.webSocket(new WebSocketConnectOptions().setHost("127.0.0.1")
+                                .setPort(listenerPort).setURI("/socket.io/").addHeader("Host", dns))
+                        .toCompletionStage().toCompletableFuture().get(15, TimeUnit.SECONDS));
+        assertEquals(status, assertInstanceOf(UpgradeRejectedException.class, failure.getCause()).getStatus());
     }
 
     private HttpServer backend(boolean tls) throws Exception {

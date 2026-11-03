@@ -20,6 +20,8 @@ import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
+import io.netty.channel.ConnectTimeoutException;
+import io.netty.handler.ssl.SslHandshakeTimeoutException;
 import io.vertx.core.Future;
 import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
@@ -52,6 +54,7 @@ import javax.naming.ldap.Rdn;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
@@ -69,6 +72,8 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -228,7 +233,9 @@ public class ElbV2DataPlane {
                 .setTrustAll(true)
                 .setVerifyHost(false)
                 .setMaxPoolSize(100)
-                .setConnectTimeout(5000)
+                .setConnectTimeout(10_000)
+                .setSslHandshakeTimeout(10)
+                .setSslHandshakeTimeoutUnit(TimeUnit.SECONDS)
                 .setKeepAlive(true)
                 .setMaxHeaderSize(MAX_RESPONSE_HEADER_SIZE));
         tcpClient = vertx.createNetClient(new NetClientOptions().setConnectTimeout(5000)
@@ -1437,10 +1444,19 @@ public class ElbV2DataPlane {
                     clientReq.send(req);
                     req.resume();
                 })
-                .onFailure(err -> {
-                    req.resume();
-                    req.response().setStatusCode(503).end("Service unavailable");
-                });
+                .onFailure(err -> backendConnectionFailed(req, err));
+    }
+
+    private void backendConnectionFailed(HttpServerRequest req, Throwable error) {
+        req.resume();
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (cause instanceof ConnectTimeoutException || cause instanceof SslHandshakeTimeoutException
+                    || cause instanceof SocketTimeoutException || cause instanceof TimeoutException) {
+                req.response().setStatusCode(504).end("Gateway timeout");
+                return;
+            }
+        }
+        req.response().setStatusCode(502).end("Bad gateway");
     }
 
     private static void copyTargetResponseHeaders(MultiMap headers, HttpServerResponse response) {
@@ -1537,10 +1553,7 @@ public class ElbV2DataPlane {
                                 }
                             });
                 })
-                .onFailure(err -> {
-                    req.resume();
-                    req.response().setStatusCode(503).end("Service unavailable");
-                });
+                .onFailure(err -> backendConnectionFailed(req, err));
     }
 
     /**

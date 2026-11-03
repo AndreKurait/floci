@@ -92,11 +92,16 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
   and WebSocket upgrades. An HTTPS target requires a TLS handshake; a failed handshake
   never falls back to plaintext. Backend certificates may be self-signed or expired, as on
   AWS ALB. This trust setting applies only to the target clients and health checks.
+- Backend connection and TLS handshake errors return 502 for HTTP requests and WebSocket
+  upgrades. Connection and handshake timeouts use ten-second deadlines and return 504.
 - HTTP and HTTPS health checks use their own configured protocol and port, independently
   of the target's application protocol. HTTPS health checks require a TLS handshake,
   preserve the configured success-code matcher, and do not follow redirects.
 - One health-check deadline covers connection, TLS handshake and response headers.
   Partial bytes do not renew it. Expiry closes the probe and counts toward `Target.Timeout`.
+- Health probes connect directly without JVM proxy settings. A timed-out lookup keeps
+  its target and shared worker slot until the underlying work actually exits. This bounds
+  background work even when name resolution ignores interruption.
 - Backend TLS uses the runtime's supported protocols and ciphers. Floci does not reproduce
   AWS ALB's backend security-policy selection from the frontend listener policy.
 - ALB listeners share the emulator's network address. Stored subnet and security-group
@@ -158,8 +163,8 @@ types remain control-plane only.
 
 | Declared listener protocol | Local forwarding behavior | Target types and transport |
 |---|---|---|
-| `HTTP` | Parses and forwards HTTP requests; supports WebSocket upgrades. | `instance` resolves an EC2 private address; `ip` uses the registered address. Backend requests use plain HTTP. `lambda` invokes the registered function with an ALB event. |
-| `HTTPS` | Terminates TLS with an ACM or IAM certificate, then handles HTTP as above. | Same targets as HTTP; an HTTPS target-group setting does not enable TLS to the backend. |
+| `HTTP` | Parses and forwards HTTP requests; supports WebSocket upgrades. | `instance` resolves an EC2 private address; `ip` uses the registered address. The target-group protocol selects HTTP or HTTPS to the backend. `lambda` invokes the registered function with an ALB event. |
+| `HTTPS` | Terminates TLS with an ACM or IAM certificate, then handles HTTP as above. | Same targets and backend protocol selection as HTTP. |
 | `TCP` | Relays bytes bidirectionally without HTTP parsing or TLS termination (enabling TLS pass-through to the target). Requires a dedicated local port. | `instance` resolves an EC2 private address; `ip` uses the registered address. Selected round-robin per connection. |
 | `TLS` | Stored; certificate references are checked, but only `HTTPS` enables TLS on the local socket. TLS termination for NLB `TLS` listeners is unsupported (use a `TCP` listener for TLS pass-through). | No NLB TLS backend transport is implemented. |
 | `UDP`, `TCP_UDP` | Stored declarations do not create UDP sockets or UDP forwarding. | Datagram targets are unsupported. |
@@ -173,11 +178,12 @@ on the listener socket.
 
 ### Health checks
 
-For non-Lambda targets, the checker sends a **plain HTTP GET** to `HealthCheckPath`
+For non-Lambda targets, the checker sends an HTTP or HTTPS GET to `HealthCheckPath`
 on `HealthCheckPort`, or the target's traffic port when configured as `traffic-port`.
+`HealthCheckProtocol` selects TLS independently of the target's application protocol.
 The response-code matcher and healthy/unhealthy thresholds affect target health.
-`HealthCheckProtocol=TCP` does not perform a TCP-only probe, and `HTTPS` does not enable
-TLS for the probe. Lambda targets are not actively probed. In ELBv2 mock mode, sockets
+`HealthCheckProtocol=TCP` does not perform a TCP-only probe.
+Lambda targets are not actively probed. In ELBv2 mock mode, sockets
 and active monitoring are disabled. The proxy can route to initial targets and fails
 open to registered targets when none are healthy, so a successful request alone does
 not prove that a health check passed.
