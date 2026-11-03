@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import io.quarkus.test.junit.QuarkusTest;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -27,7 +28,6 @@ class Ec2ReplaceRouteIntegrationTest {
     private static final String DEFAULT_ROUTE = "0.0.0.0/0";
     private static final String UNROUTED_CIDR = "198.51.100.0/24";
     private static final String INTERNET_GATEWAY = "igw-0replace0route0test";
-    private static final String NAT_GATEWAY = "nat-0replace0route0test";
     private static final String DEFAULT_ROUTE_NODE =
             "DescribeRouteTablesResponse.routeTableSet.item.routeSet.item"
                     + ".find { it.destinationCidrBlock == '0.0.0.0/0' }";
@@ -35,6 +35,14 @@ class Ec2ReplaceRouteIntegrationTest {
             "DescribeRouteTablesResponse.routeTableSet.item.routeSet.item";
 
     private static String routeTableId;
+    private static NatGatewayFixture natGateway;
+
+    @AfterAll
+    static void retireNatGateway() {
+        if (natGateway != null) {
+            natGateway.close();
+        }
+    }
 
     @Test
     @Order(1)
@@ -48,6 +56,7 @@ class Ec2ReplaceRouteIntegrationTest {
         .then()
             .statusCode(200)
             .extract().path("CreateVpcResponse.vpc.vpcId");
+        natGateway = new NatGatewayFixture(AUTH_HEADER, vpcId, "203.0.113.0/24");
 
         routeTableId = given()
             .formParam("Action", "CreateRouteTable")
@@ -78,7 +87,7 @@ class Ec2ReplaceRouteIntegrationTest {
             .formParam("Action", "ReplaceRoute")
             .formParam("RouteTableId", routeTableId)
             .formParam("DestinationCidrBlock", DEFAULT_ROUTE)
-            .formParam("NatGatewayId", NAT_GATEWAY)
+            .formParam("NatGatewayId", natGateway.id())
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -99,7 +108,7 @@ class Ec2ReplaceRouteIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body(replaced + ".natGatewayId", equalTo(NAT_GATEWAY))
+            .body(replaced + ".natGatewayId", equalTo(natGateway.id()))
             // The route keeps the origin it was created with — ReplaceRoute is not an origin value.
             .body(replaced + ".origin", equalTo("CreateRoute"))
             // ...and only the addressed route moved.
@@ -156,7 +165,7 @@ class Ec2ReplaceRouteIntegrationTest {
         .then()
             .statusCode(200)
             .body(ROUTE_SET + ".find { it.destinationCidrBlock == '" + DEFAULT_ROUTE + "' }.natGatewayId",
-                    equalTo(NAT_GATEWAY));
+                    equalTo(natGateway.id()));
     }
 
     @Test
@@ -167,7 +176,7 @@ class Ec2ReplaceRouteIntegrationTest {
             .formParam("RouteTableId", routeTableId)
             .formParam("DestinationCidrBlock", DEFAULT_ROUTE)
             .formParam("GatewayId", INTERNET_GATEWAY)
-            .formParam("NatGatewayId", NAT_GATEWAY)
+            .formParam("NatGatewayId", natGateway.id())
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -190,7 +199,7 @@ class Ec2ReplaceRouteIntegrationTest {
             .formParam("Action", "ReplaceRoute")
             .formParam("RouteTableId", routeTableId)
             .formParam("DestinationCidrBlock", vpcCidr)
-            .formParam("NatGatewayId", NAT_GATEWAY)
+            .formParam("NatGatewayId", natGateway.id())
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -255,7 +264,7 @@ class Ec2ReplaceRouteIntegrationTest {
             .body(DEFAULT_ROUTE_NODE + ".gatewayId", equalTo(INTERNET_GATEWAY))
             .extract().asString();
 
-        assertThat(table, not(containsString(NAT_GATEWAY)));
+        assertThat(table, not(containsString(natGateway.id())));
     }
 
     /** A destination with no target at all must not blank the route and report success. */
@@ -344,7 +353,7 @@ class Ec2ReplaceRouteIntegrationTest {
             .formParam("Action", "ReplaceRoute")
             .formParam("RouteTableId", routeTableId)
             .formParam("DestinationCidrBlock", DEFAULT_ROUTE)
-            .formParam("NatGatewayId", NAT_GATEWAY)
+            .formParam("NatGatewayId", natGateway.id())
             .formParam("DryRun", "true")
             .header("Authorization", AUTH_HEADER)
         .when()
@@ -364,7 +373,7 @@ class Ec2ReplaceRouteIntegrationTest {
             .body(DEFAULT_ROUTE_NODE + ".gatewayId", equalTo(INTERNET_GATEWAY))
             .extract().asString();
 
-        assertThat(table, not(containsString(NAT_GATEWAY)));
+        assertThat(table, not(containsString(natGateway.id())));
     }
 
     @Test
@@ -374,7 +383,7 @@ class Ec2ReplaceRouteIntegrationTest {
             .formParam("Action", "ReplaceRoute")
             .formParam("RouteTableId", routeTableId)
             .formParam("DestinationCidrBlock", UNROUTED_CIDR)
-            .formParam("NatGatewayId", NAT_GATEWAY)
+            .formParam("NatGatewayId", natGateway.id())
             .formParam("DryRun", "true")
             .header("Authorization", AUTH_HEADER)
         .when()
