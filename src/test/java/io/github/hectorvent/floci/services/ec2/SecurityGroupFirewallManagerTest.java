@@ -20,6 +20,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -29,7 +34,10 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
@@ -68,6 +76,143 @@ class SecurityGroupFirewallManagerTest {
                 replacement.vpcId(), "eni-replacement", "10.0.1.10", "172.18.0.2", Set.of(), List.of()),
                 "helper-replacement", Map.of());
         assertEquals(Optional.of(replacement), origins.vpcForClient("172.18.0.2"));
+    }
+
+    @Test
+    void dnsLookupDoesNotWaitForTheReconciliationMonitor() throws Exception {
+        SecurityGroupFirewallManager manager = dnsManager(mock(ContainerLifecycleManager.class));
+        registerDnsEndpoint(manager, "eni-0", "vpc-a", "172.18.0.2");
+        CountDownLatch held = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> holder = executor.submit(() -> {
+                synchronized (manager) {
+                    held.countDown();
+                    assertTrue(release.await(5, TimeUnit.SECONDS));
+                }
+                return null;
+            });
+            try {
+                assertTrue(held.await(5, TimeUnit.SECONDS));
+                Future<Optional<DnsClientVpcSource.ClientVpc>> lookup = executor.submit(
+                        () -> manager.vpcForClient("172.18.0.2"));
+                assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-a")),
+                        lookup.get(1, TimeUnit.SECONDS));
+            } finally {
+                release.countDown();
+                holder.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    void retirementRemovesDnsOriginBeforeSlowHelperRemoval() throws Exception {
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager manager = dnsManager(lifecycle);
+        registerDnsEndpoint(manager, "eni-0", "vpc-a", "172.18.0.2");
+        CountDownLatch removing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            removing.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS));
+            return null;
+        }).when(lifecycle).removeIfExists("helper-eni-0");
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> retirement = executor.submit(() -> manager.unregister("eni-0"));
+            try {
+                assertTrue(removing.await(5, TimeUnit.SECONDS));
+                Future<Optional<DnsClientVpcSource.ClientVpc>> lookup = executor.submit(
+                        () -> manager.vpcForClient("172.18.0.2"));
+                assertTrue(lookup.get(1, TimeUnit.SECONDS).isEmpty());
+            } finally {
+                release.countDown();
+                retirement.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    void failedRegistrationRestoresThePreviousDnsScope() {
+        SecurityGroupFirewallManager manager = dnsManager(mock(ContainerLifecycleManager.class));
+        registerDnsEndpoint(manager, "eni-0", "vpc-a", "172.18.0.2");
+        doThrow(new IllegalStateException("reconciliation failed")).when(manager).reconcileAll();
+
+        assertThrows(IllegalStateException.class,
+                () -> registerDnsEndpoint(manager, "eni-0", "vpc-b", "172.18.0.3"));
+
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-a")),
+                manager.vpcForClient("172.18.0.2"));
+        assertTrue(manager.vpcForClient("172.18.0.3").isEmpty());
+    }
+
+    @Test
+    void registerRejectsSecondEniOnHeldTransportAddress() {
+        SecurityGroupFirewallManager manager = dnsManager(mock(ContainerLifecycleManager.class));
+        registerDnsEndpoint(manager, "eni-0", "vpc-a", "172.18.0.2");
+
+        assertThrows(IllegalStateException.class,
+                () -> registerDnsEndpoint(manager, "eni-1", "vpc-b", "172.18.0.2"));
+
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-a")),
+                manager.vpcForClient("172.18.0.2"));
+    }
+
+    @Test
+    void reconciliationRemovesOriginsOfStoppedHelpers() {
+        SecurityGroupFirewallManager manager = dnsManager(mock(ContainerLifecycleManager.class));
+        registerDnsEndpoint(manager, "eni-0", "vpc-a", "172.18.0.2");
+        doCallRealMethod().when(manager).reconcileAll();
+
+        manager.reconcileAll();
+
+        assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+    }
+
+    @Test
+    void pendingReplacementDoesNotExposeUncommittedDnsOrigin() throws Exception {
+        SecurityGroupFirewallManager manager = dnsManager(mock(ContainerLifecycleManager.class));
+        registerDnsEndpoint(manager, "eni-0", "vpc-a", "172.18.0.2");
+        CountDownLatch reconciling = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            reconciling.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS));
+            return null;
+        }).when(manager).reconcileAll();
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> replacement = executor.submit(
+                    () -> registerDnsEndpoint(manager, "eni-0", "vpc-b", "172.18.0.3"));
+            try {
+                assertTrue(reconciling.await(5, TimeUnit.SECONDS));
+                Future<?> lookup = executor.submit(() -> {
+                    assertTrue(manager.vpcForClient("172.18.0.3").isEmpty());
+                    assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc(
+                                    "111111111111", "us-east-1", "vpc-a")),
+                            manager.vpcForClient("172.18.0.2"));
+                });
+                lookup.get(1, TimeUnit.SECONDS);
+            } finally {
+                release.countDown();
+                replacement.get(5, TimeUnit.SECONDS);
+            }
+        }
+        assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-b")),
+                manager.vpcForClient("172.18.0.3"));
+    }
+
+    private static SecurityGroupFirewallManager dnsManager(ContainerLifecycleManager lifecycle) {
+        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(
+                mock(DockerClient.class, RETURNS_DEEP_STUBS), mock(ContainerBuilder.class), lifecycle,
+                mock(EmulatorConfig.class), mock(EmbeddedDnsServer.class)));
+        doNothing().when(manager).reconcileAll();
+        return manager;
+    }
+
+    private static void registerDnsEndpoint(SecurityGroupFirewallManager manager, String eniId,
+                                            String vpcId, String address) {
+        manager.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", vpcId,
+                eniId, "10.0.1.10", address, Set.of(), List.of()), "helper-" + eniId, Map.of());
     }
 
     @Test

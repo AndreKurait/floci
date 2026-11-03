@@ -46,6 +46,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private final EmulatorConfig config;
     private final EmbeddedDnsServer embeddedDnsServer;
     private final Map<String, ProtectedEndpoint> endpoints = new HashMap<>();
+    private volatile Map<String, ClientVpc> dnsOrigins = Map.of();
 
     @Inject
     public SecurityGroupFirewallManager(DockerClient dockerClient, ContainerBuilder containerBuilder,
@@ -64,14 +65,11 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     /** The DNS packet carries the helper's transport address, not the ENI's logical private IP. */
     @Override
-    public synchronized Optional<ClientVpc> vpcForClient(String clientAddress) {
+    public Optional<ClientVpc> vpcForClient(String clientAddress) {
         if (clientAddress == null || clientAddress.isBlank()) {
             return Optional.empty();
         }
-        return endpoints.values().stream().map(ProtectedEndpoint::endpoint)
-                .filter(endpoint -> clientAddress.equals(endpoint.transportAddress()))
-                .findFirst()
-                .map(endpoint -> new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId()));
+        return Optional.ofNullable(dnsOrigins.get(clientAddress));
     }
 
     @PostConstruct
@@ -193,12 +191,14 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 new ProtectedEndpoint(endpoint, helperId, Map.copyOf(prefixLists)));
         try {
             reconcileAll();
+            publishDnsOrigins();
         } catch (RuntimeException e) {
             if (previous == null) {
                 endpoints.remove(endpoint.eniId());
             } else {
                 endpoints.put(endpoint.eniId(), previous);
             }
+            publishDnsOrigins();
             quarantine(helperId);
             throw e;
         }
@@ -207,6 +207,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     public synchronized void unregister(String eniId) {
         ProtectedEndpoint removed = endpoints.remove(eniId);
         if (removed != null) {
+            publishDnsOrigins();
             lifecycleManager.removeIfExists(removed.helperId());
             reconcileAll();
         }
@@ -242,8 +243,11 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 running = false;
             }
             if (!running) {
-                quarantine(entry.getValue().helperId());
                 endpoints.remove(entry.getKey());
+                Map<String, ClientVpc> remainingOrigins = new HashMap<>(dnsOrigins);
+                remainingOrigins.remove(entry.getValue().endpoint().transportAddress());
+                dnsOrigins = Map.copyOf(remainingOrigins);
+                quarantine(entry.getValue().helperId());
             }
         }
         List<SecurityGroupNftCompiler.Endpoint> peers = endpoints.values().stream()
@@ -259,6 +263,18 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 throw e;
             }
         }
+    }
+
+    private void publishDnsOrigins() {
+        Map<String, ClientVpc> origins = new HashMap<>();
+        for (ProtectedEndpoint protectedEndpoint : endpoints.values()) {
+            SecurityGroupNftCompiler.Endpoint endpoint = protectedEndpoint.endpoint();
+            if (endpoint.transportAddress() != null && !endpoint.transportAddress().isBlank()) {
+                origins.put(endpoint.transportAddress(),
+                        new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId()));
+            }
+        }
+        dnsOrigins = Map.copyOf(origins);
     }
 
     /** Refreshes every affected EC2 instance and ECS task after a control-plane rule change. */
