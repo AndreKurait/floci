@@ -1618,6 +1618,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 if (zone != null) {
                     task.setAvailabilityZone(zone);
                 }
+                task.setIamInstanceProfileArn(
+                        containerInstanceAttribute(placedInstance, IAM_INSTANCE_PROFILE_ATTRIBUTE));
             }
             task.setNetworkConfiguration(networkConfiguration);
             task.setOverrides(request.getOverrides());
@@ -3745,6 +3747,13 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     static final String AVAILABILITY_ZONE_ATTRIBUTE = "ecs.availability-zone";
     static final String INSTANCE_TYPE_ATTRIBUTE = "ecs.instance-type";
+    /**
+     * Emulator control knob, not an ECS attribute: the instance-profile ARN of the EC2 instance a
+     * container instance stands for. Real ECS has no such attribute because the agent's host simply
+     * has an instance profile; Floci's container instances have no EC2 instance behind them, so the
+     * registration names the profile, and the instance's IMDS serves that profile's role.
+     */
+    public static final String IAM_INSTANCE_PROFILE_ATTRIBUTE = "floci.iam-instance-profile";
     private static final com.fasterxml.jackson.databind.ObjectMapper IDENTITY_DOCUMENT_MAPPER =
             new com.fasterxml.jackson.databind.ObjectMapper();
 
@@ -3795,6 +3804,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     public ContainerInstance registerContainerInstance(RegisterContainerInstanceRequest request,
                                                         String region) {
         EcsCluster cluster = resolveClusterOrDefault(request.getCluster(), region);
+        checkInstanceProfileAttribute(request.getAttributes());
         // The agent registers with the EC2 instance identity document of the host it runs on, and
         // ECS records that instance; only a registration without one gets a made-up instance id.
         Map<String, Object> identity = parseInstanceIdentityDocument(request.getInstanceIdentityDocument());
@@ -3834,6 +3844,29 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         refreshRegisteredInstanceCount(cluster, region);
         LOG.infov("Registered container instance: {0} in cluster {1}", instanceArn, cluster.getClusterName());
         return instance;
+    }
+
+    /**
+     * A {@link #IAM_INSTANCE_PROFILE_ATTRIBUTE} must name an instance profile of the registering
+     * account, as an EC2 instance can only carry one of its own account's profiles. Whether IAM
+     * holds the profile is checked when IMDS serves its credentials, so it may be created later.
+     */
+    private void checkInstanceProfileAttribute(List<Attribute> attributes) {
+        if (attributes == null) {
+            return;
+        }
+        for (Attribute attribute : attributes) {
+            if (!IAM_INSTANCE_PROFILE_ATTRIBUTE.equals(attribute.name())) {
+                continue;
+            }
+            String value = attribute.value();
+            String account = regionResolver.getAccountId();
+            if (value == null || !value.matches("arn:aws(-[a-z]+)*:iam::" + java.util.regex.Pattern.quote(account)
+                    + ":instance-profile/([\\w+=,.@-]+/)*[\\w+=,.@-]{1,128}")) {
+                throw new AwsException("InvalidParameterException", "Attribute " + IAM_INSTANCE_PROFILE_ATTRIBUTE
+                        + " must be the ARN of an instance profile in account " + account + ": " + value, 400);
+            }
+        }
     }
 
     /**

@@ -4501,6 +4501,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public boolean isRoleSession(String accessKeyId, String sessionToken) {
         return currentSession(accessKeyId)
                 .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                // An EC2 instance-profile session is the instance's own identity, not role chaining.
+                .filter(session -> session.getEc2InstanceId() == null)
                 .map(SessionCredential::getRoleArn)
                 .filter(AwsArnUtils::isArn)
                 .map(AwsArnUtils::parse)
