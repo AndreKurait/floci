@@ -54,7 +54,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private final EmulatorConfig config;
     private final EmbeddedDnsServer embeddedDnsServer;
     private final Map<String, ProtectedEndpoint> endpoints = new HashMap<>();
+    private final Map<String, Set<String>> pendingHelperCleanup = new HashMap<>();
     private final ConcurrentMap<String, DnsOrigin> dnsOrigins = new ConcurrentHashMap<>();
+    private boolean peerPoliciesNeedRefresh;
     private final SweepWorker dnsOriginObserver = new SweepWorker(
             "protected-namespace-dns", true, 1, false, ignored -> retireDnsOrigins());
 
@@ -98,6 +100,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     void retireDnsOrigins() {
         Map<String, DnsOrigin> observed = Map.copyOf(dnsOrigins);
         if (observed.isEmpty()) {
+            retireEndpoints(List.of());
             return;
         }
         Map<String, Set<String>> liveAddresses = new HashMap<>();
@@ -112,23 +115,44 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 liveAddresses.put(container.getId(), addresses);
             }
         }
+        List<DnsOrigin> retired = new ArrayList<>();
         observed.forEach((address, origin) -> {
             if (!liveAddresses.getOrDefault(origin.helperId(), Set.of()).contains(address)) {
                 // A new registration may already own this address; retire only the observed identity.
-                dnsOrigins.remove(address, origin);
+                dnsOrigins.computeIfPresent(address, (key, current) -> {
+                    if (current != origin) {
+                        return current;
+                    }
+                    retired.add(origin);
+                    return null;
+                });
             }
         });
+        retireEndpoints(retired);
+    }
+
+    private synchronized void retireEndpoints(List<DnsOrigin> retired) {
+        for (DnsOrigin origin : retired) {
+            ProtectedEndpoint current = endpoints.get(origin.eniId());
+            if (current != null && current.dnsOrigin() == origin) {
+                endpoints.remove(origin.eniId());
+                pendingHelperCleanup.computeIfAbsent(origin.eniId(), ignored -> new HashSet<>())
+                        .add(current.helperId());
+                peerPoliciesNeedRefresh = true;
+                quarantine(current.helperId());
+            }
+        }
+        if (peerPoliciesNeedRefresh) {
+            // A failed installation quarantines peers. Retry even when the last DNS origin is gone.
+            reconcileAll();
+            peerPoliciesNeedRefresh = false;
+        }
     }
 
     private void removeDnsOrigin(ProtectedEndpoint protectedEndpoint) {
         SecurityGroupNftCompiler.Endpoint endpoint = protectedEndpoint.endpoint();
-        dnsOrigins.remove(endpoint.transportAddress(), dnsOrigin(protectedEndpoint));
-    }
-
-    private DnsOrigin dnsOrigin(ProtectedEndpoint protectedEndpoint) {
-        SecurityGroupNftCompiler.Endpoint endpoint = protectedEndpoint.endpoint();
-        return new DnsOrigin(endpoint.eniId(), protectedEndpoint.helperId(),
-                new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId()));
+        dnsOrigins.computeIfPresent(endpoint.transportAddress(),
+                (address, current) -> current == protectedEndpoint.dnsOrigin() ? null : current);
     }
 
     @PostConstruct
@@ -255,7 +279,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             }
             ProtectedEndpoint admitted = endpoints.get(endpoint.eniId());
             if (admitted != null) {
-                dnsOrigins.put(endpoint.transportAddress(), dnsOrigin(admitted));
+                dnsOrigins.put(endpoint.transportAddress(), admitted.dnsOrigin());
+                pendingHelperCleanup.values().forEach(helpers -> helpers.remove(helperId));
+                pendingHelperCleanup.values().removeIf(Set::isEmpty);
             }
         } catch (RuntimeException e) {
             if (previous == null) {
@@ -272,9 +298,20 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         ProtectedEndpoint removed = endpoints.remove(eniId);
         if (removed != null) {
             removeDnsOrigin(removed);
-            lifecycleManager.removeIfExists(removed.helperId());
-            reconcileAll();
+            pendingHelperCleanup.computeIfAbsent(eniId, ignored -> new HashSet<>()).add(removed.helperId());
+            peerPoliciesNeedRefresh = true;
         }
+        if (peerPoliciesNeedRefresh) {
+            reconcileAll();
+            peerPoliciesNeedRefresh = false;
+        }
+        // Retiring peer permissions must not discard the owning service's later cleanup obligation.
+        Set<String> helpers = pendingHelperCleanup.getOrDefault(eniId, Set.of());
+        for (String helper : new ArrayList<>(helpers)) {
+            lifecycleManager.removeIfExistsStrict(helper);
+            helpers.remove(helper);
+        }
+        pendingHelperCleanup.remove(eniId);
     }
 
     public synchronized void updateGroups(String eniId, Set<String> groupIds,
@@ -293,7 +330,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         SecurityGroupNftCompiler.Endpoint updated = new SecurityGroupNftCompiler.Endpoint(
                 identity.accountId(), identity.region(), identity.vpcId(), identity.eniId(),
                 identity.logicalAddress(), identity.transportAddress(), Set.copyOf(groupIds), attached);
-        endpoints.put(eniId, new ProtectedEndpoint(updated, current.helperId(), Map.copyOf(prefixLists)));
+        endpoints.put(eniId, new ProtectedEndpoint(updated, current.helperId(), Map.copyOf(prefixLists),
+                current.dnsOrigin()));
         reconcileAll();
     }
 
@@ -309,6 +347,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             if (!running) {
                 removeDnsOrigin(entry.getValue());
                 endpoints.remove(entry.getKey());
+                pendingHelperCleanup.computeIfAbsent(entry.getKey(), ignored -> new HashSet<>())
+                        .add(entry.getValue().helperId());
+                peerPoliciesNeedRefresh = true;
                 quarantine(entry.getValue().helperId());
             }
         }
@@ -347,7 +388,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                     identity.accountId(), identity.region(), identity.vpcId(), identity.eniId(),
                     identity.logicalAddress(), identity.transportAddress(), identity.groupIds(), attached);
             endpoints.put(entry.getKey(), new ProtectedEndpoint(updated, current.helperId(),
-                    Map.copyOf(prefixLists)));
+                    Map.copyOf(prefixLists), current.dnsOrigin()));
         }
         reconcileAll();
     }
@@ -445,5 +486,11 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     public record Namespace(String helperId, String transportAddress) {}
     private record ProtectedEndpoint(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
-                                     Map<String, List<String>> prefixLists) {}
+                                     Map<String, List<String>> prefixLists, DnsOrigin dnsOrigin) {
+        private ProtectedEndpoint(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
+                                  Map<String, List<String>> prefixLists) {
+            this(endpoint, helperId, prefixLists, new DnsOrigin(endpoint.eniId(), helperId,
+                    new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId())));
+        }
+    }
 }
