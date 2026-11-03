@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.autoscaling;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
@@ -136,17 +137,20 @@ public class AutoScalingService implements PassedRoleLookup {
     @Inject
     Ec2Service ec2Service;
 
+    private final EmulatorConfig config;
     private final ElbV2Service elbV2Service;
     private final ElbClassicService elbClassicService;
 
     @Inject
-    public AutoScalingService(ElbV2Service elbV2Service, ElbClassicService elbClassicService) {
+    public AutoScalingService(ElbV2Service elbV2Service, ElbClassicService elbClassicService,
+                              EmulatorConfig config) {
+        this.config = config;
         this.elbV2Service = elbV2Service;
         this.elbClassicService = elbClassicService;
     }
 
     AutoScalingService() {
-        this(null, null);
+        this(null, null, null);
     }
 
     // region :: name → resource
@@ -403,7 +407,7 @@ public class AutoScalingService implements PassedRoleLookup {
         }
         validateEffectiveLaunchImage(region, launchConfigName, launchTemplateId, launchTemplateName,
                 launchTemplateVersion, mixedInstancesPolicy);
-        validateOptionalFields(optionalFields);
+        validateOptionalFields(optionalFields, region);
         validateDesiredCapacityType(
                 optionalFields != null ? optionalFields.desiredCapacityType() : null,
                 mixedInstancesPolicy);
@@ -465,7 +469,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 throw new AwsException("ValidationError",
                         "LaunchTemplateVersion requires a LaunchTemplateId or LaunchTemplateName.", 400);
             }
-            validateOptionalFields(optionalFields);
+            validateOptionalFields(optionalFields, region);
             rejectDesiredConfigurationUpdateDuringActiveRefresh(region, name,
                     launchConfigName, launchTemplateId, launchTemplateName, launchTemplateVersion, mixedInstancesPolicy);
             LaunchIdentity effectiveIdentity = effectiveLaunchIdentity(asg, launchConfigName,
@@ -1872,7 +1876,7 @@ public class AutoScalingService implements PassedRoleLookup {
         return overrides != null ? overrides : List.of();
     }
 
-    private static void validateOptionalFields(AsgOptionalFields optionalFields) {
+    private void validateOptionalFields(AsgOptionalFields optionalFields, String region) {
         if (optionalFields == null) {
             return;
         }
@@ -1901,7 +1905,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 && !CAPACITY_DISTRIBUTION_STRATEGIES.contains(azDistribution.getCapacityDistributionStrategy())) {
             throw new AwsException("ValidationError", INVALID_CAPACITY_DISTRIBUTION_STRATEGY_MESSAGE, 400);
         }
-        validateCapacityReservationSpecification(optionalFields.capacityReservationSpecification());
+        validateCapacityReservationSpecification(optionalFields.capacityReservationSpecification(), region);
     }
 
     /**
@@ -1935,7 +1939,20 @@ public class AutoScalingService implements PassedRoleLookup {
         }
     }
 
-    static void validateCapacityReservationSpecification(CapacityReservationSpecification specification) {
+    void validateCapacityReservationSpecification(CapacityReservationSpecification specification) {
+        validateCapacityReservationSpecification(specification, regionResolver == null ? null : regionResolver.getRegion());
+    }
+
+    void validateCapacityReservationSpecification(CapacityReservationSpecification specification, String region) {
+        int maxCapacityReservationIds = config == null ? 1 : config.services().autoscaling().maxCapacityReservationIds();
+        List<String> multipleCapacityReservationScopes = config == null ? List.of()
+                : config.services().autoscaling().multipleCapacityReservationScopes().orElse(List.of()).stream()
+                        .map(String::trim).toList();
+        if (!multipleCapacityReservationScopes.isEmpty()
+                && (regionResolver == null || !multipleCapacityReservationScopes.contains(
+                        regionResolver.getAccountId() + "/" + region))) {
+            maxCapacityReservationIds = 1;
+        }
         if (specification == null) {
             return;
         }
@@ -1950,9 +1967,13 @@ public class AutoScalingService implements PassedRoleLookup {
                 && !specification.getCapacityReservationResourceGroupArns().isEmpty()) {
             throw new AwsException("ValidationError", MIXED_CAPACITY_RESERVATION_TARGETS_MESSAGE, 400);
         }
-        if (specification.getCapacityReservationIds().size()
-                + specification.getCapacityReservationResourceGroupArns().size() > 1) {
+        if (specification.getCapacityReservationResourceGroupArns().size() > 1) {
             throw new AwsException("ValidationError", MULTIPLE_CAPACITY_RESERVATION_TARGETS_MESSAGE, 400);
+        }
+        if (specification.getCapacityReservationIds().size() > maxCapacityReservationIds) {
+            String message = maxCapacityReservationIds == 1 ? MULTIPLE_CAPACITY_RESERVATION_TARGETS_MESSAGE
+                    : "Specifying more than " + maxCapacityReservationIds + " CapacityReservationIds is not supported.";
+            throw new AwsException("ValidationError", message, 400);
         }
         for (String id : specification.getCapacityReservationIds()) {
             if (id == null || id.isEmpty() || id.length() > 255

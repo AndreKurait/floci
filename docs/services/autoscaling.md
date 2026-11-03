@@ -44,13 +44,36 @@ and zero capacity. Both groups had identical configuration except for name, ARN
 and creation time. The SDK regression is
 `compatibility-tests/sdk-test-python/tests/test_autoscaling_subnet_whitespace.py`.
 
-Capacity reservation targets remain limited to one reservation ID or one resource
+By default, capacity reservation targets are limited to one reservation ID or one resource
 group ARN. Multiple entries, including duplicates, return `ValidationError`;
 mixing IDs and group ARNs returns a distinct validation message. These messages
 match live AWS comparisons on November 2, 2026 in `us-east-1` and `eu-west-1`
 for create, and `eu-west-1` for update, using zero desired capacity.
-Rejected updates preserve the group's existing configuration. This does not
-enable preview support for multiple reservation targets.
+Rejected updates preserve the group's existing configuration.
+
+To model a workload with a different direct-reservation limit, explicitly set
+`floci.services.autoscaling.max-capacity-reservation-ids` (environment variable
+`FLOCI_SERVICES_AUTOSCALING_MAX_CAPACITY_RESERVATION_IDS`) to a positive integer.
+Zero and negative values are rejected at startup. The default is `1`. This
+emulator setting does not reproduce account or service allowlisting, and an
+increased value is not a claim of general AWS availability.
+Resource-group ARN targets remain limited to one, and mixing target types is
+always rejected. For accepted direct ID lists, scale-out and instance refresh
+try the supplied reservations using EC2's zone, type, platform, tenancy and
+capacity checks. `capacity-reservations-first` falls back to on-demand only after
+all supplied targets lack matching capacity; `capacity-reservations-only` remains
+under desired capacity until a target can satisfy the launch. Other EC2 errors
+remain failures.
+
+To restrict the increased limit to selected accounts and regions, set
+`FLOCI_SERVICES_AUTOSCALING_MULTIPLE_CAPACITY_RESERVATION_SCOPES` to a
+comma-separated list of exact `account-id/region` pairs, such as
+`123456789012/us-east-1,123456789012/us-west-2`, alongside the increased limit.
+Whitespace around each pair is ignored. All other scopes retain the one-ID limit.
+With no scope list, the configured limit continues to apply throughout this emulator
+deployment. Scope selection
+uses the resolved request account and operation region; it adds no request
+headers, grants no IAM permissions, and does not deploy AWS service principals.
 
 Scale-out follows the [AWS placement rules](https://docs.aws.amazon.com/autoscaling/ec2/userguide/auto-scaling-benefits.html):
 choose the zone with the fewest active instances, then its subnet with the most
@@ -331,7 +354,7 @@ never set a field omits it from the response rather than reporting a default.
 | `ServiceLinkedRoleARN` | Stored and echoed as given, 1 to 1600 characters. Floci does not check that the role exists, and a group that never set it omits it rather than reporting the default `AWSServiceRoleForAutoScaling` role |
 | `InstanceMaintenancePolicy` | `MinHealthyPercentage` 0 to 100 and `MaxHealthyPercentage` 100 to 200, both required, at most 100 apart. `-1` on both clears a policy already set. Any other combination raises `ValidationError` |
 | `AvailabilityZoneDistribution` | `CapacityDistributionStrategy` is one of `balanced-only`, `balanced-best-effort`, `reservations-then-balanced` |
-| `CapacityReservationSpecification` | `CapacityReservationPreference` is one of `capacity-reservations-only`, `capacity-reservations-first`, `none`, `default`. `CapacityReservationTarget` (`CapacityReservationIds`, `CapacityReservationResourceGroupArns`) round-trips, accepts at most one ID or resource group ARN, and is rejected alongside `none`. Each ID is 1 to 255 characters of `[A-Za-z0-9-_/]` and each resource group ARN is 1 to 1600 characters |
+| `CapacityReservationSpecification` | `CapacityReservationPreference` is one of `capacity-reservations-only`, `capacity-reservations-first`, `none`, `default`. `CapacityReservationTarget` (`CapacityReservationIds`, `CapacityReservationResourceGroupArns`) round-trips, accepts one direct ID by default or more when the configured limit and account/region scope allow it, accepts at most one resource group ARN, and is rejected alongside `none`. Each ID is 1 to 255 characters of `[A-Za-z0-9-_/]` and each resource group ARN is 1 to 1600 characters |
 
 Except for `CapacityReservationSpecification`, these fields are stored and reported only.
 
