@@ -766,7 +766,7 @@ public class AutoScalingReconciler {
     private Reservation launchWithGroupCapacity(AutoScalingGroup asg, LaunchSource launchSource,
                                                  LaunchPlacement placement, String clientToken) {
         CapacityReservationSpecification groupSpecification = asg.getCapacityReservationSpecification();
-        asgService.validateCapacityReservationSpecification(groupSpecification);
+        asgService.validateCapacityReservationSpecification(groupSpecification, asg.getRegion());
         String preference = groupSpecification == null ? null
                 : groupSpecification.getCapacityReservationPreference();
         if (preference == null || "default".equals(preference)) {

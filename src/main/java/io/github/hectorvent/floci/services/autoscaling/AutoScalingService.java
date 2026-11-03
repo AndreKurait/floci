@@ -50,6 +50,7 @@ public class AutoScalingService implements PassedRoleLookup {
     private final Event<AutoScalingGroupChanged> groupChanges;
     private final ElbV2Service elbV2Service;
     private final int maxCapacityReservationIds;
+    private final List<String> multipleCapacityReservationScopes;
 
     public AutoScalingService() {
         this(null, null);
@@ -62,7 +63,8 @@ public class AutoScalingService implements PassedRoleLookup {
     @Inject
     AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
                        EmulatorConfig config) {
-        this(groupChanges, elbV2Service, config.services().autoscaling().maxCapacityReservationIds());
+        this(groupChanges, elbV2Service, config.services().autoscaling().maxCapacityReservationIds(),
+                config.services().autoscaling().multipleCapacityReservationScopes().orElse(List.of()));
     }
 
     AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service) {
@@ -71,12 +73,18 @@ public class AutoScalingService implements PassedRoleLookup {
 
     AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
                        int maxCapacityReservationIds) {
+        this(groupChanges, elbV2Service, maxCapacityReservationIds, List.of());
+    }
+
+    private AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
+                              int maxCapacityReservationIds, List<String> multipleCapacityReservationScopes) {
         if (maxCapacityReservationIds < 1) {
             throw new IllegalArgumentException("floci.services.autoscaling.max-capacity-reservation-ids must be positive");
         }
         this.groupChanges = groupChanges;
         this.elbV2Service = elbV2Service;
         this.maxCapacityReservationIds = maxCapacityReservationIds;
+        this.multipleCapacityReservationScopes = List.copyOf(multipleCapacityReservationScopes);
     }
 
     private void requestReconciliation(AutoScalingGroup group) {
@@ -435,7 +443,7 @@ public class AutoScalingService implements PassedRoleLookup {
             }
             validateEffectiveLaunchImage(region, launchConfigName, launchTemplateId, launchTemplateName,
                     launchTemplateVersion, mixedInstancesPolicy);
-            validateOptionalFields(optionalFields);
+            validateOptionalFields(optionalFields, region);
             validateDesiredCapacityType(
                     optionalFields != null ? optionalFields.desiredCapacityType() : null,
                     mixedInstancesPolicy);
@@ -495,7 +503,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 throw new AwsException("ValidationError",
                         "LaunchTemplateVersion requires a LaunchTemplateId or LaunchTemplateName.", 400);
             }
-            validateOptionalFields(optionalFields);
+            validateOptionalFields(optionalFields, region);
             rejectDesiredConfigurationUpdateDuringActiveRefresh(region, name,
                     launchConfigName, launchTemplateId, launchTemplateName, launchTemplateVersion, mixedInstancesPolicy);
             LaunchIdentity effectiveIdentity = effectiveLaunchIdentity(asg, launchConfigName,
@@ -1912,7 +1920,7 @@ public class AutoScalingService implements PassedRoleLookup {
         return overrides != null ? overrides : List.of();
     }
 
-    private void validateOptionalFields(AsgOptionalFields optionalFields) {
+    private void validateOptionalFields(AsgOptionalFields optionalFields, String region) {
         if (optionalFields == null) {
             return;
         }
@@ -1941,7 +1949,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 && !CAPACITY_DISTRIBUTION_STRATEGIES.contains(azDistribution.getCapacityDistributionStrategy())) {
             throw new AwsException("ValidationError", INVALID_CAPACITY_DISTRIBUTION_STRATEGY_MESSAGE, 400);
         }
-        validateCapacityReservationSpecification(optionalFields.capacityReservationSpecification());
+        validateCapacityReservationSpecification(optionalFields.capacityReservationSpecification(), region);
     }
 
     /**
@@ -1976,6 +1984,16 @@ public class AutoScalingService implements PassedRoleLookup {
     }
 
     void validateCapacityReservationSpecification(CapacityReservationSpecification specification) {
+        validateCapacityReservationSpecification(specification, regionResolver == null ? null : regionResolver.getRegion());
+    }
+
+    void validateCapacityReservationSpecification(CapacityReservationSpecification specification, String region) {
+        int maxCapacityReservationIds = this.maxCapacityReservationIds;
+        if (!multipleCapacityReservationScopes.isEmpty()
+                && (regionResolver == null || !multipleCapacityReservationScopes.contains(
+                        regionResolver.getAccountId() + "/" + region))) {
+            maxCapacityReservationIds = 1;
+        }
         if (specification == null) {
             return;
         }

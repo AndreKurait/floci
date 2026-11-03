@@ -1287,6 +1287,8 @@ public interface EmulatorConfig {
         /** Maximum number of direct reservation IDs accepted in an ASG capacity target. */
         @WithDefault("1")
         int maxCapacityReservationIds();
+
+        Optional<List<String>> multipleCapacityReservationScopes();
     }
 
     interface ApplicationAutoScalingServiceConfig {

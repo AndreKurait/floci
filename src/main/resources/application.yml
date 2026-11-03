@@ -912,6 +912,7 @@ floci:
       worker-poll-interval-ms: ${FLOCI_SERVICES_CODEPIPELINE_WORKER_POLL_INTERVAL_MS:100}
     autoscaling:
       enabled: true
+      multiple-capacity-reservation-scopes: ${FLOCI_SERVICES_AUTOSCALING_MULTIPLE_CAPACITY_RESERVATION_SCOPES:}
     applicationautoscaling:
       enabled: true
     elasticbeanstalk:

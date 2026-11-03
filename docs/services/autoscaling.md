@@ -68,6 +68,15 @@ all supplied targets lack matching capacity; `capacity-reservations-only` remain
 under desired capacity until a target can satisfy the launch. Other EC2 errors
 remain failures.
 
+To restrict the increased limit to selected accounts and regions, set
+`FLOCI_SERVICES_AUTOSCALING_MULTIPLE_CAPACITY_RESERVATION_SCOPES` to a
+comma-separated list of exact `account-id/region` pairs, such as
+`123456789012/us-east-1,123456789012/us-west-2`, alongside the increased limit.
+All other scopes retain the one-ID limit. With no scope list, the configured
+limit continues to apply throughout this emulator deployment. Scope selection
+uses the resolved request account and operation region; it adds no request
+headers, grants no IAM permissions, and does not deploy AWS service principals.
+
 Scale-out follows the [AWS placement rules](https://docs.aws.amazon.com/autoscaling/ec2/userguide/auto-scaling-benefits.html):
 choose the zone with the fewest active instances, then its subnet with the most
 free IPv4 addresses. Declared subnets and actual EC2 placement take precedence

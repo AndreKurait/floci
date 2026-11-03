@@ -18,6 +18,7 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
+import software.amazon.awssdk.services.autoscaling.model.AutoScalingGroup;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 
 import java.net.URI;
@@ -30,6 +31,7 @@ import java.util.UUID;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.mockito.Mockito.when;
 
@@ -86,10 +88,12 @@ class AutoScalingExitedGuestDockerIntegrationTest {
                 asg.createAutoScalingGroup(request -> request.autoScalingGroupName(name)
                         .launchConfigurationName(name).minSize(0).maxSize(1).desiredCapacity(1)
                         .availabilityZones("us-east-1a"));
-                await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
-                        assertEquals("InService", asg.describeAutoScalingGroups(request ->
-                                request.autoScalingGroupNames(name)).autoScalingGroups().getFirst()
-                                .instances().getFirst().lifecycleStateAsString()));
+                await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                    AutoScalingGroup group = asg.describeAutoScalingGroups(request ->
+                            request.autoScalingGroupNames(name)).autoScalingGroups().getFirst();
+                    assertFalse(group.instances().isEmpty(), "Waiting for the initial instance");
+                    assertEquals("InService", group.instances().getFirst().lifecycleStateAsString());
+                });
                 String original = asg.describeAutoScalingGroups(request -> request.autoScalingGroupNames(name))
                         .autoScalingGroups().getFirst().instances().getFirst().instanceId();
                 String container = docker.listContainersCmd().withAncestorFilter(List.of(image)).exec()
@@ -98,8 +102,10 @@ class AutoScalingExitedGuestDockerIntegrationTest {
                 docker.stopContainerCmd(container).withTimeout(10).exec();
 
                 await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
-                    String replacement = asg.describeAutoScalingGroups(request -> request.autoScalingGroupNames(name))
-                            .autoScalingGroups().getFirst().instances().getFirst().instanceId();
+                    AutoScalingGroup group = asg.describeAutoScalingGroups(request ->
+                            request.autoScalingGroupNames(name)).autoScalingGroups().getFirst();
+                    assertFalse(group.instances().isEmpty(), "Waiting for the replacement instance");
+                    String replacement = group.instances().getFirst().instanceId();
                     assertNotEquals(original, replacement);
                     assertEquals("terminated", ec2.describeInstances(request -> request.instanceIds(original))
                             .reservations().getFirst().instances().getFirst().state().nameAsString());
