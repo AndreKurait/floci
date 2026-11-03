@@ -17,6 +17,12 @@
 Terminated instances normally remain queryable for 1 hour before being pruned.
 Instances retained by a successful `RunInstances` client token remain available for replay until storage is reset.
 
+Container-backed termination retains failed teardown work and retries with backoff,
+capped at 30 seconds between attempts. A transient Docker removal error does not require
+another `TerminateInstances` call. The instance remains `shutting-down` and retains its
+ports, private-address reservation and cleanup identity until teardown completes.
+Repeated termination requests share the pending operation.
+
 On emulator shutdown, EC2's effective storage mode controls container retention.
 Memory-only instances are stopped and removed synchronously, including containers
 already stopped, because their tracking records disappear with the process.

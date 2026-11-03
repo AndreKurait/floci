@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.SweepWorker;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
@@ -50,6 +51,7 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashSet;
@@ -179,6 +181,10 @@ public class Ec2ContainerManager {
     private final Semaphore metadataSetupSlots = new Semaphore(METADATA_SETUP_CONCURRENCY);
     private final Map<String, CompletableFuture<Void>> lifecycleOperations = new ConcurrentHashMap<>();
     private final Map<String, String> networkHelpers = new ConcurrentHashMap<>();
+    private final Map<String, PendingTermination> pendingTerminations = new ConcurrentHashMap<>();
+    private final AtomicBoolean terminationRetriesStarted = new AtomicBoolean();
+    private final SweepWorker terminationRetries = new SweepWorker(
+            "ec2-termination-retry", true, 1, false, this::retryPendingTerminations);
     private final Duration userDataExecutionTimeout;
     private final Set<ResultCallback<Frame>> activeUserDataCallbacks = ConcurrentHashMap.newKeySet();
 
@@ -412,6 +418,7 @@ public class Ec2ContainerManager {
     void stop() {
         closeActiveUserDataCallbacks();
         executor.shutdownNow();
+        terminationRetries.stop();
         closeActiveUserDataCallbacks();
         try {
             if (!executor.awaitTermination(15, TimeUnit.SECONDS)) {
@@ -1614,19 +1621,85 @@ public class Ec2ContainerManager {
      * <p>The callback runs on the teardown executor, and only once the container is established
      * to be gone: removed, already absent, or never launched. Everything after removal can fail
      * without making the callback wrong, so it runs from a finally block, but running it when
-     * removal itself failed would attempt work Docker is bound to refuse with no later retry
-     * behind it. A skip is logged. Anything the callback throws is logged and swallowed rather
-     * than killing the executor task.
+     * removal itself failed would attempt work Docker is bound to refuse. Failed teardown stays
+     * owned here and is retried with backoff. The callback runs at most once; anything it throws
+     * is logged and swallowed rather than killing the executor task.
      */
     public void terminate(Instance instance, Runnable afterTeardown) {
-        executor.submit(terminationOperation(instance, afterTeardown));
+        PendingTermination pending = pendingTerminations.computeIfAbsent(instance.getInstanceId(), ignored -> {
+            if (instance.getState() != null && "terminated".equals(instance.getState().getName())) {
+                return null;
+            }
+            return new PendingTermination(instance, terminationOperation(instance, afterTeardown));
+        });
+        if (pending != null) {
+            submitTermination(pending);
+        }
+    }
+
+    private void retryPendingTerminations(Instant now) {
+        pendingTerminations.values().stream()
+                .filter(pending -> !now.isBefore(pending.retryAt))
+                .forEach(this::submitTermination);
+    }
+
+    private void submitTermination(PendingTermination pending) {
+        String instanceId = pending.instance.getInstanceId();
+        if (executor.isShutdown() || pendingTerminations.get(instanceId) != pending
+                || !pending.executing.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            executor.execute(() -> {
+                try {
+                    pending.operation.run();
+                } catch (RuntimeException failure) {
+                    LOG.warnv(failure, "EC2 instance {0} teardown failed; retaining it for retry", instanceId);
+                } finally {
+                    try {
+                        if ("terminated".equals(pending.instance.getState().getName())) {
+                            pendingTerminations.remove(instanceId, pending);
+                        } else {
+                            pending.retryAt = Instant.now().plusSeconds(pending.retryDelaySeconds);
+                            pending.retryDelaySeconds = Math.min(30, pending.retryDelaySeconds * 2);
+                            if (!executor.isShutdown() && terminationRetriesStarted.compareAndSet(false, true)) {
+                                terminationRetries.start();
+                            }
+                        }
+                    } finally {
+                        pending.executing.set(false);
+                    }
+                }
+            });
+        } catch (RejectedExecutionException failure) {
+            pending.executing.set(false);
+            throw failure;
+        }
+    }
+
+    private static final class PendingTermination {
+        private final Instance instance;
+        private final Runnable operation;
+        private final AtomicBoolean executing = new AtomicBoolean();
+        private volatile Instant retryAt = Instant.MAX;
+        private int retryDelaySeconds = 1;
+
+        private PendingTermination(Instance instance, Runnable operation) {
+            this.instance = instance;
+            this.operation = operation;
+        }
     }
 
     /** Complete ephemeral teardown before shutdown destroys the lifecycle executor. */
     public void terminateForShutdown(Instance instance) {
-        terminationOperation(instance, null).run();
+        PendingTermination pending = pendingTerminations.get(instance.getInstanceId());
+        Runnable operation = pending == null ? terminationOperation(instance, null) : pending.operation;
+        operation.run();
         if (instance.getState() == null || !"terminated".equals(instance.getState().getName())) {
             throw new IllegalStateException("EC2 instance teardown did not complete: " + instance.getInstanceId());
+        }
+        if (pending != null) {
+            pendingTerminations.remove(instance.getInstanceId(), pending);
         }
     }
 
@@ -1636,6 +1709,7 @@ public class Ec2ContainerManager {
         String imdsSourceIp;
         String firewallEniId;
         int sshHostPort;
+        AtomicBoolean notified = new AtomicBoolean();
         synchronized (instance) {
             containerId = instance.getDockerContainerId();
             containerIp = instance.getContainerBridgeIp();
@@ -1700,14 +1774,14 @@ public class Ec2ContainerManager {
                 instance.setState(InstanceState.terminated());
                 instance.setTerminatedAt(System.currentTimeMillis());
             } finally {
-                if (afterTeardown != null && containerGone) {
+                if (afterTeardown != null && containerGone && notified.compareAndSet(false, true)) {
                     try {
                         afterTeardown.run();
                     } catch (Exception e) {
                         LOG.warnv("Post-teardown hook failed for instance {0}: {1}",
                                 instance.getInstanceId(), e.getMessage());
                     }
-                } else if (afterTeardown != null) {
+                } else if (afterTeardown != null && !containerGone) {
                     LOG.warnv("Skipping post-teardown hook for instance {0}: its container is "
                             + "not established to be gone, so anything waiting on the container "
                             + "being gone would fail", instance.getInstanceId());
