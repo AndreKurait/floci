@@ -3,40 +3,51 @@ package io.github.hectorvent.floci.services.elbv2;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.concurrent.KeyedWorkQueue;
+import io.github.hectorvent.floci.core.common.concurrent.SocketDeadline;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.vertx.core.Vertx;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
 import java.net.HttpURLConnection;
+import java.net.Proxy;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
 
 @ApplicationScoped
 public class ElbV2HealthChecker implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(ElbV2HealthChecker.class);
+    private static final int MAX_CONCURRENT_PROBES = 32;
 
     private final Vertx vertx;
     private final EmulatorConfig config;
     private final Ec2Service ec2Service;
     private final long maxHealthCheckIntervalMillis;
+    private final SSLSocketFactory backendTls = backendTls();
 
     // tgArn → (targetKey → TargetState)
     private final Map<String, Map<String, TargetState>> states = new ConcurrentHashMap<>();
     private final Map<String, Monitoring> timers = new ConcurrentHashMap<>();
+    private final Semaphore probeSlots = new Semaphore(MAX_CONCURRENT_PROBES);
     private final KeyedWorkQueue<ProbeWork> probes = new KeyedWorkQueue<>(
-            "elb-health-probe", 32, 4096, this::runProbe);
+            "elb-health-probe", MAX_CONCURRENT_PROBES, 4096, this::runProbe);
 
     @Inject
     public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
@@ -182,7 +193,7 @@ public class ElbV2HealthChecker implements Resettable {
         for (Map.Entry<String, TargetState> entry : selected.entrySet()) {
             String key = entry.getKey();
             TargetState state = entry.getValue();
-            if (targets.get(key) != state || state.inFlight) {
+            if (targets.get(key) != state || state.inFlight || state.workerRunning) {
                 continue;
             }
             // Split at the last colon so IPv6 literals remain intact.
@@ -212,16 +223,24 @@ public class ElbV2HealthChecker implements Resettable {
         TargetState state = work.state();
         try {
             synchronized (this) {
-                if (!current(work)) {
+                if (!current(work) || !probeSlots.tryAcquire()) {
                     return;
                 }
+                state.workerRunning = true;
             }
             int statusCode = 0;
             Exception failure = null;
             try {
-                String host = ElbV2TargetResolver.resolveHost(ec2Service, work.group(), work.targetId());
-                statusCode = probe(host, healthCheckPort(work.group(), work.port()),
-                        work.settings().path(), work.settings().timeout());
+                statusCode = SocketDeadline.call(work.settings().timeout(), () -> {
+                    String host = ElbV2TargetResolver.resolveHost(ec2Service, work.group(), work.targetId());
+                    return probeOnce(host, healthCheckPort(work.group(), work.port()),
+                            work.settings().path(), work.settings().timeout(), work.settings().protocol());
+                }, () -> {
+                    synchronized (this) {
+                        state.workerRunning = false;
+                        probeSlots.release();
+                    }
+                });
             } catch (IOException | RuntimeException error) {
                 failure = error;
             }
@@ -286,9 +305,14 @@ public class ElbV2HealthChecker implements Resettable {
         }
     }
 
-    private int probe(String host, int port, String path, int timeoutSeconds) throws IOException {
-        URL url = new URL("http", ElbV2TargetResolver.resolveCheckedAddress(host), port, path);
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+    private int probeOnce(String host, int port, String path, int timeoutSeconds, String protocol) throws IOException {
+        String scheme = "HTTPS".equals(protocol) ? "https" : "http";
+        URL url = new URL(scheme, ElbV2TargetResolver.resolveCheckedAddress(host), port, path);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);
+        if (conn instanceof HttpsURLConnection https) {
+            https.setSSLSocketFactory(backendTls);
+            https.setHostnameVerifier((hostname, session) -> true);
+        }
         conn.setConnectTimeout(timeoutSeconds * 1000);
         conn.setReadTimeout(timeoutSeconds * 1000);
         conn.setRequestMethod("GET");
@@ -298,6 +322,17 @@ public class ElbV2HealthChecker implements Resettable {
             return conn.getResponseCode();
         } finally {
             conn.disconnect();
+        }
+    }
+
+    private static SSLSocketFactory backendTls() {
+        try {
+            // ALB encrypts target connections without validating target certificates.
+            SSLContext context = SSLContext.getInstance("TLS");
+            context.init(null, InsecureTrustManagerFactory.INSTANCE.getTrustManagers(), null);
+            return context.getSocketFactory();
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("Cannot initialize ELBv2 backend TLS", e);
         }
     }
 
@@ -375,6 +410,7 @@ public class ElbV2HealthChecker implements Resettable {
 
     private static class TargetState {
         boolean inFlight;
+        boolean workerRunning;
         volatile TargetHealthStatus health = TargetHealthStatus.registrationInProgress();
         int consecutiveSuccesses;
         int consecutiveFailures;
