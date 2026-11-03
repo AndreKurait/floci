@@ -13567,13 +13567,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             String effectiveInstanceOwnerId = hasInstance
                     ? resolveInstanceOwnerId(region, instanceId)
                     : null;
-            if (hasNatGateway) {
-                getRequiredNatGateway(region, natGatewayId);
-            }
-
             if (dryRun) {
                 throw new AwsException("DryRunOperation",
                         "Request would have succeeded, but DryRun flag is set.", 412);
+            }
+            if (hasNatGateway) {
+                getRequiredNatGateway(region, natGatewayId);
             }
 
             // The target the request does not name is cleared rather than carried over from the

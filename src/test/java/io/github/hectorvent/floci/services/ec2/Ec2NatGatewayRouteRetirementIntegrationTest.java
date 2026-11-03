@@ -115,6 +115,26 @@ class Ec2NatGatewayRouteRetirementIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "valid"})
+    void replaceDryRunDoesNotResolveNatTargetsOrMutateRoutes(String targetState) {
+        try (Topology network = new Topology("814540000004", Region.US_EAST_1)) {
+            String table = network.routeTable();
+            String gateway = network.gateway("private");
+            network.route(table, "0.0.0.0/0", gateway);
+            String target = "missing".equals(targetState) ? "nat-fffffffffffffffff" : gateway;
+            List<Route> before = network.routes(table);
+
+            Ec2Exception failure = assertThrows(Ec2Exception.class,
+                    () -> network.client.replaceRoute(request -> request.routeTableId(table)
+                            .destinationCidrBlock("0.0.0.0/0").natGatewayId(target).dryRun(true)));
+
+            assertEquals("DryRunOperation", failure.awsErrorDetails().errorCode());
+            assertEquals(412, failure.statusCode());
+            assertEquals(before, network.routes(table), "DryRun must preserve every route");
+        }
+    }
+
     private static final class Topology implements AutoCloseable {
         private final Ec2Client client;
         private final String vpc;
