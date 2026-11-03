@@ -13223,11 +13223,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public void deleteRouteTable(String region, String routeTableId) {
         ensureDefaultResources(region);
-        RouteTable rt = routeTables.get(key(region, routeTableId)).orElse(null);
-        if (rt == null) {
-            throw new AwsException("InvalidRouteTableID.NotFound", "The route table '" + routeTableId + "' does not exist", 400);
+        RouteTable rt;
+        synchronized (lockFor(key(region, routeTableId))) {
+            rt = routeTables.get(key(region, routeTableId)).orElse(null);
+            if (rt == null) {
+                throw new AwsException("InvalidRouteTableID.NotFound",
+                        "The route table '" + routeTableId + "' does not exist", 400);
+            }
+            routeTables.delete(key(region, routeTableId));
         }
-        routeTables.delete(key(region, routeTableId));
         notifyRouteTableUpdated(region, rt);
     }
 
