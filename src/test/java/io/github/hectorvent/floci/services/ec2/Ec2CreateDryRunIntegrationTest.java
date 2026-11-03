@@ -145,8 +145,8 @@ class Ec2CreateDryRunIntegrationTest {
     }
 
     /**
-     * A subnet or group dry run naming a VPC that does not exist, or a subnet dry run naming none, keeps the
-     * error the real create gives, as a RunInstances dry run keeps the error of a missing subnet.
+     * AWS answers these create dry runs before VPC validation, including an omitted VPC ID.
+     * The corresponding real requests still reject the missing VPC.
      */
     @ParameterizedTest
     @CsvSource({
@@ -154,10 +154,8 @@ class Ec2CreateDryRunIntegrationTest {
             "subnet-without-vpc-id, MissingParameter",
             "group-in-missing-vpc, InvalidVpcID.NotFound"
     })
-    void aDryRunKeepsTheErrorOfAMissingVpc(String request, String errorCode) {
-        missingVpcCreate(request).formParam("DryRun", "true")
-                .post("/").then().statusCode(400)
-                .body("Response.Errors.Error.Code", equalTo(errorCode));
+    void aDryRunPrecedesMissingVpcValidation(String request, String errorCode) {
+        assertDryRun(missingVpcCreate(request).formParam("DryRun", "true"));
 
         missingVpcCreate(request)
                 .post("/").then().statusCode(400)

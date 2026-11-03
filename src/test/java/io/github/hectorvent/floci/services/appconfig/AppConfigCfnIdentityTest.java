@@ -9,6 +9,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.Map;
@@ -71,22 +73,23 @@ class AppConfigCfnIdentityTest {
         assertEquals(1, service.getHostedConfigurationVersion(app, other, 1).getVersionNumber());
     }
 
-    @Test
-    void absentParentIdDoesNotResolveAnotherApplicationNameForEnvironment() {
+    @ParameterizedTest
+    @ValueSource(strings = {"__FlociUsesAppConfigApplicationId", "_floci_appconfig_application"})
+    void absentParentIdDoesNotResolveAnotherApplicationNameForEnvironment(String attribute) {
         String missing = "goneapp";
         String otherApp = service.createApplication(Map.of("Name", missing)).getId();
         String env = service.createEnvironment(otherApp, Map.of("Name", "env")).getId();
-        delete("Environment", env, missing);
+        delete("Environment", env, missing, attribute);
         assertEquals(env, service.getEnvironment(otherApp, env).getId());
     }
 
-    @Test
-    void absentParentIdDoesNotResolveAnotherApplicationNameForProfile() {
+    @ParameterizedTest
+    @ValueSource(strings = {"__FlociUsesAppConfigApplicationId", "_floci_appconfig_application"})
+    void absentParentIdDoesNotResolveAnotherApplicationNameForProfile(String attribute) {
         String missing = "goneapp";
         String otherApp = service.createApplication(Map.of("Name", missing)).getId();
         String profile = profile(otherApp, "profile");
-        assertEquals("ResourceNotFoundException", assertThrows(AwsException.class,
-                () -> delete("ConfigurationProfile", profile, missing)).getErrorCode());
+        delete("ConfigurationProfile", profile, missing, attribute);
         assertEquals(profile, service.getConfigurationProfile(otherApp, profile).getId());
     }
 
@@ -119,11 +122,21 @@ class AppConfigCfnIdentityTest {
     }
 
     private void delete(String type, String id, String app) {
+        delete(type, id, app, "_floci_appconfig_application");
+    }
+
+    @Test
+    void uncreatedChildrenHaveNothingToDelete() {
+        delete("Environment", null, "missing");
+        delete("ConfigurationProfile", " ", "missing");
+    }
+
+    private void delete(String type, String id, String app, String attribute) {
         StackResource resource = new StackResource();
         resource.setResourceType("AWS::AppConfig::" + type);
         resource.setPhysicalId(id);
         if (app != null) {
-            resource.getAttributes().put("_floci_appconfig_application", app);
+            resource.getAttributes().put(attribute, app);
         }
         provisioner.delete(resource, "us-east-1");
     }

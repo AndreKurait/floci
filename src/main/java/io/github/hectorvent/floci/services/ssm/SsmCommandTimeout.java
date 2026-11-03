@@ -17,17 +17,18 @@ final class SsmCommandTimeout {
     }
 
     String wrap(String script, int seconds) {
-        String fileCommand = "floci_ssm_dir=$(mktemp -d /tmp/floci-ssm.XXXXXXXXXX) || exit 1; "
+        // The supervisor owns a bounded invocation's directory even when the command group is killed.
+        String fileCommand = "floci_ssm_dir=$(mktemp -d \"${1:-/tmp}/floci-ssm.XXXXXXXXXX\") || exit 1; "
                 + "trap 'rm -rf \"$floci_ssm_dir\"' EXIT; "
                 + "printf '%s\\n' " + quote(script) + " > \"$floci_ssm_dir/_script.sh\" || exit 1; "
                 + "chmod 700 \"$floci_ssm_dir/_script.sh\" || exit 1; "
                 + "sh -c '\"$1\"' sh \"$floci_ssm_dir/_script.sh\"";
-        String command = "sh -c " + quote(fileCommand);
+        String command = "sh -c " + quote(fileCommand) + " sh";
         if (seconds < 1) {
             return command;
         }
         // Keep GNU timeout's monitored shell alive until -k kills the entire group, even if its child exits first.
-        String completedCommand = "trap 'while :; do sleep 1; done' TERM; " + command
+        String completedCommand = "trap 'while :; do sleep 1; done' TERM; " + command + " \"$1\""
                 + " & child=$!; wait \"$child\" 2>/dev/null; result=$?; printf '%s\\n' \"$result\" > \"$1/completed\"; exit \"$result\"";
         return """
                 if ! command -v mktemp >/dev/null 2>&1; then
@@ -50,7 +51,7 @@ final class SsmCommandTimeout {
                     *) rmdir "$state"; exec %s ;;
                   esac
                 fi
-                setsid %s &
+                setsid %s "$state" &
                 child=$!
                 (
                   timer=

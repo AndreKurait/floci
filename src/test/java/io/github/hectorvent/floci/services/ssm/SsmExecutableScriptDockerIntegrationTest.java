@@ -101,7 +101,7 @@ class SsmExecutableScriptDockerIntegrationTest {
                 assertEquals("/tmp\n", result.standardOutputContent());
                 assertEquals("diagnostic", result.standardErrorContent());
 
-                result = run(ssm, instance, "for p in /tmp/floci-ssm.*; do [ ! -d \"$p\" ] || printf '%s\\n' \"$p\"; done");
+                result = run(ssm, instance, "find /tmp -type d -name 'floci-ssm.*'");
                 assertEquals("Success", result.statusAsString());
                 assertEquals(1, result.standardOutputContent().lines().count(),
                         "Only the current invocation's temporary directory may remain");

@@ -1260,16 +1260,9 @@ public class AutoScalingService implements PassedRoleLookup {
                 throw capacityChangeError(asg, detached.size(), "detach");
             }
             if (!detached.isEmpty()) {
-                List<TargetDescription> targets = detached.stream().map(id -> {
-                    TargetDescription target = new TargetDescription();
-                    target.setId(id);
-                    return target;
-                }).toList();
-                for (String targetGroup : asg.getTargetGroupARNs()) {
-                    elbV2Service.deregisterTargets(region, targetGroup, targets);
-                }
+                deregisterFromTargetGroups(elbV2Service, asg, detached);
+                deregisterFromClassicLoadBalancers(elbClassicService, asg, detached);
                 ec2Service.deleteSystemTag(region, detached, GROUP_NAME_TAG, name);
-                completeInstanceRefreshIfSettled(region, name, asg);
             }
             releaseRefreshOwnership(activeInstanceRefresh(asg), detached);
             asg.getInstances().removeIf(i -> detached.contains(i.getInstanceId()));

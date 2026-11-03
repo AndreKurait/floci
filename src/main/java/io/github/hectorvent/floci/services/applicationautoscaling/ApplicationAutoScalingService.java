@@ -520,6 +520,8 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
     private static final Map<String, PredefinedMetric> PREDEFINED_METRICS = Map.of(
             "ECSServiceAverageCPUUtilization", new PredefinedMetric("AWS/ECS", "CPUUtilization", "Average"),
             "ECSServiceAverageMemoryUtilization", new PredefinedMetric("AWS/ECS", "MemoryUtilization", "Average"),
+            "LambdaProvisionedConcurrencyUtilization",
+            new PredefinedMetric("AWS/Lambda", "ProvisionedConcurrencyUtilization", "Average"),
             "ALBRequestCountPerTarget", new PredefinedMetric("AWS/ApplicationELB", "RequestCountPerTarget", "Sum"));
 
     private record PredefinedMetric(String namespace, String metricName, String statistic) {
@@ -570,17 +572,6 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             case "elasticache" -> "AWS/ElastiCache";
             default -> "AWS/" + serviceNamespace.toUpperCase(Locale.ROOT);
         };
-    }
-
-    private static String predefinedMetricType(ScalingPolicy policy) {
-        TargetTrackingConfiguration config = policy.getTargetTrackingConfiguration();
-        if (config != null && config.getPredefinedMetricSpecification() != null
-                && config.getPredefinedMetricSpecification().getPredefinedMetricType() != null) {
-            String type = config.getPredefinedMetricSpecification().getPredefinedMetricType();
-            return "LambdaProvisionedConcurrencyUtilization".equals(type)
-                    ? "ProvisionedConcurrencyUtilization" : type;
-        }
-        return "CustomizedMetric";
     }
 
     private static double targetValue(ScalingPolicy policy) {

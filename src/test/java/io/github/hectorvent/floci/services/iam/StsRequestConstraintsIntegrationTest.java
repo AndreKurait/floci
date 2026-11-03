@@ -51,8 +51,7 @@ class StsRequestConstraintsIntegrationTest {
     /**
      * {@code serialNumberType} and {@code tokenCodeType} are declared and were read by nothing, so
      * a request naming either is now held to it. Both are reported together, in the order the model
-     * lists them, and a well-formed pair is still accepted and still unused: the MFA check itself
-     * is not built.
+     * lists them. A well-formed pair proceeds to MFA verification, which rejects an unregistered device.
      */
     @Test
     void theMfaMembersAreReadWhereNothingReadThemBefore() {
@@ -84,8 +83,8 @@ class StsRequestConstraintsIntegrationTest {
         sts("GetSessionToken")
             .formParam("SerialNumber", "arn:aws:iam::000000000000:mfa/user")
             .formParam("TokenCode", "123456")
-        .when().post("/").then().statusCode(200)
-            .body(SESSION_KEY, containsString("ASIA"));
+        .when().post("/").then().statusCode(403)
+            .body(CODE, equalTo("AccessDenied"));
     }
 
     /**

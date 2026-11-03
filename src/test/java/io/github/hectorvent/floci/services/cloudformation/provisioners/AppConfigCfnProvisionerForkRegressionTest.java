@@ -86,10 +86,10 @@ class AppConfigCfnProvisionerForkRegressionTest {
         resource.setPhysicalId("env1234");
         resource.getAttributes().put("_floci_appconfig_application", "app1234");
         doThrow(new AwsException("ResourceNotFoundException", "Environment not found", 404))
-                .when(service).deleteEnvironmentById("env1234");
+                .when(service).deleteEnvironmentById("app1234", "env1234");
         assertDoesNotThrow(() -> provisioner.delete(resource, "us-east-1"));
         doThrow(new AwsException("InternalServerException", "storage failed", 500))
-                .when(service).deleteEnvironmentById("env1234");
+                .when(service).deleteEnvironmentById("app1234", "env1234");
         AwsException failure = assertThrows(AwsException.class, () -> provisioner.delete(resource, "us-east-1"));
         assertEquals("InternalServerException", failure.getErrorCode());
     }
@@ -116,8 +116,8 @@ class AppConfigCfnProvisionerForkRegressionTest {
             assertEquals("app1234", resource.getAttributes().get(CfnRollback.USES_ATTR_PREFIX + "AppConfigApplicationId"));
             provisioner.delete(resource, "us-east-1");
         }
-        verify(service).deleteEnvironmentById("env1234");
-        verify(service).deleteConfigurationProfileById("prof123");
+        verify(service).deleteEnvironmentById("app1234", "env1234");
+        verify(service).deleteConfigurationProfileById("app1234", "prof123");
     }
 
     private static ProvisionContext context(String prior) {

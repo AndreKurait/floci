@@ -323,8 +323,10 @@ and detaches retained volumes.
 The complete mapping is validated before allocating launch resources. Duplicate
 devices, conflicting `NoDevice`/EBS settings, missing root devices, unavailable
 snapshots, and volumes smaller than their snapshots are refused. `NoDevice`
-suppresses an inherited non-root device. Instance-store mappings and explicit
-launch-time KMS key selection are unsupported and fail explicitly.
+suppresses an inherited non-root device. Instance-store mappings are unsupported
+and fail explicitly. Launch-time KMS key identifiers use the same metadata-only
+behavior as `CreateVolume`, described below; Floci does not validate those keys
+against KMS or encrypt the stored bytes.
 
 A shared AMI's launch permission permits snapshot IDs already present in that
 AMI's unencrypted backing mappings in this launch path only, including when an

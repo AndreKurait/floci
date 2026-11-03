@@ -380,7 +380,20 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
     /** A stub left from before these types had a provisioner names nothing, so nothing is deleted. */
     @Override
     public void delete(StackResource resource, String region) {
-        if (CfnResourceDispatcher.isStub(resource.getPhysicalId(), resource.getAttributes())) {
+        if (resource.getPhysicalId() == null || resource.getPhysicalId().isBlank()
+                || CfnResourceDispatcher.isStub(resource.getPhysicalId(), resource.getAttributes())) {
+            return;
+        }
+        String applicationId = resource.getAttributes().getOrDefault(APPLICATION_ATTR,
+                resource.getAttributes().get("_floci_appconfig_application"));
+        if (applicationId != null && Set.of(ENVIRONMENT, PROFILE).contains(resource.getResourceType())) {
+            CfnDeletes.safeDelete(resource.getResourceType(), resource.getPhysicalId(), () -> {
+                if (ENVIRONMENT.equals(resource.getResourceType())) {
+                    service.deleteEnvironmentById(applicationId, resource.getPhysicalId());
+                } else {
+                    service.deleteConfigurationProfileById(applicationId, resource.getPhysicalId());
+                }
+            }, "ResourceNotFoundException");
             return;
         }
         delete(resource.getResourceType(), resource.getPhysicalId(), region);
