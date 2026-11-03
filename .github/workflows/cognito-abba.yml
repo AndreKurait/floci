@@ -1,0 +1,88 @@
+name: Cognito bounded parallel timing ABBA
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: a772b27583fac744c2449c7c9931847209bd224c
+        path: baseline
+        fetch-depth: 1
+        persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: 99396375a3a8b0a754812daff4a2fb8ee88c47c4
+        path: candidate
+        fetch-depth: 2
+        persist-credentials: false
+    - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+      with:
+        java-version: '25'
+        distribution: temurin
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ~/.m2/repository
+        key: maven-${{ runner.os }}-${{ hashFiles('baseline/pom.xml') }}
+        restore-keys: 'maven-${{ runner.os }}-
+
+          '
+    - name: Measure serial concurrent concurrent serial on one runner
+      run: "python3 - <<'PY'\n\"\"\"Measure both immutable fixtures on one runner in alternating order.\"\"\"\nimport hashlib\n\
+        import json\nimport os\nfrom pathlib import Path\nimport shutil\nimport subprocess\nimport time\nimport xml.etree.ElementTree\
+        \ as ET\n\nSOURCES = {\n    \"baseline\": \"a772b27583fac744c2449c7c9931847209bd224c\",\n    \"candidate\": \"99396375a3a8b0a754812daff4a2fb8ee88c47c4\"\
+        ,\n}\nRESULT = Path(\"cognito-abba\")\nRESULT.mkdir()\nCLASSES = [\"CognitoServiceTest\"]\nMETRICS = {\n    \"runnerImage\"\
+        : os.environ.get(\"ImageVersion\"),\n    \"runnerOS\": os.environ.get(\"ImageOS\"),\n    \"cpuCount\": os.cpu_count(),\n\
+        \    \"java\": subprocess.run([\"java\", \"-version\"], capture_output=True, text=True).stderr,\n    \"inputs\": {},\n\
+        \    \"compilation\": {},\n    \"phases\": [],\n}\n\n\ndef save():\n    (RESULT / \"metrics.json\").write_text(json.dumps(METRICS,\
+        \ indent=2) + \"\\n\")\n\n\ndef run(mode, phase, arguments):\n    runtime = Path(os.environ[\"RUNNER_TEMP\"]) / (\"\
+        cognito-abba-\" + phase)\n    runtime.mkdir()\n    properties = [\n        \"-Dquarkus.http.test-port=0\",\n     \
+        \   \"-Dquarkus.http.test-ssl-port=0\",\n        \"-Dfloci.docker.resource-namespace=cognito-abba-\" + os.environ[\"\
+        GITHUB_RUN_ID\"] + \"-\" + phase,\n        \"-Djava.io.tmpdir=\" + str(runtime),\n        \"-Dvertx.cacheDirBase=\"\
+        \ + str(runtime / \"vertx-cache\"),\n    ]\n    started = time.monotonic()\n    with (RESULT / (phase + \".log\")).open(\"\
+        w\") as output:\n        code = subprocess.run([\"./mvnw\", \"-B\"] + arguments + properties, cwd=mode,\n        \
+        \                      stdout=output, stderr=subprocess.STDOUT).returncode\n    return {\"seconds\": time.monotonic()\
+        \ - started, \"exitCode\": code}\n\n\nfor mode, expected in SOURCES.items():\n    checkout = Path(mode)\n    source\
+        \ = subprocess.check_output([\"git\", \"-C\", mode, \"rev-parse\", \"HEAD\"], text=True).strip()\n    assert source\
+        \ == expected\n    production = hashlib.sha256()\n    for path in sorted((checkout / \"src/main\").rglob(\"*\")):\n\
+        \        if path.is_file():\n            production.update(str(path.relative_to(checkout)).encode() + b\"\\0\" + path.read_bytes())\n\
+        \    inventory = sorted(str(path.relative_to(checkout))\n                       for path in (checkout / \"src/test/java\"\
+        ).rglob(\"*.java\"))\n    METRICS[\"inputs\"][mode] = {\n        \"source\": source,\n        \"pomSha256\": hashlib.sha256((checkout\
+        \ / \"pom.xml\").read_bytes()).hexdigest(),\n        \"productionSha256\": production.hexdigest(),\n        \"testInventorySha256\"\
+        : hashlib.sha256(\"\\n\".join(inventory).encode()).hexdigest(),\n        \"classes\": CLASSES,\n    }\nfor key in\
+        \ (\"productionSha256\", \"testInventorySha256\", \"classes\"):\n    assert METRICS[\"inputs\"][\"baseline\"][key]\
+        \ == METRICS[\"inputs\"][\"candidate\"][key]\nsave()\n\nexpected_changes = sorted([\n    \"pom.xml\",\n    \"src/test/java/io/github/hectorvent/floci/services/cognito/CognitoServiceTest.java\"\
+        ,\n    \".github/workflows/ci.yml\",\n])\nactual_changes = sorted(subprocess.check_output([\n    \"git\", \"-C\",\
+        \ \"candidate\", \"diff\", \"--name-only\", SOURCES[\"baseline\"], \"HEAD\"\n], text=True).splitlines())\nassert actual_changes\
+        \ == expected_changes, actual_changes\nMETRICS[\"sourceChanges\"] = actual_changes\nsave()\n\nfor mode in SOURCES:\n\
+        \    result = run(mode, \"compile-\" + mode, [\"test-compile\", \"-DskipTests\"])\n    METRICS[\"compilation\"][mode]\
+        \ = result\n    save()\n    if result[\"exitCode\"]:\n        raise SystemExit(result[\"exitCode\"])\n\nfor number,\
+        \ mode in enumerate((\"baseline\", \"candidate\", \"candidate\", \"baseline\"), 1):\n    phase = str(number) + \"\
+        -\" + mode\n    reports = Path(mode) / \"target/surefire-reports\"\n    if reports.exists():\n        shutil.rmtree(reports)\n\
+        \    result = run(mode, phase, [\"surefire:test\", \"-Dtest=\" + \",\".join(CLASSES)])\n    result.update(phase=phase,\
+        \ mode=mode)\n    METRICS[\"phases\"].append(result)\n    save()\n    if reports.exists():\n        shutil.copytree(reports,\
+        \ RESULT / phase / \"reports\")\n    if result[\"exitCode\"]:\n        raise SystemExit(result[\"exitCode\"])\n  \
+        \  paths = sorted(reports.glob(\"TEST-*.xml\"))\n    assert len(paths) == 1\n    totals = {key: 0 for key in (\"tests\"\
+        , \"failures\", \"errors\", \"skipped\")}\n    cases = []\n    suite_seconds = 0.0\n    for path in paths:\n     \
+        \   suite = ET.parse(path).getroot()\n        suite_seconds += float(suite.get(\"time\", \"0\"))\n        for key\
+        \ in totals:\n            totals[key] += int(suite.get(key, \"0\"))\n        for case in suite.findall(\"testcase\"\
+        ):\n            outcome = next((kind for kind in (\"failure\", \"error\", \"skipped\")\n                         \
+        \   if case.find(kind) is not None), \"passed\")\n            cases.append({\"class\": case.get(\"classname\"), \"\
+        name\": case.get(\"name\"),\n                          \"outcome\": outcome, \"seconds\": float(case.get(\"time\"\
+        , \"0\"))})\n    identity = sorted((case[\"class\"], case[\"name\"], case[\"outcome\"]) for case in cases)\n    assert\
+        \ len(identity) == 394\n    if number == 1:\n        baseline_identity = identity\n    else:\n        assert identity\
+        \ == baseline_identity\n    result.update(counts=totals, cases=cases, suiteSeconds=suite_seconds)\n    save()\n  \
+        \  assert totals == {\"tests\": 394, \"failures\": 0, \"errors\": 0, \"skipped\": 0}\n    shutil.rmtree(Path(os.environ[\"\
+        RUNNER_TEMP\"]) / (\"cognito-abba-\" + phase))\n\nPY\n"
+    - name: Retain all four phases and raw reports
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: cognito-bounded-parallel-abba
+        path: cognito-abba/
+        if-no-files-found: error
+        retention-days: 7
