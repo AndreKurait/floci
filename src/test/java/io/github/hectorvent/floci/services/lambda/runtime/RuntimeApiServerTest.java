@@ -2050,54 +2050,53 @@ class RuntimeApiServerTest {
             // a shared client's connection pool could otherwise hand back a stale pooled
             // connection to that iteration's now-closed server.
             HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
-            int freshPort = findFreePort();
-            RuntimeApiServer freshServer = new RuntimeApiServer(vertx, freshPort);
-            freshServer.start().get(5, TimeUnit.SECONDS);
-            try {
-                String extensionId = registerExtensionOn(client, freshPort, "lambda-adapter", "SHUTDOWN");
+            try (AutoCloseable clientCleanup = () -> {
+                client.shutdownNow();
+                assertTrue(client.awaitTermination(Duration.ofSeconds(5)), "HTTP client did not terminate");
+            }) {
+                int freshPort = findFreePort();
+                RuntimeApiServer freshServer = new RuntimeApiServer(vertx, freshPort);
+                try (AutoCloseable serverCleanup = () -> freshServer.stop().get(5, TimeUnit.SECONDS)) {
+                    freshServer.start().get(5, TimeUnit.SECONDS);
+                    String extensionId = registerExtensionOn(client, freshPort, "lambda-adapter", "SHUTDOWN");
 
-                CompletableFuture<HttpResponse<String>> asyncNext = client.sendAsync(
-                        HttpRequest.newBuilder()
-                                .uri(URI.create("http://localhost:" + freshPort + "/2020-01-01/extension/event/next"))
-                                .header("Lambda-Extension-Identifier", extensionId)
-                                .GET().build(),
-                        HttpResponse.BodyHandlers.ofString());
-
-                // Wait for the poll to actually park before racing stop() against it. A fixed
-                // sleep only *assumes* it parked: on a loaded machine the sleep expires first,
-                // stop() closes the listening socket while the request is still in flight, and
-                // the client sees the connection die (EOFException) rather than the SHUTDOWN
-                // this test is about. Same reasoning as
-                // extensionRegister_racedAgainstStop_eventuallyDeliversShutdown.
-                assertTrue(awaitExtensionParked(freshServer, extensionId, 5000),
-                        "extension never parked on /event/next; the stop() race was never set up");
-                freshServer.stop();
-
-                HttpResponse<String> response = asyncNext.get(5, TimeUnit.SECONDS);
-                boolean deliveredHere = response.statusCode() == 200
-                        && "SHUTDOWN".equals(new JsonObject(response.body()).getString("eventType"));
-                if (deliveredHere) {
-                    totalDelivered.incrementAndGet();
-                } else {
-                    // Didn't land in this specific request — a subsequent poll with the same
-                    // identifier must still find the SHUTDOWN queued (never orphaned).
-                    HttpResponse<String> retry = client.send(HttpRequest.newBuilder()
-                                    .uri(URI.create(
-                                            "http://localhost:" + freshPort + "/2020-01-01/extension/event/next"))
+                    CompletableFuture<HttpResponse<String>> asyncNext = client.sendAsync(
+                            HttpRequest.newBuilder()
+                                    .uri(URI.create("http://localhost:" + freshPort + "/2020-01-01/extension/event/next"))
                                     .header("Lambda-Extension-Identifier", extensionId)
                                     .GET().build(),
                             HttpResponse.BodyHandlers.ofString());
-                    if (retry.statusCode() == 200
-                            && "SHUTDOWN".equals(new JsonObject(retry.body()).getString("eventType"))) {
+
+                    // Wait for the poll to actually park before racing stop() against it. A fixed
+                    // sleep only *assumes* it parked: on a loaded machine the sleep expires first,
+                    // stop() closes the listening socket while the request is still in flight, and
+                    // the client sees the connection die (EOFException) rather than the SHUTDOWN
+                    // this test is about. Same reasoning as
+                    // extensionRegister_racedAgainstStop_eventuallyDeliversShutdown.
+                    assertTrue(awaitExtensionParked(freshServer, extensionId, 5000),
+                            "extension never parked on /event/next; the stop() race was never set up");
+                    freshServer.stop();
+
+                    HttpResponse<String> response = asyncNext.get(5, TimeUnit.SECONDS);
+                    boolean deliveredHere = response.statusCode() == 200
+                            && "SHUTDOWN".equals(new JsonObject(response.body()).getString("eventType"));
+                    if (deliveredHere) {
                         totalDelivered.incrementAndGet();
+                    } else {
+                        // Didn't land in this specific request — a subsequent poll with the same
+                        // identifier must still find the SHUTDOWN queued (never orphaned).
+                        HttpResponse<String> retry = client.send(HttpRequest.newBuilder()
+                                        .uri(URI.create(
+                                                "http://localhost:" + freshPort + "/2020-01-01/extension/event/next"))
+                                        .header("Lambda-Extension-Identifier", extensionId)
+                                        .GET().build(),
+                                HttpResponse.BodyHandlers.ofString());
+                        if (retry.statusCode() == 200
+                                && "SHUTDOWN".equals(new JsonObject(retry.body()).getString("eventType"))) {
+                            totalDelivered.incrementAndGet();
+                        }
                     }
                 }
-            } finally {
-                freshServer.stop().get(5, TimeUnit.SECONDS);
-                // Each HttpClient owns a selector thread and connection pool; leaking one per
-                // iteration across hundreds of iterations starves the JVM and makes even an
-                // unrelated server's bind time out.
-                client.close();
             }
         }
 
