@@ -146,6 +146,12 @@ When the image lacks `sshd` or `scp`, Floci first installs OpenSSH with the imag
 
 With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a separate Linux network namespace and an nftables default-deny policy before starting each Docker-backed instance. It checks new managed connections against both the sender's egress rules and the receiver's ingress rules, using emulated ENI addresses and security-group membership before translating to Docker addresses. Established replies use connection tracking. This filters packets but does not emulate VPC routing, NACLs, NAT gateways, or peering. Rootless Docker and Windows containers are unsupported.
 
+When embedded DNS is available, the protected namespace supplies its address as
+the sole nameserver before starting workloads. Workloads inherit that resolver
+file, so ordinary DNS works on an internal Docker network without an external
+gateway. Floci handles recursive lookups and the workload VPC's Resolver rules.
+The existing DNS packet exception still permits only port 53 at that resolver.
+
 An observer detects externally stopped, removed, or disconnected namespace helpers.
 It retires their DNS identity and removes their addresses from peer security-group rules,
 so an unrelated container reusing an address does not inherit the former ENI's membership.
