@@ -131,6 +131,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
     private final LambdaFunctionStore functionStore;
+    private final LambdaVpcNetworkManager vpcNetworkManager;
 
     public ContainerLauncher(ContainerBuilder containerBuilder,
                              ContainerLifecycleManager lifecycleManager,
@@ -148,7 +149,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 executionRoleCredentials, null);
     }
 
-    @Inject
     public ContainerLauncher(ContainerBuilder containerBuilder,
                              ContainerLifecycleManager lifecycleManager,
                              ContainerLogStreamer logStreamer,
@@ -161,6 +161,25 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              LaunchedContainerAwsEnv awsEnv,
                              LambdaExecutionRoleCredentials executionRoleCredentials,
                              LambdaFunctionStore functionStore) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, functionStore, null);
+    }
+
+    @Inject
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             EcrRegistryManager ecrRegistryManager,
+                             LambdaLayerService layerService,
+                             LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials executionRoleCredentials,
+                             LambdaFunctionStore functionStore,
+                             LambdaVpcNetworkManager vpcNetworkManager) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -173,6 +192,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.awsEnv = awsEnv;
         this.executionRoleCredentials = executionRoleCredentials;
         this.functionStore = functionStore;
+        this.vpcNetworkManager = vpcNetworkManager;
         this.populateSemaphore = new Semaphore(resolvePopulateConcurrency(config));
     }
 
@@ -246,6 +266,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // failure path, not just the one where useCodeVolume's block itself throws.
         String reservedCodeVolume = null;
         Optional<SessionCreds> roleCredentials = Optional.empty();
+        LambdaVpcNetworkManager.Attachment vpcNetwork = null;
         try {
 
         LambdaDockerFlags dockerFlags = configuredDockerFlags();
@@ -326,6 +347,15 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
         specBuilder.withEmbeddedDns();
         List<String> additionalNetworks = configuredAdditionalDockerNetworks();
+        if (vpcNetworkManager != null) {
+            vpcNetwork = vpcNetworkManager.prepare(fn, containerName, hostAddress,
+                    runtimeApiServer.getPort(), dockerFlags).orElse(null);
+            if (vpcNetwork != null) {
+                specBuilder.withNetworkMode("container:" + vpcNetwork.helperId())
+                        .withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL, "true",
+                                ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config)));
+            }
+        }
         // A container image's runtime is its own, Java as likely as any.
         if (isJavaRuntime(fn.getRuntime()) || "Image".equals(fn.getPackageType())) {
             specBuilder.withJavaTrustStore();
@@ -527,7 +557,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         ContainerHandle handle = new ContainerHandle(
                 containerId, fn.getFunctionName(), runtimeApiServer, ContainerState.WARM, fn.isHotReload(),
                 roleCredentials.map(SessionCreds::accessKeyId).orElse(null),
-                LambdaExecutionRoleCredentials.sessionAccountId(fn));
+                LambdaExecutionRoleCredentials.sessionAccountId(fn), vpcNetwork);
 
         handle.setLogStream(logHandle);
         handle.setExitWatcher(exitWatcher);
@@ -546,11 +576,26 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             if (exitWatcher != null) {
                 exitWatcher.cancel();
             }
+            boolean workloadRetained = false;
             if (containerId != null) {
                 try {
-                    lifecycleManager.stopAndRemove(containerId, logHandle);
+                    if (vpcNetwork == null) {
+                        lifecycleManager.stopAndRemove(containerId, logHandle);
+                    } else {
+                        lifecycleManager.stopAndRemoveStrict(containerId, logHandle, 1);
+                    }
                 } catch (Exception cleanupError) {
                     LOG.warnv(cleanupError, "Could not remove failed Lambda container {0}", containerId);
+                    e.addSuppressed(cleanupError);
+                    workloadRetained = vpcNetwork != null;
+                }
+            }
+            if (vpcNetwork != null && !workloadRetained) {
+                try {
+                    vpcNetworkManager.release(vpcNetwork);
+                } catch (RuntimeException cleanupError) {
+                    LOG.warnv(cleanupError, "Could not release failed Lambda network {0}", vpcNetwork.eniId());
+                    e.addSuppressed(cleanupError);
                 }
             }
             if (roleCredentials.isPresent()) {
@@ -562,6 +607,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             // null by then); otherwise the failure happened before Docker ever saw the volume, so
             // its in-flight reference must be released here or cleanup would wait on it forever.
             releaseCodeVolumeReference(reservedCodeVolume);
+            if (workloadRetained) {
+                // The old process still owns its namespace and Runtime API port.
+                throw e;
+            }
             // Stop the server before releasing its port, or the still-listening Vert.x server
             // makes a later cold start that reuses the port serve this runtime too.
             try {
@@ -768,6 +817,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     cleanupFailure.addSuppressed(retirementFailure);
                 }
             }
+        }
+
+        if (handle.getVpcNetwork() != null) {
+            vpcNetworkManager.release(handle.getVpcNetwork());
         }
 
         // Only now close the runtime API socket. Any pollers that were still parked when

@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SecurityGroupNftCompilerTest {
@@ -85,6 +86,54 @@ class SecurityGroupNftCompilerTest {
         assertTrue(nft.contains("egress ip daddr 172.18.0.2 tcp dport 53 accept"));
         assertTrue(nft.contains("egress ip6 daddr fd00::53 udp dport 53 accept"));
         assertFalse(nft.contains("daddr 172.18.0.2 accept"), "only DNS is allowed to the resolver");
+    }
+
+    @Test
+    void lambdaRuntimeControlDoesNotOpenOtherPortsOrInstanceMetadata() {
+        SecurityGroup group = new SecurityGroup();
+        SecurityGroupNftCompiler.Endpoint target = new SecurityGroupNftCompiler.Endpoint(
+                "111111111111", "us-east-1", "vpc-1", "eni-lambda", "10.0.1.10", "172.18.0.3",
+                Set.of("sg-lambda"), List.of(group),
+                List.of(new SecurityGroupNftCompiler.ControlConnection("172.18.0.2", 10042)), false);
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(), Map.of());
+
+        assertTrue(nft.contains("egress ip daddr 172.18.0.2 tcp dport 10042 accept"));
+        assertFalse(nft.contains("daddr 172.18.0.2 accept"));
+        assertFalse(nft.contains("dport 4566 accept"));
+        assertFalse(nft.contains("daddr 169.254.169.254 accept"));
+        assertTrue(nft.contains("egress ip daddr 169.254.169.254 drop"));
+        assertTrue(nft.contains("ct original ip daddr 169.254.169.254 ct original proto-dst 80 drop"));
+    }
+
+    @Test
+    void runtimeControlRequiresOneLiteralAddressAndPort() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new SecurityGroupNftCompiler.ControlConnection("172.18.0.2/16", 10042));
+        assertThrows(IllegalArgumentException.class,
+                () -> new SecurityGroupNftCompiler.ControlConnection("runtime.example", 10042));
+        assertThrows(IllegalArgumentException.class,
+                () -> new SecurityGroupNftCompiler.ControlConnection("172.18.0.2", 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new SecurityGroupNftCompiler.ControlConnection("172.18.0.2", 65536));
+    }
+
+    @Test
+    void lambdaMetadataDenialPrecedesEveryEgressExemption() {
+        SecurityGroupNftCompiler.Endpoint target = new SecurityGroupNftCompiler.Endpoint(
+                "111111111111", "us-east-1", "vpc-1", "eni-lambda", "10.0.1.10", "172.18.0.3",
+                Set.of("sg-lambda"), List.of(new SecurityGroup()),
+                List.of(new SecurityGroupNftCompiler.ControlConnection("169.254.169.254", 80),
+                        new SecurityGroupNftCompiler.ControlConnection("fd00:ec2::254", 80)), false);
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(), Map.of(),
+                List.of("169.254.169.254"));
+        int firstEgressAccept = nft.indexOf("egress oifname lo accept");
+
+        for (String denied : List.of("ip daddr 169.254.169.254 drop", "ip6 daddr fd00:ec2::254 drop",
+                "ct original ip daddr 169.254.169.254 ct original proto-dst 80 drop",
+                "ct original ip6 daddr fd00:ec2::254 ct original proto-dst 80 drop")) {
+            assertTrue(nft.contains(denied), denied);
+            assertTrue(nft.indexOf(denied) < firstEgressAccept, denied);
+        }
     }
 
     private static SecurityGroupNftCompiler.Endpoint endpoint(String eni, String logical,

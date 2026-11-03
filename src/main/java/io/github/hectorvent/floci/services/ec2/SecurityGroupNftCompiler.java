@@ -19,9 +19,29 @@ public final class SecurityGroupNftCompiler {
 
     public record Endpoint(String accountId, String region, String vpcId, String eniId,
                            String logicalAddress, String transportAddress, Set<String> groupIds,
-                           List<SecurityGroup> groups) {
+                           List<SecurityGroup> groups, List<ControlConnection> controlConnections,
+                           boolean instanceMetadataAllowed) {
+        public Endpoint {
+            controlConnections = List.copyOf(controlConnections);
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups) {
+            this(accountId, region, vpcId, eniId, logicalAddress, transportAddress, groupIds, groups, List.of(), true);
+        }
+
         SecurityGroupPolicy.Peer peer() {
             return new SecurityGroupPolicy.Peer(logicalAddress, accountId, vpcId, groupIds);
+        }
+    }
+
+    /** A service-owned TCP endpoint, such as one execution environment's Lambda Runtime API. */
+    public record ControlConnection(String address, int port) {
+        public ControlConnection {
+            if (!literal(address) || port < 1 || port > 65535) {
+                throw new IllegalArgumentException("Control connections require a literal IP and one TCP port");
+            }
         }
     }
 
@@ -42,8 +62,17 @@ public final class SecurityGroupNftCompiler {
             throw new IllegalArgumentException("Protected endpoint needs at least one security group");
         }
         StringBuilder rules = new StringBuilder("flush chain inet floci_sg ingress\n")
-                .append("flush chain inet floci_sg egress\n")
-                .append("add rule inet floci_sg ingress iifname lo accept\n")
+                .append("flush chain inet floci_sg egress\n");
+        if (!target.instanceMetadataAllowed()) {
+            // Lambda has no EC2 instance metadata, even after DNAT or a control-endpoint override.
+            rules.append("add rule inet floci_sg egress ip daddr 169.254.169.254 drop\n")
+                    .append("add rule inet floci_sg egress ip6 daddr fd00:ec2::254 drop\n")
+                    .append("add rule inet floci_sg egress meta l4proto tcp"
+                            + " ct original ip daddr 169.254.169.254 ct original proto-dst 80 drop\n")
+                    .append("add rule inet floci_sg egress meta l4proto tcp"
+                            + " ct original ip6 daddr fd00:ec2::254 ct original proto-dst 80 drop\n");
+        }
+        rules.append("add rule inet floci_sg ingress iifname lo accept\n")
                 .append("add rule inet floci_sg egress oifname lo accept\n")
                 .append("add rule inet floci_sg ingress ct state established,related accept\n")
                 .append("add rule inet floci_sg egress ct state established,related accept\n");
@@ -59,14 +88,20 @@ public final class SecurityGroupNftCompiler {
                     .append("add rule inet floci_sg egress ").append(family).append(" daddr ").append(server)
                     .append(" tcp dport 53 accept\n");
         }
+        for (ControlConnection connection : target.controlConnections()) {
+            appendRule(rules, "egress", "daddr", connection.address(),
+                    "tcp dport " + connection.port() + " accept");
+        }
         rules.append("add rule inet floci_sg egress udp sport 68 udp dport 67 accept\n")
-                .append("add rule inet floci_sg ingress udp sport 67 udp dport 68 accept\n")
-                .append("add rule inet floci_sg egress ip daddr 169.254.169.254 accept\n")
+                .append("add rule inet floci_sg ingress udp sport 67 udp dport 68 accept\n");
+        if (target.instanceMetadataAllowed()) {
+            rules.append("add rule inet floci_sg egress ip daddr 169.254.169.254 accept\n")
                 // OUTPUT DNAT runs before this filter. Exempt only traffic originally sent to
                 // IMDS, not direct connections to the emulator's metadata or API ports.
                 .append("add rule inet floci_sg egress meta l4proto tcp"
                         + " ct original ip daddr 169.254.169.254 ct original proto-dst 80 accept\n")
-                .append("add rule inet floci_sg ingress ip saddr 169.254.169.254 accept\n");
+                    .append("add rule inet floci_sg ingress ip saddr 169.254.169.254 accept\n");
+        }
 
         List<Endpoint> managed = peers == null ? List.of() : peers.stream()
                 .filter(peer -> !target.eniId().equals(peer.eniId()))
