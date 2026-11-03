@@ -576,6 +576,11 @@ Configuration replacement and deletion remain committed if environment removal f
 Failed removals retain ownership and are retried while Floci is running; they continue
 to count against local container limits until cleanup succeeds.
 
+When Docker is already removing a container, Floci waits up to five seconds for that
+removal and confirms the container is absent before releasing its runtime resources.
+A timeout, interruption or unconfirmed removal keeps ownership for a later cleanup
+attempt.
+
 Shutdown drains provisioned and on-demand containers concurrently within one
 `floci.services.lambda.container-drain-timeout-seconds` budget. The default is 15 seconds;
 set `FLOCI_SERVICES_LAMBDA_CONTAINER_DRAIN_TIMEOUT_SECONDS` when a larger fleet needs more

@@ -24,6 +24,7 @@ import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.Ports;
 import com.github.dockerjava.api.model.Ulimit;
 import com.github.dockerjava.api.model.Volume;
+import com.github.dockerjava.api.model.WaitContainerCondition;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.ContainerCaBundle;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -674,7 +675,11 @@ public class ContainerLifecycleManager {
         } catch (Exception e) {
             // Daemon AutoRemove may finish despite an explicit remove error. Only an
             // authoritative absence permits the caller to retire runtime credentials.
-            if (presenceOf(containerId) != ContainerPresence.ABSENT) {
+            boolean absent = presenceOf(containerId) == ContainerPresence.ABSENT;
+            if (!absent && e instanceof ConflictException) {
+                absent = awaitConcurrentRemoval(containerId);
+            }
+            if (!absent) {
                 IllegalStateException cleanupFailure = new IllegalStateException(
                         "Failed to remove container " + containerId, e);
                 if (stopFailure != null) {
@@ -688,6 +693,22 @@ public class ContainerLifecycleManager {
         // Closed only once the container is stopped and gone, as in stopAndRemove, so the follower
         // can drain the final tail.
         closeLogStreamIfPresent(logStream);
+    }
+
+    private boolean awaitConcurrentRemoval(String containerId) {
+        try (WaitContainerResultCallback callback = new WaitContainerResultCallback()) {
+            dockerClient.waitContainerCmd(containerId).withCondition(WaitContainerCondition.REMOVED).exec(callback);
+            callback.awaitCompletion(5, TimeUnit.SECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            LOG.debugv("Interrupted waiting for container {0} removal", containerId);
+            return false;
+        } catch (Exception e) {
+            // AutoRemove can finish before the wait registers, or the wait transport can fail.
+            // In either case, inspect still has to confirm absence before ownership is released.
+            LOG.debugv("Could not await container {0} removal: {1}", containerId, e.getMessage());
+        }
+        return presenceOf(containerId) == ContainerPresence.ABSENT;
     }
 
     private void closeLogStreamIfPresent(Closeable logStream) {
