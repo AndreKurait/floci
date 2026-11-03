@@ -26,6 +26,10 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Health checking for Classic (2012-06-01) load balancers.
@@ -246,6 +250,28 @@ public class ElbClassicHealthChecker implements Resettable {
     }
 
     private boolean probe(String host, Target target, int timeoutSeconds) throws IOException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        FutureTask<Boolean> attempt = new FutureTask<>(() -> probeTransport(host, target, timeoutSeconds));
+        Thread.ofVirtual().name("classic-elb-health-probe").start(attempt);
+        try {
+            return attempt.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        } catch (TimeoutException e) {
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof IOException cause) {
+                throw cause;
+            }
+            throw new IllegalStateException("Classic ELB health probe failed", e.getCause());
+        } finally {
+            // Interrupting the virtual thread closes its blocking JDK socket, including TLS reads.
+            attempt.cancel(true);
+        }
+    }
+
+    private boolean probeTransport(String host, Target target, int timeoutSeconds) throws IOException {
         int timeoutMs = timeoutSeconds * 1000;
         if (target.path() == null) {
             try (Socket socket = "ssl".equals(target.scheme()) ? backendTls.createSocket() : new Socket()) {

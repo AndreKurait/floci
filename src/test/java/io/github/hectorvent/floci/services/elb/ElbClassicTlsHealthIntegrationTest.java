@@ -14,6 +14,7 @@ import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.net.NetServer;
+import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.PemKeyCertOptions;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
@@ -147,6 +148,46 @@ class ElbClassicTlsHealthIntegrationTest {
         assertTrue(receivedClientHello.get(), "A TCP connection alone must not satisfy a TLS health check");
         assertTrue(Duration.ofNanos(System.nanoTime() - start).toMillis() >= 1800,
                 "The unchanged two-second health timeout should expire while awaiting the handshake");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HTTP", "HTTPS"})
+    void continuousHeaderProgressExpiresAndRemovesPreviouslyHealthyInstance(String protocol) throws Exception {
+        AtomicBoolean drip = new AtomicBoolean();
+        AtomicInteger closedDrips = new AtomicInteger();
+        NetServerOptions options = new NetServerOptions();
+        if ("HTTPS".equals(protocol)) {
+            CertificateGenerator.GeneratedCertificate certificate = new CertificateGenerator()
+                    .generateSelfSignedCertificate("backend.example.test", List.of(), KeyAlgorithm.RSA_2048);
+            options.setSsl(true).setPemKeyCertOptions(new PemKeyCertOptions()
+                    .setCertValue(Buffer.buffer(certificate.certificatePem()))
+                    .setKeyValue(Buffer.buffer(certificate.privateKeyPem())));
+        }
+        NetServer backend = vertx.createNetServer(options).connectHandler(socket -> {
+            AtomicBoolean started = new AtomicBoolean();
+            socket.handler(bytes -> {
+                if (!started.compareAndSet(false, true)) {
+                    return;
+                }
+                if (!drip.get()) {
+                    socket.end(Buffer.buffer("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+                    return;
+                }
+                socket.write("HTTP/1.1 200 OK\r\nX-Progress: ");
+                long timer = vertx.setPeriodic(100, ignored -> socket.write("a"));
+                socket.closeHandler(ignored -> {
+                    vertx.cancelTimer(timer);
+                    closedDrips.incrementAndGet();
+                });
+            });
+        }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        cleanup.add(() -> backend.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS));
+        createLoadBalancer(backend.actualPort(), protocol + ":" + backend.actualPort() + "/health");
+        awaitHealth("InService");
+        drip.set(true);
+        awaitHealth("OutOfService");
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertTrue(closedDrips.get() >= 2,
+                "Both failed probes must close their sockets rather than retaining the backend connection"));
     }
 
     private HttpServer backend(boolean tls) throws Exception {
