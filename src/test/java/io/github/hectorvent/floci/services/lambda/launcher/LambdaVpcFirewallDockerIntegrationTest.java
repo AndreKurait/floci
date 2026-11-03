@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
+import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
@@ -69,7 +70,8 @@ class LambdaVpcFirewallDockerIntegrationTest {
         @Override
         public Map<String, String> getConfigOverrides() {
             return Map.of("floci.network.security-group-enforcement.enabled", "true",
-                    "floci.services.ec2.mock", "false", "floci.storage.mode", "memory");
+                    "floci.services.ec2.mock", "false", "floci.storage.mode", "memory",
+                    "floci.services.ec2.vpc-networks.enabled", "true");
         }
     }
 
@@ -78,6 +80,7 @@ class LambdaVpcFirewallDockerIntegrationTest {
     @Inject ContainerBuilder builder;
     @Inject DockerClient docker;
     @Inject Ec2Service service;
+    @Inject VpcNetworkManager vpcNetworks;
     @Inject EmulatorConfig config;
     @TestHTTPResource("/") URI endpoint;
 
@@ -140,7 +143,9 @@ class LambdaVpcFirewallDockerIntegrationTest {
         Executable deleteFunction = () -> lambda.deleteFunction(request -> request.functionName(function));
         cleanup.addFirst(deleteFunction);
 
-        assertEquals("connected", invoke(lambda, function, listener.address()).path("status").asText());
+        JsonNode connected = invoke(lambda, function, listener.address());
+        assertEquals("connected", connected.path("status").asText(),
+                "A Lambda VPC execution must reach the listener's private ENI address");
         Map<String, Object> emulatorProbe = Map.of("runtimeHost", true, "connectOnly", true,
                 "port", endpoint.getPort());
         assertEquals("connected", invoke(lambda, function, emulatorProbe).path("status").asText());
@@ -148,6 +153,14 @@ class LambdaVpcFirewallDockerIntegrationTest {
         List<NetworkInterface> callerInterfaces = ec2.describeNetworkInterfaces(request -> request.filters(
                 filter -> filter.name("group-id").values(callerGroup))).networkInterfaces();
         assertFalse(callerInterfaces.isEmpty(), "the execution environments must own real ENIs");
+        assertTrue(callerInterfaces.stream().anyMatch(eni ->
+                        eni.privateIpAddress().equals(connected.path("sourceAddress").asText())),
+                "The Lambda TCP source must be an advertised VPC ENI private address");
+        CommandResult observedSource = execute(listener.containerId(), "/var/lang/bin/node", "-e",
+                "process.stdout.write(require('fs').readFileSync('/tmp/source', 'utf8'))");
+        assertEquals(0, observedSource.code(), observedSource.output());
+        assertEquals(connected.path("sourceAddress").asText(), observedSource.output().trim(),
+                "The listener must observe the same private source address as the Lambda socket");
         for (NetworkInterface eni : callerInterfaces) {
             assertAll(() -> assertEquals(ACCOUNT, eni.ownerId()),
                     () -> assertEquals(subnet, eni.subnetId()),
@@ -244,10 +257,14 @@ class LambdaVpcFirewallDockerIntegrationTest {
                 ACCOUNT, REGION, config.services().lambda().dockerNetwork(), Map.of());
         cleanup.addFirst(() -> lifecycle.removeIfExistsStrict(namespace.helperId()));
         cleanup.addFirst(() -> firewall.unregister(eniId));
+        assertTrue(RequestScopes.callAs(ACCOUNT, REGION, () -> vpcNetworks.attach(
+                REGION, eni.vpcId(), subnet, namespace.helperId(), eni.privateIpAddress())).isPresent(),
+                "The listener fixture must own its private ENI address");
         List<SecurityGroup> groups = RequestScopes.callAs(ACCOUNT, REGION, () ->
                 service.describeSecurityGroups(REGION, List.of(group), List.of(), Map.of()));
         firewall.register(new SecurityGroupNftCompiler.Endpoint(ACCOUNT, REGION, eni.vpcId(), eniId,
-                eni.privateIpAddress(), namespace.transportAddress(), Set.of(group), groups),
+                eni.privateIpAddress(), namespace.transportAddress(), Set.of(group), groups,
+                Set.of(eni.privateIpAddress())),
                 namespace.helperId(), Map.of());
         String container = lifecycle.createAndStart(builder.newContainer(NODE_IMAGE)
                 .withName("floci-lambda-listener-" + suffix)
@@ -258,6 +275,7 @@ class LambdaVpcFirewallDockerIntegrationTest {
                         fs.writeFileSync('/tmp/accepted', '');
                         require('net').createServer(socket => {
                           fs.appendFileSync('/tmp/accepted', 'x');
+                          fs.writeFileSync('/tmp/source', socket.remoteAddress);
                           socket.end('ok');
                         }).listen(8080, '0.0.0.0');
                         """)).build()).containerId();
@@ -267,7 +285,7 @@ class LambdaVpcFirewallDockerIntegrationTest {
             assertTrue(System.nanoTime() < deadline, "listener fixture did not start");
             Thread.sleep(50);
         }
-        return new Listener(container, namespace.transportAddress());
+        return new Listener(container, eni.privateIpAddress());
     }
 
     private JsonNode invoke(LambdaClient lambda, String function, String address) throws Exception {
@@ -321,8 +339,9 @@ class LambdaVpcFirewallDockerIntegrationTest {
                           const port = event.runtime ? Number(runtime.port) : event.port;
                           const socket = net.createConnection({host, port});
                           const finish = status => {
+                            const sourceAddress = socket.localAddress ?? null;
                             socket.destroy();
-                            resolve({status, elapsedMillis:Math.round(performance.now() - started)});
+                            resolve({status, sourceAddress, elapsedMillis:Math.round(performance.now() - started)});
                           };
                           socket.setTimeout(900, () => finish('timeout'));
                           socket.once('connect', () => { if (event.connectOnly) finish('connected'); });

@@ -11,6 +11,8 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
+import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
+import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -38,11 +40,52 @@ class LambdaVpcNetworkManagerTest {
     @Mock Ec2Service ec2;
     @Mock SecurityGroupFirewallManager firewall;
     @Mock ContainerLifecycleManager lifecycle;
+    @Mock VpcNetworkManager vpcNetworks;
     private LambdaVpcNetworkManager manager;
 
     @BeforeEach
     void setUp() {
-        manager = new LambdaVpcNetworkManager(config, ec2, firewall, lifecycle);
+        manager = new LambdaVpcNetworkManager(config, ec2, firewall, lifecycle, vpcNetworks);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void failedVpcAttachmentReleasesTheEniOnlyAfterItsHelperIsRemoved(boolean helperRemoved) {
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class, RETURNS_DEEP_STUBS);
+        DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        when(config.services()).thenReturn(services);
+        when(lifecycle.getDockerClient()).thenReturn(docker);
+        when(firewall.enabled()).thenReturn(true);
+        NetworkInterface eni = new NetworkInterface();
+        eni.setNetworkInterfaceId("eni-caller");
+        eni.setVpcId("vpc-caller");
+        eni.setPrivateIpAddress("10.74.1.10");
+        when(ec2.createNetworkInterface(anyString(), anyString(), anyString(), isNull(),
+                anyList(), anyList(), anyList())).thenReturn(eni);
+        when(firewall.createNamespace(anyString(), anyString(), anyString(), anyString(),
+                any(), anyMap(), anyMap()))
+                .thenReturn(new SecurityGroupFirewallManager.Namespace("helper", "172.17.0.2"));
+        when(vpcNetworks.enabled()).thenReturn(true);
+        IllegalStateException cleanupFailure = new IllegalStateException("helper removal failed");
+        if (!helperRemoved) {
+            doThrow(cleanupFailure).when(lifecycle).removeIfExistsStrict("helper");
+        }
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () ->
+                manager.prepare(function(), "environment", "192.0.2.1", 9001, LambdaDockerFlags.parse("")));
+        assertEquals("Protected Lambda namespace could not attach to its VPC", failure.getMessage());
+
+        if (helperRemoved) {
+            InOrder order = inOrder(lifecycle, firewall, ec2);
+            order.verify(lifecycle).removeIfExistsStrict("helper");
+            order.verify(firewall).unregister("eni-caller");
+            order.verify(ec2).releaseNetworkInterfaceFromService("us-east-1", "eni-caller");
+            order.verify(ec2).deleteNetworkInterface("us-east-1", "eni-caller");
+        } else {
+            assertEquals(List.of(cleanupFailure), List.of(failure.getSuppressed()));
+            verify(ec2, never()).releaseNetworkInterfaceFromService(anyString(), anyString());
+            verify(ec2, never()).deleteNetworkInterface(anyString(), anyString());
+        }
     }
 
     @ParameterizedTest

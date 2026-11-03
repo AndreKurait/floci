@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
+import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import jakarta.enterprise.context.ApplicationScoped;
 
@@ -42,15 +43,18 @@ public class LambdaVpcNetworkManager {
     private final Ec2Service ec2;
     private final SecurityGroupFirewallManager firewall;
     private final ContainerLifecycleManager lifecycle;
+    private final VpcNetworkManager vpcNetworks;
     private final AtomicInteger subnetSelection = new AtomicInteger();
     private boolean recovered;
 
     public LambdaVpcNetworkManager(EmulatorConfig config, Ec2Service ec2,
-                                   SecurityGroupFirewallManager firewall, ContainerLifecycleManager lifecycle) {
+                                   SecurityGroupFirewallManager firewall, ContainerLifecycleManager lifecycle,
+                                   VpcNetworkManager vpcNetworks) {
         this.config = config;
         this.ec2 = ec2;
         this.firewall = firewall;
         this.lifecycle = lifecycle;
+        this.vpcNetworks = vpcNetworks;
     }
 
     Optional<Attachment> prepare(LambdaFunction function, String resourceId, String runtimeHost, int runtimePort,
@@ -91,6 +95,12 @@ public class LambdaVpcNetworkManager {
             ec2.holdNetworkInterfaceForService(region, eniId);
             namespace = firewall.createNamespace("lambda", resourceId, account, region,
                     config.services().lambda().dockerNetwork(), Map.of(), Map.of(ENI_LABEL, eniId));
+            boolean attached = vpcNetworks.attach(region, eni.getVpcId(), subnet,
+                    namespace.helperId(), eni.getPrivateIpAddress()).isPresent();
+            if (vpcNetworks.enabled() && !attached) {
+                throw new IllegalStateException("Protected Lambda namespace could not attach to its VPC");
+            }
+            Set<String> privateAddresses = attached ? Set.of(eni.getPrivateIpAddress()) : Set.of();
             List<SecurityGroup> groups = ec2.describeSecurityGroups(region, groupIds, List.of(), Map.of());
             if (!Set.copyOf(groupIds).equals(groups.stream().map(SecurityGroup::getGroupId)
                     .collect(Collectors.toSet()))) {
@@ -110,12 +120,12 @@ public class LambdaVpcNetworkManager {
                 // host.docker.internal is supplied by Docker here, not by the host JVM's resolver.
                 firewall.register(new SecurityGroupNftCompiler.Endpoint(account, region, eni.getVpcId(), eniId,
                         eni.getPrivateIpAddress(), namespace.transportAddress(), Set.copyOf(groupIds), groups,
-                        List.of(), false), namespace.helperId(), prefixLists);
+                        List.of(), false, privateAddresses), namespace.helperId(), prefixLists);
                 control = runtimeConnections(namespace.helperId(), runtimeHost, runtimePort);
             }
             firewall.register(new SecurityGroupNftCompiler.Endpoint(account, region, eni.getVpcId(), eniId,
                             eni.getPrivateIpAddress(), namespace.transportAddress(), Set.copyOf(groupIds), groups,
-                            control, false), namespace.helperId(), prefixLists);
+                            control, false, privateAddresses), namespace.helperId(), prefixLists);
             return new Attachment(account, region, eniId, namespace.helperId());
         } catch (RuntimeException failure) {
             try {
