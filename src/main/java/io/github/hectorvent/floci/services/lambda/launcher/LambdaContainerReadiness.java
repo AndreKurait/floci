@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.lambda.launcher;
 
 import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
+import io.github.hectorvent.floci.core.common.docker.DockerFlags;
 
 import java.io.OutputStream;
 import java.time.Duration;
@@ -39,7 +40,7 @@ final class LambdaContainerReadiness {
         if (command.isBlank()) {
             return;
         }
-        List<String> arguments = LambdaDockerFlags.tokenize(command);
+        List<String> arguments = DockerFlags.tokenize(command);
         if (arguments.isEmpty() || timeoutSeconds < 1 || timeoutSeconds > 900) {
             throw new IllegalArgumentException("Lambda container readiness requires a command and a 1–900 second budget");
         }

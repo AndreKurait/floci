@@ -820,6 +820,10 @@ floci:
       # the service scheduler starts replacements. Scoped to this deployment's own containers.
       reconcile-containers-on-startup: true
       image-pull-behavior: default
+      # Extra Docker create flags for ECS task containers, same grammar as lambda.docker-flags.
+      # When set, tasks get no AWS_ENDPOINT_URL/FLOCI_ENDPOINT/FLOCI_HOSTNAME (production-like naming).
+      # docker-flags: ""                     # FLOCI_SERVICES_ECS_DOCKER_FLAGS
+      # additional-docker-networks: []       # FLOCI_SERVICES_ECS_ADDITIONAL_DOCKER_NETWORKS: existing networks joined before start
       task-role-credentials:
         enabled: false
         ttl-seconds: 21600
