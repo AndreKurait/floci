@@ -95,6 +95,9 @@ jobs:
           DIAGNOSTIC_MODE: ${{ matrix.mode }}
         run: |
           date -u +%FT%TZ > profiling/tests-start.txt
+          python3 .ci-diagnostic/.github/ci/startup-profile/capture-build-metrics.py target profiling/sanitized-build-metrics.json > profiling/build-metrics-observer.log 2>&1 &
+          task_metrics_pid=$!
+          trap 'kill "$task_metrics_pid" 2>/dev/null || true; wait "$task_metrics_pid" 2>/dev/null || true' EXIT
           result=0
           if [ "$DIAGNOSTIC_MODE" = profiled ]; then
             bash .ci-diagnostic/.github/ci/startup-profile/run-profiled-shard.sh || result=$?
@@ -103,6 +106,9 @@ jobs:
           fi
           date -u +%FT%TZ > profiling/tests-end.txt
           echo "$result" > profiling/tests-exit-code.txt
+          kill "$task_metrics_pid" 2>/dev/null || true
+          wait "$task_metrics_pid" 2>/dev/null || true
+          trap - EXIT
           exit "$result"
       - name: Summarize recording and remove private artifacts
         if: always()
@@ -111,6 +117,14 @@ jobs:
           if [ -f target/ci-profile/surefire.jfr ]; then
             python3 .ci-diagnostic/.github/ci/startup-profile/summarize.py               target/ci-profile/surefire.jfr profiling/sanitized-samples.json
           fi
+          python3 - <<'PYTHON'
+          import json, pathlib
+          data = json.loads(pathlib.Path('profiling/sanitized-build-metrics.json').read_text())
+          assert data['builds'], 'No augmentation metrics captured'
+          assert len(data['builds']) < 64, 'Build capture limit reached'
+          assert data['captureErrors'] == 0, 'Incomplete augmentation metrics capture'
+          assert all(build['allowedStepCount'] for build in data['builds']), 'No allowed build steps captured'
+          PYTHON
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
@@ -126,6 +140,7 @@ jobs:
             profiling/tests-end.txt
             profiling/tests-exit-code.txt
             profiling/sanitized-samples.json
+            profiling/sanitized-build-metrics.json
             shard.txt
             all-classes.txt
             target/surefire-reports/TEST-*.xml
