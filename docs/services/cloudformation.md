@@ -30,6 +30,14 @@ Generated Ed25519 keys and PPK output are currently rejected before any resource
 created. The CloudFormation strict unsupported-resource policy remains enabled by
 callers that require it.
 
+## IAM role session duration
+
+`AWS::IAM::Role` applies `MaxSessionDuration` on creation and update, including
+resolved parameters. Its range is 3,600 to 43,200 seconds; omitting the property
+uses 3,600 seconds. Updates preserve the role's identity, and failed updates
+restore its previous duration. The limit controls new STS sessions without
+changing credentials already issued.
+
 ## Load balancer target registrations
 
 `AWS::ElasticLoadBalancingV2::TargetGroup` registers its declared `Targets` through
