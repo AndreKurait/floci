@@ -1259,12 +1259,14 @@ public class AutoScalingService implements PassedRoleLookup {
             if (decrementDesiredCapacity && desired < asg.getMinSize()) {
                 throw capacityChangeError(asg, detached.size(), "detach");
             }
+            InstanceRefresh refresh = activeInstanceRefresh(asg);
             if (!detached.isEmpty()) {
                 deregisterFromTargetGroups(elbV2Service, asg, detached);
                 deregisterFromClassicLoadBalancers(elbClassicService, asg, detached);
                 ec2Service.deleteSystemTag(region, detached, GROUP_NAME_TAG, name);
+                completeInstanceRefreshIfSettled(region, name, asg);
             }
-            releaseRefreshOwnership(activeInstanceRefresh(asg), detached);
+            releaseRefreshOwnership(refresh, detached);
             asg.getInstances().removeIf(i -> detached.contains(i.getInstanceId()));
             if (decrementDesiredCapacity) {
                 asg.setDesiredCapacity(desired);
