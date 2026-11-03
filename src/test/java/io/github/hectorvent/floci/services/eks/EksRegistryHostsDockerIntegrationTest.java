@@ -249,6 +249,9 @@ class EksRegistryHostsDockerIntegrationTest {
             }
             Thread.sleep(2000);
         }
+        if (!running) {
+            logPodFailureDiagnostics(containerId);
+        }
         assertTrue(running, "registry-hosts-pod must reach Running, pulling its image through the configured host");
         execInContainerWithExitCode(containerId, new String[]{"kubectl", "delete", "pod", "registry-hosts-pod", "--now"});
     }
@@ -386,6 +389,24 @@ class EksRegistryHostsDockerIntegrationTest {
         // Code
         buf.put(code);
         return buf.array();
+    }
+
+    private void logPodFailureDiagnostics(String containerId) {
+        List<String[]> commands = List.of(
+                new String[]{"kubectl", "--request-timeout=2s", "get", "pod", "registry-hosts-pod", "-o", "json"},
+                new String[]{"kubectl", "--request-timeout=2s", "describe", "pod", "registry-hosts-pod"},
+                new String[]{"kubectl", "--request-timeout=2s", "get", "events",
+                        "--field-selector=involvedObject.name=registry-hosts-pod", "-o", "json"});
+        for (String[] command : commands) {
+            try {
+                ContainerExec.Result result = ContainerExec.run(dockerClient, containerId, command, 5);
+                LOG.warnv("Pod readiness diagnostic {0}: exit={1}, {2}",
+                        String.join(" ", command), result.exitCode(), result.summary());
+            } catch (Exception diagnosticFailure) {
+                LOG.warnv(diagnosticFailure, "Could not collect pod readiness diagnostic {0}",
+                        String.join(" ", command));
+            }
+        }
     }
 
     private void uploadBlob(String host, String repo, String digest, byte[] content) {
