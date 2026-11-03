@@ -442,6 +442,13 @@ With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a s
 Rule and prefix-list updates refresh protected workloads in the caller's account and region.
 Workloads in other accounts keep their own groups and prefix-list entries.
 
+An observer detects externally stopped, removed, or disconnected namespace helpers.
+It retires their DNS identity and removes their addresses from peer security-group rules,
+so an unrelated container reusing an address does not inherit the former ENI's membership.
+Detection is asynchronous; failed policy updates quarantine peers and are retried.
+The owning workload retains responsibility for removing its retired helper; failed
+Docker removal is reported and remains retryable.
+
 VPC-connected Docker Lambda environments use the same policy engine. Their Runtime API
 has an exact IP and TCP-port exception, while their application traffic remains filtered.
 See [Lambda VPC configuration](lambda.md#vpcconfig-snapstart-loggingconfig-and-durableconfig)
