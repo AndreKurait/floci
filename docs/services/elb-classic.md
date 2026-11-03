@@ -73,9 +73,14 @@ Requests use the listener's `InstancePort`. Host, method, raw path/query, author
 and response status/body are preserved. No external DNS target is contacted. Deregistration,
 failed health checks, record changes and load-balancer deletion take effect without restarting.
 
-This serves HTTP backends for HTTP listeners and HTTPS listeners behind Floci's existing TLS
-edge. It does not install the listener's ACM certificate on that edge. TCP/SSL forwarding,
-HTTPS backends, cookie stickiness and connection draining remain unsupported. An owned endpoint
+This serves HTTP and HTTPS backends for HTTP listeners and HTTPS listeners behind Floci's existing
+TLS edge. `InstanceProtocol=HTTPS` opens a TLS connection to `InstancePort`; it never falls back to
+plaintext. Backend certificates are not authenticated, matching Classic ELB without its optional
+backend authentication policy. The policy APIs remain unsupported. Backend TLS uses the runtime's
+enabled protocols and ciphers rather than reproducing Classic ELB's legacy cipher list.
+
+It does not install the listener's ACM certificate on that edge. TCP/SSL forwarding,
+cookie stickiness and connection draining remain unsupported. An owned endpoint
 with no healthy registered instance returns 503. Classic never forwards unresolved, deleted or
 ambiguous endpoints. Hosts without a current Classic resource binding continue through the shared
 edge's existing routing, including API Gateway and S3 custom domains. Multiple competing weighted
@@ -91,15 +96,19 @@ records, latency/failover records and independent Route53 health checks are not 
   group, reported in `SecurityGroups` and `SourceSecurityGroup`. Floci uses the VPC's `default`
   group in the default VPC too, rather than a dedicated `default_elb_<id>` group. A load balancer
   created with only `AvailabilityZones` gets no security group.
+- These security-group associations are metadata at the shared Classic edge. It does not enforce
+  frontend security-group rules or route clients through modeled NAT gateways. A successful request
+  through this edge does not validate those network prerequisites.
 - Load balancer state is persisted through Floci storage, and on startup health checking is
   restarted for the load balancers of every account.
 - A new load balancer gets AWS's default health check (`TCP:80`, interval 30, timeout 5,
   unhealthy 2, healthy 10) and AWS's default attributes (cross-zone off, access log off,
   connection draining off with a 300 second timeout, 60 second idle timeout).
-- Health checks probe the instance's reachable local address. `HTTP:`/`HTTPS:` targets are probed
-  with an HTTP request to the target's path and any 2xx/3xx is healthy; `TCP:`/`SSL:` targets are
-  probed by connecting. TLS is not terminated — an `HTTPS:` target is probed over plain HTTP on
-  the same port.
+- Health checks probe the instance's reachable local address. `HTTP:` and `HTTPS:` send a request
+  to the target's path and require status 200; redirects and other success codes are unhealthy.
+  `HTTPS:` uses TLS. `TCP:` requires a connection, while `SSL:` also requires a TLS handshake.
+  The configured health timeout bounds waiting for the handshake or response. Health probes
+  do not authenticate backend certificates.
 - Between registration and the first successful check an instance reports `OutOfService` with
   reason code `ELB`, as it does on AWS.
 - Health is tracked per account, so two accounts can each have a load balancer with the same name
