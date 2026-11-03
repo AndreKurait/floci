@@ -8,6 +8,7 @@ import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Info;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
@@ -36,7 +37,7 @@ import java.util.concurrent.TimeUnit;
 
 /** Owns the protected namespace and the Floci-only nftables table for each managed ENI. */
 @ApplicationScoped
-public class SecurityGroupFirewallManager {
+public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     private static final Logger LOG = Logger.getLogger(SecurityGroupFirewallManager.class);
     private final DockerClient dockerClient;
@@ -59,6 +60,18 @@ public class SecurityGroupFirewallManager {
 
     public boolean enabled() {
         return config.network().securityGroupEnforcement().enabled();
+    }
+
+    /** The DNS packet carries the helper's transport address, not the ENI's logical private IP. */
+    @Override
+    public synchronized Optional<ClientVpc> vpcForClient(String clientAddress) {
+        if (clientAddress == null || clientAddress.isBlank()) {
+            return Optional.empty();
+        }
+        return endpoints.values().stream().map(ProtectedEndpoint::endpoint)
+                .filter(endpoint -> clientAddress.equals(endpoint.transportAddress()))
+                .findFirst()
+                .map(endpoint -> new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId()));
     }
 
     @PostConstruct

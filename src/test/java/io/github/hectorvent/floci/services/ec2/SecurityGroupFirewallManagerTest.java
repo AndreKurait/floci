@@ -6,6 +6,7 @@ import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.Info;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
@@ -18,20 +19,56 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class SecurityGroupFirewallManagerTest {
+
+    @Test
+    void dnsOriginsUseRegisteredTransportAddressesAndTheirCompleteVpcScope() {
+        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(mock(DockerClient.class),
+                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), mock(EmulatorConfig.class),
+                mock(EmbeddedDnsServer.class)));
+        doNothing().when(manager).reconcileAll();
+        DnsClientVpcSource origins = assertInstanceOf(DnsClientVpcSource.class, manager);
+        List<DnsClientVpcSource.ClientVpc> scopes = List.of(
+                new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-a"),
+                new DnsClientVpcSource.ClientVpc("222222222222", "us-east-1", "vpc-a"),
+                new DnsClientVpcSource.ClientVpc("111111111111", "us-west-2", "vpc-a"),
+                new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-b"));
+        for (int index = 0; index < scopes.size(); index++) {
+            DnsClientVpcSource.ClientVpc scope = scopes.get(index);
+            String address = "172.18.0." + (index + 2);
+            manager.register(new SecurityGroupNftCompiler.Endpoint(scope.accountId(), scope.region(), scope.vpcId(),
+                    "eni-" + index, "10.0.1.10", address, Set.of(), List.of()), "helper-" + index, Map.of());
+            assertEquals(Optional.of(scope), origins.vpcForClient(address));
+        }
+        assertTrue(origins.vpcForClient("10.0.1.10").isEmpty(), "logical addresses can repeat across VPCs");
+        assertTrue(origins.vpcForClient("172.18.0.99").isEmpty());
+        assertTrue(origins.vpcForClient(null).isEmpty());
+        assertTrue(origins.vpcForClient(" ").isEmpty());
+        manager.unregister("eni-0");
+        assertTrue(origins.vpcForClient("172.18.0.2").isEmpty(), "retired namespaces no longer own DNS queries");
+        DnsClientVpcSource.ClientVpc replacement = scopes.getLast();
+        manager.register(new SecurityGroupNftCompiler.Endpoint(replacement.accountId(), replacement.region(),
+                replacement.vpcId(), "eni-replacement", "10.0.1.10", "172.18.0.2", Set.of(), List.of()),
+                "helper-replacement", Map.of());
+        assertEquals(Optional.of(replacement), origins.vpcForClient("172.18.0.2"));
+    }
 
     @Test
     void helperCarriesTheResolverAndHostsItsWorkloadsUse() {
