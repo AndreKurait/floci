@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.autoscaling;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
@@ -48,6 +49,7 @@ public class AutoScalingService implements PassedRoleLookup {
 
     private final Event<AutoScalingGroupChanged> groupChanges;
     private final ElbV2Service elbV2Service;
+    private final int maxCapacityReservationIds;
 
     public AutoScalingService() {
         this(null, null);
@@ -58,9 +60,23 @@ public class AutoScalingService implements PassedRoleLookup {
     }
 
     @Inject
+    AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
+                       EmulatorConfig config) {
+        this(groupChanges, elbV2Service, config.services().autoscaling().maxCapacityReservationIds());
+    }
+
     AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service) {
+        this(groupChanges, elbV2Service, 1);
+    }
+
+    AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
+                       int maxCapacityReservationIds) {
+        if (maxCapacityReservationIds < 1) {
+            throw new IllegalArgumentException("floci.services.autoscaling.max-capacity-reservation-ids must be positive");
+        }
         this.groupChanges = groupChanges;
         this.elbV2Service = elbV2Service;
+        this.maxCapacityReservationIds = maxCapacityReservationIds;
     }
 
     private void requestReconciliation(AutoScalingGroup group) {
@@ -1896,7 +1912,7 @@ public class AutoScalingService implements PassedRoleLookup {
         return overrides != null ? overrides : List.of();
     }
 
-    private static void validateOptionalFields(AsgOptionalFields optionalFields) {
+    private void validateOptionalFields(AsgOptionalFields optionalFields) {
         if (optionalFields == null) {
             return;
         }
@@ -1959,7 +1975,7 @@ public class AutoScalingService implements PassedRoleLookup {
         }
     }
 
-    static void validateCapacityReservationSpecification(CapacityReservationSpecification specification) {
+    void validateCapacityReservationSpecification(CapacityReservationSpecification specification) {
         if (specification == null) {
             return;
         }
@@ -1974,9 +1990,13 @@ public class AutoScalingService implements PassedRoleLookup {
                 && !specification.getCapacityReservationResourceGroupArns().isEmpty()) {
             throw new AwsException("ValidationError", MIXED_CAPACITY_RESERVATION_TARGETS_MESSAGE, 400);
         }
-        if (specification.getCapacityReservationIds().size()
-                + specification.getCapacityReservationResourceGroupArns().size() > 1) {
+        if (specification.getCapacityReservationResourceGroupArns().size() > 1) {
             throw new AwsException("ValidationError", MULTIPLE_CAPACITY_RESERVATION_TARGETS_MESSAGE, 400);
+        }
+        if (specification.getCapacityReservationIds().size() > maxCapacityReservationIds) {
+            String message = maxCapacityReservationIds == 1 ? MULTIPLE_CAPACITY_RESERVATION_TARGETS_MESSAGE
+                    : "Specifying more than " + maxCapacityReservationIds + " CapacityReservationIds is not supported.";
+            throw new AwsException("ValidationError", message, 400);
         }
         for (String id : specification.getCapacityReservationIds()) {
             if (id == null || id.isEmpty() || id.length() > 255

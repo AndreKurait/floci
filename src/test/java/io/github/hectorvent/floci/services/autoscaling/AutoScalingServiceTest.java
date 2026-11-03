@@ -197,6 +197,12 @@ class AutoScalingServiceTest {
         assertEquals(List.of(owned), group.getInstances());
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 0})
+    void invalidCapacityTargetLimitPreventsStartup(int limit) {
+        assertThrows(IllegalArgumentException.class, () -> new AutoScalingService(null, null, limit));
+    }
+
     @BeforeEach
     void setUp() {
         service = new AutoScalingService();
