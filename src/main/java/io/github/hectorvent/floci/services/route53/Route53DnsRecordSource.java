@@ -245,6 +245,9 @@ public class Route53DnsRecordSource implements DnsRecordSource {
                         int cnameTtl = ttlOf(rrs);
                         if (route53Service.isCoveredByPrivateZone(cleanTarget, origin)) {
                             DnsAnswer targetAnswer = resolveAddresses(cleanTarget, visited, depth + 1, origin);
+                            if (targetAnswer.isEmpty()) {
+                                return targetAnswer;
+                            }
                             return DnsAnswer.records(targetAnswer.addresses(),
                                     Math.min(cnameTtl, targetAnswer.ttlSeconds()));
                         }
