@@ -53,7 +53,8 @@ class SsmTimeoutDockerIntegrationTest {
             assertEquals("stderr-marker", output.stderr());
 
             ContainerExec.Result tools = ContainerExec.run(docker, container.containerId(), new String[]{"sh", "-c",
-                    "mkdir /tmp/ssm-minimal-tools && ln -s /bin/sh /tmp/ssm-minimal-tools/sh"}, 3);
+                    "mkdir /tmp/ssm-minimal-tools && for tool in sh mktemp chmod rm rmdir; do "
+                            + "ln -s \"$(command -v $tool)\" /tmp/ssm-minimal-tools/$tool || exit 1; done"}, 3);
             assertEquals(0, tools.exitCode(), tools.summary());
             ContainerExec.Result fallback = ContainerExec.run(docker, container.containerId(), new String[]{"sh", "-c",
                     "PATH=/tmp/ssm-minimal-tools; export PATH; " + SsmDirectCommandExecutor.timeoutWrappedScript(
@@ -62,7 +63,7 @@ class SsmTimeoutDockerIntegrationTest {
             assertEquals("fallback", fallback.stdout());
 
             ContainerExec.Result withoutSetsid = ContainerExec.run(docker, container.containerId(), new String[]{"sh", "-c",
-                    "for tool in mktemp mkdir rmdir rm sleep timeout; do "
+                    "for tool in mkdir sleep timeout; do "
                             + "ln -s \"$(command -v $tool)\" /tmp/ssm-minimal-tools/$tool || exit 1; done; "
                             + "PATH=/tmp/ssm-minimal-tools; export PATH; "
                             + SsmDirectCommandExecutor.timeoutWrappedScript("printf no-setsid; exit 137", 5)}, 3);
@@ -73,9 +74,36 @@ class SsmTimeoutDockerIntegrationTest {
             assertFalse(terminated.timedOut(), "The guest timeout must finish before Docker attach's deadline");
             assertTrue(Set.of(124L, 137L, 143L).contains(terminated.exitCode()), terminated.summary());
 
-            ContainerExec.Result killed = execute(container.containerId(), "trap '' TERM; exec sleep 20", 1);
+            SsmCommandTimeout supervisor = new SsmCommandTimeout(4096);
+            ContainerExec.Result killed = ContainerExec.run(docker, container.containerId(),
+                    new String[]{"sh", "-c", supervisor.wrap("trap '' TERM; exec sleep 20", 1)}, 8);
+            supervisor.writeError(killed.stderr().getBytes(StandardCharsets.UTF_8));
             assertFalse(killed.timedOut(), "Kill escalation must finish before Docker attach's deadline");
-            assertEquals(137, killed.exitCode(), killed.summary());
+            assertTrue(Set.of(124L, 137L).contains(killed.exitCode()), killed.summary());
+            assertTrue(supervisor.timedOut(), "Kill escalation must emit the guest deadline marker");
+        } finally {
+            lifecycle.removeIfExistsStrict(name, true);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"busybox:stable", "public.ecr.aws/lambda/nodejs:20", "ubuntu:24.04"})
+    void timeoutRemovesInvocationFilesAfterKillingTheCommand(String image) {
+        String name = ContainerStorageHelper.resourceName(config, "ssm-timeout", null, UUID.randomUUID().toString());
+        try {
+            ContainerInfo container = lifecycle.createAndStartEphemeral(builder.newContainer(image)
+                    .withName(name).withEntrypoint(List.of("sh", "-c"))
+                    .withCmd(List.of("exec sleep 600")).build());
+            ContainerExec.Result timed = execute(container.containerId(),
+                    "#!/bin/sh\nprintf '%s\\n' \"$0\"\nsleep 20", 1);
+            assertFalse(timed.timedOut(), timed.summary());
+            assertTrue(Set.of(124L, 137L, 143L).contains(timed.exitCode()), timed.summary());
+            String script = timed.stdout().strip();
+            assertTrue(script.startsWith("/tmp/") && script.endsWith("/_script.sh"), timed.summary());
+            String directory = script.substring(0, script.lastIndexOf('/'));
+            ContainerExec.Result removed = ContainerExec.run(docker, container.containerId(),
+                    new String[]{"test", "!", "-d", directory}, 3);
+            assertEquals(0, removed.exitCode(), "Timed-out invocation retained " + directory);
         } finally {
             lifecycle.removeIfExistsStrict(name, true);
         }
@@ -108,7 +136,7 @@ class SsmTimeoutDockerIntegrationTest {
                     .withName(name).withEntrypoint(List.of("sh", "-c"))
                     .withCmd(List.of("exec sleep 600")).build());
             ContainerExec.Result setup = ContainerExec.run(docker, container.containerId(), new String[]{"sh", "-c",
-                    "mkdir /tmp/ssm-gnu-tools; for tool in sh mktemp mkdir rmdir rm sleep timeout mkfifo; do "
+                    "mkdir /tmp/ssm-gnu-tools; for tool in sh mktemp chmod mkdir rmdir rm sleep timeout mkfifo; do "
                             + "ln -s \"$(command -v $tool)\" /tmp/ssm-gnu-tools/$tool || exit 1; done"}, 3);
             assertEquals(0, setup.exitCode(), setup.summary());
             SsmCommandTimeout timeout = new SsmCommandTimeout(4096);

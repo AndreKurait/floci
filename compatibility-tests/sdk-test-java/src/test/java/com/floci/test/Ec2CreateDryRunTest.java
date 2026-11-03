@@ -86,25 +86,25 @@ class Ec2CreateDryRunTest {
     }
 
     @Test
-    @DisplayName("CreateSubnet with DryRun in a missing VPC keeps InvalidVpcID.NotFound")
+    @DisplayName("CreateSubnet with DryRun answers DryRun before missing VPC validation")
     void createSubnetWithDryRunInAMissingVpc() {
         try (Ec2Client ec2 = TestFixtures.ec2Client()) {
             Ec2Exception error = assertThrows(Ec2Exception.class, () -> ec2.createSubnet(r -> r
                     .vpcId("vpc-0123456789abcdef0").cidrBlock("10.215.8.0/24").dryRun(true)));
-            assertThat(error.statusCode()).isEqualTo(400);
-            assertThat(error.awsErrorDetails().errorCode()).isEqualTo("InvalidVpcID.NotFound");
+            assertThat(error.statusCode()).isEqualTo(412);
+            assertThat(error.awsErrorDetails().errorCode()).isEqualTo("DryRunOperation");
         }
     }
 
     @Test
-    @DisplayName("CreateSecurityGroup with DryRun in a missing VPC keeps InvalidVpcID.NotFound")
+    @DisplayName("CreateSecurityGroup with DryRun answers DryRun before missing VPC validation")
     void createSecurityGroupWithDryRunInAMissingVpc() {
         try (Ec2Client ec2 = TestFixtures.ec2Client()) {
             Ec2Exception error = assertThrows(Ec2Exception.class, () -> ec2.createSecurityGroup(r -> r
                     .vpcId("vpc-0123456789abcdef0").groupName("compat-dry-run-missing-vpc")
                     .description("compatibility dry run").dryRun(true)));
-            assertThat(error.statusCode()).isEqualTo(400);
-            assertThat(error.awsErrorDetails().errorCode()).isEqualTo("InvalidVpcID.NotFound");
+            assertThat(error.statusCode()).isEqualTo(412);
+            assertThat(error.awsErrorDetails().errorCode()).isEqualTo("DryRunOperation");
         }
     }
 

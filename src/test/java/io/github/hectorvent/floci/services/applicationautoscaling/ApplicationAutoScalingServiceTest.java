@@ -495,6 +495,23 @@ class ApplicationAutoScalingServiceTest {
     }
 
     @Test
+    void lambdaAlarmsWatchThePublishedProvisionedConcurrencyMetric() {
+        String resource = "function:worker:live";
+        String dimension = "lambda:function:ProvisionedConcurrency";
+        service.registerScalableTarget("lambda", resource, dimension, 1, 3, null, null, Map.of(), REGION);
+        service.putScalingPolicy("utilization", "TargetTrackingScaling", "lambda", resource, dimension,
+                targetTracking(0.7, "LambdaProvisionedConcurrencyUtilization", null), null, REGION);
+
+        assertEquals(2, createdAlarms.size());
+        for (MetricAlarm alarm : createdAlarms) {
+            assertEquals("AWS/Lambda", alarm.getNamespace());
+            assertEquals("ProvisionedConcurrencyUtilization", alarm.getMetricName());
+            assertEquals(List.of(new Dimension("FunctionName", "worker"), new Dimension("Resource", "worker:live")),
+                    alarm.getDimensions());
+        }
+    }
+
+    @Test
     void ecsCpuPredefinedAlarmsWatchTheRealAwsEcsMetricIdentity() {
         register();
         service.putScalingPolicy("cpu", "TargetTrackingScaling",

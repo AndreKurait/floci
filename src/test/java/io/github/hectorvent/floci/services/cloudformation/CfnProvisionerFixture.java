@@ -433,9 +433,6 @@ final class CfnProvisionerFixture {
             if (appSyncService != null) {
                 discovered.add(new AppSyncCfnProvisioner(appSyncService));
             }
-            if (appConfigService != null) {
-                discovered.add(new AppConfigCfnProvisioner(appConfigService));
-            }
             if (lambdaService != null) {
                 discovered.add(new LambdaAddressingCfnProvisioner(lambdaService));
                 discovered.add(new LambdaEventInvokeConfigCfnProvisioner(lambdaService));
@@ -506,9 +503,6 @@ final class CfnProvisionerFixture {
                 discovered.add(new Ec2InstanceCfnProvisioner(ec2Service));
                 discovered.add(new Ec2LaunchTemplateCfnProvisioner(ec2Service));
                 discovered.add(new Ec2NetworkCfnProvisioner(ec2Service));
-            }
-            if (ec2Service != null && ssmService != null) {
-                discovered.add(new Ec2KeyPairCfnProvisioner(ec2Service, ssmService));
             }
             if (route53Service != null) {
                 discovered.add(new Route53CfnProvisioner(route53Service));

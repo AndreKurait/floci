@@ -9696,9 +9696,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             boolean takesIops = volumeType != null && PROVISIONED_IOPS_VOLUME_TYPES.contains(volumeType);
             int iops = takesIops && ebs.getIops() != null ? ebs.getIops() : 0;
             Integer throughput = "gp3".equals(volumeType) ? ebs.getThroughput() : null;
-            if (ebs.getKmsKeyId() != null) {
-                throw new AwsException("UnsupportedOperation", "Launch-time KMS key selection is not supported.", 400);
-            }
             if (snapshot != null && snapshot.isEncrypted() && Boolean.FALSE.equals(ebs.getEncrypted())) {
                 throw new AwsException("InvalidBlockDeviceMapping", "An encrypted snapshot cannot be decrypted at launch.", 400);
             }

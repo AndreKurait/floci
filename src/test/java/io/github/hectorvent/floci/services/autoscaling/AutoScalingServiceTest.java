@@ -1187,6 +1187,7 @@ class AutoScalingServiceTest {
         assertEquals(100, refresh.getPercentageComplete());
         assertEquals(0, refresh.getInstancesToUpdate());
         assertNotNull(refresh.getEndTime());
+        assertTrue(refresh.getReplacements().isEmpty(), "Removal releases ownership even after refresh completion");
         AutoScalingGroup group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
         assertEquals(0, group.getDesiredCapacity());
         if (terminate) {

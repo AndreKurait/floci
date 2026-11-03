@@ -610,7 +610,7 @@ class AppConfigCfnProvisionerTest {
         String appId = create(APPLICATION, props("Name", "orders")).getPhysicalId();
         StackResource env = create(ENVIRONMENT, props("ApplicationId", appId, "Name", "beta"));
         AwsException storage = new AwsException("InternalServerException", "storage failed", 500);
-        doThrow(storage).when(service).deleteEnvironmentById(env.getPhysicalId());
+        doThrow(storage).when(service).deleteEnvironmentById(appId, env.getPhysicalId());
 
         assertSame(storage, assertThrows(AwsException.class, () -> provisioner.delete(env, REGION)));
     }
@@ -624,6 +624,7 @@ class AppConfigCfnProvisionerTest {
         provisioner.delete(stub, REGION);
 
         verify(service, never()).deleteEnvironmentById(anyString());
+        verify(service, never()).deleteEnvironmentById(anyString(), anyString());
         verify(service, never()).deleteEnvironment(anyString(), anyString());
     }
 

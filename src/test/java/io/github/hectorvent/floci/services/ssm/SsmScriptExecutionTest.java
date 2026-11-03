@@ -2,10 +2,13 @@ package io.github.hectorvent.floci.services.ssm;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -25,6 +28,24 @@ class SsmScriptExecutionTest {
     @Test
     void interpreterFailureDoesNotFallBackToShell() throws Exception {
         Result result = execute("#!/floci-no-such-interpreter\nprintf 'must not execute'", 5, null);
+        assertTrue(result.exitCode() != 0);
+        assertEquals("", result.stdout());
+        assertFalse(result.stderr().isBlank());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"mktemp,/bin/cat", "chmod,/bin/cat",
+            "mktemp,/floci-no-such-interpreter", "chmod,/floci-no-such-interpreter"})
+    void missingExecutionToolsDoNotChangeTheInterpreter(String missing, String interpreter,
+                                                       @TempDir Path tools) throws Exception {
+        for (String tool : List.of("sh", "mktemp", "chmod", "rm", "rmdir")) {
+            if (!tool.equals(missing)) {
+                Path executable = Path.of("/bin", tool);
+                assertTrue(Files.isExecutable(executable), executable.toString());
+                Files.createSymbolicLink(tools.resolve(tool), executable);
+            }
+        }
+        Result result = execute("#!" + interpreter + "\nprintf 'must not execute'", 5, null, tools);
         assertTrue(result.exitCode() != 0);
         assertEquals("", result.stdout());
         assertFalse(result.stderr().isBlank());
@@ -51,8 +72,15 @@ class SsmScriptExecutionTest {
     }
 
     private Result execute(String script, int timeoutSeconds, Path directory) throws Exception {
+        return execute(script, timeoutSeconds, directory, null);
+    }
+
+    private Result execute(String script, int timeoutSeconds, Path directory, Path tools) throws Exception {
         ProcessBuilder builder = new ProcessBuilder(
                 "sh", "-c", SsmDirectCommandExecutor.timeoutWrappedScript(script, timeoutSeconds));
+        if (tools != null) {
+            builder.environment().put("PATH", tools.toString());
+        }
         if (directory != null) {
             builder.directory(directory.toFile());
         }

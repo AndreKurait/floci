@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.autoscaling;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
@@ -29,6 +30,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -54,7 +56,10 @@ class AutoScalingStandbyServiceTest {
         elb = mock(ElbV2Service.class);
         classic = mock(ElbClassicService.class);
         changes = mock(Event.class);
-        service = new AutoScalingService(changes, elb);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().autoscaling().maxCapacityReservationIds()).thenReturn(1);
+        when(config.services().autoscaling().multipleCapacityReservationScopes()).thenReturn(Optional.empty());
+        service = new AutoScalingService(changes, elb, config, classic);
         service.regionResolver = new RegionResolver(REGION, "000000000000");
         group = service.createAutoScalingGroup(REGION, GROUP, null, "lt-original", null, "1", null,
                 0, 4, 2, 300, List.of(REGION + "a"), List.of(), List.of("target-group"),

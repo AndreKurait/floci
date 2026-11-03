@@ -178,7 +178,8 @@ public class TargetDispatcher implements Resettable {
         return target;
     }
 
-    private void attempt(Delivery delivery, Target target, Instant now) {
+    private void attempt(Delivery delivery, Target currentTarget, Instant now) {
+        Target target = new Target(currentTarget);
         try {
             String targetArn = target.getArn();
             if (AwsArnUtils.isArnFor(targetArn, "lambda")) {

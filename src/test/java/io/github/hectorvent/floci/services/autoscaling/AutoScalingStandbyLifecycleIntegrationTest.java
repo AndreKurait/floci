@@ -197,11 +197,11 @@ class AutoScalingStandbyLifecycleIntegrationTest {
                         .reservations().getFirst().instances().getFirst().state().nameAsString());
             });
             assertTrafficMembers(activeInstanceIds());
-            Activity failed = client.describeScalingActivities(request -> request.autoScalingGroupName(name))
+            Activity cancelled = client.describeScalingActivities(request -> request.autoScalingGroupName(name))
                     .activities().stream().filter(activity -> exiting.activityId().equals(activity.activityId()))
                     .findFirst().orElseThrow();
-            assertEquals("Failed", failed.statusCodeAsString());
-            assertNotNull(failed.endTime());
+            assertEquals("Cancelled", cancelled.statusCodeAsString());
+            assertNotNull(cancelled.endTime());
         }
     }
 
