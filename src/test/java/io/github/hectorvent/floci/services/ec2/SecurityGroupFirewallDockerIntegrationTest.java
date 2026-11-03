@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.services.ec2;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
@@ -12,7 +14,10 @@ import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -21,9 +26,11 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 class SecurityGroupFirewallDockerIntegrationTest {
@@ -37,6 +44,59 @@ class SecurityGroupFirewallDockerIntegrationTest {
     @Inject ContainerLifecycleManager lifecycle;
     @Inject ContainerBuilder builder;
     @Inject DockerClient docker;
+
+    @ParameterizedTest
+    @ValueSource(strings = {"stop", "remove", "disconnect"})
+    void externalHelperChangesRetireDnsWithoutAControlPlaneCall(String action) {
+        Assumptions.assumeTrue(firewall.enabled());
+        try {
+            Assumptions.assumeTrue("linux".equalsIgnoreCase(docker.infoCmd().exec().getOsType()));
+        } catch (Exception e) {
+            Assumptions.abort("Docker daemon is unavailable");
+        }
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String eni = "eni-dns-" + suffix;
+        String networkName = "floci-sg-dns-" + suffix;
+        String network = null;
+        String replacement = null;
+        SecurityGroupFirewallManager.Namespace source = null;
+        try {
+            network = docker.createNetworkCmd().withName(networkName).withIpam(new Network.Ipam()
+                    .withConfig(new Network.Ipam.Config().withSubnet("10.199.42.0/24"))).exec().getId();
+            source = firewall.createNamespace("ec2", "dns-" + suffix, "000000000000",
+                    "us-east-1", Optional.of(networkName), Map.of());
+            firewall.register(endpoint(eni, "10.0.0.2", source, group("sg-dns", true, "0.0.0.0/0")),
+                    source.helperId(), Map.of());
+            String address = source.transportAddress();
+            assertTrue(firewall.vpcForClient(address).isPresent());
+
+            switch (action) {
+                case "stop" -> docker.stopContainerCmd(source.helperId()).withTimeout(0).exec();
+                case "remove" -> docker.removeContainerCmd(source.helperId()).withForce(true).exec();
+                case "disconnect" -> docker.disconnectFromNetworkCmd().withNetworkId(network)
+                        .withContainerId(source.helperId()).withForce(true).exec();
+                default -> throw new IllegalArgumentException(action);
+            }
+            await().atMost(Duration.ofSeconds(10)).until(() -> firewall.vpcForClient(address).isEmpty());
+
+            replacement = docker.createContainerCmd("alpine:3.21").withName("floci-dns-unmanaged-" + suffix)
+                    .withHostConfig(HostConfig.newHostConfig().withNetworkMode(networkName))
+                    .withIpv4Address(address).withCmd("sleep", "600").exec().getId();
+            docker.startContainerCmd(replacement).exec();
+            assertTrue(firewall.vpcForClient(address).isEmpty(), "reused addresses do not inherit VPC identity");
+        } finally {
+            if (replacement != null) {
+                lifecycle.removeIfExists(replacement);
+            }
+            firewall.unregister(eni);
+            if (source != null) {
+                lifecycle.removeIfExists(source.helperId());
+            }
+            if (network != null) {
+                docker.removeNetworkCmd(network).exec();
+            }
+        }
+    }
 
     @Test
     void deniedLogicalCidrBlocksManagedPeerThenRuleUpdatePermitsIt() throws Exception {
