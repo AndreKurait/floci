@@ -107,8 +107,9 @@ records, latency/failover records and independent Route53 health checks are not 
 - Health checks probe the instance's reachable local address. `HTTP:` and `HTTPS:` send a request
   to the target's path and require status 200; redirects and other success codes are unhealthy.
   `HTTPS:` uses TLS. `TCP:` requires a connection, while `SSL:` also requires a TLS handshake.
-  The configured health timeout bounds waiting for the handshake or response. Health probes
-  do not authenticate backend certificates.
+  The configured health timeout bounds the whole connection, handshake and response probe.
+  Continuous response progress does not extend that deadline; expiry closes the probe socket.
+  Health probes do not authenticate backend certificates.
 - Between registration and the first successful check an instance reports `OutOfService` with
   reason code `ELB`, as it does on AWS.
 - Health is tracked per account, so two accounts can each have a load balancer with the same name
