@@ -445,6 +445,11 @@ When the image lacks `sshd` or `scp`, Floci first installs OpenSSH with the imag
 
 With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a separate Linux network namespace and an nftables default-deny policy before starting each Docker-backed instance. It checks new managed connections against both the sender's egress rules and the receiver's ingress rules, using emulated ENI addresses and security-group membership before translating to Docker addresses. Established replies use connection tracking. This filters packets but does not emulate VPC routing, NACLs, NAT gateways, or peering. Rootless Docker and Windows containers are unsupported.
 
+With VPC Docker networks enabled, the protected EC2 namespace also joins its VPC
+at the instance's allocated private IP. Guests can bind and reach that address;
+the private and primary Docker addresses share the same ENI permissions.
+A failed VPC attachment stops the launch. Stop/start retains the private interface.
+
 When embedded DNS is available, the protected namespace supplies its address as
 the sole nameserver before starting workloads. Workloads inherit that resolver
 file, so ordinary DNS works on an internal Docker network without an external
@@ -457,6 +462,7 @@ Workloads in other accounts keep their own groups and prefix-list entries.
 An observer detects externally stopped, removed, or disconnected namespace helpers.
 It retires their DNS identity and removes their addresses from peer security-group rules,
 so an unrelated container reusing an address does not inherit the former ENI's membership.
+Losing either registered interface withdraws both addresses, including a surviving primary interface.
 Detection is asynchronous; failed policy updates quarantine peers and are retried.
 The owning workload retains responsibility for removing its retired helper; failed
 Docker removal is reported and remains retryable.
@@ -1859,9 +1865,9 @@ true or it is in the log.
 
 Limits worth knowing before reading a passing test as evidence:
 
-- **Security groups and NACLs are not enforced by this.** Within one Docker network every
-  container reaches every other on every port.
-- **Between-VPC isolation is the daemon's, not Floci's.** It comes from Docker's own
+- **VPC networks alone do not enforce security groups or NACLs.** Enable security-group
+  enforcement to protect EC2 namespaces on these networks. NACLs remain unemulated.
+- **Without packet enforcement, between-VPC isolation depends on the daemon.** It comes from Docker's own
   `DOCKER-ISOLATION-STAGE` rules. OrbStack does not apply them: measured on OrbStack 29.4.0,
   two containers on separate networks reach each other in both directions, `--internal` included.
   On such a host the VPC boundary is an addressing boundary only.
