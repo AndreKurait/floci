@@ -344,6 +344,7 @@ aws-data-check: ## CI gate: the vendored AWS data must match a fresh generation
 	@$(MAKE) --no-print-directory iam-passed-network-connectors-check
 	@$(MAKE) --no-print-directory iam-tag-on-create-check
 	@$(MAKE) --no-print-directory iam-request-resources-check
+	@$(MAKE) --no-print-directory s3control-tag-condition-keys-check
 
 aws-data-test: ## Run the AWS data generators' unit tests
 	$(PYTHON) -m pytest tools/aws -q
@@ -423,11 +424,15 @@ IAM_REQUEST_RESOURCES_PATHS := src/main/resources/aws/iam-request-resources.json
 	tools/aws/regen_iam_request_resources.py $(IAM_PASSED_ROLES_GENERATOR) \
 	tools/aws/test_regen_iam_request_resources.py
 
+S3CONTROL_TAG_CONDITION_KEYS_PATHS := src/main/resources/aws/s3control-tag-condition-keys.json \
+	tools/aws/regen_s3control_tag_condition_keys.py tools/aws/test_regen_s3control_tag_condition_keys.py \
+	tools/aws/regen_iam_tag_on_create.py $(IAM_PASSED_ROLES_GENERATOR)
+
 iam-data-verify: ## CI gate (online): every vendored IAM file must still match AWS; CHANGED="<paths>" checks only the ones they cover
 	@# Every check runs even when an earlier one fails, so one file's drift cannot hide another's
 	@# state. Sequential steps in CI stop at the first failure, which once left the action
 	@# resource gate unexercised while the namespace list was stale.
-	@namespaces=0; actions=0; authorized=0; passed=0; connectors=0; tagged=0; requested=0; \
+	@namespaces=0; actions=0; authorized=0; passed=0; connectors=0; tagged=0; requested=0; s3control=0; \
 	covers() { \
 		[ -z "$(strip $(CHANGED))" ] && return 0; \
 		for path in $(CHANGED); do case " $$1 " in *" $$path "*) return 0;; esac; done; \
@@ -455,8 +460,11 @@ iam-data-verify: ## CI gate (online): every vendored IAM file must still match A
 	if covers "$(IAM_REQUEST_RESOURCES_PATHS)" "the table of the resources requests name"; then \
 		$(MAKE) --no-print-directory iam-request-resources-verify || requested=$$?; \
 	fi; \
+	if covers "$(S3CONTROL_TAG_CONDITION_KEYS_PATHS)" "the S3 Control tag condition key table"; then \
+		$(MAKE) --no-print-directory s3control-tag-condition-keys-verify || s3control=$$?; \
+	fi; \
 	if [ $$namespaces -ne 0 ] || [ $$actions -ne 0 ] || [ $$authorized -ne 0 ] || [ $$passed -ne 0 ] \
-			|| [ $$connectors -ne 0 ] || [ $$tagged -ne 0 ] || [ $$requested -ne 0 ]; then \
+			|| [ $$connectors -ne 0 ] || [ $$tagged -ne 0 ] || [ $$requested -ne 0 ] || [ $$s3control -ne 0 ]; then \
 		echo ""; \
 		echo "error: vendored IAM data does not match upstream:"; \
 		if [ $$namespaces -ne 0 ]; then \
@@ -476,6 +484,9 @@ iam-data-verify: ## CI gate (online): every vendored IAM file must still match A
 		fi; \
 		if [ $$tagged -ne 0 ]; then \
 			echo "       the table of the tagging actions creates need, see its message above"; \
+		fi; \
+		if [ $$s3control -ne 0 ]; then \
+			echo "       the S3 Control tag condition key table, see its message above"; \
 		fi; \
 		if [ $$requested -ne 0 ]; then \
 			echo "       the table of the resources requests name, see its message above"; \
@@ -649,3 +660,11 @@ cfn-property-types-verify: ## CI gate (online): the vendored CloudFormation prop
 
 cfn-property-types-test: ## Run the CloudFormation property type generator's unit tests
 	$(PYTHON) -m pytest tools/aws/test_regen_cfn_property_types.py -q
+
+.PHONY: s3control-tag-condition-keys-sync s3control-tag-condition-keys-check s3control-tag-condition-keys-verify
+s3control-tag-condition-keys-sync: ## Regenerate the S3 Control tag condition keys from AWS and botocore
+	$(PYTHON) tools/aws/regen_s3control_tag_condition_keys.py
+s3control-tag-condition-keys-check: ## Check the S3 Control tag condition request members against pinned botocore
+	$(PYTHON) tools/aws/regen_s3control_tag_condition_keys.py --check
+s3control-tag-condition-keys-verify: ## Check the S3 Control tag condition action keys against AWS
+	$(PYTHON) tools/aws/regen_s3control_tag_condition_keys.py --verify
