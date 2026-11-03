@@ -325,12 +325,14 @@ class S3ObjectOperationsIamEnforcementIntegrationTest {
         // make it a copy whose tags come from a source.
         denied(f.user().header("x-amz-tagging", "env=a").header("x-amz-copy-source", f.bucket + "/a/source")
                 .queryParam("uploads", "").when().post(f.path("a/upload")).then(), "s3:PutObjectTagging");
-        denied(f.user().header("x-amz-acl", "private").queryParam("uploads", "")
-                .when().post(f.path("a/upload")).then(), "s3:PutObjectAcl");
+        String privateUploadId = f.user().header("x-amz-acl", "private").queryParam("uploads", "")
+                .when().post(f.path("a/upload")).then().statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        cleanup.register(() -> f.admin().queryParam("uploadId", privateUploadId).when().delete(f.path("a/upload")));
         denied(f.copy().header("x-amz-tagging-directive", "REPLACE").header("x-amz-tagging", "env=a")
                 .when().put(f.path("a/copy")).then(), "s3:PutObjectTagging");
-        denied(f.copy().header("x-amz-tagging-directive", "REPLACE").header("x-amz-acl", "private")
-                .when().put(f.path("a/copy")).then(), "s3:PutObjectAcl");
+        f.copy().header("x-amz-tagging-directive", "REPLACE").header("x-amz-acl", "private")
+                .when().put(f.path("a/copy")).then().statusCode(200);
         // Without REPLACE a copy puts the source's tags on the new object, so a tagged source needs
         // the tagging action too, and an untagged one does not, whatever tags the request sends.
         denied(f.copy().when().put(f.path("a/copy")).then(), "s3:PutObjectTagging");
@@ -348,6 +350,35 @@ class S3ObjectOperationsIamEnforcementIntegrationTest {
         f.copy().when().put(f.path("a/copied-tags")).then().statusCode(200);
         f.admin().queryParam("tagging", "").when().get(f.path("a/copied-tags")).then()
                 .statusCode(200).body(containsString("<Value>a</Value>"));
+    }
+
+    @Test
+    void defaultPrivateAclDoesNotRequireAclPermissionButChangingTheAclStillDoes() {
+        Fixture f = new Fixture("private-acl", false);
+        f.policy(f.allow("s3:PutObject", "s3:GetObject") + ","
+                + f.allow("s3:PutObjectAcl").replace("\"Allow\"", "\"Deny\""));
+
+        f.user().header("x-amz-acl", "private").body("private data")
+                .when().put(f.path("a/source")).then().statusCode(200);
+        f.copyOf("a/source").header("x-amz-acl", "private")
+                .when().put(f.path("a/copy")).then().statusCode(200);
+        assertEquals("private data", f.user().when().get(f.path("a/copy"))
+                .then().statusCode(200).extract().asString());
+
+        String uploadId = f.user().header("x-amz-acl", "private").queryParam("uploads", "")
+                .when().post(f.path("a/upload")).then().statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        cleanup.register(() -> f.admin().queryParam("uploadId", uploadId).when().delete(f.path("a/upload")));
+        String etag = f.user().queryParam("uploadId", uploadId).queryParam("partNumber", 1).body("private part")
+                .when().put(f.path("a/upload")).then().statusCode(200).extract().header("ETag");
+        f.complete(new Upload("a/upload", uploadId, etag)).statusCode(200);
+        assertEquals("private part", f.user().when().get(f.path("a/upload"))
+                .then().statusCode(200).extract().asString());
+
+        denied(f.user().header("x-amz-acl", "private").queryParam("acl", "")
+                .when().put(f.path("a/source")).then(), "s3:PutObjectAcl");
+        denied(f.user().header("x-amz-acl", "private").header("x-amz-grant-read", "id=000000000000")
+                .body("grant").when().put(f.path("a/grant")).then(), "s3:PutObjectAcl");
     }
 
     @Test
