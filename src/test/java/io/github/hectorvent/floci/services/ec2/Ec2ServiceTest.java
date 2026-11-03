@@ -7803,9 +7803,9 @@ class Ec2ServiceTest {
         Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
         AtomicReference<Map<String, List<String>>> policyLists = new AtomicReference<>();
         doAnswer(invocation -> {
-            policyLists.set(invocation.getArgument(2));
+            policyLists.set(invocation.getArgument(3));
             return null;
-        }).when(manager).refreshSecurityGroups(eq(region), anyMap(), anyMap());
+        }).when(manager).refreshSecurityGroups(eq("000000000000"), eq(region), anyMap(), anyMap());
         Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
                 mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
                 new InMemoryStorageFactory());

@@ -145,13 +145,13 @@ class SecurityGroupFirewallDockerIntegrationTest {
             IpRange corrected = new IpRange();
             corrected.setCidrIp("10.1.0.0/24");
             targetGroup.getIpPermissions().getFirst().getIpRanges().add(corrected);
-            firewall.refreshPolicies("us-east-1", Map.of("sg-target", targetGroup,
+            firewall.refreshPolicies("000000000000", "us-east-1", Map.of("sg-target", targetGroup,
                     "sg-source", sourceGroup), Map.of());
             assertEquals(0, connect(workers.get(1), target.transportAddress()));
 
             firewall.quarantineSurvivingNamespaces();
             assertNotEquals(0, connect(workers.get(1), target.transportAddress(), DENIED_TIMEOUT_SECONDS));
-            firewall.refreshPolicies("us-east-1", Map.of("sg-target", targetGroup,
+            firewall.refreshPolicies("000000000000", "us-east-1", Map.of("sg-target", targetGroup,
                     "sg-source", sourceGroup), Map.of());
             assertEquals(0, connect(workers.get(1), target.transportAddress()));
 
@@ -164,7 +164,7 @@ class SecurityGroupFirewallDockerIntegrationTest {
             assertEquals(0, connect(workers.get(1), target.transportAddress()));
 
             docker.stopContainerCmd(target.helperId()).withTimeout(0).exec();
-            firewall.refreshPolicies("us-east-1", groups, Map.of());
+            firewall.refreshPolicies("000000000000", "us-east-1", groups, Map.of());
             assertFalse(docker.inspectContainerCmd(workers.getFirst()).exec().getState().getRunning());
         } finally {
             for (String worker : workers) {
