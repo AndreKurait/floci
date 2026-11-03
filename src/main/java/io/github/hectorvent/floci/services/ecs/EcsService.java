@@ -2095,8 +2095,31 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 ? ephemeralStorage : new EphemeralStorage(EphemeralStorage.DEFAULT_SIZE_IN_GIB));
     }
 
+    /**
+     * StopTask as ECS answers it: in Docker mode the task is marked {@code STOPPING} and returned at
+     * once, and its containers get their stop grace and are torn down on another thread, the task
+     * reaching {@code STOPPED} when they are gone (a teardown that fails is retried by the
+     * reconciler, as before). Without Docker there is nothing to wait for and the task is
+     * {@code STOPPED} on return.
+     */
     public EcsTask stopTask(String clusterRef, String taskRef, String reason, String region) {
-        return stopTask(clusterRef, taskRef, reason, STOP_CODE_USER_INITIATED, region);
+        if (!dockerMode) {
+            return stopTask(clusterRef, taskRef, reason, STOP_CODE_USER_INITIATED, region);
+        }
+        EcsTask task = resolveTaskOrThrow(taskRef, region);
+        synchronized (task) {
+            // The Docker stop goes to the task stopper, as the service scheduler's stops do.
+            stopTaskLocked(task, reason, STOP_CODE_USER_INITIATED, region, true);
+            // What the caller is told: the task as it is now, not as the teardown leaves it.
+            return new EcsTask(task);
+        }
+    }
+
+    /** Waits for the background stops in flight, for tests that check what a teardown left. */
+    void awaitPendingStops() throws Exception {
+        for (CompletableFuture<Void> stop : List.copyOf(taskStops.values())) {
+            stop.get(60, java.util.concurrent.TimeUnit.SECONDS);
+        }
     }
 
     /**
@@ -2147,16 +2170,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         if (TaskStatus.STOPPED.name().equals(task.getLastStatus())) {
             return task;
         }
-        if (!TaskStatus.STOPPING.name().equals(task.getLastStatus())) {
-            task.setDesiredStatus(TaskStatus.STOPPED.name());
-            task.setLastStatus(TaskStatus.STOPPING.name());
-            task.setStoppingAt(Instant.now());
-            task.setStoppedReason(reason != null ? reason : "Stopped by user");
-            task.setStopCode(stopCode);
-            task.bumpVersion();
-            deregisterTaskFromLoadBalancers(task, region);
-            deregisterTaskFromServiceDiscovery(task, region);
-        }
+        markStopping(task, reason, stopCode, region);
 
         if (!dockerMode) {
             markTaskStopped(task, Map.of(), Map.of(), region);
@@ -2293,6 +2307,21 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         if (eventPublisher != null) {
             eventPublisher.emitTaskLadder(task, TaskStatus.RUNNING, TaskStatus.STOPPED, region);
         }
+    }
+
+    /** Moves a task to STOPPING, once, taking it out of its load balancers and Cloud Map. */
+    private void markStopping(EcsTask task, String reason, String stopCode, String region) {
+        if (TaskStatus.STOPPING.name().equals(task.getLastStatus())) {
+            return;
+        }
+        task.setDesiredStatus(TaskStatus.STOPPED.name());
+        task.setLastStatus(TaskStatus.STOPPING.name());
+        task.setStoppingAt(Instant.now());
+        task.setStoppedReason(reason != null ? reason : "Stopped by user");
+        task.setStopCode(stopCode);
+        task.bumpVersion();
+        deregisterTaskFromLoadBalancers(task, region);
+        deregisterTaskFromServiceDiscovery(task, region);
     }
 
     /** Registers a freshly-started task's containers as ELBv2 targets if its service is load-balanced. */
