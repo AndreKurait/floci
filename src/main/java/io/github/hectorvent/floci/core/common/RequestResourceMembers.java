@@ -34,8 +34,12 @@ final class RequestResourceMembers {
     private static final Pattern MEMBER = Pattern.compile("[A-Za-z][A-Za-z0-9_]*(\\[])?");
     /** A member holding an ARN may also be one level inside a structure or each of a list's structures. */
     private static final Pattern ARN_MEMBER = Pattern.compile("[A-Za-z][A-Za-z0-9_]*(\\[])?(\\.[A-Za-z][A-Za-z0-9_]*(\\[])?)?");
-    /** A member filling a variable may also be a field of each of a list's structures, one value for each. */
-    private static final Pattern FILL_MEMBER = Pattern.compile("[A-Za-z][A-Za-z0-9_]*(\\[]|\\[]\\.[A-Za-z][A-Za-z0-9_]*)?");
+    /**
+     * A member filling a variable may also be a field of a structure, or of each of a list's structures, one value
+     * for each.
+     */
+    private static final Pattern FILL_MEMBER = Pattern.compile(
+            "[A-Za-z][A-Za-z0-9_]*(\\[]|\\[]\\.[A-Za-z][A-Za-z0-9_]*|\\.[A-Za-z][A-Za-z0-9_]*)?");
     /** An ARN format's leading resource type word, and the rest of its resource. */
     private static final Pattern RESOURCE_PART = Pattern.compile(
             "^arn:\\$\\{Partition}:[^:]*:[^:]*:[^:]*:([A-Za-z][A-Za-z0-9-]*)(.*)$");
@@ -43,6 +47,10 @@ final class RequestResourceMembers {
     private static final Pattern ONE_VARIABLE = Pattern.compile("[^$]*\\$\\{\\w+}");
     /** The one id a child type's format appends to its parent's. */
     private static final Pattern APPENDED_ID = Pattern.compile("[/:]\\$\\{\\w+}");
+    /** The keys a resource found by members does not take: it is read no other way, in the caller's account. */
+    private static final List<String> FOUND_ONLY = List.of("absent", "arnOf", "account", "fixed", "before");
+    /** The keys of a resource named through a member naming another of its service's own: it is read no other way. */
+    private static final Set<String> THROUGH_KEYS = Set.of("types", "through", "endpoint");
 
     /**
      * A top-level request member that holds a string, or a list of them when {@code list}, or, with a
@@ -106,7 +114,7 @@ final class RequestResourceMembers {
      * A resource a request names: by a member holding its ARN, which names a resource of one of {@code types} when
      * it matches the type's format, or by members filling the variables of one type's format, the others open,
      * only {@code when} each member named has one of its values and {@code unless} it has one of those, an empty
-     * one for the member absent, in the account an {@code account} member gives (ECR's {@code registryId}), or else
+     * one for the member absent or given a JSON null it is not read as a value for, in the account an {@code account} member gives (ECR's {@code registryId}), or else
      * the request's. A member {@code absent} from the request, or given a JSON null, is read as the value given for
      * it (an EventBridge request naming no event bus names {@code default}), and one in {@code arnOf} may give an
      * ARN of the type named for it instead of its name, read as that type's one variable, the resource then in the
@@ -114,12 +122,31 @@ final class RequestResourceMembers {
      * a variable may be a field of each of a list's structures ({@code Entries[].EventBusName}), which names one
      * resource for each structure, read as {@code absent} gives for one that lacks it and in the account and Region
      * of the ARN that structure gives, if any. Such a member is in {@code absent} or {@code arnOf} only when it
-     * fills a variable. An ARN member's value is read up to the character {@code before}, when there is one, as its
-     * handler drops the rest.
+     * fills a variable. A member filling a variable may also be a field of a structure ({@code pipeline.name}). A
+     * variable no member gives may be {@code fixed} to the one value its handler uses (a CodePipeline custom action
+     * type's owner, {@code Custom}). A member's value, an ARN or a variable's, is read up to the character
+     * {@code before}, when there is one: Step Functions Local's handler drops a test case after {@code #}, and a
+     * CodeBuild build id is {@code <project>:<id>}, a build being checked on its project. A create naming other
+     * resources beside the one it makes marks that one {@code made}, where its tags go (a webhook, not the pipeline
+     * it connects to). A type whose ARN is all an id its service mints is named instead by the members its service
+     * finds it by, {@code find}, each one value, in the order its service reads them, filling none of its variables
+     * and read no other way, in the caller's account (a scalable target by its service namespace, resource id and
+     * scalable dimension). A resource with an {@code endpoint} applies only to a request the service of that endpoint
+     * prefix serves, where two APIs share the operation's name and nothing in a request tells them apart
+     * (EventBridge's {@code events} and EventBridge V2's {@code eventsv2}); null for every request. A resource of one
+     * of {@code types} may be named {@code through} a member of one value naming a resource of its service's own the
+     * table gives no type, which runs on it (a Data API session, by its {@code SessionId}), and read no other way.
      */
     record Resource(List<String> types, Member arn, Map<String, Member> fill, Map<String, List<String>> when,
                     Map<String, List<String>> unless, Map<String, String> absent, Map<String, String> arnOf,
-                    Member account, String before) {
+                    Member account, String before, Map<String, String> fixed, boolean made, List<Member> find,
+                    String endpoint, Member through) {
+
+        Resource(List<String> types, Member arn, Map<String, Member> fill, Map<String, List<String>> when,
+                 Map<String, List<String>> unless, Map<String, String> absent, Map<String, String> arnOf,
+                 Member account, String before, Map<String, String> fixed, boolean made, String endpoint) {
+            this(types, arn, fill, when, unless, absent, arnOf, account, before, fixed, made, List.of(), endpoint, null);
+        }
     }
 
     /**
@@ -222,19 +249,45 @@ final class RequestResourceMembers {
     }
 
     private static Resource resource(String operation, JsonNode resource, Map<String, ArnFormat> formats) {
+        if (resource.has("made") && !(resource.path("made").isBoolean() && resource.path("made").booleanValue())) {
+            throw new IllegalStateException(RESOURCE_NAME + " marks a resource of " + operation + " made by "
+                    + resource.path("made") + ", which is not true");
+        }
+        boolean made = resource.has("made");
+        String endpoint = resource.has("endpoint") ? resource.path("endpoint").asText("") : null;
+        if (endpoint != null && endpoint.isEmpty()) {
+            throw new IllegalStateException(RESOURCE_NAME + " serves a resource of " + operation
+                    + " on no endpoint prefix");
+        }
+        String before = resource.has("before") ? resource.path("before").asText("") : null;
+        if (before != null && before.length() != 1) {
+            throw new IllegalStateException(RESOURCE_NAME + " reads a member for " + operation
+                    + " before " + before + ", no one character");
+        }
+        if (resource.has("through")) {
+            List<String> types = resource.path("types").valueStream().map(JsonNode::asText).toList();
+            Member through = member(operation, resource.path("through").asText(""));
+            if (types.isEmpty() || !formats.keySet().containsAll(types) || through.list() || resource.properties()
+                    .stream().map(Map.Entry::getKey).anyMatch(key -> !THROUGH_KEYS.contains(key))) {
+                throw new IllegalStateException(RESOURCE_NAME + " names a resource of " + operation + " through "
+                        + resource.path("through") + ", no member of one value naming types with a format, or beside "
+                        + "members reading it otherwise");
+            }
+            return new Resource(types, null, Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), null, null, Map.of(),
+                    false, List.of(), endpoint, through);
+        }
         if (resource.has("arn")) {
             List<String> types = resource.path("types").valueStream().map(JsonNode::asText).toList();
             if (types.isEmpty() || !formats.keySet().containsAll(types)) {
                 throw new IllegalStateException(RESOURCE_NAME + " reads an ARN for " + operation
                         + " of types with no format: " + types);
             }
-            String before = resource.has("before") ? resource.path("before").asText("") : null;
-            if (before != null && before.length() != 1) {
+            if (resource.has("find")) {
                 throw new IllegalStateException(RESOURCE_NAME + " reads an ARN for " + operation
-                        + " before " + before + ", no one character");
+                        + " and finds its resource by " + resource.path("find") + " too");
             }
             return new Resource(types, arnMember(operation, resource.path("arn").asText("")), Map.of(), Map.of(),
-                    Map.of(), Map.of(), Map.of(), null, before);
+                    Map.of(), Map.of(), Map.of(), null, before, Map.of(), made, endpoint);
         }
         String type = resource.path("type").asText("");
         ArnFormat format = formats.get(type);
@@ -251,6 +304,24 @@ final class RequestResourceMembers {
             }
             fill.put(variable.getKey(), fillMember(operation, variable.getValue().asText("")));
         });
+        Map<String, String> fixed = new LinkedHashMap<>();
+        resource.path("fixed").properties().forEach(variable -> {
+            if (!variables.contains(variable.getKey()) || fill.containsKey(variable.getKey())
+                    || !variable.getValue().isTextual() || variable.getValue().asText().isEmpty()) {
+                throw new IllegalStateException(RESOURCE_NAME + " fixes " + variable.getKey() + " for " + operation
+                        + ", no variable of " + type + "'s format that no member fills, or to no value");
+            }
+            fixed.put(variable.getKey(), variable.getValue().asText());
+        });
+        List<Member> find = new ArrayList<>();
+        for (JsonNode member : resource.path("find")) {
+            find.add(member(operation, member.asText("")));
+        }
+        if (resource.has("find") && (!resource.path("find").isArray() || find.isEmpty() || !fill.isEmpty()
+                || find.stream().anyMatch(Member::list) || FOUND_ONLY.stream().anyMatch(resource::has))) {
+            throw new IllegalStateException(RESOURCE_NAME + " finds a " + type + " for " + operation + " by "
+                    + resource.path("find") + ", no members of one value each, or beside members reading it otherwise");
+        }
         if (fill.values().stream().filter(Member::list).count() > 1) {
             throw new IllegalStateException(RESOURCE_NAME + " fills " + type + " for " + operation
                     + " from more than one list");
@@ -283,7 +354,7 @@ final class RequestResourceMembers {
                     + " from " + account.name() + ", no member of one account or a type of none");
         }
         return new Resource(List.of(type), null, Map.copyOf(fill), when, unless, Map.copyOf(absent), Map.copyOf(arnOf),
-                account, null);
+                account, before, Map.copyOf(fixed), made, List.copyOf(find), endpoint, null);
     }
 
     /** The values each member named in {@code when} or {@code unless} may have, an empty one for the member absent. */
@@ -324,8 +395,8 @@ final class RequestResourceMembers {
     }
 
     /**
-     * A member filling a variable: {@code Name}, {@code Name[]}, or a field of each of a list's structures,
-     * {@code Name[].Field}.
+     * A member filling a variable: {@code Name}, {@code Name[]}, or a field of a structure, {@code Name.Field}, or of
+     * each of a list's structures, {@code Name[].Field}.
      */
     private static Member fillMember(String operation, String path) {
         if (!FILL_MEMBER.matcher(path).matches()) {
@@ -335,12 +406,15 @@ final class RequestResourceMembers {
     }
 
     /**
-     * Whether a member gives one value as it is read: a top-level one that is no list, or a field of each of a
-     * list's structures that fills a variable, one value for each structure.
+     * Whether a member gives one value as it is read: one that is no list, top-level or a field of a structure, or a
+     * field of each of a list's structures that fills a variable, one value for each structure.
      */
     private static boolean readAsOne(String operation, String path, Set<String> filled) {
-        return FILL_MEMBER.matcher(path).matches() && path.contains("[].") ? filled.contains(path)
-                : !member(operation, path).list();
+        if (FILL_MEMBER.matcher(path).matches() && path.contains("[].")) {
+            return filled.contains(path);
+        }
+        Member member = path.contains(".") ? fillMember(operation, path) : member(operation, path);
+        return !member.list() && (member.field() == null || !member.field().list());
     }
 
     /** A member holding an ARN: {@code Name}, {@code Name[]}, or a field of it, {@code Name.Field} or {@code Name[].Field}. */

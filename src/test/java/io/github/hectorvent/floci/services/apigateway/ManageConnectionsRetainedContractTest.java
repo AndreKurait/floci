@@ -193,7 +193,7 @@ class ManageConnectionsRetainedContractTest {
         try (Response response = switch (method) {
             case "GET" -> controller.handleGet(headers, uri, "api", "prod", "@connections/connection");
             case "POST" -> controller.handlePost(headers, uri, "api", "prod", "@connections/connection", new byte[0]);
-            case "DELETE" -> controller.handleDelete(headers, uri, "api", "prod", "@connections/connection");
+            case "DELETE" -> controller.handleDelete(headers, uri, "api", "prod", "@connections/connection", new byte[0]);
             default -> throw new AssertionError(method);
         }) {
             return response.getStatus();

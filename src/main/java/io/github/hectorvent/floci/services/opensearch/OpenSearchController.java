@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.opensearch.model.DomainEndpointOption
 import io.github.hectorvent.floci.services.opensearch.model.EbsOptions;
 import io.github.hectorvent.floci.services.opensearch.model.EncryptionAtRestOptions;
 import io.github.hectorvent.floci.services.opensearch.model.NodeToNodeEncryptionOptions;
+import io.github.hectorvent.floci.services.opensearch.model.OpenSearchVpcEndpoint;
 import io.github.hectorvent.floci.services.opensearch.model.VpcOptions;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
@@ -37,15 +38,22 @@ public class OpenSearchController {
     private static final Logger LOG = Logger.getLogger(OpenSearchController.class);
 
     private final OpenSearchService service;
+    private final OpenSearchVpcEndpointService vpcEndpoints;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
 
     @Inject
-    public OpenSearchController(OpenSearchService service, RegionResolver regionResolver,
-                                 ObjectMapper objectMapper) {
+    public OpenSearchController(OpenSearchService service, OpenSearchVpcEndpointService vpcEndpoints,
+                                RegionResolver regionResolver, ObjectMapper objectMapper) {
         this.service = service;
+        this.vpcEndpoints = vpcEndpoints;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
+    }
+
+    /** For {@link ElasticsearchController}, which delegates the domain operations only. */
+    OpenSearchController(OpenSearchService service, RegionResolver regionResolver, ObjectMapper objectMapper) {
+        this(service, null, regionResolver, objectMapper);
     }
 
     @POST
@@ -85,7 +93,7 @@ public class OpenSearchController {
     @Path("/opensearch/domain/{domainName}")
     public Response describeDomain(@Context HttpHeaders headers,
                                     @PathParam("domainName") String domainName) {
-        Domain domain = service.describeDomain(domainName);
+        Domain domain = service.describeDomain(domainName, regionResolver.resolveRegion(headers));
         ObjectNode response = objectMapper.createObjectNode();
         response.set("DomainStatus", toDomainStatusNode(domain));
         return Response.ok(response).build();
@@ -98,7 +106,7 @@ public class OpenSearchController {
             JsonNode req = objectMapper.readTree(body);
             List<String> names = new ArrayList<>();
             req.path("DomainNames").forEach(n -> names.add(n.asText()));
-            List<Domain> domains = service.describeDomains(names);
+            List<Domain> domains = service.describeDomains(names, regionResolver.resolveRegion(headers));
 
             ObjectNode response = objectMapper.createObjectNode();
             ArrayNode list = response.putArray("DomainStatusList");
@@ -115,7 +123,7 @@ public class OpenSearchController {
     @Path("/domain")
     public Response listDomainNames(@Context HttpHeaders headers,
                                      @QueryParam("engineType") String engineType) {
-        List<Domain> domains = service.listDomainNames(engineType);
+        List<Domain> domains = service.listDomainNames(engineType, regionResolver.resolveRegion(headers));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode list = response.putArray("DomainNames");
         for (Domain d : domains) {
@@ -132,7 +140,7 @@ public class OpenSearchController {
     @Path("/opensearch/domain/{domainName}/config")
     public Response describeDomainConfig(@Context HttpHeaders headers,
                                           @PathParam("domainName") String domainName) {
-        Domain domain = service.describeDomain(domainName);
+        Domain domain = service.describeDomain(domainName, regionResolver.resolveRegion(headers));
         long epochSeconds = domain.getCreatedAt() != null ? domain.getCreatedAt().getEpochSecond() : 0;
 
         ObjectNode response = objectMapper.createObjectNode();
@@ -175,7 +183,7 @@ public class OpenSearchController {
                     parseDomainEndpointOptions(req.path("DomainEndpointOptions")));
 
             Domain domain = service.updateDomainConfig(domainName, engineVersion, clusterConfig,
-                    ebsOptions, accessPolicies, options);
+                    ebsOptions, accessPolicies, options, regionResolver.resolveRegion(headers));
 
             long epochSeconds = domain.getCreatedAt() != null ? domain.getCreatedAt().getEpochSecond() : 0;
             ObjectNode response = objectMapper.createObjectNode();
@@ -207,7 +215,7 @@ public class OpenSearchController {
     @Path("/opensearch/domain/{domainName}")
     public Response deleteDomain(@Context HttpHeaders headers,
                                   @PathParam("domainName") String domainName) {
-        Domain domain = service.deleteDomain(domainName);
+        Domain domain = service.deleteDomain(domainName, regionResolver.resolveRegion(headers));
         ObjectNode response = objectMapper.createObjectNode();
         response.set("DomainStatus", toDomainStatusNode(domain));
         return Response.ok(response).build();
@@ -292,7 +300,9 @@ public class OpenSearchController {
         // version — matches AWS's GetCompatibleVersions behavior. Otherwise
         // return the full matrix so SDK clients can render upgrade pickers.
         if (domainName != null && !domainName.isBlank()) {
-            String sourceVersion = service.describeDomain(domainName).getEngineVersion();
+            String sourceVersion = service
+                    .describeDomain(domainName, regionResolver.resolveRegion(headers))
+                    .getEngineVersion();
             ObjectNode entry = objectMapper.createObjectNode();
             entry.put("SourceVersion", sourceVersion);
             ArrayNode targets = entry.putArray("TargetVersions");
@@ -424,12 +434,13 @@ public class OpenSearchController {
 
     @POST
     @Path("/opensearch/upgradeDomain")
-    public Response upgradeDomain(String body) {
+    public Response upgradeDomain(@Context HttpHeaders headers, String body) {
         try {
             JsonNode req = objectMapper.readTree(body);
             String domainName = req.path("DomainName").asText(null);
             String targetVersion = req.path("TargetVersion").asText(null);
-            Domain domain = service.upgradeDomain(domainName, targetVersion);
+            Domain domain = service.upgradeDomain(domainName, targetVersion,
+                    regionResolver.resolveRegion(headers));
 
             ObjectNode response = objectMapper.createObjectNode();
             response.put("UpgradeId", UUID.randomUUID().toString());
@@ -481,6 +492,125 @@ public class OpenSearchController {
         return Response.ok(response).build();
     }
 
+    // ── VPC endpoints ────────────────────────────────────────────────────────
+
+    @POST
+    @Path("/opensearch/vpcEndpoints")
+    public Response createVpcEndpoint(@Context HttpHeaders headers, String body) {
+        JsonNode req = readBody(body);
+        OpenSearchVpcEndpoint endpoint = vpcEndpoints.create(req.path("DomainArn").asText(null),
+                parseVpcOptions(req.path("VpcOptions")), egressEnabled(req), req.path("ClientToken").asText(null),
+                regionResolver.resolveRegion(headers));
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("VpcEndpoint", toVpcEndpointNode(endpoint, "CREATING"));
+        return Response.ok(response).build();
+    }
+
+    @POST
+    @Path("/opensearch/vpcEndpoints/describe")
+    public Response describeVpcEndpoints(@Context HttpHeaders headers, String body) {
+        JsonNode req = readBody(body);
+        List<String> ids = null;
+        if (req.path("VpcEndpointIds").isArray()) {
+            ids = new ArrayList<>();
+            for (JsonNode id : req.path("VpcEndpointIds")) {
+                ids.add(id.asText());
+            }
+        }
+        OpenSearchVpcEndpointService.DescribeResult result =
+                vpcEndpoints.describe(ids, regionResolver.resolveRegion(headers));
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode found = response.putArray("VpcEndpoints");
+        result.endpoints().forEach(endpoint -> found.add(toVpcEndpointNode(endpoint, endpoint.getStatus())));
+        ArrayNode errors = response.putArray("VpcEndpointErrors");
+        for (OpenSearchVpcEndpointService.EndpointError error : result.errors()) {
+            errors.addObject()
+                    .put("VpcEndpointId", error.vpcEndpointId())
+                    .put("ErrorCode", error.errorCode())
+                    .put("ErrorMessage", error.errorMessage());
+        }
+        return Response.ok(response).build();
+    }
+
+    @POST
+    @Path("/opensearch/vpcEndpoints/update")
+    public Response updateVpcEndpoint(@Context HttpHeaders headers, String body) {
+        JsonNode req = readBody(body);
+        OpenSearchVpcEndpoint endpoint = vpcEndpoints.update(req.path("VpcEndpointId").asText(null),
+                parseVpcOptions(req.path("VpcOptions")), egressEnabled(req), regionResolver.resolveRegion(headers));
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("VpcEndpoint", toVpcEndpointNode(endpoint, "UPDATING"));
+        return Response.ok(response).build();
+    }
+
+    @DELETE
+    @Path("/opensearch/vpcEndpoints/{vpcEndpointId}")
+    public Response deleteVpcEndpoint(@Context HttpHeaders headers,
+                                      @PathParam("vpcEndpointId") String vpcEndpointId) {
+        OpenSearchVpcEndpoint endpoint = vpcEndpoints.delete(vpcEndpointId, regionResolver.resolveRegion(headers));
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("VpcEndpointSummary", toVpcEndpointSummaryNode(endpoint, "DELETING"));
+        return Response.ok(response).build();
+    }
+
+    /** One page holds every endpoint, so no {@code NextToken} is returned. */
+    @GET
+    @Path("/opensearch/vpcEndpoints")
+    public Response listVpcEndpoints(@Context HttpHeaders headers) {
+        return vpcEndpointSummaries(vpcEndpoints.list(regionResolver.resolveRegion(headers)));
+    }
+
+    @GET
+    @Path("/opensearch/domain/{domainName}/vpcEndpoints")
+    public Response listVpcEndpointsForDomain(@Context HttpHeaders headers,
+                                              @PathParam("domainName") String domainName) {
+        return vpcEndpointSummaries(vpcEndpoints.listForDomain(domainName, regionResolver.resolveRegion(headers)));
+    }
+
+    private Response vpcEndpointSummaries(List<OpenSearchVpcEndpoint> endpoints) {
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode list = response.putArray("VpcEndpointSummaryList");
+        endpoints.forEach(endpoint -> list.add(toVpcEndpointSummaryNode(endpoint, endpoint.getStatus())));
+        return Response.ok(response).build();
+    }
+
+    private ObjectNode toVpcEndpointNode(OpenSearchVpcEndpoint endpoint, String status) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("VpcEndpointId", endpoint.getVpcEndpointId());
+        node.put("VpcEndpointOwner", endpoint.getVpcEndpointOwner());
+        node.put("DomainArn", endpoint.getDomainArn());
+        ObjectNode options = toVpcOptionsNode(endpoint.getVpcOptions());
+        if (endpoint.getEgressEnabled() != null) {
+            options.put("EgressEnabled", endpoint.getEgressEnabled());
+        }
+        node.set("VpcOptions", options);
+        node.put("Status", status);
+        vpcEndpoints.endpointAddress(endpoint).ifPresent(address -> node.put("Endpoint", address));
+        return node;
+    }
+
+    private ObjectNode toVpcEndpointSummaryNode(OpenSearchVpcEndpoint endpoint, String status) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("VpcEndpointId", endpoint.getVpcEndpointId());
+        node.put("VpcEndpointOwner", endpoint.getVpcEndpointOwner());
+        node.put("DomainArn", endpoint.getDomainArn());
+        node.put("Status", status);
+        return node;
+    }
+
+    private static Boolean egressEnabled(JsonNode req) {
+        JsonNode egress = req.path("VpcOptions").path("EgressEnabled");
+        return egress.isBoolean() ? egress.asBoolean() : null;
+    }
+
+    private JsonNode readBody(String body) {
+        try {
+            return body == null || body.isBlank() ? objectMapper.createObjectNode() : objectMapper.readTree(body);
+        } catch (IOException e) {
+            throw new AwsException("ValidationException", e.getMessage(), 400);
+        }
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private ObjectNode toDomainStatusNode(Domain domain) {
@@ -492,7 +622,14 @@ public class OpenSearchController {
         node.put("Created", !domain.isProcessing());
         node.put("Processing", domain.isProcessing());
         node.put("Deleted", domain.isDeleted());
-        node.put("Endpoint", domain.getEndpoint() != null ? domain.getEndpoint() : "");
+        String endpoint = domain.getEndpoint() != null ? domain.getEndpoint() : "";
+        if (domain.getVpcOptions() == null) {
+            node.put("Endpoint", endpoint);
+        } else if (!endpoint.isEmpty()) {
+            // AWS reports a domain in a VPC under Endpoints.vpc and leaves Endpoint out; the Terraform
+            // AWS provider refuses a VPC domain that carries an Endpoint.
+            node.putObject("Endpoints").put("vpc", endpoint);
+        }
         if (domain.getAccessPolicies() != null) {
             node.put("AccessPolicies", domain.getAccessPolicies());
         }

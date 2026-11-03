@@ -47,6 +47,7 @@ public class ApiGatewayExecuteApiHostFilter implements ContainerRequestFilter {
 
     @Inject
     public ApiGatewayExecuteApiHostFilter(ApiGatewayV2Service apiGatewayV2Service,
+                                          ApiGatewayService apiGatewayService,
                                           RegionResolver regionResolver,
                                           ApiGatewayExecuteRouteContext routeContext,
                                           EmulatorConfig config,
@@ -55,6 +56,11 @@ public class ApiGatewayExecuteApiHostFilter implements ContainerRequestFilter {
             @Override
             public Optional<ApiGatewayV2Service.ApiOwner> findApiOwner(String apiId) {
                 return apiGatewayV2Service.findApiOwner(apiId);
+            }
+
+            @Override
+            public Optional<String> findRestApiRegion(String apiId) {
+                return apiGatewayService.findRestApiOwner(apiId).map(ApiGatewayService.ApiOwner::region);
             }
 
             @Override
@@ -122,6 +128,28 @@ public class ApiGatewayExecuteApiHostFilter implements ContainerRequestFilter {
             case DISABLED -> requestContext.abortWith(notFoundResponse());
             case REST_API -> routeToRestApi(requestContext, originalUri, originalPath, decision.apiId());
             case HTTP_API -> routeToHttpApi(requestContext, host, originalUri, originalPath, decision);
+        }
+    }
+
+    /**
+     * Whether a request for this execute-api host and raw path would be rewritten onto an API by
+     * {@link #filter}. False when the host names no API, the region label is not the API's region,
+     * the API is not invokable on this path (WebSocket, disabled endpoint, no stage), or the path is
+     * already an internal {@code /execute-api/} path.
+     */
+    public boolean routes(String host, String originalPath) {
+        try {
+            RouteDecision decision = decide(host, originalPath, null);
+            Optional<String> apiRegion = switch (decision.kind()) {
+                case HTTP_API -> Optional.of(decision.region());
+                case REST_API -> apiGatewayLookup.findRestApiRegion(decision.apiId());
+                case NONE, DISABLED -> Optional.empty();
+            };
+            String hostRegion = regionResolver.resolveRegionFromHost(host);
+            return apiRegion.isPresent() && (hostRegion == null || hostRegion.equals(apiRegion.get()));
+        } catch (AwsException e) {
+            LOG.debugv(e, "Execute API host did not resolve to one API: apiId={0}", extractApiId(host, baseHostname));
+            return false;
         }
     }
 
@@ -288,6 +316,10 @@ public class ApiGatewayExecuteApiHostFilter implements ContainerRequestFilter {
 
     interface ApiGatewayLookup {
         default Optional<ApiGatewayV2Service.ApiOwner> findApiOwner(String apiId) {
+            return Optional.empty();
+        }
+
+        default Optional<String> findRestApiRegion(String apiId) {
             return Optional.empty();
         }
 

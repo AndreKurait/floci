@@ -8,14 +8,15 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnShapes;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.SignedMarkers;
+import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
@@ -55,7 +56,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
-public class StepFunctionsService implements Resettable, ResourceProvider {
+public class StepFunctionsService implements Resettable, ResourceProvider, StoredResourceArns {
     private static final int LIST_EXECUTIONS_MAX_TOKEN_LENGTH = 3096;
 
     private static final Logger LOG = Logger.getLogger(StepFunctionsService.class);
@@ -487,7 +488,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         }
 
         updated.setRevisionId(UUID.randomUUID().toString());
-        updated.setUpdateDate(System.currentTimeMillis() / 1000.0);
+        updated.setUpdateDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
         StateMachineVersion version = request.publish()
                 ? addVersion(updated, request.versionDescription())
                 : null;
@@ -532,20 +533,19 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     }
 
     /**
-     * Key prefix matching every Step Functions ARN in {@code region}. This store is keyed by the
-     * full ARN, unlike the other services, which key by {@code region::name}, so the prefix has to
-     * carry the region's partition or a list cannot find what a create wrote.
+     * True for a store key that is a Step Functions ARN in {@code region}. This store is keyed by
+     * the full ARN, unlike the other services, which key by {@code region::name}, so the match has
+     * to carry the region's partition or a list cannot find what a create wrote.
      *
-     * <p>Deliberately stops before the account segment: the store holds resources for more than
-     * one account under account isolation, so {@code RegionResolver.buildArn} is the wrong helper
-     * here, since it appends its own account id.
+     * <p>Deliberately ignores the account segment: the store holds resources for more than one
+     * account under account isolation.
      */
-    private static String regionArnPrefix(String region) {
-        return "arn:" + AwsRegions.partitionFor(region) + ":states:" + region + ":";
+    private static boolean isInRegion(String key, String region) {
+        return AwsArnUtils.parseIfArnIn(key, "states", region).isPresent();
     }
 
     public List<StateMachine> listStateMachines(String region) {
-        return stateMachineStore.scan(k -> k.startsWith(regionArnPrefix(region)));
+        return stateMachineStore.scan(k -> isInRegion(k, region));
     }
 
     public PaginatedResult<StateMachine> listStateMachines(String region, Integer maxResults, String nextToken) {
@@ -732,7 +732,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         if (routingConfiguration != null) {
             updated.setRoutingConfiguration(copyRoutingConfiguration(routingConfiguration));
         }
-        updated.setUpdateDate(System.currentTimeMillis() / 1000.0);
+        updated.setUpdateDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
         stateMachineAliasStore.put(aliasArn, updated);
         return copyAlias(updated);
     }
@@ -1138,7 +1138,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             }
             exec.setError(error);
             exec.setCause(cause);
-            exec.setStopDate(System.currentTimeMillis() / 1000.0);
+            exec.setStopDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
             exec.setStatus("ABORTED");
         }
 
@@ -1250,8 +1250,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     }
 
     public List<Activity> listActivities(String region) {
-        String prefix = regionArnPrefix(region);
-        return activityStore.scan(k -> k.startsWith(prefix) && k.contains(":activity:"));
+        return activityStore.scan(k -> isInRegion(k, region) && k.contains(":activity:"));
     }
 
     public PaginatedResult<Activity> listActivities(String region, Integer maxResults, String nextToken) {
@@ -1302,6 +1301,27 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         }
         future.completeExceptionally(new AslExecutor.FailStateException("States.TaskFailed", "StepFunctionsService cleared"));
         return future;
+    }
+
+    @Override
+    public String namespace() {
+        return "states";
+    }
+
+    @Override
+    public Optional<String> find(String type, List<String> names, String region) {
+        return Optional.empty();
+    }
+
+    @Override
+    public Optional<String> findByMembers(String type, List<String> names, String region) {
+        if (!Set.of("activity", "statemachine").contains(type)) {
+            return Optional.empty();
+        }
+        // The token selects one of the table's two resource kinds. Both lookups return that same ARN,
+        // so the reader deduplicates it without synthesizing a wildcard for the other kind.
+        return Optional.of(callbackResourceArn(names.size() == 1 ? names.getFirst() : null,
+                regionResolver.getAccountId()));
     }
 
     /**
@@ -1540,7 +1560,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         StateMachineVersion version = new StateMachineVersion(
                 stateMachine.getStateMachineArn() + ":" + next,
                 next,
-                System.currentTimeMillis() / 1000.0);
+                EpochSeconds.fromMillis(System.currentTimeMillis()));
         version.setDescription(description);
         version.setName(stateMachine.getName());
         version.setDefinition(stateMachine.getDefinition());

@@ -87,6 +87,10 @@ records, latency/failover records and independent Route53 health checks are not 
   `TCP` for TCP/SSL listeners. Explicit backend protocols remain unchanged.
   Creation, listener additions, persisted readback and identical listener retries
   use the same effective value.
+- A load balancer created in subnets without `SecurityGroups` gets the VPC's `default` security
+  group, reported in `SecurityGroups` and `SourceSecurityGroup`. Floci uses the VPC's `default`
+  group in the default VPC too, rather than a dedicated `default_elb_<id>` group. A load balancer
+  created with only `AvailabilityZones` gets no security group.
 - Load balancer state is persisted through Floci storage, and on startup health checking is
   restarted for the load balancers of every account.
 - A new load balancer gets AWS's default health check (`TCP:80`, interval 30, timeout 5,
@@ -105,8 +109,11 @@ records, latency/failover records and independent Route53 health checks are not 
   satisfied.
 - A listener's `SSLCertificateId` must name an existing certificate: an IAM server certificate ARN
   or an ACM certificate ARN. `CreateLoadBalancer` and `CreateLoadBalancerListeners` reject a
-  missing one with `CertificateNotFound`. An IAM server certificate a listener references cannot
-  be deleted: `DeleteServerCertificate` returns `DeleteConflict` until the listener is removed.
+  missing one with `CertificateNotFound`, and a blank one on an HTTPS or SSL listener; an HTTP or
+  TCP listener may carry a blank one, as Terraform sends. A certificate a listener references cannot be
+  deleted until the listener is removed: `DeleteServerCertificate` returns `DeleteConflict`, and
+  ACM's `DeleteCertificate` returns `ResourceInUseException` and lists the load balancer under
+  `InUseBy`.
 
 ## Configuration
 

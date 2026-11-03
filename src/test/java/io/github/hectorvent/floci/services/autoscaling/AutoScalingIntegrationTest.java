@@ -10,6 +10,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
 
+import static io.github.hectorvent.floci.services.autoscaling.AutoScalingXmlAssertions.assertModeledNamespace;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;

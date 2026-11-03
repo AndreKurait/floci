@@ -353,7 +353,7 @@ class Ec2CapturedImageReclaimIntegrationTest {
         Image source = captureAmi("copy-carries-capture", tag);
 
         Image copy = service.copyImage(WEST, REGION, source.getImageId(),
-                uniqueName("copy-carries-capture-west"), "copied");
+                uniqueName("copy-carries-capture-west"), "copied", false, List.of());
         Instance fromCopy = launch(WEST, copy.getImageId());
 
         assertEquals(tag, launchedImageOf(fromCopy).dockerImage());
@@ -366,7 +366,7 @@ class Ec2CapturedImageReclaimIntegrationTest {
         String tag = "floci-ami/ami-copy-shared:latest";
         Image source = captureAmi("copy-shared-capture", tag);
         service.copyImage(WEST, REGION, source.getImageId(),
-                uniqueName("copy-shared-capture-west"), "copied");
+                uniqueName("copy-shared-capture-west"), "copied", false, List.of());
 
         service.deregisterImage(REGION, source.getImageId(), false);
 

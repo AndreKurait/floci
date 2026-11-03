@@ -167,6 +167,13 @@ public class ElbV2HealthChecker implements Resettable {
         }
     }
 
+    synchronized void probeAll(String tgArn, TargetGroup group) {
+        Map<String, TargetState> targets = states.get(tgArn);
+        if (targets != null) {
+            probeTargets(tgArn, group, targets);
+        }
+    }
+
     private synchronized void probeTargets(String tgArn, TargetGroup tg, Map<String, TargetState> selected) {
         Map<String, TargetState> targets = states.get(tgArn);
         if (targets == null || !Boolean.TRUE.equals(tg.getHealthCheckEnabled())) {

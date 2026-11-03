@@ -270,7 +270,7 @@ class Ec2PortForwardManagerTest {
         ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
         verify(lifecycle).create(spec.capture());
         assertEquals("vpc-network", spec.getValue().networkMode());
-        assertEquals(List.of("TCP-LISTEN:80,fork,reuseaddr,nodelay", "TCP:10.0.1.10:80,nodelay"),
+        assertEquals(List.of("TCP-LISTEN:80,fork,reuseaddr,nodelay,backlog=1024", "TCP:10.0.1.10:80,nodelay"),
                 spec.getValue().cmd());
     }
 
@@ -307,8 +307,8 @@ class Ec2PortForwardManagerTest {
         verify(lifecycleManager).create(spec.capture());
         assertEquals("alpine/socat", spec.getValue().image());
         assertEquals(List.of("socat"), spec.getValue().entrypoint());
-        assertEquals(List.of("TCP-LISTEN:80,fork,reuseaddr,nodelay", "TCP:172.17.0.3:80,nodelay"),
-                spec.getValue().cmd());
+        assertEquals(List.of("TCP-LISTEN:80,fork,reuseaddr,nodelay,backlog=1024,backlog=4096",
+                "TCP:172.17.0.3:80,nodelay"), spec.getValue().cmd());
         assertEquals(Map.of(80, 30000), spec.getValue().portBindings());
     }
 

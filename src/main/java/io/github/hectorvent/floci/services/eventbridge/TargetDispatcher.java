@@ -102,12 +102,16 @@ public class TargetDispatcher implements Resettable {
     public void dispatch(String ruleArn, Target target, String eventJson, String region,
                          Supplier<List<Target>> currentTargets) {
         Instant now = clock.instant();
+        Delivery delivery = new Delivery(ruleArn, target.getId(), eventJson, region, currentTargets,
+                generation.get(), now, 0, null, null, now);
         try {
-            attempt(new Delivery(ruleArn, target.getId(), eventJson, region, currentTargets, generation.get(), now, 0,
-                    null, null, now), target, now);
+            if (AwsArnUtils.isArn(ruleArn)) {
+                RequestScopes.runAs(AwsArnUtils.parse(ruleArn).accountId(), () -> attempt(delivery, target, now));
+            } else {
+                attempt(delivery, target, now);
+            }
         } catch (RuntimeException e) {
-            LOG.warnv("EventBridge rule {0} could not dispatch to target {1}: {2}",
-                    ruleArn, target.getId(), e.getMessage());
+            handleFailure(delivery, target, now, e);
         }
     }
 
@@ -123,17 +127,40 @@ public class TargetDispatcher implements Resettable {
                 return;
             }
             try {
-                RequestScopes.runAs(AwsArnUtils.parse(delivery.ruleArn()).accountId(), () -> retry(delivery, now));
+                if (AwsArnUtils.isArn(delivery.ruleArn())) {
+                    RequestScopes.runAs(AwsArnUtils.parse(delivery.ruleArn()).accountId(), () -> retry(delivery, now));
+                } else {
+                    retry(delivery, now);
+                }
             } catch (RuntimeException e) {
-                LOG.warnv("EventBridge retry for rule {0} target {1} failed: {2}",
-                        delivery.ruleArn(), delivery.targetId(), e.getMessage());
+                handleRetryScopeFailure(delivery, now, e);
             }
         }
     }
 
-    private void retry(Delivery delivery, Instant now) {
-        if (delivery.generation() != generation.get()) {
+    private void handleRetryScopeFailure(Delivery delivery, Instant now, RuntimeException e) {
+        Target target = retryTarget(delivery, now);
+        if (target == null) {
             return;
+        }
+        handleFailure(delivery.nextRetry(), target, now, e);
+    }
+
+    private void retry(Delivery delivery, Instant now) {
+        Target target = retryTarget(delivery, now);
+        if (target == null) {
+            return;
+        }
+        if (delivery.retryAttempts() >= maximumRetryAttempts(target)) {
+            deadLetter(delivery, target, EXHAUSTED_BY_ATTEMPTS);
+            return;
+        }
+        attempt(delivery.nextRetry(), target, now);
+    }
+
+    private Target retryTarget(Delivery delivery, Instant now) {
+        if (delivery.generation() != generation.get()) {
+            return null;
         }
         Target target = delivery.currentTargets().get().stream()
                 .filter(candidate -> delivery.targetId().equals(candidate.getId()))
@@ -142,17 +169,13 @@ public class TargetDispatcher implements Resettable {
         if (target == null) {
             LOG.debugv("Dropped pending retry for rule {0} target {1}: target or rule removed",
                     delivery.ruleArn(), delivery.targetId());
-            return;
+            return null;
         }
         if (!now.isBefore(expiresAt(delivery, target))) {
             deadLetter(delivery, target, EXHAUSTED_BY_AGE);
-            return;
+            return null;
         }
-        if (delivery.retryAttempts() >= maximumRetryAttempts(target)) {
-            deadLetter(delivery, target, EXHAUSTED_BY_ATTEMPTS);
-            return;
-        }
-        attempt(delivery.nextRetry(), target, now);
+        return target;
     }
 
     private void attempt(Delivery delivery, Target target, Instant now) {
@@ -170,31 +193,35 @@ public class TargetDispatcher implements Resettable {
                     throw new AwsException("AccessDeniedException", "EventBridge is not authorized to invoke "
                             + targetArn, 403);
                 }
-                invoker.invokeTarget(target, delivery.eventJson(), delivery.region(), targetArn);
+                invoker.invokeTarget(target, delivery.eventJson(), delivery.region(), delivery.ruleArn());
             } else {
-                invoker.invokeTarget(target, delivery.eventJson(), delivery.region());
+                invoker.invokeTarget(target, delivery.eventJson(), delivery.region(), delivery.ruleArn());
             }
         } catch (Exception e) {
-            if (delivery.generation() != generation.get()) {
-                return;
-            }
-            String errorCode = classify(e);
-            String message = e.getMessage() != null && !e.getMessage().isBlank()
-                    ? e.getMessage()
-                    : e.getClass().getSimpleName();
-            LOG.warnv("EventBridge rule {0} target {1} delivery failed with {2}: {3}",
-                    delivery.ruleArn(), target.getId(), errorCode, message);
-            long backoffSeconds = Math.min(MAXIMUM_BACKOFF_SECONDS, 1L << Math.min(delivery.retryAttempts(), 9));
-            Instant backoff = now.plusSeconds(backoffSeconds);
-            Instant expiresAt = expiresAt(delivery, target);
-            Delivery failed = delivery.failed(errorCode, message, backoff.isBefore(expiresAt) ? backoff : expiresAt);
-            if (!RETRYABLE_ERROR_CODES.contains(errorCode)) {
-                deadLetter(failed, target, null);
-            } else if (failed.retryAttempts() >= maximumRetryAttempts(target)) {
-                deadLetter(failed, target, EXHAUSTED_BY_ATTEMPTS);
-            } else {
-                pending.add(failed);
-            }
+            handleFailure(delivery, target, now, e);
+        }
+    }
+
+    private void handleFailure(Delivery delivery, Target target, Instant now, Exception e) {
+        if (delivery.generation() != generation.get()) {
+            return;
+        }
+        String errorCode = classify(e);
+        String message = e.getMessage() != null && !e.getMessage().isBlank()
+                ? e.getMessage()
+                : e.getClass().getSimpleName();
+        LOG.warnv("EventBridge rule {0} target {1} delivery failed with {2}: {3}",
+                delivery.ruleArn(), target.getId(), errorCode, message);
+        long backoffSeconds = Math.min(MAXIMUM_BACKOFF_SECONDS, 1L << Math.min(delivery.retryAttempts(), 9));
+        Instant backoff = now.plusSeconds(backoffSeconds);
+        Instant expiresAt = expiresAt(delivery, target);
+        Delivery failed = delivery.failed(errorCode, message, backoff.isBefore(expiresAt) ? backoff : expiresAt);
+        if (!RETRYABLE_ERROR_CODES.contains(errorCode)) {
+            deadLetter(failed, target, null);
+        } else if (failed.retryAttempts() >= maximumRetryAttempts(target)) {
+            deadLetter(failed, target, EXHAUSTED_BY_ATTEMPTS);
+        } else {
+            pending.add(failed);
         }
     }
 
@@ -204,7 +231,10 @@ public class TargetDispatcher implements Resettable {
             return "INTERNAL_ERROR";
         }
         String code = aws.getErrorCode() != null ? aws.getErrorCode() : "";
-        if (aws.getHttpStatus() == 429 || code.contains("Throttl") || code.contains("TooManyRequests")) {
+        if (aws.getHttpStatus() == 429
+                || code.contains("Throttl")
+                || code.contains("TooManyRequests")
+                || "ActiveStatementsExceededException".equals(code)) {
             return "THROTTLING";
         }
         if (aws.getHttpStatus() >= 500) {

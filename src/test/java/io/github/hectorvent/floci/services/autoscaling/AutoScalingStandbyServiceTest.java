@@ -282,8 +282,8 @@ class AutoScalingStandbyServiceTest {
                 Map.of("ShouldDecrementDesiredCapacity", "true")), 400);
         assertEquals("AutoScalingGroup " + GROUP + " has min-size=" + group.getMinSize()
                         + ", max-size=" + group.getMaxSize() + ", and desired-size=2. To "
-                        + (entering ? "place into standby" : "place in service")
-                        + " 1 instance, please update the AutoScalingGroup sizes appropriately.",
+                        + (entering ? "place into standby" : "exit standby")
+                        + " 1 instances, please update the AutoScalingGroup sizes appropriately.",
                 response.getString("ErrorResponse.Error.Message"));
     }
 
@@ -409,7 +409,7 @@ class AutoScalingStandbyServiceTest {
         doThrow(new AwsException("InternalFailure", "retry deregistration", 500))
                 .doNothing().when(elb).deregisterTargets(eq(REGION), eq("target-group"), anyList());
 
-        reconciler.reconcile(group);
+        assertThrows(AwsException.class, () -> reconciler.reconcile(group));
         assertEquals("EnteringStandby", member().getLifecycleState());
         assertEquals("InProgress", service.describeScalingActivities(REGION, GROUP).getFirst().getStatusCode());
 
@@ -521,7 +521,7 @@ class AutoScalingStandbyServiceTest {
 
         reconciler.reconcile(group);
         assertTrue(group.getInstances().stream().noneMatch(instance -> INSTANCE.equals(instance.getInstanceId())));
-        assertEquals("Failed", activity(activityId).getStatusCode());
+        assertEquals("Cancelled", activity(activityId).getStatusCode());
         assertNotNull(activity(activityId).getEndTime());
         verify(ec2, times(2)).terminateInstances(REGION, List.of(INSTANCE));
     }

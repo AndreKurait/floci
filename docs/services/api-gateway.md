@@ -245,7 +245,10 @@ A domain created with `CreateDomainName` is `AVAILABLE` at once. Its `regionalDo
 itself is routed through the domain's base path mappings to the mapped REST API stage. An
 `EDGE` domain also reports a `distributionDomainName` under `cloudfront.net` and the fixed
 CloudFront hosted zone `Z2FDTNDATAQYW2`; a `REGIONAL` domain reports neither, as on AWS. Moving a
-domain between the two types with `UpdateDomainName` creates or drops the distribution.
+domain between the two types with `UpdateDomainName` creates or drops the distribution. A
+domain created with no endpoint type is `EDGE`, as on AWS; it is `REGIONAL` when the request
+carries a regional certificate (`regionalCertificateArn` or `regionalCertificateName`) or the
+partition has no edge-optimized endpoints.
 `GetDomainName` returns the `domainNameArn`, the `endpointConfiguration`, both certificate ARNs
 and the `tags`. Tags are managed through `TagResource`, `UntagResource` and `GetTags` on
 `arn:aws:apigateway:<region>::/domainnames/<domain>`. A second mapping on a base path that
@@ -763,7 +766,8 @@ Gateway v1 (`AWS`/Lambda mapping templates) and the AppSync resolver templates d
 V2 management APIs retain `credentialsArn` for integrations and
 `authorizerCredentialsArn` for REQUEST authorizers through create, update, get and
 list. Omitting either member on update preserves its stored value. HTTP API quick
-create retains its integration credentials. OpenAPI import maps the integration
+create retains integration credentials for Lambda ARN targets and ignores them for
+HTTP targets. OpenAPI import and CloudFormation API `Body` map the integration
 `credentials` and authorizer `authorizerCredentials` extensions to these fields.
 Integration copies and authorizer restore paths retain them too.
 
@@ -804,6 +808,16 @@ curl http://{apiId}.execute-api.{region}.localhost.floci.io:4566/{stageName}/{pa
 APIs created or updated with `disableExecuteApiEndpoint` reject requests to
 this default hostname with `404 Not Found`, matching AWS HTTP API behavior.
 
+HTTP API route selection prefers an exact method-and-path key. Otherwise, a
+matching non-greedy path outranks a greedy `{proxy+}` path; among comparable
+templates, literal segments outrank `{parameter}` segments at the first
+position where they differ. For `/pets/dog`, `GET /pets/dog` wins over
+`GET /pets/{pet}`, which wins over `GET /pets/{proxy+}`. Among greedy routes,
+a longer literal prefix such as `GET /pets/dogs/{proxy+}` wins over
+`GET /pets/{proxy+}`. For equally specific paths, a method-specific route
+wins over `ANY`; `$default` handles requests no other route matches. Route
+selection determines which route's authorizer and integration handle the request.
+
 HTTP API Lambda REQUEST authorizers resolve header, query string, context, and
 stage variable sources once, in configured order. Format `2.0` carries the values
 in an `identitySource` array; format `1.0` carries them as comma-separated
@@ -812,6 +826,12 @@ query names are case-sensitive. No configured sources produces an empty array
 or string. A missing or empty configured value returns `401` without invoking
 Lambda in either format. Repeated request values use each event's delivered
 representation: last value in format `1.0`, comma-joined values in format `2.0`.
+
+HTTP API `HTTP_PROXY` integrations can map values from a successful Lambda
+authorizer's context into request headers, query strings, and paths. For a returned
+`context` containing `tenantId`, use `$context.authorizer.tenantId` in
+`requestParameters`. String, numeric, and boolean context values are rendered as
+text. This works with format `1.0` policy responses and format `2.0` simple responses.
 
 A Lambda proxy integration's response is read as AWS reads it (measured): a function that raises, a
 format 1.0 result that is not an object with a `statusCode`, and a `statusCode` that is not a whole
@@ -889,6 +909,20 @@ The `integrationUri` names the backend:
 
 The request path is forwarded as received. The stage name is not added to it, and `tlsConfig` is not
 applied: the call to a Cloud Map instance uses plain HTTP.
+
+`$context.identity.sourceIp` is the address of the TCP connection to Floci, whatever `X-Forwarded-For`
+the client sent. An HTTP API `HTTP_PROXY` backend receives a `Forwarded` header holding the client's
+`X-Forwarded-For` entries and the client address, for example
+`Forwarded: for=198.51.100.7,for=192.0.2.43;by=10.0.0.1;host=api.example.test;proto=https`, and an
+`X-Forwarded-For` naming only the address Floci accepted the request on. A client's own `Forwarded`
+header is replaced. `$request.header.X-Forwarded-For` mappings still see the client's value. The
+[API Gateway important notes](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-known-issues.html)
+say HTTP APIs translate `X-Forwarded-*` into `Forwarded` and append the egress IP, Host and protocol.
+They do not give the syntax or the `X-Forwarded-For` value, which follow third-party descriptions of
+observed behavior. Floci translates only `X-Forwarded-For`: `X-Forwarded-Host`, `X-Forwarded-Proto` and
+`X-Forwarded-Port` reach the backend as the client sent them.
+An ALB HTTP or HTTPS listener integration goes through the listener, which adds its own hop. An NLB TCP
+listener relays the request unchanged and does not add a hop.
 
 ### Supported Operations
 

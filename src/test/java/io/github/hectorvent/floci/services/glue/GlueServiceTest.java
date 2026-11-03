@@ -18,6 +18,7 @@ import io.github.hectorvent.floci.services.glue.model.ConnectionPasswordEncrypti
 import io.github.hectorvent.floci.services.glue.model.Crawler;
 import io.github.hectorvent.floci.services.glue.model.CrawlerTargets;
 import io.github.hectorvent.floci.services.glue.model.DataCatalogEncryptionSettings;
+import io.github.hectorvent.floci.services.glue.model.DataQualityRuleset;
 import io.github.hectorvent.floci.services.glue.model.Database;
 import io.github.hectorvent.floci.services.glue.model.EncryptionAtRest;
 import io.github.hectorvent.floci.services.glue.model.GluePolicy;
@@ -112,6 +113,7 @@ class GlueServiceTest {
                 new InMemoryStorage<String, GluePolicy>(),
                 new InMemoryStorage<String, DataCatalogEncryptionSettings>(),
                 new InMemoryStorage<String, SecurityConfiguration>(),
+                new InMemoryStorage<String, DataQualityRuleset>(),
                 new InMemoryStorage<String, Trigger>(),
                 new InMemoryStorage<String, Workflow>(),
                 schemaRegistryService, regionResolver, new ResourceGroupsTaggingService(null), kmsService);
@@ -503,6 +505,45 @@ class GlueServiceTest {
                 glueService.getPartitions("db1", "plain").stream()
                         .map(Partition::getValues)
                         .toList());
+    }
+
+    @Test
+    void readDefaultsFillACopyAndLeaveTheStoredTableAndPartitionAsWritten() {
+        StorageDescriptor descriptor = new StorageDescriptor();
+        descriptor.setLocation("s3://warehouse/plain/");
+        Table table = new Table();
+        table.setName("plain");
+        table.setStorageDescriptor(descriptor);
+        glueService.createTable("db1", table);
+        Partition partition = new Partition();
+        partition.setValues(List.of("one"));
+        partition.setStorageDescriptor(new StorageDescriptor());
+        glueService.createPartition("db1", "plain", partition);
+
+        Table read = GlueService.withReadDefaults(glueService.getTable("db1", "plain"));
+        Partition readPartition =
+                GlueService.withReadDefaults(glueService.getPartition("db1", "plain", List.of("one")));
+
+        assertEquals(0, read.getRetention());
+        assertEquals(false, read.getRegisteredWithLakeFormation());
+        assertEquals(List.of("one"), readPartition.getValues());
+        for (StorageDescriptor filled : List.of(read.getStorageDescriptor(), readPartition.getStorageDescriptor())) {
+            assertEquals(false, filled.getCompressed());
+            assertEquals(0, filled.getNumberOfBuckets());
+            assertEquals(List.of(), filled.getSortColumns());
+            assertEquals(false, filled.getStoredAsSubDirectories());
+        }
+        // Spectrum reads a partition's missing Compressed as its table's, so the stored records keep their nulls.
+        Table stored = glueService.getTable("db1", "plain");
+        assertNull(stored.getRetention());
+        assertNull(stored.getRegisteredWithLakeFormation());
+        StorageDescriptor storedPartition = glueService.getPartitions("db1", "plain").get(0).getStorageDescriptor();
+        for (StorageDescriptor kept : List.of(stored.getStorageDescriptor(), storedPartition)) {
+            assertNull(kept.getCompressed());
+            assertNull(kept.getNumberOfBuckets());
+            assertNull(kept.getSortColumns());
+            assertNull(kept.getStoredAsSubDirectories());
+        }
     }
 
     @Test

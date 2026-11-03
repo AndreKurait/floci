@@ -73,8 +73,8 @@ class CloudWatchGzipIntegrationTest {
     @Test
     void anOversizeDecodedBodyCannotPublishAMetric() throws Exception {
         String namespace = namespace();
-        request(ROOT, "PutMetricData", gzip(paddedPublication(namespace, 5 * 1024 * 1024 + 1)), "gzip")
-                .then().statusCode(413).body("__type", equalTo("RequestEntityTooLargeException"));
+        request(ROOT, "PutMetricData", gzip(paddedPublication(namespace, 10 * 1024 * 1024 + 1)), "gzip")
+                .then().statusCode(413).body("__type", equalTo("PayloadTooLargeException"));
         assertAbsent(namespace);
     }
 

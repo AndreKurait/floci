@@ -264,7 +264,8 @@ public class BackupController {
         List<BackupRule> rules = readRules(planNode.path("Rules"));
         String creatorRequestId = textOrNull(req, "CreatorRequestId");
 
-        BackupPlan plan = service.createBackupPlan(planName, rules, creatorRequestId, region);
+        BackupPlan plan = service.createBackupPlan(planName, rules, creatorRequestId,
+                readStringMap(req, "BackupPlanTags"), region);
 
         ObjectNode out = objectMapper.createObjectNode();
         out.put("BackupPlanId", plan.getBackupPlanId());
@@ -309,8 +310,13 @@ public class BackupController {
     @DELETE
     @Path("/backup/plans/{backupPlanId}")
     public Response deleteBackupPlan(@PathParam("backupPlanId") String planId) {
-        service.deleteBackupPlan(planId);
-        return Response.noContent().build();
+        BackupPlan plan = service.deleteBackupPlan(planId);
+        ObjectNode out = objectMapper.createObjectNode();
+        out.put("BackupPlanId", plan.getBackupPlanId());
+        out.put("BackupPlanArn", plan.getBackupPlanArn());
+        out.put("DeletionDate", plan.getDeletionDate());
+        out.put("VersionId", plan.getVersionId());
+        return Response.ok(out).build();
     }
 
     @GET
@@ -583,13 +589,19 @@ public class BackupController {
         return n.asText();
     }
 
-    @SuppressWarnings("unchecked")
     private Map<String, String> readStringMap(JsonNode node, String field) {
         JsonNode mapNode = node.path(field);
         if (mapNode.isMissingNode() || mapNode.isNull()) {
             return new HashMap<>();
         }
-        return objectMapper.convertValue(mapNode, Map.class);
+        if (!mapNode.isObject() || mapNode.properties().stream()
+                .anyMatch(entry -> !entry.getValue().isTextual())) {
+            throw new AwsException("InvalidParameterValueException",
+                    field + " must be an object with string values", 400);
+        }
+        Map<String, String> result = new HashMap<>();
+        mapNode.properties().forEach(entry -> result.put(entry.getKey(), entry.getValue().textValue()));
+        return result;
     }
 
     private static List<String> readStringList(JsonNode node) {

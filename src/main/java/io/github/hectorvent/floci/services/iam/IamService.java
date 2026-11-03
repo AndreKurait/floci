@@ -159,20 +159,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private static final String ACCOUNT_PASSWORD_POLICY_KEY = "account-password-policy";
     private static final String STS_PREFERENCES_KEY = "sts-preferences";
     private static final String OUTBOUND_FEDERATION_KEY = "outbound-web-identity-federation";
-    /** accountPropertiesMapType's key: 1 to 50 of this, and a value of 1 to 1024. */
-    private static final Pattern ACCOUNT_PROPERTY_KEY_PATTERN =
-            Pattern.compile("^[A-Za-z][A-Za-z0-9/_-]*$");
-    private static final int MAX_ACCOUNT_PROPERTY_KEY_LENGTH = 50;
-    private static final int MAX_ACCOUNT_PROPERTY_VALUE_LENGTH = 1024;
     /** globalEndpointTokenVersion's only two values. */
     private static final Set<String> GLOBAL_ENDPOINT_TOKEN_VERSIONS = Set.of("v1Token", "v2Token");
     /** AWS-documented bounds for the account password policy's numeric fields. */
-    private static final int MIN_PASSWORD_LENGTH_FLOOR = 6;
-    private static final int MIN_PASSWORD_LENGTH_CEILING = 128;
-    private static final int MAX_PASSWORD_AGE_FLOOR = 1;
-    private static final int MAX_PASSWORD_AGE_CEILING = 1095;
-    private static final int PASSWORD_REUSE_PREVENTION_FLOOR = 1;
-    private static final int PASSWORD_REUSE_PREVENTION_CEILING = 24;
     /**
      * AWS's documented {@code passwordType} pattern for Create/UpdateLoginProfile: printable
      * ASCII and Latin-1 Supplement (space through code point 0xFF), plus tab/LF/CR, 1-128 chars.
@@ -189,11 +178,16 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     private final Object tagLock = new Object();
 
+    /**
+     * Guards the read-modify-write of a customer managed policy's AttachmentCount. Attaching or
+     * detaching one policy on several principals at once would otherwise lose updates, leaving a
+     * fully detached policy that DeletePolicy still refuses as attached.
+     */
+    private final Object policyAttachmentCountLock = new Object();
+
     /** CSPRNG for long-term secret access keys; ordinary resource IDs keep using {@link ThreadLocalRandom}. */
     private final SecureRandom secureRandom = new SecureRandom();
 
-    /** AWSServiceName as AWS constrains it: 1-128 characters of {@code [\w+=,.@-]}. */
-    private static final Pattern SERVICE_PRINCIPAL_PATTERN = Pattern.compile("[\\w+=,.@-]{1,128}");
     /** CustomSuffix as AWS constrains it: 1-64 characters of {@code [\w+=,.@-]}. */
     private static final Pattern CUSTOM_SUFFIX_PATTERN = Pattern.compile("[\\w+=,.@-]{1,64}");
     private static final int ROLE_DESCRIPTION_MAX_LENGTH = 1000;
@@ -290,16 +284,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private static final Set<String> SSH_PUBLIC_KEY_ENCODINGS = Set.of("SSH", "PEM");
     /** certificateIdType is 24 to 128 of [\w]+, so a 32-character id sits inside that. */
     private static final int SIGNING_CERTIFICATE_ID_LENGTH = 32;
+    /** Two of {@code statusType}'s values, which this service writes itself where the model reads the set. */
     private static final String CREDENTIAL_STATUS_ACTIVE = "Active";
     private static final String CREDENTIAL_STATUS_EXPIRED = "Expired";
-    /**
-     * statusType's values, shared by access keys, signing certificates, SSH public keys and
-     * service-specific credentials: Active, Inactive and Expired. Each operation's prose explains
-     * only the first two, so the third is easy to reject by mistake, while the API Reference lists
-     * all three as valid on each of them.
-     */
-    private static final Set<String> CREDENTIAL_STATUSES =
-            Set.of(CREDENTIAL_STATUS_ACTIVE, "Inactive", CREDENTIAL_STATUS_EXPIRED);
     /** {@code certificateBodyType} and {@code privateKeyType} are both 1 to 16384 characters. */
     private static final int MAX_CERTIFICATE_BODY_LENGTH = 16384;
     /** {@code certificateChainType} is far larger, at 1 to 2097152. */
@@ -309,16 +296,18 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * types" (IAM User Guide). Floci models only virtual devices, so this bounds those alone.
      */
     private static final int MAX_MFA_DEVICES_PER_USER = 8;
-    /** {@code AuthenticationCode1}/{@code 2}: fixed length of 6, pattern {@code [\d]+}. */
-    private static final Pattern AUTHENTICATION_CODE_PATTERN = Pattern.compile("[0-9]{6}");
     /**
-     * {@code virtualMFADeviceName}: a minimum of 1 and this pattern, with no maximum length. IAM's
-     * other name types are all capped at 64 or 128; this one is deliberately not.
+     * The largest window {@code PasswordReusePrevention} accepts, which the model declares and the
+     * constraints read ahead of the operation hold a request to. It stays here for the password
+     * history that window bounds: nothing can be asked about a password further back than this.
      */
-    private static final Pattern VIRTUAL_MFA_DEVICE_NAME_PATTERN = Pattern.compile("[\\w+=,.@-]+");
-    /** {@code serialNumberType}: 9-256 characters, and a wider pattern than a name, allowing ARNs. */
-    private static final Pattern SERIAL_NUMBER_PATTERN = Pattern.compile("[\\w+=/:,.@-]+");
-    private static final int SERIAL_NUMBER_MIN_LENGTH = 9;
+    private static final int PASSWORD_REUSE_PREVENTION_CEILING = 24;
+    /**
+     * {@code serialNumberType}'s maximum, which bounds the serial number a virtual device is minted
+     * with rather than one a request sends: that one is read against the model with the rest of the
+     * request. The name and the path together make the serial, so neither member's own bound says
+     * what the pair may produce.
+     */
     private static final int SERIAL_NUMBER_MAX_LENGTH = 256;
     /**
      * How far the code pair may sit from the current 30-second window. Enabling a device is done
@@ -820,6 +809,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return accessKeys.get(accessKeyId).map(AccessKey::getUserName);
     }
 
+    /** The account this request's IAM entities are read from, or null outside account-aware storage. */
+    public String requestAccountId() {
+        return users instanceof AccountAwareStorageBackend<IamUser> aware ? aware.accountId() : null;
+    }
+
     /**
      * The owner of a key in the calling account, for a read that is not the owner's own request.
      * Unlike {@link #findUserNameByAccessKeyId}, this never migrates: an unprefixed
@@ -907,6 +901,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         String prefix = pathPrefix != null ? pathPrefix : "/";
         return users.scan(k -> true).stream()
                 .filter(u -> u.getPath().startsWith(prefix))
+                .sorted(Comparator.comparing(IamUser::getUserName))
                 .toList();
     }
 
@@ -1128,6 +1123,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         String prefix = pathPrefix != null ? pathPrefix : "/";
         return groups.scan(k -> true).stream()
                 .filter(g -> g.getPath().startsWith(prefix))
+                .sorted(Comparator.comparing(IamGroup::getGroupName))
                 .toList();
     }
 
@@ -1271,9 +1267,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * five entities and passes everything else through, which would make the {@code Role} this
      * action and {@code GetRole} answer unparsable.
      *
-     * <p>The rendering names neither the offending value nor the set, the way
-     * {@link #requireStatusFromEnum} does, which is the one IAM constraint rendering a recording
-     * covers. It also keeps the refused description out of the error body, where a control
+     * <p>The rendering names the member and not the offending value, which is IAM's form
+     * throughout. It also keeps the refused description out of the error body, where a control
      * character would break the answer it is being refused for.
      */
     private static void validateRoleDescription(String description) {
@@ -1306,9 +1301,10 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         } else {
             return;
         }
-        String value = roleName == null ? "null" : "'" + roleName + "'";
-        throw SmithyValidationErrors.validationError("Value " + value
-                + " at 'roleName' failed to satisfy constraint: " + constraint);
+        if (roleName == null) {
+            throw IamValidationErrors.notNull("roleName");
+        }
+        throw IamValidationErrors.validationError("roleName", roleName, constraint);
     }
 
     /**
@@ -1421,10 +1417,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * {@code _}, and that attribute forces replacement, so a name without one never converges.
      */
     public IamRole createServiceLinkedRole(String awsServiceName, String customSuffix, String description) {
-        if (awsServiceName == null || !SERVICE_PRINCIPAL_PATTERN.matcher(awsServiceName).matches()) {
-            throw new AwsException("InvalidInput",
-                    "AWSServiceName must be 1-128 characters matching [\\w+=,.@-], for example es.amazonaws.com.", 400); // partition-literal: AWS's own message text
-        }
         if (customSuffix != null && !customSuffix.isEmpty()
                 && !CUSTOM_SUFFIX_PATTERN.matcher(customSuffix).matches()) {
             throw new AwsException("InvalidInput",
@@ -1711,21 +1703,23 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     private void incrementCustomerManagedPolicyAttachmentCount(IamPolicy policy) {
-        if (AwsManagedPolicies.isManagedPolicyArn(policy.getArn())) {
-            return;
-        }
-        policy.setAttachmentCount(policy.getAttachmentCount() + 1);
-        policies.put(policy.getArn(), policy);
+        adjustCustomerManagedPolicyAttachmentCount(policy.getArn(), 1);
     }
 
     private void decrementCustomerManagedPolicyAttachmentCount(String policyArn) {
+        adjustCustomerManagedPolicyAttachmentCount(policyArn, -1);
+    }
+
+    private void adjustCustomerManagedPolicyAttachmentCount(String policyArn, int delta) {
         if (AwsManagedPolicies.isManagedPolicyArn(policyArn)) {
             return;
         }
-        policies.get(policyArn).ifPresent(policy -> {
-            policy.setAttachmentCount(Math.max(0, policy.getAttachmentCount() - 1));
-            policies.put(policyArn, policy);
-        });
+        synchronized (policyAttachmentCountLock) {
+            policies.get(policyArn).ifPresent(policy -> {
+                policy.setAttachmentCount(Math.max(0, policy.getAttachmentCount() + delta));
+                policies.put(policyArn, policy);
+            });
+        }
     }
 
     private void rejectIfAwsManaged(String policyArn) {
@@ -1773,10 +1767,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 && !"All".equalsIgnoreCase(scope)
                 && !"AWS".equalsIgnoreCase(scope)
                 && !"Local".equalsIgnoreCase(scope)) {
-            throw SmithyValidationErrors.validationError(
-                    "Value '" + scope + "' at 'scope' failed to "
-                            + "satisfy constraint: Member must satisfy enum value set: "
-                            + "[All, AWS, Local]");
+            throw IamValidationErrors.validationError("scope", scope,
+                    "Member must satisfy enum value set: [All, AWS, Local]");
         }
         String prefix = pathPrefix != null ? pathPrefix : "/";
         boolean blankScope = scope == null || scope.isBlank();
@@ -2432,12 +2424,12 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     /**
-     * Sets an access key's status, validated before the key is looked up the way the other three
-     * {@code statusType} operations validate theirs: a status outside the enum is answered for the
-     * status whether or not the key exists.
+     * Sets an access key's status. The status is held to {@code statusType} ahead of this, by the
+     * model the Query front door reads, so a value outside the set and an omitted one are both
+     * answered before any key is looked up. The CloudFormation provisioner validates the status it
+     * resolves from a template before it calls here, that path having no front door of its own.
      */
     public void updateAccessKey(String userName, String accessKeyId, String status) {
-        requireStatusFromEnum(status);
         synchronized (accessKeyLock) {
             AccessKey key = userAccessKey(userName, accessKeyId);
             key.setStatus(status);
@@ -2698,7 +2690,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * their documented defaults instead of carrying over the previous policy's value.
      */
     public AccountPasswordPolicy updateAccountPasswordPolicy(AccountPasswordPolicy policy) {
-        validateAccountPasswordPolicy(policy);
         passwordPolicies.put(ACCOUNT_PASSWORD_POLICY_KEY, policy);
         LOG.infov("Updated IAM account password policy");
         return policy;
@@ -2716,29 +2707,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         }
         passwordPolicies.delete(ACCOUNT_PASSWORD_POLICY_KEY);
         LOG.infov("Deleted IAM account password policy");
-    }
-
-    private void validateAccountPasswordPolicy(AccountPasswordPolicy policy) {
-        int minLength = policy.getMinimumPasswordLength();
-        if (minLength < MIN_PASSWORD_LENGTH_FLOOR || minLength > MIN_PASSWORD_LENGTH_CEILING) {
-            throw new AwsException("ValidationError",
-                    "MinimumPasswordLength must be between " + MIN_PASSWORD_LENGTH_FLOOR + " and "
-                            + MIN_PASSWORD_LENGTH_CEILING + ".", 400);
-        }
-        Integer maxAge = policy.getMaxPasswordAge();
-        if (maxAge != null && (maxAge < MAX_PASSWORD_AGE_FLOOR || maxAge > MAX_PASSWORD_AGE_CEILING)) {
-            throw new AwsException("ValidationError",
-                    "MaxPasswordAge must be between " + MAX_PASSWORD_AGE_FLOOR + " and "
-                            + MAX_PASSWORD_AGE_CEILING + ".", 400);
-        }
-        Integer reusePrevention = policy.getPasswordReusePrevention();
-        if (reusePrevention != null
-                && (reusePrevention < PASSWORD_REUSE_PREVENTION_FLOOR
-                        || reusePrevention > PASSWORD_REUSE_PREVENTION_CEILING)) {
-            throw new AwsException("ValidationError",
-                    "PasswordReusePrevention must be between " + PASSWORD_REUSE_PREVENTION_FLOOR + " and "
-                            + PASSWORD_REUSE_PREVENTION_CEILING + ".", 400);
-        }
     }
 
     // =========================================================================
@@ -2930,8 +2898,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     private static void validatePassword(String password, String member) {
         if (password == null) {
-            throw SmithyValidationErrors.validationError(
-                    SmithyValidationErrors.notNull(member));
+            throw IamValidationErrors.notNull(member);
         }
         if (!LOGIN_PROFILE_PASSWORD_PATTERN.matcher(password).matches()) {
             throw SmithyValidationErrors.validationError(
@@ -2965,20 +2932,39 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         }
     }
 
+    /**
+     * A name held to the pattern every IAM name type declares. The constraints read ahead of the
+     * operation answer this for a request that arrives through the Query protocol, so what reaches
+     * here is a caller inside the emulator, a seeded configuration or a template, and the wording
+     * is the same either way.
+     */
     private void validateIamResourceName(String value, String paramName) {
-        if (value == null || !IAM_RESOURCE_NAME_PATTERN.matcher(value).matches()) {
-            throw new AwsException("ValidationError",
-                    paramName + " must be 1-128 characters matching [\\w+=,.@-].", 400);
+        if (value == null) {
+            throw IamValidationErrors.notNull(memberPath(paramName));
+        }
+        if (!IAM_RESOURCE_NAME_PATTERN.matcher(value).matches()) {
+            throw IamValidationErrors.validationError(memberPath(paramName), value,
+                    "Member must satisfy regular expression pattern: "
+                            + IAM_RESOURCE_NAME_PATTERN.pattern());
         }
     }
 
+    /** The member's name as a validation message spells it, the request's with a lower first letter. */
+    private static String memberPath(String paramName) {
+        return Character.toLowerCase(paramName.charAt(0)) + paramName.substring(1);
+    }
+
+    /** The same for a path, which the model holds to its own length and pattern. */
     private void validateIamPath(String value, String paramName) {
         if (value == null) return;
-        if (value.length() > IAM_PATH_MAX_LENGTH || !IAM_PATH_PATTERN.matcher(value).matches()) {
-            throw new AwsException("ValidationError",
-                    paramName + " must be at most " + IAM_PATH_MAX_LENGTH
-                            + " characters, either a bare forward slash or a string that begins and ends "
-                            + "with a forward slash.", 400);
+        String path = memberPath(paramName);
+        if (value.codePointCount(0, value.length()) > IAM_PATH_MAX_LENGTH) {
+            throw IamValidationErrors.validationError(path, value,
+                    "Member must have length less than or equal to " + IAM_PATH_MAX_LENGTH);
+        }
+        if (!IAM_PATH_PATTERN.matcher(value).matches()) {
+            throw IamValidationErrors.validationError(path, value,
+                    "Member must satisfy regular expression pattern: " + IAM_PATH_PATTERN.pattern());
         }
     }
 
@@ -3003,13 +2989,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     public void putAccountProperties(Map<String, String> properties) {
         if (properties == null || properties.isEmpty()) {
-            throw SmithyValidationErrors.validationError(
-                    SmithyValidationErrors.notNull("properties"));
+            throw IamValidationErrors.notNull("properties");
         }
         String namespace = null;
         for (Map.Entry<String, String> entry : properties.entrySet()) {
-            String keyNamespace = validateAccountPropertyKey(entry.getKey());
-            validateAccountPropertyValue(entry.getKey(), entry.getValue());
+            String keyNamespace = accountPropertyNamespace(entry.getKey());
             if (namespace == null) {
                 namespace = keyNamespace;
             } else if (!namespace.equals(keyNamespace)) {
@@ -3028,27 +3012,18 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     /**
-     * The namespace half of the key, having checked the whole key against the model.
+     * The namespace half of the key, whose own length and pattern, and whose value's length, the
+     * model declares and {@code IamRequestShapes} answers ahead of this.
      *
-     * <p>The two rejections here are not the same kind of error. The length and the pattern are
+     * <p>What is left here is not the same kind of error as those. The length and the pattern are
      * published constraints on the parameter, and the API Reference defines {@code ValidationError}
      * as the common error for input that "doesn't meet the required format or constraints". The
      * {@code Namespace/PropertyName} rule is not expressible in the published pattern, which admits
      * no slash, several, and a trailing one, so it is a rule the service applies after the format
      * is already satisfied: that is {@code InvalidInput}, "an invalid or out-of-range value".
      */
-    private String validateAccountPropertyKey(String key) {
-        if (key == null || key.isEmpty() || key.length() > MAX_ACCOUNT_PROPERTY_KEY_LENGTH
-                || !ACCOUNT_PROPERTY_KEY_PATTERN.matcher(key).matches()) {
-            throw SmithyValidationErrors.validationError(
-                    "Value '" + key + "' at 'properties' failed "
-                            + "to satisfy constraint: Map keys "
-                            + "must satisfy constraint: [Member must have length less than or "
-                            + "equal to " + MAX_ACCOUNT_PROPERTY_KEY_LENGTH + ", Member must "
-                            + "satisfy regular expression pattern: "
-                            + ACCOUNT_PROPERTY_KEY_PATTERN.pattern() + "]");
-        }
-        int separator = key.indexOf('/');
+    private String accountPropertyNamespace(String key) {
+        int separator = key == null ? -1 : key.indexOf('/');
         if (separator <= 0 || separator != key.lastIndexOf('/') || separator == key.length() - 1) {
             throw new AwsException("InvalidInput",
                     "The property key '" + key + "' is not Namespace/PropertyName: a key has "
@@ -3058,24 +3033,12 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return key.substring(0, separator);
     }
 
-    private void validateAccountPropertyValue(String key, String value) {
-        if (value == null || value.isEmpty()
-                || value.length() > MAX_ACCOUNT_PROPERTY_VALUE_LENGTH) {
-            throw SmithyValidationErrors.validationError(
-                    "Value at 'properties." + key + "' failed to "
-                            + "satisfy constraint: Member must have length between 1 and "
-                            + MAX_ACCOUNT_PROPERTY_VALUE_LENGTH);
-        }
-    }
-
     /** The account's global endpoint token version, {@code v1Token} or {@code v2Token}. */
     public void setSecurityTokenServicePreferences(String globalEndpointTokenVersion) {
         if (globalEndpointTokenVersion == null
                 || !GLOBAL_ENDPOINT_TOKEN_VERSIONS.contains(globalEndpointTokenVersion)) {
-            throw SmithyValidationErrors.validationError(
-                    "Value '" + globalEndpointTokenVersion
-                            + "' at 'globalEndpointTokenVersion' failed to satisfy constraint: "
-                            + "Member must satisfy enum value set: ["
+            throw IamValidationErrors.validationError("globalEndpointTokenVersion",
+                    globalEndpointTokenVersion, "Member must satisfy enum value set: ["
                             + String.join(", ", GLOBAL_ENDPOINT_TOKEN_VERSIONS) + "]");
         }
         stsPreferences.put(STS_PREFERENCES_KEY, globalEndpointTokenVersion);
@@ -3470,24 +3433,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return getServerCertificate(name).getTags();
     }
 
-    // Credential status, shared by the four operations that take statusType
-    // =========================================================================
-
-    /**
-     * {@code statusType}, shared by UpdateAccessKey, UpdateSigningCertificate, UpdateSSHPublicKey
-     * and UpdateServiceSpecificCredential. One rendering serves all four because one front end
-     * validates one shape: the recording is of UpdateServiceSpecificCredential, and AWS names
-     * neither the offending value nor the permitted set, unlike this message elsewhere in the
-     * tree. Matched rather than made uniform.
-     */
-    private void requireStatusFromEnum(String status) {
-        if (status == null || !CREDENTIAL_STATUSES.contains(status)) {
-            throw SmithyValidationErrors.validationError(
-                    "Value at 'status' failed to satisfy "
-                            + "constraint: Member must satisfy enum value set");
-        }
-    }
-
     // Signing certificates
     // =========================================================================
 
@@ -3543,7 +3488,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void updateSigningCertificate(String userName, String certificateId, String status) {
-        requireStatusFromEnum(status);
         synchronized (signingCertificateLock) {
             SigningCertificate certificate = userSigningCertificate(userName, certificateId);
             certificate.setStatus(status);
@@ -3707,7 +3651,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void updateSshPublicKey(String userName, String keyId, String status) {
-        requireStatusFromEnum(status);
         synchronized (sshPublicKeyLock) {
             SshPublicKey stored = userSshPublicKey(userName, keyId);
             stored.setStatus(status);
@@ -3810,11 +3753,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             }
             if (credentialAgeDays < MIN_CREDENTIAL_AGE_DAYS
                     || credentialAgeDays > MAX_CREDENTIAL_AGE_DAYS) {
-                throw SmithyValidationErrors.validationError(
-                        "Value '" + credentialAgeDays
-                                + "' at 'credentialAgeDays' failed to satisfy constraint: "
-                                + "Member must be between " + MIN_CREDENTIAL_AGE_DAYS + " and "
-                                + MAX_CREDENTIAL_AGE_DAYS);
+                throw IamValidationErrors.validationError("credentialAgeDays",
+                        String.valueOf(credentialAgeDays), "Member must be between "
+                                + MIN_CREDENTIAL_AGE_DAYS + " and " + MAX_CREDENTIAL_AGE_DAYS);
             }
         }
         synchronized (serviceCredentialLock) {
@@ -3983,7 +3924,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void updateServiceSpecificCredential(String userName, String credentialId,
                                                 String status) {
         requireCredentialIdFormat(credentialId);
-        requireStatusFromEnum(status);
         synchronized (serviceCredentialLock) {
             ServiceSpecificCredential credential = userServiceCredential(userName, credentialId);
             credential.setStatus(status);
@@ -4089,7 +4029,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * it. A caller that seeds a TOTP app from a Floci device gets working codes.
      */
     public VirtualMfaDevice createVirtualMfaDevice(String name, String path, Map<String, String> tags) {
-        validateVirtualMfaDeviceName(name);
         validateIamPath(path, "Path");
         String normalizedPath = normalizePath(path);
         // The serial number is the ARN, and the ARN embeds the path, so two devices of the same
@@ -4135,10 +4074,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public List<VirtualMfaDevice> listVirtualMfaDevices(String assignmentStatus) {
         String status = assignmentStatus == null || assignmentStatus.isBlank() ? "Any" : assignmentStatus;
         if (!status.equals("Any") && !status.equals("Assigned") && !status.equals("Unassigned")) {
-            throw SmithyValidationErrors.validationError(
-                    "Value '" + assignmentStatus
-                            + "' at 'assignmentStatus' failed to satisfy constraint: "
-                            + "Member must satisfy enum value set: [Any, Unassigned, Assigned]");
+            throw IamValidationErrors.validationError("assignmentStatus", assignmentStatus,
+                    "Member must satisfy enum value set: [Any, Unassigned, Assigned]");
         }
         return virtualMfaDevices.scan(k -> true).stream()
                 .filter(d -> switch (status) {
@@ -4156,7 +4093,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * documented DeleteConflict rather than a silent detach.
      */
     public void deleteVirtualMfaDevice(String serialNumber) {
-        validateSerialNumber(serialNumber);
         synchronized (mfaDeviceLock) {
             VirtualMfaDevice device = getVirtualMfaDevice(serialNumber);
             if (device.isAssigned()) {
@@ -4176,9 +4112,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     public void enableMfaDevice(String userName, String serialNumber, String code1, String code2) {
         validateIamResourceName(userName, "UserName");
-        validateSerialNumber(serialNumber);
-        validateAuthenticationCode(code1, "AuthenticationCode1");
-        validateAuthenticationCode(code2, "AuthenticationCode2");
         synchronized (mfaDeviceLock) {
             // The user's existence is confirmed under the same lock DeleteUser checks for devices
             // under. Checked outside it, a DeleteUser that saw no devices could remove the user
@@ -4211,7 +4144,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * The seed survives, so the same authenticator entry keeps working if it is re-enabled.
      */
     public void deactivateMfaDevice(String userName, String serialNumber) {
-        validateSerialNumber(serialNumber);
         getUser(userName);
         synchronized (mfaDeviceLock) {
             VirtualMfaDevice device = getVirtualMfaDevice(serialNumber);
@@ -4235,10 +4167,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     public void resyncMfaDevice(String userName, String serialNumber, String code1, String code2) {
         validateIamResourceName(userName, "UserName");
-        validateSerialNumber(serialNumber);
-        validateAuthenticationCode(code1, "AuthenticationCode1");
         getUser(userName);
-        validateAuthenticationCode(code2, "AuthenticationCode2");
         synchronized (mfaDeviceLock) {
             VirtualMfaDevice device = getVirtualMfaDevice(serialNumber);
             if (!userName.equals(device.getUserName())) {
@@ -4257,7 +4186,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void tagMfaDevice(String serialNumber, Map<String, String> newTags) {
-        validateSerialNumber(serialNumber);
         synchronized (mfaDeviceLock) {
             VirtualMfaDevice device = getVirtualMfaDevice(serialNumber);
             device.setTags(mergeTagsWithinQuota(device.getTags(), newTags, "TagsPerMFADevice", false));
@@ -4266,7 +4194,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void untagMfaDevice(String serialNumber, List<String> tagKeys) {
-        validateSerialNumber(serialNumber);
         synchronized (mfaDeviceLock) {
             VirtualMfaDevice device = getVirtualMfaDevice(serialNumber);
             Map<String, String> remaining = new LinkedHashMap<>(device.getTags());
@@ -4279,7 +4206,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public Map<String, String> listMfaDeviceTags(String serialNumber) {
-        validateSerialNumber(serialNumber);
         return getVirtualMfaDevice(serialNumber).getTags();
     }
 
@@ -4298,42 +4224,6 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 .filter(d -> userName.equals(d.getUserName()))
                 .sorted(Comparator.comparing(VirtualMfaDevice::getSerialNumber))
                 .toList();
-    }
-
-    private void validateAuthenticationCode(String code, String paramName) {
-        if (code == null || !AUTHENTICATION_CODE_PATTERN.matcher(code).matches()) {
-            throw new AwsException("ValidationError",
-                    paramName + " must be exactly 6 digits.", 400);
-        }
-    }
-
-    /**
-     * {@code virtualMFADeviceName} carries a minimum and a pattern but, unlike every other IAM
-     * name type, no maximum length. So this cannot reuse
-     * {@link #validateIamResourceName(String, String)}: capping the name at 128 would reject a
-     * name AWS accepts.
-     */
-    private void validateVirtualMfaDeviceName(String name) {
-        if (name == null || name.isEmpty() || !VIRTUAL_MFA_DEVICE_NAME_PATTERN.matcher(name).matches()) {
-            throw new AwsException("ValidationError",
-                    "VirtualMFADeviceName must be at least 1 character matching [\\w+=,.@-].", 400);
-        }
-    }
-
-    /**
-     * {@code serialNumberType}: 9 to 256 characters of {@code [\w+=/:,.@-]}. Checked before the
-     * device is looked up, so a malformed serial number is the ValidationError AWS returns rather
-     * than a NoSuchEntity for a device that could never have existed under that name.
-     */
-    private void validateSerialNumber(String serialNumber) {
-        if (serialNumber == null
-                || serialNumber.length() < SERIAL_NUMBER_MIN_LENGTH
-                || serialNumber.length() > SERIAL_NUMBER_MAX_LENGTH
-                || !SERIAL_NUMBER_PATTERN.matcher(serialNumber).matches()) {
-            throw new AwsException("ValidationError",
-                    "SerialNumber must be " + SERIAL_NUMBER_MIN_LENGTH + "-" + SERIAL_NUMBER_MAX_LENGTH
-                            + " characters matching [\\w+=/:,.@-].", 400);
-        }
     }
 
     /**
@@ -4560,6 +4450,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return findSessionAnyAccount(accessKeyId)
                 .filter(session -> isExpired(session, clock.instant()))
                 .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .isPresent();
+    }
+
+    /** Role chaining requires a live role credential with this request's matching issued token. */
+    public boolean isRoleSession(String accessKeyId, String sessionToken) {
+        return currentSession(accessKeyId)
+                .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .map(SessionCredential::getRoleArn)
+                .filter(AwsArnUtils::isArn)
+                .map(AwsArnUtils::parse)
+                .filter(arn -> "iam".equals(arn.service()) && arn.resource().startsWith("role/"))
                 .isPresent();
     }
 
@@ -4913,7 +4814,10 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private void verifyMfa(String issuerArn, String issuerUserId, String serialNumber, String tokenCode,
                            Instant authenticationTime) {
         if (serialNumber != null) {
-            validateSerialNumber(serialNumber);
+            if (serialNumber.length() < 9 || serialNumber.length() > SERIAL_NUMBER_MAX_LENGTH
+                    || !serialNumber.matches("[\\w+=/:,.@-]+")) {
+                throw new AwsException("ValidationError", "SerialNumber must be 9-256 characters matching [\\w+=/:,.@-].", 400);
+            }
         }
         if (tokenCode != null && !Totp.isSixDigits(tokenCode)) {
             throw new AwsException("ValidationError", "TokenCode must contain six digits.", 400);
@@ -5065,6 +4969,31 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                         && session.getPresignedResourceArn() != null)
                 .map(session -> new PresignedScope(
                         session.getPresignedAction(), session.getPresignedResourceArn()));
+    }
+
+    /** Binds a Redshift Spectrum scratch object ARN to an active transfer role session. */
+    public void registerSpectrumScratchResource(String accessKeyId, String resourceArn) {
+        currentSession(accessKeyId).ifPresent(session -> {
+            session.setSpectrumScratchResourceArn(resourceArn);
+            String accountId = session.getOriginAccountId() != null ? session.getOriginAccountId() : "000000000000";
+            putSessionForAccount(accountId, accessKeyId, session);
+        });
+    }
+
+    /** Clears the Spectrum scratch object permission from the session when the transfer completes. */
+    public void clearSpectrumScratchResource(String accessKeyId) {
+        currentSession(accessKeyId).ifPresent(session -> {
+            session.setSpectrumScratchResourceArn(null);
+            String accountId = session.getOriginAccountId() != null ? session.getOriginAccountId() : "000000000000";
+            putSessionForAccount(accountId, accessKeyId, session);
+        });
+    }
+
+    /** The exact scratch object ARN permitted for this session, if it is a Spectrum transfer session. */
+    public Optional<String> spectrumScratchResourceArn(String accessKeyId) {
+        return currentSession(accessKeyId)
+                .map(SessionCredential::getSpectrumScratchResourceArn)
+                .filter(arn -> arn != null && !arn.isBlank());
     }
 
     /**

@@ -9,6 +9,18 @@ Table and partition column-statistics reads fill omitted required numeric member
 string, binary, long, double, decimal, date, and boolean statistics. Supplied values and stored
 records are preserved; optional minimum and maximum values remain absent when omitted.
 
+Table and partition reads (`GetTable`, `GetTables`, `SearchTables`, `GetTableVersion`, `GetTableVersions`,
+`GetPartition`, `GetPartitions`, `BatchGetPartition`) return a table's `Retention` as `0`, and a storage
+descriptor's `Compressed`, `NumberOfBuckets`, `SortColumns` and `StoredAsSubDirectories` as `false`, `0`, `[]`
+and `false`, when they were written without them, as Glue does. A table's `IsRegisteredWithLakeFormation` is
+`false`: Floci does not tie a table to a location registered with Lake Formation. The Glue Data Catalog client
+that Hive and Spark use on EMR reads each of them. Stored records keep what was written, and a storage
+descriptor keeps the `AdditionalLocations`, `BucketColumns`, `SortColumns`, `SkewedInfo` and
+`StoredAsSubDirectories` it was given. A `SortColumns` entry that is null, lacks its required `Column` or
+`SortOrder`, or has a `SortOrder` other than `0` or `1` fails the whole `CreateTable`, `UpdateTable`,
+`CreatePartition`, `UpdatePartition`, `BatchCreatePartition` or `BatchUpdatePartition` with a
+`ValidationException`, before anything is stored.
+
 ## Supported Actions
 
 ### Data Catalog
@@ -43,7 +55,7 @@ records are preserved; optional minimum and maximum values remain absent when om
 | Action | Description |
 |--------|-------------|
 | CreatePartition | Creates a partition for a Data Catalog table. |
-| GetPartitions | Lists partitions stored for a Data Catalog table. |
+| GetPartitions | Lists partitions stored for a Data Catalog table. With a `Segment`, returns that segment's share of them: each partition is in exactly one of `TotalSegments` (1 to 10) segments; a `Segment` member that is not an integer is a `SerializationException`. |
 | BatchDeletePartition | Deletes up to 25 partitions, reporting the ones not found in `Errors`. |
 | CreatePartitionIndex | Registers a partition index on a table. Keys must name partition columns, and a table holds at most 3 indexes. The index reports `CREATING` before `ACTIVE`. |
 | GetPartitionIndexes | Lists a table's partition indexes, each with its keys resolved to name and type. |
@@ -253,6 +265,21 @@ Blueprints are not emulated.
 | GetClassifiers | Lists classifiers, paged by `MaxResults` and `NextToken`. |
 | UpdateClassifier | Partially updates a classifier without changing its type. |
 | DeleteClassifier | Deletes a classifier by name. |
+
+#### Data quality rulesets
+
+| Action | Description |
+|--------|-------------|
+| CreateDataQualityRuleset | Stores a named DQDL ruleset, optionally with a `TargetTable` and tags. |
+| GetDataQualityRuleset | Returns a ruleset with its `CreatedOn` and `LastModifiedOn`. |
+| UpdateDataQualityRuleset | Replaces the `Description` or `Ruleset` the request sets and keeps the rest. |
+| DeleteDataQualityRuleset | Deletes a ruleset and its tags. |
+| ListDataQualityRulesets | Lists rulesets in name order with `RuleCount`, filtered by `Filter` (name, description, target table, created and last modified times) and `Tags`, paged by `MaxResults` (1 to 1000) and `NextToken`. |
+
+Rulesets are stored, not evaluated: there are no recommendation or evaluation runs, so
+`RecommendationRunId` is never set. `RuleCount` is the number of entries in the ruleset's
+top level `Rules = [ ... ]` list, with a composite rule counted once. Rulesets are tagged by
+ARN `arn:aws:glue:<region>:<account>:dataQualityRuleset/<name>`.
 
 ### Schema Registry
 

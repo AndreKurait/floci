@@ -426,6 +426,7 @@ Alongside the classic Query API, Floci implements a subset of the SES v2 REST JS
 | `PUT` | `/v2/email/reputation/entities/{ReputationEntityType}/{ReputationEntityReference}/policy` | `UpdateReputationEntityPolicy` |
 | `PUT` | `/v2/email/reputation/entities/{ReputationEntityType}/{ReputationEntityReference}/customer-managed-status` | `UpdateReputationEntityCustomerManagedStatus` |
 | `POST` | `/v2/email/email-address-insights/` | `GetEmailAddressInsights` |
+| `POST` | `/v2/email/vdm/recommendations` | `ListRecommendations` |
 
 Floci models no leased dedicated IPs: `GetDedicatedIps` is empty and IP-targeted operations return `NotFoundException`, as real AWS does for an account with no leased IPs, with required request members validated first (`BadRequestException`). `PutDedicatedIpPoolScalingAttributes` rejects downgrading a `MANAGED` pool to `STANDARD`, and `PutAccountDedicatedIpWarmupAttributes` stores the flag behind `GetAccount.DedicatedIpAutoWarmupEnabled` (default `true`).
 
@@ -523,9 +524,13 @@ S/MIME certificate associations are stored per region and never used: Floci does
 
 Deviations from AWS: `IsValid` is `HIGH` whenever it is not `LOW` and never `MEDIUM`, although AWS documents a `MEDIUM` overall verdict too (no probed address returned one), every domain that is not reserved is taken to have valid DNS records, Floci keeps no disposable-domain list and detects no random input, and an address with a non-ASCII character in its domain (an internationalized domain name included) or in an unquoted local part is rated `LOW` everywhere, as a send would reject it, while a quoted local part, which a send does not inspect, is rated like any other; AWS's verdicts for such addresses were not probed.
 
+[`ListRecommendations`](https://docs.aws.amazon.com/ses/latest/dg/vdm-advisor.html) is derived on every call from the region's verified domain identities, with the TXT records in Route53 hosted zones standing in for public DNS, as for DKIM detection. As on AWS, a region without Virtual Deliverability Manager enabled answers an empty list rather than an error, and a `TYPE` filter makes an `IMPACT` filter sent with it ignored. Floci raises `DKIM1` when DKIM signing is disabled, `DKIM3` when Easy DKIM signs with a 1024-bit key, `DMARC1` without a TXT record at `_dmarc.<domain>`, and `BIMI1` without one at `default._bimi.<domain>`.
+
+Deviations from AWS: Floci keeps no recommendation history, so every recommendation is `OPEN`, one whose condition clears disappears instead of turning `FIXED`, `CreatedTimestamp` is the identity's creation time and `LastUpdatedTimestamp` the time of the request, and a change shows at once where AWS takes up to six hours. Floci never raises `DKIM2` (DKIM verification failed), as its DKIM status never reaches `FAILED`, nor the codes no probe could tie to a condition (`DMARC5` among them), nor `SPF`, `COMPLAINT`, `BOUNCE`, `FEEDBACK_3P`, `IP_LISTING` or AWS's `ENGAGEMENT` announcements. Which other filter combinations AWS accepts was not probed: Floci applies them all, and validates the request before checking Virtual Deliverability Manager. Also unprobed, and Floci's choice: any TXT record at `_dmarc.<domain>` or `default._bimi.<domain>` clears its finding whatever it holds, a `RESOURCE_ARN` filter matches the identity's ARN exactly, the domain's case included, an SES ARN with no account is not taken for another account's and simply matches nothing, and a `NextToken` is refused (`Failed to deserialize token.`) once the filter differs from the one it came from, as in Floci's other filtered SES v2 lists.
+
 ### Request member types
 
-The operations whose body nests a structure in a structure, or holds a list of structures, check the request body against the SES v2 service model before anything else is validated, as AWS's restJson1 deserializer does: the send operations (`SendEmail`, `SendBulkEmail`, `SendCustomVerificationEmail`), `CreateConfigurationSet`, `UpdateConfigurationSet`, `PutConfigurationSetSuppressionOptions`, `PutConfigurationSetVdmOptions`, `CreateConfigurationSetEventDestination`, `UpdateConfigurationSetEventDestination`, `CreateContactList`, `UpdateContactList`, `CreateContact`, `UpdateContact`, `ListContacts`, `PutAccountSuppressionAttributes`, `PutAccountVdmAttributes`, `BatchGetMetricData`, `CreateImportJob` and `CreateExportJob`. `ListReputationEntities`, `UpdateReputationEntityPolicy`, `UpdateReputationEntityCustomerManagedStatus` and `GetEmailAddressInsights` run the same check although their bodies are flat. In those operations, the first body member of the wrong JSON type, in body order, is a `SerializationException` with AWS's deserializer message:
+The operations whose body has a structure member holding another structure, or holds a list of structures, check the request body against the SES v2 service model before anything else is validated, as AWS's restJson1 deserializer does: the send operations (`SendEmail`, `SendBulkEmail`, `SendCustomVerificationEmail`), `CreateConfigurationSet`, `UpdateConfigurationSet`, `PutConfigurationSetSuppressionOptions`, `PutConfigurationSetVdmOptions`, `CreateConfigurationSetEventDestination`, `UpdateConfigurationSetEventDestination`, `CreateContactList`, `UpdateContactList`, `CreateContact`, `UpdateContact`, `ListContacts`, `PutAccountSuppressionAttributes`, `PutAccountVdmAttributes`, `BatchGetMetricData`, `CreateImportJob` and `CreateExportJob`. `ListReputationEntities`, `UpdateReputationEntityPolicy`, `UpdateReputationEntityCustomerManagedStatus`, `GetEmailAddressInsights`, `ListRecommendations` and `PutEmailIdentityDkimSigningAttributes` run the same check although their bodies are flat (`SigningAttributes` holds only scalars). In those operations, the first body member of the wrong JSON type, in body order, is a `SerializationException` with AWS's deserializer message:
 
 | Member type | Value sent | Message |
 |---|---|---|
@@ -542,6 +547,24 @@ The other operations check their members one at a time, and some of them still a
 An empty body is read as an object without members. A body that is not a JSON object is a `SerializationException`, before any member is read: `Start of list found where not expected` for an array, and no message for a string, a number, `null`, a whitespace-only body, malformed JSON or anything but whitespace after the object (`{} x`, `{}{}`). `CreateContactList`, `CreateContact`, `CreateDedicatedIpPool`, `CreateEmailIdentityPolicy`, `UpdateEmailIdentityPolicy`, `PutEmailIdentityMailFromAttributes`, `CreateImportJob`, `PutSuppressedDestination`, `TestRenderEmailTemplate` and `TagResource` answer an empty body with `BadRequestException` `Request body is required.` instead of reporting the missing members.
 
 The body shapes are vendored in `src/main/resources/aws/sesv2-request-shapes.json`, generated by `tools/aws/regen_sesv2_shapes.py` from the botocore release pinned in `tools/aws/requirements.txt`.
+
+### CloudFormation receipt rules
+
+`AWS::SES::ReceiptRule` provisions a rule in an existing SES receipt rule set. Create the rule set
+through the SES API first. `Ref` and `Fn::GetAtt RuleName` return the stored rule's name. A missing
+`Rule.Name` gets a generated name that remains stable across updates.
+
+Rule contents and `After` update in place. Content-only updates preserve the rule's position;
+changing the resolved `After` value repositions it, and removing `After` moves it to the front.
+Rules stored before resolved ordering metadata was recorded reapply the current `After` value
+once on their next update. Subsequent content-only updates preserve their position.
+Changing the rule name or `RuleSetName` creates a
+replacement; the old rule is deleted after the stack update commits unless `UpdateReplacePolicy`
+is `Retain`. Failed updates restore the previous contents and ordering, and stack deletion removes
+the managed rule. Actions use the same local-target validation as the SES API.
+
+This is management-plane support: stored rules do not deliver or process inbound mail.
+See the [AWS receipt-rule resource reference](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-ses-receiptrule.html).
 
 ### IAM enforcement
 

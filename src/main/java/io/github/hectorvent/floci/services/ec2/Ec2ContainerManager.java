@@ -70,6 +70,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiPredicate;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
@@ -96,6 +97,8 @@ public class Ec2ContainerManager {
     private static final int LAUNCH_CORE_THREADS = 4;
     private static final int LAUNCH_MAX_THREADS = 8;
     private static final int LAUNCH_QUEUE_CAPACITY = 64;
+    // ponytail: a fixed cap on concurrent post-start IMDS setups; a start beyond it skips the setup.
+    private static final int METADATA_SETUP_CONCURRENCY = 16;
     private static final long USER_DATA_EXECUTION_TIMEOUT_MINUTES = 30;
     private static final Pattern ENVIRONMENT_KEY = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
     private static final Pattern PROCESS_LIMIT = Pattern.compile("([a-z][a-z0-9]*)=(-1|[0-9]+)(?::(-1|[0-9]+))?");
@@ -173,6 +176,7 @@ public class Ec2ContainerManager {
     private final Ec2MetadataNamespace metadataNamespaces;
     private SecurityGroupFirewallManager firewallManager;
     private final ExecutorService executor;
+    private final Semaphore metadataSetupSlots = new Semaphore(METADATA_SETUP_CONCURRENCY);
     private final Map<String, CompletableFuture<Void>> lifecycleOperations = new ConcurrentHashMap<>();
     private final Map<String, String> networkHelpers = new ConcurrentHashMap<>();
     private final Duration userDataExecutionTimeout;
@@ -534,19 +538,22 @@ public class Ec2ContainerManager {
                     return;
                 }
 
-                if (!markRunning(instance)) {
-                    failLaunch(instance, leasedPrivateIp);
-                    return;
-                }
-                if (postLaunch != null) {
-                    postLaunch.run();
-                }
 
                 // Set public-facing addresses only for instances due one, by the rule mock instances
                 // follow too, or holding an Elastic IP their interface carries, which RunInstances
                 // recorded. Private-subnet instances have no public IP/DNS, matching real EC2.
                 if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, false)) {
                     exposeReachablePublicAddress(instance);
+                }
+
+                // Published before the state flips, so a poller that sees running never sees it without the address.
+                if (!markRunning(instance)) {
+                    failLaunch(instance, leasedPrivateIp);
+                    return;
+                }
+
+                if (postLaunch != null) {
+                    postLaunch.run();
                 }
 
                 LOG.infov("EC2 instance {0} running in container {1} (SSH host port {2})",
@@ -566,7 +573,13 @@ public class Ec2ContainerManager {
                 // key-pair association) - starting it only when a key was present meant
                 // run-instances without --key-name produced a "connection refused" instead of AWS's
                 // actual behavior: a running daemon with simply nothing to authenticate against.
-                startSshd(containerId, instanceId);
+                // A systemd guest is the exception: its init starts sshd from the image's own unit,
+                // as it does on EC2. A second sshd launched here raced that unit for port 22, and
+                // whichever lost left either the unit failed or a daemon outside systemd that a
+                // later `systemctl restart ssh` could not replace.
+                if (!image.systemd()) {
+                    startSshd(containerId, instanceId);
+                }
 
                 // Execute UserData
                 String userData = instance.getUserData();
@@ -893,6 +906,9 @@ public class Ec2ContainerManager {
         String containerIp;
         boolean alreadyCleaned;
         synchronized (instance) {
+            // A launch cancelled after its address was published must not keep it.
+            instance.setPublicIpAddress(null);
+            instance.setPublicDnsName(null);
             alreadyCleaned = isLaunchCancelledState(instance)
                     && instance.getDockerContainerId() == null
                     && instance.getSshHostPort() <= 0
@@ -1161,6 +1177,7 @@ public class Ec2ContainerManager {
         InstanceState pending = InstanceState.pending();
         instance.setState(pending);
         submitLifecycleOperation(containerId, () -> {
+            boolean setUpMetadataEndpoint = false;
             try {
                 if (beforeStart != null) {
                     beforeStart.run();
@@ -1213,6 +1230,7 @@ public class Ec2ContainerManager {
                         refreshImdsSourceRegistration(instance, containerId, containerIp);
                         refreshMetadataAddresses(instance, containerId);
                     }
+                    setUpMetadataEndpoint = namespace == null;
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -1223,7 +1241,8 @@ public class Ec2ContainerManager {
                 instance.compareAndSetState(pending, InstanceState.stopped());
                 return;
             }
-            if (!instance.compareAndSetState(pending, InstanceState.running())) {
+            InstanceState running = InstanceState.running();
+            if (!instance.compareAndSetState(pending, running)) {
                 return;
             }
             if (postStart != null) {
@@ -1234,7 +1253,46 @@ public class Ec2ContainerManager {
                             instance.getInstanceId(), e.getMessage());
                 }
             }
+            if (setUpMetadataEndpoint) {
+                setUpMetadataEndpointWhileRunning(instance, containerId, running);
+            }
         });
+    }
+
+    /**
+     * Best effort with its own bounded commands, as at launch, and off the container's lifecycle
+     * queue: a slow setup holds neither the instance pending nor a stop queued behind this start.
+     * It goes ahead only while {@code running} is still the instance's state, so a stop, terminate
+     * or later start makes it stand down; an exec against a container already stopped just fails.
+     *
+     * <p>Not on {@link #executor}: the start runs on one of its workers, and its backpressure
+     * blocks a submitter while the queue is full, so with every worker submitting nothing would
+     * drain it. A setup that finds no free slot is skipped and logged rather than waited for.
+     */
+    private void setUpMetadataEndpointWhileRunning(Instance instance, String containerId, InstanceState running) {
+        String instanceId = instance.getInstanceId();
+        if (!metadataSetupSlots.tryAcquire()) {
+            LOG.warnv("Skipped link-local IMDS setup for EC2 instance {0}: {1} setups already running",
+                    instanceId, METADATA_SETUP_CONCURRENCY);
+            return;
+        }
+        BooleanSupplier stillRunning = () -> instance.getState() == running;
+        try {
+            Thread.ofVirtual().name("ec2-imds-setup-" + instanceId).start(() -> {
+                try {
+                    configureLinkLocalMetadataEndpoint(containerId, instance, dockerHostResolver.resolve(),
+                            config.services().ec2().imdsPort(), stillRunning);
+                } catch (RuntimeException e) {
+                    LOG.warnv("Could not configure link-local IMDS endpoint for EC2 instance {0}: {1}",
+                            instanceId, e.getMessage());
+                } finally {
+                    metadataSetupSlots.release();
+                }
+            });
+        } catch (RuntimeException e) {
+            metadataSetupSlots.release();
+            LOG.warnv("Could not schedule link-local IMDS setup for EC2 instance {0}: {1}", instanceId, e.getMessage());
+        }
     }
 
     boolean isContainerRunning(String containerId) {
@@ -1941,11 +1999,22 @@ public class Ec2ContainerManager {
     }
 
     private void configureLinkLocalMetadataEndpoint(String containerId, Instance instance, String flociHost, int imdsPort) {
+        configureLinkLocalMetadataEndpoint(containerId, instance, flociHost, imdsPort, () -> true);
+    }
+
+    private void configureLinkLocalMetadataEndpoint(String containerId, Instance instance, String flociHost, int imdsPort,
+                                                    BooleanSupplier stillWanted) {
+        if (!stillWanted.getAsBoolean()) {
+            return;
+        }
         ContainerExec.Result install = execInContainerForResult(containerId, metadataProxyInstallCommand(), 180);
         if (install.exitCode() != 0) {
             throw new IllegalStateException("Cannot prepare EC2 metadata dependencies: " + install.summary());
         }
 
+        if (!stillWanted.getAsBoolean()) {
+            return;
+        }
         boolean enabled = instance.getMetadataOptions() == null
                 || !"disabled".equals(instance.getMetadataOptions().getHttpEndpoint());
         ContainerExec.Result start = execInContainerForResult(containerId,

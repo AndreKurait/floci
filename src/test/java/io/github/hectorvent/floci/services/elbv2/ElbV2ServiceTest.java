@@ -1028,6 +1028,30 @@ class ElbV2ServiceTest {
     }
 
     @Test
+    void modifyListenerAttributesValidatesTcpIdleTimeoutRange() {
+        String lb = service.createLoadBalancer(REGION, "nlb-attr", "internal", "network", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        Listener listener = service.createListener(REGION, lb, "TCP", 9876, null,
+                List.of(), List.of(), List.of(), Map.of());
+        String listenerArn = listener.getListenerArn();
+
+        AwsException tooLow = assertThrows(AwsException.class, () ->
+                service.modifyListenerAttributes(REGION, listenerArn, Map.of("tcp.idle_timeout.seconds", "1")));
+        assertEquals("InvalidConfigurationRequest", tooLow.getErrorCode());
+
+        AwsException tooHigh = assertThrows(AwsException.class, () ->
+                service.modifyListenerAttributes(REGION, listenerArn, Map.of("tcp.idle_timeout.seconds", "6001")));
+        assertEquals("InvalidConfigurationRequest", tooHigh.getErrorCode());
+
+        AwsException nonNumeric = assertThrows(AwsException.class, () ->
+                service.modifyListenerAttributes(REGION, listenerArn, Map.of("tcp.idle_timeout.seconds", "abc")));
+        assertEquals("InvalidConfigurationRequest", nonNumeric.getErrorCode());
+
+        service.modifyListenerAttributes(REGION, listenerArn, Map.of("tcp.idle_timeout.seconds", "120"));
+        assertEquals("120", service.describeListenerAttributes(REGION, listenerArn).get("tcp.idle_timeout.seconds"));
+    }
+
+    @Test
     void deleteListenerIsIgnoredForRegionWithNoListeners() {
         String emptyRegion = "eu-central-1";
 

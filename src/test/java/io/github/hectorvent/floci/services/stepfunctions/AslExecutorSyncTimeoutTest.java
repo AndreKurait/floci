@@ -232,6 +232,7 @@ class AslExecutorSyncTimeoutTest {
     }
 
     private void assertEndedTimedOut(Execution execution) {
+        awaitTerminalEvent();
         assertEquals("TIMED_OUT", execution.getStatus());
         assertEquals("ExecutionTimedOut", history.getLast().getType());
     }

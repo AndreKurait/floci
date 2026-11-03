@@ -4,13 +4,18 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.AccessKey;
+import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.github.hectorvent.floci.testing.SignedIamEnforcementProfile;
 import io.github.hectorvent.floci.testing.SignedIamUsers;
+import io.github.hectorvent.floci.testing.SqsTestQueue;
+import io.github.hectorvent.floci.testutil.AwsRequestSigner;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import io.restassured.response.Response;
 import jakarta.inject.Inject;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -23,17 +28,19 @@ import software.amazon.awssdk.services.iam.IamClient;
 import software.amazon.awssdk.services.sfn.SfnClient;
 import software.amazon.awssdk.services.sfn.model.CreateStateMachineResponse;
 import software.amazon.awssdk.services.sfn.model.SfnException;
-import software.amazon.awssdk.services.sqs.SqsClient;
-import software.amazon.awssdk.services.sqs.model.Message;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
+import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 @QuarkusTest
@@ -47,6 +54,9 @@ class StepFunctionsCallbackIamIntegrationTest {
     @Inject
     IamService iam;
 
+    @Inject
+    SqsService sqsService;
+
     @RegisterExtension
     final PartitionCleanup cleanup = new PartitionCleanup();
 
@@ -54,33 +64,28 @@ class StepFunctionsCallbackIamIntegrationTest {
     @CsvSource({
             "integration,exact,true", "integration,wrong,false", "integration,wildcard,true",
             "integration,deny-exact,false", "integration,deny-wrong,true",
-            "integration,deny-all,false", "integration,execution,false",
+            "integration,deny-all,false", "integration,deny-other-type,true", "integration,execution,false",
             "integration-version,exact,true", "integration-version,wrong,false",
             "integration-version,deny-exact,false",
             "integration-version,qualified,false", "integration-version,deny-qualified,true",
             "activity,exact,true", "activity,wrong,false", "activity,wildcard,true",
             "activity,deny-exact,false", "activity,deny-wrong,true",
-            "activity,deny-all,false", "activity,execution,false",
+            "activity,deny-all,false", "activity,deny-other-type,true", "activity,execution,false",
             "activity,state-machine,false"
     })
     void signedCallbacksAuthorizeTheTokensResource(String mode, String policy, boolean allowed) throws Exception {
         SfnClient admin = client("test", "test");
-        SqsClient sqs = SqsClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
-                .httpClientBuilder(UrlConnectionHttpClient.builder())
-                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
-                .build();
-        cleanup.register(sqs::close);
         String name = "callback-iam-" + UUID.randomUUID();
         String role = executionRole(name);
-        String queue = sqs.createQueue(request -> request.queueName(name)).queueUrl();
-        cleanup.register(() -> sqs.deleteQueue(request -> request.queueUrl(queue)));
+        SqsTestQueue queue = SqsTestQueue.create(sqsService, "000000000000", "us-east-1", "callback-iam-");
+        cleanup.register(queue::delete);
         String activity = admin.createActivity(request -> request.name(name)).activityArn();
         cleanup.register(() -> admin.deleteActivity(request -> request.activityArn(activity)));
         boolean isActivity = "activity".equals(mode);
         Map<String, Object> task = isActivity
                 ? Map.of("Type", "Task", "Resource", activity, "TimeoutSeconds", 60, "End", true)
                 : Map.of("Type", "Task", "Resource", "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
-                        "Parameters", Map.of("QueueUrl", queue, "MessageBody", Map.of("token.$", "$$.Task.Token")),
+                        "Parameters", Map.of("QueueUrl", queue.url(), "MessageBody", Map.of("token.$", "$$.Task.Token")),
                         "TimeoutSeconds", 60, "End", true);
         String definition = MAPPER.writeValueAsString(Map.of("StartAt", "Callback", "States", Map.of("Callback", task)));
         boolean versioned = "integration-version".equals(mode);
@@ -95,11 +100,13 @@ class StepFunctionsCallbackIamIntegrationTest {
             case "wrong", "deny-wrong" -> resource + "-other";
             case "execution" -> machine.replace(":stateMachine:", ":execution:") + ":*";
             case "state-machine" -> machine;
+            case "deny-other-type" -> (isActivity ? machine : activity).replace(name, "*");
             case "qualified", "deny-qualified" -> startMachine;
             default -> resource;
         };
         List<Map<String, Object>> statements = policy.startsWith("deny-")
-                ? List.of(statement("Allow", "*"), statement("Deny", policyResource))
+                ? List.of(statement("Allow", "deny-other-type".equals(policy) ? resource : "*"),
+                        statement("Deny", policyResource))
                 : List.of(statement("Allow", policyResource));
         SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "callback-", "callback",
                 MAPPER.writeValueAsString(Map.of("Version", "2012-10-17", "Statement", statements)));
@@ -123,7 +130,7 @@ class StepFunctionsCallbackIamIntegrationTest {
             });
             String token = isActivity
                     ? admin.getActivityTask(request -> request.activityArn(activity)).taskToken()
-                    : queueToken(sqs, queue);
+                    : queue.awaitJson(Duration.ofSeconds(10)).path("token").asText();
             if (allowed) {
                 callback(actor, action, token);
                 if (!"heartbeat".equals(action)) {
@@ -140,6 +147,54 @@ class StepFunctionsCallbackIamIntegrationTest {
             }
             if ("RUNNING".equals(admin.describeExecution(request -> request.executionArn(execution)).statusAsString())) {
                 admin.stopExecution(request -> request.executionArn(execution));
+            }
+        }
+    }
+
+    @Test
+    void signedNamedResourcesDoNotUseTheCallbackTokenSelector() throws Exception {
+        SfnClient admin = client("test", "test");
+        String name = "named-" + UUID.randomUUID();
+        String role = executionRole(name);
+        String prefix = "arn:aws:states:us-east-1:000000000000:";
+        List<Map<String, Object>> statements = List.of(
+                Map.of("Effect", "Allow", "Action", "states:*", "Resource",
+                        List.of(prefix + "activity:" + name, prefix + "stateMachine:" + name)),
+                Map.of("Effect", "Allow", "Action", "iam:PassRole", "Resource", role));
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "named-", "named",
+                MAPPER.writeValueAsString(Map.of("Version", "2012-10-17", "Statement", statements)))) {
+            SfnClient actor = client(user.accessKeyId(), user.secretAccessKey());
+            String activity = actor.createActivity(request -> request.name(name)).activityArn();
+            cleanup.register(() -> admin.deleteActivity(request -> request.activityArn(activity)));
+            assertEquals(name, actor.describeActivity(request -> request.activityArn(activity)).name());
+            String definition = "{\"StartAt\":\"Done\",\"States\":{\"Done\":{\"Type\":\"Succeed\"}}}";
+            String machine = actor.createStateMachine(request -> request.name(name).roleArn(role)
+                    .definition(definition)).stateMachineArn();
+            cleanup.register(() -> admin.deleteStateMachine(request -> request.stateMachineArn(machine)));
+            assertEquals(name, actor.describeStateMachine(request -> request.stateMachineArn(machine)).name());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{}", "{\"taskToken\":null}", "{\"taskToken\":\"\"}",
+            "{\"taskToken\":\" \"}", "{\"taskToken\":42}", "{\"taskToken\":true}",
+            "{\"taskToken\":{}}", "{\"taskToken\":[]}"})
+    void invalidOperandsKeepTokenErrorPrecedence(String body) throws Exception {
+        for (String mode : List.of("none", "deny", "allow")) {
+            Map<String, Object> policy = Map.of("Effect", "deny".equals(mode) ? "Deny" : "Allow", "Resource", "*", "Action",
+                    "none".equals(mode) ? "states:DescribeExecution" : "states:*");
+            try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "operand-", "callback",
+                    MAPPER.writeValueAsString(Map.of("Version", "2012-10-17", "Statement", List.of(policy))))) {
+                for (String operation : List.of("SendTaskHeartbeat", "SendTaskSuccess", "SendTaskFailure")) {
+                    Response response = given().filter(AwsRequestSigner.signedAs(
+                                    user.accessKeyId(), user.secretAccessKey(), "states"))
+                            .contentType("application/x-amz-json-1.0")
+                            .header("X-Amz-Target", "AWSStepFunctions." + operation)
+                            .body(body.getBytes(StandardCharsets.UTF_8)).post(endpoint);
+                    assertEquals(400, response.statusCode(), operation + ": " + response.asString());
+                    assertTrue(response.jsonPath().getString("__type").endsWith("InvalidToken"),
+                            operation + ": " + response.asString());
+                }
             }
         }
     }
@@ -231,19 +286,6 @@ class StepFunctionsCallbackIamIntegrationTest {
             case "failure" -> actor.sendTaskFailure(request -> request.taskToken(token).error("ExpectedFailure"));
             default -> throw new IllegalArgumentException(action);
         }
-    }
-
-    private static String queueToken(SqsClient sqs, String queue) throws Exception {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (System.nanoTime() < deadline) {
-            List<Message> messages = sqs.receiveMessage(request -> request.queueUrl(queue).waitTimeSeconds(1)).messages();
-            if (!messages.isEmpty()) {
-                Message message = messages.getFirst();
-                sqs.deleteMessage(request -> request.queueUrl(queue).receiptHandle(message.receiptHandle()));
-                return MAPPER.readTree(message.body()).path("token").asText();
-            }
-        }
-        return fail("integration did not send its task token");
     }
 
     private static String terminal(SfnClient admin, String execution) throws InterruptedException {

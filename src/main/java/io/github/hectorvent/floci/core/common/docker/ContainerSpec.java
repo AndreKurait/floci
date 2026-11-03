@@ -50,6 +50,8 @@ import java.util.regex.Pattern;
  *        images whose command does not handle SIGTERM itself
  * @param linuxOptions Capabilities, devices, shared memory, tmpfs and swap
  *        ({@link LinuxOptions#NONE} = daemon defaults)
+ * @param javaTrustStore Whether, with TLS on, the container's JVMs trust Floci's CA: the CA bundle's Java trust
+ *        store goes in beside the bundle, and {@code JAVA_TOOL_OPTIONS} points at it
  */
 public record ContainerSpec(
         String image,
@@ -82,8 +84,46 @@ public record ContainerSpec(
         Map<Integer, String> portBindingHostIps,
         Map<String, ResourceLimit> ulimits,
         boolean init,
-        LinuxOptions linuxOptions
+        LinuxOptions linuxOptions,
+        boolean javaTrustStore
 ) {
+    /** Keeps existing callers on the image's Java trust store. */
+    public ContainerSpec(
+        String image,
+        String name,
+        List<String> env,
+        List<String> cmd,
+        List<String> entrypoint,
+        Long memoryBytes,
+        Map<Integer, Integer> portBindings,
+        List<Integer> loopbackPortBindings,
+        List<Integer> exposedPorts,
+        String networkMode,
+        List<Mount> mounts,
+        List<Bind> binds,
+        List<VolumesFrom> volumesFrom,
+        List<String> extraHosts,
+        Map<String, String> labels,
+        LogConfig logConfig,
+        boolean privileged,
+        String cgroupnsMode,
+        List<String> dnsServers,
+        String workingDir,
+        String user,
+        List<String> groupAdd,
+        List<DeviceRequest> deviceRequests,
+        Long nanoCpus,
+        Integer cpuShares,
+        boolean readonlyRootfs,
+        List<String> linkLocalIps,
+        Map<Integer, String> portBindingHostIps,
+        Map<String, ResourceLimit> ulimits,
+        boolean init,
+        LinuxOptions linuxOptions
+    ) {
+        this(image, name, env, cmd, entrypoint, memoryBytes, portBindings, loopbackPortBindings, exposedPorts, networkMode, mounts, binds, volumesFrom, extraHosts, labels, logConfig, privileged, cgroupnsMode, dnsServers, workingDir, user, groupAdd, deviceRequests, nanoCpus, cpuShares, readonlyRootfs, linkLocalIps, portBindingHostIps, ulimits, init, linuxOptions, false);
+    }
+
     private static final Pattern LINK_LOCAL_IPV4 = Pattern.compile("^169\\.254\\.(\\d{1,3})\\.(\\d{1,3})$");
     private static final Set<String> NETWORKS_WITHOUT_ENDPOINT_IPAM = Set.of("bridge", "default", "host", "none");
     private static final Set<String> NAMESPACE_NETWORK_MODES = Set.of("host", "none");

@@ -104,7 +104,6 @@ public class Deployment {
     public String getCompletedAt() { return completedAt; }
     public void setCompletedAt(String completedAt) { this.completedAt = completedAt; }
 
-
     public Float getPercentageComplete() { return percentageComplete; }
     public void setPercentageComplete(Float percentageComplete) { this.percentageComplete = percentageComplete; }
 }

@@ -180,7 +180,7 @@ class ManageConnectionsIamTest {
         try (Response result = switch (method) {
             case "POST" -> controller.handlePost(headers, uri, "api", "prod", "@connections/id", "hello".getBytes(StandardCharsets.UTF_8));
             case "GET" -> controller.handleGet(headers, uri, "api", "prod", "@connections/id");
-            case "DELETE" -> controller.handleDelete(headers, uri, "api", "prod", "@connections/id");
+            case "DELETE" -> controller.handleDelete(headers, uri, "api", "prod", "@connections/id", new byte[0]);
             default -> throw new AssertionError(method);
         }) {
             return result.getStatus();

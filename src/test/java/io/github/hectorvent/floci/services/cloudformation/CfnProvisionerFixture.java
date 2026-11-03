@@ -110,6 +110,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.Scheduler
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SecretTargetAttachmentCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SecretsManagerCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SesCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.SesReceiptRuleCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SnsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SqsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmCfnProvisioner;
@@ -164,6 +165,7 @@ import io.github.hectorvent.floci.services.s3vectors.S3VectorsService;
 import io.github.hectorvent.floci.services.scheduler.SchedulerService;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.ses.SesIdentityService;
+import io.github.hectorvent.floci.services.ses.SesReceiptRuleService;
 import io.github.hectorvent.floci.services.ses.SesService;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
@@ -207,6 +209,7 @@ final class CfnProvisionerFixture {
         private S3VectorsService s3VectorsService;
         private SnsService snsService;
         private SesService sesService;
+        private SesReceiptRuleService sesReceiptRuleService;
         private SesIdentityService sesIdentityService;
         private DynamoDbService dynamoDbService;
         private LambdaService lambdaService;
@@ -336,6 +339,9 @@ final class CfnProvisionerFixture {
             if (sesService != null && sesIdentityService != null) {
                 discovered.add(new SesCfnProvisioner(sesService, sesIdentityService));
             }
+            if (sesReceiptRuleService != null && sesIdentityService != null) {
+                discovered.add(new SesReceiptRuleCfnProvisioner(sesReceiptRuleService, sesIdentityService));
+            }
             if (dynamoDbService != null) {
                 NativeDynamoDbBackend backend = new NativeDynamoDbBackend(null, null, dynamoDbService, null, null, objectMapper);
                 discovered.add(new DynamoDbCfnProvisioner(new DynamoDbFacade(backend, backend,
@@ -427,6 +433,9 @@ final class CfnProvisionerFixture {
             if (appSyncService != null) {
                 discovered.add(new AppSyncCfnProvisioner(appSyncService));
             }
+            if (appConfigService != null) {
+                discovered.add(new AppConfigCfnProvisioner(appConfigService));
+            }
             if (lambdaService != null) {
                 discovered.add(new LambdaAddressingCfnProvisioner(lambdaService));
                 discovered.add(new LambdaEventInvokeConfigCfnProvisioner(lambdaService));
@@ -498,6 +507,9 @@ final class CfnProvisionerFixture {
                 discovered.add(new Ec2LaunchTemplateCfnProvisioner(ec2Service));
                 discovered.add(new Ec2NetworkCfnProvisioner(ec2Service));
             }
+            if (ec2Service != null && ssmService != null) {
+                discovered.add(new Ec2KeyPairCfnProvisioner(ec2Service, ssmService));
+            }
             if (route53Service != null) {
                 discovered.add(new Route53CfnProvisioner(route53Service));
             }
@@ -562,6 +574,11 @@ final class CfnProvisionerFixture {
             return this;
         }
 
+        public Builder sesReceiptRules(SesReceiptRuleService v) {
+            this.sesReceiptRuleService = v;
+            return this;
+        }
+
         public Builder dynamoDb(DynamoDbService v) {
             this.dynamoDbService = v;
             return this;
@@ -577,6 +594,11 @@ final class CfnProvisionerFixture {
             return this;
         }
 
+        public Builder appConfig(AppConfigService v) {
+            this.appConfigService = v;
+            return this;
+        }
+
         public Builder iam(IamService v) {
             this.iamService = v;
             return this;
@@ -584,11 +606,6 @@ final class CfnProvisionerFixture {
 
         public Builder ssm(SsmService v) {
             this.ssmService = v;
-            return this;
-        }
-
-        public Builder appConfig(AppConfigService value) {
-            this.appConfigService = value;
             return this;
         }
 

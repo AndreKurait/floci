@@ -32,8 +32,10 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `AddPermission` | Add a resource-policy statement |
 | `GetPolicy` | Get the function resource policy |
 | `RemovePermission` | Remove a resource-policy statement |
-| `GetFunctionCodeSigningConfig` | Return code-signing config (always empty) |
-| `ListFunctionsByCodeSigningConfig` | List functions carrying a config. Always empty, since nothing can attach one |
+| `GetFunctionCodeSigningConfig` | Return the code-signing config attached to `$LATEST` (or an empty ARN) |
+| `PutFunctionCodeSigningConfig` | Attach or replace a code-signing config on `$LATEST` |
+| `DeleteFunctionCodeSigningConfig` | Detach the code-signing config from `$LATEST` |
+| `ListFunctionsByCodeSigningConfig` | List functions carrying a config, with marker pagination |
 | `CreateCodeSigningConfig` | Create a code signing configuration |
 | `GetCodeSigningConfig` | Read a code signing configuration |
 | `UpdateCodeSigningConfig` | Update the members the request names |
@@ -254,6 +256,13 @@ Not emulated yet:
 - EventBridge status-change events, the X-Ray `TraceHeader`, and a dead-letter queue or
   destinations for durable executions.
 - The per-execution limits of 3,000 operations and 100 MB of persisted payload.
+
+## Code signing configuration pagination
+
+`ListCodeSigningConfigs` accepts `MaxItems` from 1 to 10,000 and returns `NextMarker`
+when more configurations remain. Pass that value as `Marker` to continue listing.
+Omitting `MaxItems` returns up to 10,000 configurations. Markers are signed and scoped
+to the account and region; the final page omits `NextMarker`.
 
 ## Hot-Reloading via Reactive S3 Sync
 
@@ -592,13 +601,17 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 
 - Layer permissions (`AddLayerVersionPermission`, `RemoveLayerVersionPermission`, `GetLayerVersionPolicy`)
 - `InvokeWithResponseStream`
-- Code signing enforcement. A configuration is created, read, updated, deleted and listed, and
-  nothing verifies a signature against it, so it never gates a deployment. Attaching one to a
-  function is not wired either: there is no `PutFunctionCodeSigningConfig`, so
-  `GetFunctionCodeSigningConfig` still reports an empty ARN and `ListFunctionsByCodeSigningConfig`
-  always reports no functions. An unknown configuration is `ResourceNotFoundException`, and a
-  malformed ARN or an out-of-range `MaxItems` is rejected with `InvalidParameterValueException`
-  first
+
+Code signing enforcement is not emulated: an attached configuration never gates a deployment.
+The attachment lifecycle is supported for `$LATEST`: `PutFunctionCodeSigningConfig` attaches or
+replaces a configuration, `GetFunctionCodeSigningConfig` reads it,
+`DeleteFunctionCodeSigningConfig` detaches it, and `ListFunctionsByCodeSigningConfig` returns
+attached functions with marker pagination. `PutFunctionCodeSigningConfig` and the
+`CodeSigningConfigArn` supplied to `CreateFunction` return
+`CodeSigningConfigNotFoundException` when the named configuration does not exist.
+Configuration resource reads and `ListFunctionsByCodeSigningConfig` return
+`ResourceNotFoundException` for an unknown configuration. A malformed ARN or out-of-range
+`MaxItems` is rejected with `InvalidParameterValueException` first.
 
 ## Configuration
 
@@ -994,6 +1007,11 @@ exist, and `AWS_LAMBDA_LOG_GROUP_NAME` names that group. Once a group is named, 
 functions can share, each stream's name carries the function's name, as on AWS:
 `2026/10/16/my-fn[$LATEST]<id>` rather than the default group's `2026/10/16/[$LATEST]<id>`.
 
+The execution environment gets `AWS_LAMBDA_LOG_FORMAT` from `LogFormat` and, under `LogFormat=JSON`,
+`AWS_LAMBDA_LOG_LEVEL` from `ApplicationLogLevel` (`INFO` when unset, the level the API reports).
+The runtime interface clients read both: a Python function writes each record as a JSON object,
+`extra` keys included, and drops records under the level.
+
 `DurableConfig` requires `ExecutionTimeout` on create. A durable function created without
 a `Timeout` gets `min(ExecutionTimeout, 900)`. It always logs in JSON format, and
 `LogFormat: Text` is rejected. On update the members are merged, and a function created
@@ -1275,6 +1293,32 @@ use `ParallelizationFactor` instead, which is a separate field.
     at a time regardless). Real parallel dispatch capped by
     `MaximumConcurrency` is tracked as a follow-up.
 
+### ParallelizationFactor (Kinesis and DynamoDB Streams only)
+
+`CreateEventSourceMapping` and `UpdateEventSourceMapping` accept a
+`ParallelizationFactor` integer between 1 and 10 on Kinesis and DynamoDB
+Streams event sources. `GetEventSourceMapping`, `ListEventSourceMappings`
+and the create, update and delete responses return it on every stream
+mapping, `1` when none was set, as AWS does. SQS mappings omit it.
+
+```bash
+aws lambda create-event-source-mapping \
+  --function-name my-function \
+  --event-source-arn $STREAM_ARN \
+  --starting-position LATEST \
+  --parallelization-factor 4 \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+Values outside 1 to 10 are rejected with `InvalidParameterValueException`,
+and so is `ParallelizationFactor` on any other event source.
+
+!!! note "Enforcement status"
+    The configured `ParallelizationFactor` is persisted and returned on the
+    wire, but the Kinesis and DynamoDB Streams pollers still process one
+    batch per shard at a time. Concurrent batches per shard are tracked as
+    a follow-up.
+
 ### FilterCriteria
 
 `CreateEventSourceMapping` and `UpdateEventSourceMapping` accept a
@@ -1314,28 +1358,26 @@ of `{}` or with an empty `Filters` array clears any existing filters.
 
 !!! note "Supported operators"
     Filtering reuses Floci's shared EventBridge matcher (the same one EventBridge
-    Pipes uses). It supports exact match on a string, number or `null`, plus
-    `prefix`, `suffix`, `equals-ignore-case`, `exists`, `anything-but` (a string,
-    a non-empty array of strings and numbers, or a nested `prefix`), and `numeric`
-    comparison/value pairs using `=`, `>`, `>=`, `<`, `<=`. Patterns using only
-    these behave as on AWS.
+    Pipes and EventBridge V2 use). It supports exact match on a string, number,
+    boolean or `null`, plus `prefix`, `suffix`, `equals-ignore-case`, `exists`,
+    `anything-but` (a string, a non-empty array of strings and numbers, or a nested
+    `prefix`), `numeric` comparison/value pairs using `=`, `>`, `>=`, `<`, `<=`,
+    and `$or`. Patterns using only these behave as on AWS. As on AWS, `[null]`
+    matches a field whose value is `null`, not a missing one (use
+    `[{"exists": false}]` for that), `anything-but` does not match a missing
+    field, and a record field that is an array matches when any element does.
 
     A pattern is validated at `CreateEventSourceMapping` and
     `UpdateEventSourceMapping` and rejected with `InvalidParameterValueException`
     when the matcher could not satisfy it: an unknown operator, an operator AWS
     documents that Floci does not implement (`cidr`, `wildcard`), more than one
-    operator in a single match element, a boolean literal, a wrong operand type,
+    operator in a single match element, a wrong operand type,
     or a malformed `numeric` sequence such as an odd-length array or a
     non-numeric value. This is stricter than AWS, which accepts several of these.
     The trade is deliberate: the pollers checkpoint past (Kinesis, DynamoDB) or
     delete (SQS) any record a pattern fails to match, so a pattern that cannot
     match destroys records rather than being inert, and create time is the last
     point at which the caller can still act on it.
-
-    One matcher deviation remains and is not a validation error, because it
-    depends on the record rather than the pattern: event-value array intersection,
-    where AWS matches when the record's own field is itself an array and any
-    element satisfies the pattern, and Floci does not.
 
 !!! warning "SAM event sources"
     CloudFormation `AWS::Lambda::EventSourceMapping` resources forward

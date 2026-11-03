@@ -122,7 +122,7 @@ class CloudFormationServiceRestoreIntegrationTest {
         List<Future<?>> runningOperations = fillExecutor();
         try {
             AwsException rejected = assertThrows(AwsException.class,
-                    () -> service.deleteStack(targetStack, REGION));
+                    () -> service.deleteStack(targetStack, List.of(), REGION));
             assertEquals("LimitExceededException", rejected.getErrorCode());
             assertEquals("CREATE_COMPLETE", service.describeStacks(targetStack, REGION).getFirst().getStatus());
         } finally {

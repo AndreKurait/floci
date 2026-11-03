@@ -330,6 +330,31 @@ class CloudFrontServiceTest {
     }
 
     @Test
+    void distributionTagsAreReadAndUpdatedByArn() {
+        CloudFrontService service = serviceWithDomainSuffix(DEFAULT_DOMAIN_SUFFIX);
+        Distribution dist = service.createDistribution(new Distribution(), Map.of("env", "dev"));
+
+        assertEquals(Map.of("env", "dev"), service.listTagsForResource(dist.getArn()));
+
+        service.tagResource(dist.getArn(), Map.of("team", "infra"));
+        assertEquals(Map.of("env", "dev", "team", "infra"), service.listTagsForResource(dist.getArn()));
+
+        service.untagResource(dist.getArn(), List.of("env"));
+        assertEquals(Map.of("team", "infra"), service.listTagsForResource(dist.getArn()));
+    }
+
+    @Test
+    void deletingDistributionRemovesTagsStoredUnderItsArn() {
+        CloudFrontService service = serviceWithDomainSuffix(DEFAULT_DOMAIN_SUFFIX);
+        Distribution dist = service.createDistribution(new Distribution(), Map.of());
+        service.tagResource(dist.getArn(), Map.of("env", "dev"));
+
+        service.deleteDistribution(dist.getId(), dist.getEtag());
+
+        assertEquals(Map.of(), service.listTagsForResource(dist.getArn()));
+    }
+
+    @Test
     void createDistributionUsesDefaultDomainSuffix() {
         CloudFrontService service = serviceWithDomainSuffix(null);
 

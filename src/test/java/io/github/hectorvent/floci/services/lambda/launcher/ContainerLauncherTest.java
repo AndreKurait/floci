@@ -588,6 +588,30 @@ class ContainerLauncherTest {
                         .filter(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION=")).toList());
     }
 
+    @ParameterizedTest
+    @CsvSource({"JSON, DEBUG, DEBUG", "JSON, , INFO", "Text, , "})
+    void launchPassesTheLoggingConfigToTheRuntime(String logFormat, String level, String runtimeLevel) {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("logging-config-fn");
+        fn.setHotReloadHostPath("/home/ci/code");
+        fn.setRuntime("python3.13");
+        fn.setHandler("fn.handler");
+        fn.setLogFormat(logFormat);
+        fn.setApplicationLogLevel(level);
+
+        launcher.launch(fn);
+
+        List<String> expected = new ArrayList<>(List.of("AWS_LAMBDA_LOG_FORMAT=" + logFormat));
+        if (runtimeLevel != null) {
+            expected.add("AWS_LAMBDA_LOG_LEVEL=" + runtimeLevel);
+        }
+        assertEquals(expected,
+                captureRealContainerSpec().env().stream()
+                        .filter(value -> value.startsWith("AWS_LAMBDA_LOG_FORMAT=")
+                                || value.startsWith("AWS_LAMBDA_LOG_LEVEL="))
+                        .toList());
+    }
+
     @Test
     void launchFunction_hotReloadMountsTheHostDirectoryReadOnlyAtVarTask() {
         LambdaFunction fn = new LambdaFunction();
@@ -809,6 +833,31 @@ class ContainerLauncherTest {
                 "io.floci.account", "222222222222",
                 "io.floci.region", "us-west-2"),
                 spec.labels());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"java21, true", "java8.al2, true", "java17, true", "nodejs20.x, false", "python3.13, false",
+            "provided.al2023, false"})
+    void launchFunction_hasTheJvmsOfAJavaRuntimeTrustFlocisCa(String runtime, boolean javaTrustStore)
+            throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("code"));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("runtime-fn");
+        fn.setRuntime(runtime);
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+
+        launcher.launch(fn);
+
+        assertEquals(javaTrustStore, captureRealContainerSpec().javaTrustStore());
+    }
+
+    @Test
+    void launchFunction_hasTheJvmsOfAContainerImageTrustFlocisCa() {
+        launcher.launch(imageFunction());
+
+        assertTrue(captureRealContainerSpec().javaTrustStore());
     }
 
     @Test
@@ -2404,7 +2453,7 @@ class ContainerLauncherTest {
                 new CodeStore(tempDir.resolve("code-store")), new ZipExtractor(), null,
                 new RegionResolver("us-east-1", "000000000000"), null, null,
                 new LambdaTargetResolver(store, null), null, null, null, null, null,
-                null, null, null, null, null, new ObjectMapper());
+                null, null, null, null, null, new ObjectMapper(), null);
     }
 
     @Test

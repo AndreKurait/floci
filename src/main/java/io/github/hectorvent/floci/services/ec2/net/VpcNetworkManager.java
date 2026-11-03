@@ -857,18 +857,27 @@ public class VpcNetworkManager {
         synchronized (vpc.declarationLock) {
             vpc.subnetDeclarations.keySet().forEach(subnetId -> subnetOwner.remove(key(region, subnetId)));
         }
+        Set<String> previousRunNetworks = networksFromPreviousRun.remove(key(region, vpcId));
+        Set<String> networkNames = new LinkedHashSet<>();
         synchronized (vpc) {
-            // A Docker create already in flight must finish before we decide whether
-            // there is a network to remove. The retired binding cannot create another.
-            if (!vpc.created) {
-                return;
+            // Wait for any admitted Docker create before selecting networks to remove.
+            if (vpc.created) {
+                networkNames.add(vpc.networkName);
             }
+        }
+        if (previousRunNetworks != null) {
+            networkNames.addAll(previousRunNetworks);
+        }
+        if (networkNames.isEmpty()) {
+            return;
         }
         String flociContainerId = vpc.flociContainerId;
         if (flociContainerId == null && currentContainerNetworkResolver != null) {
             flociContainerId = currentContainerNetworkResolver.resolveContainerId().orElse(null);
         }
-        removeNetworkWithRetry(vpc.networkName, flociContainerId, 1);
+        for (String networkName : networkNames) {
+            removeNetworkWithRetry(networkName, flociContainerId, 1);
+        }
     }
 
     private void removeNetworkWithRetry(String networkName, String flociContainerId, int attempt) {
@@ -894,6 +903,9 @@ public class VpcNetworkManager {
 
     // ─── Startup reconciliation ──────────────────────────────────────────────
 
+    /** Network names by VPC, for VPCs still declared at startup whose networks a previous run created. */
+    private final Map<String, Set<String>> networksFromPreviousRun = new ConcurrentHashMap<>();
+
     /**
      * Removes VPC networks this Floci left behind on a previous run.
      *
@@ -906,12 +918,17 @@ public class VpcNetworkManager {
      * API port) are considered. Several Floci instances share a daemon here; scoping by owner is
      * what makes the deletion safe.
      *
+     * <p>The networks of VPCs that are still declared are kept and remembered, so deleting such a
+     * VPC later removes its network even though this run never materialised it. That listing runs
+     * with {@code reconcile-on-startup} off too; only the removal of orphans is behind the flag.
+     *
      * @param stillDeclared answers whether (region, vpcId) exists in the restored state
      */
     public void reconcileOrphans(BiPredicate<String, String> stillDeclared) {
-        if (!enabled() || !config.services().ec2().vpcNetworks().reconcileOnStartup()) {
+        if (!enabled()) {
             return;
         }
+        boolean reap = config.services().ec2().vpcNetworks().reconcileOnStartup();
         int removed = 0;
         try {
             List<Network> networks = ALIASES.listByLabels(
@@ -931,6 +948,11 @@ public class VpcNetworkManager {
                 String vpcId = ALIASES.labelValue(labels, ContainerStorageHelper.RESOURCE_ID_LABEL);
                 String region = ALIASES.labelValue(labels, ContainerStorageHelper.REGION_LABEL);
                 if (vpcId != null && region != null && stillDeclared.test(region, vpcId)) {
+                    networksFromPreviousRun.computeIfAbsent(key(region, vpcId), k -> ConcurrentHashMap.newKeySet())
+                            .add(network.getName());
+                    continue;
+                }
+                if (!reap) {
                     continue;
                 }
                 disconnectAll(network);

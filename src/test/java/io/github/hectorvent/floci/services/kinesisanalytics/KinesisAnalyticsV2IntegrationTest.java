@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.kinesisanalytics;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.json.config.JsonPathConfig;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -14,6 +15,9 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
  * Drives the full JSON-1.1 dispatch path (AwsJson11Controller → ResolvedServiceCatalog →
@@ -134,6 +138,37 @@ class KinesisAnalyticsV2IntegrationTest {
         .then()
             .statusCode(200)
             .body("ApplicationSummaries.ApplicationName", hasItem("it-list"));
+    }
+
+    @Test
+    void listApplicationsPaginatesThroughJsonProtocol() {
+        createApplication("it-page-a-" + System.nanoTime());
+        createApplication("it-page-b-" + System.nanoTime());
+
+        Response firstPage = given()
+            .header("X-Amz-Target", "KinesisAnalytics_20180523.ListApplications")
+            .contentType(CONTENT_TYPE)
+            .body("{\"Limit\":1}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ApplicationSummaries.size()", equalTo(1))
+            .extract().response();
+        String token = firstPage.path("NextToken");
+        assertNotNull(token);
+
+        String secondName = given()
+            .header("X-Amz-Target", "KinesisAnalytics_20180523.ListApplications")
+            .contentType(CONTENT_TYPE)
+            .body("{\"Limit\":1,\"NextToken\":\"" + token + "\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ApplicationSummaries.size()", equalTo(1))
+            .extract().path("ApplicationSummaries[0].ApplicationName");
+        assertNotEquals(firstPage.path("ApplicationSummaries[0].ApplicationName"), secondName);
     }
 
     @Test
@@ -355,6 +390,87 @@ class KinesisAnalyticsV2IntegrationTest {
         .then()
             .statusCode(200)
             .body("SnapshotSummaries", equalTo(List.of()));
+    }
+
+    @Test
+    void listApplicationSnapshotsPaginatesThroughJsonProtocol() {
+        String applicationName = "it-snapshot-page-" + System.nanoTime();
+        // A snapshot needs a RUNNING app with a deployed job, so the app must carry code config.
+        given()
+            .header("X-Amz-Target", "KinesisAnalytics_20180523.CreateApplication")
+            .contentType(CONTENT_TYPE)
+            .body("""
+                {"ApplicationName": "%s", "RuntimeEnvironment": "FLINK-1_18",
+                 "ServiceExecutionRole": "%s",
+                 "ApplicationConfiguration": {"ApplicationCodeConfiguration": {
+                     "CodeContent": {"S3ContentLocation": {
+                         "BucketARN": "arn:aws:s3:::flink-code", "FileKey": "app.jar"}},
+                     "CodeContentType": "ZIPFILE"}}}
+                """.formatted(applicationName, ROLE))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("X-Amz-Target", "KinesisAnalytics_20180523.StartApplication")
+            .contentType(CONTENT_TYPE)
+            .body("{\"ApplicationName\": \"" + applicationName + "\", \"RunConfiguration\": {}}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        for (String snapshotName : List.of("snap-a", "snap-b")) {
+            given()
+                .header("X-Amz-Target", "KinesisAnalytics_20180523.CreateApplicationSnapshot")
+                .contentType(CONTENT_TYPE)
+                .body("{\"ApplicationName\": \"" + applicationName + "\","
+                        + " \"SnapshotName\": \"" + snapshotName + "\"}")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
+        }
+
+        Response firstPage = given()
+            .header("X-Amz-Target", "KinesisAnalytics_20180523.ListApplicationSnapshots")
+            .contentType(CONTENT_TYPE)
+            .body("{\"ApplicationName\": \"" + applicationName + "\", \"Limit\": 1}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("SnapshotSummaries.size()", equalTo(1))
+            .body("SnapshotSummaries[0].SnapshotName", equalTo("snap-a"))
+            .extract().response();
+        String token = firstPage.path("NextToken");
+        assertNotNull(token);
+
+        Response secondPage = given()
+            .header("X-Amz-Target", "KinesisAnalytics_20180523.ListApplicationSnapshots")
+            .contentType(CONTENT_TYPE)
+            .body("{\"ApplicationName\": \"" + applicationName + "\", \"Limit\": 1,"
+                    + " \"NextToken\": \"" + token + "\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("SnapshotSummaries.size()", equalTo(1))
+            .body("SnapshotSummaries[0].SnapshotName", equalTo("snap-b"))
+            .extract().response();
+        assertNull(secondPage.path("NextToken"));
+
+        given()
+            .header("X-Amz-Target", "KinesisAnalytics_20180523.ListApplicationSnapshots")
+            .contentType(CONTENT_TYPE)
+            .body("{\"ApplicationName\": \"" + applicationName + "\", \"Limit\": 60}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidArgumentException"))
+            .body("message", equalTo("Page size must be between 1 and 50."));
     }
 
     @Test

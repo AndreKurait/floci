@@ -74,6 +74,10 @@ public class InMemoryStorage<K, V> implements StorageBackend<K, V> {
         // This backend is intentionally volatile.
     }
 
+    public boolean isEmpty() {
+        return store.isEmpty();
+    }
+
     @Override
     public void flush() {
         // No-op for in-memory storage

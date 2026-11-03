@@ -128,14 +128,38 @@ public final class Pagination {
                                                   Integer maxResults, String nextToken,
                                                   int defaultPageSize, int maxResultsLimit, int maxTokenLength,
                                                   String errorCode, String namespace) {
+        validatePageSizeAndToken(maxResults, nextToken, maxResultsLimit, maxTokenLength, errorCode,
+                false, "Pagination token must not exceed " + maxTokenLength + " characters.");
+        return paginate(all, cursorOf, maxResults == null ? defaultPageSize : maxResults, nextToken, namespace,
+                token -> new AwsException(errorCode, "Invalid pagination token.", 400));
+    }
+
+    /**
+     * Paginates a list whose cursor is itself a valid API token. Unlike the namespaced overloads,
+     * this leaves the sorted cursor unencoded in the response, so an API whose resource name is
+     * also its token can resume after that resource has been removed.
+     */
+    public static <T> PaginatedResult<T> paginateUnencoded(List<T> all, Function<T, String> cursorOf,
+                                                            Integer maxResults, String nextToken,
+                                                            int defaultPageSize, int maxResultsLimit,
+                                                            int maxTokenLength, String errorCode) {
+        validatePageSizeAndToken(maxResults, nextToken, maxResultsLimit, maxTokenLength, errorCode,
+                true, "Pagination token must be between 1 and " + maxTokenLength + " characters.");
+        int limit = maxResults == null ? defaultPageSize : maxResults;
+        return slice(all, cursorOf, limit, nextToken, "", Function.identity());
+    }
+
+    private static void validatePageSizeAndToken(Integer maxResults, String nextToken,
+                                                  int maxResultsLimit, int maxTokenLength,
+                                                  String errorCode, boolean tokenMustBeNonEmpty,
+                                                  String tokenErrorMessage) {
         if (maxResults != null && (maxResults < 1 || maxResults > maxResultsLimit)) {
             throw new AwsException(errorCode, "Page size must be between 1 and " + maxResultsLimit + ".", 400);
         }
-        if (nextToken != null && nextToken.length() > maxTokenLength) {
-            throw new AwsException(errorCode, "Pagination token must not exceed " + maxTokenLength + " characters.", 400);
+        if (nextToken != null
+                && ((tokenMustBeNonEmpty && nextToken.isEmpty()) || nextToken.length() > maxTokenLength)) {
+            throw new AwsException(errorCode, tokenErrorMessage, 400);
         }
-        return paginate(all, cursorOf, maxResults == null ? defaultPageSize : maxResults, nextToken, namespace,
-                token -> new AwsException(errorCode, "Invalid pagination token.", 400));
     }
 
     /** Reads an optional JSON page size without coercing strings, fractions, or overflowing integers. */

@@ -36,17 +36,17 @@ class RestAuthorizerCredentialsIntegrationTest {
     @Inject
     ObjectMapper mapper;
 
-    private ApiGatewayClient client() {
+    ApiGatewayClient client() {
         return ApiGatewayClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
                 .build();
     }
 
     @Test
-    void sdkRetainsCredentialsAndReplacesOrClearsThemAtomically() {
+    void sdkRetainsCredentialsAndReplacesOrClearsThemAtomically() throws Exception {
         try (ApiGatewayClient client = client()) {
             String api = client.createRestApi(b -> b.name("authorizer-credentials")).id();
-            try {
+            try (AutoCloseable cleanup = () -> client.deleteRestApi(b -> b.restApiId(api))) {
                 CreateAuthorizerResponse created = client.createAuthorizer(b -> b.restApiId(api).name("token")
                         .type("TOKEN").authorizerUri(URI_VALUE).identitySource("method.request.header.Authorization")
                         .authorizerCredentials(ROLE));
@@ -69,8 +69,6 @@ class RestAuthorizerCredentialsIntegrationTest {
                 assertNull(client.updateAuthorizer(b -> b.restApiId(api).authorizerId(id)
                         .patchOperations(patch("replace", "/authorizerCredentials", null))).authorizerCredentials());
                 assertNull(client.getAuthorizer(b -> b.restApiId(api).authorizerId(id)).authorizerCredentials());
-            } finally {
-                client.deleteRestApi(b -> b.restApiId(api));
             }
         }
     }
@@ -78,19 +76,17 @@ class RestAuthorizerCredentialsIntegrationTest {
     @Test
     void storedAuthorizerJsonKeepsCredentialsAndReadsLegacyRecords() throws Exception {
         String api = service.createRestApi("us-east-1", Map.of("name", "stored-credentials")).getId();
-        try {
+        try (AutoCloseable cleanup = () -> service.deleteRestApi("us-east-1", api)) {
             Authorizer authorizer = service.createAuthorizer("us-east-1", api,
                     Map.of("name", "token", "type", "TOKEN", "authorizerCredentials", ROLE));
             assertEquals(ROLE, mapper.readValue(mapper.writeValueAsString(authorizer), Authorizer.class)
                     .getAuthorizerCredentials());
             assertNull(mapper.readValue("{}", Authorizer.class).getAuthorizerCredentials());
-        } finally {
-            service.deleteRestApi("us-east-1", api);
         }
     }
 
     @Test
-    void importedCredentialsPreserveOmittedMergeClearExplicitNullAndRollbackInvalidType() {
+    void importedCredentialsPreserveOmittedMergeClearExplicitNullAndRollbackInvalidType() throws Exception {
         String spec = """
                 {"openapi":"3.0.1","info":{"title":"credentials","version":"1"},"paths":{},
                  "components":{"securitySchemes":{"Token":{"type":"apiKey","name":"Authorization",
@@ -98,7 +94,7 @@ class RestAuthorizerCredentialsIntegrationTest {
                      "authorizerUri":"%s","authorizerCredentials":"%s"}}}}}
                 """.formatted(URI_VALUE, ROLE);
         String api = service.importRestApi("us-east-1", spec).getId();
-        try {
+        try (AutoCloseable cleanup = () -> service.deleteRestApi("us-east-1", api)) {
             assertEquals(ROLE, service.getAuthorizers("us-east-1", api).getFirst().getAuthorizerCredentials());
             String omitted = spec.replace(",\"authorizerCredentials\":\"" + ROLE + "\"", "");
             service.putRestApi("us-east-1", api, "merge", omitted);
@@ -108,8 +104,6 @@ class RestAuthorizerCredentialsIntegrationTest {
             assertEquals(ROLE, service.getAuthorizers("us-east-1", api).getFirst().getAuthorizerCredentials());
             service.putRestApi("us-east-1", api, "merge", spec.replace("\"" + ROLE + "\"", "null"));
             assertNull(service.getAuthorizers("us-east-1", api).getFirst().getAuthorizerCredentials());
-        } finally {
-            service.deleteRestApi("us-east-1", api);
         }
     }
 

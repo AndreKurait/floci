@@ -4,6 +4,8 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
+import io.vertx.core.Future;
+import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerResponse;
@@ -16,10 +18,12 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -27,8 +31,10 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -509,6 +515,48 @@ class ElbV2HealthCheckerTest {
                 assertNull(healthy.description());
             });
         } finally {
+            close(server);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void periodicProbeRetainsIntervalAndNetworkAdmissionThreshold() throws Exception {
+        HttpServer server = startServer(200);
+        Vertx scheduled = mock(Vertx.class);
+        AtomicReference<Handler<Long>> periodic = new AtomicReference<>();
+        doAnswer(invocation -> {
+            Handler<Long> callback = invocation.getArgument(1);
+            callback.handle(1L);
+            return 1L;
+        }).when(scheduled).setTimer(anyLong(), any());
+        doAnswer(invocation -> {
+            assertEquals(5000L, invocation.<Long>getArgument(0));
+            periodic.set(invocation.getArgument(1));
+            return 2L;
+        }).when(scheduled).setPeriodic(anyLong(), any());
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().elbv2().mock()).thenReturn(false);
+        ElbV2HealthChecker checker = new ElbV2HealthChecker(scheduled, config, mock(Ec2Service.class));
+        TargetGroup group = targetGroup(server.actualPort(), "200", 2, 1);
+        group.setProtocol("TCP");
+        group.setHealthCheckIntervalSeconds(5);
+        TargetDescription target = target("127.0.0.1", server.actualPort());
+
+        try {
+            checker.startMonitoring(group);
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> assertEquals("Elb.InitialHealthChecking",
+                    checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason()));
+            periodic.get().handle(2L);
+            await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
+                    assertEquals("healthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+            checker.stopMonitoring(group.getTargetGroupArn());
+            verify(scheduled).cancelTimer(2L);
+            assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+        } finally {
+            checker.stopMonitoring(group.getTargetGroupArn());
             close(server);
         }
     }

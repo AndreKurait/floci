@@ -4,22 +4,24 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Authorizer;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Integration;
-import io.quarkus.test.common.http.TestHTTPResource;
+import io.github.hectorvent.floci.testing.AwsTestClients;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.apache5.Apache5HttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.apigatewayv2.ApiGatewayV2Client;
 import software.amazon.awssdk.services.apigatewayv2.model.CreateAuthorizerResponse;
 import software.amazon.awssdk.services.apigatewayv2.model.CreateIntegrationResponse;
+import software.amazon.awssdk.services.apigatewayv2.model.GetIntegrationResponse;
+import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
 
-import java.net.URI;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.*;
@@ -30,9 +32,6 @@ class ApiGatewayV2CredentialsIntegrationTest {
     private static final String OTHER = "arn:aws:iam::000000000000:role/updated";
     private static final String FUNCTION = "arn:aws:lambda:us-east-1:000000000000:function:target";
 
-    @TestHTTPResource
-    URI endpoint;
-
     @Inject
     ApiGatewayV2Service service;
 
@@ -40,9 +39,8 @@ class ApiGatewayV2CredentialsIntegrationTest {
     ObjectMapper mapper;
 
     private ApiGatewayV2Client client() {
-        return ApiGatewayV2Client.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
-                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
-                .build();
+        return AwsTestClients.create(ApiGatewayV2Client.builder(), "test", Region.US_EAST_1,
+                Apache5HttpClient.builder());
     }
 
     @ParameterizedTest
@@ -85,6 +83,23 @@ class ApiGatewayV2CredentialsIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {FUNCTION, "https://backend.example/items"})
+    void sdkQuickCreateUsesCredentialsOnlyForLambdaTarget(String target) throws Exception {
+        try (ApiGatewayV2Client client = client()) {
+            String api = client.createApi(b -> b.name("quick-credentials-sdk").protocolType("HTTP")
+                    .target(target).credentialsArn(ROLE)).apiId();
+            try (AutoCloseable cleanup = () -> client.deleteApi(b -> b.apiId(api))) {
+                String id = client.getIntegrations(b -> b.apiId(api)).items().getFirst().integrationId();
+                GetIntegrationResponse integration = client.getIntegration(b -> b.apiId(api).integrationId(id));
+                assertEquals(target, integration.integrationUri());
+                assertEquals(FUNCTION.equals(target) ? "AWS_PROXY" : "HTTP_PROXY",
+                        integration.integrationTypeAsString());
+                assertEquals(FUNCTION.equals(target) ? ROLE : null, integration.credentialsArn());
+            }
+        }
+    }
+
     @Test
     void quickCreateAndRestoreKeepCredentialsAndOldStoredJsonDefaultsToNull() throws Exception {
         String api = service.createApi("us-east-1", Map.of("name", "quick-credentials", "protocolType", "HTTP",
@@ -109,6 +124,47 @@ class ApiGatewayV2CredentialsIntegrationTest {
             assertNull(mapper.readValue("{}", Authorizer.class).getAuthorizerCredentialsArn());
         } finally {
             service.deleteApi("us-east-1", api);
+        }
+    }
+
+    @Test
+    void sdkCloudFormationBodyKeepsIntegrationAndAuthorizerCredentials() throws Exception {
+        String stack = "body-credentials-" + UUID.randomUUID();
+        String template = """
+                {"Resources":{"HttpApi":{"Type":"AWS::ApiGatewayV2::Api","Properties":{
+                  "Name":"body-credentials","ProtocolType":"HTTP","Body":{
+                    "openapi":"3.0.1","info":{"title":"credentials","version":"1"},
+                    "components":{"securitySchemes":{"RequestAuth":{
+                      "type":"apiKey","name":"Authorization","in":"header",
+                      "x-amazon-apigateway-authorizer":{"type":"request",
+                        "authorizerUri":"%s","authorizerCredentials":"%s",
+                        "identitySource":"$request.header.Authorization",
+                        "authorizerPayloadFormatVersion":"2.0"}}}},
+                    "paths":{"/items":{"get":{"security":[{"RequestAuth":[]}],
+                      "x-amazon-apigateway-integration":{"type":"aws_proxy","uri":"%s",
+                        "credentials":"%s","httpMethod":"POST","payloadFormatVersion":"2.0"}}}}}}}}}
+                """.formatted(FUNCTION, OTHER, FUNCTION, ROLE);
+        try (CloudFormationClient cfn = AwsTestClients.create(CloudFormationClient.builder(), "test", Region.US_EAST_1);
+                ApiGatewayV2Client client = client()) {
+            cfn.createStack(b -> b.stackName(stack).templateBody(template));
+            try (AutoCloseable cleanup = () -> {
+                cfn.deleteStack(b -> b.stackName(stack));
+                CfnStackWaits.awaitStackDeleted(stack);
+            }) {
+                CfnStackWaits.awaitStatus(stack, "CREATE_COMPLETE");
+                String api = cfn.describeStackResource(b -> b.stackName(stack).logicalResourceId("HttpApi"))
+                        .stackResourceDetail().physicalResourceId();
+                assertEquals(ROLE, client.getIntegrations(b -> b.apiId(api)).items().getFirst().credentialsArn());
+                assertEquals(OTHER, client.getAuthorizers(b -> b.apiId(api)).items().getFirst()
+                        .authorizerCredentialsArn());
+                cfn.updateStack(b -> b.stackName(stack).templateBody(template
+                        .replace(ROLE, ROLE + "-updated").replace(OTHER, OTHER + "-updated")));
+                CfnStackWaits.awaitStatus(stack, "UPDATE_COMPLETE");
+                assertEquals(ROLE + "-updated", client.getIntegrations(b -> b.apiId(api))
+                        .items().getFirst().credentialsArn());
+                assertEquals(OTHER + "-updated", client.getAuthorizers(b -> b.apiId(api))
+                        .items().getFirst().authorizerCredentialsArn());
+            }
         }
     }
 

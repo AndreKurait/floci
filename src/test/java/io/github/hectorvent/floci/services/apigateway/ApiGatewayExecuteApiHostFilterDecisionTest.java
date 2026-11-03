@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -23,6 +24,7 @@ class ApiGatewayExecuteApiHostFilterDecisionTest {
     private static final String VIEWER_ACCOUNT = "000000000000";
     private static final String OWNER_ACCOUNT = "111122223333";
     private static final String HOST = API_ID + ".execute-api." + REGION + ".amazonaws.com";
+    private static final String WRONG_REGION_HOST = API_ID + ".execute-api.eu-west-1.amazonaws.com";
 
     private final RequestContext viewer = viewerContext();
     private final StubLookup lookup = new StubLookup(viewer);
@@ -142,6 +144,55 @@ class ApiGatewayExecuteApiHostFilterDecisionTest {
         assertEquals(REGION, viewer.getRegion());
     }
 
+    @Test
+    void httpApiOfAnotherAccountRoutes() {
+        lookup.owner = new ApiGatewayV2Service.ApiOwner(OWNER_ACCOUNT, REGION);
+        lookup.httpApi = true;
+
+        assertTrue(filter.routes(HOST, "/dev/accounts"));
+    }
+
+    @Test
+    void httpApiWithAnotherRegionLabelDoesNotRoute() {
+        lookup.owner = new ApiGatewayV2Service.ApiOwner(OWNER_ACCOUNT, REGION);
+        lookup.httpApi = true;
+
+        assertFalse(filter.routes(WRONG_REGION_HOST, "/dev/accounts"));
+    }
+
+    @Test
+    void restApiInTheHostRegionRoutes() {
+        lookup.restRegion = REGION;
+
+        assertTrue(filter.routes(HOST, "/dev/"));
+    }
+
+    @Test
+    void restApiWithAnotherRegionLabelDoesNotRoute() {
+        lookup.restRegion = REGION;
+
+        assertFalse(filter.routes(WRONG_REGION_HOST, "/dev/"));
+    }
+
+    @Test
+    void restApiThatDoesNotExistDoesNotRoute() {
+        assertFalse(filter.routes(HOST, "/dev/"));
+    }
+
+    @Test
+    void ambiguousApiIdDoesNotRoute() {
+        lookup.ambiguous = true;
+
+        assertFalse(filter.routes(HOST, "/dev/accounts"));
+    }
+
+    @Test
+    void internalExecuteApiPathDoesNotRoute() {
+        lookup.restRegion = REGION;
+
+        assertFalse(filter.routes(HOST, "/execute-api/" + API_ID + "/dev/"));
+    }
+
     private static RequestContext viewerContext() {
         RequestContext context = new RequestContext();
         context.setAccountId(VIEWER_ACCOUNT);
@@ -153,6 +204,7 @@ class ApiGatewayExecuteApiHostFilterDecisionTest {
         private final RequestContext viewer;
         private final List<String> accountsSeen = new ArrayList<>();
         private ApiGatewayV2Service.ApiOwner owner;
+        private String restRegion;
         private String stage = "dev";
         private boolean disabled;
         private boolean crash;
@@ -169,6 +221,11 @@ class ApiGatewayExecuteApiHostFilterDecisionTest {
                 throw new AwsException("ConflictException", "ambiguous", 409);
             }
             return Optional.ofNullable(owner);
+        }
+
+        @Override
+        public Optional<String> findRestApiRegion(String apiId) {
+            return Optional.ofNullable(restRegion);
         }
 
         @Override

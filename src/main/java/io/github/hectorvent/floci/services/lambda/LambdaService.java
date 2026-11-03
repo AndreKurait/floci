@@ -9,9 +9,9 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
-import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CustomResourceLiveness;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.SignedMarkers;
@@ -51,6 +51,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -138,9 +139,8 @@ public class LambdaService implements ResourceProvider {
     private static final Pattern FUNCTION_URL_QUALIFIER_PATTERN = Pattern.compile("^(?!^\\d+$)[0-9a-zA-Z-_]+$");
     private static final Pattern EVENT_SOURCE_ARN_PATTERN = Pattern.compile(
             "^arn:(aws[a-zA-Z0-9-]*):([a-zA-Z0-9-])+:((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1})?:(\\d{12})?:(.*)$");
-    private static final Pattern LIST_ESM_FUNCTION_NAME_PATTERN = Pattern.compile(
-            "^(arn:(aws[a-zA-Z-]*)?:lambda:)?((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?(\\d{12}:)?"
-                    + "(function:)?([a-zA-Z0-9-_\\.]+)(:(\\$LATEST(\\.PUBLISHED)?|[a-zA-Z0-9-_]+))?$");
+    private static final Pattern LIST_ESM_FUNCTION_NAME_PATTERN =
+            LambdaArnUtils.NAMESPACED_FUNCTION_NAME_PATTERN;
     // AddPermission members: botocore's PrincipalOrgID, SourceOwner and EventSourceToken shapes.
     private static final Pattern PRINCIPAL_ORG_ID_PATTERN = Pattern.compile("o-[a-z0-9]{10,32}");
     private static final Pattern ACCOUNT_ID_PATTERN = Pattern.compile("\\d{12}");
@@ -194,6 +194,7 @@ public class LambdaService implements ResourceProvider {
     private final DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller;
     private final StorageFactory storageFactory;
     private final LambdaLayerService layerService;
+    private final LambdaCodeSigningConfigService codeSigningConfigService;
     private final Map<String, PendingReactiveSync> pendingReactiveSyncs = new ConcurrentHashMap<>();
     private final Map<String, Integer> runningReactiveSyncs = new ConcurrentHashMap<>();
     private final Map<String, String> failedReactiveSyncs = new ConcurrentHashMap<>();
@@ -207,6 +208,7 @@ public class LambdaService implements ResourceProvider {
     private final ConcurrentHashMap<String, Object> policyMutationLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> versionCounterLocks = new ConcurrentHashMap<>();
     private final SignedMarkers listFunctionMarkers = new SignedMarkers();
+    private final SignedMarkers codeSigningFunctionMarkers = new SignedMarkers();
 
     /**
      * Package-private constructor for testing without CDI. Config defaults
@@ -262,32 +264,63 @@ public class LambdaService implements ResourceProvider {
         this.ec2Service = null;
         this.customResourceLiveness = null;
         this.durableExecutionService = null;
+        this.codeSigningConfigService = storageFactory == null
+                ? null : new LambdaCodeSigningConfigService(storageFactory, regionResolver);
         this.objectMapper = new ObjectMapper();
+    }
+
+    LambdaService(LambdaFunctionStore functionStore,
+                  LambdaExecutorService executorService,
+                  LambdaConcurrencyLimiter concurrencyLimiter,
+                  WarmPool warmPool,
+                  CodeStore codeStore,
+                  ZipExtractor zipExtractor,
+                  EmulatorConfig config,
+                  RegionResolver regionResolver,
+                  EsmStore esmStore,
+                  LambdaAliasStore aliasStore,
+                  LambdaTargetResolver targetResolver,
+                  S3Service s3Service,
+                  SqsService sqsService,
+                  SqsEventSourcePoller poller,
+                  KinesisEventSourcePoller kinesisPoller,
+                  DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller,
+                  StorageFactory storageFactory,
+                  LambdaLayerService layerService,
+                  Ec2Service ec2Service,
+                  CustomResourceLiveness customResourceLiveness,
+                  DurableExecutionService durableExecutionService,
+                  ObjectMapper objectMapper) {
+        this(functionStore, executorService, concurrencyLimiter, warmPool, codeStore, zipExtractor, config,
+                regionResolver, esmStore, aliasStore, targetResolver, s3Service, sqsService, poller,
+                kinesisPoller, dynamodbStreamsPoller, storageFactory, layerService, ec2Service,
+                customResourceLiveness, durableExecutionService, objectMapper, null);
     }
 
     @Inject
     public LambdaService(LambdaFunctionStore functionStore,
-                          LambdaExecutorService executorService,
-                          LambdaConcurrencyLimiter concurrencyLimiter,
-                          WarmPool warmPool,
-                          CodeStore codeStore,
-                          ZipExtractor zipExtractor,
-                          EmulatorConfig config,
-                          RegionResolver regionResolver,
-                          EsmStore esmStore,
-                          LambdaAliasStore aliasStore,
-                          LambdaTargetResolver targetResolver,
-                          S3Service s3Service,
-                          SqsService sqsService,
-                          SqsEventSourcePoller poller,
-                          KinesisEventSourcePoller kinesisPoller,
-                          DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller,
-                          StorageFactory storageFactory,
-                          LambdaLayerService layerService,
-                          Ec2Service ec2Service,
-                          CustomResourceLiveness customResourceLiveness,
-                          DurableExecutionService durableExecutionService,
-                          ObjectMapper objectMapper) {
+                         LambdaExecutorService executorService,
+                         LambdaConcurrencyLimiter concurrencyLimiter,
+                         WarmPool warmPool,
+                         CodeStore codeStore,
+                         ZipExtractor zipExtractor,
+                         EmulatorConfig config,
+                         RegionResolver regionResolver,
+                         EsmStore esmStore,
+                         LambdaAliasStore aliasStore,
+                         LambdaTargetResolver targetResolver,
+                         S3Service s3Service,
+                         SqsService sqsService,
+                         SqsEventSourcePoller poller,
+                         KinesisEventSourcePoller kinesisPoller,
+                         DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller,
+                         StorageFactory storageFactory,
+                         LambdaLayerService layerService,
+                         Ec2Service ec2Service,
+                         CustomResourceLiveness customResourceLiveness,
+                         DurableExecutionService durableExecutionService,
+                         ObjectMapper objectMapper,
+                         LambdaCodeSigningConfigService codeSigningConfigService) {
         this.customResourceLiveness = customResourceLiveness;
         this.durableExecutionService = durableExecutionService;
         this.functionStore = functionStore;
@@ -309,6 +342,7 @@ public class LambdaService implements ResourceProvider {
         this.storageFactory = storageFactory;
         this.layerService = layerService;
         this.ec2Service = ec2Service;
+        this.codeSigningConfigService = codeSigningConfigService;
         this.objectMapper = objectMapper;
     }
 
@@ -439,6 +473,22 @@ public class LambdaService implements ResourceProvider {
     }
 
     public LambdaFunction createFunction(String region, Map<String, Object> request) {
+        Object codeSigningConfigValue = request.get("CodeSigningConfigArn");
+        if (codeSigningConfigValue == null) {
+            return createFunctionInternal(region, request);
+        }
+        if (codeSigningConfigService == null) {
+            throw new IllegalStateException("Lambda code-signing configuration service is unavailable");
+        }
+        String codeSigningConfigArn = codeSigningConfigValue.toString();
+        // Keep the configuration alive until the function record is stored. DeleteCodeSigningConfig
+        // uses the same lock while checking attached functions, so a concurrent create cannot
+        // validate a configuration and then leave a dangling attachment after deletion.
+        return codeSigningConfigService.withConfigLock(codeSigningConfigArn,
+                () -> createFunctionInternal(region, request));
+    }
+
+    private LambdaFunction createFunctionInternal(String region, Map<String, Object> request) {
         Map<String, Object> environment = structureMember(request, "Environment");
         Map<String, String> environmentVariables = environmentVariables(environment);
         Map<String, Object> ephemeralStorage = structureMember(request, "EphemeralStorage");
@@ -458,6 +508,8 @@ public class LambdaService implements ResourceProvider {
         validateEnum(request.get("PackageType"), "packageType", List.of("Zip", "Image"));
         String packageType = request.getOrDefault("PackageType", "Zip").toString();
         String description = (String) request.get("Description");
+        String codeSigningConfigArn = request.get("CodeSigningConfigArn") == null
+                ? null : request.get("CodeSigningConfigArn").toString();
         DurableConfigRequest durable = durableConfigRequest(durableConfig);
         int defaultTimeout = config != null ? config.services().lambda().defaultTimeoutSeconds() : 3;
         if (durable != null) {
@@ -491,6 +543,13 @@ public class LambdaService implements ResourceProvider {
         }
         validateEnum(runtime, "runtime", RUNTIME_VALUES);
         validateMaxLength(description, "description", 256);
+        if (codeSigningConfigArn != null) {
+            if (codeSigningConfigService == null) {
+                throw new IllegalStateException("Lambda code-signing configuration service is unavailable");
+            }
+            codeSigningConfigService.requireForAttachment(
+                    region, regionResolver.getAccountId(), codeSigningConfigArn);
+        }
 
         @SuppressWarnings("unchecked")
         Map<String, String> tags = (Map<String, String>) request.get("Tags");
@@ -515,6 +574,7 @@ public class LambdaService implements ResourceProvider {
         fn.setState("Active");
         fn.setLastModified(System.currentTimeMillis());
         fn.setRevisionId(UUID.randomUUID().toString());
+        fn.setCodeSigningConfigArn(codeSigningConfigArn);
 
         // Handle environment variables
         if (environment != null) {
@@ -624,6 +684,89 @@ public class LambdaService implements ResourceProvider {
                         "Function not found: " + functionName, 404));
     }
 
+    /** Resolves the $LATEST record that owns the code-signing attachment. */
+    public LambdaFunction getFunctionForCodeSigningConfig(String region, String functionName) {
+        String name = codeSigningFunctionName(region, functionName);
+        Optional<LambdaFunction> function = functionStore.getForAccount(
+                regionResolver.getAccountId(), region, name);
+        return function.orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                "Function not found: " + functionName, 404));
+    }
+
+    private String codeSigningFunctionName(String region, String functionName) {
+        // Code-signing attachment APIs use botocore's NamespacedFunctionName
+        // (max 256, dots allowed), not the narrower shape used by other routes.
+        LambdaArnUtils.ResolvedFunctionRef reference =
+                LambdaArnUtils.resolveNamespacedFunctionName(functionName);
+        if (AwsArnUtils.isArn(functionName)) {
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(functionName);
+            if (!region.equals(arn.region())
+                    || !regionResolver.getAccountId().equals(arn.accountId())
+                    || !regionResolver.partitionForRegion(region).equals(arn.partition())) {
+                throw new AwsException("ResourceNotFoundException", "Function not found: " + functionName, 404);
+            }
+            return reference.name();
+        }
+        // The shape matcher backtracks when a would-be prefix is actually a bare name or
+        // a qualified name (for example, "us-east-1:$LATEST").
+        if ((reference.region() != null && !region.equals(reference.region()))
+                || (reference.account() != null && !regionResolver.getAccountId().equals(reference.account()))) {
+            throw new AwsException("ResourceNotFoundException", "Function not found: " + functionName, 404);
+        }
+        return reference.name();
+    }
+
+    /** Attaches or replaces a code-signing configuration on the function's {@code $LATEST}. */
+    public LambdaFunction putFunctionCodeSigningConfig(String region, String functionName,
+                                                       String codeSigningConfigArn) {
+        return updateFunctionCodeSigningConfig(region, functionName, codeSigningConfigArn);
+    }
+
+    /** Removes a code-signing configuration from the function's {@code $LATEST}. */
+    public void deleteFunctionCodeSigningConfig(String region, String functionName) {
+        updateFunctionCodeSigningConfig(region, functionName, null);
+    }
+
+    private LambdaFunction updateFunctionCodeSigningConfig(String region, String functionName,
+                                                           String codeSigningConfigArn) {
+        String name = codeSigningFunctionName(region, functionName);
+        String functionArn = regionResolver.buildArn("lambda", region, "function:" + name);
+        synchronized (lockForConcurrencyOp(functionArn)) {
+            LambdaFunction function = getFunctionForCodeSigningConfig(region, functionName);
+            function.setAccountId(regionResolver.getAccountId());
+            function.setCodeSigningConfigArn(codeSigningConfigArn);
+            function.setLastModified(System.currentTimeMillis());
+            function.setRevisionId(UUID.randomUUID().toString());
+            // The account-aware lookup may have migrated a legacy record whose model predates
+            // accountId. The lookup already proved ownership from the ARN, so keep the write in
+            // the caller's partition instead of falling back to the default account.
+            functionStore.saveForAccount(regionResolver.getAccountId(), region, function);
+            return function;
+        }
+    }
+
+    /** Lists the full function ARNs that use a configuration in the caller's account and region. */
+    public PaginatedResult<String> listFunctionsByCodeSigningConfig(String region, String accountId,
+                                                                    String codeSigningConfigArn,
+                                                                    Integer maxItems, String marker) {
+        if (maxItems != null && (maxItems < 1 || maxItems > 10_000)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "Value '" + maxItems + "' at 'maxItems' failed to satisfy constraint: "
+                            + "Member must be between 1 and 10000", 400);
+        }
+        String scope = accountId + "\n" + region + "\n" + codeSigningConfigArn + "\n";
+        List<String> functionArns = functionStore.listForAccount(accountId, region).stream()
+                .filter(function -> codeSigningConfigArn.equals(function.getCodeSigningConfigArn()))
+                .map(LambdaFunction::getFunctionArn)
+                .filter(Objects::nonNull)
+                .toList();
+        int limit = maxItems == null ? 50 : maxItems;
+        return Pagination.paginate(functionArns, value -> value, limit, marker,
+                codeSigningFunctionMarkers, scope,
+                ignored -> new AwsException("InvalidParameterValueException",
+                        "Invalid pagination key.", 400));
+    }
+
     public boolean functionExists(String region, String functionName) {
         try {
             // The qualifier-aware read resolves an embedded alias/version and enforces the ARN's
@@ -661,7 +804,7 @@ public class LambdaService implements ResourceProvider {
         if (effective == null) {
             return getFunction(region, functionName);
         }
-        if (functionName.startsWith("arn:")) {
+        if (AwsArnUtils.looksLikeArn(functionName)) {
             AwsArnUtils.Arn arn = AwsArnUtils.parse(functionName);
             return targetResolver.resolveReadTargetForAccount(arn.accountId(), region, ref.name(), effective);
         }
@@ -1554,6 +1697,7 @@ public class LambdaService implements ResourceProvider {
 
         Integer maximumRetryAttempts = parseMaximumRetryAttempts(request);
         Integer maximumRecordAgeInSeconds = parseMaximumRecordAgeInSeconds(request);
+        Integer parallelizationFactor = parseParallelizationFactor(request, eventSourceArn);
 
         EventSourceMapping.DestinationConfig destinationConfig = parseDestinationConfig(request);
 
@@ -1582,6 +1726,7 @@ public class LambdaService implements ResourceProvider {
         esm.setBisectBatchOnFunctionError(bisectBatchOnFunctionError);
         esm.setMaximumRetryAttempts(maximumRetryAttempts);
         esm.setMaximumRecordAgeInSeconds(maximumRecordAgeInSeconds);
+        esm.setParallelizationFactor(parallelizationFactor);
         esm.setDestinationConfig(destinationConfig);
         esm.setFilterCriteria(filterCriteria);
         esm.setStartingPosition(startingPosition.position());
@@ -1736,28 +1881,39 @@ public class LambdaService implements ResourceProvider {
     /** Operators AWS documents that the matcher does not implement, rejected with a clearer message. */
     private static final Set<String> UNIMPLEMENTED_FILTER_OPERATORS = Set.of("cidr", "wildcard");
 
-    /** Comparisons {@code matchesNumericFilter} understands. Anything else evaluates false for every record. */
+    /** Comparisons {@code PipesFilterMatcher} understands. It treats a pattern with any other as matching nothing. */
     private static final Set<String> NUMERIC_COMPARISONS = Set.of("=", ">", ">=", "<", "<=");
 
     /**
      * Validates the recursive shape of an EventBridge filter pattern: every field value must be either a
-     * non-empty match array (a leaf) or a nested object (recursed into). A scalar or empty-array value is a
+     * non-empty match array (a leaf) or a nested object (recursed into), and {@code $or} a non-empty list of
+     * patterns, each validated the same way. A scalar or empty-array value is a
      * pattern the matcher can never satisfy, so, with enforcement active, it would silently drop every
      * record; reject it at create/update instead.
      *
      * <p>Match-array elements are validated against the operator set the matcher implements. This does couple
      * the validator to {@code PipesFilterMatcher}, which is deliberate: now that the pollers enforce filters,
-     * a pattern the matcher cannot satisfy is destructive rather than inert. A bad operand silently corrupts
-     * delivery instead of erroring, and the failure direction is not even consistent. {@code
-     * {"numeric":[">","abc"]}} coerces its operand to zero and matches every positive value, {@code
-     * {"numeric":[">"]}} matches every record because the comparison loop never runs, and an unknown operator
-     * matches nothing, so every record is checkpointed past or deleted. Failing at create/update is the only
+     * a pattern the matcher cannot evaluate is destructive rather than inert. The matcher refuses an unknown
+     * operator or a bad operand such as {@code {"numeric":[">","abc"]}}, and the pollers treat a refused pattern
+     * as matching nothing, so every record is checkpointed past or deleted. Failing at create/update is the only
      * point where the caller can still act on it.
      */
     private static void validatePatternStructure(JsonNode node) {
         for (Map.Entry<String, JsonNode> entry : node.properties()) {
             JsonNode value = entry.getValue();
-            if (value.isArray()) {
+            if ("$or".equals(entry.getKey())) {
+                if (!value.isArray() || value.isEmpty()) {
+                    throw new AwsException("InvalidParameterValueException",
+                            "Filter Pattern field '$or' must be a non-empty list of patterns", 400);
+                }
+                for (JsonNode branch : value) {
+                    if (!branch.isObject()) {
+                        throw new AwsException("InvalidParameterValueException",
+                                "Filter Pattern field '$or' must be a non-empty list of patterns", 400);
+                    }
+                    validatePatternStructure(branch);
+                }
+            } else if (value.isArray()) {
                 if (value.isEmpty()) {
                     throw new AwsException("InvalidParameterValueException",
                             "Filter Pattern field '" + entry.getKey() + "' must have a non-empty match array", 400);
@@ -1775,17 +1931,17 @@ public class LambdaService implements ResourceProvider {
     }
 
     /**
-     * A match-array element is either a literal the matcher compares directly (string, number, or null for
-     * "absent") or a single-operator object. Two operators in one object is rejected because the matcher
+     * A match-array element is either a literal the matcher compares directly (string, number, boolean, or
+     * null) or a single-operator object. Two operators in one object is rejected because the matcher
      * tests them in a fixed order and silently honours only the first.
      */
     private static void validateMatchElement(String field, JsonNode element) {
-        if (element.isTextual() || element.isNumber() || element.isNull()) {
+        if (element.isTextual() || element.isNumber() || element.isBoolean() || element.isNull()) {
             return;
         }
         if (!element.isObject()) {
             throw new AwsException("InvalidParameterValueException", "Filter Pattern field '" + field
-                    + "' has an invalid match value: expected a string, number, null, or an operator object", 400);
+                    + "' has an invalid match value: expected a string, number, boolean, null, or an operator object", 400);
         }
         List<String> operators = new ArrayList<>();
         element.fieldNames().forEachRemaining(operators::add);
@@ -1948,25 +2104,12 @@ public class LambdaService implements ResourceProvider {
             }
             return null;
         }
-        if (!(mc instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "ScalingConfig.MaximumConcurrency must be a numeric value", 400);
-        }
-        double d = ((Number) mc).doubleValue();
-        if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "ScalingConfig.MaximumConcurrency must be an integer", 400);
-        }
-        long longValue = ((Number) mc).longValue();
-        if (longValue < 2 || longValue > 1000) {
-            throw new AwsException("InvalidParameterValueException",
-                    "ScalingConfig.MaximumConcurrency must be between 2 and 1000 (got " + longValue + ")", 400);
-        }
+        int maximumConcurrency = boundedInteger(mc, "ScalingConfig.MaximumConcurrency", 2, 1000);
         if (!isSqs) {
             throw new AwsException("InvalidParameterValueException",
                     "ScalingConfig is only supported for Amazon SQS event source mappings", 400);
         }
-        return new ScalingConfig((int) longValue);
+        return new ScalingConfig(maximumConcurrency);
     }
 
     /**
@@ -1975,69 +2118,75 @@ public class LambdaService implements ResourceProvider {
      * is absent so a create leaves it unset and an update leaves the stored value untouched.
      */
     private Integer parseMaximumBatchingWindow(Map<String, Object> request) {
-        Object raw = request.get("MaximumBatchingWindowInSeconds");
-        if (raw == null) {
-            return null;
-        }
-        if (!(raw instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumBatchingWindowInSeconds must be a numeric value", 400);
-        }
-        double d = ((Number) raw).doubleValue();
-        if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumBatchingWindowInSeconds must be an integer", 400);
-        }
-        long value = ((Number) raw).longValue();
-        if (value < 0 || value > 300) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumBatchingWindowInSeconds must be between 0 and 300 (got " + value + ")", 400);
-        }
-        return (int) value;
+        return boundedInteger(request.get("MaximumBatchingWindowInSeconds"), "MaximumBatchingWindowInSeconds", 0, 300);
     }
 
     private Integer parseMaximumRetryAttempts(Map<String, Object> request) {
-        Object raw = request.get("MaximumRetryAttempts");
-        if (raw == null) {
-            return null;
-        }
-        if (!(raw instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRetryAttempts must be a numeric value", 400);
-        }
-        double d = ((Number) raw).doubleValue();
-        if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRetryAttempts must be an integer", 400);
-        }
-        long value = ((Number) raw).longValue();
-        if (value < -1 || value > 10000) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRetryAttempts must be between -1 and 10000 (got " + value + ")", 400);
-        }
-        return (int) value;
+        return boundedInteger(request.get("MaximumRetryAttempts"), "MaximumRetryAttempts", -1, 10000);
     }
 
+    /** -1 (infinite) or 60 to 604800: the one member whose range has a gap. */
     private Integer parseMaximumRecordAgeInSeconds(Map<String, Object> request) {
         Object raw = request.get("MaximumRecordAgeInSeconds");
+        String range = "-1 or between 60 and 604800";
+        Integer value = boundedInteger(raw, "MaximumRecordAgeInSeconds", -1, 604800, range);
+        if (value != null && value != -1 && value < 60) {
+            throw outOfRange("MaximumRecordAgeInSeconds", range, value);
+        }
+        return value;
+    }
+
+    /**
+     * Reads an integer member of an event source mapping request: {@code null} when absent, otherwise a
+     * whole number from {@code minimum} to {@code maximum}, or {@code InvalidParameterValueException}. The
+     * range is checked on the value as sent, before it is narrowed, so a value beyond {@code long} cannot
+     * wrap into range.
+     */
+    private static Integer boundedInteger(Object raw, String member, int minimum, int maximum) {
+        return boundedInteger(raw, member, minimum, maximum, "between " + minimum + " and " + maximum);
+    }
+
+    private static Integer boundedInteger(Object raw, String member, int minimum, int maximum, String range) {
         if (raw == null) {
             return null;
         }
-        if (!(raw instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRecordAgeInSeconds must be a numeric value", 400);
+        if (!(raw instanceof Number number)) {
+            throw new AwsException("InvalidParameterValueException", member + " must be a numeric value", 400);
         }
-        double d = ((Number) raw).doubleValue();
+        double d = number.doubleValue();
         if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRecordAgeInSeconds must be an integer", 400);
+            throw new AwsException("InvalidParameterValueException", member + " must be an integer", 400);
         }
-        long value = ((Number) raw).longValue();
-        if (value != -1 && (value < 60 || value > 604800)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRecordAgeInSeconds must be -1 or between 60 and 604800 (got " + value + ")", 400);
+        if (d < minimum || d > maximum) {
+            throw outOfRange(member, range, number);
         }
-        return (int) value;
+        return number.intValue();
+    }
+
+    private static AwsException outOfRange(String member, String range, Number value) {
+        // Printed as a whole number whatever its JSON spelling: 301.0 reads as 301.
+        String got = new BigDecimal(value.toString()).toBigInteger().toString();
+        return new AwsException("InvalidParameterValueException",
+                member + " must be " + range + " (got " + got + ")", 400);
+    }
+
+    /**
+     * Parses {@code ParallelizationFactor}: an integer in [1, 10], accepted only on Kinesis and
+     * DynamoDB Streams sources. Returns {@code null} when the field is absent.
+     */
+    private Integer parseParallelizationFactor(Map<String, Object> request, String eventSourceArn) {
+        Integer value = boundedInteger(request.get("ParallelizationFactor"), "ParallelizationFactor", 1, 10);
+        if (value != null && !isStreamSource(eventSourceArn)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "ParallelizationFactor is only supported for Amazon Kinesis and Amazon DynamoDB Streams event sources",
+                    400);
+        }
+        return value;
+    }
+
+    static boolean isStreamSource(String eventSourceArn) {
+        return eventSourceArn != null
+                && (eventSourceArn.contains(":kinesis:") || eventSourceArn.contains(":dynamodb:"));
     }
 
     private void startPollingHelper(EventSourceMapping esm) {
@@ -2155,6 +2304,11 @@ public class LambdaService implements ResourceProvider {
         if (request.containsKey("MaximumRecordAgeInSeconds")) {
             Integer maximumRecordAge = parseMaximumRecordAgeInSeconds(request);
             changes.add(m -> m.setMaximumRecordAgeInSeconds(maximumRecordAge));
+        }
+        if (request.get("ParallelizationFactor") != null) {
+            // A JSON null is an absent member and leaves the stored factor unchanged.
+            Integer parallelizationFactor = parseParallelizationFactor(request, esm.getEventSourceArn());
+            changes.add(m -> m.setParallelizationFactor(parallelizationFactor));
         }
 
         if (request.containsKey("DestinationConfig")) {
@@ -2456,6 +2610,7 @@ public class LambdaService implements ResourceProvider {
             // point is that its bind-mounted directory tracks the developer's working tree.
             snapshot.setCodeLocalPath(versionCodePath(region, fn, String.valueOf(version)));
             snapshot.setCodeSha256(fn.getCodeSha256());
+            snapshot.setCodeSigningConfigArn(fn.getCodeSigningConfigArn());
             snapshot.setS3Bucket(fn.getS3Bucket());
             snapshot.setS3Key(fn.getS3Key());
             snapshot.setHotReloadHostPath(fn.getHotReloadHostPath());
@@ -3749,15 +3904,15 @@ public class LambdaService implements ResourceProvider {
      * (such as {@code *}) is kept as given. ARNs are checked first because an IAM role, user or
      * session name may contain a dot.
      */
-    private static Object permissionPrincipal(String principal, String region) {
+    private Object permissionPrincipal(String principal, String region) {
         if (principal == null) {
             return null;
         }
-        if (principal.startsWith("arn:")) {
+        if (AwsArnUtils.looksLikeArn(principal)) {
             return Map.of("AWS", principal);
         }
         if (ACCOUNT_ID_PATTERN.matcher(principal).matches()) {
-            String partition = AwsRegions.partitionFor(region);
+            String partition = regionResolver.partitionForRegion(region);
             return Map.of("AWS", AwsArnUtils.Arn.global(partition, "iam", principal, "root").toString());
         }
         if (principal.contains(".")) {
@@ -3977,7 +4132,7 @@ public class LambdaService implements ResourceProvider {
      * than the mapping's is reported as missing, as AWS does.
      */
     private EventSourceMapping taggedEventSourceMapping(String resourceArn) {
-        if (resourceArn == null || !resourceArn.startsWith("arn:")) {
+        if (!AwsArnUtils.looksLikeArn(resourceArn)) {
             return null;
         }
         AwsArnUtils.Arn arn;
@@ -4007,7 +4162,7 @@ public class LambdaService implements ResourceProvider {
         if (functionArn == null || functionArn.isBlank()) {
             throw new AwsException("InvalidParameterValueException", "Resource ARN is required", 400);
         }
-        if (!functionArn.startsWith("arn:")) {
+        if (!AwsArnUtils.looksLikeArn(functionArn)) {
             throw new AwsException("InvalidParameterValueException",
                     "Resource ARN must be a full Lambda function ARN: " + functionArn, 400);
         }

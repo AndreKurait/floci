@@ -48,6 +48,7 @@ import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Authorizer;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Route;
 import io.github.hectorvent.floci.services.apigatewayv2.proxy.CloudMapInstanceResolver;
+import io.github.hectorvent.floci.services.apigatewayv2.proxy.HttpApiForwardedHeaders;
 import io.github.hectorvent.floci.services.apigatewayv2.websocket.ConnectionInfo;
 import io.github.hectorvent.floci.services.apigatewayv2.websocket.WebSocketConnectionManager;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
@@ -376,12 +377,13 @@ public class ApiGatewayExecuteController {
     public Response handleDelete(@Context HttpHeaders headers, @Context UriInfo uriInfo,
                                  @PathParam("apiId") String apiId,
                                  @PathParam("stageName") String stageName,
-                                 @PathParam("proxy") String proxy) {
+                                 @PathParam("proxy") String proxy,
+                                 byte[] body) {
         if (isWebSocketConnectionRequest(apiId, proxy)) {
             String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
             return handleConnectionRequest("DELETE", apiId, stageName, connectionId, headers, uriInfo, null);
         }
-        return dispatch("DELETE", apiId, stageName, proxy, headers, uriInfo, null);
+        return dispatch("DELETE", apiId, stageName, proxy, headers, uriInfo, body);
     }
 
     @PATCH
@@ -3045,7 +3047,7 @@ public class ApiGatewayExecuteController {
 
         if ("HTTP_PROXY".equalsIgnoreCase(integrationType)) {
             return dispatchHttpProxyV2(integration, route, httpMethod, path, headers, uriInfo, body,
-                    apiId, stageName, jwtClaims, region);
+                    apiId, stageName, jwtClaims, lambdaAuthorizerContext, region);
         }
 
         String functionName = functionNameFromUri(integration.getIntegrationUri());
@@ -3133,6 +3135,7 @@ public class ApiGatewayExecuteController {
                                           Route route, String httpMethod, String path,
                                           HttpHeaders headers, UriInfo uriInfo, byte[] body,
                                           String apiId, String stageName, Map<String, String> jwtClaims,
+                                          ObjectNode lambdaAuthorizerContext,
                                           String region) {
         // CDK HttpAlbIntegration sets integrationUri to an ALB listener ARN. Resolve it
         // to the listener's bound localhost port so HttpProxyInvoker (which assumes a
@@ -3210,15 +3213,20 @@ public class ApiGatewayExecuteController {
         // would otherwise have $context.authorizer.claims.* resolve from the unverified header
         // token instead of the one the authorizer actually checked.
         Map<String, Object> claims = jwtClaims != null ? Map.copyOf(jwtClaims) : Map.of();
+        Map<String, Object> authorizerContext = lambdaAuthorizerContext == null
+                ? Map.of() : objectMapper.convertValue(lambdaAuthorizerContext, MAP_TYPE);
 
-        String sourceIp = requestHeaders.getOrDefault("X-Forwarded-For", "127.0.0.1");
+        String sourceIp = routeContext.sourceIp();
+        // $request.header.* mappings keep the caller's values; only what reaches the backend changes.
+        Map<String, List<String>> backendHeaders = HttpApiForwardedHeaders.apply(multiValueHeaders, sourceIp,
+                routeContext.localIp(), headers.getHeaderString("Host"), isSecureTransport(uriInfo) ? "https" : "http");
         io.github.hectorvent.floci.services.apigatewayv2.proxy.RequestContext ctx =
                 new io.github.hectorvent.floci.services.apigatewayv2.proxy.RequestContext(
                         apiId, stageName, httpMethod, path,
                         pathParams.getOrDefault("proxy", ""), route.getRouteKey(),
                         UUID.randomUUID().toString(), sourceIp,
                         requestHeaders, queryParams, pathParams, body,
-                        claims, Map.of(), multiValueHeaders, multiValueQueryParams);
+                        claims, authorizerContext, backendHeaders, multiValueQueryParams);
 
         LOG.debugv("execute-api v2: {0} {1}/{2}{3} → HTTP_PROXY {4}",
                 httpMethod, apiId, stageName, path, effective.getIntegrationUri());

@@ -37,7 +37,8 @@ public class AthenaJsonHandler {
         return switch (action) {
             case "StartQueryExecution" -> {
                 String query = request.get("QueryString").asText();
-                String workGroup = request.has("WorkGroup") ? request.get("WorkGroup").asText() : "primary";
+                String named = text(request, "WorkGroup");
+                String workGroup = named != null ? named : "primary";
 
                 QueryExecutionContext context = null;
                 if (request.has("QueryExecutionContext")) {
@@ -63,16 +64,28 @@ public class AthenaJsonHandler {
                 yield Response.ok(Map.of("ResultSet", results)).build();
             }
             case "ListQueryExecutions" -> {
-                yield Response.ok(Map.of("QueryExecutionIds",
-                        athenaService.listQueryExecutions().stream()
-                                .map(QueryExecution::getQueryExecutionId).toList())).build();
+                Integer maxResults = Pagination.parseMaxResults(request, "MaxResults", "InvalidRequestException");
+                String nextToken = Pagination.parseNextToken(request, "NextToken", "InvalidRequestException");
+                JsonNode workGroup = request.get("WorkGroup");
+                if (workGroup != null && !workGroup.isNull() && !workGroup.isTextual()) {
+                    throw new AwsException("InvalidRequestException", "WorkGroup must be a string.", 400);
+                }
+                PaginatedResult<QueryExecution> page = athenaService.listQueryExecutionsPage(
+                        region, text(request, "WorkGroup"), maxResults, nextToken);
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("QueryExecutionIds", page.items().stream().map(QueryExecution::getQueryExecutionId).toList());
+                if (page.nextToken() != null) {
+                    response.put("NextToken", page.nextToken());
+                }
+                yield Response.ok(response).build();
             }
             case "StopQueryExecution" -> {
                 athenaService.stopQueryExecution(request.get("QueryExecutionId").asText());
                 yield Response.ok(Map.of()).build();
             }
             case "GetWorkGroup" -> {
-                String name = request.has("WorkGroup") ? request.get("WorkGroup").asText() : "primary";
+                String named = text(request, "WorkGroup");
+                String name = named != null ? named : "primary";
                 yield Response.ok(Map.of("WorkGroup", athenaService.getWorkGroup(name, region))).build();
             }
             case "ListWorkGroups" -> {
@@ -111,10 +124,8 @@ public class AthenaJsonHandler {
                 }
                 yield Response.ok(response).build();
             }
-            case "GetDataCatalog" -> {
-                String name = request.has("Name") ? request.get("Name").asText() : AthenaService.DEFAULT_CATALOG;
-                yield Response.ok(Map.of("DataCatalog", athenaService.getDataCatalog(region, name))).build();
-            }
+            case "GetDataCatalog" -> Response.ok(
+                    Map.of("DataCatalog", athenaService.getDataCatalog(region, text(request, "Name")))).build();
             case "CreateDataCatalog" -> {
                 Map<String, Object> catalog = athenaService.createDataCatalog(region,
                         text(request, "Name"),
@@ -143,16 +154,16 @@ public class AthenaJsonHandler {
                 yield Response.ok(Map.of()).build();
             }
             case "ListDatabases" -> {
-                String catalog = request.has("CatalogName") ? request.get("CatalogName").asText() : AthenaService.DEFAULT_CATALOG;
+                String catalog = catalogName(request);
                 yield Response.ok(Map.of("DatabaseList", athenaService.listDatabases(catalog))).build();
             }
             case "ListTableMetadata" -> {
-                String catalog = request.has("CatalogName") ? request.get("CatalogName").asText() : AthenaService.DEFAULT_CATALOG;
+                String catalog = catalogName(request);
                 String database = request.path("DatabaseName").asText(request.path("Database").asText(""));
                 yield Response.ok(Map.of("TableMetadataList", athenaService.listTableMetadata(catalog, database))).build();
             }
             case "GetTableMetadata" -> {
-                String catalog = request.has("CatalogName") ? request.get("CatalogName").asText() : AthenaService.DEFAULT_CATALOG;
+                String catalog = catalogName(request);
                 String database = request.path("DatabaseName").asText(request.path("Database").asText(""));
                 String tableName = request.get("TableName").asText();
                 yield Response.ok(Map.of("TableMetadata", athenaService.getTableMetadata(catalog, database, tableName))).build();
@@ -179,6 +190,11 @@ public class AthenaJsonHandler {
     private static String text(JsonNode request, String field) {
         JsonNode node = request.get(field);
         return node == null || node.isNull() ? null : node.asText();
+    }
+
+    private static String catalogName(JsonNode request) {
+        String named = text(request, "CatalogName");
+        return named != null ? named : AthenaService.DEFAULT_CATALOG;
     }
 
     private static Map<String, String> parameters(JsonNode request) {

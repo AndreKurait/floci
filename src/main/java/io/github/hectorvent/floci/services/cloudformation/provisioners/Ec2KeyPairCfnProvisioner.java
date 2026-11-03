@@ -1,14 +1,19 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.NullNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
 
 import java.util.HashMap;
 import java.util.List;
@@ -16,151 +21,357 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 
-/** Real EC2 keys, including the SSM private-key record owned by generated CFN keys. */
+/**
+ * Provisions {@code AWS::EC2::KeyPair}. The key name is the physical id and {@code Ref};
+ * {@code Fn::GetAtt} exposes {@code KeyPairId} and {@code KeyFingerprint}.
+ *
+ * <p>Without {@code PublicKeyMaterial} the key is made by CreateKeyPair, of the {@code KeyType} and
+ * in the {@code KeyFormat} the template asks for, and its private key is stored, as on AWS, in the
+ * {@code SecureString} parameter {@code /ec2/keypair/<KeyPairId>}. With it the key is imported, its
+ * type read from the material, so {@code KeyType} is ignored as AWS documents and {@code KeyFormat}
+ * has no private key to format, and nothing is written to Parameter Store. Failed writes clean up
+ * any parameter they may have saved before deleting the key, retaining its id if cleanup needs a retry.
+ *
+ * <p>Every property is create-only and {@code KeyName} is required, so the resource is always
+ * custom-named. An update that changes another property under the same name is refused, as
+ * CloudFormation refuses it; one that changes the name creates the new key and leaves the displaced
+ * one to the {@link ReplacementCleanup} record.
+ */
 @ApplicationScoped
 public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final String PRIOR_NAME = "__FlociKeyPairPriorName";
-    private static final String PRIOR_INPUTS = "__FlociKeyPairPriorInputs";
-    private static final String PRIOR_GENERATED = "__FlociKeyPairPriorGenerated";
-    private static final String GENERATED = "__FlociKeyPairGenerated";
-    private static final String INPUTS = "__FlociKeyPairInputs";
+
+    private static final Logger LOG = Logger.getLogger(Ec2KeyPairCfnProvisioner.class);
+    private static final String TYPE = "AWS::EC2::KeyPair";
+    /** The registry schema's enums; EC2 itself takes the same values. */
+    private static final List<String> KEY_TYPES = List.of("rsa", "ed25519");
+    private static final List<String> KEY_FORMATS = List.of("pem", "ppk");
+    private static final CreateOnlyInputs CREATE_ONLY_INPUTS =
+            new CreateOnlyInputs("__FlociKeyPairInputs", "__FlociKeyPairPriorInputs");
+    /**
+     * The keys CreateKeyPair made that the resource no longer names but still owes a delete, by
+     * name to id: those a rename displaced and a replacement a rollback undoes. The cleanup deletes
+     * them by name alone, so this keeps the id whose parameter goes too when the key is already gone.
+     * An entry leaves once its delete succeeds.
+     */
+    private static final String CREATED_KEYS_ATTR = "__FlociKeyPairCreatedKeys";
     private static final String OWNED_KEY_PREFIX = "__FlociKeyPairOwnedKey/";
     private static final String OWNED_PARAMETER_PREFIX = "__FlociKeyPairOwnedParameter/";
-    private final Ec2Service ec2;
-    private final SsmService ssm;
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private final Ec2Service ec2Service;
+    private final SsmService ssmService;
 
     @Inject
-    public Ec2KeyPairCfnProvisioner(Ec2Service ec2, SsmService ssm) {
-        this.ec2 = ec2;
-        this.ssm = ssm;
+    public Ec2KeyPairCfnProvisioner(Ec2Service ec2Service, SsmService ssmService) {
+        this.ec2Service = ec2Service;
+        this.ssmService = ssmService;
     }
 
     @Override
     public Set<String> resourceTypes() {
-        return Set.of("AWS::EC2::KeyPair");
+        return Set.of(TYPE);
     }
 
     @Override
-    public void provision(StackResource resource, JsonNode props, ProvisionContext ctx) {
-        String name = ctx.resolveOptional(props, "KeyName");
-        String material = ctx.resolveOptional(props, "PublicKeyMaterial");
-        String type = ctx.resolveOptional(props, "KeyType");
-        String format = ctx.resolveOptional(props, "KeyFormat");
+    public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
+        if (ctx.isUpdate()) {
+            // Rolling this update back undoes it alone; only ContinueUpdateRollback retries the
+            // delete the last rollback could not make.
+            ReplacementCleanup.endRollbackRetry(r);
+        }
+        String name = resolveProperty(props, "KeyName", ctx);
         if (name == null || name.isBlank()) {
-            throw new AwsException("ValidationError", "AWS::EC2::KeyPair requires KeyName.", 400);
+            throw new AwsException("ValidationError", TYPE + " requires KeyName.", 400);
         }
-        if (material == null && ((type != null && !"rsa".equals(type))
-                || (format != null && !"pem".equals(format)))) {
-            throw new AwsException("ValidationError", "Floci currently generates only RSA PEM key pairs.", 400);
+        String keyType = resolveProperty(props, "KeyType", ctx);
+        String keyFormat = resolveProperty(props, "KeyFormat", ctx);
+        String publicKeyMaterial = resolveProperty(props, "PublicKeyMaterial", ctx);
+        requireAllowed("KeyType", keyType, KEY_TYPES);
+        requireAllowed("KeyFormat", keyFormat, KEY_FORMATS);
+        List<Tag> tags = Ec2Tags.validatedTags(ctx.resolveTags(props, "Tags"));
+        ObjectNode inputs = inputs(name, keyType, keyFormat, publicKeyMaterial, tags);
+
+        Map<String, String> attributesBefore = new HashMap<>(r.getAttributes());
+        // A dispatcher stub created nothing, so a key that takes over its id is a create.
+        if (ctx.isUpdate() && !CfnResourceDispatcher.isStub(ctx.priorPhysicalId(), attributesBefore)) {
+            if (madeFrom(readInputs(CREATE_ONLY_INPUTS.read(attributesBefore), r), inputs)) {
+                // No property changed, and a key has nothing that changes in place.
+                ReplacementCleanup.record(r, ctx, attributesBefore);
+                return;
+            }
+            if (name.equals(ctx.priorPhysicalId())) {
+                throw CfnExceptions.customNamedReplacement(name);
+            }
         }
-        if (material != null && material.isBlank()) {
-            throw new AwsException("ValidationError", "PublicKeyMaterial must not be empty.", 400);
+
+        if (publicKeyMaterial != null && publicKeyMaterial.isEmpty()) {
+            // What ImportKeyPair answers for an empty PublicKeyMaterial.
+            throw new AwsException("MissingParameter", "The request must contain the parameter PublicKeyMaterial", 400);
         }
-        Map<String, String> tags = ctx.resolveTags(props, "Tags");
-        Ec2Tags.validatedTags(tags);
-        String inputs = MAPPER.valueToTree(List.of(name, material == null ? "" : material,
-                material == null && type != null ? type : "rsa",
-                material == null && format != null ? format : "pem",
-                new TreeMap<>(tags))).toString();
-        Map<String, String> before = new HashMap<>(resource.getAttributes());
-        KeyPair key = ctx.isUpdate() && name.equals(ctx.priorPhysicalId())
-                && inputs.equals(before.get(INPUTS)) ? find(name, ctx.region()) : null;
-        if (key != null && !key.getKeyPairId().equals(before.get("KeyPairId"))) {
-            throw new AwsException("ValidationError", "The managed EC2 key pair was replaced outside this stack.", 400);
+        KeyPair key = publicKeyMaterial == null
+                ? ec2Service.createKeyPair(ctx.region(), name, keyType, keyFormat)
+                : ec2Service.importKeyPair(ctx.region(), name, publicKeyMaterial);
+        r.setPhysicalId(key.getKeyName());
+        r.getAttributes().put("KeyPairId", key.getKeyPairId());
+        r.getAttributes().put("KeyFingerprint", key.getKeyFingerprint());
+        CREATE_ONLY_INPUTS.record(r, ctx, attributesBefore, inputs.toString());
+        if (ctx.isUpdate()) {
+            String priorCreatedId = createdKeyId(attributesBefore, r);
+            if (priorCreatedId != null) {
+                Map<String, String> owed = createdKeys(r);
+                owed.put(ctx.priorPhysicalId(), priorCreatedId);
+                putCreatedKeys(r, owed);
+            }
         }
-        boolean created = key == null;
-        if (created) {
-            key = material == null ? ec2.createKeyPair(ctx.region(), name)
-                    : ec2.importKeyPair(ctx.region(), name, material);
+        try {
+            CfnRollback.guarded(r, ctx, true,
+                    () -> deleteTrackedKey(r, key, ctx.region()),
+                    () -> { },
+                    () -> {
+                        if (!tags.isEmpty()) {
+                            ec2Service.createTags(ctx.region(), List.of(key.getKeyPairId()), tags);
+                        }
+                        if (publicKeyMaterial == null) {
+                            try {
+                                ssmService.putParameter(parameterName(key.getKeyPairId()), key.getKeyMaterial(),
+                                        "SecureString", null, false, ctx.region());
+                            } catch (AwsException failure) {
+                                if ("ParameterAlreadyExists".equals(failure.getErrorCode())) {
+                                    r.getAttributes().put(OWNED_KEY_PREFIX + name, key.getKeyPairId());
+                                    r.getAttributes().put(OWNED_PARAMETER_PREFIX + name, "false");
+                                }
+                                throw failure;
+                            }
+                        }
+                    });
+        } catch (RuntimeException failure) {
+            if (publicKeyMaterial == null
+                    && "true".equals(r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR))) {
+                Map<String, String> owed = createdKeys(r);
+                owed.put(key.getKeyName(), key.getKeyPairId());
+                putCreatedKeys(r, owed);
+            }
+            throw failure;
         }
-        resource.setPhysicalId(key.getKeyName());
-        resource.getAttributes().put("KeyPairId", key.getKeyPairId());
-        resource.getAttributes().put("KeyFingerprint", key.getKeyFingerprint());
-        resource.getAttributes().put(INPUTS, inputs);
-        resource.getAttributes().put(GENERATED, Boolean.toString(!created && material == null));
-        if (created) {
-            KeyPair createdKey = key;
-            resource.getAttributes().put(OWNED_KEY_PREFIX + name, key.getKeyPairId());
-            resource.getAttributes().put(OWNED_PARAMETER_PREFIX + name, "false");
-            CfnRollback.guarded(resource, ctx, true, () -> delete(resource, ctx.region()), () -> {}, () -> {
-                if (material == null) {
-                    ssm.putParameter(parameter(createdKey), createdKey.getKeyMaterial(), "SecureString",
-                            "CloudFormation EC2 key pair", false, ctx.region());
-                    resource.getAttributes().put(GENERATED, "true");
-                    resource.getAttributes().put(OWNED_PARAMETER_PREFIX + name, "true");
-                }
-                Ec2Tags.reconcile(ec2, ctx.region(), createdKey.getKeyPairId(), tags);
-            });
-        }
-        resource.getAttributes().put(GENERATED, Boolean.toString(material == null));
-        if (ctx.isUpdate() && !ctx.priorPhysicalId().equals(resource.getPhysicalId())) {
-            resource.getAttributes().put(PRIOR_NAME, ctx.priorPhysicalId());
-            restore(resource, PRIOR_INPUTS, before.get(INPUTS));
-            restore(resource, PRIOR_GENERATED, before.get(GENERATED));
-        }
-        ReplacementCleanup.record(resource, ctx, before);
+        ReplacementCleanup.record(r, ctx, attributesBefore);
     }
 
-    private KeyPair find(String name, String region) {
+    /**
+     * The resolved property, or null when it is absent or {@code AWS::NoValue}, directly or as the
+     * {@code Fn::If} branch its condition chooses. Every other value is kept as resolved, an empty
+     * string included, so a value a parameter supplies acts as the same value written literally.
+     */
+    private static String resolveProperty(JsonNode props, String name, ProvisionContext ctx) {
+        if (props == null || !props.has(name) || props.get(name).isNull()) {
+            return null;
+        }
+        JsonNode value = ctx.engine().omitNoValue(props.get(name));
+        return value.isMissingNode() ? null : ctx.engine().resolve(value);
+    }
+
+    private static void requireAllowed(String property, String value, List<String> allowed) {
+        if (value != null && !allowed.contains(value)) {
+            throw new AwsException("ValidationError",
+                    TYPE + " " + property + " must be " + String.join(" or ", allowed) + ", got '" + value + "'", 400);
+        }
+    }
+
+    /**
+     * The create-only properties as resolved, null when absent; tags as a sorted map, because their
+     * order is no change, and null when there are none.
+     */
+    private static ObjectNode inputs(String name, String keyType, String keyFormat, String publicKeyMaterial,
+                                     List<Tag> tags) {
+        ObjectNode inputs = MAPPER.createObjectNode();
+        inputs.put("KeyName", name);
+        inputs.put("KeyType", keyType);
+        inputs.put("KeyFormat", keyFormat);
+        inputs.put("PublicKeyMaterial", publicKeyMaterial);
+        if (tags.isEmpty()) {
+            inputs.putNull("Tags");
+        } else {
+            Map<String, String> sortedTags = new TreeMap<>();
+            tags.forEach(tag -> sortedTags.put(tag.getKey(), tag.getValue()));
+            inputs.set("Tags", MAPPER.valueToTree(sortedTags));
+        }
+        return inputs;
+    }
+
+    /** The inputs a key was recorded with, or null when the resource carries none it can read. */
+    private static JsonNode readInputs(String recorded, StackResource r) {
+        if (recorded == null || recorded.isEmpty()) {
+            return null;
+        }
         try {
-            return ec2.describeKeyPairs(region, List.of(name), List.of()).getFirst();
-        } catch (AwsException expected) {
-            if (!"InvalidKeyPair.NotFound".equals(expected.getErrorCode())) {
-                throw expected;
+            JsonNode parsed = MAPPER.readTree(recorded);
+            if (parsed.isArray() && parsed.size() == 5) {
+                ObjectNode converted = MAPPER.createObjectNode();
+                converted.set("KeyName", parsed.get(0));
+                converted.put("PublicKeyMaterial", parsed.get(1).asText().isEmpty() ? null : parsed.get(1).asText());
+                converted.put("KeyType", "rsa".equals(parsed.get(2).asText()) ? null : parsed.get(2).asText());
+                converted.put("KeyFormat", "pem".equals(parsed.get(3).asText()) ? null : parsed.get(3).asText());
+                converted.set("Tags", parsed.get(4).isEmpty() ? NullNode.getInstance() : parsed.get(4));
+                return converted;
+            }
+            return parsed;
+        } catch (JsonProcessingException e) {
+            LOG.warnv("Unreadable key pair inputs on {0}, treating them as unknown: {1}",
+                    r.getLogicalId(), e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Whether a key recorded with {@code recorded} was made from {@code inputs}, compared property by
+     * property; a property the record lacks counts as absent, so a record written before a property
+     * was tracked still matches a template that leaves it out.
+     */
+    private static boolean madeFrom(JsonNode recorded, ObjectNode inputs) {
+        if (recorded == null) {
+            return false;
+        }
+        for (Map.Entry<String, JsonNode> input : inputs.properties()) {
+            JsonNode was = recorded.path(input.getKey());
+            if (!(was.isMissingNode() ? NullNode.getInstance() : was).equals(input.getValue())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String parameterName(String keyPairId) {
+        return "/ec2/keypair/" + keyPairId;
+    }
+
+    private void deletePrivateKeyParameter(String keyPairId, String region) {
+        String parameter = parameterName(keyPairId);
+        CfnDeletes.safeDelete("EC2 key pair private key parameter", parameter,
+                () -> ssmService.deleteParameter(parameter, region), "ParameterNotFound");
+    }
+
+    /**
+     * Deletes the key the resource's name holds, as a Cloud Control DeleteResource names it by that
+     * identifier alone, with its parameter first when CreateKeyPair made it. The name is all this
+     * goes by, so once this resource's key was deleted outside the stack, a key made under the same
+     * name since then is the one deleted. When the name no longer holds the key this resource
+     * recorded, the recorded key's parameter is deleted as well, so no private key outlives its key.
+     */
+    @Override
+    public void delete(StackResource resource, String region) {
+        // A stub left from before this type had a provisioner names no key.
+        if (CfnResourceDispatcher.isStub(resource.getPhysicalId(), resource.getAttributes())) {
+            return;
+        }
+        String name = resource.getPhysicalId();
+        if (deleteRecordedKey(resource, name, region)) {
+            return;
+        }
+        deleteNamed(name, createdKeyId(resource.getAttributes(), resource), region);
+    }
+
+    /**
+     * Deletes the key the name holds, which is all a displaced or rolled-back key is recorded by, and
+     * first the parameter holding its private key when CreateKeyPair made it: an imported key has
+     * none. A key or parameter that is already gone counts as deleted; any other failure keeps the
+     * key, so a retry still finds it.
+     */
+    @Override
+    public void delete(String resourceType, String physicalId, String region) {
+        deleteNamed(physicalId, null, region);
+    }
+
+    /**
+     * Deletes the key {@code name} holds, and, when {@code createdKeyId} names a key CreateKeyPair made
+     * for this resource that the name no longer holds, that key's parameter too.
+     */
+    private void deleteNamed(String name, String createdKeyId, String region) {
+        KeyPair current = findKeyPair(name, region);
+        if (current != null) {
+            deleteKeyPair(current, region);
+        }
+        if (createdKeyId != null && (current == null || !createdKeyId.equals(current.getKeyPairId()))) {
+            deletePrivateKeyParameter(createdKeyId, region);
+        }
+    }
+
+    /** The recorded KeyPairId when the recorded inputs show CreateKeyPair made the key, else null. */
+    private static String createdKeyId(Map<String, String> attributes, StackResource r) {
+        String recordedId = attributes.get("KeyPairId");
+        JsonNode inputs = readInputs(CREATE_ONLY_INPUTS.read(attributes), r);
+        return recordedId != null && inputs != null && !inputs.path("PublicKeyMaterial").isTextual()
+                ? recordedId : null;
+    }
+
+    private static Map<String, String> createdKeys(StackResource r) {
+        Map<String, String> owed = new TreeMap<>();
+        JsonNode recorded = readInputs(r.getAttributes().get(CREATED_KEYS_ATTR), r);
+        if (recorded != null) {
+            recorded.properties().forEach(e -> owed.put(e.getKey(), e.getValue().asText()));
+        }
+        return owed;
+    }
+
+    private static void putCreatedKeys(StackResource r, Map<String, String> owed) {
+        if (owed.isEmpty()) {
+            r.getAttributes().remove(CREATED_KEYS_ATTR);
+        } else {
+            r.getAttributes().put(CREATED_KEYS_ATTR, MAPPER.valueToTree(owed).toString());
+        }
+    }
+
+    /**
+     * Deletes a key the cleanup names, with the parameter of the created key recorded under that
+     * name, and drops the record once the delete succeeds.
+     */
+    private ReplacementCleanup.Deleter owedDeleter(StackResource r) {
+        return (type, name, region) -> {
+            Map<String, String> owed = createdKeys(r);
+            if (!deleteRecordedKey(r, name, region)) {
+                deleteNamed(name, owed.get(name), region);
+            }
+            if (owed.remove(name) != null) {
+                putCreatedKeys(r, owed);
+            }
+        };
+    }
+
+    /** The key pair {@code name} holds, or null when there is none. */
+    private KeyPair findKeyPair(String name, String region) {
+        try {
+            return ec2Service.describeKeyPairs(region, List.of(name), List.of()).getFirst();
+        } catch (AwsException e) {
+            if (!"InvalidKeyPair.NotFound".equals(e.getErrorCode())) {
+                throw e;
             }
             return null;
         }
     }
 
-    private static String parameter(KeyPair key) {
-        return "/ec2/keypair/" + key.getKeyPairId();
+    private void deleteTrackedKey(StackResource resource, KeyPair key, String region) {
+        if (!deleteRecordedKey(resource, key.getKeyName(), region)) {
+            deleteKeyPair(key, region);
+        }
     }
 
-    @Override
-    public void delete(StackResource resource, String region) {
-        if (resource.getAttributes().containsKey(OWNED_KEY_PREFIX + resource.getPhysicalId())) {
-            deleteTrackedKey(resource, resource.getPhysicalId(), region);
-            return;
-        }
-        String id = resource.getAttributes().get("KeyPairId");
-        if (id == null) {
-            delete(resource.getResourceType(), resource.getPhysicalId(), region);
-            return;
-        }
-        if (Boolean.parseBoolean(resource.getAttributes().get(GENERATED))) {
-            CfnDeletes.safeDelete("EC2 key pair parameter", id,
-                    () -> ssm.deleteParameter("/ec2/keypair/" + id, region), "ParameterNotFound");
-        }
-        ec2.deleteKeyPair(region, null, id);
-    }
-
-    private void deleteTrackedKey(StackResource resource, String name, String region) {
+    private boolean deleteRecordedKey(StackResource resource, String name, String region) {
         String id = resource.getAttributes().get(OWNED_KEY_PREFIX + name);
         if (id == null) {
-            delete(resource.getResourceType(), name, region);
-            return;
+            return false;
         }
         if (Boolean.parseBoolean(resource.getAttributes().get(OWNED_PARAMETER_PREFIX + name))) {
-            CfnDeletes.safeDelete("EC2 key pair parameter", id,
-                    () -> ssm.deleteParameter("/ec2/keypair/" + id, region), "ParameterNotFound");
+            deletePrivateKeyParameter(id, region);
         }
-        ec2.deleteKeyPair(region, null, id);
+        ec2Service.deleteKeyPair(region, null, id);
         resource.getAttributes().remove(OWNED_KEY_PREFIX + name);
         resource.getAttributes().remove(OWNED_PARAMETER_PREFIX + name);
+        return true;
     }
 
-    @Override
-    public void delete(String resourceType, String physicalId, String region) {
-        KeyPair key = find(physicalId, region);
-        if (key == null) {
-            return;
-        }
+    private void deleteKeyPair(KeyPair key, String region) {
         if (key.getKeyMaterial() != null) {
-            CfnDeletes.safeDelete("EC2 key pair parameter", parameter(key),
-                    () -> ssm.deleteParameter(parameter(key), region), "ParameterNotFound");
+            deletePrivateKeyParameter(key.getKeyPairId(), region);
         }
-        ec2.deleteKeyPair(region, null, key.getKeyPairId());
+        ec2Service.deleteKeyPair(region, null, key.getKeyPairId());
     }
 
     @Override
@@ -175,31 +386,15 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
-        return ReplacementCleanup.complete(resource,
-                (type, name, region) -> deleteTrackedKey(resource, name, region));
+        CREATE_ONLY_INPUTS.clearPrior(resource);
+        return ReplacementCleanup.complete(resource, owedDeleter(resource));
     }
 
     @Override
     public void clearUpdate(StackResource resource) {
+        CREATE_ONLY_INPUTS.clearPrior(resource);
+        resource.getAttributes().remove(CREATED_KEYS_ATTR);
         ReplacementCleanup.clear(resource);
-        clearPrior(resource);
-    }
-
-    @Override
-    public boolean rollbackUpdate(StackResource resource) {
-        String prior = resource.getAttributes().get(PRIOR_NAME);
-        String inputs = resource.getAttributes().get(PRIOR_INPUTS);
-        String generated = resource.getAttributes().get(PRIOR_GENERATED);
-        try {
-            return ReplacementCleanup.rollback(resource,
-                    (type, name, region) -> deleteTrackedKey(resource, name, region));
-        } finally {
-            if (prior != null && prior.equals(resource.getPhysicalId())) {
-                restore(resource, INPUTS, inputs);
-                restore(resource, GENERATED, generated);
-                clearPrior(resource);
-            }
-        }
     }
 
     @Override
@@ -209,19 +404,42 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
                 previous.getAttributes().put(key, value);
             }
         });
+        Map<String, String> owed = createdKeys(previous);
+        createdKeys(attempted).forEach((name, id) -> {
+            if (!name.equals(previous.getPhysicalId())) {
+                owed.putIfAbsent(name, id);
+            }
+        });
+        putCreatedKeys(previous, owed);
     }
 
-    private static void restore(StackResource resource, String key, String value) {
-        if (value == null) {
-            resource.getAttributes().remove(key);
-        } else {
-            resource.getAttributes().put(key, value);
+    /**
+     * A rename is undone through the cleanup record, which names the displaced key again and deletes
+     * the replacement; the displaced key's inputs are put back here, even when that delete fails, as
+     * the resource names the displaced key from then on. Any other update changed nothing, so there
+     * is nothing to undo.
+     */
+    @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        String replacement = resource.getPhysicalId();
+        boolean hasPriorInputs = CREATE_ONLY_INPUTS.hasPrior(resource);
+        String replacementCreatedId = createdKeyId(resource.getAttributes(), resource);
+        if (hasPriorInputs && replacementCreatedId != null) {
+            Map<String, String> owed = createdKeys(resource);
+            owed.put(replacement, replacementCreatedId);
+            putCreatedKeys(resource, owed);
         }
-    }
-
-    private static void clearPrior(StackResource resource) {
-        resource.getAttributes().remove(PRIOR_NAME);
-        resource.getAttributes().remove(PRIOR_INPUTS);
-        resource.getAttributes().remove(PRIOR_GENERATED);
+        try {
+            ReplacementCleanup.rollback(resource, owedDeleter(resource));
+        } finally {
+            if (hasPriorInputs && !replacement.equals(resource.getPhysicalId())) {
+                CREATE_ONLY_INPUTS.restorePrior(resource);
+                Map<String, String> owed = createdKeys(resource);
+                if (owed.remove(resource.getPhysicalId()) != null) {
+                    putCreatedKeys(resource, owed);
+                }
+            }
+        }
+        return true;
     }
 }

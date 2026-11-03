@@ -220,6 +220,40 @@ class AppConfigResourceFieldsIntegrationTest {
                 .body("Type", equalTo("AWS.Freeform"));
     }
 
+    @Test
+    void nonHostedProfileWithoutTypeRemainsUntyped() {
+        String applicationId = createApplication("external-profile-app");
+        String profileId = given()
+                .contentType(ContentType.JSON)
+                .body("{\"Name\":\"external\",\"LocationUri\":\"ssm-parameter://configuration\"}")
+                .when().post("/applications/" + applicationId + "/configurationprofiles")
+                .then().statusCode(201)
+                .body("Type", nullValue())
+                .extract().path("Id");
+
+        given()
+                .when().get("/applications/" + applicationId + "/configurationprofiles/" + profileId)
+                .then().statusCode(200)
+                .body("Type", nullValue());
+    }
+
+    @Test
+    void explicitNullTypeUsesOnlyTheHostedDefault() {
+        String applicationId = createApplication("null-type-app");
+        for (String location : List.of("hosted", "ssm-parameter://configuration")) {
+            String profileId = given()
+                    .contentType(ContentType.JSON)
+                    .body("{\"Name\":\"null-type\",\"LocationUri\":\"" + location + "\",\"Type\":null}")
+                    .when().post("/applications/" + applicationId + "/configurationprofiles")
+                    .then().statusCode(201)
+                    .body("Type", "hosted".equals(location) ? equalTo("AWS.Freeform") : nullValue())
+                    .extract().path("Id");
+            given().get("/applications/" + applicationId + "/configurationprofiles/" + profileId)
+                    .then().statusCode(200)
+                    .body("Type", "hosted".equals(location) ? equalTo("AWS.Freeform") : nullValue());
+        }
+    }
+
     private static String createApplication(String name) {
         return given()
                 .contentType(ContentType.JSON)

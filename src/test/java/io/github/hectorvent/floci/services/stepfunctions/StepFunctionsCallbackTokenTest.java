@@ -10,6 +10,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -52,6 +54,21 @@ class StepFunctionsCallbackTokenTest {
         service.clear();
         refuses("InvalidToken", () -> service.callbackResourceArn("resource", OWNER));
         refuses("InvalidToken", () -> service.callbackResourceArn(null, OWNER));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"activity", "statemachine"})
+    void storedLookupSelectsTheTokenResourceAndEnforcesItsOwner(String type) {
+        when(resolver.getAccountId()).thenReturn(OWNER);
+        service.registerPendingToken("stored", OWNER, RESOURCE);
+        assertEquals("states", service.namespace());
+        assertEquals(Optional.empty(), service.find(type, List.of("new-resource"), "us-east-1"));
+        refuses("InvalidToken", () -> service.findByMembers(type, List.of(), "us-east-1"));
+        assertEquals(Optional.of(RESOURCE), service.findByMembers(type, List.of("stored"), "us-east-1"));
+        assertEquals(Optional.empty(), service.findByMembers("execution", List.of("stored"), "us-east-1"));
+        refuses("InvalidToken", () -> service.findByMembers(type, List.of("unknown"), "us-east-1"));
+        when(resolver.getAccountId()).thenReturn("222222222222");
+        refuses("AccessDeniedException", () -> service.findByMembers(type, List.of("stored"), "us-east-1"));
     }
 
     @Test
