@@ -36,6 +36,7 @@ public class CloudTrailJsonHandler {
         return switch (action) {
             case "CreateTrail" -> createTrail(request, region);
             case "DescribeTrails" -> describeTrails(request, region);
+            case "GetTrail" -> getTrail(request, region);
             case "DeleteTrail" -> deleteTrail(request, region);
             case "UpdateTrail" -> updateTrail(request, region);
             case "PutEventSelectors" -> putEventSelectors(request, region);
@@ -151,6 +152,13 @@ public class CloudTrailJsonHandler {
         List<Trail> trails = service.describeTrails(region, nameList);
         ObjectNode resp = mapper.createObjectNode();
         resp.set("trailList", mapper.valueToTree(trails));
+        return Response.ok(resp).build();
+    }
+
+    private Response getTrail(JsonNode req, String region) {
+        Trail trail = service.getTrailDetails(region, req.path("Name").asText(null));
+        ObjectNode resp = mapper.createObjectNode();
+        resp.set("Trail", mapper.valueToTree(trail));
         return Response.ok(resp).build();
     }
 
