@@ -3051,6 +3051,7 @@ public class S3Service implements Resettable, ResourceProvider {
         snapshot.put("lifecycleConfiguration", bucket.getLifecycleConfiguration());
         snapshot.put("transitionDefaultMinimumObjectSize", bucket.getTransitionDefaultMinimumObjectSize());
         snapshot.put("ownershipControlsConfiguration", bucket.getOwnershipControlsConfiguration());
+        snapshot.put("loggingConfiguration", bucket.getLoggingConfiguration());
         snapshot.set("tags", objectMapper.valueToTree(bucket.getTags()));
         snapshot.set("notificationConfiguration", objectMapper.valueToTree(bucket.getNotificationConfiguration()));
         return snapshot.toString();
@@ -3081,6 +3082,7 @@ public class S3Service implements Resettable, ResourceProvider {
         String lifecycle = snapshotText(snapshot, "lifecycleConfiguration");
         String transitionSize = snapshotText(snapshot, "transitionDefaultMinimumObjectSize");
         String ownership = snapshotText(snapshot, "ownershipControlsConfiguration");
+        String logging = snapshot.has("loggingConfiguration") ? snapshotText(snapshot, "loggingConfiguration") : null;
         if (!snapshot.path("publicAccessBlockDeleted").isBoolean()) {
             throw new IllegalArgumentException("Missing bucket public access block snapshot state");
         }
@@ -3095,6 +3097,9 @@ public class S3Service implements Resettable, ResourceProvider {
         bucket.setLifecycleConfiguration(lifecycle);
         bucket.setTransitionDefaultMinimumObjectSize(transitionSize);
         bucket.setOwnershipControlsConfiguration(ownership);
+        if (snapshot.has("loggingConfiguration")) {
+            bucket.setLoggingConfiguration(logging);
+        }
         bucket.setTags(tags);
         bucket.setNotificationConfiguration(notifications);
         bucketStore.put(bucketName, bucket);
