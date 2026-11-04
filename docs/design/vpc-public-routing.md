@@ -32,6 +32,30 @@ association or the VPC's main table, then longest prefix match. Unsupported
 targets and absent routes drop traffic instead of falling back to Docker's
 default internet route.
 
+With `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API=true`, the transport also has an
+owned TCP bridge for the public AWS APIs. Spoofed AWS API DNS names resolve to
+`192.0.2.1` for known VPC clients; queries outside a VPC retain the usual emulator
+address. Stored public records, including Classic frontend addresses, retain
+precedence. The API address is distinct from the Classic and NAT address pools.
+The bridge forwards HTTP and TLS bytes to Floci's container-reachable API
+listener. The client keeps its AWS hostname, protocol and certificate verification.
+Use the ordinary TLS configuration and install Floci's CA for HTTPS.
+
+Private workloads reach that address only through an active native NAT route and
+the NAT subnet's attached internet-gateway route. Workload egress rules still
+apply. The bridge admits ports 80 and 443 from the active NAT EIPs and installs
+explicit return routes to those NATs. Its only new outbound connection is to the
+emulator API listener. It neither routes general internet traffic nor adds a
+workload control-network exemption. Removing the last NAT retires the bridge.
+The existing shared TLS proxy forwards to Quarkus over loopback without preserving
+the original peer address, so this path does not qualify IAM `aws:SourceIp` behavior.
+
+`VpcPublicAwsApiPacketIntegrationTest` covers normal AWS DNS, signed EC2 requests
+over HTTP and verified HTTPS, observed NAT peers, workload egress denial, private
+and NAT-subnet route withdrawal, recovery, NAT replacement and retirement. It
+also repeats the existing private frontend and public NAT cases with the feature
+enabled. The bounded test client waits on dropped packets; no server delay is injected.
+
 Floci installs routing and translation rules inside owned container namespaces.
 Docker manages its host bridge configuration. Removing a NAT
 gateway retires forwarding before releasing its addresses. A namespace still
@@ -90,9 +114,9 @@ peering, transit gateways, IPv6/NAT64, regional or multi-address NAT gateways,
 network ACLs, public EC2 addresses, multiple
 frontend subnets, or Application Load Balancer frontends.
 Platform DNS and service-owned Runtime API connections retain their existing
-narrow exemptions. Public AWS API routing and a complete application workflow
-need separate qualification before this is a
-general VPC runtime. Persisted restart recovery and Docker Desktop also need
+narrow exemptions. Direct public-instance API routes, VPC endpoints, IAM source-IP
+conditions and a complete application workflow need separate qualification before
+this is a general VPC runtime. Persisted restart recovery and Docker Desktop also need
 separate qualification.
 
 References:

@@ -1192,6 +1192,17 @@ both the NAT and frontend subnets' internet-gateway routes must exist; missing o
 unsupported routes drop traffic. Frontend security-group ingress remains a
 separate requirement.
 
+`FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API=true` also routes private workloads to
+Floci's public AWS APIs through their NAT. Enable DNS spoofing
+(`FLOCI_DNS_SPOOF_AWS_ENDPOINTS=true`) and TLS (`FLOCI_TLS_ENABLED=true`) for clients
+using normal AWS HTTPS endpoints, and install Floci's CA in the client's trust store.
+Known VPC clients resolve spoofed AWS API names to `192.0.2.1`; stored resource
+DNS answers still take precedence. Security-group egress, a private-subnet NAT
+route and the NAT subnet's attached internet-gateway route remain required.
+HTTP and HTTPS use their standard ports. This does not enable arbitrary internet
+access, public-instance routes or VPC endpoints. The shared TLS proxy does not
+preserve the NAT source for IAM `aws:SourceIp` evaluation.
+
 In this mode, public NAT creation without an attached internet gateway returns a
 failed gateway with failure code `Gateway.NotAttached`. Runtime programming errors fail route API calls.
 Deleting a NAT removes forwarding before releasing its addresses; a remaining
@@ -1828,6 +1839,7 @@ State is reported settled rather than transitional, as elsewhere in this service
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_DRIVER` | `bridge` | Docker network driver used for VPC networks |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL` | `false` | Create internal Docker VPC networks without external connectivity through that network |
 | `FLOCI_NETWORK_VPC_ROUTING_ENABLED` | `false` | Enforce native IPv4 routes and public NAT for protected workloads reaching managed Classic frontends |
+| `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API` | `false` | Route spoofed AWS API destinations from private workloads through their native public NAT and internet gateway |
 
 ## VPC Docker networks
 

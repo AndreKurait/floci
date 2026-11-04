@@ -132,8 +132,14 @@ public interface EmulatorConfig {
     }
 
     interface VpcRoutingConfig {
+        String PUBLIC_AWS_API_ADDRESS = "192.0.2.1";
+
         @WithDefault("false")
         boolean enabled();
+
+        /** Routes spoofed AWS API names from known VPC clients through their public NAT gateways. */
+        @WithDefault("false")
+        boolean publicAwsApi();
     }
 
     interface SecurityGroupEnforcementConfig {
