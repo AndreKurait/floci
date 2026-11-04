@@ -128,8 +128,8 @@ public class CloudFormationQueryHandler {
         List<String> capabilities = extractList(params, "Capabilities.member.");
         Map<String, String> tags = extractTags(params);
 
-        cfnService.createChangeSet(stackName, "initial-create", "CREATE",
-                templateBody, templateUrl, parameters, capabilities, tags, region);
+        cfnService.createChangeSetForStackOperation(stackName, "initial-create", "CREATE",
+                templateBody, templateUrl, parameters, capabilities, tags, region, params.getFirst("RoleARN"));
         awaitExecution(cfnService.executeCreateChangeSet(stackName, "initial-create", region, disableRollback));
 
         if (Boolean.parseBoolean(params.getFirst("EnableTerminationProtection"))) {
@@ -171,9 +171,10 @@ public class CloudFormationQueryHandler {
         String changeSetName = "update-" + UUID.randomUUID().toString().substring(0, 8);
         ChangeSet cs = usePreviousTemplate
                 ? cfnService.createChangeSetFromPreviousTemplate(stackName, changeSetName,
-                        parameters, capabilities, tags, region)
-                : cfnService.createChangeSet(stackName, changeSetName,
-                        "UPDATE", templateBody, templateUrl, parameters, capabilities, tags, region);
+                        parameters, capabilities, tags, region, params.getFirst("RoleARN"))
+                : cfnService.createChangeSetForStackOperation(stackName, changeSetName,
+                        "UPDATE", templateBody, templateUrl, parameters, capabilities, tags, region,
+                        params.getFirst("RoleARN"));
         // An update that submits what the stack already has is refused, and leaves no change set
         // behind, as UpdateStack does on AWS.
         if (CloudFormationService.NO_CHANGES_REASON.equals(cs.getStatusReason())) {
@@ -200,7 +201,7 @@ public class CloudFormationQueryHandler {
         String stackName = params.getFirst("StackName");
         List<String> retainResources = extractList(params, "RetainResources.member.");
         try {
-            cfnService.deleteStack(stackName, retainResources, region);
+            cfnService.deleteStackWithRole(stackName, retainResources, region, params.getFirst("RoleARN"));
             String xml = new XmlBuilder()
                     .start("DeleteStackResponse", CF_NS)
                     .raw(AwsQueryResponse.responseMetadata())
@@ -218,10 +219,10 @@ public class CloudFormationQueryHandler {
         String stackName = params.getFirst("StackName");
         List<String> resourcesToSkip = extractList(params, "ResourcesToSkip.member.");
         boolean forceRollback = Boolean.parseBoolean(params.getFirst("ForceRollback"));
-        // RoleARN and ClientRequestToken are accepted and have no effect: Floci assumes no role
-        // for stack operations and does not deduplicate retried requests.
+        // ClientRequestToken is accepted; retried requests are not deduplicated.
         try {
-            cfnService.continueUpdateRollback(stackName, resourcesToSkip, forceRollback, region);
+            cfnService.continueUpdateRollback(stackName, resourcesToSkip, forceRollback, region,
+                    params.getFirst("RoleARN"));
         } catch (AwsException e) {
             return xmlError(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
         }
@@ -278,9 +279,9 @@ public class CloudFormationQueryHandler {
         // internally, may attach a CREATE change set to a stack still in REVIEW_IN_PROGRESS.
         ChangeSet cs = usePreviousTemplate
                 ? cfnService.createChangeSetFromPreviousTemplate(stackName, changeSetName,
-                        parameters, capabilities, tags, region)
+                        parameters, capabilities, tags, region, params.getFirst("RoleARN"))
                 : cfnService.createChangeSetForRequest(stackName, changeSetName, changeSetType,
-                        templateBody, templateUrl, parameters, capabilities, tags, region);
+                        templateBody, templateUrl, parameters, capabilities, tags, region, params.getFirst("RoleARN"));
 
         String xml = new XmlBuilder()
                 .start("CreateChangeSetResponse", CF_NS)
@@ -680,6 +681,9 @@ public class CloudFormationQueryHandler {
         }
         if (s.getStatusReason() != null) {
             xml.elem("StackStatusReason", s.getStatusReason());
+        }
+        if (s.getRoleArn() != null) {
+            xml.elem("RoleARN", s.getRoleArn());
         }
         xml.start("Capabilities");
         for (String cap : s.getCapabilities()) {
