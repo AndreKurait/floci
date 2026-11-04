@@ -41,7 +41,7 @@ env:
   # Hardcoded on purpose: strategy.job-total counts EVERY matrix job, so adding an
   # unrelated matrix entry later would change the modulus and silently leave part
   # of the suite running in no shard. Keep in sync with the matrix below.
-  SHARD_TOTAL: 5
+  SHARD_TOTAL: 6
 
 jobs:
   test:
@@ -62,7 +62,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -125,9 +125,9 @@ jobs:
             || { echo "::error::test class list from src/test/java differs from target/test-classes:"; diff all-classes.txt "$RUNNER_TEMP/compiled-classes.txt" | head -50; exit 1; }
 
       # surefire.timeout kills a fork whose test ignores JUnit's interrupt (deadlock, blocking
-      # I/O). It caps the whole shard (one fork runs all its tests), so 20 min leaves room above
-      # the slowest shard, about 12.5 min of tests across five, and still lets surefire report
-      # before the 25-minute job limit.
+      # I/O). It caps the whole shard (one fork runs all its tests). Six shards leave room
+      # below that 20-minute limit as the suite grows, and let surefire report before the
+      # 30-minute job limit. Keep the partition-completeness check below enabled.
       - name: Run tests
         run: |
           # Protected workload DNS must reach this host JVM. Bind only the
