@@ -960,6 +960,10 @@ public class Ec2ContainerManager {
                 LOG.warnv("Error removing failed EC2 container {0}: {1}", containerId, e.getMessage());
             }
         }
+        if (firewallManager != null && firewallManager.enabled()
+                && instance.getNetworkInterfaces() != null && !instance.getNetworkInterfaces().isEmpty()) {
+            firewallManager.unregister(instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+        }
         removeNetworkHelper(instance);
         try {
             vpcNetworkManager.detach(instance.getRegion(), instance.getVpcId(), containerId);
@@ -967,10 +971,6 @@ public class Ec2ContainerManager {
         } catch (Exception e) {
             LOG.warnv("Error releasing the VPC address of failed EC2 launch {0}: {1}",
                     instance.getInstanceId(), e.getMessage());
-        }
-        if (firewallManager != null && firewallManager.enabled()
-                && instance.getNetworkInterfaces() != null && !instance.getNetworkInterfaces().isEmpty()) {
-            firewallManager.unregister(instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
         }
         if (sshHostPort > 0) {
             portAllocator.release(sshHostPort);
@@ -1780,11 +1780,12 @@ public class Ec2ContainerManager {
                     }
                 }
                 containerGone = false;
-                removeNetworkHelper(instance);
-                containerGone = true;
+                // Retire the endpoint before removing its namespace: another termination may reconcile peers.
                 if (firewallManager != null && firewallManager.enabled() && firewallEniId != null) {
                     firewallManager.unregister(firewallEniId);
                 }
+                removeNetworkHelper(instance);
+                containerGone = true;
                 if (sshHostPort > 0) {
                     portAllocator.release(sshHostPort);
                 }

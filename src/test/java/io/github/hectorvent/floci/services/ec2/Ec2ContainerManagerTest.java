@@ -162,15 +162,19 @@ class Ec2ContainerManagerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void terminationRetainsFirewallIdentityAfterInterfacesAreReleased(boolean transientFailure) throws Exception {
+    @CsvSource({"false,false", "true,false", "false,true"})
+    void terminationRetiresFirewallIdentityBeforeRemovingItsHelper(
+            boolean transientFailure, boolean peerRefreshFailure) throws Exception {
         DockerClient docker = mock(DockerClient.class);
         SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        when(config.port()).thenReturn(4566);
         when(firewall.enabled()).thenReturn(true);
         Ec2ContainerManager manager = new Ec2ContainerManager(
-                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class),
+                mock(ContainerBuilder.class), lifecycle,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
-                mock(DockerHostResolver.class), docker, mock(PortAllocator.class), mock(EmulatorConfig.class),
+                mock(DockerHostResolver.class), docker, mock(PortAllocator.class), config,
                 mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
                 mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
                 mock(ContainerReachableEndpoint.class), firewall);
@@ -183,9 +187,36 @@ class Ec2ContainerManagerTest {
         when(docker.removeContainerCmd(TEST_CONTAINER_ID)).thenReturn(remove);
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         InspectContainerResponse inspected = inspectResponse("172.18.0.12");
+        when(inspected.getHostConfig()).thenReturn(
+                HostConfig.newHostConfig().withNetworkMode("container:" + TEST_HELPER_ID));
         when(inspect.exec()).thenReturn(inspected);
         when(docker.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerCmd inspectHelper = mock(InspectContainerCmd.class);
+        InspectContainerResponse helper = inspectResponse("172.18.0.12");
+        when(helper.getConfig()).thenReturn(new ContainerConfig().withLabels(Map.of(
+                "io.floci.security-group.helper", "true",
+                "io.floci.service", "ec2",
+                "io.floci.resource-id", instance.getInstanceId(),
+                "io.floci.owner", "4566")));
+        when(inspectHelper.exec()).thenReturn(helper);
+        when(docker.inspectContainerCmd(TEST_HELPER_ID)).thenReturn(inspectHelper);
         AtomicInteger removals = new AtomicInteger();
+        AtomicInteger peerUpdates = new AtomicInteger();
+        AtomicBoolean retired = new AtomicBoolean();
+        AtomicBoolean helperRemoved = new AtomicBoolean();
+        doAnswer(invocation -> {
+            assertFalse(helperRemoved.get(), "Peer reconciliation still needs this registered namespace");
+            if (peerUpdates.incrementAndGet() == 1 && peerRefreshFailure) {
+                throw new IllegalStateException("peer policy refresh is still completing");
+            }
+            retired.set(true);
+            return null;
+        }).when(firewall).unregister("eni-firewall-teardown");
+        doAnswer(invocation -> {
+            assertTrue(retired.get(), "A removed helper must no longer be visible to peer reconciliation");
+            helperRemoved.set(true);
+            return null;
+        }).when(lifecycle).removeIfExistsStrict(TEST_HELPER_ID);
         doAnswer(invocation -> {
             // The service releases ENIs while container teardown is still in progress.
             instance.getNetworkInterfaces().clear();
@@ -199,8 +230,9 @@ class Ec2ContainerManagerTest {
             manager.terminate(instance, completed::countDown);
             assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
             assertEquals("terminated", instance.getState().getName());
-            verify(firewall).unregister("eni-firewall-teardown");
-            assertEquals(transientFailure ? 2 : 1, removals.get());
+            assertTrue(helperRemoved.get());
+            verify(firewall, times(peerRefreshFailure ? 2 : 1)).unregister("eni-firewall-teardown");
+            assertEquals(transientFailure || peerRefreshFailure ? 2 : 1, removals.get());
         } finally {
             manager.stop();
         }

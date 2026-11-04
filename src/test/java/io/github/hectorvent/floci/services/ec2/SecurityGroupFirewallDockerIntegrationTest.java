@@ -8,6 +8,7 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.IpRange;
@@ -244,8 +245,11 @@ class SecurityGroupFirewallDockerIntegrationTest {
             firewall.register(endpoint(eni, "10.0.0.2", source, denyEgress), source.helperId(), Map.of());
 
             assertNotEquals(0, connect(source.helperId(), backendAddress, DENIED_TIMEOUT_SECONDS));
-            assertEquals(0, execute(source.helperId(),
-                    Ec2MetadataProxy.ec2RoutingCommand(backendName, 8080, false)));
+            // The VPC resolver does not serve Docker container names. Match the literal transport
+            // address selected by DockerHostResolver when the emulator runs in a container.
+            ContainerExec.Result routing = ContainerExec.run(docker, source.helperId(),
+                    Ec2MetadataProxy.ec2RoutingCommand(backendAddress, 8080, false), 5);
+            assertEquals(0, routing.exitCode(), routing.summary());
             assertEquals(0, execute(source.helperId(), "nc", "-z", "-w", "2", "169.254.169.254", "80"));
             assertNotEquals(0, connect(source.helperId(), backendAddress, DENIED_TIMEOUT_SECONDS));
         } finally {
