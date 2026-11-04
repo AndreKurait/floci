@@ -514,6 +514,22 @@ The CDK then deletes that change set, and before its next deploy deletes it agai
 status, named with its stack or by its ARN alone; a `StackName` that names no stack is still a
 `ValidationError`.
 
+## Change-set Replacement Previews
+
+A static change to a create-only property reports `Replacement: True`. A changed create-only
+property that still depends on a resource, export or stack-output reference reports `Conditional`;
+an update that needs no replacement reports `False`. The preview uses the same parameter, mapping
+and condition comparison as other updates, and carries replacement certainty through dependent
+resources. A definite replacement takes precedence over a conditional one.
+
+An updated resource can re-read `Fn::GetStackOutput` even when the expression is unchanged, so its
+create-only input remains conditional until execution. Previewing does not resolve those external
+outputs or mutate resources. Execution decides whether the resolved properties require replacement.
+
+Security-group replacements use the shared replacement lifecycle: a committed update retires the
+old group unless `UpdateReplacePolicy: Retain` applies, and a failed update restores the original
+group and removes the replacement. Groups outside the stack remain untouched.
+
 ## Lambda Stack Updates
 
 `AWS::Lambda::Function` resources are reconciled during `UpdateStack` in the same shape as CloudFormation/CDK deployments:

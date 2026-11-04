@@ -1027,7 +1027,7 @@ public class CloudFormationService implements ResourceProvider {
                 }
             }
 
-            Set<String> replacedResourceIds = new HashSet<>();
+            Map<String, Replacement> replacements = new HashMap<>();
             List<ResourceChange> changes = new ArrayList<>();
             newResources.fields().forEachRemaining(e -> {
                 String logicalId = e.getKey();
@@ -1061,14 +1061,15 @@ public class CloudFormationService implements ResourceProvider {
                                         || referencesAnyCondition(newDef, changedConditions))
                         || ("AWS::CloudFormation::Stack".equals(resourceType) && isNestedStackChanged(stack, logicalId, newDef, region, accountId)))) {
                     boolean typeChanged = !oldDef.path("Type").asText().equals(resourceType);
-                    boolean replacement = typeChanged
-                            || requiresReplacement(resourceType, oldDef.path("Properties"), newDef.path("Properties"), changedParams, changedConditions);
-                    if (replacement) {
-                        replacedResourceIds.add(logicalId);
+                    Replacement replacement = typeChanged ? Replacement.ALWAYS
+                            : replacementFor(logicalId, resourceType, oldDef, newDef, compared,
+                                    changedParams, changedConditions);
+                    if (replacement != Replacement.NEVER) {
+                        replacements.put(logicalId, replacement);
                     }
                     changes.add(new ResourceChange("Modify", logicalId,
                             resourcePhysicalId(stack, logicalId), resourceType,
-                            replacement ? "True" : "False"));
+                            replacement.value));
                 }
             });
             oldResources.fields().forEachRemaining(e -> {
@@ -1084,7 +1085,7 @@ public class CloudFormationService implements ResourceProvider {
                     .collect(Collectors.toCollection(LinkedHashSet::new));
             Map<String, Set<String>> inPlaceChangedAttributes = new HashMap<>();
             for (ResourceChange change : changes) {
-                if ("Modify".equals(change.action()) && !replacedResourceIds.contains(change.logicalResourceId())) {
+                if ("Modify".equals(change.action()) && !replacements.containsKey(change.logicalResourceId())) {
                     String logicalId = change.logicalResourceId();
                     JsonNode oldDef = oldResources.get(logicalId);
                     JsonNode newDef = newResources.get(logicalId);
@@ -1096,7 +1097,7 @@ public class CloudFormationService implements ResourceProvider {
                 }
             }
 
-            if (!replacedResourceIds.isEmpty() || !inPlaceChangedAttributes.isEmpty()) {
+            if (!replacements.isEmpty() || !inPlaceChangedAttributes.isEmpty()) {
                 Set<String> allResourceIds = new LinkedHashSet<>();
                 newResources.fieldNames().forEachRemaining(allResourceIds::add);
 
@@ -1115,7 +1116,7 @@ public class CloudFormationService implements ResourceProvider {
                         Set<String> propertyDependencies = new LinkedHashSet<>();
                         collectDependencies(newDef.path("Properties"), allResourceIds, propertyDependencies, newConditions);
 
-                        boolean dependsOnReplaced = propertyDependencies.stream().anyMatch(replacedResourceIds::contains);
+                        boolean dependsOnReplaced = propertyDependencies.stream().anyMatch(replacements::containsKey);
                         boolean referencesChangedAttr = false;
                         if (!dependsOnReplaced) {
                             for (Map.Entry<String, Set<String>> entry : inPlaceChangedAttributes.entrySet()) {
@@ -1131,7 +1132,7 @@ public class CloudFormationService implements ResourceProvider {
                             JsonNode oldDef = oldResources.get(logicalId);
                             boolean typeChanged = oldDef != null && !oldDef.path("Type").asText().equals(resourceType);
 
-                            boolean createOnlyReferencesReplaced = false;
+                            Replacement referenceReplacement = Replacement.NEVER;
                             JsonNode props = newDef.path("Properties");
                             if (props != null && props.isObject()) {
                                 for (Iterator<String> it = props.fieldNames(); it.hasNext(); ) {
@@ -1139,25 +1140,35 @@ public class CloudFormationService implements ResourceProvider {
                                     if (CfnCreateOnlyProperties.isCreateOnly(resourceType, field)) {
                                         Set<String> fieldDeps = new LinkedHashSet<>();
                                         collectDependencies(props.get(field), allResourceIds, fieldDeps, newConditions);
-                                        if (fieldDeps.stream().anyMatch(replacedResourceIds::contains)) {
-                                            createOnlyReferencesReplaced = true;
-                                            break;
+                                        for (String dependency : fieldDeps) {
+                                            referenceReplacement = referenceReplacement.stronger(
+                                                    replacements.getOrDefault(dependency, Replacement.NEVER));
                                         }
                                     }
                                 }
                             }
 
-                            boolean replacement = typeChanged
-                                    || (oldDef != null && requiresReplacement(resourceType, oldDef.path("Properties"), newDef.path("Properties"), changedParams, changedConditions))
-                                    || createOnlyReferencesReplaced;
-                            if (replacement && replacedResourceIds.add(logicalId)) {
+                            Replacement directReplacement = typeChanged ? Replacement.ALWAYS
+                                    : replacementFor(logicalId, resourceType, oldDef, newDef, compared,
+                                            changedParams, changedConditions);
+                            Replacement previous = replacements.getOrDefault(logicalId, Replacement.NEVER);
+                            Replacement replacement = previous.stronger(
+                                    directReplacement.stronger(referenceReplacement));
+                            if (replacement != previous) {
+                                replacements.put(logicalId, replacement);
+                                changes.replaceAll(change -> logicalId.equals(change.logicalResourceId())
+                                        && "Modify".equals(change.action())
+                                                ? new ResourceChange(change.action(), logicalId,
+                                                        change.physicalResourceId(), change.resourceType(),
+                                                        replacement.value)
+                                                : change);
                                 anyNewChange = true;
                             }
                             if (!alreadyChangedIds.contains(logicalId)) {
                                 alreadyChangedIds.add(logicalId);
                                 changes.add(new ResourceChange("Modify", logicalId,
                                         resourcePhysicalId(stack, logicalId), resourceType,
-                                        replacement ? "True" : "False"));
+                                        replacement.value));
                                 anyNewChange = true;
                                 Set<String> attrs = expectedChangedAttributes(resourceType, oldDef, newDef);
                                 if (!attrs.isEmpty()) {
@@ -1208,31 +1219,71 @@ public class CloudFormationService implements ResourceProvider {
         return false;
     }
 
-    private boolean requiresReplacement(String resourceType, JsonNode oldProps, JsonNode newProps,
-                                        Set<String> changedParams, Set<String> changedConditions) {
-        if (oldProps == null || newProps == null || oldProps.isMissingNode() || newProps.isMissingNode()) {
-            return false;
+    private Replacement replacementFor(String logicalId, String resourceType, JsonNode oldDef, JsonNode newDef,
+                                       JsonNode[] compared, Set<String> changedParams, Set<String> changedConditions) {
+        if (oldDef == null) {
+            return Replacement.NEVER;
         }
+        boolean resolved = compared[0] != null;
+        JsonNode oldProps = (resolved ? compared[0].path(logicalId) : oldDef).path("Properties");
+        JsonNode newProps = (resolved ? compared[1].path(logicalId) : newDef).path("Properties");
+        Replacement replacement = Replacement.NEVER;
         for (Iterator<String> it = newProps.fieldNames(); it.hasNext(); ) {
             String field = it.next();
             if (CfnCreateOnlyProperties.isCreateOnly(resourceType, field)) {
                 JsonNode oldVal = oldProps.get(field);
                 JsonNode newVal = newProps.get(field);
-                if (oldVal != null && !oldVal.equals(newVal)) {
-                    return true;
+                // Weak output values can change outside this stack while the expression stays
+                // identical. An update resolves them again; preview must keep that uncertainty.
+                if (newVal != null && newVal.findValue("Fn::GetStackOutput") != null) {
+                    replacement = replacement.stronger(Replacement.CONDITIONAL);
                 }
-                if (newVal != null && (referencesAnyParameter(newVal, changedParams) || referencesAnyCondition(newVal, changedConditions))) {
-                    return true;
+                if (!Objects.equals(oldVal, newVal)
+                        || !resolved && newVal != null
+                                && (referencesAnyParameter(newVal, changedParams)
+                                        || referencesAnyCondition(newVal, changedConditions))) {
+                    replacement = replacement.stronger(hasUnresolvedReference(newVal)
+                            ? Replacement.CONDITIONAL : Replacement.ALWAYS);
                 }
             }
         }
         for (Iterator<String> it = oldProps.fieldNames(); it.hasNext(); ) {
             String field = it.next();
             if (CfnCreateOnlyProperties.isCreateOnly(resourceType, field) && !newProps.has(field)) {
+                return Replacement.ALWAYS;
+            }
+        }
+        return replacement;
+    }
+
+    private static boolean hasUnresolvedReference(JsonNode value) {
+        if (value == null) {
+            return false;
+        }
+        // ComparedTemplate already folds parameter-only expressions and inactive conditions.
+        // Remaining references need resource or external-stack values available at execution.
+        for (String function : List.of("Ref", "Fn::GetAtt", "Fn::ImportValue", "Fn::GetStackOutput", "Fn::Sub")) {
+            if (value.findValue(function) != null) {
                 return true;
             }
         }
         return false;
+    }
+
+    private enum Replacement {
+        NEVER("False"),
+        CONDITIONAL("Conditional"),
+        ALWAYS("True");
+
+        private final String value;
+
+        Replacement(String value) {
+            this.value = value;
+        }
+
+        private Replacement stronger(Replacement other) {
+            return ordinal() >= other.ordinal() ? this : other;
+        }
     }
 
     public record ResourceChange(String action, String logicalResourceId, String physicalResourceId,
