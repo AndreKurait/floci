@@ -5,6 +5,7 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -51,6 +52,8 @@ public class ClassicLoadBalancer {
     private ClassicHealthCheck healthCheck = ClassicHealthCheck.defaults();
     private ClassicLoadBalancerAttributes attributes = new ClassicLoadBalancerAttributes();
     private Map<String, String> tags = new LinkedHashMap<>();
+    private Map<String, ClassicLoadBalancerPolicy> policies = Map.of();
+    private Map<Integer, List<String>> listenerPolicies = Map.of();
 
     public ClassicLoadBalancer() {}
 
@@ -112,4 +115,16 @@ public class ClassicLoadBalancer {
 
     public Map<String, String> getTags() { return tags; }
     public void setTags(Map<String, String> v) { this.tags = v; }
+
+    public Map<String, ClassicLoadBalancerPolicy> getPolicies() { return policies; }
+    public void setPolicies(Map<String, ClassicLoadBalancerPolicy> value) {
+        policies = Collections.unmodifiableMap(new LinkedHashMap<>(value));
+    }
+
+    public Map<Integer, List<String>> getListenerPolicies() { return listenerPolicies; }
+    public void setListenerPolicies(Map<Integer, List<String>> value) {
+        Map<Integer, List<String>> copy = new LinkedHashMap<>();
+        value.forEach((port, names) -> copy.put(port, List.copyOf(names)));
+        listenerPolicies = Collections.unmodifiableMap(copy);
+    }
 }

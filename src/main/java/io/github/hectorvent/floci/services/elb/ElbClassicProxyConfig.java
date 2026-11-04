@@ -76,6 +76,9 @@ final class ElbClassicProxyConfig {
                 // Classic terminates HTTP/1.x; HAProxy otherwise advertises HTTP/2 on TLS by default.
                 text.append(" proto h1");
             }
+            if (tls) {
+                text.append(ClassicSslPolicies.options(ClassicSslPolicies.effective(loadBalancer, listener)));
+            }
             text.append("\n    mode ").append(http ? "http" : "tcp")
                     .append("\n    balance roundrobin\n");
             if (http) {

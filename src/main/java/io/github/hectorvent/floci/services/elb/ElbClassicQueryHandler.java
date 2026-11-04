@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.elb.model.ClassicHealthCheck;
 import io.github.hectorvent.floci.services.elb.model.ClassicListener;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancerAttributes;
+import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancerPolicy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MediaType;
@@ -102,6 +103,10 @@ public class ElbClassicQueryHandler {
                 case "DescribeLoadBalancers"     -> describeLoadBalancers(params, region);
                 case "CreateLoadBalancerListeners" -> createListeners(params, region);
                 case "DeleteLoadBalancerListeners" -> deleteListeners(params, region);
+                case "CreateLoadBalancerPolicy"  -> createPolicy(params, region);
+                case "DescribeLoadBalancerPolicies" -> describePolicies(params, region);
+                case "DeleteLoadBalancerPolicy"  -> deletePolicy(params, region);
+                case "SetLoadBalancerPoliciesOfListener" -> setListenerPolicies(params, region);
                 case "ConfigureHealthCheck"      -> configureHealthCheck(params, region);
                 case "RegisterInstancesWithLoadBalancer"    -> registerInstances(params, region);
                 case "DeregisterInstancesFromLoadBalancer"  -> deregisterInstances(params, region);
@@ -186,6 +191,54 @@ public class ElbClassicQueryHandler {
         }
         service.deleteLoadBalancerListeners(region, requireName(p), ports);
         return emptyResult("DeleteLoadBalancerListeners");
+    }
+
+    private Response createPolicy(MultivaluedMap<String, String> params, String region) {
+        Map<String, String> attributes = new LinkedHashMap<>();
+        for (int index = 1; ; index++) {
+            String prefix = "PolicyAttributes.member." + index + ".";
+            String name = params.getFirst(prefix + "AttributeName");
+            String value = params.getFirst(prefix + "AttributeValue");
+            if (name == null && value == null) {
+                break;
+            }
+            ClassicSslPolicies.requireValue(name, "AttributeName");
+            ClassicSslPolicies.requireValue(value, "AttributeValue");
+            if (attributes.putIfAbsent(name, value) != null) {
+                throw new AwsException("InvalidConfigurationRequest", "Repeated policy attribute " + name, 409);
+            }
+        }
+        service.createLoadBalancerPolicy(region, requireName(params), params.getFirst("PolicyName"),
+                params.getFirst("PolicyTypeName"), attributes);
+        return emptyResult("CreateLoadBalancerPolicy");
+    }
+
+    private Response describePolicies(MultivaluedMap<String, String> params, String region) {
+        List<ClassicLoadBalancerPolicy> policies = service.describeLoadBalancerPolicies(region,
+                params.getFirst("LoadBalancerName"), memberList(params, "PolicyNames"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeLoadBalancerPoliciesResponse", AwsNamespaces.ELB_CLASSIC)
+                .start("DescribeLoadBalancerPoliciesResult").start("PolicyDescriptions");
+        for (ClassicLoadBalancerPolicy policy : policies) {
+            xml.start("member").elem("PolicyName", policy.policyName()).elem("PolicyTypeName", policy.policyTypeName())
+                    .start("PolicyAttributeDescriptions");
+            policy.attributes().forEach((name, value) -> xml.start("member")
+                    .elem("AttributeName", name).elem("AttributeValue", value).end("member"));
+            xml.end("PolicyAttributeDescriptions").end("member");
+        }
+        return ok(xml.end("PolicyDescriptions").end("DescribeLoadBalancerPoliciesResult")
+                .raw(AwsQueryResponse.responseMetadata()).end("DescribeLoadBalancerPoliciesResponse").build());
+    }
+
+    private Response deletePolicy(MultivaluedMap<String, String> params, String region) {
+        service.deleteLoadBalancerPolicy(region, requireName(params), params.getFirst("PolicyName"));
+        return emptyResult("DeleteLoadBalancerPolicy");
+    }
+
+    private Response setListenerPolicies(MultivaluedMap<String, String> params, String region) {
+        service.setLoadBalancerPoliciesOfListener(region, requireName(params),
+                intOrNull(params.getFirst("LoadBalancerPort")), memberList(params, "PolicyNames"));
+        return emptyResult("SetLoadBalancerPoliciesOfListener");
     }
 
     // ── Health ────────────────────────────────────────────────────────────────
@@ -396,17 +449,19 @@ public class ElbClassicQueryHandler {
                    .elem("InstancePort", String.valueOf(listener.getInstancePort()))
                    .elem("SSLCertificateId", listener.getSslCertificateId())
                  .end("Listener")
-                 .start("PolicyNames").end("PolicyNames")
-               .end("member");
+                 .start("PolicyNames");
+            for (String policy : lb.getListenerPolicies().getOrDefault(listener.getLoadBalancerPort(), List.of())) {
+                xml.elem("member", policy);
+            }
+            xml.end("PolicyNames").end("member");
         }
         xml.end("ListenerDescriptions")
-           // Floci implements no Classic policies; the element is present and empty, as it is on a
-           // live load balancer that has none.
            .start("Policies")
              .start("AppCookieStickinessPolicies").end("AppCookieStickinessPolicies")
              .start("LBCookieStickinessPolicies").end("LBCookieStickinessPolicies")
-             .start("OtherPolicies").end("OtherPolicies")
-           .end("Policies")
+             .start("OtherPolicies");
+        lb.getPolicies().keySet().forEach(policy -> xml.elem("member", policy));
+        xml.end("OtherPolicies").end("Policies")
            .start("BackendServerDescriptions").end("BackendServerDescriptions")
            .start("AvailabilityZones");
         for (String zone : lb.getAvailabilityZones()) {
