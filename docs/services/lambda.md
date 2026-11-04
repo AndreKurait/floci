@@ -1043,6 +1043,10 @@ protected network namespace. Subnet selection rotates across the declared subnet
 when new environments start. Security-group rules are installed before function
 code starts, and SDK rule changes update warm environments. A missing ingress or
 egress rule drops real packets, leaving the function's own client to time out.
+With `FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=true`, the namespace also holds
+the ENI's private IP on its VPC network. Same-VPC connections use that address
+at both ends. Policy and DNS ownership track both actual interfaces, and an
+attachment failure prevents the environment from starting.
 
 The namespace permits the exact IP and TCP port of that environment's Runtime API,
 so blocked application traffic does not prevent invocation delivery or results.
@@ -1054,8 +1058,8 @@ helpers and their workloads.
 
 This currently allocates an ENI per execution environment. Hyperplane ENI sharing,
 attachment-time IAM permission checks, VPC routes, NACLs and NAT translation are
-not emulated by this path. Packets still use Docker transport addresses. The
-security-group flag is opt-in and applies to Docker execution.
+not emulated by this path. The security-group flag is opt-in and applies to
+Docker execution.
 
 `RuntimeVersionConfig.RuntimeVersionArn` is returned for managed (non-image)
 runtimes. Its value is derived from the runtime name, so it is stable across
