@@ -84,6 +84,30 @@ approval policies or registering an AWS-owned baseline ARN is not implemented.
 | `ListCommandInvocations` | List command invocation records |
 | `CancelCommand` | Cancel pending or in-progress command invocations |
 
+### Inventory
+
+| Action | Description |
+|---|---|
+| `PutInventory` | Report inventory for a registered managed node |
+| `ListInventoryEntries` | Read, filter and page one inventory type on a managed node |
+
+Inventory belongs to the registering account and region. Each upload replaces the
+reported types and preserves other types. An unchanged `ContentHash` and schema version
+retain the previous content while refreshing `CaptureTime`, matching SSM Agent's
+optimized uploads. A hash-only upload with no matching stored content fails with
+`ItemContentMismatchException`; an explicit empty content list clears that type's entries.
+
+The software-inventory agent's `AWS:*` types and `Custom:*` types are supported. Custom
+inventory allows 20 types per account and region and requires consistent attribute casing.
+Values remain strings. Invalid batches leave the previous inventory intact.
+The SSM storage setting controls persistence across restarts.
+
+This implements inventory upload and entry reads. Inventory collection scheduling,
+compliance item contexts, inventory aggregators, custom-schema deletion and S3 resource
+data sync are not implemented by these actions. AWS's full attribute-schema and
+daily byte-quota validation are not modeled. A successful upload does not prove a
+State Manager document executed.
+
 ### ec2messages Agent Protocol
 
 | Action | Description |
