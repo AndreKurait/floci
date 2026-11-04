@@ -490,5 +490,17 @@ class LeafCfnProvisionerTest {
             // The stub arm would have added a fake Arn here; the real type has no attributes.
             assertTrue(r.getAttributes().isEmpty(), "CDK::Metadata exposes no Fn::GetAtt attributes");
         }
+
+        @Test
+        void anAnalyticsUpdatePreservesThePriorPhysicalId() {
+            StackResource r = resource("CDKMetadata", "AWS::CDK::Metadata");
+            ProvisionContext update = new ProvisionContext(engine, REGION, "000000000000",
+                    "my-stack", "cdk-metadata-existing");
+
+            provisioner.provision(r, props("{\"Analytics\":\"updated\"}"), update);
+
+            assertEquals("cdk-metadata-existing", r.getPhysicalId());
+            assertTrue(r.getAttributes().isEmpty());
+        }
     }
 }
