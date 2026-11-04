@@ -3777,6 +3777,13 @@ public interface EmulatorConfig {
         /** When true, no health check is ever probed and a registered instance is InService at once. */
         @WithDefault("false")
         boolean mock();
+
+        /** Serve supported Classic frontends inside their own protected VPC namespaces. */
+        @WithDefault("false")
+        boolean vpcFrontends();
+
+        @WithDefault("haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b")
+        String proxyImage();
     }
 
     interface ElbV2ServiceConfig {

@@ -70,6 +70,7 @@ public class ElbClassicHealthChecker implements Resettable {
     private final Vertx vertx;
     private final EmulatorConfig config;
     private final Ec2Service ec2Service;
+    private final ElbClassicFrontendManager frontends;
     private final SSLSocketFactory backendTls = backendTls();
 
     // "account|region|lbName" → instanceId → state
@@ -80,11 +81,17 @@ public class ElbClassicHealthChecker implements Resettable {
     /** A periodic check: its Vert.x timer and the tick that timer runs. */
     private record ArmedCheck(long id, Runnable tick) {}
 
-    @Inject
     public ElbClassicHealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
+        this(vertx, config, ec2Service, null);
+    }
+
+    @Inject
+    public ElbClassicHealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
+                                  ElbClassicFrontendManager frontends) {
         this.vertx = vertx;
         this.config = config;
         this.ec2Service = ec2Service;
+        this.frontends = frontends;
     }
 
     /**
@@ -159,10 +166,11 @@ public class ElbClassicHealthChecker implements Resettable {
         }
         Map<String, InstanceState> lbStates = states.get(key(lb));
         InstanceState s = lbStates != null ? lbStates.get(instanceId) : null;
-        if (s == null || s.health == null) {
+        if (s == null) {
             return InstanceHealth.registering();
         }
-        return s.health;
+        InstanceHealth health = frontends != null && frontends.enabled() ? s.publishedHealth : s.health;
+        return health == null ? InstanceHealth.registering() : health;
     }
 
     @Override
@@ -203,8 +211,14 @@ public class ElbClassicHealthChecker implements Resettable {
             String instanceId = entry.getKey();
             InstanceState state = entry.getValue();
             String host = resolveHost(lb.getAccountId(), instanceId);
-            vertx.executeBlocking(() -> probe(host, target, timeout))
+            boolean protectedFrontend = frontends != null && frontends.enabled();
+            ElbClassicFrontendManager.Probe namespace = protectedFrontend ? frontends.probeFor(lb, instanceId) : null;
+            vertx.executeBlocking(() -> protectedFrontend
+                    ? frontends.probe(namespace, target, timeout) : probe(host, target, timeout))
                     .onSuccess(ok -> {
+                        if (protectedFrontend && !frontends.current(lb, namespace)) {
+                            return;
+                        }
                         if (Boolean.TRUE.equals(ok)) {
                             state.consecutiveFailures = 0;
                             state.consecutiveSuccesses++;
@@ -214,13 +228,38 @@ public class ElbClassicHealthChecker implements Resettable {
                         } else {
                             recordFailure(state, unhealthyThreshold);
                         }
+                        if (protectedFrontend) {
+                            publishProtectedHealth(lb, namespace, state);
+                        }
                     })
                     .onFailure(err -> {
+                        if (protectedFrontend && !frontends.current(lb, namespace)) {
+                            return;
+                        }
                         recordFailure(state, unhealthyThreshold);
+                        if (protectedFrontend) {
+                            publishProtectedHealth(lb, namespace, state);
+                        }
                         LOG.debugv("Classic ELB health check failed for {0} ({1}): {2}",
                                 instanceId, host, err.getMessage());
                     });
         }
+    }
+
+    private void publishProtectedHealth(ClassicLoadBalancer loadBalancer,
+                                        ElbClassicFrontendManager.Probe probe, InstanceState state) {
+        InstanceHealth health = state.health == null ? InstanceHealth.registering() : state.health;
+        vertx.executeBlocking(() -> {
+            frontends.healthChanged(loadBalancer, probe, health);
+            return null;
+        }).onSuccess(ignored -> {
+            if (frontends.current(loadBalancer, probe)) {
+                state.publishedHealth = health;
+            }
+        }).onFailure(failure -> {
+            state.publishedHealth = InstanceHealth.registering();
+            LOG.warnv(failure, "Could not apply protected Classic health for {0}", probe.instanceId());
+        });
     }
 
     private static void recordFailure(InstanceState state, int unhealthyThreshold) {
@@ -351,6 +390,7 @@ public class ElbClassicHealthChecker implements Resettable {
 
     private static final class InstanceState {
         volatile InstanceHealth health;
+        volatile InstanceHealth publishedHealth;
         volatile int consecutiveSuccesses;
         volatile int consecutiveFailures;
     }

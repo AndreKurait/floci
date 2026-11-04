@@ -123,6 +123,11 @@ public class ElbClassicDataPlane {
             return;
         }
         ClassicLoadBalancer lb = balancers.getFirst();
+        if (config.services().elb().vpcFrontends()) {
+            // The owned VPC listener is the only data path for a protected load balancer.
+            fail(context, 421);
+            return;
+        }
         int port = authority.getPort() > 0 ? authority.getPort() : context.request().isSSL() ? 443 : 80;
         ClassicListener listener = lb.getListeners().stream()
                 .filter(candidate -> Objects.equals(candidate.getLoadBalancerPort(), port))
