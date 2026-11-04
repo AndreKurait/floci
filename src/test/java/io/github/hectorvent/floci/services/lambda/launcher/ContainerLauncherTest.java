@@ -161,8 +161,12 @@ class ContainerLauncherTest {
         EmulatorConfig.DockerConfig docker = mock(EmulatorConfig.DockerConfig.class);
         EmulatorConfig.StorageConfig storage = mock(EmulatorConfig.StorageConfig.class);
         EmulatorConfig.EfsSharingConfig efs = mock(EmulatorConfig.EfsSharingConfig.class);
+        EmulatorConfig.NetworkConfig network = mock(EmulatorConfig.NetworkConfig.class);
+        EmulatorConfig.VpcRoutingConfig routing = mock(EmulatorConfig.VpcRoutingConfig.class);
 
         when(config.services()).thenReturn(services);
+        lenient().when(config.network()).thenReturn(network);
+        lenient().when(network.vpcRouting()).thenReturn(routing);
         when(services.lambda()).thenReturn(lambda);
         lenient().when(services.iam()).thenReturn(iam);
         lenient().when(iam.lambdaIdentityVerificationEnabled()).thenReturn(false);
@@ -729,6 +733,42 @@ class ContainerLauncherTest {
         order.verify(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any(), eq(1));
         order.verify(vpcNetworkManager).release(attachment);
         order.verify(runtimeApiServer).close();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "true, true, true, false",
+            "false, true, true, true",
+            "true, false, true, true",
+            "true, true, false, true"
+    })
+    void sdkEndpointOverrideFollowsThePreparedVpc(boolean attached, boolean routed, boolean publicApis,
+                                                 boolean override) throws Exception {
+        if (attached) {
+            protectedNetwork();
+        }
+        lenient().when(config.network().vpcRouting().enabled()).thenReturn(routed);
+        lenient().when(config.network().vpcRouting().publicAwsApi()).thenReturn(publicApis);
+
+        launcher.launch(protectedFunction());
+
+        ContainerSpec spec = captureRealContainerSpec();
+        assertEquals(override, spec.env().stream().anyMatch(value -> value.startsWith("AWS_ENDPOINT_URL=")));
+        assertTrue(spec.env().contains("AWS_REGION=us-east-1"));
+        assertTrue(spec.env().stream().anyMatch(value -> value.startsWith("AWS_LAMBDA_RUNTIME_API=")));
+    }
+
+    @Test
+    void routedVpcPreservesAnExplicitFunctionEndpoint() throws Exception {
+        protectedNetwork();
+        lenient().when(config.network().vpcRouting().enabled()).thenReturn(true);
+        lenient().when(config.network().vpcRouting().publicAwsApi()).thenReturn(true);
+        LambdaFunction function = protectedFunction();
+        function.setEnvironment(Map.of("AWS_ENDPOINT_URL", "https://explicit.example"));
+
+        launcher.launch(function);
+
+        assertTrue(captureRealContainerSpec().env().contains("AWS_ENDPOINT_URL=https://explicit.example"));
     }
 
     @Test

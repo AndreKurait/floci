@@ -303,9 +303,17 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         if (awsConfigPath.isEmpty()) {
             roleCredentials = executionRoleCredentials.forFunction(fn);
         }
+        if (vpcNetworkManager != null) {
+            vpcNetwork = vpcNetworkManager.prepare(fn, containerName, hostAddress,
+                    runtimeApiServer.getPort(), dockerFlags).orElse(null);
+        }
         env.addAll(awsEnv.sdkBaselineEnv(lambdaRegion,
                 awsConfigPath.isPresent() ? Optional.of("/opt/aws-config") : Optional.empty(),
                 awsEnv.flociEndpoint(dockerFlags.dnsServers().isEmpty()), roleCredentials, lambdaAccountId));
+        if (vpcNetwork != null && config.network().vpcRouting().enabled()
+                && config.network().vpcRouting().publicAwsApi()) {
+            env.removeIf(value -> value.startsWith("AWS_ENDPOINT_URL="));
+        }
         if (fn.getEnvironment() != null) {
             boolean hasExecutionRoleCredentials = roleCredentials.isPresent();
             boolean userDefinesFullCredentialTriad = definesFullCredentialTriad(fn.getEnvironment());
@@ -347,14 +355,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
         specBuilder.withEmbeddedDns();
         List<String> additionalNetworks = configuredAdditionalDockerNetworks();
-        if (vpcNetworkManager != null) {
-            vpcNetwork = vpcNetworkManager.prepare(fn, containerName, hostAddress,
-                    runtimeApiServer.getPort(), dockerFlags).orElse(null);
-            if (vpcNetwork != null) {
-                specBuilder.withNetworkMode("container:" + vpcNetwork.helperId())
-                        .withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL, "true",
-                                ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config)));
-            }
+        if (vpcNetwork != null) {
+            specBuilder.withNetworkMode("container:" + vpcNetwork.helperId())
+                    .withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL, "true",
+                            ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config)));
         }
         // A container image's runtime is its own, Java as likely as any.
         if (isJavaRuntime(fn.getRuntime()) || "Image".equals(fn.getPackageType())) {
