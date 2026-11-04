@@ -173,7 +173,7 @@ class SqsIntegrationTest {
                 .body(not(containsString("<Name>secret</Name>")))
                 .body(containsString("<MD5OfMessageAttributes>46db9885b8f221ea04082f03e3a63d14</MD5OfMessageAttributes>"));
 
-            for (String allSelector : new String[]{"All", ".*"}) {
+            for (String allSelector : new String[]{"All", ".*", "*"}) {
                 given()
                     .contentType("application/x-www-form-urlencoded")
                     .formParam("Action", "ReceiveMessage")
@@ -184,6 +184,19 @@ class SqsIntegrationTest {
                     .body(containsString("<Name>color.primary</Name>"))
                     .body(containsString("<Name>secret</Name>"));
             }
+
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", filterQueueUrl)
+                .formParam("VisibilityTimeout", "0")
+                .formParam("MessageAttributeName.1", "*")
+                .formParam("MessageAttributeName.2", "missing")
+            .when().post("/").then().statusCode(200)
+                .body(containsString("<Name>color.primary</Name>"))
+                .body(containsString("<Name>color</Name>"))
+                .body(containsString("<Name>colorful</Name>"))
+                .body(containsString("<Name>secret</Name>"));
         } finally {
             given()
                 .contentType("application/x-www-form-urlencoded")
