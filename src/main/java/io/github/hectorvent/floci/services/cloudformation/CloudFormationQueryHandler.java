@@ -53,6 +53,7 @@ public class CloudFormationQueryHandler {
             case "DescribeStacks" -> describeStacks(params, region);
             case "CreateStack" -> createStack(params, region);
             case "UpdateStack" -> updateStack(params, region);
+            case "SignalResource" -> signalResource(params, region);
             case "DeleteStack" -> deleteStack(params, region);
             case "ContinueUpdateRollback" -> continueUpdateRollback(params, region);
             case "UpdateTerminationProtection" -> updateTerminationProtection(params, region);
@@ -146,6 +147,12 @@ public class CloudFormationQueryHandler {
                 .end("CreateStackResponse")
                 .build();
         return Response.ok(xml).type("text/xml").build();
+    }
+
+    private Response signalResource(MultivaluedMap<String, String> params, String region) {
+        cfnService.signalResource(params.getFirst("StackName"), params.getFirst("LogicalResourceId"),
+                params.getFirst("UniqueId"), params.getFirst("Status"), region);
+        return Response.ok(emptyResult("SignalResourceResponse")).type("text/xml").build();
     }
 
     // ── UpdateStack ───────────────────────────────────────────────────────────
