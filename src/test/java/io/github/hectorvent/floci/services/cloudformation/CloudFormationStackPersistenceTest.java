@@ -17,6 +17,7 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -39,6 +40,7 @@ class CloudFormationStackPersistenceTest {
         stack.setStackName("my-stack");
         stack.setRegion("us-east-1");
         stack.setStatus("CREATE_COMPLETE");
+        stack.setRoleArn("arn:aws:iam::000000000000:role/deployment/active");
         stack.setDisableRollback(true);
         stack.setTemplateBody("{\"Resources\":{}}");
         stack.getParameters().put("Env", "prod");
@@ -64,6 +66,7 @@ class CloudFormationStackPersistenceTest {
         changeSet.setChangeSetName("initial-create");
         changeSet.setStackName("my-stack");
         changeSet.setStatus("CREATE_COMPLETE");
+        changeSet.setRoleArn("arn:aws:iam::000000000000:role/deployment/proposed");
         stack.getChangeSets().put("initial-create", changeSet);
 
         PersistentStorage<String, Stack> writer = new PersistentStorage<>(
@@ -82,6 +85,7 @@ class CloudFormationStackPersistenceTest {
         assertEquals("my-stack", loaded.getStackName());
         assertEquals("us-east-1", loaded.getRegion());
         assertEquals("CREATE_COMPLETE", loaded.getStatus());
+        assertEquals("arn:aws:iam::000000000000:role/deployment/active", loaded.getRoleArn());
         assertTrue(loaded.isDisableRollback());
         assertEquals("arn:aws:cloudformation:us-east-1:000000000000:stack/my-stack/abc123", loaded.getStackId());
         assertNotNull(loaded.getCreationTime(), "Instant fields must round-trip");
@@ -101,6 +105,8 @@ class CloudFormationStackPersistenceTest {
         assertEquals("CREATE_COMPLETE", loaded.getEvents().get(0).getResourceStatus());
         assertTrue(loaded.getChangeSets().containsKey("initial-create"));
         assertEquals("CREATE_COMPLETE", loaded.getChangeSets().get("initial-create").getStatus());
+        assertEquals("arn:aws:iam::000000000000:role/deployment/proposed",
+                loaded.getChangeSets().get("initial-create").getRoleArn());
     }
 
     @Test
@@ -129,5 +135,6 @@ class CloudFormationStackPersistenceTest {
         assertEquals("legacy-stack", loaded.get().getStackName());
         assertEquals("CREATE_COMPLETE", loaded.get().getStatus());
         assertFalse(loaded.get().isDisableRollback(), "Legacy records retain default creation rollback");
+        assertNull(loaded.get().getRoleArn(), "Legacy stacks retain caller-based execution");
     }
 }

@@ -595,7 +595,11 @@ class IamPassRoleEnforcementIntegrationTest {
 
     @Test
     void aStackNeedsPassRoleOnAServiceRoleTheRequestNames() {
-        String role = role("cloudformation");
+        String role = EnforcementFixtures.createRole(cleanup, baseUri.getPort(), ACCOUNT, "/",
+                "cloudformation-" + suffix(), """
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+                          "Principal":{"Service":"cloudformation.amazonaws.com"}}]}""", """
+                        {"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}""");
         User user = user("passrole-stack");
         String stack = "passrole-stack-" + suffix();
         String stacks = allow("cloudformation:CreateStack", "*") + "," + allow("cloudformation:DeleteStack", "*");

@@ -29,13 +29,21 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
 
 import java.io.Closeable;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -127,8 +135,109 @@ class EcrRegistryManagerTest {
         when(ecr.preferLocalImages()).thenReturn(true);
         when(ecr.enabled()).thenReturn(true);
 
-        manager = new EcrRegistryManager(containerBuilder, lifecycleManager, logStreamer,
-                containerDetector, currentContainerNetworkResolver, portAllocator, config, regionResolver);
+        manager = Mockito.spy(new EcrRegistryManager(containerBuilder, lifecycleManager, logStreamer,
+                containerDetector, currentContainerNetworkResolver, portAllocator, config, regionResolver));
+        Mockito.doAnswer(invocation -> {
+            RegistryHttpClient client = Mockito.spy((RegistryHttpClient) invocation.callRealMethod());
+            Mockito.doReturn(true).when(client).ping(any(Duration.class));
+            return client;
+        }).when(manager).httpClient();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void startupWaitsForRegistryWithoutReconciliation(boolean adopt) throws Exception {
+        configureStartup(adopt);
+        RegistryHttpClient registry = Mockito.mock(RegistryHttpClient.class);
+        Mockito.doReturn(registry).when(manager).httpClient();
+        CountDownLatch waiting = new CountDownLatch(1);
+        CountDownLatch ready = new CountDownLatch(1);
+        AtomicInteger probes = new AtomicInteger();
+        when(registry.ping(any(Duration.class))).thenAnswer(invocation -> {
+            if (probes.getAndIncrement() == 0) {
+                return false;
+            }
+            waiting.countDown();
+            assertTrue(ready.await(5, TimeUnit.SECONDS));
+            return true;
+        });
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> startup = executor.submit(manager::ensureStarted);
+            try {
+                assertTrue(waiting.await(2, TimeUnit.SECONDS),
+                        "Startup must keep checking an unready registry even without a reconciliation hook");
+                assertFalse(startup.isDone());
+                assertFalse(manager.isStarted(), "An unready registry must not be published as started");
+                ready.countDown();
+                startup.get(2, TimeUnit.SECONDS);
+                assertTrue(manager.isStarted());
+            } finally {
+                ready.countDown();
+                startup.cancel(true);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void readinessTimeoutCanRecoverTheSameContainer(boolean adopt) {
+        configureStartup(adopt);
+        RegistryHttpClient registry = Mockito.mock(RegistryHttpClient.class);
+        Mockito.doReturn(registry).when(manager).httpClient();
+        when(registry.ping(any(Duration.class))).thenAnswer(invocation -> {
+            Duration timeout = invocation.getArgument(0);
+            assertTrue(timeout.isPositive() && timeout.compareTo(Duration.ofSeconds(1)) <= 0);
+            return false;
+        });
+
+        RuntimeException error = assertThrows(RuntimeException.class, manager::ensureStarted);
+        assertTrue(error.getMessage().contains("did not become ready within 10 seconds"));
+        assertFalse(manager.isStarted());
+
+        configureStartup(true);
+        when(registry.ping(any(Duration.class))).thenReturn(true);
+        manager.ensureStarted();
+        assertTrue(manager.isStarted());
+        verify(lifecycleManager, times(adopt ? 0 : 1)).createAndStart(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void interruptedStartupPreservesCancellationAndOwnedCleanup(boolean adopt) {
+        configureStartup(adopt);
+        RegistryHttpClient registry = Mockito.mock(RegistryHttpClient.class);
+        Mockito.doReturn(registry).when(manager).httpClient();
+        when(registry.ping(any(Duration.class))).thenAnswer(invocation -> {
+            Thread.currentThread().interrupt();
+            return false;
+        });
+
+        try {
+            RuntimeException error = assertThrows(RuntimeException.class, manager::ensureStarted);
+            assertTrue(error.getMessage().contains("Interrupted while waiting"));
+            assertTrue(Thread.currentThread().isInterrupted());
+            assertFalse(manager.isStarted());
+        } finally {
+            Thread.interrupted();
+        }
+        manager.shutdown();
+        verify(lifecycleManager).stopAndRemove(eq("startup-registry"), any());
+    }
+
+    private void configureStartup(boolean adopt) {
+        ContainerLifecycleManager.ContainerInfo info =
+                new ContainerLifecycleManager.ContainerInfo("startup-registry", Map.of());
+        if (adopt) {
+            Container container = Mockito.mock(Container.class);
+            when(container.getId()).thenReturn(info.containerId());
+            when(container.getPorts()).thenReturn(new ContainerPort[] {
+                    new ContainerPort().withPrivatePort(5000).withPublicPort(BASE_PORT)
+                            .withType("tcp").withIp("127.0.0.1")});
+            when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(container));
+            when(lifecycleManager.adopt(info.containerId(), List.of(5000), Optional.empty())).thenReturn(info);
+        } else {
+            when(lifecycleManager.createAndStart(any())).thenReturn(info);
+        }
     }
 
     @Test

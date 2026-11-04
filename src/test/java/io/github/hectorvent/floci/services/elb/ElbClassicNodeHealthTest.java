@@ -10,6 +10,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 
 import java.time.Duration;
@@ -59,7 +61,8 @@ class ElbClassicNodeHealthTest {
         when(frontends.probesFor(lb, INSTANCE)).thenAnswer(invocation -> nodes.get());
         when(frontends.current(eq(lb), any())).thenAnswer(invocation -> {
             ElbClassicFrontendManager.Probe probe = invocation.getArgument(1);
-            return nodes.get().stream().anyMatch(current -> current.frontend() == probe.frontend());
+            return nodes.get().stream().anyMatch(current -> current.frontend() == probe.frontend()
+                    && current.generation() == probe.generation());
         });
         when(frontends.probe(eq(good), any(), anyInt())).thenAnswer(invocation -> {
             goodChecks.incrementAndGet();
@@ -121,12 +124,14 @@ class ElbClassicNodeHealthTest {
         await().atMost(Duration.ofSeconds(3)).until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
     }
 
-    @Test
-    void replacingANodeDoesNotReuseItsPreviousSuccessfulChecks() {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void replacingANodeOrRegistrationDoesNotReuseItsPreviousSuccessfulChecks(boolean replaceNode) {
         startAndAwaitFirstChecks();
         health.runArmedChecks();
         await().atMost(Duration.ofSeconds(3)).until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
-        ElbClassicFrontendManager.Probe replacement = node("eni-a", "replacement");
+        ElbClassicFrontendManager.Probe replacement = replaceNode ? node("eni-a", "replacement")
+                : new ElbClassicFrontendManager.Probe(good.frontend(), INSTANCE, good.address(), 1);
         AtomicInteger checks = new AtomicInteger();
         when(frontends.probe(eq(replacement), any(), anyInt())).thenAnswer(invocation -> {
             checks.incrementAndGet();
@@ -141,6 +146,21 @@ class ElbClassicNodeHealthTest {
         assertEquals("OutOfService", health.getHealth(lb, INSTANCE).state());
         health.runArmedChecks();
         await().atMost(Duration.ofSeconds(3)).until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
+    }
+
+    @Test
+    void reconcilingOtherRegistrationsPreservesHealthyMembersAndRemovesDeregisteredState() {
+        lb.getInstanceIds().add(INSTANCE);
+        startAndAwaitFirstChecks();
+        health.runArmedChecks();
+        await().atMost(Duration.ofSeconds(3)).until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
+        lb.getInstanceIds().add("i-new");
+        health.startMonitoring(lb);
+        health.reconcileInstances(lb);
+        assertEquals("InService", health.getHealth(lb, INSTANCE).state());
+        lb.getInstanceIds().remove(INSTANCE);
+        health.reconcileInstances(lb);
+        assertEquals("OutOfService", health.getHealth(lb, INSTANCE).state());
     }
 
     @Test

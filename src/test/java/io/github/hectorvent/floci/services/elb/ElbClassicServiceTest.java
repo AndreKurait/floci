@@ -16,6 +16,8 @@ import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -24,6 +26,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -428,6 +431,30 @@ class ElbClassicServiceTest {
         AwsException e = assertThrows(AwsException.class,
                 () -> service.describeInstanceHealth(REGION, "my-elb", List.of("i-unknown")));
         assertEquals("InvalidInstance", e.getErrorCode());
+    }
+
+    @Test
+    void aKnownDeregisteredInstanceIsReportedOutOfService() {
+        create("my-elb");
+        when(ec2Service.getInstance(REGION, "i-known")).thenReturn(
+                Optional.of(new io.github.hectorvent.floci.services.ec2.model.Instance()));
+        assertEquals(new ElbClassicHealthChecker.InstanceHealth("OutOfService", "Instance",
+                        "Instance is not currently registered with the LoadBalancer."),
+                service.describeInstanceHealth(REGION, "my-elb", List.of("i-known")).get("i-known"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 3601})
+    void anInvalidDrainingTimeoutLeavesAttributesUnchanged(int timeout) {
+        create("my-elb");
+        AwsException failure = assertThrows(AwsException.class, () -> service.modifyLoadBalancerAttributes(
+                REGION, "my-elb", new ElbClassicService.AttributeUpdate(true, null, null, null, null,
+                        true, timeout, null, Map.of())));
+        assertEquals("InvalidConfigurationRequest", failure.getErrorCode());
+        ClassicLoadBalancer actual = service.requireLoadBalancer(REGION, "my-elb");
+        assertEquals(300, actual.getAttributes().getConnectionDrainingTimeout());
+        assertEquals(false, actual.getAttributes().isConnectionDrainingEnabled());
+        assertEquals(false, actual.getAttributes().isCrossZoneLoadBalancingEnabled());
     }
 
     @Test

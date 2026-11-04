@@ -109,10 +109,20 @@ enabled zones; with cross-zone routing disabled, each node selects only its own
 zone. An instance is reported healthy after an eligible node applies its
 healthy state to the listener. Retired nodes cannot update their replacements.
 
-This mode reconstructs the runtime on listener, health-check, backend,
-subnet or group-attachment changes; the private address can change, and clients
+Adding or removing backend instances preserves the frontend processes and addresses.
+Connection draining stops new work for a deregistered instance while existing
+requests finish, up to the configured 1–3600 second timeout. With draining disabled,
+deregistration closes those connections immediately. An unhealthy instance stops
+receiving new work but keeps existing connections without the deregistration
+deadline when draining is enabled. Re-registration cancels a pending retirement
+and requires fresh health admission; other healthy instances retain their state.
+See [connection draining](../design/classic-connection-draining.md) for the API
+states, tests and Auto Scaling integration.
+
+This mode reconstructs the runtime on listener, health-check, subnet,
+group-attachment, cross-zone or idle-timeout changes; the private address can change, and clients
 must resolve it again after those updates. Security-group rule edits reconcile
-the existing firewall directly. IPv6, connection draining, access logging and
+the existing firewall directly. IPv6, access logging and
 automatic DNS withdrawal of zones without healthy targets are not supported in
 this mode. Route53 aliases need separate
 qualification. Deletion retains the

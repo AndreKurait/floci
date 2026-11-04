@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elb.model.ClassicHealthCheck;
 import io.github.hectorvent.floci.services.elb.model.ClassicListener;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
+import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancerAttributes;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.ServerCertificateReferenceProvider;
 import jakarta.annotation.PostConstruct;
@@ -519,20 +520,37 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         }
     }
 
+    /** Instances still serving requests after deregistration, across every frontend node. */
+    public Set<String> deregisteringInstances(String region, String name) {
+        ClassicLoadBalancer loadBalancer = requireLoadBalancer(region, name);
+        return frontends == null ? Set.of() : frontends.drainingInstances(loadBalancer);
+    }
+
     /** The health of each requested instance, or of every registered instance when none is named. */
     public Map<String, ElbClassicHealthChecker.InstanceHealth> describeInstanceHealth(
             String region, String name, List<String> instanceIds) {
         ClassicLoadBalancer lb = requireLoadBalancer(region, name);
+        Set<String> draining = frontends == null ? Set.of() : frontends.drainingInstances(lb);
+        Set<String> registeredOrDraining = new LinkedHashSet<>(lb.getInstanceIds());
+        registeredOrDraining.addAll(draining);
         List<String> wanted = instanceIds == null || instanceIds.isEmpty()
-                ? lb.getInstanceIds()
+                ? List.copyOf(registeredOrDraining)
                 : instanceIds;
         Map<String, ElbClassicHealthChecker.InstanceHealth> result = new LinkedHashMap<>();
         for (String id : wanted) {
-            if (!lb.getInstanceIds().contains(id)) {
-                throw new AwsException("InvalidInstance",
-                        "Could not find EC2 instance " + id + ".", 400);
+            if (draining.contains(id)) {
+                result.put(id, new ElbClassicHealthChecker.InstanceHealth("InService", "N/A",
+                        "Instance deregistration currently in progress"));
+            } else if (lb.getInstanceIds().contains(id)) {
+                result.put(id, healthChecker.getHealth(lb, id));
+            } else {
+                if (ec2Service.getInstance(region, id).isEmpty()) {
+                    throw new AwsException("InvalidInstance",
+                            "Could not find EC2 instance " + id + ".", 400);
+                }
+                result.put(id, new ElbClassicHealthChecker.InstanceHealth("OutOfService", "Instance",
+                        "Instance is not currently registered with the LoadBalancer."));
             }
-            result.put(id, healthChecker.getHealth(lb, id));
         }
         return result;
     }
@@ -541,6 +559,11 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
 
     public ClassicLoadBalancer modifyLoadBalancerAttributes(String region, String name,
                                                             AttributeUpdate update) {
+        if (update.connectionDrainingTimeout() != null
+                && (update.connectionDrainingTimeout() < 1 || update.connectionDrainingTimeout() > 3600)) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "Connection draining timeout must be between 1 and 3600 seconds.", 400);
+        }
         try (RuntimeWrite ignored = runtimeWrite(region, name)) {
             ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
             update.applyTo(lb.getAttributes());
@@ -560,7 +583,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
                                   Integer idleTimeout,
                                   Map<String, String> additionalAttributes) {
 
-        void applyTo(io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancerAttributes attrs) {
+        void applyTo(ClassicLoadBalancerAttributes attrs) {
             if (crossZoneEnabled != null) attrs.setCrossZoneLoadBalancingEnabled(crossZoneEnabled);
             if (accessLogEnabled != null) attrs.setAccessLogEnabled(accessLogEnabled);
             if (accessLogS3BucketName != null) attrs.setAccessLogS3BucketName(accessLogS3BucketName);
@@ -680,9 +703,8 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             loadBalancers.put(region, regionLbs);
         }
         if (changed) {
-            healthChecker.stopMonitoring(loadBalancer);
             healthChecker.startMonitoring(loadBalancer);
-            healthChecker.registerInstances(loadBalancer, loadBalancer.getInstanceIds());
+            healthChecker.reconcileInstances(loadBalancer);
         }
     }
 

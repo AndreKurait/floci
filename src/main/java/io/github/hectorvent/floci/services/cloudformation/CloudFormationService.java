@@ -20,6 +20,7 @@ import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.cloudformation.GetStackOutputRoleAuthorizer.ExecutionIdentity;
 import io.github.hectorvent.floci.services.cloudformation.model.ChangeSet;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
@@ -333,6 +334,14 @@ public class CloudFormationService implements ResourceProvider {
                                                          Map<String, String> parameters,
                                                          List<String> capabilities,
                                                          Map<String, String> tags, String region) {
+        return createChangeSetFromPreviousTemplate(stackName, changeSetName, parameters, capabilities, tags,
+                region, null);
+    }
+
+    public ChangeSet createChangeSetFromPreviousTemplate(String stackName, String changeSetName,
+                                                         Map<String, String> parameters,
+                                                         List<String> capabilities,
+                                                         Map<String, String> tags, String region, String roleArn) {
         ChangeSet created = null;
         while (created == null) {
             Stack stack = resolveStack(stackName, region);
@@ -342,7 +351,7 @@ public class CloudFormationService implements ResourceProvider {
             }
             String previousTemplate = previousTemplateOf(stack);
             created = createChangeSet(stackName, changeSetName, "UPDATE", previousTemplate, null,
-                    parameters, capabilities, tags, region, currentAccount(), false, true);
+                    parameters, capabilities, tags, region, currentAccount(), false, true, roleArn);
         }
         return created;
     }
@@ -360,7 +369,16 @@ public class CloudFormationService implements ResourceProvider {
                                      Map<String, String> parameters, List<String> capabilities,
                                      Map<String, String> tags, String region) {
         return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
-                parameters, capabilities, tags, region, regionResolver.getAccountId(), false, false);
+                parameters, capabilities, tags, region, regionResolver.getAccountId(), false, false, null);
+    }
+
+    /** The implicit change set used by CreateStack and UpdateStack, with their RoleARN selection. */
+    public ChangeSet createChangeSetForStackOperation(String stackName, String changeSetName, String changeSetType,
+                                                      String templateBody, String templateUrl,
+                                                      Map<String, String> parameters, List<String> capabilities,
+                                                      Map<String, String> tags, String region, String roleArn) {
+        return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
+                parameters, capabilities, tags, region, currentAccount(), false, false, roleArn);
     }
 
     /**
@@ -383,8 +401,16 @@ public class CloudFormationService implements ResourceProvider {
                                                String templateBody, String templateUrl,
                                                Map<String, String> parameters, List<String> capabilities,
                                                Map<String, String> tags, String region) {
+        return createChangeSetForRequest(stackName, changeSetName, changeSetType, templateBody, templateUrl,
+                parameters, capabilities, tags, region, null);
+    }
+
+    public ChangeSet createChangeSetForRequest(String stackName, String changeSetName, String changeSetType,
+                                               String templateBody, String templateUrl,
+                                               Map<String, String> parameters, List<String> capabilities,
+                                               Map<String, String> tags, String region, String roleArn) {
         return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
-                parameters, capabilities, tags, region, regionResolver.getAccountId(), true, false);
+                parameters, capabilities, tags, region, regionResolver.getAccountId(), true, false, roleArn);
     }
 
     /**
@@ -402,14 +428,15 @@ public class CloudFormationService implements ResourceProvider {
                                      Map<String, String> parameters, List<String> capabilities,
                                      Map<String, String> tags, String region, String accountId) {
         return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
-                parameters, capabilities, tags, region, accountId, false, false);
+                parameters, capabilities, tags, region, accountId, false, false, null);
     }
 
     private ChangeSet createChangeSet(String stackName, String changeSetName, String changeSetType,
                                       String templateBody, String templateUrl,
                                       Map<String, String> parameters, List<String> capabilities,
                                       Map<String, String> tags, String region, String accountId,
-                                      boolean attachToReviewInProgressStack, boolean fromPreviousTemplate) {
+                                      boolean attachToReviewInProgressStack, boolean fromPreviousTemplate,
+                                      String roleArn) {
         String resolvedTemplate = resolveTemplate(templateBody, templateUrl);
         requireValidTemplate(resolvedTemplate);
         boolean isCreateType = "CREATE".equalsIgnoreCase(changeSetType);
@@ -440,6 +467,8 @@ public class CloudFormationService implements ResourceProvider {
         String preflightStackName = identity != null ? identity.getStackName() : stackName;
         String preflightStackId = identity != null ? identity.getStackId()
                 : createdStackId != null ? createdStackId : "";
+        stackOutputRoles.validateExecutionRole(roleArn, accountId, preflightStackId,
+                AwsRegions.partitionFor(region));
 
         // Real CloudFormation runs a declared macro (here, only AWS::Serverless-2016-10-31)
         // before it ever evaluates the template's own resources or conditions. On real AWS,
@@ -493,6 +522,7 @@ public class CloudFormationService implements ResourceProvider {
         // the verdict stands only if the stack still holds what it was reached against.
         DeployedState checked = isCreateType || live == null ? null : DeployedState.of(live);
         boolean unchangedWhenChecked = checked != null
+                && (roleArn == null || roleArn.equals(live.getRoleArn()))
                 && submitsWhatTheStackHas(live, resolvedTemplate, parameters, tags, region);
         ChangeSet[] created = new ChangeSet[1];
         boolean[] unchanged = new boolean[1];
@@ -550,6 +580,7 @@ public class CloudFormationService implements ResourceProvider {
             cs.setStackId(target.getStackId());
             cs.setChangeSetType(changeSetType != null ? changeSetType : "UPDATE");
             cs.setTemplateBody(resolvedTemplate);
+            cs.setRoleArn(roleArn);
             cs.setParameters(parameters);
             cs.setCapabilities(capabilities);
             cs.setTags(tags);
@@ -578,10 +609,10 @@ public class CloudFormationService implements ResourceProvider {
 
     /** What {@link #submitsWhatTheStackHas} compares an update against. */
     private record DeployedState(String template, Map<String, String> parameters,
-                                 Map<String, String> resolvedParameters, Map<String, String> tags) {
+                                 Map<String, String> resolvedParameters, Map<String, String> tags, String roleArn) {
         static DeployedState of(Stack stack) {
             return new DeployedState(stack.getTemplateBody(), stack.parametersSnapshot(),
-                    stack.resolvedParametersSnapshot(), stack.tagsSnapshot());
+                    stack.resolvedParametersSnapshot(), stack.tagsSnapshot(), stack.getRoleArn());
         }
     }
 
@@ -1203,11 +1234,11 @@ public class CloudFormationService implements ResourceProvider {
         return claimAndSubmitExecution(stackName, changeSetName, region, accountId, false, false);
     }
 
-    private record ClaimedExecution(ChangeSet changeSet, boolean isCreate) {}
+    private record ClaimedExecution(ChangeSet changeSet, boolean isCreate, ExecutionIdentity identity) {}
 
     private record ChangeSetState(String status, String executionStatus) {}
 
-    private record StackMutationSnapshot(String status, Instant lastUpdatedTime, boolean disableRollback,
+    private record StackMutationSnapshot(String status, Instant lastUpdatedTime, boolean disableRollback, String roleArn,
                                          List<StackEvent> events,
                                          Map<String, ChangeSet> changeSets,
                                          Map<ChangeSet, ChangeSetState> changeSetStates) {}
@@ -1217,6 +1248,8 @@ public class CloudFormationService implements ResourceProvider {
                                               String accountId, boolean requireAvailable, boolean disableCreateRollback) {
         String canonicalStackName = getStackForChangeSet(stackNameOrArn, changeSetName, region,
                 accountId).getStackName();
+        String partition = AwsRegions.partitionFor(region);
+        ExecutionIdentity caller = stackOutputRoles.captureCaller(accountId, partition);
 
         ClaimedExecution[] claimed = new ClaimedExecution[1];
         StackMutationSnapshot[] snapshot = new StackMutationSnapshot[1];
@@ -1237,6 +1270,9 @@ public class CloudFormationService implements ResourceProvider {
             if (!eligible) {
                 throw invalidChangeSetStatus(cs);
             }
+            String roleArn = cs.getRoleArn() != null ? cs.getRoleArn() : existing.getRoleArn();
+            ExecutionIdentity identity = stackOutputRoles.executionIdentity(
+                    roleArn, accountId, existing.getStackId(), partition, caller);
             snapshot[0] = snapshot(existing);
             boolean isCreate = "CREATE".equalsIgnoreCase(cs.getChangeSetType()) ||
                     "CREATE_IN_PROGRESS".equals(existing.getStatus());
@@ -1256,16 +1292,18 @@ public class CloudFormationService implements ResourceProvider {
                     }
                 }
             }
+            existing.setRoleArn(roleArn);
             existing.setStatus(isCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS");
             existing.setLastUpdatedTime(now());
             addEvent(existing, existing.getStackName(), existing.getStackId(),
                     "AWS::CloudFormation::Stack", isCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS", null);
-            claimed[0] = new ClaimedExecution(cs, isCreate);
+            claimed[0] = new ClaimedExecution(cs, isCreate, identity);
             return existing;
         });
         try {
             persistStack(stack);
-            return submitExecution(stack, claimed[0].changeSet(), claimed[0].isCreate(), region, accountId);
+            return submitExecution(stack, claimed[0].changeSet(), claimed[0].isCreate(), region, accountId,
+                    claimed[0].identity());
         } catch (AwsException e) {
             if ("LimitExceededException".equals(e.getErrorCode())) {
                 Stack restored = restoreStack(accountId, canonicalStackName, region, snapshot[0]);
@@ -1285,12 +1323,13 @@ public class CloudFormationService implements ResourceProvider {
                 "ChangeSet [" + cs.getChangeSetId() + "] cannot be executed in its current " + detail, 400);
     }
 
-    private Future<?> submitExecution(Stack stack, ChangeSet cs, boolean isCreate, String region, String accountId) {
+    private Future<?> submitExecution(Stack stack, ChangeSet cs, boolean isCreate, String region, String accountId,
+                                      ExecutionIdentity identity) {
         String templateBody = cs.getTemplateBody();
         Map<String, String> params = cs.getParameters() != null ? cs.getParameters() : Map.of();
 
         return submitOperation(() -> RequestScopes.runAs(accountId, region, () -> {
-            executeTemplate(stack, templateBody, params, cs.getTags(), isCreate, region, accountId);
+            executeTemplate(stack, templateBody, params, cs.getTags(), isCreate, region, accountId, identity);
             String status = stack.getStatus();
             cs.setExecutionStatus(status != null && (status.contains("ROLLBACK") || status.endsWith("_FAILED"))
                 ? "EXECUTE_FAILED" : "EXECUTE_COMPLETE");
@@ -1326,6 +1365,10 @@ public class CloudFormationService implements ResourceProvider {
         deleteStack(stackName, retainResources, region, regionResolver.getAccountId());
     }
 
+    public Future<?> deleteStackWithRole(String stackName, List<String> retainResources, String region, String roleArn) {
+        return deleteStack(stackName, retainResources, region, currentAccount(), roleArn);
+    }
+
     public Future<?> deleteStack(String stackName, String region, String accountId) {
         return deleteStack(stackName, List.of(), region, accountId);
     }
@@ -1342,6 +1385,11 @@ public class CloudFormationService implements ResourceProvider {
      *         removal) can await it.
      */
     public Future<?> deleteStack(String stackName, List<String> retainResources, String region, String accountId) {
+        return deleteStack(stackName, retainResources, region, accountId, null);
+    }
+
+    private Future<?> deleteStack(String stackName, List<String> retainResources, String region, String accountId,
+                                   String roleArn) {
         validateRetainResources(retainResources);
         purgeExpiredDeletedStacks();
         Stack stack = resolveStack(stackName, region, accountId);
@@ -1397,7 +1445,11 @@ public class CloudFormationService implements ResourceProvider {
                     }
                 }
             }
+            String selectedRole = roleArn != null ? roleArn : existing.getRoleArn();
+            stackOutputRoles.validateExecutionRole(
+                    selectedRole, accountId, existing.getStackId(), AwsRegions.partitionFor(region));
             StackMutationSnapshot snapshot = snapshot(existing);
+            existing.setRoleArn(selectedRole);
             existing.setRetainResources(retain);
             existing.setStatus("DELETE_IN_PROGRESS");
             addEvent(existing, existing.getStackName(), existing.getStackId(),
@@ -1442,6 +1494,11 @@ public class CloudFormationService implements ResourceProvider {
      */
     public Future<?> continueUpdateRollback(
             String stackNameOrArn, List<String> resourcesToSkip, boolean forceRollback, String region) {
+        return continueUpdateRollback(stackNameOrArn, resourcesToSkip, forceRollback, region, null);
+    }
+
+    public Future<?> continueUpdateRollback(
+            String stackNameOrArn, List<String> resourcesToSkip, boolean forceRollback, String region, String roleArn) {
         validateContinueUpdateRollback(stackNameOrArn, resourcesToSkip);
         if (forceRollback && !resourcesToSkip.isEmpty()) {
             throw new AwsException("ValidationError", FORCE_WITH_SKIPS, 400);
@@ -1461,7 +1518,11 @@ public class CloudFormationService implements ResourceProvider {
             if (!"UPDATE_ROLLBACK_FAILED".equals(existing.getStatus())) {
                 throw new AwsException("ValidationError", CONTINUE_ROLLBACK_REFUSED, 400);
             }
+            String selectedRole = roleArn != null ? roleArn : existing.getRoleArn();
+            stackOutputRoles.validateExecutionRole(
+                    selectedRole, accountId, existing.getStackId(), AwsRegions.partitionFor(region));
             snapshot[0] = snapshot(existing);
+            existing.setRoleArn(selectedRole);
             existing.setStatus("UPDATE_ROLLBACK_IN_PROGRESS");
             addEvent(existing, existing.getStackName(), existing.getStackId(),
                     "AWS::CloudFormation::Stack", "UPDATE_ROLLBACK_IN_PROGRESS", "User Initiated");
@@ -1517,6 +1578,7 @@ public class CloudFormationService implements ResourceProvider {
             states.put(changeSet, new ChangeSetState(changeSet.getStatus(), changeSet.getExecutionStatus()));
         }
         return new StackMutationSnapshot(stack.getStatus(), stack.getLastUpdatedTime(), stack.isDisableRollback(),
+                stack.getRoleArn(),
                 stack.eventsSnapshot(), stack.changeSetsSnapshot(), states);
     }
 
@@ -1525,6 +1587,7 @@ public class CloudFormationService implements ResourceProvider {
             return;
         }
         stack.setDisableRollback(snapshot.disableRollback());
+        stack.setRoleArn(snapshot.roleArn());
         stack.setStatus(snapshot.status());
         stack.setLastUpdatedTime(snapshot.lastUpdatedTime());
         stack.setEvents(new ArrayList<>(snapshot.events()));
@@ -1999,7 +2062,7 @@ public class CloudFormationService implements ResourceProvider {
 
     private void executeTemplate(Stack stack, String templateBody, Map<String, String> params,
                                  Map<String, String> tags,
-                                 boolean isCreate, String region, String accountId) {
+                                 boolean isCreate, String region, String accountId, ExecutionIdentity identity) {
         StackUpdateSnapshot previousState = snapshotForUpdate(stack);
         boolean updateCommitted = false;
         Set<String> attemptedResourceIds = new LinkedHashSet<>();
@@ -2096,7 +2159,7 @@ public class CloudFormationService implements ResourceProvider {
                             name -> exports.get(accountExportKey(accountId, exportKey(region, name))),
                             value -> dynamicReferences.resolveDynamicReferences(value, region, false),
                             (name, output, outputRegion, roleArn) ->
-                                    resolveStackOutput(accountId, name, output, outputRegion, roleArn),
+                                    resolveStackOutput(accountId, name, output, outputRegion, roleArn, identity),
                             parameterTypes,
                             (id, attribute, value) -> dispatcher.attributeValue(
                                     resources.path(id).path("Type").asText(), attribute, value));
@@ -2153,7 +2216,7 @@ public class CloudFormationService implements ResourceProvider {
                     if ("AWS::CloudFormation::Stack".equals(type)) {
                         resource = executeNestedStack(stack, logicalId,
                                 props.isMissingNode() ? null : props,
-                                engine, region, accountId, isCreate, previousResource);
+                                engine, region, accountId, isCreate, previousResource, identity);
                     } else {
                         JsonNode previousDefinition = previousResources.path(logicalId);
                         JsonNode priorProps = type.equals(previousDefinition.path("Type").asText())
@@ -2310,7 +2373,7 @@ public class CloudFormationService implements ResourceProvider {
                     name -> exports.get(accountExportKey(accountId, exportKey(region, name))),
                     value -> dynamicReferences.resolveDynamicReferences(value, region, false),
                     (name, output, outputRegion, roleArn) ->
-                            resolveStackOutput(accountId, name, output, outputRegion, roleArn),
+                            resolveStackOutput(accountId, name, output, outputRegion, roleArn, identity),
                     parameterTypes,
                     (id, attribute, value) -> dispatcher.attributeValue(
                             resources.path(id).path("Type").asText(), attribute, value));
@@ -4331,7 +4394,7 @@ public class CloudFormationService implements ResourceProvider {
     private StackResource executeNestedStack(Stack parentStack, String logicalId, JsonNode props,
                                              CloudFormationTemplateEngine engine, String region,
                                              String accountId, boolean isCreate,
-                                             StackResource previousResource) {
+                                             StackResource previousResource, ExecutionIdentity identity) {
         StackResource resource = new StackResource();
         resource.setLogicalId(logicalId);
         resource.setResourceType("AWS::CloudFormation::Stack");
@@ -4390,7 +4453,8 @@ public class CloudFormationService implements ResourceProvider {
             stacks.put(stackKey(accountId, childStackName, region), childStack);
         }
 
-        executeTemplate(childStack, childTemplate, childParams, null, childCreate, region, accountId);
+        childStack.setRoleArn(parentStack.getRoleArn());
+        executeTemplate(childStack, childTemplate, childParams, null, childCreate, region, accountId, identity);
 
         resource.setPhysicalId(childStack.getStackId());
         resource.getAttributes().put("Arn", childStack.getStackId());
@@ -4661,9 +4725,10 @@ public class CloudFormationService implements ResourceProvider {
      * missing stack, and a template error for a missing output.
      */
     private String resolveStackOutput(String accountId, String stackName, String outputName,
-                                      String region, String roleArn) {
+                                      String region, String roleArn, ExecutionIdentity identity) {
         String partition = AwsRegions.partitionFor(region);
-        String ownerAccount = roleArn == null ? accountId : stackOutputRoles.assume(roleArn, accountId, partition);
+        String ownerAccount = roleArn == null ? accountId
+                : stackOutputRoles.assume(roleArn, identity, region, partition);
         // CloudFormation hands the stack name to DescribeStacks as written, a dynamic reference
         // included (it resolves none inside Fn::GetStackOutput), and DescribeStacks validates it.
         if (!STACK_NAME.matcher(stackName).matches()) {
@@ -4681,6 +4746,8 @@ public class CloudFormationService implements ResourceProvider {
         }
         if (roleArn != null) {
             stackOutputRoles.requireDescribeStacks(roleArn, referenced.getStackId(), partition);
+        } else {
+            stackOutputRoles.requireDescribeStacks(identity, referenced.getStackId());
         }
         String value = referenced.outputsSnapshot().get(outputName);
         if (value == null) {

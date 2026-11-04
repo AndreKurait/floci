@@ -680,6 +680,24 @@ deployment reuse identical export names across its member accounts.
 
 ## Stack Output References (`Fn::GetStackOutput`)
 
+`RoleARN` on `CreateStack`, `UpdateStack` or `CreateChangeSet` selects the stack's
+CloudFormation execution role. An executed change set retains that role for later
+operations; creating or deleting an unexecuted change set does not replace it.
+`DeleteStack` and `ContinueUpdateRollback` can select a replacement role.
+`DescribeStacks` returns the associated `RoleARN`. Omitting it preserves the
+existing role, including on `UsePreviousTemplate` updates.
+
+With IAM enforcement enabled, the role must belong to the stack's account and
+partition and trust CloudFormation. The ordinary request authorization filter
+enforces `iam:PassRole` when a request supplies a role. Reusing the associated role
+does not require passing it again. Before submitting asynchronous execution, Floci
+captures the selected role or the API caller's identity and session restrictions.
+Nested stack execution inherits that identity.
+
+This authorization applies to stack-role selection and output reads. Individual
+resource provisioners do not yet evaluate every downstream AWS action against the
+execution role. It is not full CloudFormation service-role IAM enforcement.
+
 `Fn::GetStackOutput` reads an output of another stack, which needs no `Export`. It is what the CDK
 synthesizes for a weak cross-stack reference. The value is read when the consuming resource is created
 or updated. Floci follows what CloudFormation does, measured against it, where that departs from the
@@ -701,18 +719,17 @@ intrinsic's reference page:
   valid AWS region.`, and one of another partition with `InvalidClientTokenId`, as the call to it does.
 - A `RoleArn` that is not an ARN fails with `TemplateError: Invalid RoleArn parameter X in
   Fn::GetStackOutput`. Any other ARN that is not an existing role (a user, a role of another
-  partition, a role that does not exist) fails with STS's `AccessDenied`, naming the account's root
-  as the caller. On AWS the role is assumed by the stack's execution role, or without one by the
-  caller of the stack operation, and the outputs are read with DescribeStacks in a session named
-  `GetStackOutput`; the CDK's role trusts the consuming account's execution role. Floci runs stack
-  operations under no execution role and keeps no caller for them. With IAM enforcement off, as
-  `AssumeRole`, it evaluates neither the role's trust policy nor its permissions. With enforcement on,
-  the trust policy has to allow a principal in the consuming account (its root, or any principal of
-  it the policy names, such as the CDK's execution role), or STS's `AccessDenied` fails the resource,
-  and the role's policies have to allow `cloudformation:DescribeStacks` on the stack, or
+  partition, a role that does not exist) fails with STS's `AccessDenied`, naming the executing
+  principal. The reader role must trust that principal, including exact `aws:PrincipalArn`
+  conditions; trusting another role in the same account does not suffice. The shared IAM
+  evaluators apply the caller's permissions, session policy, permissions boundary and SCPs to
+  `sts:AssumeRole`. With IAM enforcement off, trust and permissions are not evaluated.
+  After a successful assumption, the reader's policies must allow `cloudformation:DescribeStacks`
+  on the referenced stack, or
   DescribeStacks' `AccessDenied` does (`User: arn:aws:sts::A:assumed-role/R/GetStackOutput is not
   authorized to perform: cloudformation:DescribeStacks on resource: ... because no identity-based
   policy allows the cloudformation:DescribeStacks action`).
+  Without a reader `RoleArn`, DescribeStacks uses the operation's execution identity.
 - Arguments that are not a map, or that lack `StackName` or `OutputName`, are refused when the stack
   operation is requested, with `ValidationError` `TemplateError: Fn::GetStackOutput requires a map of
   named parameters` or `GetStackOutput: StackName is required`, as on AWS.
@@ -1109,7 +1126,7 @@ other than `UPDATE_ROLLBACK_FAILED` with `RollbackUpdatedStack cannot be called 
 status`. `ResourcesToSkip` is checked against the stack after the call is accepted: a skip that is
 not a resource of the stack, or not `UPDATE_FAILED`, returns the stack to `UPDATE_ROLLBACK_FAILED`
 with the reason, touching no resource, and a later call can still finish the rollback. `RoleARN`
-and `ClientRequestToken` are accepted and have no effect.
+replaces the associated execution role after validation. `ClientRequestToken` is accepted and has no effect.
 
 Known difference: `ResourcesToSkip` does not support a nested stack's resource
 (`NestedStackName.ResourceLogicalID`). When the prefix names a nested stack of the stack, the

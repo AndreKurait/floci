@@ -18,6 +18,9 @@ public class AsgInstance {
     private String launchTemplateVersion;
     private String instanceType;
     private boolean protectedFromScaleIn;
+    // Retain the scale-in intent while ELB drains or EC2 termination is retried.
+    // Older stored Terminating members retain the existing refresh termination path.
+    private boolean scaleInTermination;
     // The EnterStandby or ExitStandby activity the reconciler completes when this instance finishes moving
     // into or out of standby; null otherwise, and for members stored before standby was supported.
     private String standbyActivityId;
@@ -53,6 +56,9 @@ public class AsgInstance {
 
     public boolean isProtectedFromScaleIn() { return protectedFromScaleIn; }
     public void setProtectedFromScaleIn(boolean v) { this.protectedFromScaleIn = v; }
+
+    public boolean isScaleInTermination() { return scaleInTermination; }
+    public void setScaleInTermination(boolean v) { this.scaleInTermination = v; }
 
     public String getStandbyActivityId() { return standbyActivityId; }
     public void setStandbyActivityId(String v) { this.standbyActivityId = v; }
