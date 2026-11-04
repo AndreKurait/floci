@@ -1573,6 +1573,7 @@ public class SsmService implements ResourceProvider {
 
     public synchronized SsmAssociation updateAssociation(
             String associationId,
+            String name,
             String associationName,
             String documentVersion,
             List<SsmAssociation.Target> targets,
@@ -1581,26 +1582,41 @@ public class SsmService implements ResourceProvider {
             String maxErrors,
             String maxConcurrency,
             String complianceSeverity,
+            String expectedAssociationVersion,
             String region) {
         String storageKey = regionKey(region, associationId);
         SsmAssociation association = associationStore.get(storageKey)
                 .orElseThrow(() -> new AwsException("AssociationDoesNotExist",
                         "The specified association does not exist.", 400));
 
-        if (documentVersion != null) {
-            validateDocumentVersion(getDocument(association.getName(), region), documentVersion);
+        long currentVersion = parseAssociationVersion(association.getAssociationVersion());
+        if (expectedAssociationVersion != null && !"$LATEST".equals(expectedAssociationVersion)
+                && !Long.toString(currentVersion).equals(expectedAssociationVersion)) {
+            throw new AwsException("InvalidAssociationVersion",
+                    "The association version must match the latest version.", 400);
         }
 
-        if (associationName != null) association.setAssociationName(associationName);
-        if (documentVersion != null) association.setDocumentVersion(documentVersion);
-        if (targets != null) association.setTargets(targets);
-        if (parameters != null) association.setParameters(parameters);
-        if (scheduleExpression != null) association.setScheduleExpression(scheduleExpression);
-        if (maxErrors != null) association.setMaxErrors(maxErrors);
-        if (maxConcurrency != null) association.setMaxConcurrency(maxConcurrency);
-        if (complianceSeverity != null) association.setComplianceSeverity(complianceSeverity);
+        String selectedName = name == null ? association.getName() : name;
+        boolean documentChanged = !Objects.equals(selectedName, association.getName());
+        String selectedVersion = documentVersion;
+        if (selectedVersion == null) {
+            selectedVersion = documentChanged ? "$DEFAULT" : association.getDocumentVersion();
+        }
+        if (name != null || documentVersion != null) {
+            validateDocumentVersion(getDocument(selectedName, region), selectedVersion);
+        }
 
-        long currentVersion = parseAssociationVersion(association.getAssociationVersion());
+        // Validate against the new document before mutating the stored association.
+        if (name != null) association.setName(name);
+        association.setAssociationName(associationName);
+        if (documentVersion != null || documentChanged) association.setDocumentVersion(selectedVersion);
+        if (targets != null) association.setTargets(targets);
+        association.setParameters(parameters);
+        association.setScheduleExpression(scheduleExpression);
+        association.setMaxErrors(maxErrors);
+        association.setMaxConcurrency(maxConcurrency);
+        association.setComplianceSeverity(complianceSeverity);
+
         association.setAssociationVersion(String.valueOf(currentVersion + 1));
         association.setStatus(new SsmAssociation.AssociationStatus(
                 "Pending", "Awaiting association execution", Instant.now(), null));

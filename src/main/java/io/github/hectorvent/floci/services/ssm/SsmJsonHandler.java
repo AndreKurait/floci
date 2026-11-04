@@ -875,7 +875,10 @@ public class SsmJsonHandler {
                     SmithyValidationErrors.notNull("associationId"));
         }
 
+        String name = request.hasNonNull("Name") ? requireDocumentNameOrArn(request) : null;
         String associationName = request.hasNonNull("AssociationName") ? request.path("AssociationName").asText() : null;
+        String associationVersion = request.hasNonNull("AssociationVersion")
+                ? request.path("AssociationVersion").asText() : null;
         String documentVersion = request.hasNonNull("DocumentVersion") ? request.path("DocumentVersion").asText() : null;
         String scheduleExpression = request.hasNonNull("ScheduleExpression") ? request.path("ScheduleExpression").asText() : null;
         String maxErrors = request.hasNonNull("MaxErrors") ? request.path("MaxErrors").asText() : null;
@@ -885,8 +888,8 @@ public class SsmJsonHandler {
         Map<String, List<String>> parameters = parseParameters(request);
 
         SsmAssociation assoc = ssmService.updateAssociation(
-                associationId, associationName, documentVersion, targets, parameters, scheduleExpression,
-                maxErrors, maxConcurrency, complianceSeverity, region);
+                associationId, name, associationName, documentVersion, targets, parameters, scheduleExpression,
+                maxErrors, maxConcurrency, complianceSeverity, associationVersion, region);
 
         return Response.ok(associationDescriptionResponse(assoc)).build();
     }
