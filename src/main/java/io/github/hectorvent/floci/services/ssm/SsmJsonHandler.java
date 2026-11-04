@@ -109,6 +109,7 @@ public class SsmJsonHandler {
             case "DeleteDocument" -> handleDeleteDocument(request, region);
             case "CreateDocument" -> handleCreateDocument(request, region);
             case "UpdateDocument" -> handleUpdateDocument(request, region);
+            case "UpdateDocumentDefaultVersion" -> handleUpdateDocumentDefaultVersion(request, region);
             // Document share permissions
             case "ModifyDocumentPermission" -> handleModifyDocumentPermission(request, region);
             case "DescribeDocumentPermission" -> handleDescribeDocumentPermission(request, region);
@@ -597,28 +598,32 @@ public class SsmJsonHandler {
     private Response handleGetDocument(JsonNode request, String region) {
         String name = requireDocumentNameOrArn(request);
         SsmDocument document = ssmService.getDocument(name, region);
-
-        String requestedVersion = request.hasNonNull("DocumentVersion") ? request.path("DocumentVersion").asText() : null;
-        String effectiveVersion = String.valueOf(document.getDocumentVersion());
-        String effectiveContent = document.getContent();
-
-        if (requestedVersion != null && !requestedVersion.isBlank()
-                && !"$LATEST".equals(requestedVersion) && !"$DEFAULT".equals(requestedVersion)) {
-            if (!document.hasRetainedContent(requestedVersion)) {
-                throw new AwsException("InvalidDocumentVersion",
-                        "The document version is not valid or does not exist.", 400);
-            }
-            effectiveVersion = requestedVersion;
-            effectiveContent = document.getContentForVersion(requestedVersion);
-        }
+        String effectiveVersion = resolveDocumentVersion(request, document);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("Name", document.getName());
         response.put("DocumentType", document.getDocumentType());
         response.put("DocumentVersion", effectiveVersion);
-        response.put("Content", effectiveContent);
+        response.put("Content", document.getContentForVersion(effectiveVersion));
         response.put("Status", document.getStatus());
         return Response.ok(response).build();
+    }
+
+    private String resolveDocumentVersion(JsonNode request, SsmDocument document) {
+        String requested = optionalText(request, "DocumentVersion");
+        String version;
+        if (requested == null || requested.isBlank() || "$DEFAULT".equals(requested)) {
+            version = String.valueOf(document.getDefaultVersion());
+        } else if ("$LATEST".equals(requested)) {
+            version = String.valueOf(document.getDocumentVersion());
+        } else {
+            version = requested;
+        }
+        if (!document.hasRetainedContent(version)) {
+            throw new AwsException("InvalidDocumentVersion",
+                    "The document version is not valid or does not exist.", 400);
+        }
+        return version;
     }
 
     private Response handleCreateDocument(JsonNode request, String region) {
@@ -655,6 +660,22 @@ public class SsmJsonHandler {
         return Response.ok(documentDescriptionResponse(document)).build();
     }
 
+    private Response handleUpdateDocumentDefaultVersion(JsonNode request, String region) {
+        String name = requireDocumentName(request);
+        JsonNode version = request.path("DocumentVersion");
+        if (!version.isTextual() || !version.textValue().matches("[1-9][0-9]*")) {
+            throw SmithyValidationErrors.validationException(
+                    "Value at 'documentVersion' failed to satisfy constraint: "
+                            + "Member must satisfy regular expression pattern: [1-9][0-9]*");
+        }
+        SsmDocument document = ssmService.updateDocumentDefaultVersion(name, version.textValue(), region);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.putObject("Description")
+                .put("Name", document.getName())
+                .put("DefaultVersion", String.valueOf(document.getDefaultVersion()));
+        return Response.ok(response).build();
+    }
+
     private ObjectNode documentDescriptionResponse(SsmDocument document) {
         ObjectNode response = objectMapper.createObjectNode();
         ObjectNode description = objectMapper.createObjectNode();
@@ -663,7 +684,7 @@ public class SsmJsonHandler {
         description.put("DocumentVersion", String.valueOf(document.getDocumentVersion()));
         description.put("Status", document.getStatus());
         description.put("LatestVersion", String.valueOf(document.getDocumentVersion()));
-        description.put("DefaultVersion", String.valueOf(document.getDocumentVersion()));
+        description.put("DefaultVersion", String.valueOf(document.getDefaultVersion()));
         response.set("DocumentDescription", description);
         return response;
     }
@@ -1557,28 +1578,17 @@ public class SsmJsonHandler {
     private Response handleDescribeDocument(JsonNode request, String region) {
         String name = requireDocumentNameOrArn(request);
         SsmDocument document = ssmService.getDocument(name, region);
-
-        String requestedVersion = request.hasNonNull("DocumentVersion") ? request.path("DocumentVersion").asText() : null;
-        String effectiveVersion = String.valueOf(document.getDocumentVersion());
-        String effectiveContent = document.getContent();
-
-        if (requestedVersion != null && !requestedVersion.isBlank()
-                && !"$LATEST".equals(requestedVersion) && !"$DEFAULT".equals(requestedVersion)) {
-            if (!document.hasRetainedContent(requestedVersion)) {
-                throw new AwsException("InvalidDocumentVersion",
-                        "The document version is not valid or does not exist.", 400);
-            }
-            effectiveVersion = requestedVersion;
-            effectiveContent = document.getContentForVersion(requestedVersion);
-        }
+        String effectiveVersion = resolveDocumentVersion(request, document);
 
         ObjectNode response = objectMapper.createObjectNode();
         ObjectNode documentNode = objectMapper.createObjectNode();
         documentNode.put("Name", document.getName());
         documentNode.put("DocumentType", document.getDocumentType());
         documentNode.put("DocumentVersion", effectiveVersion);
-        documentNode.put("Content", effectiveContent);
+        documentNode.put("Content", document.getContentForVersion(effectiveVersion));
         documentNode.put("Status", document.getStatus());
+        documentNode.put("DefaultVersion", String.valueOf(document.getDefaultVersion()));
+        documentNode.put("LatestVersion", String.valueOf(document.getDocumentVersion()));
         if (document.getCreatedDate() != null) {
             documentNode.put("CreatedDate", EpochSeconds.fromInstant(document.getCreatedDate()));
         }

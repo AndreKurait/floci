@@ -25,6 +25,9 @@ public class SsmDocument {
     @JsonProperty("DocumentVersion")
     private long documentVersion;
 
+    @JsonProperty("DefaultVersion")
+    private Long defaultVersion;
+
     @JsonProperty("Status")
     private String status = "Active";
 
@@ -53,6 +56,7 @@ public class SsmDocument {
         this.content = content;
         this.documentType = documentType;
         this.documentVersion = 1;
+        this.defaultVersion = 1L;
         this.createdDate = Instant.now();
         if (content != null) {
             this.versions.put("1", content);
@@ -70,6 +74,10 @@ public class SsmDocument {
 
     public long getDocumentVersion() { return documentVersion; }
     public void setDocumentVersion(long documentVersion) { this.documentVersion = documentVersion; }
+
+    /** Older stored documents served their latest version as the default. */
+    public long getDefaultVersion() { return defaultVersion != null ? defaultVersion : documentVersion; }
+    public void setDefaultVersion(Long defaultVersion) { this.defaultVersion = defaultVersion; }
 
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
