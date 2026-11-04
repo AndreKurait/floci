@@ -568,7 +568,7 @@ public class EksClusterManager
 
     private void launchCluster(Cluster cluster, String image, String containerName, int hostPort) {
         // Remove any stale container
-        ContainerStorageHelper.removeStaleContainer(config, lifecycleManager, containerName);
+        ContainerStorageHelper.removeStaleContainerStrict(config, lifecycleManager, containerName, true);
 
         // k3s v1.34+ removed support for --kube-apiserver-arg=storage-backend and
         // --kube-apiserver-arg=etcd-servers. k3s now manages kine (embedded SQLite)
@@ -769,7 +769,11 @@ public class EksClusterManager
         try {
             info = lifecycleManager.startCreated(containerId, spec);
         } catch (Exception e) {
-            lifecycleManager.removeIfExists(containerName);
+            try {
+                lifecycleManager.removeIfExistsStrict(containerName, true);
+            } catch (RuntimeException cleanup) {
+                e.addSuppressed(cleanup);
+            }
             throw e;
         }
 
@@ -908,7 +912,7 @@ public class EksClusterManager
                 .map(Container::getLabels).orElse(null));
         DockerClient docker = lifecycleManager.getDockerClient();
         try {
-            lifecycleManager.removeIfExistsStrict(backupName);
+            lifecycleManager.removeIfExistsStrict(backupName, true);
         } catch (RuntimeException cleanup) {
             LOG.warnv("Could not clear prior EKS capacity backup for cluster {0}: {1}; keeping current node",
                     cluster.getName(), cleanup.getMessage());
@@ -933,7 +937,7 @@ public class EksClusterManager
                 return false;
             }
             try {
-                lifecycleManager.removeIfExistsStrict(containerName);
+                lifecycleManager.removeIfExistsStrict(containerName, true);
                 docker.renameContainerCmd(oldId).withName(containerName).exec();
                 if (!adoptSurvivingCluster(cluster, oldId, oldCertificateHost)) {
                     throw new IllegalStateException("Could not adopt previous EKS container " + oldId);
@@ -945,7 +949,7 @@ public class EksClusterManager
             return false;
         }
         try {
-            lifecycleManager.removeIfExistsStrict(backupName);
+            lifecycleManager.removeIfExistsStrict(backupName, true);
         } catch (RuntimeException cleanup) {
             LOG.warnv("EKS cluster {0} replacement is running, but its stopped capacity backup"
                     + " could not be removed: {1}; cluster deletion will retry",
@@ -1096,7 +1100,7 @@ public class EksClusterManager
         // Strict: a container Docker could not remove may still be running and publishing the
         // port, so the delete fails and keeps the cluster record, its metadata endpoint, log
         // handle and port reservation; a retried delete releases them once the container is gone.
-        lifecycleManager.stopAndRemoveStrict(cluster.getContainerId(), logStream);
+        lifecycleManager.stopAndRemoveStrict(cluster.getContainerId(), logStream, 5, true);
         unregisterMetadataEndpoint(cluster);
         // Removed by value so an overlapping delete cannot drop a handle it does not own.
         if (logStream != null) {
@@ -1115,7 +1119,7 @@ public class EksClusterManager
         if (cluster.getDockerName() != null) {
             // A failed backup cleanup must not leave the live node running. Keep the cluster
             // record so explicit deletion can be retried once Docker accepts the removal.
-            lifecycleManager.removeIfExistsStrict(capacityBackupName(cluster));
+            lifecycleManager.removeIfExistsStrict(capacityBackupName(cluster), true);
         }
         ContainerStorageHelper.removeNamedVolume(config, lifecycleManager, clusterResourceName(cluster));
         LOG.infov("Stopped k3s container for cluster {0}", cluster.getName());

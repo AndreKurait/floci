@@ -444,6 +444,10 @@ services:
 
 #### Clusters survive a restart
 
+Removing a retired k3s container also removes its anonymous Docker volumes.
+The named k3s data volume follows the storage policy below, including when a
+capacity replacement retires the old container.
+
 With a persistent [storage mode](../configuration/storage.md) (the default), clusters recorded in
 `eks-clusters.json` are **re-latched to their k3s containers when Floci starts**:
 
