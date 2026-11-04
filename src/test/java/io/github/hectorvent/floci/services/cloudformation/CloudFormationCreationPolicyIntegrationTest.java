@@ -81,8 +81,7 @@ class CloudFormationCreationPolicyIntegrationTest {
     void groupPercentageWaitsForDistinctInstanceSignalsBeforeCreatingDependants() throws Exception {
         create(groupTemplate());
         String group = physicalId();
-        List<String> instances = scaling.describeAutoScalingGroups(request -> request.autoScalingGroupNames(group))
-                .autoScalingGroups().getFirst().instances().stream().map(value -> value.instanceId()).toList();
+        List<String> instances = groupInstances(group, 3);
         assertEquals(3, instances.size());
         assertPending();
         signal(cfn, stack, "Compute", instances.getFirst(), "SUCCESS");
@@ -108,8 +107,7 @@ class CloudFormationCreationPolicyIntegrationTest {
         String group = physicalId();
         assertEquals(3, scaling.describeAutoScalingGroups(request -> request.autoScalingGroupNames(group))
                 .autoScalingGroups().getFirst().desiredCapacity());
-        List<String> instances = scaling.describeAutoScalingGroups(request -> request.autoScalingGroupNames(group))
-                .autoScalingGroups().getFirst().instances().stream().map(value -> value.instanceId()).toList();
+        List<String> instances = groupInstances(group, 3);
         assertEquals(3, instances.size());
         signal(cfn, stack, "Compute", instances.getFirst(), "SUCCESS");
         signal(cfn, stack, "Compute", instances.get(1), "SUCCESS");
@@ -140,8 +138,7 @@ class CloudFormationCreationPolicyIntegrationTest {
     void failedGroupSignalRollsBackItsInstancesAndLaunchConfiguration() throws Exception {
         create(groupTemplate());
         String group = physicalId();
-        List<String> instances = scaling.describeAutoScalingGroups(request -> request.autoScalingGroupNames(group))
-                .autoScalingGroups().getFirst().instances().stream().map(value -> value.instanceId()).toList();
+        List<String> instances = groupInstances(group, 3);
         signal(cfn, stack, "Compute", instances.getFirst(), "FAILURE");
         awaitStatus("ROLLBACK_COMPLETE");
         assertTrue(scaling.describeAutoScalingGroups().autoScalingGroups().isEmpty());
@@ -225,7 +222,8 @@ class CloudFormationCreationPolicyIntegrationTest {
         template.withObject("/Resources/Compute/Properties").put("ImageId", "ami-87654321");
         cfn.updateStack(request -> request.stackName(stack).templateBody(template.toString()));
         awaitStatus("UPDATE_IN_PROGRESS");
-        String replacement = physicalId();
+        String replacement = await().atMost(Duration.ofSeconds(10))
+                .until(this::physicalId, id -> !original.equals(id));
         assertNotEquals(original, replacement);
         assertEquals("running", ec2.describeInstances(request -> request.instanceIds(original))
                 .reservations().getFirst().instances().getFirst().state().nameAsString());
@@ -247,7 +245,8 @@ class CloudFormationCreationPolicyIntegrationTest {
         template.withObject("/Resources/Compute/Properties").put("ImageId", "ami-87654321");
         cfn.updateStack(request -> request.stackName(stack).templateBody(template.toString()));
         awaitStatus("UPDATE_IN_PROGRESS");
-        String replacement = physicalId();
+        String replacement = await().atMost(Duration.ofSeconds(10))
+                .until(this::physicalId, id -> !original.equals(id));
         assertNotEquals(original, replacement);
         signal(cfn, stack, "Compute", replacement, "FAILURE");
         awaitStatus("UPDATE_ROLLBACK_COMPLETE");
@@ -303,9 +302,18 @@ class CloudFormationCreationPolicyIntegrationTest {
     }
 
     private String physicalId() {
-        return cfn.describeStackResources(request -> request.stackName(stack)).stackResources().stream()
-                .filter(value -> "Compute".equals(value.logicalResourceId())).findFirst().orElseThrow()
-                .physicalResourceId();
+        return await().atMost(Duration.ofSeconds(10)).until(() ->
+                cfn.describeStackResources(request -> request.stackName(stack)).stackResources().stream()
+                        .filter(value -> "Compute".equals(value.logicalResourceId()))
+                        .map(StackResource::physicalResourceId).filter(id -> id != null && !id.isBlank())
+                        .findFirst().orElse(""), id -> !id.isBlank());
+    }
+
+    private List<String> groupInstances(String group, int expectedCount) {
+        return await().atMost(Duration.ofSeconds(10)).until(() ->
+                scaling.describeAutoScalingGroups(request -> request.autoScalingGroupNames(group))
+                        .autoScalingGroups().stream().flatMap(value -> value.instances().stream())
+                        .map(value -> value.instanceId()).toList(), instances -> instances.size() == expectedCount);
     }
 
     private String status() {
