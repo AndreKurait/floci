@@ -83,6 +83,10 @@ jobs:
           restore-keys: |
             maven-${{ runner.os }}-
 
+      - name: Test shard partitioner
+        if: matrix.shard == 1
+        run: python3 -m unittest discover -s .github/ci -p 'test_partition.py'
+
       # Derived from test sources, not target/test-classes, so shard.txt exists
       # before Compile and the image prefetch below overlaps the compile instead
       # of starting moments before the tests that need the images. Every test is
@@ -125,9 +129,9 @@ jobs:
             || { echo "::error::test class list from src/test/java differs from target/test-classes:"; diff all-classes.txt "$RUNNER_TEMP/compiled-classes.txt" | head -50; exit 1; }
 
       # surefire.timeout kills a fork whose test ignores JUnit's interrupt (deadlock, blocking
-      # I/O). It caps the whole shard (one fork runs all its tests). Six shards leave room
-      # below that 20-minute limit as the suite grows, and let surefire report before the
-      # 30-minute job limit. Keep the partition-completeness check below enabled.
+      # I/O). It caps the whole shard (one fork runs all its tests). Balance recorded suite
+      # durations across eight shards while keeping shared profiles together. The fork
+      # reports before the 30-minute job limit. Keep the partition-completeness check enabled.
       - name: Run tests
         run: |
           # Protected workload DNS must reach this host JVM. Bind only the
