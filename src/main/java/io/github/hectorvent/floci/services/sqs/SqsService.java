@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
@@ -96,7 +97,7 @@ public class SqsService implements Resettable, ResourceProvider {
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Instant>> deduplicationCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, DeduplicationIdentity>> deduplicationIdentityCache =
             new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Object[]> deduplicationLocks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, StripedLocks> deduplicationLocks = new ConcurrentHashMap<>();
     /** Move tasks keyed by opaque task handle. */
     private final MoveTaskStore moveTasksByHandle;
     /** Per-task cancellation signal: the move worker waits on it between moves, so a cancel wakes
@@ -684,14 +685,9 @@ public class SqsService implements Resettable, ResourceProvider {
     }
 
     private Object deduplicationLock(String storageKey, String dedupKey) {
-        Object[] locks = deduplicationLocks.computeIfAbsent(storageKey, key -> {
-            Object[] stripes = new Object[DEDUP_LOCK_STRIPES];
-            for (int i = 0; i < stripes.length; i++) {
-                stripes[i] = new Object();
-            }
-            return stripes;
-        });
-        return locks[dedupKey.hashCode() & (DEDUP_LOCK_STRIPES - 1)];
+        StripedLocks locks = deduplicationLocks.computeIfAbsent(storageKey,
+                key -> new StripedLocks(DEDUP_LOCK_STRIPES));
+        return locks.lockFor(dedupKey);
     }
 
     @Override

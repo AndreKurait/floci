@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
@@ -247,7 +248,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     // hand a same-key call a different lock than one still held by an in-flight call.
     // ponytail: distinct services sharing a stripe serialize too; widen if contention shows.
     private static final int SERVICE_LOCK_STRIPES = 64;
-    private final Object[] serviceLocks = newServiceLocks();
+    private final StripedLocks serviceLocks = new StripedLocks(SERVICE_LOCK_STRIPES);
     // serviceDeploymentArn → ServiceDeployment
     private final Map<String, ServiceDeployment> serviceDeployments = new ConcurrentHashMap<>();
     // serviceRevisionArn → ServiceRevision
@@ -3178,16 +3179,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         return operatingSystemFamily;
     }
 
-    private static Object[] newServiceLocks() {
-        Object[] locks = new Object[SERVICE_LOCK_STRIPES];
-        for (int i = 0; i < locks.length; i++) {
-            locks[i] = new Object();
-        }
-        return locks;
-    }
-
     private Object serviceLock(String key) {
-        return serviceLocks[Math.floorMod(key.hashCode(), SERVICE_LOCK_STRIPES)];
+        return serviceLocks.lockFor(key);
     }
 
     public EcsServiceModel deleteService(String clusterRef, String serviceName, boolean force, String region) {
