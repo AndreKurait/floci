@@ -62,6 +62,7 @@ public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Map<String, String> attributesBefore = Map.copyOf(r.getAttributes());
         Map<String, String> desiredTags = ctx.resolveTags(props, "Tags");
         Ec2Tags.validatedTags(desiredTags);
         CloudFormationTemplateEngine engine = ctx.engine();
@@ -119,6 +120,32 @@ public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
         } else {
             configure.run();
         }
+        ReplacementCleanup.record(r, ctx, attributesBefore);
+    }
+
+    @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        return ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return ReplacementCleanup.cleanupPhysicalId(resource);
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        return ReplacementCleanup.complete(resource, this::delete);
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        ReplacementCleanup.clear(resource);
+    }
+
+    @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        return ReplacementCleanup.rollback(resource, this::delete);
     }
 
     @Override

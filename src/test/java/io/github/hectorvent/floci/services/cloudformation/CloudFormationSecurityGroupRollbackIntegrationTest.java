@@ -13,6 +13,7 @@ import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.SecurityGroup;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
@@ -20,6 +21,7 @@ import java.util.concurrent.ThreadLocalRandom;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -94,6 +96,72 @@ class CloudFormationSecurityGroupRollbackIntegrationTest {
         SecurityGroup restored = ec2.describeSecurityGroups(request -> request.groupIds(originalId))
                 .securityGroups().getFirst();
         assertEquals(original, restored);
+        assertEquals(originalId, cfn.describeStackResource(request -> request.stackName(stackId)
+                .logicalResourceId("Web")).stackResourceDetail().physicalResourceId());
+        assertMissingExportFailure();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void successfulReplacementRetiresTheOldGroupUnlessRetained(boolean retain) {
+        stackId = cfn.createStack(request -> request.stackName(name)
+                .templateBody(template(name + "-original", null))).stackId();
+        awaitStatus("CREATE_COMPLETE");
+        String originalId = cfn.describeStackResource(request -> request.stackName(stackId)
+                .logicalResourceId("Web")).stackResourceDetail().physicalResourceId();
+        List<String> expected = new ArrayList<>(List.of(outsideGroupId));
+        if (retain) {
+            expected.add(originalId);
+        }
+
+        String previousId = originalId;
+        for (int update = 1; update <= 2; update++) {
+            String body = template(name + "-replacement-" + update, null);
+            if (retain) {
+                body = body.replace("\"Web\":{", "\"Web\":{\"UpdateReplacePolicy\":\"Retain\",");
+            }
+            String templateBody = body;
+            cfn.updateStack(request -> request.stackName(stackId).templateBody(templateBody));
+            awaitStatus("UPDATE_COMPLETE");
+            String currentId = cfn.describeStackResource(request -> request.stackName(stackId)
+                    .logicalResourceId("Web")).stackResourceDetail().physicalResourceId();
+            assertNotEquals(previousId, currentId);
+            expected.add(currentId);
+            assertEquals(expected.stream().sorted().toList(), groupIds(),
+                    "Replacement cleanup must honor retention and preserve the external group");
+            if (!retain) {
+                expected.remove(currentId);
+            }
+            previousId = currentId;
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void laterFailureRestoresTheOriginalGroupEvenWithRetention(boolean retain) {
+        stackId = cfn.createStack(request -> request.stackName(name)
+                .templateBody(template(name + "-original", null))).stackId();
+        awaitStatus("CREATE_COMPLETE");
+        String originalId = cfn.describeStackResource(request -> request.stackName(stackId)
+                .logicalResourceId("Web")).stackResourceDetail().physicalResourceId();
+        SecurityGroup original = ec2.describeSecurityGroups(request -> request.groupIds(originalId))
+                .securityGroups().getFirst();
+        String body = template(name + "-replacement", null);
+        if (retain) {
+            body = body.replace("\"Web\":{", "\"Web\":{\"UpdateReplacePolicy\":\"Retain\",");
+        }
+        String replacement = body.stripTrailing();
+        String failingUpdate = replacement.substring(0, replacement.length() - 2) + """
+                ,"Later":{"Type":"AWS::SSM::Parameter","DependsOn":"Web","Properties":{
+                  "Name":"%s-later","Type":"String","Value":{"Fn::ImportValue":"%s-missing"}}}}}
+                """.formatted(name, name);
+
+        cfn.updateStack(request -> request.stackName(stackId).templateBody(failingUpdate));
+        awaitStatus("UPDATE_ROLLBACK_COMPLETE");
+
+        assertEquals(List.of(originalId, outsideGroupId).stream().sorted().toList(), groupIds());
+        assertEquals(original, ec2.describeSecurityGroups(request -> request.groupIds(originalId))
+                .securityGroups().getFirst());
         assertEquals(originalId, cfn.describeStackResource(request -> request.stackName(stackId)
                 .logicalResourceId("Web")).stackResourceDetail().physicalResourceId());
         assertMissingExportFailure();
