@@ -22,11 +22,9 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
- * With IAM enforcement on, the role a {@code Fn::GetStackOutput} names has to trust a principal in
- * the consuming account, and its policies have to allow DescribeStacks on the referenced stack. On
- * AWS CloudFormation assumes the role as the stack's execution role, or as the caller, and reads in
- * a session named {@code GetStackOutput} (measured, eu-west-1, 2026-10-16); Floci keeps neither, so
- * a grant to any principal of the consuming account is enough.
+ * With IAM enforcement on, the output reader must trust the actual executing principal and allow
+ * DescribeStacks on the referenced stack. These requests use account-root credentials; a grant
+ * to an unrelated role in the same account must not authorize their reads.
  */
 @QuarkusTest
 @TestProfile(IamEnforcementProfile.class)
@@ -64,9 +62,8 @@ class CloudFormationGetStackOutputEnforcementIntegrationTest {
         parameterValue("account").body("Parameter.Value", equalTo("vpc-account"));
     }
 
-    /** The CDK's role trusts the consuming account's CloudFormation execution role. */
     @Test
-    void aRoleTrustingARoleOfTheConsumingAccount_readsTheOutput() {
+    void aRoleTrustingAnUnselectedRoleOfTheConsumingAccount_isRefused() {
         String executionRole = "cdk-exec-" + suffix;
         String executionRoleArn = EnforcementFixtures.createRole(cleanup, baseUri.getPort(), CONSUMER, "/",
                 executionRole, DESCRIBE_STACKS);
@@ -75,8 +72,8 @@ class CloudFormationGetStackOutputEnforcementIntegrationTest {
 
         String consumer = consume("cdk", producer, roleArn);
 
-        assertEquals("CREATE_COMPLETE", awaitConsumer(consumer).status());
-        parameterValue("cdk").body("Parameter.Value", equalTo("vpc-cdk"));
+        assertEquals("ROLLBACK_COMPLETE", awaitConsumer(consumer).status());
+        parameterValue("cdk").statusCode(400);
     }
 
     @Test
