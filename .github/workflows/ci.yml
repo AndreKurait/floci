@@ -129,11 +129,18 @@ jobs:
       # the slowest shard, about 12.5 min of tests across five, and still lets surefire report
       # before the 25-minute job limit.
       - name: Run tests
-        run: >
-          ./mvnw surefire:test -B
-          -Dsurefire.includesFile="$GITHUB_WORKSPACE/shard.txt"
-          -Dsurefire.failIfNoTests=true
-          -Dsurefire.timeout=1200
+        run: |
+          # Protected workload DNS must reach this host JVM. Bind only the
+          # Docker bridge address, and restore the ephemeral runner's port policy.
+          dns_address="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
+          test -n "$dns_address"
+          port_floor="$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
+          trap 'sudo sysctl -w "net.ipv4.ip_unprivileged_port_start=$port_floor" >/dev/null' EXIT
+          sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
+          FLOCI_TEST_HOST_DNS_ADDRESS="$dns_address" ./mvnw surefire:test -B \
+            -Dsurefire.includesFile="$GITHUB_WORKSPACE/shard.txt" \
+            -Dsurefire.failIfNoTests=true \
+            -Dsurefire.timeout=1200
 
       # The prefetch runs in the background past its own step, so its per-image
       # results are only complete once the tests are done. A pull still running

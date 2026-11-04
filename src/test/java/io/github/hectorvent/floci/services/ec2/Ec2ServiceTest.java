@@ -113,7 +113,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
-import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -5377,6 +5376,32 @@ class Ec2ServiceTest {
                 .getInstances().getFirst().getPrivateIpAddress());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void isolatedDefaultVpcIgnoresAnotherAccountsPrivateAddress(boolean requested) {
+        String subnetId = Ec2Service.defaultSubnetId("us-east-1", "a");
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-other",
+                defaultSubnetInstance("i-other", "172.31.0.50", InstanceState.running()));
+        VpcNetworkManager vpcNetworks = mock(VpcNetworkManager.class);
+        when(vpcNetworks.isolatesAddressSpaces()).thenReturn(true);
+        when(vpcNetworks.effectiveSubnetCidr("us-east-1", subnetId)).thenReturn(Optional.of("172.31.0.0/20"));
+        when(vpcNetworks.allocatePrivateIp("us-east-1", subnetId))
+                .thenReturn(Optional.of("172.31.0.50"), Optional.of("172.31.0.51"));
+        Ec2Service service = mockedVpcNetworkService(Map.of("ec2-instances.json", instanceStore), vpcNetworks);
+
+        String address = requested
+                ? launchWithPrivateIp(service, subnetId, 1, "172.31.0.50")
+                    .getInstances().getFirst().getPrivateIpAddress()
+                : launchAddresses(service, subnetId, 1).getFirst();
+
+        assertEquals("172.31.0.50", address);
+        AwsException duplicate = assertThrows(AwsException.class,
+                () -> launchWithPrivateIp(service, subnetId, 1, address));
+        assertEquals("InvalidIPAddress.InUse", duplicate.getErrorCode(),
+                "Isolation must still reject an address held in the caller's own subnet");
+    }
+
     @Test
     void aRequestedPrivateIpIsLeasedSoTheRealVpcNetworkDoesNotHandItOutAgain() {
         // The manager's allocator consults only its own lease table. Without the lease it would
@@ -6888,7 +6913,7 @@ class Ec2ServiceTest {
         if (enabled) {
             verify(containers).restoreMetadataRegistration(instance);
             verify(containers).reconcileOrphanedContainers(any());
-            verify(networks).reconcileOrphans(any());
+            verify(networks).reconcileOwnedOrphans(any());
             verify(forwarding).restore(instance);
         } else {
             verifyNoInteractions(containers, networks);
@@ -7038,10 +7063,16 @@ class Ec2ServiceTest {
         service.restoreMetadataRegistrations();
 
         @SuppressWarnings("unchecked")
-        ArgumentCaptor<BiPredicate<String, String>> stillDeclared = ArgumentCaptor.forClass(BiPredicate.class);
-        verify(vpcNetworks).reconcileOrphans(stillDeclared.capture());
-        assertTrue(stillDeclared.getValue().test("us-east-1", "vpc-a"));
-        assertFalse(stillDeclared.getValue().test("us-east-1", "vpc-gone"));
+        ArgumentCaptor<Predicate<VpcNetworkManager.VpcOwner>> stillDeclared = ArgumentCaptor.forClass(Predicate.class);
+        verify(vpcNetworks).reconcileOwnedOrphans(stillDeclared.capture());
+        assertTrue(stillDeclared.getValue().test(
+                new VpcNetworkManager.VpcOwner("111122223333", "us-east-1", "vpc-a")));
+        assertFalse(stillDeclared.getValue().test(
+                new VpcNetworkManager.VpcOwner("444455556666", "us-east-1", "vpc-a")));
+        assertFalse(stillDeclared.getValue().test(
+                new VpcNetworkManager.VpcOwner("111122223333", "us-east-1", "vpc-gone")));
+        assertTrue(stillDeclared.getValue().test(
+                new VpcNetworkManager.VpcOwner(null, "us-east-1", "vpc-a")));
         verify(vpcNetworks).declareVpc("us-east-1", "vpc-a", "10.20.0.0/16");
         verify(vpcNetworks).declareSubnet("us-east-1", "vpc-a", "subnet-a", "10.20.1.0/24");
         verify(vpcNetworks).reservePrivateIp("us-east-1", "subnet-a", "10.20.1.10");

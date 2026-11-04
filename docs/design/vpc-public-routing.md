@@ -3,7 +3,7 @@
 Status: AWS SDK lifecycle and protected EC2 and Lambda packet regressions qualified on
 Linux amd64. Full native application qualification remains incomplete.
 
-The first public routing slice connects protected IPv4 workloads in nonoverlapping VPCs to managed
+Public routing connects protected IPv4 workloads in separate VPCs to managed
 internet-facing Classic load balancers through a public NAT gateway. AWS EC2
 route tables, NAT gateways, Elastic IPs and internet-gateway attachments supply
 the topology. Security groups continue to supply admission independently.
@@ -62,9 +62,32 @@ The fixture's two-second HTTP client deadline bounds connection failures; the
 backend does not inject delays. This case passes a resolved frontend address to
 the function, so it does not qualify application DNS resolution.
 
+`FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES=true` preserves overlapping
+VPC CIDRs on independent account-scoped bridges. Docker allocates a unique IPv4
+transport pool for each bridge, which installs its ordinary forwarding rules
+even when the daemon's forwarding policy is DROP. The native VPC CIDR is never
+registered in Docker IPAM. Before workload admission, an owned helper replaces
+its temporary transport address with its declared subnet address. The control
+network and its default gateway remain separate.
+
+The mode requires protected namespaces, faithful private addresses and
+`vpc-networks.internal=false`. Namespace filters own isolation: Docker internal
+bridges reject addresses outside their transport pool. It refuses overlap with
+the selected Docker transport, foreign helpers and incompatible retained
+bridges. Docker's configured default address pools must have capacity for the
+selected VPCs; the emulator does not modify daemon address pools or host
+firewall rules. IPv6 is disabled and no temporary transport address remains on
+the native interface before workload admission.
+
+`ElbOverlappingVpcPacketIntegrationTest` repeats the protected frontend and NAT
+cases with this mode enabled. Its Lambda caller and backend belong to different
+accounts and both use `10.89.1.10`; the backend must still observe the caller's
+NAT EIP. It also verifies independent private DNS zones over UDP and TCP and
+instance metadata for namespaces with identical private addresses.
+
 This milestone does not implement arbitrary internet forwarding, VPC endpoints,
 peering, transit gateways, IPv6/NAT64, regional or multi-address NAT gateways,
-network ACLs, overlapping VPC address spaces, public EC2 addresses, multiple
+network ACLs, public EC2 addresses, multiple
 frontend subnets, or Application Load Balancer frontends.
 Platform DNS and service-owned Runtime API connections retain their existing
 narrow exemptions. Public AWS API routing and a complete application workflow

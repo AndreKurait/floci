@@ -211,8 +211,7 @@ public class Ec2ContainerManager {
         if (namespace == null) {
             return null;
         }
-        String privateAddress = Ec2PublicAddressRouting.privateAddress(
-                namespace.inspection(), instance.getContainerBridgeIp());
+        String privateAddress = namespacePrivateAddress(instance, namespace.helperId(), namespace.inspection());
         String transportAddress = namespace.securityGroupsEnforced()
                 ? Ec2PublicAddressRouting.primaryAddress(namespace.inspection()) : privateAddress;
         return new ProtectedNamespace(namespace.helperId(), transportAddress, privateAddress,
@@ -1561,7 +1560,7 @@ public class Ec2ContainerManager {
     private void preparePublicAddressRouting(String namespaceId, Instance instance) {
         InspectContainerResponse namespace = dockerClient.inspectContainerCmd(namespaceId).exec();
         String primary = Ec2PublicAddressRouting.primaryAddress(namespace);
-        String privateAddress = Ec2PublicAddressRouting.privateAddress(namespace, instance.getContainerBridgeIp());
+        String privateAddress = namespacePrivateAddress(instance, namespaceId, namespace);
         if (!primary.equals(privateAddress)) {
             ContainerExec.Result result = execInContainerForResult(namespaceId,
                     Ec2PublicAddressRouting.command(privateAddress, primary), 15);
@@ -1615,6 +1614,15 @@ public class Ec2ContainerManager {
                 networkInterface.setPrivateDnsName(privateDnsName);
             });
         }
+    }
+
+    private String namespacePrivateAddress(Instance instance, String namespaceId,
+                                            InspectContainerResponse namespace) {
+        if (vpcNetworkManager != null && vpcNetworkManager.isolatesAddressSpaces()) {
+            return vpcNetworkManager.requireNativePrivateAddress(instance.getRegion(), instance.getVpcId(),
+                    instance.getSubnetId(), namespaceId, instance.getContainerBridgeIp());
+        }
+        return Ec2PublicAddressRouting.privateAddress(namespace, instance.getContainerBridgeIp());
     }
 
     /**

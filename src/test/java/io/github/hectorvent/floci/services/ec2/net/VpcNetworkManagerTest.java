@@ -15,6 +15,7 @@ import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -121,6 +122,100 @@ class VpcNetworkManagerTest {
 
     private void existingNetwork(String name, String subnet, Map<String, String> labels) {
         existingNetwork(name, subnet, labels, Map.of());
+    }
+
+    @Test
+    void isolatedVpcNetworksPreserveOverlappingDeclaredAddresses() {
+        enableAddressSpaceIsolation();
+        manager.declareVpc(REGION, "vpc-a", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-a", "subnet-a", "10.0.1.0/24");
+        manager.declareVpc(REGION, "vpc-b", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-b", "subnet-b", "10.0.1.0/24");
+
+        assertEquals(Optional.of("10.0.0.0/16"), manager.effectiveVpcCidr(REGION, "vpc-a"));
+        assertEquals(Optional.of("10.0.0.0/16"), manager.effectiveVpcCidr(REGION, "vpc-b"));
+        assertEquals(Optional.of("10.0.1.10"), manager.allocatePrivateIp(REGION, "subnet-a"));
+        assertEquals(Optional.of("10.0.1.10"), manager.allocatePrivateIp(REGION, "subnet-b"));
+        assertFalse(manager.isSubstituted(REGION, "vpc-a"));
+        assertFalse(manager.isSubstituted(REGION, "vpc-b"));
+        verifyNoInteractions(docker);
+    }
+
+    @Test
+    void isolatedAccountsCanUseTheSameDefaultVpcAndSubnetIds() {
+        enableAddressSpaceIsolation();
+        RegionResolver resolver = mock(RegionResolver.class);
+        when(resolver.getAccountId()).thenReturn("111111111111");
+        manager = new VpcNetworkManager(config, docker, null, resolver);
+        manager.declareVpc(REGION, "vpc-default", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-default", "subnet-default", "10.0.1.0/24");
+        String firstNetwork = manager.networkNameFor(REGION, "vpc-default").orElseThrow();
+        assertEquals(Optional.of("10.0.1.10"), manager.allocatePrivateIp(REGION, "subnet-default"));
+
+        when(resolver.getAccountId()).thenReturn("222222222222");
+        manager.declareVpc(REGION, "vpc-default", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-default", "subnet-default", "10.0.1.0/24");
+        String secondNetwork = manager.networkNameFor(REGION, "vpc-default").orElseThrow();
+        assertNotEquals(firstNetwork, secondNetwork);
+        assertEquals(Optional.of("10.0.1.10"), manager.allocatePrivateIp(REGION, "subnet-default"));
+
+        when(resolver.getAccountId()).thenReturn("111111111111");
+        manager.deleteVpcNetwork(REGION, "vpc-default");
+        when(resolver.getAccountId()).thenReturn("222222222222");
+        assertEquals(Optional.of(secondNetwork), manager.networkNameFor(REGION, "vpc-default"));
+        assertEquals(Optional.of("10.0.1.11"), manager.allocatePrivateIp(REGION, "subnet-default"));
+    }
+
+    @Test
+    void nativeAddressSpacesRejectInvalidSubnetsInsteadOfSubstituting() {
+        enableAddressSpaceIsolation();
+        manager.declareVpc(REGION, "vpc-a", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-a", "subnet-a", "10.1.1.0/24");
+        assertThrows(IllegalStateException.class, () -> manager.effectiveSubnetCidr(REGION, "subnet-a"));
+        verifyNoInteractions(docker);
+    }
+
+    @Test
+    void nativeAddressSpacesRequireProtectedNamespaces() {
+        enableAddressSpaceIsolation();
+        when(config.network().securityGroupEnforcement().enabled()).thenReturn(false);
+        manager.declareVpc(REGION, "vpc-a", "10.0.0.0/16");
+        assertThrows(IllegalStateException.class, () -> manager.effectiveVpcCidr(REGION, "vpc-a"));
+        verifyNoInteractions(docker);
+    }
+
+    @Test
+    void nativeAddressSpacesRejectInternalTransportBeforeCreatingResources() {
+        enableAddressSpaceIsolation();
+        when(config.services().ec2().vpcNetworks().internal()).thenReturn(true);
+        manager.declareVpc(REGION, "vpc-a", "10.0.0.0/16");
+        assertThrows(IllegalStateException.class, () -> manager.effectiveVpcCidr(REGION, "vpc-a"));
+        verifyNoInteractions(docker);
+    }
+
+    @Test
+    void nativeAddressRestorationRejectsUnrelatedSubnetsAndOutOfRangeAddresses() {
+        enableAddressSpaceIsolation();
+        manager.declareVpc(REGION, "vpc-a", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-a", "subnet-a", "10.0.1.0/24");
+        manager.declareVpc(REGION, "vpc-b", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-b", "subnet-b", "10.0.1.0/24");
+        assertThrows(IllegalStateException.class, () -> manager.requireNativePrivateAddress(
+                REGION, "vpc-a", "subnet-b", "helper", "10.0.1.10"));
+        assertThrows(IllegalStateException.class, () -> manager.requireNativePrivateAddress(
+                REGION, "vpc-a", "subnet-a", "helper", "10.0.2.10"));
+        assertThrows(IllegalStateException.class, () -> manager.requireNativePrivateAddress(
+                REGION, "vpc-a", "subnet-a", "helper", null));
+        assertThrows(IllegalStateException.class, () -> manager.requireNativePrivateAddress(
+                REGION, "vpc-missing", "subnet-a", "helper", "10.0.1.10"));
+        verifyNoInteractions(docker);
+    }
+
+    private void enableAddressSpaceIsolation() {
+        when(config.defaultAccountId()).thenReturn("111111111111");
+        when(config.services().ec2().vpcNetworks().isolateAddressSpaces()).thenReturn(true);
+        when(config.services().ec2().awsFaithfulPrivateIp()).thenReturn(true);
+        when(config.network().securityGroupEnforcement().enabled()).thenReturn(true);
     }
 
     @Test

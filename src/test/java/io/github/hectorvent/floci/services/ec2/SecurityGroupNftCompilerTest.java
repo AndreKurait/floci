@@ -16,6 +16,36 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class SecurityGroupNftCompilerTest {
 
     @Test
+    void isolatedVpcPoliciesDoNotImportAnotherVpcPrivateAddresses() {
+        SecurityGroup group = new SecurityGroup();
+        group.setVpcId("vpc-1");
+        group.setOwnerId("000000000000");
+        IpPermission allow = new IpPermission();
+        allow.setIpProtocol("tcp");
+        allow.setFromPort(443);
+        allow.setToPort(443);
+        IpRange range = new IpRange();
+        range.setCidrIp("0.0.0.0/0");
+        allow.getIpRanges().add(range);
+        group.getIpPermissions().add(allow);
+        group.getIpPermissionsEgress().add(allow);
+        SecurityGroupNftCompiler.Endpoint target = endpoint("eni-a", "10.0.0.2", "172.17.0.2", group);
+        SecurityGroupNftCompiler.Endpoint foreign = new SecurityGroupNftCompiler.Endpoint(
+                "222222222222", "us-east-1", "vpc-1", "eni-b", "10.0.0.3", "172.17.0.3",
+                Set.of(), List.of(group), Set.of("10.0.0.3"));
+
+        String rules = SecurityGroupNftCompiler.compile(target, List.of(foreign), Map.of(),
+                List.of("172.17.0.1"), true);
+
+        assertFalse(rules.contains("ip saddr 10.0.0.3 "), "the foreign VPC cannot reserve a local source address");
+        assertFalse(rules.contains("ip daddr 10.0.0.3 "), "the foreign VPC cannot reserve a local destination");
+        assertTrue(rules.indexOf("ip daddr 172.17.0.3 drop")
+                < rules.indexOf("ip daddr 0.0.0.0/0 tcp dport 443 accept"));
+        assertTrue(rules.contains("ip daddr 172.17.0.1 meta l4proto { tcp, udp } th dport 53 snat to 172.17.0.2"));
+        assertFalse(rules.contains("dport 443 snat"), "ordinary application traffic must retain its native source");
+    }
+
+    @Test
     void everyAttachedAddressUsesTheManagedPeersVpcBoundary() {
         SecurityGroup group = new SecurityGroup();
         group.setVpcId("vpc-1");

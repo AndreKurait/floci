@@ -62,6 +62,10 @@ public final class SecurityGroupNftCompiler {
         SecurityGroupPolicy.Peer peer() {
             return new SecurityGroupPolicy.Peer(logicalAddress, accountId, vpcId, groupIds);
         }
+
+        boolean sameVpc(Endpoint other) {
+            return accountId.equals(other.accountId) && region.equals(other.region) && vpcId.equals(other.vpcId);
+        }
     }
 
     /** A service-owned TCP endpoint, such as one execution environment's Lambda Runtime API. */
@@ -86,6 +90,12 @@ public final class SecurityGroupNftCompiler {
 
     public static String compile(Endpoint target, Collection<Endpoint> peers,
                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers) {
+        return compile(target, peers, prefixLists, vpcResolvers, false);
+    }
+
+    public static String compile(Endpoint target, Collection<Endpoint> peers,
+                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                                  boolean isolatedAddressSpaces) {
         if (target == null || target.groups() == null || target.groups().isEmpty()) {
             throw new IllegalArgumentException("Protected endpoint needs at least one security group");
         }
@@ -151,9 +161,7 @@ public final class SecurityGroupNftCompiler {
                         continue;
                     }
                     for (Endpoint peer : managed) {
-                        if (target.accountId().equals(peer.accountId())
-                                && target.region().equals(peer.region())
-                                && target.vpcId().equals(peer.vpcId())
+                        if (target.sameVpc(peer)
                                 && SecurityGroupPolicy.matchesPeer(group, permission, peer.peer(), prefixLists)) {
                             for (String address : peer.transportAddresses()) {
                                 appendRule(rules, chain, addressField, address, protocol);
@@ -165,7 +173,9 @@ public final class SecurityGroupNftCompiler {
             // A managed peer must never fall through to a broad external CIDR rule
             // evaluated against its Docker bridge IP instead of its logical ENI address.
             for (Endpoint peer : managed) {
-                for (String address : peer.transportAddresses()) {
+                List<String> visible = isolatedAddressSpaces && !target.sameVpc(peer)
+                        ? List.of(peer.transportAddress()) : peer.transportAddresses();
+                for (String address : visible) {
                     appendRule(rules, chain, addressField, address, "drop");
                 }
             }
@@ -196,6 +206,23 @@ public final class SecurityGroupNftCompiler {
                             appendRule(rules, chain, addressField, cidr, protocol);
                         }
                     }
+                }
+            }
+        }
+        if (isolatedAddressSpaces) {
+            // Native private addresses can repeat across VPCs. The resolver identifies a
+            // namespace by its unique control address, including when a client binds its ENI.
+            if (!literal(target.transportAddress()) || target.transportAddress().contains(":")) {
+                throw new IllegalArgumentException("Isolated IPv4 VPCs require an IPv4 control transport");
+            }
+            rules.append("add table ip floci_vpc_dns\n")
+                    .append("add chain ip floci_vpc_dns source { type nat hook postrouting priority srcnat; }\n")
+                    .append("flush chain ip floci_vpc_dns source\n");
+            for (String resolver : vpcResolvers) {
+                if (literal(resolver) && !resolver.contains(":")) {
+                    rules.append("add rule ip floci_vpc_dns source ip daddr ").append(resolver)
+                            .append(" meta l4proto { tcp, udp } th dport 53 snat to ")
+                            .append(target.transportAddress()).append('\n');
                 }
             }
         }

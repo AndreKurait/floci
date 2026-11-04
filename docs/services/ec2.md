@@ -1821,6 +1821,7 @@ State is reported settled rather than transitional, as elsewhere in this service
 | `FLOCI_SERVICES_EC2_CONTAINER_IPS_ROUTABLE` | auto-detect | Whether an instance's container IP is reachable from the machines consuming Floci's API (Terraform, Terratest, your shell). When it is, DescribeInstances and DescribeAddresses report the container IP, so port 22 really is port 22; when it is not, they report `127.0.0.1` and reachability goes through the published high host ports. Detected by a throwaway TCP connect; set explicitly when Floci itself runs as a container |
 | `FLOCI_SERVICES_EC2_RECONCILE_CONTAINERS_ON_STARTUP` | `true` | On startup, remove instance containers this Floci left on the daemon whose record did not survive the restart or came back terminated; stopped instances are never swept |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED` | `true` | Back each VPC with a real Docker network (see [VPC Docker networks](#vpc-docker-networks)) |
+| `FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES` | `false` | Preserve overlapping native IPv4 ranges on separate, account-scoped bridges; requires protected namespaces, faithful private addresses and Docker Engine 28 or newer |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_FALLBACK_POOL` | `10.240.0.0/12` | RFC 1918 pool that substituted CIDRs are drawn from |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_FALLBACK_PREFIX_LENGTH` | `16` | Prefix length of each block handed out of that pool |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP` | `true` | Remove VPC networks left behind by a previous run of this same emulator. Whatever its value, the network a previous run created for a VPC that still exists is kept, and goes when that VPC is deleted |
@@ -1838,9 +1839,28 @@ VPC reach each other at those addresses; instances in different VPCs sit on diff
 `CreateVpc` and `CreateSubnet` record declarations without contacting Docker. CIDR collision
 checks and fallback address planning run when a consumer first needs an effective address or
 network attachment. This keeps management calls responsive even when the Docker daemon is slow.
-For overlapping VPC CIDRs, the first VPC whose addresses are needed keeps the declared range;
+By default, for overlapping VPC CIDRs, the first VPC whose addresses are needed keeps the declared range;
 later VPCs use the fallback pool. Within one emulator run, allocated addresses remain on the
 same effective range.
+
+Set `FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES=true` to preserve each
+VPC's declared IPv4 range, including identical addresses in different accounts.
+This mode requires Linux Docker Engine 28 or newer, the `bridge` driver,
+`FLOCI_SERVICES_EC2_AWS_FAITHFUL_PRIVATE_IP=true`, and security-group enforcement.
+Each account and VPC gets its own bridge, including the seeded default VPCs.
+Docker reserves no IPv4 pool for these bridges. Floci configures the declared
+address and subnet mask inside an owned, protected network namespace and verifies
+them before admitting a workload. Floci's API container stays on its control network.
+Malformed declarations and collisions with that control network fail attachment;
+this mode never substitutes a fallback CIDR.
+
+The native interface carries IPv4 only. Its IPv6 addresses and routes are removed
+before workload admission, and its IPv6 traffic is blocked. Existing control
+connections keep their own addresses and default gateway. Private DNS requests,
+including requests explicitly bound to the native private address, retain their
+account and VPC identity through the namespace's unique control address.
+Public NAT routing can connect overlapping VPCs through managed public frontends;
+this mode does not add peering or arbitrary internet access.
 
 Set `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL=true` to create internal Docker VPC
 bridges. This deployment setting does not change EC2 request or response fields.
@@ -1853,13 +1873,14 @@ also remain separate from this network setting.
 Publishing the guest's SSH port does not add Docker's default bridge.
 
 When Floci runs in Docker, use Docker Engine 28 or newer for VPC networking.
+With the default shared address-space mode,
 Floci joins each VPC with gateway priority `-1`, keeping its default gateway and
 published API ports on the original network (whose Docker default priority is `0`).
 The EC2 guests retain their normal gateway priority. Older engines ignore this
 endpoint setting and can interrupt API connections when a VPC is attached or deleted.
 If you explicitly configure gateway priorities, keep Floci's original network above `-1`.
 
-When Floci runs in Docker, deleting a VPC disconnects Floci's own container before removing
+In the default mode, deleting a VPC disconnects Floci's own container before removing
 the VPC network. Other endpoints are not forcibly disconnected: removal retries while they
 drain, up to five attempts two seconds apart. After successful removal, a new VPC can reuse
 the CIDR without colliding with a network left behind by that deletion.
@@ -1871,14 +1892,15 @@ still depend on daemon responsiveness.
 
 One network per **VPC**, not per subnet: subnets inside a VPC route to each other in AWS, so a
 network per subnet would manufacture a partition AWS does not have. Per-subnet addressing is kept
-anyway: the network's IPAM pool is the whole VPC CIDR and each subnet allocates static addresses
-out of its own slice of it.
+anyway: each subnet allocates static addresses from its own CIDR. The default mode gives
+Docker IPAM the whole VPC range; isolated address spaces configure the native interface directly.
 
 An address a subnet picks on its own is never one that an instance, network interface or NAT
-gateway in the subnet already holds. Default subnet ids are the same in every account, so those
-subnets share a network, and what any account holds there counts.
+gateway in the subnet already holds. With shared address spaces, default subnet ids are the
+same in every account, so those subnets share a network and what any account holds there counts.
+With isolated address spaces, only the owning account's resources reserve an address.
 
-The declared CIDR is used verbatim whenever it can be. It cannot be when it is absent, malformed,
+In the default mode the declared CIDR is used verbatim whenever it can be. It cannot be when it is absent, malformed,
 outside RFC 1918, or already claimed on the Docker daemon, including by another Floci VPC, since
 two VPCs may legally declare the same CIDR in AWS but one daemon cannot route two identical
 ranges. Only then is an equivalent block taken from `fallback-pool`, and the substitution is
@@ -1914,7 +1936,7 @@ options, and the `PrivateIpAddress` of a launch template's primary interface. Se
 from `PrivateIpAddresses` entries not marked `Primary` or from `SecondaryPrivateIpAddressCount`, are
 not applied. An address outside the subnet's CIDR, or one of the five AWS reserves, fails with
 `InvalidParameterValue`, and one that an instance, network interface, NAT gateway or interface
-endpoint already holds fails with `InvalidIPAddress.InUse`. In a Docker-backed default subnet, whose
+endpoint already holds fails with `InvalidIPAddress.InUse`. In a shared Docker-backed default subnet, whose
 network every account shares, that includes an address another account's instance, network interface
 or NAT gateway holds. As on AWS it applies only to a single instance that creates its own primary
 interface: with more than one instance, or with `NetworkInterface.1.NetworkInterfaceId`, the call
