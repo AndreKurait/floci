@@ -101,16 +101,24 @@ public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
         // group does not already carry, and revoke a rule this resource authorized on a prior run
         // that the template no longer declares. Ownership is scoped by the keys recorded in the
         // internal attributes, so a rule owned by a standalone resource is never revoked here.
-        UnaryOperator<String> peerGroupId = peerGroupIdResolver(region, sg.getVpcId());
-        reconcileRules(props, "SecurityGroupIngress", sg.getIpPermissions(), engine, peerGroupId, r,
-                INGRESS_RULES_ATTR,
-                perms -> ec2Service.authorizeSecurityGroupIngress(region, sg.getGroupId(), perms),
-                perms -> ec2Service.revokeSecurityGroupIngress(region, sg.getGroupId(), perms));
-        reconcileRules(props, "SecurityGroupEgress", sg.getIpPermissionsEgress(), engine, peerGroupId, r,
-                EGRESS_RULES_ATTR,
-                perms -> ec2Service.authorizeSecurityGroupEgress(region, sg.getGroupId(), perms),
-                perms -> ec2Service.revokeSecurityGroupEgress(region, sg.getGroupId(), perms));
-        Ec2Tags.reconcile(ec2Service, region, sg.getGroupId(), desiredTags);
+        Runnable configure = () -> {
+            UnaryOperator<String> peerGroupId = peerGroupIdResolver(region, sg.getVpcId());
+            reconcileRules(props, "SecurityGroupIngress", sg.getIpPermissions(), engine, peerGroupId, r,
+                    INGRESS_RULES_ATTR,
+                    perms -> ec2Service.authorizeSecurityGroupIngress(region, sg.getGroupId(), perms),
+                    perms -> ec2Service.revokeSecurityGroupIngress(region, sg.getGroupId(), perms));
+            reconcileRules(props, "SecurityGroupEgress", sg.getIpPermissionsEgress(), engine, peerGroupId, r,
+                    EGRESS_RULES_ATTR,
+                    perms -> ec2Service.authorizeSecurityGroupEgress(region, sg.getGroupId(), perms),
+                    perms -> ec2Service.revokeSecurityGroupEgress(region, sg.getGroupId(), perms));
+            Ec2Tags.reconcile(ec2Service, region, sg.getGroupId(), desiredTags);
+        };
+        if (reconciled == null) {
+            CfnRollback.guarded(r, ctx, true, () -> delete(SECURITY_GROUP, sg.getGroupId(), region),
+                    () -> { }, configure);
+        } else {
+            configure.run();
+        }
     }
 
     @Override
