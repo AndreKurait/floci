@@ -101,9 +101,12 @@ public final class Ec2MetadataProxy {
                 "  case \"$octet\" in ''|0[0-9]*|[0-9][0-9][0-9][0-9]*) refuse 'Invalid IMDS IPv4 target' ;; esac",
                 "  [ \"$octet\" -le 255 ] || refuse 'Invalid IMDS IPv4 target'",
                 "done",
-                "[ \"$1\" -ge 1 ] && [ \"$1\" -le 223 ] && [ \"$1\" -ne 127 ]"
+                // Linux permits Docker transport bridges in 240/4. The route below must still be unicast.
+                "[ \"$1\" -ge 1 ] && [ \"$1\" -ne 127 ]"
+                        + " && { [ \"$1\" -le 223 ] || [ \"$1\" -ge 240 ]; }"
                         + " || refuse 'IMDS target must be a remote unicast IPv4 address'",
-                "case \"$target_ip\" in 169.254.*) refuse 'IMDS target must not be link-local' ;; esac",
+                "case \"$target_ip\" in 169.254.*|255.255.255.255)"
+                        + " refuse 'IMDS target must not be link-local or broadcast' ;; esac",
                 "if printf '%s\\n' \"$addresses\" | grep -Fq \"inet $target_ip/\"; then",
                 "  refuse 'IMDS target must not be a guest interface address'",
                 "fi",
@@ -113,6 +116,7 @@ public final class Ec2MetadataProxy {
                 "target_route=$(ip -4 route get \"$target_ip\")",
                 "route_device=; route_source=",
                 "set -- $target_route",
+                "[ \"${1-}\" = \"$target_ip\" ] || refuse 'IMDS target must have a remote unicast route'",
                 "while [ \"$#\" -gt 0 ]; do",
                 "  case \"$1\" in dev) route_device=${2-} ;; src) route_source=${2-} ;; esac",
                 "  shift",
