@@ -3,13 +3,19 @@ package io.github.hectorvent.floci.services.lambda.launcher;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.WaitContainerCondition;
 import com.github.dockerjava.api.model.WaitResponse;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import org.jboss.logging.Logger;
 
+import java.io.Closeable;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.IntConsumer;
 import java.util.function.LongSupplier;
@@ -18,11 +24,11 @@ import java.util.function.LongSupplier;
  * Reports when a Lambda container's main process exits, through Docker's wait-for-exit stream.
  *
  * <p>The stream sends nothing until the container exits, so on a quiet container it ends with a read
- * timeout (the Docker client's response timeout) while the container still runs. A watch that simply
+ * timeout or a transport failure while the container still runs. A watch that simply
  * stopped there would miss every later crash, turning a {@code Runtime.ExitError} into a
  * {@code Function.TimedOut}. When the stream ends with an error, the container is inspected instead:
- * still running re-arms the watch, already exited reports the inspected exit code, and gone (removed
- * by teardown) reports nothing.
+ * still running re-arms the watch, already exited reports the inspected exit code, and gone reports
+ * an unknown exit status. Intentional teardown cancels the captured watcher after quiescing its server.
  *
  * <p>A stream that fails soon after it was armed, or an inspect that fails, usually means the daemon
  * itself is unreachable (a dropped connection, a restart). Those re-arm after a delay that doubles each
@@ -46,6 +52,11 @@ final class LambdaExitWatcher {
     private final IntConsumer onExit;
     private final BiConsumer<Duration, Runnable> scheduler;
     private final LongSupplier nanoClock;
+    private final AtomicBoolean reported = new AtomicBoolean();
+    private final CompletableFuture<Void> readiness = new CompletableFuture<>();
+    private volatile boolean awaitingStart;
+    private volatile Throwable beforeStartFailure;
+    private volatile WaitContainerResultCallback currentCallback;
     private int quickFailures;
 
     LambdaExitWatcher(DockerClient dockerClient, String containerId, IntConsumer onExit,
@@ -63,30 +74,138 @@ final class LambdaExitWatcher {
                 .arm();
     }
 
+    static LambdaExitWatcher watchBeforeStart(
+            DockerClient dockerClient, String containerId, IntConsumer onExit, Duration timeout) {
+        LambdaExitWatcher watcher = new LambdaExitWatcher(
+                dockerClient, containerId, onExit, LambdaExitWatcher::schedule, System::nanoTime);
+        watcher.awaitingStart = true;
+        try {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IllegalStateException("Interrupted while registering Lambda exit watcher");
+            }
+            watcher.currentCallback = watcher.callback(watcher.nanoClock.getAsLong());
+            dockerClient.waitContainerCmd(containerId).withCondition(WaitContainerCondition.NEXT_EXIT)
+                    .exec(watcher.currentCallback);
+            watcher.readiness.get(Math.max(0, timeout.toNanos()), TimeUnit.NANOSECONDS);
+            watcher.requireHealthy();
+            return watcher;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            watcher.cancel();
+            throw new IllegalStateException("Interrupted while registering Lambda exit watcher", e);
+        } catch (ExecutionException | TimeoutException | RuntimeException e) {
+            watcher.cancel();
+            throw new IllegalStateException("Lambda exit watcher was not ready before start", e);
+        }
+    }
+
+    void requireHealthy() {
+        if (beforeStartFailure != null) {
+            throw new IllegalStateException("Lambda exit watcher failed before start", beforeStartFailure);
+        }
+        if (reported.get()) {
+            throw new IllegalStateException("Lambda container exited before start");
+        }
+    }
+
+    void containerStarted() {
+        Throwable failure;
+        synchronized (this) {
+            awaitingStart = false;
+            failure = beforeStartFailure;
+        }
+        if (failure != null && !reported.get()) {
+            streamFailed(failure, nanoClock.getAsLong());
+        }
+    }
+
+    void cancel() {
+        reported.set(true);
+        if (currentCallback != null) {
+            try {
+                currentCallback.close();
+            } catch (IOException e) {
+                LOG.debugv(e, "Could not close exit watcher for container {0}", containerId);
+            }
+        }
+    }
+
     private static void schedule(Duration delay, Runnable task) {
         CompletableFuture.delayedExecutor(delay.toMillis(), TimeUnit.MILLISECONDS).execute(task);
     }
 
     void arm() {
+        if (reported.get()) {
+            return;
+        }
         long armedAt = nanoClock.getAsLong();
         try {
-            dockerClient.waitContainerCmd(containerId).exec(new WaitContainerResultCallback() {
-                @Override
-                public void onNext(WaitResponse response) {
-                    super.onNext(response);
-                    Integer statusCode = response.getStatusCode();
-                    onExit.accept(statusCode != null ? statusCode : -1);
-                }
-
-                @Override
-                public void onError(Throwable throwable) {
-                    super.onError(throwable);
-                    streamFailed(throwable, armedAt);
-                }
-            });
+            WaitContainerResultCallback callback = callback(armedAt);
+            currentCallback = callback;
+            dockerClient.waitContainerCmd(containerId).exec(callback);
+            if (reported.get()) {
+                cancel();
+            }
         } catch (RuntimeException e) {
             LOG.debugv(e, "Could not arm exit watcher for container {0}", containerId);
             reArm(e, armedAt);
+        }
+    }
+
+    private WaitContainerResultCallback callback(long armedAt) {
+        return new WaitContainerResultCallback() {
+            @Override
+            public void onStart(Closeable stream) {
+                super.onStart(stream);
+                if (reported.get()) {
+                    cancel();
+                    return;
+                }
+                readiness.complete(null);
+            }
+
+            @Override
+            public void onNext(WaitResponse response) {
+                super.onNext(response);
+                Integer statusCode = response.getStatusCode();
+                reportExit(statusCode != null ? statusCode : -1);
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                boolean deferred = deferBeforeStartFailure(throwable);
+                super.onError(throwable);
+                if (!deferred && !reported.get()) {
+                    streamFailed(throwable, armedAt);
+                }
+            }
+
+            @Override
+            public void onComplete() {
+                Throwable failure = new IllegalStateException("Lambda exit watcher ended without an exit status");
+                boolean deferred = deferBeforeStartFailure(failure);
+                super.onComplete();
+                if (!deferred && !reported.get()) {
+                    streamFailed(failure, armedAt);
+                }
+            }
+        };
+    }
+
+    private boolean deferBeforeStartFailure(Throwable cause) {
+        synchronized (this) {
+            if (awaitingStart && !reported.get()) {
+                beforeStartFailure = cause;
+                readiness.completeExceptionally(cause);
+                return true;
+            }
+            return false;
+        }
+    }
+
+    private void reportExit(int statusCode) {
+        if (reported.compareAndSet(false, true)) {
+            onExit.accept(statusCode);
         }
     }
 
@@ -95,7 +214,10 @@ final class LambdaExitWatcher {
         try {
             state = dockerClient.inspectContainerCmd(containerId).exec().getState();
         } catch (NotFoundException e) {
-            LOG.debugv("Exit watcher for container {0} stopped: the container is gone", containerId);
+            LOG.debugv("Exit watcher for container {0} lost its exit status: the container is gone", containerId);
+            // An auto-removed runtime cannot be inspected. Its owning server ignores this after
+            // intentional quiesce, but an unexpected disappearance must not become an invoke timeout.
+            reportExit(-1);
             return;
         } catch (RuntimeException e) {
             LOG.debugv(e, "Exit watcher for container {0} could not inspect the container", containerId);
@@ -104,7 +226,7 @@ final class LambdaExitWatcher {
         }
         if (state == null || !Boolean.TRUE.equals(state.getRunning())) {
             Long exitCode = state == null ? null : state.getExitCodeLong();
-            onExit.accept(exitCode != null ? exitCode.intValue() : -1);
+            reportExit(exitCode != null ? exitCode.intValue() : -1);
             return;
         }
         reArm(cause, armedAt);

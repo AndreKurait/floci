@@ -20,6 +20,7 @@ public class ContainerHandle {
     private volatile ContainerState state;
     private volatile long lastUsedMs;
     private Closeable logStream;
+    private LambdaExitWatcher exitWatcher;
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state) {
@@ -59,6 +60,14 @@ public class ContainerHandle {
 
     public Closeable getLogStream() { return logStream; }
     public void setLogStream(Closeable logStream) { this.logStream = logStream; }
+
+    void setExitWatcher(LambdaExitWatcher exitWatcher) { this.exitWatcher = exitWatcher; }
+
+    void cancelExitWatcher() {
+        if (exitWatcher != null) {
+            exitWatcher.cancel();
+        }
+    }
 
     /**
      * True once an extension in this container reported an init or exit error. Real AWS treats

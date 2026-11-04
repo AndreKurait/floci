@@ -50,7 +50,6 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
@@ -86,8 +85,6 @@ public class ContainerLifecycleManager {
 
     /** Host interface a port marked loopback-only publishes on. */
     private static final String LOOPBACK_HOST_IP = "127.0.0.1";
-
-    private final Semaphore teardownSlots = new Semaphore(8, true);
 
     private final DockerClient dockerClient;
     private final ImageCacheService imageCacheService;
@@ -581,7 +578,7 @@ public class ContainerLifecycleManager {
      *        SIGTERM before Docker sends SIGKILL. Must be a non-negative integer.
      */
     public void stopAndRemove(String containerId, Closeable logStream, int stopTimeoutSeconds) {
-        withTeardownSlot(() -> stopAndRemoveAdmitted(containerId, logStream, stopTimeoutSeconds));
+        stopAndRemoveAdmitted(containerId, logStream, stopTimeoutSeconds);
     }
 
     private void stopAndRemoveAdmitted(String containerId, Closeable logStream, int stopTimeoutSeconds) {
@@ -614,7 +611,7 @@ public class ContainerLifecycleManager {
      *        SIGTERM before Docker sends SIGKILL. Must be a non-negative integer.
      */
     public void stop(String containerId, int stopTimeoutSeconds) {
-        withTeardownSlot(() -> stopAdmitted(containerId, stopTimeoutSeconds));
+        stopAdmitted(containerId, stopTimeoutSeconds);
     }
 
     private boolean stopAdmitted(String containerId, int stopTimeoutSeconds) {
@@ -668,8 +665,7 @@ public class ContainerLifecycleManager {
     /** Strict teardown that can also reclaim the container's anonymous volumes. */
     public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds,
                                      boolean removeAnonymousVolumes) {
-        withTeardownSlot(() -> stopAndRemoveStrictAdmitted(
-                containerId, logStream, stopTimeoutSeconds, removeAnonymousVolumes));
+        stopAndRemoveStrictAdmitted(containerId, logStream, stopTimeoutSeconds, removeAnonymousVolumes);
     }
 
     private void stopAndRemoveStrictAdmitted(String containerId, Closeable logStream, int stopTimeoutSeconds,
@@ -735,15 +731,6 @@ public class ContainerLifecycleManager {
             LOG.debugv("Could not await container {0} removal: {1}", containerId, e.getMessage());
         }
         return presenceOf(containerId) == ContainerPresence.ABSENT;
-    }
-
-    private void withTeardownSlot(Runnable stopAndRemove) {
-        teardownSlots.acquireUninterruptibly();
-        try {
-            stopAndRemove.run();
-        } finally {
-            teardownSlots.release();
-        }
     }
 
     private void closeLogStreamIfPresent(Closeable logStream) {
@@ -1150,7 +1137,10 @@ public class ContainerLifecycleManager {
         try {
             InspectContainerResponse.ContainerState state =
                     dockerClient.inspectContainerCmd(containerId).exec().getState();
-            boolean running = state != null && Boolean.TRUE.equals(state.getRunning());
+            Boolean running = state != null ? state.getRunning() : null;
+            if (running == null) {
+                return ContainerPresence.UNKNOWN;
+            }
             return running ? ContainerPresence.RUNNING : ContainerPresence.STOPPED;
         } catch (NotFoundException e) {
             return ContainerPresence.ABSENT;
@@ -1451,7 +1441,11 @@ public class ContainerLifecycleManager {
     }
 
     private HostConfig buildHostConfig(ContainerSpec spec) {
-        HostConfig hostConfig = HostConfig.newHostConfig();
+        // Lambda output and exit streams are registered before start; the daemon can therefore
+        // finish removing their captured runtime IDs even after Floci's shutdown budget expires.
+        // EC2, other services, and the unlabelled code-volume helpers keep their containers.
+        HostConfig hostConfig = HostConfig.newHostConfig().withAutoRemove(
+                "lambda".equals(ContainerStorageHelper.labelValue(spec.labels(), ContainerStorageHelper.SERVICE_LABEL)));
 
         // Privileged mode (required for e.g. k3s containers)
         if (spec.privileged()) {
