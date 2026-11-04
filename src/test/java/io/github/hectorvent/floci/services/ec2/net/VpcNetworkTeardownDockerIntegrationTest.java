@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ec2.net;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ConnectToNetworkCmd;
+import com.github.dockerjava.api.command.RemoveNetworkCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -22,6 +23,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.IntStream;
 
 import static org.awaitility.Awaitility.await;
@@ -31,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.AdditionalAnswers.delegatesTo;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -82,6 +85,17 @@ class VpcNetworkTeardownDockerIntegrationTest {
                 return result == command ? call.getMock() : result;
             });
         }).when(interrupted).connectToNetworkCmd();
+        AtomicBoolean firstRemoval = new AtomicBoolean(true);
+        doAnswer(invocation -> {
+            RemoveNetworkCmd command = docker.removeNetworkCmd(invocation.getArgument(0));
+            return mock(RemoveNetworkCmd.class, call -> {
+                if ("exec".equals(call.getMethod().getName()) && firstRemoval.getAndSet(false)) {
+                    throw new IllegalStateException("transient Docker network removal failure");
+                }
+                Object result = call.getMethod().invoke(command, call.getArguments());
+                return result == command ? call.getMock() : result;
+            });
+        }).when(interrupted).removeNetworkCmd(anyString());
         VpcNetworkManager manager = new VpcNetworkManager(config, interrupted);
         String guest = startContainer(namespace + "-guest");
         String networkName = manager.networkName(REGION, "vpc-1");
@@ -101,13 +115,18 @@ class VpcNetworkTeardownDockerIntegrationTest {
                         .getNetworkSettings().getNetworks().containsKey(networkName));
             }
         } finally {
-            lifecycleManager.removeIfExistsStrict(guest);
-            manager.forgetSubnet(REGION, "subnet-1");
-            manager.deleteVpcNetwork(REGION, "vpc-1");
-            manager.shutdown();
+            try {
+                lifecycleManager.removeIfExistsStrict(guest);
+                manager.forgetSubnet(REGION, "subnet-1");
+                manager.deleteVpcNetwork(REGION, "vpc-1");
+                await().pollInterval(Duration.ofMillis(25)).atMost(Duration.ofSeconds(12))
+                        .untilAsserted(() -> assertThrows(NotFoundException.class,
+                                () -> docker.inspectNetworkCmd().withNetworkId(networkName).exec()));
+                assertFalse(firstRemoval.get());
+            } finally {
+                manager.shutdown();
+            }
         }
-        assertThrows(NotFoundException.class,
-                () -> docker.inspectNetworkCmd().withNetworkId(networkName).exec());
     }
 
     @ParameterizedTest
