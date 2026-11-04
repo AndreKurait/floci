@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.Authorizer;
 import io.github.hectorvent.floci.services.apigateway.model.Integration;
 import io.github.hectorvent.floci.services.apigateway.model.MethodConfig;
+import io.github.hectorvent.floci.services.apigateway.model.RestApi;
 import io.github.hectorvent.floci.services.apigateway.model.Stage;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -80,6 +81,7 @@ class RestCustomResourcePolicyTest {
         ServiceRoleCallAuthorizer roles = mock(ServiceRoleCallAuthorizer.class);
         direct = mock(ServiceCallAuthorizer.class);
         ApiGatewayService gateway = mock(ApiGatewayService.class);
+        when(gateway.getRestApi("us-east-1", "api")).thenReturn(new RestApi());
         lambda = mock(LambdaService.class);
         integration = new Integration();
         integration.setType("AWS_PROXY");
