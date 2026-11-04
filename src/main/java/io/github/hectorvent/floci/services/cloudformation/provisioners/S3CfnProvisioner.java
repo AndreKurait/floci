@@ -643,11 +643,16 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
                 xml.end("Expiration");
             }
             JsonNode noncurrent = rule.get("NoncurrentVersionExpiration");
+            String noncurrentDays = ctx.resolveOptional(rule, "NoncurrentVersionExpirationInDays");
             if (noncurrent != null && !noncurrent.isNull()) {
                 xml.start("NoncurrentVersionExpiration");
                 appendResolved(xml, "NoncurrentDays", noncurrent, "NoncurrentDays", ctx);
                 appendResolved(xml, "NewerNoncurrentVersions", noncurrent, "NewerNoncurrentVersions", ctx);
                 xml.end("NoncurrentVersionExpiration");
+            } else if (isSet(noncurrentDays)) {
+                xml.start("NoncurrentVersionExpiration")
+                        .elem("NoncurrentDays", noncurrentDays)
+                        .end("NoncurrentVersionExpiration");
             }
             JsonNode abort = rule.get("AbortIncompleteMultipartUpload");
             if (abort != null && !abort.isNull()) {
