@@ -57,13 +57,14 @@ existing application storage and region visibility.
 
 | Operation | Notes |
 |---|---|
-| `CreateDeployment` | Starts a real Lambda or ECS blue/green deployment; shifts traffic via alias weights (Lambda) or ELB listener rules (ECS); invokes lifecycle hooks |
+| `CreateDeployment` | Starts Lambda/ECS traffic shifting or an S3 Server deployment through the AWS agent; Server file handling follows DISALLOW, OVERWRITE or RETAIN |
 | `GetDeployment` | Returns current deployment state; poll `status` until `Succeeded`, `Failed`, or `Stopped` |
 | `StopDeployment` | Signals an in-progress deployment to stop; transitions to `Stopped` |
 | `ContinueDeployment` | Accepted (no-op for fully automated deployments) |
 | `ListDeployments` | Returns deployment IDs filtered by application, group, or status |
 | `BatchGetDeployments` | Returns info for multiple deployments |
 | `ListDeploymentTargets` | Returns target IDs for a deployment |
+| `GetDeploymentTarget` | Returns one target and its lifecycle event diagnostics |
 | `BatchGetDeploymentTargets` | Returns target details including lifecycle event status |
 | `PutLifecycleEventHookExecutionStatus` | Called by lifecycle hook Lambda to report `Succeeded` or `Failed`; failure triggers auto-rollback |
 
@@ -86,6 +87,19 @@ existing application storage and region visibility.
 | `ListOnPremisesInstances` | Lists registered names, optionally filtered by status or tags |
 | `AddTagsToOnPremisesInstances` | Adds or replaces tags by key on named instances |
 | `RemoveTagsFromOnPremisesInstances` | Removes matching tag keys from named instances |
+
+## EC2 S3 deployments
+
+For `Server` applications, an S3 revision is downloaded and installed by the AWS
+CodeDeploy agent running inside each selected EC2 instance. Floci selects
+existing Auto Scaling members and EC2 tags, schedules the lifecycle commands,
+and records the agent's results. `DownloadBundle` and `Install` require actual
+agent completion. The existing inline-AppSpec path uses SSM for script hooks.
+
+The host-agent APIs use the independent `codedeploy-commands` and
+`codedeploy-commands-secure` IAM namespaces. See the
+[agent runtime contract](../design/codedeploy-agent-runtime.md) for supported
+deployment policies, endpoint configuration, deadlines and qualification limits.
 
 ## Pre-seeded Built-in Deployment Configs
 

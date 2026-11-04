@@ -112,6 +112,7 @@ AWS::ElastiCache::ServerlessCache	ARN,CreateTime,FullEngineVersion,Status	CacheU
 AWS::ElastiCache::SubnetGroup		CacheSubnetGroupName,Description,SubnetIds,Tags
 AWS::ElastiCache::User	Arn,Status	AccessString,AuthenticationMode,Engine,NoPasswordRequired,Passwords,Tags,UserId,UserName
 AWS::ElastiCache::UserGroup	Arn,Status	Engine,Tags,UserGroupId,UserIds
+AWS::ElasticLoadBalancing::LoadBalancer	CanonicalHostedZoneName,CanonicalHostedZoneNameID,DNSName,SourceSecurityGroup	AccessLoggingPolicy,AppCookieStickinessPolicy,AvailabilityZones,ConnectionDrainingPolicy,ConnectionSettings,CrossZone,HealthCheck,Instances,LBCookieStickinessPolicy,Listeners,LoadBalancerName,Policies,Scheme,SecurityGroups,Subnets,Tags
 AWS::ElasticLoadBalancingV2::Listener	ListenerArn	AlpnPolicy,Certificates,DefaultActions,ListenerAttributes,LoadBalancerArn,MutualAuthentication,Port,Protocol,SslPolicy,Tags
 AWS::ElasticLoadBalancingV2::ListenerRule	IsDefault,RuleArn	Actions,Conditions,ListenerArn,Priority,Tags,Transforms
 AWS::ElasticLoadBalancingV2::LoadBalancer	CanonicalHostedZoneID,DNSName,LoadBalancerArn,LoadBalancerFullName,LoadBalancerName	EnableCapacityReservationProvisionStabilize,EnablePrefixForIpv6SourceNat,EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic,IpAddressType,Ipv4IpamPoolId,LoadBalancerAttributes,MinimumLoadBalancerCapacity,Name,Scheme,SecurityGroups,SubnetMappings,Subnets,Tags,Type

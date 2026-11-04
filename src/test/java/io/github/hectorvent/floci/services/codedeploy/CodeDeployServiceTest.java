@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.codedeploy;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.codedeploy.model.Deployment;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -25,6 +26,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -59,9 +61,34 @@ class CodeDeployServiceTest {
     private CodeDeployService newService(Duration hookCallbackTimeout, Clock clock) {
         CodeDeployService svc = new CodeDeployService(lambdaService, mock(EcsService.class),
                 mock(ElbV2Service.class), ssmCommandService, mock(Ec2Service.class), new ObjectMapper(),
-                new RegionResolver(REGION, ACCOUNT_ID), null, hookCallbackTimeout, clock);
+                new RegionResolver(REGION, ACCOUNT_ID), null, hookCallbackTimeout, clock,
+                mock(CodeDeployAgentDeployment.class));
         svc.initializeStorage();
         return svc;
+    }
+
+    @Test
+    void deploymentHistoryAndStopRequestsAreScopedToTheirAccountAndRegion() {
+        AtomicReference<String> account = new AtomicReference<>(ACCOUNT_ID);
+        RegionResolver resolver = mock(RegionResolver.class);
+        when(resolver.getAccountId()).thenAnswer(ignored -> account.get());
+        CodeDeployService scoped = new CodeDeployService(lambdaService, mock(EcsService.class),
+                mock(ElbV2Service.class), ssmCommandService, mock(Ec2Service.class), new ObjectMapper(),
+                resolver, null, mock(CodeDeployAgentDeployment.class));
+        scoped.createApplication(REGION, "account-app", "Server", null);
+        scoped.createDeploymentGroup(REGION, "account-app", "group", null, ROLE_ARN, Map.of());
+        String id = scoped.createDeployment(REGION, "account-app", "group", null,
+                Map.of("appSpecContent", Map.of("content", "{\"version\":0.0,\"os\":\"linux\"}")), null);
+        assertEquals(id, scoped.getDeployment(REGION, id).getDeploymentId());
+        assertThrows(AwsException.class, () -> scoped.getDeployment("us-west-2", id));
+        account.set("999999999999");
+        assertTrue(scoped.listDeployments(REGION, null, null, null).isEmpty());
+        assertThrows(AwsException.class, () -> scoped.getDeployment(REGION, id));
+        assertThrows(AwsException.class, () -> scoped.listDeploymentTargets(REGION, id));
+        assertThrows(AwsException.class, () -> scoped.getDeploymentTarget(REGION, id, "instance-1"));
+        assertThrows(AwsException.class, () -> scoped.stopDeployment(REGION, id));
+        account.set(ACCOUNT_ID);
+        assertEquals(id, scoped.getDeployment(REGION, id).getDeploymentId());
     }
 
     // ---- Server platform (SSM) hooks ---------------------------------------------------
@@ -79,6 +106,11 @@ class CodeDeployServiceTest {
         assertEquals("Failed", deployment.getStatus());
         assertEquals("HEALTH_CONSTRAINTS", deployment.getErrorInformation().get("code"));
         Map<String, Object> event = instanceTargetEvent(deploymentId, "instance-1", "ApplicationStart");
+        assertEquals(service.batchGetDeploymentTargets(REGION, deploymentId, List.of("instance-1")).getFirst(),
+                service.getDeploymentTarget(REGION, deploymentId, "instance-1"));
+        assertThrows(AwsException.class, () -> service.getDeploymentTarget(REGION, deploymentId, "not-selected"));
+        assertThrows(AwsException.class, () -> service.getDeploymentTarget(REGION, deploymentId, null));
+        assertThrows(AwsException.class, () -> service.getDeploymentTarget(REGION, null, "instance-1"));
         assertEquals("Failed", event.get("status"));
         Map<String, String> diagnostics = diagnosticsOf(event);
         assertEquals("UnknownError", diagnostics.get("errorCode"));

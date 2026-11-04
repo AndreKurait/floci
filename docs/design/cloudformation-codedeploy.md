@@ -19,10 +19,10 @@ Cleanup follows the resource's recorded application, account and Region.
 The `Deployment` property requires starting and waiting for a revision during
 CloudFormation provisioning. This initial implementation explicitly rejects it,
 and also rejects `Ec2DeploymentOptions`, before creating or mutating a resource.
-The existing server runtime does not select targets from Auto Scaling membership
-or install S3 revision bundles. Those paths and Auto Scaling deployment hooks
-need separate runtime work and qualification. Creating a deployment group
-establishes configuration only.
+Creating a deployment group establishes configuration only. Installing a
+revision requires `CreateDeployment` and a running
+[host agent](codedeploy-agent-runtime.md). Auto Scaling launch hooks still need
+separate runtime work and qualification.
 
 Group cleanup retains the application for each live or displaced name. A failed
 replacement can restore the original group and retry deletion of the replacement

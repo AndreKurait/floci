@@ -32,6 +32,7 @@ order:
   - AWS::Redshift
   - AWS::RedshiftServerless
   - AWS::EC2
+  - AWS::ElasticLoadBalancing
   - AWS::ElasticLoadBalancingV2
   - AWS::AutoScaling
   - AWS::ApplicationAutoScaling
@@ -150,6 +151,7 @@ service_labels:
   AWS::ECR: ECR
   AWS::ECS: ECS
   AWS::EKS: EKS
+  AWS::ElasticLoadBalancing: Elastic Load Balancing Classic
   AWS::ElasticLoadBalancingV2: Elastic Load Balancing v2
   AWS::Events: EventBridge
   AWS::GuardDuty: GuardDuty

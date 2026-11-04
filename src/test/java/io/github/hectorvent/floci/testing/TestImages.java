@@ -18,6 +18,9 @@ public final class TestImages {
 
     public static final String BUSYBOX = "busybox:stable";
 
+    public static final String UBUNTU_NOBLE =
+            "ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852";
+
     /**
      * For the one test that pulls the other architecture. A foreign-platform pull replaces what
      * the local tag points at on a daemon without the containerd image store, so it must not share

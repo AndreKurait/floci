@@ -7,6 +7,14 @@ The initial wait does not cancel or resubmit an accepted operation. Existing syn
 **Protocol:** Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 **Endpoint:** `POST http://localhost:4566/`
 
+## Mapping values
+
+`Fn::FindInMap` preserves both string and list values from `Mappings`. A mapped
+list can feed `Fn::Select`, `Fn::Join`, list properties, or a conditional `Fn::If`
+branch without losing member commas or empty positions. This includes templates
+that choose between mapped Availability Zones and `Fn::GetAZs`. AWS documents
+both value types in the [Mappings syntax](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/mappings-section-structure.html).
+
 ## EC2 instance network placement
 
 `AWS::EC2::Instance` uses the resolved `NetworkInterfaces` entry with `DeviceIndex`
@@ -242,6 +250,7 @@ cross-resource references.
 | Redshift | `Cluster` (single-node container; Port and non-dev DBName ignored; ManageMasterPassword unsupported), `ClusterParameterGroup`, `ClusterSubnetGroup`, `ClusterSecurityGroup` (accepted; no EC2-Classic security group model), `EventSubscription` |
 | Redshift Serverless | `Namespace` (Managed admin credentials use Secrets Manager; GetAtt uses the dotted Namespace.* form), `Workgroup` (starts a real container; one workgroup per namespace; capacity, VPC and price-performance settings are stored only; snapshot restore properties are ignored; GetAtt uses the dotted Workgroup.* form) |
 | EC2 | `VPC` (deleted on stack teardown; a VPC with dependents outside the stack, including anything still holding a network interface in its subnets (an instance that is not terminated, a NAT gateway that is not deleted or failed, a standalone interface, an interface endpoint), fails the delete with `DependencyViolation`, as on AWS), `Subnet`, `SecurityGroup` (inline `SecurityGroupIngress`/`SecurityGroupEgress` supported), `SecurityGroupIngress`, `SecurityGroupEgress`, `InternetGateway`, `RouteTable`, `SubnetRouteTableAssociation`, `Route`, `NatGateway` (zonal, primary address only; `AvailabilityMode` regional and the `Secondary*` address properties fail), `EIP`, `Instance`, `LaunchTemplate`, `VPCGatewayAttachment`, `VPCEndpoint`, `NetworkAcl`, `NetworkAclEntry`, `SubnetNetworkAclAssociation`, `FlowLog`, `DHCPOptions`, `KeyPair` (a created key's private key is stored in the `SecureString` parameter `/ec2/keypair/<KeyPairId>`, as on AWS, and deleted with the key), `PrefixList` (updated in place; an update that changes `AddressFamily`, or `MaxEntries` together with `Entries`, fails), `VPCDHCPOptionsAssociation` |
+| Elastic Load Balancing Classic | `LoadBalancer` |
 | Elastic Load Balancing v2 | `LoadBalancer`, `TargetGroup`, `Listener`, `ListenerRule` |
 | Auto Scaling | `LaunchConfiguration`, `AutoScalingGroup`, `LifecycleHook`, `ScalingPolicy` |
 | Application Auto Scaling | `ScalableTarget` (`ScheduledActions` are accepted and not run; Floci has no scheduled scaling), `ScalingPolicy` |
