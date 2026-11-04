@@ -1421,6 +1421,11 @@ launches. An instance's reported private IP is then an address its container act
 from the subnet CIDR the caller declared, not a plausible-looking number. Instances in the same
 VPC reach each other at those addresses; instances in different VPCs sit on different bridges.
 
+If a Docker network-attach request fails, Floci checks the guest's actual endpoint on the
+requested VPC network. A confirmed match at the requested private address recovers a lost
+response. An absent or different endpoint, or an unsuccessful inspection, fails the launch
+through normal instance cleanup. It does not silently start the guest on its bridge alone.
+
 `CreateVpc` and `CreateSubnet` record declarations without contacting Docker. CIDR collision
 checks and fallback address planning run when a consumer first needs an effective address or
 network attachment. This keeps management calls responsive even when the Docker daemon is slow.

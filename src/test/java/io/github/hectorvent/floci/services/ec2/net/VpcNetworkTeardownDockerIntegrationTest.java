@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2.net;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.ConnectToNetworkCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -29,7 +30,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -50,6 +53,61 @@ class VpcNetworkTeardownDockerIntegrationTest {
     @BeforeEach
     void requireDocker() throws InterruptedException {
         assumeTrue(DockerAvailability.isAvailable(), "Docker must be available for VPC network teardown tests");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void uncertainAttachRequiresTheActualRequestedEndpoint(boolean requestReachedDaemon) {
+        String namespace = "vpc-attach-loss-" + UUID.randomUUID();
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.port()).thenReturn(4650);
+        when(config.services().ec2().mock()).thenReturn(false);
+        when(config.services().ec2().vpcNetworks().enabled()).thenReturn(true);
+        when(config.services().ec2().vpcNetworks().driver()).thenReturn("bridge");
+        when(config.services().ec2().vpcNetworks().fallbackPool()).thenReturn("10.240.0.0/12");
+        when(config.services().ec2().vpcNetworks().fallbackPrefixLength()).thenReturn(24);
+        when(config.docker().extraLabels()).thenReturn(List.of());
+        when(config.docker().resourceNamespace()).thenReturn(Optional.of(namespace));
+        DockerClient interrupted = mock(DockerClient.class, delegatesTo(docker));
+        doAnswer(invocation -> {
+            ConnectToNetworkCmd command = docker.connectToNetworkCmd();
+            return mock(ConnectToNetworkCmd.class, call -> {
+                if ("exec".equals(call.getMethod().getName())) {
+                    if (requestReachedDaemon) {
+                        command.exec();
+                    }
+                    throw new IllegalStateException("lost Docker attach response");
+                }
+                Object result = call.getMethod().invoke(command, call.getArguments());
+                return result == command ? call.getMock() : result;
+            });
+        }).when(interrupted).connectToNetworkCmd();
+        VpcNetworkManager manager = new VpcNetworkManager(config, interrupted);
+        String guest = startContainer(namespace + "-guest");
+        String networkName = manager.networkName(REGION, "vpc-1");
+        try {
+            manager.declareVpc(REGION, "vpc-1", "10.220.0.0/24");
+            manager.declareSubnet(REGION, "vpc-1", "subnet-1", "10.220.0.0/24");
+            String address = manager.allocatePrivateIp(REGION, "subnet-1").orElseThrow();
+            if (requestReachedDaemon) {
+                assertEquals(Optional.of(networkName),
+                        manager.attach(REGION, "vpc-1", "subnet-1", guest, address));
+                assertEquals(address, docker.inspectContainerCmd(guest).exec()
+                        .getNetworkSettings().getNetworks().get(networkName).getIpAddress());
+            } else {
+                assertThrows(IllegalStateException.class,
+                        () -> manager.attach(REGION, "vpc-1", "subnet-1", guest, address));
+                assertFalse(docker.inspectContainerCmd(guest).exec()
+                        .getNetworkSettings().getNetworks().containsKey(networkName));
+            }
+        } finally {
+            lifecycleManager.removeIfExistsStrict(guest);
+            manager.forgetSubnet(REGION, "subnet-1");
+            manager.deleteVpcNetwork(REGION, "vpc-1");
+            manager.shutdown();
+        }
+        assertThrows(NotFoundException.class,
+                () -> docker.inspectNetworkCmd().withNetworkId(networkName).exec());
     }
 
     @ParameterizedTest
