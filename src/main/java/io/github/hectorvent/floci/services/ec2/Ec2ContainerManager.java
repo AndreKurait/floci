@@ -182,6 +182,7 @@ public class Ec2ContainerManager {
     private final Map<String, CompletableFuture<Void>> lifecycleOperations = new ConcurrentHashMap<>();
     private final Map<String, String> networkHelpers = new ConcurrentHashMap<>();
     private final Map<String, PendingTermination> pendingTerminations = new ConcurrentHashMap<>();
+    private final Map<String, FailedLaunchCleanup> failedLaunchCleanups = new ConcurrentHashMap<>();
     private final AtomicBoolean terminationRetriesStarted = new AtomicBoolean();
     private final SweepWorker terminationRetries = new SweepWorker(
             "ec2-termination-retry", true, 1, false, this::retryPendingTerminations);
@@ -924,29 +925,49 @@ public class Ec2ContainerManager {
      * reserved while the endpoint stands, and would refuse the next launch handed the same one.
      */
     private void failLaunch(Instance instance, String leasedPrivateIp) {
-        String containerId;
-        int sshHostPort;
-        String containerIp;
-        boolean alreadyCleaned;
+        FailedLaunchCleanup cleanup;
         synchronized (instance) {
-            // A launch cancelled after its address was published must not keep it.
             instance.setPublicIpAddress(null);
             instance.setPublicDnsName(null);
-            alreadyCleaned = isLaunchCancelledState(instance)
-                    && instance.getDockerContainerId() == null
-                    && instance.getSshHostPort() <= 0
-                    && (instance.getContainerBridgeIp() == null || instance.getContainerBridgeIp().isBlank());
-            instance.setState(InstanceState.terminated());
-            containerId = instance.getDockerContainerId();
-            sshHostPort = instance.getSshHostPort();
-            containerIp = instance.getContainerBridgeIp();
-            instance.setDockerContainerId(null);
-            instance.setSshHostPort(0);
-            instance.setContainerBridgeIp(null);
+            cleanup = failedLaunchCleanups.get(instance.getInstanceId());
+            if (cleanup == null) {
+                boolean alreadyCleaned = isLaunchCancelledState(instance)
+                        && instance.getDockerContainerId() == null
+                        && instance.getSshHostPort() <= 0
+                        && (instance.getContainerBridgeIp() == null || instance.getContainerBridgeIp().isBlank());
+                instance.setState(InstanceState.terminated());
+                if (alreadyCleaned) {
+                    return;
+                }
+                String eniId = instance.getNetworkInterfaces() == null || instance.getNetworkInterfaces().isEmpty()
+                        ? null : instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+                cleanup = new FailedLaunchCleanup(instance.getDockerContainerId(), instance.getSshHostPort(),
+                        instance.getContainerBridgeIp(), eniId, instance.getRegion(), instance.getVpcId(),
+                        instance.getSubnetId(), leasedPrivateIp);
+                failedLaunchCleanups.put(instance.getInstanceId(), cleanup);
+                instance.setDockerContainerId(null);
+                instance.setSshHostPort(0);
+                instance.setContainerBridgeIp(null);
+            }
         }
-        if (alreadyCleaned) {
-            return;
+        synchronized (cleanup) {
+            if (failedLaunchCleanups.get(instance.getInstanceId()) != cleanup) {
+                return;
+            }
+            finishFailedLaunch(instance, cleanup);
+            failedLaunchCleanups.remove(instance.getInstanceId(), cleanup);
         }
+    }
+
+    private record FailedLaunchCleanup(String containerId, int sshHostPort, String containerIp,
+                                       String eniId, String region, String vpcId, String subnetId,
+                                       String leasedPrivateIp) {
+    }
+
+    private void finishFailedLaunch(Instance instance, FailedLaunchCleanup cleanup) {
+        String containerId = cleanup.containerId();
+        int sshHostPort = cleanup.sshHostPort();
+        String containerIp = cleanup.containerIp();
         try {
             portForwardManager.unpublishAll(instance);
         } catch (Exception e) {
@@ -961,13 +982,13 @@ public class Ec2ContainerManager {
             }
         }
         if (firewallManager != null && firewallManager.enabled()
-                && instance.getNetworkInterfaces() != null && !instance.getNetworkInterfaces().isEmpty()) {
-            firewallManager.unregister(instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+                && cleanup.eniId() != null) {
+            firewallManager.unregister(cleanup.eniId());
         }
         removeNetworkHelper(instance);
         try {
-            vpcNetworkManager.detach(instance.getRegion(), instance.getVpcId(), containerId);
-            vpcNetworkManager.releasePrivateIp(instance.getRegion(), instance.getSubnetId(), leasedPrivateIp);
+            vpcNetworkManager.detach(cleanup.region(), cleanup.vpcId(), containerId);
+            vpcNetworkManager.releasePrivateIp(cleanup.region(), cleanup.subnetId(), cleanup.leasedPrivateIp());
         } catch (Exception e) {
             LOG.warnv("Error releasing the VPC address of failed EC2 launch {0}: {1}",
                     instance.getInstanceId(), e.getMessage());
