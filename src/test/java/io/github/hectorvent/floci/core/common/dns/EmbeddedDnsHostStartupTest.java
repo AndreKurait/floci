@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.net.BindException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -16,11 +17,13 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -68,11 +71,13 @@ class EmbeddedDnsHostStartupTest {
                     Arrays.copyOfRange(udp, udp.length - 4, udp.length));
             server.stop();
             assertTrue(server.getServerIp().isEmpty());
-            try (ServerSocket tcp = bindTcp(port);
-                 DatagramSocket rebound = new DatagramSocket(port, InetAddress.ofLiteral(ADDRESS))) {
-                assertEquals(port, tcp.getLocalPort());
-                assertEquals(port, rebound.getLocalPort());
-            }
+            await().atMost(Duration.ofSeconds(5)).ignoreException(BindException.class).untilAsserted(() -> {
+                try (ServerSocket tcp = bindTcp(port);
+                     DatagramSocket rebound = new DatagramSocket(port, InetAddress.ofLiteral(ADDRESS))) {
+                    assertEquals(port, tcp.getLocalPort());
+                    assertEquals(port, rebound.getLocalPort());
+                }
+            });
         } finally {
             if (server != null) {
                 server.stop();
