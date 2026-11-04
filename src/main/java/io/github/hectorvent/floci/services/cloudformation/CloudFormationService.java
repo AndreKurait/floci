@@ -792,7 +792,7 @@ public class CloudFormationService implements ResourceProvider {
         // The transform succeeded but produced a template CloudFormation rejects: AWS fails the
         // change set with the template error itself, not a transform failure.
         try {
-            requireStringConditionReferencesIn(expanded);
+            requireValidConditionsIn(expanded);
         } catch (AwsException e) {
             return e.getMessage();
         }
@@ -2020,7 +2020,7 @@ public class CloudFormationService implements ResourceProvider {
             // submitted body byte for byte.
             // A template CloudFormation rejects outright fails before the stack takes it on, as the
             // synchronous check does for a template no transform touched.
-            requireStringConditionReferencesIn(template);
+            requireValidConditionsIn(template);
             if (includeMerged || hasSamTransform) {
                 templateBody = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(template);
             }
@@ -3823,10 +3823,15 @@ public class CloudFormationService implements ResourceProvider {
         CloudFormationTemplateEngine engine = new CloudFormationTemplateEngine(
                 accountId, region, stackName, stackId, conditionParams, Map.of(), Map.of(),
                 conditions, mappings, objectMapper, name -> "");
-        // Two-pass: collect all names first, then evaluate (handles forward references)
+        // Keep defaults for legacy stored templates with invalid references or cycles, but evaluate
+        // declared dependencies first. A name appearing later in the file must not read as false.
         condNode.fields().forEachRemaining(e -> conditions.put(e.getKey(), false));
-        condNode.fields().forEachRemaining(e ->
-                conditions.put(e.getKey(), evaluateCondition(e.getValue(), conditions, engine)));
+        Map<String, Set<String>> dependencies = conditionDependencies(condNode);
+        for (List<String> component : componentsDependenciesFirst(dependencies.keySet(), Set.of(), dependencies)) {
+            for (String name : component) {
+                conditions.put(name, evaluateCondition(condNode.get(name), conditions, engine));
+            }
+        }
         return conditions;
     }
 
@@ -3841,12 +3846,55 @@ public class CloudFormationService implements ResourceProvider {
      * {@code Fn::Not} stop early, so evaluation alone would read such an operand as false or never
      * reach it. SAM's translator emits this shape when a conditional function's event invoke
      * destination is itself conditional. Also rejects {@code Fn::ImportValue} anywhere in a
-     * condition, which CloudFormation does not allow there. Checked on the template being deployed
+     * condition, which CloudFormation does not allow there. Named references must exist and form
+     * an acyclic graph, including references in branches evaluation would skip. Checked on the template being deployed
      * only, so a stored template read as the old side of a diff, a rollback or a delete ordering is
      * never a reason an update cannot proceed.
      */
-    private static void requireStringConditionReferencesIn(JsonNode template) {
-        template.path("Conditions").forEach(CloudFormationService::requireStringConditionReferences);
+    private static void requireValidConditionsIn(JsonNode template) {
+        JsonNode conditions = template.path("Conditions");
+        conditions.forEach(CloudFormationService::requireStringConditionReferences);
+        Map<String, Set<String>> dependencies = conditionDependencies(conditions);
+        Set<String> missing = new LinkedHashSet<>();
+        dependencies.values().forEach(names -> names.stream()
+                .filter(name -> !dependencies.containsKey(name)).forEach(missing::add));
+        if (!missing.isEmpty()) {
+            throw new AwsException("ValidationError",
+                    "Unresolved condition dependencies [" + String.join(", ", missing)
+                            + "] in the Conditions block of the template", 400);
+        }
+        Set<String> circular = new LinkedHashSet<>();
+        for (List<String> component : componentsDependenciesFirst(dependencies.keySet(), Set.of(), dependencies)) {
+            if (component.size() > 1 || dependencies.get(component.getFirst()).contains(component.getFirst())) {
+                circular.addAll(component);
+            }
+        }
+        if (!circular.isEmpty()) {
+            throw new AwsException("ValidationError",
+                    "Circular dependency between Conditions: [" + String.join(", ", circular) + "]", 400);
+        }
+    }
+
+    private static Map<String, Set<String>> conditionDependencies(JsonNode conditions) {
+        Map<String, Set<String>> dependencies = new LinkedHashMap<>();
+        conditions.fields().forEachRemaining(condition -> {
+            Set<String> names = new LinkedHashSet<>();
+            Deque<JsonNode> pending = new ArrayDeque<>();
+            pending.add(condition.getValue());
+            while (!pending.isEmpty()) {
+                JsonNode expression = pending.removeFirst();
+                if (expression.path("Condition").isTextual()) {
+                    names.add(expression.get("Condition").textValue());
+                }
+                JsonNode ifArguments = expression.path("Fn::If");
+                if (ifArguments.isArray() && !ifArguments.isEmpty() && ifArguments.get(0).isTextual()) {
+                    names.add(ifArguments.get(0).textValue());
+                }
+                expression.forEach(pending::addLast);
+            }
+            dependencies.put(condition.getKey(), names);
+        });
+        return dependencies;
     }
 
     private static void requireStringConditionReferences(JsonNode expression) {
@@ -3948,7 +3996,7 @@ public class CloudFormationService implements ResourceProvider {
             return;
         }
 
-        requireStringConditionReferencesIn(template);
+        requireValidConditionsIn(template);
         Map<String, String> resolvedParams = resolveDefaultParameters(template, params);
         // Against the stack name and id the execution will use, which createChangeSet decides.
         Map<String, Boolean> conditions =
