@@ -118,6 +118,22 @@ association version pending while preserving any previously stored execution tim
 Association creation is not evidence that a document ran, inventory was collected or
 a target became compliant. The Run Command execution paths below are separate.
 
+`UpdateAssociation.Name` selects the new document without changing the association ID.
+The requested document version is validated against that document before any stored
+fields change. Changing the document without a version selects its `$DEFAULT`, so a
+numeric version from the previous document cannot carry over. Missing documents or
+invalid versions leave the association unchanged.
+
+Updates replace the optional `AssociationName`, `Parameters`, `ScheduleExpression`,
+`MaxErrors`, `MaxConcurrency` and `ComplianceSeverity` values. Include their current
+values in the request to retain them; omitting them clears the previous configuration.
+
+`AssociationVersion` provides optimistic concurrency: an explicit version must match
+the current association version, otherwise the update fails with
+`InvalidAssociationVersion`. Omitting it or passing `$LATEST` permits the update.
+The check and write are atomic, so concurrent requests for the same explicit version
+cannot both overwrite the association.
+
 ## Run Command Execution
 
 `SendCommand` supports the `AWS-RunShellScript` document. For EC2 instances launched by Floci in real Docker mode, Floci creates the command invocation, returns the command response, and then runs the script asynchronously inside the target instance container. Callers observe completion through `GetCommandInvocation`. `stdout`, `stderr`, response code, start time, and end time are recorded on the invocation.

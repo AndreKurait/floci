@@ -1480,7 +1480,8 @@ class SsmServiceTest {
         SsmAssociation created = ssmService.createAssociation("MyDoc", "my-assoc", null, "i-12345", null, null, null, region);
 
         AwsException ex = assertThrows(AwsException.class, () ->
-                ssmService.updateAssociation(created.getAssociationId(), null, "99", null, null, null, null, null, null, region));
+                ssmService.updateAssociation(created.getAssociationId(), null, null, "99",
+                        null, null, null, null, null, null, null, region));
         assertEquals("InvalidDocumentVersion", ex.getErrorCode());
 
         // The association's DocumentVersion is unchanged after the rejected update
@@ -1521,8 +1522,8 @@ class SsmServiceTest {
         assertEquals("1", created.getAssociationVersion());
 
         SsmAssociation updated = ssmService.updateAssociation(
-                created.getAssociationId(), null, null, null, null,
-                "rate(1 hour)", "5", null, null, region);
+                created.getAssociationId(), null, null, null, null, null,
+                "rate(1 hour)", "5", null, null, null, region);
 
         assertEquals("rate(1 hour)", updated.getScheduleExpression());
         assertEquals("5", updated.getMaxErrors());
@@ -1543,8 +1544,8 @@ class SsmServiceTest {
         created.setOverview(new SsmAssociation.AssociationOverview("Success", "Success"));
         created.setLastExecutionDate(previousExecution);
 
-        SsmAssociation updated = ssmService.updateAssociation(created.getAssociationId(), null, null,
-                null, null, "rate(6 hours)", null, null, null, region);
+        SsmAssociation updated = ssmService.updateAssociation(created.getAssociationId(), null, null, null,
+                null, null, "rate(6 hours)", null, null, null, null, region);
 
         assertEquals("2", updated.getAssociationVersion());
         assertEquals("Pending", updated.getStatus().getName());
@@ -1561,7 +1562,8 @@ class SsmServiceTest {
     void testUpdateAssociation_NotFound() {
         String region = "us-east-1";
         AwsException ex = assertThrows(AwsException.class, () ->
-                ssmService.updateAssociation("non-existent-id", null, null, null, null, null, null, null, null, region));
+                ssmService.updateAssociation("non-existent-id", null, null, null,
+                        null, null, null, null, null, null, null, region));
         assertEquals("AssociationDoesNotExist", ex.getErrorCode());
         assertEquals(400, ex.getHttpStatus());
     }
