@@ -50,7 +50,8 @@ ARCHIVE_URL = "https://schema.cloudformation.us-east-1.amazonaws.com/Cloudformat
 FETCH_TIMEOUT_SECONDS = 60
 
 # The resource types whose provisioners read their properties through CfnPropertyTypes.
-RESOURCE_TYPES = ["AWS::AutoScaling::LaunchConfiguration", "AWS::DSQL::Cluster", "AWS::EC2::Instance",
+RESOURCE_TYPES = ["AWS::AutoScaling::LaunchConfiguration", "AWS::DSQL::Cluster", "AWS::DynamoDB::Table",
+                  "AWS::EC2::Instance",
                   "AWS::EC2::LaunchTemplate", "AWS::ECS::TaskDefinition",
                   "AWS::ElasticLoadBalancingV2::LoadBalancer", "AWS::ElasticLoadBalancingV2::TargetGroup",
                   "AWS::Events::Rule",
@@ -64,6 +65,7 @@ SHAPE_TYPES = {"structure", "list", "map", *SCALAR_SHAPES}
 # Types the provisioners rely on: (shape, member) -> member shape,
 # and for a list or a map the shape of its items or values.
 ANCHORS = {
+    ("AWS::DynamoDB::Table", "DeletionProtectionEnabled"): "Boolean",
     ("AWS::Events::Rule/RetryPolicy", "MaximumRetryAttempts"): "Integer",
     ("AWS::Events::Rule/EcsParameters", "EnableECSManagedTags"): "Boolean",
     ("AWS::Events::Rule/AwsVpcConfiguration", "Subnets"): ["String"],

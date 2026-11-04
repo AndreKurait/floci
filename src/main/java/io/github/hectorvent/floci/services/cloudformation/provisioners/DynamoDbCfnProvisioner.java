@@ -9,6 +9,9 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
+import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations;
+import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Api;
+import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Call;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Scope;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbTableAccess.TimeToLive;
 import io.github.hectorvent.floci.services.dynamodb.model.AttributeDefinition;
@@ -44,8 +47,9 @@ import java.util.Set;
  *
  * <p>A table's {@code TimeToLiveSpecification} is reconciled against what DescribeTimeToLive
  * reports, so UpdateTimeToLive is called only when the setting differs. An in-place update of an
- * {@code AWS::DynamoDB::Table} keeps the tags, stream and TTL setting it replaces, so a failed
- * stack update can put all three back.
+ * {@code AWS::DynamoDB::Table} keeps the tags, stream, TTL and deletion protection settings
+ * it replaces, so a failed stack update can restore them. Stack deletion uses the public DynamoDB operation and therefore
+ * respects protection enabled either by the stack or through the DynamoDB API.
  */
 @ApplicationScoped
 public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
@@ -64,10 +68,12 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
     private static final int TABLE_NAME_MAX_LENGTH = 255;
 
     private final DynamoDbFacade dynamoDb;
+    private final DynamoDbOperations operations;
 
     @Inject
-    public DynamoDbCfnProvisioner(DynamoDbFacade dynamoDb) {
+    public DynamoDbCfnProvisioner(DynamoDbFacade dynamoDb, DynamoDbOperations operations) {
         this.dynamoDb = dynamoDb;
+        this.operations = operations;
     }
 
     @Override
@@ -103,7 +109,8 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
             case "AWS::DynamoDB::Table", "AWS::DynamoDB::GlobalTable" -> CfnDeletes.safeDelete(
                     "DynamoDB table", physicalId,
                     // Deletes get no ProvisionContext; the engine and Cloud Control run them as the stack account.
-                    () -> dynamoDb.tables().deleteTable(dynamoDb.scope(region), physicalId),
+                    () -> callDynamoDb(dynamoDb.scope(region), "DeleteTable",
+                            MAPPER.createObjectNode().put("TableName", physicalId)),
                     "ResourceNotFoundException");
             // Nothing to derive from the id alone once the attributes are gone; the replica stays.
             case "Custom::DynamoDBReplica" -> LOG.warnv(
@@ -119,6 +126,14 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().remove(CfnRollback.DYNAMODB_TABLE_UPDATE_SNAPSHOT_ATTR);
         CloudFormationTemplateEngine engine = ctx.engine();
         String region = ctx.region();
+        CfnPropertyTypes.Reader types = new CfnPropertyTypes.Reader(engine);
+        JsonNode protection = TABLE.equals(r.getResourceType()) && props != null
+                ? types.read("DeletionProtectionEnabled", props.get("DeletionProtectionEnabled"),
+                        CfnPropertyTypes.propertyShape(TABLE, "DeletionProtectionEnabled")) : null;
+        types.finish();
+        boolean protectionManaged = TABLE.equals(r.getResourceType())
+                && (protection != null || ctx.previouslyDeclared("DeletionProtectionEnabled"));
+        boolean desiredProtection = protection != null && protection.booleanValue();
         // TableName is create-only, so an update without one must keep the name generated on
         // create rather than mint another: a fresh name here created a second table on every
         // UpdateStack and re-pointed Ref at it.
@@ -271,6 +286,9 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
                 r.getAttributes().put("TableId", table.getTableId());
                 reconcileGlobalTableReplicas(tableName, props, ctx);
             }
+            if (protectionManaged) {
+                reconcileDeletionProtection(scope, tableName, table, desiredProtection);
+            }
             // Only a live stream has an ARN worth handing to Fn::GetAtt. Publishing one unconditionally
             // resolved to nothing on a streamless table; publishing the retained ARN of a stream that
             // has since been switched off would resolve to something no longer running. An update
@@ -312,6 +330,23 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
                 r.setPhysicalId(tableName);
                 r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
             }
+        }
+    }
+
+    private void callDynamoDb(Scope scope, String action, ObjectNode request) {
+        try {
+            operations.execute(new Call(scope, Api.DYNAMODB, action, request)).successBody();
+        } catch (RuntimeException failure) {
+            throw failure;
+        } catch (Exception failure) {
+            throw new IllegalStateException("DynamoDB " + action + " failed", failure);
+        }
+    }
+
+    private void reconcileDeletionProtection(Scope scope, String tableName, TableDefinition table, boolean enabled) {
+        if (table.isDeletionProtectionEnabled() != enabled) {
+            callDynamoDb(scope, "UpdateTable", MAPPER.createObjectNode()
+                    .put("TableName", tableName).put("DeletionProtectionEnabled", enabled));
         }
     }
 
@@ -382,9 +417,9 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * Keeps the tags, stream setting and TTL setting the table has before an in-place update
+     * Keeps the tags, stream, TTL and deletion protection settings before an in-place update
      * changes them, with the account and region that address it, so {@link #rollbackUpdate} can
-     * put all three back.
+     * restore those settings.
      */
     private static void snapshotBeforeUpdate(StackResource r, Scope scope, String tableName, TableDefinition table,
                                              Map<String, String> tags, TimeToLive ttl) {
@@ -398,6 +433,7 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
         snapshot.put("streamViewType", table.getStreamViewType());
         snapshot.put("ttlEnabled", ttl.enabled());
         snapshot.put("ttlAttributeName", ttl.attributeName());
+        snapshot.put("deletionProtectionEnabled", table.isDeletionProtectionEnabled());
         r.getAttributes().put(CfnRollback.DYNAMODB_TABLE_UPDATE_SNAPSHOT_ATTR, snapshot.toString());
     }
 
@@ -412,8 +448,8 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * Puts back the tags, stream setting and TTL setting an in-place table update changed. All
-     * three go back or none is claimed: restoring one alone would report a rollback while the
+     * Puts back the settings an in-place table update changed. Every captured setting is
+     * restored before success is reported: restoring one alone would report a rollback while the
      * others stayed changed. Only an in-place {@code AWS::DynamoDB::Table} update takes the
      * snapshot, so a global table or a replacing update still reports that rollback is not
      * implemented. The snapshot is spent only once the restore succeeded: a restore that throws
@@ -453,6 +489,10 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
         requireTimeToLiveChangeAllowed(currentTtl, priorTtl);
         reconcileTimeToLive(scope, tableName, currentTtl, priorTtl);
 
+        if (snapshot.has("deletionProtectionEnabled")) {
+            reconcileDeletionProtection(scope, tableName, table,
+                    snapshot.path("deletionProtectionEnabled").asBoolean());
+        }
         publishStreamArn(resource, table);
         resource.getAttributes().remove(CfnRollback.DYNAMODB_TABLE_UPDATE_SNAPSHOT_ATTR);
         return true;

@@ -16,6 +16,9 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.DynamoDbC
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ProvisionContext;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
+import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Api;
+import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Call;
+import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Reply;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Scope;
 import io.github.hectorvent.floci.services.dynamodb.backend.RecordingDynamoDbBackend.Invocation;
 import io.github.hectorvent.floci.services.firehose.FirehoseService;
@@ -45,6 +48,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -93,7 +97,9 @@ class DynamoDbFacadeTest {
 
     @Test
     void cloudFormationTableUsesTheStackRegion() throws Exception {
-        DynamoDbCfnProvisioner provisioner = new DynamoDbCfnProvisioner(facade);
+        DynamoDbOperations operations = mock(DynamoDbOperations.class);
+        when(operations.execute(any())).thenReturn(new Reply(200, null, Map.of()));
+        DynamoDbCfnProvisioner provisioner = new DynamoDbCfnProvisioner(facade, operations);
         StackResource table = cfnResource("Orders", "AWS::DynamoDB::Table");
 
         provisioner.provision(table, mapper.readTree("{\"TableName\":\"orders\"}"),
@@ -102,13 +108,14 @@ class DynamoDbFacadeTest {
 
         assertEquals(List.of(
                 new Invocation("createTable", DEFAULT_ACCOUNT, OTHER_REGION),
-                new Invocation("listTagsOfResource", DEFAULT_ACCOUNT, OTHER_REGION),
-                new Invocation("deleteTable", DEFAULT_ACCOUNT, OTHER_REGION)), backend.invocations());
+                new Invocation("listTagsOfResource", DEFAULT_ACCOUNT, OTHER_REGION)), backend.invocations());
+        verify(operations).execute(new Call(new Scope(DEFAULT_ACCOUNT, OTHER_REGION),
+                Api.DYNAMODB, "DeleteTable", mapper.readTree("{\"TableName\":\"orders\"}")));
     }
 
     @Test
     void cloudFormationProvisionsUnderTheStackAccountRatherThanTheAmbientOne() throws Exception {
-        DynamoDbCfnProvisioner provisioner = new DynamoDbCfnProvisioner(facade);
+        DynamoDbCfnProvisioner provisioner = new DynamoDbCfnProvisioner(facade, mock(DynamoDbOperations.class));
         ProvisionContext stack = cfnContext(OWNER_ACCOUNT, OTHER_REGION);
 
         provisioner.provision(cfnResource("Orders", "AWS::DynamoDB::GlobalTable"), mapper.readTree("""
