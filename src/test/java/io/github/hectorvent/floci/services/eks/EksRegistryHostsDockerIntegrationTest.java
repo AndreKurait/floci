@@ -459,6 +459,19 @@ class EksRegistryHostsDockerIntegrationTest {
                 new String[]{"kubectl", "--request-timeout=2s", "get", "events",
                         "--field-selector=involvedObject.name=registry-hosts-pod", "--sort-by=.lastTimestamp"},
                 new String[]{"kubectl", "--request-timeout=2s", "get", "nodes", "-o", "json"},
+                new String[]{"kubectl", "--request-timeout=2s", "get", "clusterrole,clusterrolebinding",
+                        "k3s-cloud-controller-manager", "-o", "json"},
+                new String[]{"kubectl", "--request-timeout=2s", "get", "leases", "-n", "kube-system", "-o", "json"},
+                new String[]{"kubectl", "--request-timeout=2s", "get", "addons.k3s.cattle.io", "ccm",
+                        "-n", "kube-system", "-o", "json"},
+                new String[]{"sh", "-c", """
+                        printf '%s' '{"apiVersion":"authorization.k8s.io/v1","kind":"SubjectAccessReview",
+                        "spec":{"user":"k3s-cloud-controller-manager",
+                        "resourceAttributes":{"namespace":"kube-system","verb":"watch",
+                        "resource":"endpointslices","group":"discovery.k8s.io"}}}' | \
+                        kubectl --kubeconfig=/var/lib/rancher/k3s/server/cred/supervisor.kubeconfig \
+                        --request-timeout=2s create --raw /apis/authorization.k8s.io/v1/subjectaccessreviews -f -
+                        """},
                 new String[]{"sh", "-c", "tail -n 80 /var/lib/rancher/k3s/agent/containerd/containerd.log"});
         for (String[] command : commands) {
             try {
