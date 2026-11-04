@@ -20,7 +20,9 @@ import io.vertx.core.net.PemKeyCertOptions;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -95,9 +97,11 @@ class ElbV2TcpDataPlaneIntegrationTest {
     private String targetGroupArn;
     private String listenerArn;
     private int listenerPort;
+    private boolean nonDefaultAccount;
 
     @BeforeEach
-    void createTcpListenerWithHealthyTarget() throws Exception {
+    void createTcpListenerWithHealthyTarget(TestInfo testInfo) throws Exception {
+        nonDefaultAccount = testInfo.getTags().contains("nondefault-account");
         backend = vertx.createNetServer()
                 .connectHandler(socket -> socket.handler(socket::write))
                 .listen(0, "127.0.0.1")
@@ -109,7 +113,7 @@ class ElbV2TcpDataPlaneIntegrationTest {
         client = ElasticLoadBalancingV2Client.builder()
                 .endpointOverride(endpoint)
                 .region(Region.US_EAST_1)
-                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(nonDefaultAccount ? "111122223333" : "test", "test")))
                 .httpClientBuilder(UrlConnectionHttpClient.builder())
                 .build();
 
@@ -166,7 +170,9 @@ class ElbV2TcpDataPlaneIntegrationTest {
                             || "Elb.InitialHealthChecking".equals(description.targetHealth().reasonAsString())));
         });
         // Keep the real network probes and threshold, without waiting for the periodic timer.
-        healthChecker.probeAll(targetGroupArn, service.getTargetGroup("us-east-1", targetGroupArn));
+        if (!nonDefaultAccount) {
+            healthChecker.probeAll(targetGroupArn, service.getTargetGroup("us-east-1", targetGroupArn));
+        }
     }
 
     @AfterEach
@@ -206,6 +212,40 @@ class ElbV2TcpDataPlaneIntegrationTest {
 
     @Test
     void tcpListenerRelaysBinaryBytesWithoutInterpretingHttp() throws Exception {
+        assertBinaryRelay();
+    }
+
+    @Tag("nondefault-account")
+    @Test
+    void tcpListenerRelaysBinaryBytesForItsNondefaultOwner() throws Exception {
+        assertBinaryRelay();
+    }
+
+    @Tag("nondefault-account")
+    @Test
+    void runtimeReinitializationRestoresTheNondefaultOwnersListenerAndHealthChecks() throws Exception {
+        assertBinaryRelay();
+        assertTrue(dataPlane.removeListener(listenerArn, listenerPort, () -> true));
+        healthChecker.stopMonitoring(targetGroupArn);
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                assertThrows(ConnectException.class, () -> connect(listenerPort).close()));
+
+        service.initializeStorage();
+        service.restorePersistedRuntime();
+
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> assertEquals(
+                TargetHealthStateEnum.HEALTHY,
+                client.describeTargetHealth(request -> request.targetGroupArn(targetGroupArn))
+                        .targetHealthDescriptions().getFirst().targetHealth().state()));
+        await().atMost(Duration.ofSeconds(5)).ignoreException(ConnectException.class).untilAsserted(() -> {
+            try (Socket socket = connect(listenerPort)) {
+                assertEquals(listenerPort, socket.getPort());
+            }
+        });
+        assertBinaryRelay();
+    }
+
+    private void assertBinaryRelay() throws Exception {
         // PostgreSQL SSLRequest: valid TCP payload, not an HTTP request.
         byte[] payload = {0, 0, 0, 8, 4, (byte) 0xd2, 0x16, 0x2f};
         try (Socket direct = connect(backend.actualPort())) {

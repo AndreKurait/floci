@@ -5,14 +5,17 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmCertificateReferenceProvider.CertificateReference;
@@ -80,6 +83,11 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     private Map<String, Map<String, Listener>> listeners = new ConcurrentHashMap<>();
     private Map<String, Map<String, Rule>> rules = new ConcurrentHashMap<>();
 
+    private AccountAwareStorageBackend<Map<String, LoadBalancer>> loadBalancersStore;
+    private AccountAwareStorageBackend<Map<String, TargetGroup>> targetGroupsStore;
+    private AccountAwareStorageBackend<Map<String, Listener>> listenersStore;
+    private AccountAwareStorageBackend<Map<String, Rule>> rulesStore;
+
     // indexes
     private final Map<String, List<String>> lbToListeners   = new ConcurrentHashMap<>(); // LB-ARN → listener ARNs
     private final Map<String, List<String>> listenerToRules  = new ConcurrentHashMap<>(); // Listener-ARN → rule ARNs
@@ -94,20 +102,24 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (storageFactory == null) {
             return;
         }
-        this.loadBalancers = storageBacked("elbv2-load-balancers.json",
+        this.loadBalancersStore = storageFactory.create("elbv2", "elbv2-load-balancers.json",
                 new TypeReference<Map<String, Map<String, LoadBalancer>>>() {});
-        this.targetGroups = storageBacked("elbv2-target-groups.json",
+        this.loadBalancers = new StorageBackedMap<>(loadBalancersStore);
+        this.targetGroupsStore = storageFactory.create("elbv2", "elbv2-target-groups.json",
                 new TypeReference<Map<String, Map<String, TargetGroup>>>() {});
-        this.listeners = storageBacked("elbv2-listeners.json",
+        this.targetGroups = new StorageBackedMap<>(targetGroupsStore);
+        this.listenersStore = storageFactory.create("elbv2", "elbv2-listeners.json",
                 new TypeReference<Map<String, Map<String, Listener>>>() {});
-        this.rules = storageBacked("elbv2-rules.json",
+        this.listeners = new StorageBackedMap<>(listenersStore);
+        this.rulesStore = storageFactory.create("elbv2", "elbv2-rules.json",
                 new TypeReference<Map<String, Map<String, Rule>>>() {});
+        this.rules = new StorageBackedMap<>(rulesStore);
         this.tags = storageBacked("elbv2-tags.json",
                 new TypeReference<Map<String, Map<String, String>>>() {});
-        normalizeRegionMaps(loadBalancers);
-        normalizeRegionMaps(targetGroups);
-        normalizeRegionMaps(listeners);
-        normalizeRegionMaps(rules);
+        normalizeStoredRegions(loadBalancers, loadBalancersStore);
+        normalizeStoredRegions(targetGroups, targetGroupsStore);
+        normalizeStoredRegions(listeners, listenersStore);
+        normalizeStoredRegions(rules, rulesStore);
         normalizeRegionMaps(tags);
         rebuildIndexes();
     }
@@ -122,6 +134,41 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             if (!(entry.getValue() instanceof ConcurrentHashMap)) {
                 resources.put(entry.getKey(), new ConcurrentHashMap<>(entry.getValue()));
             }
+        }
+    }
+
+    private record StoredRegion<V>(String accountId, String region, Map<String, V> resources) {}
+
+    private <V> List<StoredRegion<V>> storedRegions(Map<String, Map<String, V>> resources,
+                                                  AccountAwareStorageBackend<Map<String, V>> store) {
+        List<StoredRegion<V>> stored = new ArrayList<>();
+        if (store == null) {
+            resources.forEach((region, values) -> stored.add(new StoredRegion<>(null, region, values)));
+            return stored;
+        }
+        store.scanAllAccountsWithRawKeys().forEach((rawKey, values) -> {
+            int slash = rawKey.indexOf('/');
+            if (slash < 0 && store.getForAccount(config.defaultAccountId(), rawKey).isPresent()) {
+                return;
+            }
+            String accountId = slash < 0 ? config.defaultAccountId() : rawKey.substring(0, slash);
+            String region = slash < 0 ? rawKey : rawKey.substring(slash + 1);
+            stored.add(new StoredRegion<>(accountId, region, values));
+        });
+        return stored;
+    }
+
+    private <V> void normalizeStoredRegions(Map<String, Map<String, V>> resources,
+                                           AccountAwareStorageBackend<Map<String, V>> store) {
+        if (store == null) {
+            normalizeRegionMaps(resources);
+            return;
+        }
+        for (StoredRegion<V> stored : storedRegions(resources, store)) {
+            Map<String, V> concurrent = stored.resources() instanceof ConcurrentHashMap
+                    ? stored.resources() : new ConcurrentHashMap<>(stored.resources());
+            store.putForAccount(stored.accountId(), stored.region(), concurrent);
+            store.deleteRaw(stored.region());
         }
     }
 
@@ -157,20 +204,20 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         listenerToRules.clear();
         tgToLbs.clear();
 
-        for (Map<String, Listener> regionListeners : listeners.values()) {
-            for (Listener listener : regionListeners.values()) {
+        for (StoredRegion<Listener> stored : storedRegions(listeners, listenersStore)) {
+            for (Listener listener : stored.resources().values()) {
                 lbToListeners.computeIfAbsent(listener.getLoadBalancerArn(), k -> new CopyOnWriteArrayList<>())
                         .add(listener.getListenerArn());
             }
         }
-        for (Map<String, Rule> regionRules : rules.values()) {
-            for (Rule rule : regionRules.values()) {
+        for (StoredRegion<Rule> stored : storedRegions(rules, rulesStore)) {
+            for (Rule rule : stored.resources().values()) {
                 listenerToRules.computeIfAbsent(rule.getListenerArn(), k -> new CopyOnWriteArrayList<>())
                         .add(rule.getRuleArn());
             }
         }
-        for (Map.Entry<String, Map<String, TargetGroup>> regionEntry : targetGroups.entrySet()) {
-            for (TargetGroup targetGroup : regionEntry.getValue().values()) {
+        for (StoredRegion<TargetGroup> stored : storedRegions(targetGroups, targetGroupsStore)) {
+            for (TargetGroup targetGroup : stored.resources().values()) {
                 tgToLbs.computeIfAbsent(targetGroup.getTargetGroupArn(), k -> ConcurrentHashMap.newKeySet())
                         .addAll(targetGroup.getLoadBalancerArns());
             }
@@ -186,8 +233,8 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     {
         refreshCanonicalHostedZones();
         if (healthChecker != null) {
-            for (Map<String, TargetGroup> regionTargetGroups : targetGroups.values()) {
-                for (TargetGroup targetGroup : regionTargetGroups.values()) {
+            for (StoredRegion<TargetGroup> stored : storedRegions(targetGroups, targetGroupsStore)) {
+                for (TargetGroup targetGroup : stored.resources().values()) {
                     healthChecker.startMonitoring(targetGroup);
                     if (!targetGroup.getTargets().isEmpty()) {
                         healthChecker.addTargets(targetGroup.getTargetGroupArn(), targetGroup.getTargets(), targetGroup);
@@ -196,11 +243,12 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             }
         }
         if (dataPlane != null) {
-            for (Map.Entry<String, Map<String, Listener>> regionEntry : listeners.entrySet()) {
-                String region = regionEntry.getKey();
-                for (Listener listener : regionEntry.getValue().values()) {
+            for (StoredRegion<Listener> stored : storedRegions(listeners, listenersStore)) {
+                String region = stored.region();
+                for (Listener listener : stored.resources().values()) {
                     try {
-                        restoreListener(region, listener.getListenerArn());
+                        RequestScopes.runAs(stored.accountId(), region,
+                                () -> restoreListener(region, listener.getListenerArn()));
                     } catch (RuntimeException failure) {
                         LOG.warnv("ELBv2 saved listener {0} could not be restored ({1}: {2}); its configuration is retained",
                                 listener.getListenerArn(), failure.getClass().getSimpleName(), failure.getMessage());
@@ -417,6 +465,38 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     Listener getListener(String region, String arn) {
         return listeners.getOrDefault(region, Map.of()).get(arn);
+    }
+
+    TargetGroup getTargetGroupForListener(String region, String listenerArn, String targetGroupArn) {
+        return dataPlaneResource(targetGroups, targetGroupsStore, region, listenerArn, targetGroupArn);
+    }
+
+    LoadBalancer getLoadBalancerForListener(String region, String listenerArn, String loadBalancerArn) {
+        return dataPlaneResource(loadBalancers, loadBalancersStore, region, listenerArn, loadBalancerArn);
+    }
+
+    Listener getDataPlaneListener(String region, String listenerArn) {
+        return dataPlaneResource(listeners, listenersStore, region, listenerArn, listenerArn);
+    }
+
+    private <V> V dataPlaneResource(Map<String, Map<String, V>> resources,
+                                   AccountAwareStorageBackend<Map<String, V>> store,
+                                   String region, String listenerArn, String resourceArn) {
+        if (!AwsArnUtils.isArn(listenerArn) || !AwsArnUtils.isArn(resourceArn)) {
+            return null;
+        }
+        AwsArnUtils.Arn owner = AwsArnUtils.parse(listenerArn);
+        AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
+        if (!"elasticloadbalancing".equals(owner.service()) || !owner.service().equals(resource.service())
+                || !region.equals(owner.region()) || !region.equals(resource.region())
+                || !owner.partition().equals(resource.partition())
+                || !owner.partition().equals(AwsRegions.partitionFor(region))
+                || owner.accountId().isBlank() || !owner.accountId().equals(resource.accountId())) {
+            return null;
+        }
+        Map<String, V> regionResources = store == null ? resources.get(region)
+                : store.getForAccount(owner.accountId(), region).orElse(null);
+        return regionResources == null ? null : regionResources.get(resourceArn);
     }
 
     /** Capacity reservation status for a load balancer. All fields are {@code null} when no
@@ -1713,16 +1793,18 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      * zone of their region and type again, written back so the stored copy agrees.
      */
     private void refreshCanonicalHostedZones() {
-        for (String region : List.copyOf(loadBalancers.keySet())) {
-            Map<String, LoadBalancer> regionLoadBalancers = loadBalancers.get(region);
-            if (regionLoadBalancers == null) {
-                continue;
-            }
+        for (StoredRegion<LoadBalancer> stored : storedRegions(loadBalancers, loadBalancersStore)) {
+            String region = stored.region();
+            Map<String, LoadBalancer> regionLoadBalancers = stored.resources();
             for (LoadBalancer lb : regionLoadBalancers.values()) {
                 String lbType = lb.getType() != null ? lb.getType() : "application";
                 lb.setCanonicalHostedZoneId(canonicalHostedZoneId(lbType, region));
             }
-            loadBalancers.put(region, regionLoadBalancers);
+            if (loadBalancersStore == null) {
+                loadBalancers.put(region, regionLoadBalancers);
+            } else {
+                loadBalancersStore.putForAccount(stored.accountId(), region, regionLoadBalancers);
+            }
         }
     }
 
