@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.net.VpcRoutingManager;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
+import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancerAttributes;
 import io.github.hectorvent.floci.services.iam.IamService;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -28,6 +29,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
@@ -139,6 +141,35 @@ class ElbClassicFrontendRetirementTest {
         manager.healthChanged(loadBalancer, probe, healthy());
         verifyNoInteractions(docker);
         verify(lifecycle, never()).stopAndRemoveStrict(anyString(), any(), anyInt());
+    }
+
+    @Test
+    void anOldRegistrationCannotPublishHealthAfterReregistrationOnTheSameFrontend() {
+        ClassicLoadBalancer lb = loadBalancer("registration");
+        ElbClassicFrontendManager.Frontend installed = install(lb);
+        AtomicInteger commands = new AtomicInteger();
+        ElbClassicBackendRuntime runtime = new ElbClassicBackendRuntime(
+                List.of(), installed.servers(), installed.backends(), command -> {
+                    commands.incrementAndGet();
+                    return command.startsWith("show stat")
+                            ? "# pxname,svname,qcur,scur\nbackend,server,0,1\n" : "";
+                }, () -> 0);
+        ElbClassicFrontendManager.Frontend frontend = installed.withRuntime(runtime);
+        frontends.put(ACCOUNT + "/" + REGION + "/" + lb.getLoadBalancerName(),
+                new ElbClassicFrontendManager.Frontends("", List.of(frontend)));
+        ElbClassicFrontendManager.Probe old = manager.probesFor(lb, "instance").getFirst();
+        assertTrue(manager.current(lb, old));
+        ClassicLoadBalancerAttributes attributes = new ClassicLoadBalancerAttributes();
+        attributes.setConnectionDrainingEnabled(true);
+        attributes.setConnectionDrainingTimeout(30);
+        runtime.reconcile(Map.of(), attributes);
+        runtime.reconcile(installed.backends(), attributes);
+        assertFalse(manager.current(lb, old));
+        assertTrue(manager.current(lb, manager.probesFor(lb, "instance").getFirst()));
+        int before = commands.get();
+        manager.healthChanged(lb, old, healthy());
+        assertEquals(before, commands.get());
+        verifyNoInteractions(docker);
     }
 
     @Test

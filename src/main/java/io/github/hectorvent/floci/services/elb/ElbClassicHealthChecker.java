@@ -157,6 +157,13 @@ public class ElbClassicHealthChecker implements Resettable {
         }
     }
 
+    /** Keep healthy existing members admitted while a registration change starts new probes. */
+    void reconcileInstances(ClassicLoadBalancer lb) {
+        Map<String, InstanceState> lbStates = states.computeIfAbsent(key(lb), k -> new ConcurrentHashMap<>());
+        lbStates.keySet().retainAll(lb.getInstanceIds());
+        registerInstances(lb, lb.getInstanceIds());
+    }
+
     /**
      * The health of one instance registered with a load balancer.
      *
@@ -182,6 +189,8 @@ public class ElbClassicHealthChecker implements Resettable {
             for (ElbClassicFrontendManager.Probe probe : probes) {
                 ProbeState node = s.nodes.get(probe.frontend().eni());
                 InstanceHealth health = node != null && node.probe.frontend() == probe.frontend()
+                        && node.probe.generation() == probe.generation()
+                        && Objects.equals(node.probe.address(), probe.address())
                         ? node.publishedHealth : null;
                 if (health != null && "InService".equals(health.state())) {
                     return health;
@@ -243,6 +252,8 @@ public class ElbClassicHealthChecker implements Resettable {
                 for (ElbClassicFrontendManager.Probe probe : probes) {
                     ProbeState node = state.nodes.compute(probe.frontend().eni(), (ignored, previous) ->
                             previous != null && previous.probe.frontend() == probe.frontend()
+                                    && previous.probe.generation() == probe.generation()
+                                    && Objects.equals(previous.probe.address(), probe.address())
                                     ? previous : new ProbeState(probe));
                     probeOne(lb, instanceId, node, target, timeout, healthyThreshold, unhealthyThreshold);
                 }

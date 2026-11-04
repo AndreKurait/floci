@@ -26,7 +26,7 @@ class ElbClassicProxyConfigTest {
                     return material;
                 });
         String config = new String(result.files().get("haproxy.cfg"), StandardCharsets.UTF_8);
-        assertTrue(config.contains("bind 10.9.1.5:443 ssl crt /usr/local/etc/haproxy/listener-443.pem"));
+        assertTrue(config.contains("bind 10.9.1.5:443 ssl crt /usr/local/etc/haproxy/listener-443.pem no-alpn proto h1"));
         assertTrue(config.contains("server target_0 10.9.1.8:8443 ssl verify none disabled"));
         assertTrue(config.contains("X-Forwarded-Proto https"));
         assertFalse(config.contains("private-key"));
