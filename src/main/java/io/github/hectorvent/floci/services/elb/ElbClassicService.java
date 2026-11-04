@@ -572,6 +572,38 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         }
     }
 
+    /** Restore the mutable configuration captured before a failed CloudFormation update. */
+    public void restoreLoadBalancerConfiguration(String region, String name, ClassicLoadBalancer previous) {
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer current = mutableLoadBalancer(region, name);
+            for (ClassicListener listener : previous.getListeners()) {
+                validateListener(listener);
+            }
+            requireCertificates(region, previous.getListeners());
+            validateHealthCheck(previous.getHealthCheck());
+            if (!previous.getSubnets().isEmpty()) {
+                singleVpcId(resolveSubnets(region, previous.getSubnets()).values());
+            }
+            whileCertificatesHeld(previous.getListeners(), () -> {
+                requireCertificates(region, previous.getListeners());
+                current.setListeners(new ArrayList<>(previous.getListeners()));
+                current.setSubnets(new ArrayList<>(previous.getSubnets()));
+                current.setAvailabilityZones(new ArrayList<>(previous.getAvailabilityZones()));
+                current.setSecurityGroups(new ArrayList<>(previous.getSecurityGroups()));
+                current.setInstanceIds(new ArrayList<>(previous.getInstanceIds()));
+                current.setHealthCheck(previous.getHealthCheck());
+                current.setAttributes(previous.getAttributes());
+                current.setTags(new LinkedHashMap<>(previous.getTags()));
+                populateSourceSecurityGroup(region, current);
+                persist(region, current);
+            });
+            if (frontends == null || !frontends.enabled()) {
+                healthChecker.healthCheckChanged(current);
+                healthChecker.reconcileInstances(current);
+            }
+        }
+    }
+
     /** The subset of {@code LoadBalancerAttributes} a request actually carried; unset stays unset. */
     public record AttributeUpdate(Boolean crossZoneEnabled,
                                   Boolean accessLogEnabled,

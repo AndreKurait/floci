@@ -72,6 +72,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCfnPro
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EksCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ElastiCacheCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ElastiCacheServerlessCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.ElbClassicCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ElbV2CfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EventsArchiveCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EventsCfnProvisioner;
@@ -144,6 +145,7 @@ import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheMemcachedService;
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheServerlessService;
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheService;
+import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
 import io.github.hectorvent.floci.services.firehose.FirehoseService;
@@ -239,6 +241,7 @@ final class CfnProvisionerFixture {
         private CustomResourceResponseStore customResourceResponseStore;
         private ContainerReachableEndpoint reachableEndpoint;
         private EcsService ecsService;
+        private ElbClassicService elbClassicService;
         private ElbV2Service elbV2Service;
         private StepFunctionsService stepFunctionsService;
         private BatchService batchService;
@@ -419,6 +422,9 @@ final class CfnProvisionerFixture {
             }
             if (elbV2Service != null) {
                 discovered.add(new ElbV2CfnProvisioner(elbV2Service));
+            }
+            if (elbClassicService != null) {
+                discovered.add(new ElbClassicCfnProvisioner(elbClassicService));
             }
             if (ecsService != null) {
                 discovered.add(new EcsCapacityCfnProvisioner(ecsService));
@@ -703,6 +709,11 @@ final class CfnProvisionerFixture {
 
         public Builder elbV2(ElbV2Service v) {
             this.elbV2Service = v;
+            return this;
+        }
+
+        public Builder elbClassic(ElbClassicService v) {
+            this.elbClassicService = v;
             return this;
         }
 

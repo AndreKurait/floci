@@ -59,6 +59,24 @@ fabricated result:
 `SetLoadBalancerPoliciesForBackendServer`, `SetLoadBalancerPoliciesOfListener`,
 `SetLoadBalancerListenerSSLCertificate`.
 
+## CloudFormation
+
+`AWS::ElasticLoadBalancing::LoadBalancer` provisions an actual Classic load
+balancer. `Ref` returns its name; the DNS, canonical hosted-zone and source
+security-group GetAtt values come from the Classic API resource.
+
+The provisioner applies listeners, health checks, subnets or availability zones,
+security groups, instances, attributes and tags. Updates preserve an unnamed
+resource's identity unless replacement is required. Replacement cleanup and
+failed-update restoration preserve the previous resource; an existing
+same-name load balancer is never adopted by an ordinary stack create.
+
+Policy properties and listener `PolicyNames` currently fail explicitly before
+allocation because their Classic APIs are not implemented. Removing
+`SecurityGroups` from an existing template also fails explicitly; specifying
+the desired groups remains supported. Access-log attributes are retained as
+configuration and do not imply that log delivery is implemented.
+
 ## HTTP data plane
 
 With `FLOCI_SERVICES_ELB_MOCK=false`, Floci's shared HTTP edge forwards requests addressed to an
