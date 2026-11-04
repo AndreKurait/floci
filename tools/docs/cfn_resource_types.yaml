@@ -117,7 +117,7 @@ type_order:
   AWS::Batch: [ComputeEnvironment, JobQueue, JobDefinition]
   AWS::Cognito: [UserPool, UserPoolClient]
   AWS::Events: [Rule, EventBus, EventBusPolicy]
-  AWS::CloudFormation: [CustomResource]
+  AWS::CloudFormation: [CustomResource, WaitConditionHandle]
   AWS::BedrockAgentCore: [Runtime, RuntimeEndpoint, Memory]
 
 # Namespace -> the service name shown in the Service column.
