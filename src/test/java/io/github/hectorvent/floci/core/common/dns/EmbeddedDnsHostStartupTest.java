@@ -4,10 +4,12 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
 import io.vertx.core.Vertx;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.net.BindException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -32,7 +34,7 @@ import static org.mockito.Mockito.when;
 class EmbeddedDnsHostStartupTest {
     private static final String ADDRESS = "127.0.0.1";
 
-    @Test
+    @RepeatedTest(5)
     void hostOptInStartsBothListenersAndReleasesTheirSockets() throws Exception {
         Vertx vertx = Vertx.vertx();
         EmbeddedDnsServer server = null;
@@ -61,11 +63,14 @@ class EmbeddedDnsHostStartupTest {
                 DataInputStream input = new DataInputStream(client.getInputStream());
                 byte[] tcp = input.readNBytes(input.readUnsignedShort());
                 assertArrayEquals(udp, tcp);
+                client.shutdownOutput();
+                assertEquals(-1, input.read(), "The DNS peer must finish closing this TCP connection");
             }
             assertEquals(0, udp[3] & 15);
             assertEquals(1, ByteBuffer.wrap(udp).getShort(6));
             assertArrayEquals(InetAddress.ofLiteral(ADDRESS).getAddress(),
                     Arrays.copyOfRange(udp, udp.length - 4, udp.length));
+            assertThrows(BindException.class, () -> bindTcp(port));
             server.stop();
             assertTrue(server.getServerIp().isEmpty());
             try (ServerSocket tcp = bindTcp(port);
