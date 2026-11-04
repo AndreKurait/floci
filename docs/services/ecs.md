@@ -396,6 +396,14 @@ timestamps, `AvailabilityZone`, `LaunchType`, `ServiceName` for a service's task
 EC2 task, and, for Fargate, `ClockDrift` and `EphemeralStorageMetrics`. Floci has no clock drift to
 report and does not meter the disk, so those two report a synchronized clock and zero usage.
 
+Every task container carries the Docker labels the ECS agent sets: `com.amazonaws.ecs.task-arn`,
+`com.amazonaws.ecs.container-name`, `com.amazonaws.ecs.task-definition-family`,
+`com.amazonaws.ecs.task-definition-version` (the revision) and `com.amazonaws.ecs.cluster`, so
+`docker ps --filter label=com.amazonaws.ecs.task-arn=<task ARN>` finds a task's containers as on an
+ECS host. As on ECS they override the same keys in the definition's `dockerLabels`; Floci's own
+`io.floci.*` labels still win. The cluster label is the cluster ARN (the agent writes its configured
+`ECS_CLUSTER`, a name or an ARN). A container's metadata reports the same labels under `Labels`.
+
 An `awsvpc` container's `Networks` object describes the task ENI and the subnet it sits in:
 `NetworkMode`, `IPv4Addresses`, `AttachmentIndex`, `MACAddress`, `PrivateDNSName`,
 `IPv4SubnetCIDRBlock`, `SubnetGatewayIpv4Address`, `DomainNameServers` and `DomainNameSearchList`.
