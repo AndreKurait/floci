@@ -92,10 +92,22 @@ approval policies or registering an AWS-owned baseline ARN is not implemented.
 | `AcknowledgeMessage` | Agent acknowledges receipt of a command message |
 | `SendReply` | Agent reports command output and status |
 
-## Document descriptions
+## Document versions
 
 `DescribeDocument` returns `CreatedDate` as numeric epoch seconds, so AWS SDK
 clients can decode descriptions of current and retained document versions.
+
+New documents default to version 1. `UpdateDocument` publishes a new latest version
+without changing the default. `UpdateDocumentDefaultVersion` selects an existing
+numeric version; `GetDocument` and `DescribeDocument` resolve an omitted selector
+or `$DEFAULT` to that selection, `$LATEST` to the newest version, and a number to
+that retained version. Descriptions report the default and latest separately.
+
+The selection survives storage reloads. Older stored documents without a default
+field retain their previous effective default, the latest version at migration.
+Content missing from legacy history is not recreated: a reference can exist while
+`GetDocument` and `DescribeDocument` cannot return that version's content.
+Changing the default does not schedule State Manager execution.
 
 ## State Manager associations
 
@@ -105,6 +117,22 @@ therefore remain `Pending` and have no `LastExecutionDate`. An update marks the 
 association version pending while preserving any previously stored execution timestamp.
 Association creation is not evidence that a document ran, inventory was collected or
 a target became compliant. The Run Command execution paths below are separate.
+
+`UpdateAssociation.Name` selects the new document without changing the association ID.
+The requested document version is validated against that document before any stored
+fields change. Changing the document without a version selects its `$DEFAULT`, so a
+numeric version from the previous document cannot carry over. Missing documents or
+invalid versions leave the association unchanged.
+
+Updates replace the optional `AssociationName`, `Parameters`, `ScheduleExpression`,
+`MaxErrors`, `MaxConcurrency` and `ComplianceSeverity` values. Include their current
+values in the request to retain them; omitting them clears the previous configuration.
+
+`AssociationVersion` provides optimistic concurrency: an explicit version must match
+the current association version, otherwise the update fails with
+`InvalidAssociationVersion`. Omitting it or passing `$LATEST` permits the update.
+The check and write are atomic, so concurrent requests for the same explicit version
+cannot both overwrite the association.
 
 ## Run Command Execution
 

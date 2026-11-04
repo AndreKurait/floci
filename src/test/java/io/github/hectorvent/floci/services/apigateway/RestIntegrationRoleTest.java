@@ -97,6 +97,7 @@ class RestIntegrationRoleTest {
                 new AssumeRolePolicyEvaluator(mapper, evaluator), evaluator, providers, scpInstance);
         direct = mock(ServiceCallAuthorizer.class);
         ApiGatewayService gateway = mock(ApiGatewayService.class);
+        when(gateway.getRestApi("us-east-1", "api")).thenReturn(new RestApi());
         lambda = mock(LambdaService.class);
         integration = new Integration();
         integration.setType("AWS_PROXY");
