@@ -100,7 +100,7 @@ class CodeDeployServicePersistenceTest {
         CodeDeployService service = new CodeDeployService(
                 mock(LambdaService.class), mock(EcsService.class), mock(ElbV2Service.class),
                 mock(SsmCommandService.class), mock(Ec2Service.class), new ObjectMapper(),
-                new RegionResolver(REGION, "000000000000"), storage);
+                new RegionResolver(REGION, "000000000000"), storage, mock(CodeDeployAgentDeployment.class));
         service.initializeStorage();
         return service;
     }

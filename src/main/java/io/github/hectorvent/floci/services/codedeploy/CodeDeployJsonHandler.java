@@ -24,11 +24,18 @@ public class CodeDeployJsonHandler {
 
     private final CodeDeployService service;
     private final ObjectMapper mapper;
+    private final CodeDeployAgentJsonHandler agentHandler;
 
     @Inject
-    public CodeDeployJsonHandler(CodeDeployService service, ObjectMapper mapper) {
+    public CodeDeployJsonHandler(CodeDeployService service, ObjectMapper mapper,
+                                 CodeDeployAgentJsonHandler agentHandler) {
         this.service = service;
         this.mapper = mapper;
+        this.agentHandler = agentHandler;
+    }
+
+    public Response handleAgent(String action, JsonNode request, String region, String account) {
+        return agentHandler.handle(action, request, region, account);
     }
 
     public Response handle(String action, JsonNode request, String region) throws Exception {
@@ -59,6 +66,7 @@ public class CodeDeployJsonHandler {
             case "ContinueDeployment" -> Response.ok(Map.of()).build();
             case "BatchGetDeployments" -> batchGetDeployments(request, region);
             case "ListDeploymentTargets" -> listDeploymentTargets(request, region);
+            case "GetDeploymentTarget" -> getDeploymentTarget(request, region);
             case "BatchGetDeploymentTargets" -> batchGetDeploymentTargets(request, region);
             case "PutLifecycleEventHookExecutionStatus" -> putLifecycleEventHookExecutionStatus(request);
             case "RegisterOnPremisesInstance" -> registerOnPremisesInstance(request, region);
@@ -222,14 +230,59 @@ public class CodeDeployJsonHandler {
     }
 
     private Response createDeployment(JsonNode req, String region) throws Exception {
+        String fileExistsBehavior = validateDeploymentOptions(req);
         String appName = req.path("applicationName").asText(null);
         String groupName = req.path("deploymentGroupName").asText(null);
         String configName = req.has("deploymentConfigName") ? req.path("deploymentConfigName").asText() : null;
         String description = req.has("description") ? req.path("description").asText() : null;
         Map<String, Object> revision = req.has("revision")
                 ? mapper.treeToValue(req.get("revision"), Map.class) : null;
-        String deploymentId = service.createDeployment(region, appName, groupName, configName, revision, description);
+        String deploymentId = service.createDeployment(region, appName, groupName, configName, revision, description,
+                fileExistsBehavior);
         return Response.ok(Map.of("deploymentId", deploymentId)).build();
+    }
+
+    private String validateDeploymentOptions(JsonNode req) {
+        if (req.hasNonNull("deploymentMode")) {
+            if (!req.path("deploymentMode").isTextual()
+                    || !List.of("STANDARD", "RESTART").contains(req.path("deploymentMode").asText())) {
+                throw new AwsException("InvalidInputException", "deploymentMode must be STANDARD or RESTART", 400);
+            }
+            if ("RESTART".equals(req.path("deploymentMode").asText())) {
+                throw new AwsException("UnsupportedOperationException", "Deployment restart is not implemented", 400);
+            }
+        }
+        String behavior = req.path("fileExistsBehavior").asText("DISALLOW");
+        if (!List.of("DISALLOW", "OVERWRITE", "RETAIN").contains(behavior)) {
+            throw new AwsException("InvalidFileExistsBehaviorException",
+                    "fileExistsBehavior must be DISALLOW, OVERWRITE or RETAIN", 400);
+        }
+        if (!"S3".equals(req.path("revision").path("revisionType").asText())) {
+            if (!"DISALLOW".equals(behavior)) {
+                throw new AwsException("UnsupportedOperationException",
+                        "File behavior overrides require an S3 Server revision", 400);
+            }
+            return behavior;
+        }
+        for (String option : List.of("autoRollbackConfiguration", "overrideAlarmConfiguration",
+                "targetInstances", "ec2DeploymentOptions")) {
+            if (req.hasNonNull(option)) {
+                throw new AwsException("UnsupportedOperationException",
+                        option + " overrides are not implemented for S3 agent deployments", 400);
+            }
+        }
+        for (String option : List.of("ignoreApplicationStopFailures", "updateOutdatedInstancesOnly")) {
+            if (req.hasNonNull(option)) {
+                if (!req.path(option).isBoolean()) {
+                    throw new AwsException("InvalidInputException", option + " must be a boolean", 400);
+                }
+                if (req.path(option).booleanValue()) {
+                    throw new AwsException("UnsupportedOperationException",
+                            option + " is not implemented for S3 agent deployments", 400);
+                }
+            }
+        }
+        return behavior;
     }
 
     private Response getDeployment(JsonNode req, String region) {
@@ -264,6 +317,11 @@ public class CodeDeployJsonHandler {
         String deploymentId = req.path("deploymentId").asText(null);
         List<String> targetIds = service.listDeploymentTargets(region, deploymentId);
         return Response.ok(Map.of("targetIds", targetIds)).build();
+    }
+
+    private Response getDeploymentTarget(JsonNode req, String region) {
+        return Response.ok(Map.of("deploymentTarget", service.getDeploymentTarget(region,
+                req.path("deploymentId").asText(null), req.path("targetId").asText(null)))).build();
     }
 
     private Response batchGetDeploymentTargets(JsonNode req, String region) {

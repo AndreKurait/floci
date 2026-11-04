@@ -84,7 +84,7 @@ class CodeDeployHookTimeoutTest {
         CodeDeployService service = new CodeDeployService(
                 mock(LambdaService.class), mock(EcsService.class), mock(ElbV2Service.class),
                 ssm, mock(Ec2Service.class), new ObjectMapper(),
-                new RegionResolver(region, "000000000000"), null);
+                new RegionResolver(region, "000000000000"), null, mock(CodeDeployAgentDeployment.class));
         service.createApplication(region, "app", "Server", null);
         service.createDeploymentGroup(region, "app", "group", null, "role", null);
         return service;

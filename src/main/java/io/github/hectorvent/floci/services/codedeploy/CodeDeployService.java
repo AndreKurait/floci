@@ -63,6 +63,7 @@ public class CodeDeployService {
     private final ElbV2Service elbV2Service;
     private final SsmCommandService ssmCommandService;
     private final Ec2Service ec2Service;
+    private final CodeDeployAgentDeployment agentDeployment;
     private final ObjectMapper mapper;
     private final ObjectMapper yamlMapper;
     private final RegionResolver regionResolver;
@@ -74,20 +75,22 @@ public class CodeDeployService {
     public CodeDeployService(LambdaService lambdaService, EcsService ecsService,
                              ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
                              Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
-                             StorageFactory storageFactory) {
+                              StorageFactory storageFactory, CodeDeployAgentDeployment agentDeployment) {
         this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
-                regionResolver, storageFactory, DEFAULT_HOOK_CALLBACK_TIMEOUT, Clock.systemUTC());
+                regionResolver, storageFactory, DEFAULT_HOOK_CALLBACK_TIMEOUT, Clock.systemUTC(), agentDeployment);
     }
 
     CodeDeployService(LambdaService lambdaService, EcsService ecsService,
                       ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
                       Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
-                      StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock) {
+                       StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock,
+                       CodeDeployAgentDeployment agentDeployment) {
         this.lambdaService = lambdaService;
         this.ecsService = ecsService;
         this.elbV2Service = elbV2Service;
         this.ssmCommandService = ssmCommandService;
         this.ec2Service = ec2Service;
+        this.agentDeployment = agentDeployment;
         this.mapper = mapper;
         this.yamlMapper = new ObjectMapper(new YAMLFactory());
         this.regionResolver = regionResolver;
@@ -109,14 +112,19 @@ public class CodeDeployService {
     private Map<String, Map<String, OnPremisesInstance>> onPremisesInstances = new ConcurrentHashMap<>();
 
     // ---- Transient runtime state (in memory only) ----
-    // key: region -> deploymentId -> Deployment
-    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Deployment>> deployments = new ConcurrentHashMap<>();
-    // key: region -> deploymentId -> targetId -> DeploymentTarget wrapper
-    private final ConcurrentHashMap<String, ConcurrentHashMap<String, ConcurrentHashMap<String, Map<String, Object>>>> deploymentTargets = new ConcurrentHashMap<>();
+    // key: account/region -> deploymentId -> Deployment
+    private final ConcurrentHashMap<RuntimeScope, ConcurrentHashMap<String, Deployment>> deployments =
+            new ConcurrentHashMap<>();
+    // key: account/region -> deploymentId -> targetId -> DeploymentTarget wrapper
+    private final ConcurrentHashMap<RuntimeScope,
+            ConcurrentHashMap<String, ConcurrentHashMap<String, Map<String, Object>>>> deploymentTargets =
+            new ConcurrentHashMap<>();
     // key: lifecycleEventHookExecutionId -> CompletableFuture<status>
     private final ConcurrentHashMap<String, CompletableFuture<String>> hookFutures = new ConcurrentHashMap<>();
     // key: deploymentId -> stop flag
     private final ConcurrentHashMap<String, AtomicBoolean> stopFlags = new ConcurrentHashMap<>();
+
+    private record RuntimeScope(String account, String region) {}
 
     @PostConstruct
     void initializeStorage() {
@@ -567,11 +575,13 @@ public class CodeDeployService {
     // ---- Deployments ----
 
     private Map<String, Deployment> deploymentsFor(String region) {
-        return deployments.computeIfAbsent(region, r -> new ConcurrentHashMap<>());
+        return deployments.computeIfAbsent(new RuntimeScope(regionResolver.getAccountId(), region),
+                ignored -> new ConcurrentHashMap<>());
     }
 
     private Map<String, ConcurrentHashMap<String, Map<String, Object>>> deploymentTargetsFor(String region) {
-        return deploymentTargets.computeIfAbsent(region, r -> new ConcurrentHashMap<>());
+        return deploymentTargets.computeIfAbsent(new RuntimeScope(regionResolver.getAccountId(), region),
+                ignored -> new ConcurrentHashMap<>());
     }
 
     private Map<String, OnPremisesInstance> onPremisesFor(String region) {
@@ -580,6 +590,12 @@ public class CodeDeployService {
 
     public String createDeployment(String region, String appName, String groupName,
                                    String configName, Map<String, Object> revision, String description) {
+        return createDeployment(region, appName, groupName, configName, revision, description, "DISALLOW");
+    }
+
+    public String createDeployment(String region, String appName, String groupName,
+                                   String configName, Map<String, Object> revision, String description,
+                                   String fileExistsBehavior) {
         Application app = getApplication(region, appName);
         DeploymentGroup group = getDeploymentGroup(region, appName, groupName);
         // Compute platform is authoritative on the Application; the deployment group may also carry it
@@ -587,15 +603,21 @@ public class CodeDeployService {
         if (computePlatform == null) {
             computePlatform = app.getComputePlatform();
         }
+        if (!"DISALLOW".equals(fileExistsBehavior)
+                && (!"Server".equals(computePlatform) || revision == null
+                    || !"S3".equals(revision.get("revisionType")))) {
+            throw new AwsException("InvalidFileExistsBehaviorException",
+                    "File behavior overrides require an S3 Server revision", 400);
+        }
 
         if ("ECS".equals(computePlatform)) {
             return createEcsDeployment(region, appName, groupName, group, configName, revision, description);
         }
 
         if ("Server".equals(computePlatform)) {
-            return createServerDeployment(region, appName, groupName, group, configName, revision, description);
+            return createServerDeployment(region, appName, groupName, group, configName, revision, description,
+                    fileExistsBehavior);
         }
-
         AppSpecInfo appSpec = parseAppSpec(revision);
         String effectiveConfig = configName != null ? configName : group.getDeploymentConfigName();
 
@@ -695,6 +717,21 @@ public class CodeDeployService {
             return List.of();
         }
         return new ArrayList<>(targets.keySet());
+    }
+
+    public Map<String, Object> getDeploymentTarget(String region, String deploymentId, String targetId) {
+        if (deploymentId == null || deploymentId.isBlank()) {
+            throw new AwsException("DeploymentIdRequiredException", "A deployment ID is required", 400);
+        }
+        if (targetId == null || targetId.isBlank()) {
+            throw new AwsException("DeploymentTargetIdRequiredException", "A deployment target ID is required", 400);
+        }
+        List<Map<String, Object>> targets = batchGetDeploymentTargets(region, deploymentId, List.of(targetId));
+        if (targets.isEmpty()) {
+            throw new AwsException("DeploymentTargetDoesNotExistException",
+                    "The target does not belong to this deployment", 400);
+        }
+        return targets.getFirst();
     }
 
     public List<Map<String, Object>> batchGetDeploymentTargets(String region, String deploymentId, List<String> targetIds) {
@@ -798,9 +835,13 @@ public class CodeDeployService {
 
     private String createServerDeployment(String region, String appName, String groupName,
                                           DeploymentGroup group, String configName,
-                                          Map<String, Object> revision, String description) {
-        ServerAppSpecInfo appSpec = parseServerAppSpec(revision);
+                                          Map<String, Object> revision, String description,
+                                          String fileExistsBehavior) {
         String effectiveConfig = configName != null ? configName : group.getDeploymentConfigName();
+        boolean s3Revision = revision != null && "S3".equals(revision.get("revisionType"));
+        CodeDeployAgentDeployment.Prepared prepared = s3Revision
+                ? agentDeployment.prepare(region, group, effectiveConfig, revision, fileExistsBehavior) : null;
+        ServerAppSpecInfo appSpec = s3Revision ? null : parseServerAppSpec(revision);
 
         String deploymentId = generateDeploymentId();
         double now = EpochSeconds.fromInstant(Instant.now());
@@ -809,22 +850,24 @@ public class CodeDeployService {
         deployment.setDeploymentId(deploymentId);
         deployment.setApplicationName(appName);
         deployment.setDeploymentGroupName(groupName);
-        deployment.setDeploymentConfigName(effectiveConfig);
+        deployment.setDeploymentConfigName(prepared == null ? effectiveConfig : prepared.config());
         deployment.setStatus("Queued");
         deployment.setRevision(revision);
         deployment.setCreateTime(now);
         deployment.setDescription(description);
         deployment.setCreator("user");
         deployment.setComputePlatform("Server");
-        deploymentsFor(region).put(deploymentId, deployment);
-
+        if (s3Revision) {
+            deployment.setFileExistsBehavior(fileExistsBehavior);
+        }
         // Resolve target instances
-        List<String> instanceIds = resolveServerTargets(region, group);
+        List<String> instanceIds = prepared == null ? resolveServerTargets(region, group) : prepared.instanceIds();
         if (instanceIds.isEmpty()) {
             deployment.setStatus("Failed");
             deployment.setCompleteTime(now);
             deployment.setErrorInformation(Map.of("code", "NoInstancesReachable",
                     "message", "No instances found for deployment group"));
+            deploymentsFor(region).put(deploymentId, deployment);
             return deploymentId;
         }
 
@@ -834,7 +877,7 @@ public class CodeDeployService {
             Map<String, Object> instanceTargetMap = new ConcurrentHashMap<>();
             instanceTargetMap.put("deploymentId", deploymentId);
             instanceTargetMap.put("targetId", instanceId);
-            instanceTargetMap.put("targetArn", instanceId);
+            instanceTargetMap.put("targetArn", prepared == null ? instanceId : prepared.hosts().get(instanceId));
             instanceTargetMap.put("status", "Pending");
             instanceTargetMap.put("lastUpdatedAt", now);
             instanceTargetMap.put("lifecycleEvents", new CopyOnWriteArrayList<>());
@@ -845,14 +888,25 @@ public class CodeDeployService {
             allTargets.put(instanceId, targetWrapper);
             instanceTargetMaps.add(instanceTargetMap);
         }
+        CodeDeployAgentCommands.Session session = prepared == null ? null : agentDeployment.open(prepared, deployment);
+        deploymentsFor(region).put(deploymentId, deployment);
         deploymentTargetsFor(region).put(deploymentId, allTargets);
 
         AtomicBoolean stopFlag = new AtomicBoolean(false);
         stopFlags.put(deploymentId, stopFlag);
 
         Thread.ofVirtual().name("codedeploy-server-" + deploymentId).start(
-                () -> runServerStateMachine(region, deployment, appSpec, instanceIds,
-                        instanceTargetMaps, stopFlag));
+                () -> {
+                    try {
+                        if (prepared != null) {
+                            agentDeployment.run(prepared, session, deployment, instanceTargetMaps, stopFlag);
+                        } else {
+                            runServerStateMachine(region, deployment, appSpec, instanceIds, instanceTargetMaps, stopFlag);
+                        }
+                    } finally {
+                        stopFlags.remove(deploymentId);
+                    }
+                });
         return deploymentId;
     }
 
