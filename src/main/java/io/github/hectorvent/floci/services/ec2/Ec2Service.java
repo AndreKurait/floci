@@ -8630,15 +8630,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<SecurityGroupRule> authorizeSecurityGroupIngress(String region, String groupId, List<IpPermission> permissions) {
         ensureDefaultResources(region);
-        List<SecurityGroupRule> rules = new ArrayList<>();
+        List<SecurityGroupRule> rules;
         synchronized (lockFor(key(region, groupId))) {
             SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
-            requireKnownPrefixLists(region, permissions);
+            rules = prepareAuthorizedRules(region, sg, permissions, false);
             List<IpPermission> next = new ArrayList<>(sg.getIpPermissions());
-            for (IpPermission perm : permissions) {
-                resolveGroupReferences(region, sg.getVpcId(), perm);
-                next.add(perm);
-                rules.addAll(createRules(region, groupId, perm, false));
+            next.addAll(permissions);
+            for (SecurityGroupRule rule : rules) {
+                securityGroupRules.put(key(region, rule.getSecurityGroupRuleId()), rule);
             }
             sg.setIpPermissions(next);
             securityGroups.put(key(region, groupId), sg);
@@ -8649,20 +8648,76 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public List<SecurityGroupRule> authorizeSecurityGroupEgress(String region, String groupId, List<IpPermission> permissions) {
         ensureDefaultResources(region);
-        List<SecurityGroupRule> rules = new ArrayList<>();
+        List<SecurityGroupRule> rules;
         synchronized (lockFor(key(region, groupId))) {
             SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
-            requireKnownPrefixLists(region, permissions);
+            rules = prepareAuthorizedRules(region, sg, permissions, true);
             List<IpPermission> next = new ArrayList<>(sg.getIpPermissionsEgress());
-            for (IpPermission perm : permissions) {
-                resolveGroupReferences(region, sg.getVpcId(), perm);
-                next.add(perm);
-                rules.addAll(createRules(region, groupId, perm, true));
+            next.addAll(permissions);
+            for (SecurityGroupRule rule : rules) {
+                securityGroupRules.put(key(region, rule.getSecurityGroupRuleId()), rule);
             }
             sg.setIpPermissionsEgress(next);
             securityGroups.put(key(region, groupId), sg);
         }
         reconcileFirewallPolicies(region);
+        return rules;
+    }
+
+    private List<SecurityGroupRule> prepareAuthorizedRules(String region, SecurityGroup group,
+                                                          List<IpPermission> permissions, boolean egress) {
+        requireKnownPrefixLists(region, permissions);
+        Set<RulePermissionKey> seen = describeSecurityGroupRules(region, List.of(group.getGroupId()), List.of())
+                .stream().map(this::rulePermissionKey).collect(Collectors.toCollection(HashSet::new));
+        List<SecurityGroupRule> prepared = new ArrayList<>();
+        for (IpPermission permission : permissions) {
+            resolveGroupReferences(region, group.getVpcId(), permission);
+            normalizePermissionCidrs(permission);
+            for (SecurityGroupRule rule : rulesForPermission(group.getGroupId(), permission, egress)) {
+                if (!seen.add(rulePermissionKey(rule))) {
+                    throw new AwsException("InvalidPermission.Duplicate",
+                            "The specified rule already exists in this security group", 400);
+                }
+                prepared.add(rule);
+            }
+        }
+        return prepared;
+    }
+
+    private record RulePermissionKey(boolean egress, String protocol, Integer fromPort, Integer toPort,
+                                     String cidrIpv4, String cidrIpv6, String prefixListId,
+                                     String referencedGroupId, String referencedAccount) {}
+
+    private RulePermissionKey rulePermissionKey(SecurityGroupRule rule) {
+        String protocol = SecurityGroupPolicy.normalizeProtocol(rule.getIpProtocol());
+        boolean hasPorts = protocol != null && Set.of("tcp", "udp", "icmp", "icmpv6").contains(protocol);
+        ReferencedSecurityGroup peer = rule.getReferencedGroupInfo();
+        return new RulePermissionKey(rule.isEgress(), protocol,
+                hasPorts ? rule.getFromPort() : null, hasPorts ? rule.getToPort() : null,
+                CidrCanonicalizer.canonicalize(rule.getCidrIpv4()).orElse(rule.getCidrIpv4()),
+                CidrCanonicalizer.canonicalize(rule.getCidrIpv6()).orElse(rule.getCidrIpv6()), rule.getPrefixListId(),
+                peer == null ? null : peer.getGroupId(),
+                peer == null ? null : peer.getUserId() == null ? callerAccountId() : peer.getUserId());
+    }
+
+    private static void normalizePermissionCidrs(IpPermission permission) {
+        if (permission.getIpRanges() != null) {
+            for (IpRange range : permission.getIpRanges()) {
+                CidrCanonicalizer.canonicalize(range.getCidrIp()).ifPresent(range::setCidrIp);
+            }
+        }
+        if (permission.getIpv6Ranges() != null) {
+            for (Ipv6Range range : permission.getIpv6Ranges()) {
+                CidrCanonicalizer.canonicalize(range.getCidrIpv6()).ifPresent(range::setCidrIpv6);
+            }
+        }
+    }
+
+    private List<SecurityGroupRule> createRules(String region, String groupId, IpPermission perm, boolean egress) {
+        List<SecurityGroupRule> rules = rulesForPermission(groupId, perm, egress);
+        for (SecurityGroupRule rule : rules) {
+            securityGroupRules.put(key(region, rule.getSecurityGroupRuleId()), rule);
+        }
         return rules;
     }
 
@@ -8677,7 +8732,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * the prefix list lock are different monitors. The other callers pass a CIDR-only default egress
      * permission.
      */
-    private List<SecurityGroupRule> createRules(String region, String groupId, IpPermission perm, boolean egress) {
+    private List<SecurityGroupRule> rulesForPermission(String groupId, IpPermission perm, boolean egress) {
         List<SecurityGroupRule> rules = new ArrayList<>();
         if (perm.getIpRanges() != null) {
             for (IpRange range : perm.getIpRanges()) {
@@ -8718,9 +8773,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // needs a rule to describe.
         if (rules.isEmpty()) {
             rules.add(newRule(groupId, perm, egress));
-        }
-        for (SecurityGroupRule rule : rules) {
-            securityGroupRules.put(key(region, rule.getSecurityGroupRuleId()), rule);
         }
         return rules;
     }
@@ -8790,6 +8842,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 resolveGroupReferences(region, sg.getVpcId(), perm);
             }
             List<IpPermission> next = revokeSources(new ArrayList<>(sg.getIpPermissions()), permissions);
+            removeRevokedRules(region, groupId, next, false);
             sg.setIpPermissions(next);
             securityGroups.put(key(region, groupId), sg);
         }
@@ -8804,10 +8857,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 resolveGroupReferences(region, sg.getVpcId(), perm);
             }
             List<IpPermission> next = revokeSources(new ArrayList<>(sg.getIpPermissionsEgress()), permissions);
+            removeRevokedRules(region, groupId, next, true);
             sg.setIpPermissionsEgress(next);
             securityGroups.put(key(region, groupId), sg);
         }
         reconcileFirewallPolicies(region);
+    }
+
+    private void removeRevokedRules(String region, String groupId, List<IpPermission> remaining, boolean egress) {
+        Set<RulePermissionKey> retained = remaining.stream()
+                .flatMap(permission -> rulesForPermission(groupId, permission, egress).stream())
+                .map(this::rulePermissionKey).collect(Collectors.toSet());
+        for (SecurityGroupRule rule : describeSecurityGroupRules(region, List.of(groupId), List.of())) {
+            if (rule.isEgress() == egress && !retained.contains(rulePermissionKey(rule))) {
+                securityGroupRules.delete(key(region, rule.getSecurityGroupRuleId()));
+            }
+        }
     }
 
     /**
@@ -9001,8 +9066,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         .map(PrefixListId::getPrefixListId).toList();
                 List<String> groups = removal.getUserIdGroupPairs().stream()
                         .map(UserIdGroupPair::getGroupId).toList();
-                perm.getIpRanges().removeIf(e -> cidrs.contains(e.getCidrIp()));
-                perm.getIpv6Ranges().removeIf(e -> cidrsV6.contains(e.getCidrIpv6()));
+                perm.getIpRanges().removeIf(e -> cidrs.stream()
+                        .anyMatch(cidr -> CidrCanonicalizer.sameBlock(cidr, e.getCidrIp())));
+                perm.getIpv6Ranges().removeIf(e -> cidrsV6.stream()
+                        .anyMatch(cidr -> CidrCanonicalizer.sameBlock(cidr, e.getCidrIpv6())));
                 perm.getPrefixListIds().removeIf(e -> lists.contains(e.getPrefixListId()));
                 perm.getUserIdGroupPairs().removeIf(e -> groups.contains(e.getGroupId()));
             }
@@ -9162,12 +9229,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         List<PermissionDescription> result = new ArrayList<>();
         for (IpRange range : permission.getIpRanges()) {
             result.add(new PermissionDescription(rule ->
-                    range.getCidrIp() != null && range.getCidrIp().equals(rule.getCidrIpv4()),
+                    range.getCidrIp() != null && CidrCanonicalizer.sameBlock(range.getCidrIp(), rule.getCidrIpv4()),
                     range.getDescription(), range::setDescription));
         }
         for (Ipv6Range range : permission.getIpv6Ranges()) {
             result.add(new PermissionDescription(rule ->
-                    range.getCidrIpv6() != null && range.getCidrIpv6().equals(rule.getCidrIpv6()),
+                    range.getCidrIpv6() != null && CidrCanonicalizer.sameBlock(range.getCidrIpv6(), rule.getCidrIpv6()),
                     range.getDescription(), range::setDescription));
         }
         for (PrefixListId prefix : permission.getPrefixListIds()) {
