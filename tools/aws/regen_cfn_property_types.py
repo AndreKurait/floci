@@ -55,7 +55,7 @@ RESOURCE_TYPES = ["AWS::AutoScaling::LaunchConfiguration", "AWS::DSQL::Cluster",
                   "AWS::EC2::LaunchTemplate", "AWS::ECS::TaskDefinition",
                   "AWS::ElasticLoadBalancingV2::LoadBalancer", "AWS::ElasticLoadBalancingV2::TargetGroup",
                   "AWS::Events::Rule",
-                  "AWS::Lambda::Function", "AWS::Lambda::LayerVersion"]
+                  "AWS::Lambda::Function", "AWS::Lambda::LayerVersion", "AWS::SSM::PatchBaseline"]
 
 # The shared shape each scalar body is written as, inline; a definition keeps its own name.
 SCALAR_SHAPES = {"string": "String", "integer": "Integer", "boolean": "Boolean", "double": "Double", "json": "Json"}
@@ -81,6 +81,8 @@ ANCHORS = {
     ("AWS::ECS::TaskDefinition/KernelCapabilities", "Add"): ["String"],
     ("AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription", "Port"): "Integer",
     ("AWS::ElasticLoadBalancingV2::LoadBalancer/LoadBalancerAttribute", "Value"): "String",
+    ("AWS::SSM::PatchBaseline", "DefaultBaseline"): "Boolean",
+    ("AWS::SSM::PatchBaseline/Rule", "ApproveAfterDays"): "Integer",
 }
 
 # Required members the provisioners rely on: shape -> its required members.
@@ -88,6 +90,7 @@ REQUIRED_ANCHORS = {
     "AWS::ECS::TaskDefinition/ContainerDefinition": ["Name", "Image"],
     "AWS::ECS::TaskDefinition/Tmpfs": ["Size"],
     "AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription": ["Id"],
+    "AWS::SSM::PatchBaseline": ["Name"],
 }
 
 

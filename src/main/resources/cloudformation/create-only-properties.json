@@ -808,6 +808,9 @@
   "AWS::SSM::Parameter": [
     "Name"
   ],
+  "AWS::SSM::PatchBaseline": [
+    "OperatingSystem"
+  ],
   "AWS::StepFunctions::StateMachine": [
     "StateMachineName",
     "StateMachineType"

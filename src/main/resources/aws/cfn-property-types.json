@@ -16,7 +16,8 @@
     "AWS::ElasticLoadBalancingV2::TargetGroup": "AWS::ElasticLoadBalancingV2::TargetGroup",
     "AWS::Events::Rule": "AWS::Events::Rule",
     "AWS::Lambda::Function": "AWS::Lambda::Function",
-    "AWS::Lambda::LayerVersion": "AWS::Lambda::LayerVersion"
+    "AWS::Lambda::LayerVersion": "AWS::Lambda::LayerVersion",
+    "AWS::SSM::PatchBaseline": "AWS::SSM::PatchBaseline"
   },
   "shapes": {
     "AWS::AutoScaling::LaunchConfiguration": {
@@ -2593,6 +2594,114 @@
       "required": [
         "S3Bucket",
         "S3Key"
+      ]
+    },
+    "AWS::SSM::PatchBaseline": {
+      "type": "structure",
+      "members": {
+        "Id": "String",
+        "DefaultBaseline": "Boolean",
+        "OperatingSystem": "String",
+        "Description": "String",
+        "ApprovalRules": "AWS::SSM::PatchBaseline/RuleGroup",
+        "Sources": "AWS::SSM::PatchBaseline.Sources",
+        "Name": "String",
+        "RejectedPatches": "AWS::SSM::PatchBaseline.RejectedPatches",
+        "ApprovedPatches": "AWS::SSM::PatchBaseline.ApprovedPatches",
+        "RejectedPatchesAction": "String",
+        "PatchGroups": "AWS::SSM::PatchBaseline.PatchGroups",
+        "ApprovedPatchesComplianceLevel": "String",
+        "ApprovedPatchesEnableNonSecurity": "Boolean",
+        "GlobalFilters": "AWS::SSM::PatchBaseline/PatchFilterGroup",
+        "AvailableSecurityUpdatesComplianceStatus": "String",
+        "Tags": "AWS::SSM::PatchBaseline.Tags"
+      },
+      "required": [
+        "Name"
+      ]
+    },
+    "AWS::SSM::PatchBaseline.ApprovedPatches": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::PatchBaseline.PatchGroups": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::PatchBaseline.RejectedPatches": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::PatchBaseline.Sources": {
+      "type": "list",
+      "member": "AWS::SSM::PatchBaseline/PatchSource"
+    },
+    "AWS::SSM::PatchBaseline.Tags": {
+      "type": "list",
+      "member": "AWS::SSM::PatchBaseline/Tag"
+    },
+    "AWS::SSM::PatchBaseline/PatchFilter": {
+      "type": "structure",
+      "members": {
+        "Values": "AWS::SSM::PatchBaseline/PatchFilter.Values",
+        "Key": "String"
+      }
+    },
+    "AWS::SSM::PatchBaseline/PatchFilter.Values": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::PatchBaseline/PatchFilterGroup": {
+      "type": "structure",
+      "members": {
+        "PatchFilters": "AWS::SSM::PatchBaseline/PatchFilterGroup.PatchFilters"
+      }
+    },
+    "AWS::SSM::PatchBaseline/PatchFilterGroup.PatchFilters": {
+      "type": "list",
+      "member": "AWS::SSM::PatchBaseline/PatchFilter"
+    },
+    "AWS::SSM::PatchBaseline/PatchSource": {
+      "type": "structure",
+      "members": {
+        "Products": "AWS::SSM::PatchBaseline/PatchSource.Products",
+        "Configuration": "String",
+        "Name": "String"
+      }
+    },
+    "AWS::SSM::PatchBaseline/PatchSource.Products": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::PatchBaseline/Rule": {
+      "type": "structure",
+      "members": {
+        "ApproveUntilDate": "String",
+        "EnableNonSecurity": "Boolean",
+        "PatchFilterGroup": "AWS::SSM::PatchBaseline/PatchFilterGroup",
+        "ApproveAfterDays": "Integer",
+        "ComplianceLevel": "String"
+      }
+    },
+    "AWS::SSM::PatchBaseline/RuleGroup": {
+      "type": "structure",
+      "members": {
+        "PatchRules": "AWS::SSM::PatchBaseline/RuleGroup.PatchRules"
+      }
+    },
+    "AWS::SSM::PatchBaseline/RuleGroup.PatchRules": {
+      "type": "list",
+      "member": "AWS::SSM::PatchBaseline/Rule"
+    },
+    "AWS::SSM::PatchBaseline/Tag": {
+      "type": "structure",
+      "members": {
+        "Key": "String",
+        "Value": "String"
+      },
+      "required": [
+        "Value",
+        "Key"
       ]
     },
     "Boolean": {
