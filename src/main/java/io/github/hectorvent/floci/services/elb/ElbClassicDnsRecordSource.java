@@ -31,8 +31,8 @@ public class ElbClassicDnsRecordSource implements DnsRecordSource {
         if (matches.size() != 1) {
             return Optional.of(DnsAnswer.refused());
         }
-        return Optional.of(frontends.address(matches.getFirst())
-                .map(address -> DnsAnswer.records(List.of(address), 60)).orElse(DnsAnswer.noData()));
+        List<String> addresses = frontends.addresses(matches.getFirst());
+        return Optional.of(addresses.isEmpty() ? DnsAnswer.noData() : DnsAnswer.records(addresses, 60));
     }
 
     @Override

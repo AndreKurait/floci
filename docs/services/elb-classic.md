@@ -89,11 +89,12 @@ records, latency/failover records and independent Route53 health checks are not 
 ## Protected frontends
 
 `FLOCI_SERVICES_ELB_VPC_FRONTENDS=true` enables an experimental packet path for an
-internal Classic load balancer in one IPv4 subnet. It requires real ELB operation,
+internal IPv4 Classic load balancer across its selected subnets. It requires real ELB operation,
 EC2 VPC networks, native private addresses and security-group enforcement. A
-digest-pinned stock HAProxy process runs inside the load balancer's firewall
-namespace and binds its EC2 network interface's private address. The embedded
-DNS source returns that address for the load balancer's native DNS name.
+digest-pinned stock HAProxy process runs inside each node's firewall namespace
+and binds its EC2 network interface's private address. Select at most one subnet
+per Availability Zone, all in the same VPC. The embedded DNS source returns all
+node addresses for the load balancer's native DNS name.
 
 Frontend ingress is checked before TCP or TLS reaches a listener. HTTPS and SSL
 listeners use their declared IAM or ACM certificate. Backend connections and the
@@ -102,21 +103,29 @@ an instance's rule referencing the frontend security group is exercised too.
 The shared HTTP edge refuses protected load balancers; it cannot bypass their
 firewall.
 
-This first mode reconstructs the runtime on listener, health-check, backend,
+Each node has independent health thresholds and admits only instances its own
+namespace can reach. Cross-zone routing selects registered instances in all
+enabled zones; with cross-zone routing disabled, each node selects only its own
+zone. An instance is reported healthy after an eligible node applies its
+healthy state to the listener. Retired nodes cannot update their replacements.
+
+This mode reconstructs the runtime on listener, health-check, backend,
 subnet or group-attachment changes; the private address can change, and clients
 must resolve it again after those updates. Security-group rule edits reconcile
-the existing firewall directly. Multiple subnets, IPv6, connection draining and
-access logging are not supported in this mode. Route53 aliases need separate
+the existing firewall directly. IPv6, connection draining, access logging and
+automatic DNS withdrawal of zones without healthy targets are not supported in
+this mode. Route53 aliases need separate
 qualification. Deletion retains the
 interface reservation if retiring its namespace fails, allowing cleanup to be
 retried without reallocating a live address.
 
 With `FLOCI_NETWORK_VPC_ROUTING_ENABLED=true`, this mode also accepts
-internet-facing Classic frontends in one IPv4 subnet. Protected callers use
+internet-facing Classic frontends in their selected IPv4 subnets. Protected callers use
 native VPC routes and a public NAT gateway; the frontend sees that gateway's
 allocated Elastic IP, and its ingress rules must permit that source.
-Both VPCs need their required internet-gateway routes. See
-[public routing and its limits](../design/vpc-public-routing.md).
+Both VPCs need their required internet-gateway routes, including each public
+frontend subnet. See [public routing and its limits](../design/vpc-public-routing.md)
+and [node ownership across zones](../design/classic-multiaz.md).
 
 ## Behavior Notes
 
