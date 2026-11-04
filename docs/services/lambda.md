@@ -1057,9 +1057,16 @@ container before releasing its helper and ENI; startup retires surviving owned
 helpers and their workloads.
 
 This currently allocates an ENI per execution environment. Hyperplane ENI sharing,
-attachment-time IAM permission checks, VPC routes, NACLs and NAT translation are
-not emulated by this path. The security-group flag is opt-in and applies to
-Docker execution.
+attachment-time IAM permission checks and NACLs are not emulated by this path.
+The security-group flag is opt-in and applies to Docker execution.
+
+The optional [public VPC routing mode](ec2.md#nat-gateways) adds managed NAT
+destinations. With `FLOCI_NETWORK_VPC_ROUTING_ENABLED=true` and
+`FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API=true`, protected Docker functions receive
+no automatic `AWS_ENDPOINT_URL`. Their SDKs use normal AWS endpoints through the
+configured DNS, TLS and NAT path. Explicit function and Docker environment
+settings retain their precedence. The Runtime API remains reachable when an
+application's API route or security-group egress is blocked.
 
 `RuntimeVersionConfig.RuntimeVersionArn` is returned for managed (non-image)
 runtimes. Its value is derived from the runtime name, so it is stable across

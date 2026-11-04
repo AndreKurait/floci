@@ -199,7 +199,7 @@ credential selection keep their existing behavior. A stop/start retains the
 container's mounts. Mount configuration is a deployment input, not an EC2 API
 extension.
 
-When a mount replaces `/etc/resolv.conf` or `/etc`, the injected
+When a mount replaces `/etc/resolv.conf` or `/etc`, the default injected
 `AWS_ENDPOINT_URL` uses the Docker-reachable host address. It does not depend on
 Floci's embedded DNS names being available through the guest's custom resolver.
 Floci uses its selected workload-network address when available, avoiding an
@@ -493,7 +493,7 @@ Notes and limitations:
 `UserData` must be base64-encoded in the request (matching the AWS wire format). Floci decodes it, copies the script into `/var/lib/user-data.sh` inside the container, and executes the script directly after SSH key injection so the script shebang selects the interpreter. Output is captured and logged.
 
 EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT=http://169.254.169.254`
-for IMDS and `AWS_ENDPOINT_URL` for AWS service API calls back to Floci. The
+for IMDS and, by default, `AWS_ENDPOINT_URL` for AWS service API calls back to Floci. The
 metadata endpoint uses the instance's prepared link-local route, including when
 security groups deny ordinary egress.
 
@@ -1202,6 +1202,12 @@ route and the NAT subnet's attached internet-gateway route remain required.
 HTTP and HTTPS use their standard ports. This does not enable arbitrary internet
 access, public-instance routes or VPC endpoints. The shared TLS proxy does not
 preserve the NAT source for IAM `aws:SourceIp` evaluation.
+
+With both routing flags enabled, Floci omits its automatic `AWS_ENDPOINT_URL`
+from protected EC2 and Docker Lambda workloads. SDKs select their normal AWS
+endpoints, so API calls exercise the NAT and security-group path. Region,
+credentials, IMDS and the Lambda Runtime API keep their existing configuration.
+Explicit function or image endpoint settings remain application inputs.
 
 In this mode, public NAT creation without an attached internet gateway returns a
 failed gateway with failure code `Gateway.NotAttached`. Runtime programming errors fail route API calls.
