@@ -30,6 +30,7 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudformation.model.StackUpdateSnapshot;
 import io.github.hectorvent.floci.services.cloudformation.model.TemplateSummary;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnDynamicReferences;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnReplacement;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ProvisionContext;
@@ -1083,7 +1084,7 @@ public class CloudFormationService implements ResourceProvider {
                 }
             }
 
-            Map<String, Replacement> replacements = new HashMap<>();
+            Map<String, CfnReplacement> replacements = new HashMap<>();
             List<ResourceChange> changes = new ArrayList<>();
             newResources.fields().forEachRemaining(e -> {
                 String logicalId = e.getKey();
@@ -1117,15 +1118,15 @@ public class CloudFormationService implements ResourceProvider {
                                         || referencesAnyCondition(newDef, changedConditions))
                         || "AWS::CloudFormation::Stack".equals(resourceType))) {
                     boolean typeChanged = !oldDef.path("Type").asText().equals(resourceType);
-                    Replacement replacement = typeChanged ? Replacement.ALWAYS
+                    CfnReplacement replacement = typeChanged ? CfnReplacement.ALWAYS
                             : replacementFor(logicalId, resourceType, oldDef, newDef, compared,
                                     changedParams, changedConditions);
-                    if (replacement != Replacement.NEVER) {
+                    if (replacement != CfnReplacement.NEVER) {
                         replacements.put(logicalId, replacement);
                     }
                     changes.add(new ResourceChange("Modify", logicalId,
                             resourcePhysicalId(stack, logicalId), resourceType,
-                            replacement.value));
+                            replacement.value()));
                 }
             });
             oldResources.fields().forEachRemaining(e -> {
@@ -1188,27 +1189,40 @@ public class CloudFormationService implements ResourceProvider {
                             JsonNode oldDef = oldResources.get(logicalId);
                             boolean typeChanged = oldDef != null && !oldDef.path("Type").asText().equals(resourceType);
 
-                            Replacement referenceReplacement = Replacement.NEVER;
+                            CfnReplacement referenceReplacement = CfnReplacement.NEVER;
                             JsonNode props = newDef.path("Properties");
+                            JsonNode previewProps = compared[0] != null
+                                    ? compared[1].path(logicalId).path("Properties") : props;
+                            Map<String, CfnReplacement> conditional = dispatcher
+                                    .conditionalReplacements(resourceType, previewProps);
                             if (props != null && props.isObject()) {
                                 for (Iterator<String> it = props.fieldNames(); it.hasNext(); ) {
                                     String field = it.next();
-                                    if (CfnCreateOnlyProperties.isCreateOnly(resourceType, field)) {
+                                    CfnReplacement requirement = replacementRequirement(resourceType, field, conditional);
+                                    if (requirement != CfnReplacement.NEVER) {
                                         Set<String> fieldDeps = new LinkedHashSet<>();
                                         collectDependencies(props.get(field), allResourceIds, fieldDeps, newConditions);
                                         for (String dependency : fieldDeps) {
                                             referenceReplacement = referenceReplacement.stronger(
-                                                    replacements.getOrDefault(dependency, Replacement.NEVER));
+                                                    requirement.weaker(replacements.getOrDefault(
+                                                            dependency, CfnReplacement.NEVER)));
+                                        }
+                                        for (Map.Entry<String, Set<String>> entry : inPlaceChangedAttributes.entrySet()) {
+                                            if (referencesAnyAttribute(props.get(field), entry.getKey(),
+                                                    entry.getValue(), newConditions)) {
+                                                referenceReplacement = referenceReplacement.stronger(
+                                                        requirement.weaker(CfnReplacement.CONDITIONAL));
+                                            }
                                         }
                                     }
                                 }
                             }
 
-                            Replacement directReplacement = typeChanged ? Replacement.ALWAYS
+                            CfnReplacement directReplacement = typeChanged ? CfnReplacement.ALWAYS
                                     : replacementFor(logicalId, resourceType, oldDef, newDef, compared,
                                             changedParams, changedConditions);
-                            Replacement previous = replacements.getOrDefault(logicalId, Replacement.NEVER);
-                            Replacement replacement = previous.stronger(
+                            CfnReplacement previous = replacements.getOrDefault(logicalId, CfnReplacement.NEVER);
+                            CfnReplacement replacement = previous.stronger(
                                     directReplacement.stronger(referenceReplacement));
                             if (replacement != previous) {
                                 replacements.put(logicalId, replacement);
@@ -1216,7 +1230,7 @@ public class CloudFormationService implements ResourceProvider {
                                         && "Modify".equals(change.action())
                                                 ? new ResourceChange(change.action(), logicalId,
                                                         change.physicalResourceId(), change.resourceType(),
-                                                        replacement.value)
+                                                        replacement.value())
                                                 : change);
                                 anyNewChange = true;
                             }
@@ -1224,7 +1238,7 @@ public class CloudFormationService implements ResourceProvider {
                                 alreadyChangedIds.add(logicalId);
                                 changes.add(new ResourceChange("Modify", logicalId,
                                         resourcePhysicalId(stack, logicalId), resourceType,
-                                        replacement.value));
+                                        replacement.value()));
                                 anyNewChange = true;
                                 Set<String> attrs = expectedChangedAttributes(resourceType, oldDef, newDef);
                                 if (!attrs.isEmpty()) {
@@ -1275,41 +1289,49 @@ public class CloudFormationService implements ResourceProvider {
         return false;
     }
 
-    private Replacement replacementFor(String logicalId, String resourceType, JsonNode oldDef, JsonNode newDef,
+    private CfnReplacement replacementFor(String logicalId, String resourceType, JsonNode oldDef, JsonNode newDef,
                                        JsonNode[] compared, Set<String> changedParams, Set<String> changedConditions) {
         if (oldDef == null) {
-            return Replacement.NEVER;
+            return CfnReplacement.NEVER;
         }
         boolean resolved = compared[0] != null;
         JsonNode oldProps = (resolved ? compared[0].path(logicalId) : oldDef).path("Properties");
         JsonNode newProps = (resolved ? compared[1].path(logicalId) : newDef).path("Properties");
-        Replacement replacement = Replacement.NEVER;
+        Map<String, CfnReplacement> conditional = dispatcher.conditionalReplacements(resourceType, newProps);
+        CfnReplacement replacement = CfnReplacement.NEVER;
         for (Iterator<String> it = newProps.fieldNames(); it.hasNext(); ) {
             String field = it.next();
-            if (CfnCreateOnlyProperties.isCreateOnly(resourceType, field)) {
+            CfnReplacement requirement = replacementRequirement(resourceType, field, conditional);
+            if (requirement != CfnReplacement.NEVER) {
                 JsonNode oldVal = oldProps.get(field);
                 JsonNode newVal = newProps.get(field);
                 // Weak output values can change outside this stack while the expression stays
                 // identical. An update resolves them again; preview must keep that uncertainty.
                 if (newVal != null && newVal.findValue("Fn::GetStackOutput") != null) {
-                    replacement = replacement.stronger(Replacement.CONDITIONAL);
+                    replacement = replacement.stronger(CfnReplacement.CONDITIONAL);
                 }
                 if (!Objects.equals(oldVal, newVal)
                         || !resolved && newVal != null
                                 && (referencesAnyParameter(newVal, changedParams)
                                         || referencesAnyCondition(newVal, changedConditions))) {
-                    replacement = replacement.stronger(hasUnresolvedReference(newVal)
-                            ? Replacement.CONDITIONAL : Replacement.ALWAYS);
+                    replacement = replacement.stronger(requirement.weaker(hasUnresolvedReference(newVal)
+                            ? CfnReplacement.CONDITIONAL : CfnReplacement.ALWAYS));
                 }
             }
         }
         for (Iterator<String> it = oldProps.fieldNames(); it.hasNext(); ) {
             String field = it.next();
-            if (CfnCreateOnlyProperties.isCreateOnly(resourceType, field) && !newProps.has(field)) {
-                return Replacement.ALWAYS;
+            if (!newProps.has(field)) {
+                replacement = replacement.stronger(replacementRequirement(resourceType, field, conditional));
             }
         }
         return replacement;
+    }
+
+    private static CfnReplacement replacementRequirement(String resourceType, String property,
+                                                         Map<String, CfnReplacement> conditional) {
+        return CfnCreateOnlyProperties.isCreateOnly(resourceType, property)
+                ? CfnReplacement.ALWAYS : conditional.getOrDefault(property, CfnReplacement.NEVER);
     }
 
     private static boolean hasUnresolvedReference(JsonNode value) {
@@ -1324,22 +1346,6 @@ public class CloudFormationService implements ResourceProvider {
             }
         }
         return false;
-    }
-
-    private enum Replacement {
-        NEVER("False"),
-        CONDITIONAL("Conditional"),
-        ALWAYS("True");
-
-        private final String value;
-
-        Replacement(String value) {
-            this.value = value;
-        }
-
-        private Replacement stronger(Replacement other) {
-            return ordinal() >= other.ordinal() ? this : other;
-        }
     }
 
     public record ResourceChange(String action, String logicalResourceId, String physicalResourceId,

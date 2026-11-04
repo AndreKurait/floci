@@ -198,6 +198,28 @@ an atomic ownership check against another stack or a direct Cognito API writer r
 Failed in-place restoration preserves the original name and scopes for a `ContinueUpdateRollback`
 retry. Deleting the current server keeps this snapshot if deletion fails.
 
+## SSM documents
+
+`AWS::SSM::Document` creates a backing SSM document. `Ref` returns its name, and
+`GetDocument` returns the resolved JSON content. Object content and JSON-encoded
+strings are supported. The registry schema declares no `Fn::GetAtt` attributes.
+
+`UpdateMethod: NewVersion` keeps the document name and selects the new version
+as the default. A failed stack update restores the prior default; retained
+versions remain readable. A retry can select the version that the failed update
+already published. The default `Replace` method replaces changed content:
+an automatically named document gets a new name, while a custom-named document
+requires a different `Name`. Replacement cleanup honors `UpdateReplacePolicy`.
+Change-set previews use the selected `UpdateMethod` for content changes, including
+content that references another resource. A method resolved only during execution
+reports conditional replacement; changing `Name` still requires replacement.
+Creation never adopts a document that exists outside the stack.
+
+Non-JSON `DocumentFormat`, nonempty `Attachments`, `Requires` or `Tags`, and
+`TargetType` or `VersionName` are rejected because the backing SSM document service
+does not yet implement them. Creating a document does not run its steps or
+establish State Manager inventory collection.
+
 ## SSM parameters
 
 Like AWS's resource handler, `AWS::SSM::Parameter` is created with one `PutParameter` that carries
@@ -247,7 +269,7 @@ cross-resource references.
 | Signer | `SigningProfile` (identifiers only; Floci has no Signer API) |
 | IAM | `Role`, `User` (template `LoginProfile` and `PermissionsBoundary` are ignored; an API-created login profile is removed on delete), `AccessKey`, `Policy`, `ManagedPolicy`, `InstanceProfile` |
 | Organizations | `Organization`, `OrganizationalUnit`, `Account`, `Policy`, `ResourcePolicy` |
-| SSM | `Parameter`, `PatchBaseline` (backed by SSM configuration, tags and patch-group bindings; OperatingSystem changes replace the baseline; DefaultBaseline only registers a default; does not execute patches on managed nodes) |
+| SSM | `Document` (JSON content, version selection, replacement and rollback; see SSM documents for unsupported properties), `Parameter`, `PatchBaseline` (backed by SSM configuration, tags and patch-group bindings; OperatingSystem changes replace the baseline; DefaultBaseline only registers a default; does not execute patches on managed nodes) |
 | KMS | `Key`, `Alias` |
 | Secrets Manager | `Secret`, `SecretTargetAttachment` |
 | ECR | `Repository` |

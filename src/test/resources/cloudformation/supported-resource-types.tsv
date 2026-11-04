@@ -194,6 +194,7 @@ AWS::SNS::Topic	SnsCfnProvisioner
 AWS::SNS::TopicPolicy	SnsCfnProvisioner
 AWS::SQS::Queue	SqsCfnProvisioner
 AWS::SQS::QueuePolicy	SqsCfnProvisioner
+AWS::SSM::Document	SsmDocumentCfnProvisioner
 AWS::SSM::Parameter	SsmCfnProvisioner
 AWS::SSM::PatchBaseline	SsmPatchBaselineCfnProvisioner
 AWS::Scheduler::Schedule	SchedulerScheduleCfnProvisioner
