@@ -25,11 +25,14 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 /**
  * Core MemoryDB business logic — clusters, ACLs and users.
@@ -56,8 +59,8 @@ public class MemoryDbService {
 
     // Per the MemoryDB API: a user name must start with a letter and contain only
     // letters, digits and hyphens.
-    private static final java.util.regex.Pattern USER_NAME_PATTERN =
-            java.util.regex.Pattern.compile("[a-zA-Z][a-zA-Z0-9\\-]*");
+    private static final Pattern USER_NAME_PATTERN =
+            Pattern.compile("[a-zA-Z][a-zA-Z0-9\\-]*");
 
     private final StorageBackend<String, Cluster> clusters;
     private final StorageBackend<String, User> users;
@@ -98,18 +101,19 @@ public class MemoryDbService {
             throw new AwsException("InvalidParameterValueException", "ClusterName is required.", 400);
         }
         String resourceKey = key(region, name);
-        if (clusters.get(resourceKey).isPresent() || legacyGet(clusters, name, region).isPresent()) {
-            throw new AwsException("ClusterAlreadyExistsFault",
-                    "Cluster with specified name already exists.", 400);
-        }
         // Claim the name for the whole provisioning attempt so a concurrent create can't race
-        // ahead and be stopped by this request's handle-less rollback fallback.
+        // ahead and be stopped by this request's handle-less rollback fallback. The existence
+        // check follows the claim, so a create that ended before it is seen.
         if (!provisioningClusterNames.add(resourceKey)) {
             throw new AwsException("ClusterAlreadyExistsFault",
                     "Cluster " + name + " is already being created.", 400);
         }
 
         try {
+            if (clusters.get(resourceKey).isPresent() || legacyGet(clusters, name, region).isPresent()) {
+                throw new AwsException("ClusterAlreadyExistsFault",
+                        "Cluster with specified name already exists.", 400);
+            }
             String aclName = spec.getAclName();
             if (aclName == null || aclName.isBlank()) {
                 throw new AwsException("InvalidParameterValueException", "ACLName is required.", 400);
@@ -268,8 +272,8 @@ public class MemoryDbService {
             return resourceGet(users, filterName, region)
                     .map(List::of)
                     .or(() -> DEFAULT_USER.equals(filterName)
-                            ? java.util.Optional.of(List.of(builtinDefaultUser(region)))
-                            : java.util.Optional.empty())
+                            ? Optional.of(List.of(builtinDefaultUser(region)))
+                            : Optional.empty())
                     .orElseThrow(() -> new AwsException("UserNotFoundFault", "User not found.", 404));
         }
         migrateLegacyUsers(region);
@@ -312,7 +316,7 @@ public class MemoryDbService {
             throw new AwsException("DefaultUserRequired",
                     "A default user is required and must be specified.", 400);
         }
-        java.util.Set<String> seen = new java.util.HashSet<>();
+        Set<String> seen = new HashSet<>();
         for (String userName : spec.getUserNames()) {
             if (!seen.add(userName)) {
                 throw new AwsException("DuplicateUserNameFault",
@@ -343,8 +347,8 @@ public class MemoryDbService {
             return resourceGet(acls, filterName, region)
                     .map(List::of)
                     .or(() -> DEFAULT_ACL.equals(filterName)
-                            ? java.util.Optional.of(List.of(builtinOpenAccessAcl(region)))
-                            : java.util.Optional.empty())
+                            ? Optional.of(List.of(builtinOpenAccessAcl(region)))
+                            : Optional.empty())
                     .orElseThrow(() -> new AwsException("ACLNotFoundFault", "ACL not found.", 404));
         }
         migrateLegacyAcls(region);
@@ -477,7 +481,7 @@ public class MemoryDbService {
         }
         return acl.getUserNames().stream()
                 .map(name -> resolveUser(name, region))
-                .filter(java.util.Objects::nonNull)
+                .filter(Objects::nonNull)
                 .anyMatch(u -> u.getAuthMode() != AuthMode.NO_PASSWORD);
     }
 
@@ -631,24 +635,24 @@ public class MemoryDbService {
     private String identityName(String accountId, String region, String name) {
         String defaultAccount = regionResolver.getDefaultAccountId();
         String defaultRegion = regionResolver.getDefaultRegion();
-        if ((defaultAccount == null || java.util.Objects.equals(defaultAccount, accountId))
-                && (defaultRegion == null || java.util.Objects.equals(defaultRegion, region))) {
+        if ((defaultAccount == null || Objects.equals(defaultAccount, accountId))
+                && (defaultRegion == null || Objects.equals(defaultRegion, region))) {
             return name;
         }
         return accountId + "-" + region + "-" + name;
     }
 
-    private <V> java.util.Optional<V> legacyGet(StorageBackend<String, V> store, String name, String region) {
+    private <V> Optional<V> legacyGet(StorageBackend<String, V> store, String name, String region) {
         String defaultAccount = regionResolver.getDefaultAccountId();
         String defaultRegion = regionResolver.getDefaultRegion();
-        if ((defaultAccount != null && !java.util.Objects.equals(defaultAccount, regionResolver.getAccountId()))
-                || (defaultRegion != null && !java.util.Objects.equals(defaultRegion, region))) {
-            return java.util.Optional.empty();
+        if ((defaultAccount != null && !Objects.equals(defaultAccount, regionResolver.getAccountId()))
+                || (defaultRegion != null && !Objects.equals(defaultRegion, region))) {
+            return Optional.empty();
         }
         return store.get(name);
     }
 
-    private <V> java.util.Optional<V> resourceGet(StorageBackend<String, V> store, String name, String region) {
+    private <V> Optional<V> resourceGet(StorageBackend<String, V> store, String name, String region) {
         Optional<V> result = store.get(key(region, name));
         if (result.isPresent()) {
             return result;
@@ -723,8 +727,8 @@ public class MemoryDbService {
     private boolean isDefaultOwner(String region) {
         String defaultAccount = regionResolver.getDefaultAccountId();
         String defaultRegion = regionResolver.getDefaultRegion();
-        return (defaultAccount == null || java.util.Objects.equals(defaultAccount, regionResolver.getAccountId()))
-                && (defaultRegion == null || java.util.Objects.equals(defaultRegion, region));
+        return (defaultAccount == null || Objects.equals(defaultAccount, regionResolver.getAccountId()))
+                && (defaultRegion == null || Objects.equals(defaultRegion, region));
     }
 
     private void setOwner(Object resource, String region) {

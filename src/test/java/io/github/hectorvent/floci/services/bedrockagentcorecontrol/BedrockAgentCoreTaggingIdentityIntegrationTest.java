@@ -13,6 +13,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -74,6 +75,70 @@ class BedrockAgentCoreTaggingIdentityIntegrationTest {
         given().contentType("application/json").body("{\"tags\":{\"env\":\"stolen\"}}")
                 .when().post("/tags/" + foreignAccount)
                 .then().statusCode(404);
+    }
+
+    @Test
+    void aClientTokenReplayKeepsTheTagsOfTheOriginalCreate() {
+        String clientToken = "replay-create-runtime-tags-token-0001";
+        String firstArn = createRuntimeWithTags(clientToken, "{\"team\":\"ml\"}");
+        String replayArn = createRuntimeWithTags(clientToken, "{\"env\":\"dev\"}");
+
+        assertEquals(firstArn, replayArn);
+        given().when().get("/tags/" + firstArn)
+                .then().statusCode(200)
+                .body("tags.team", equalTo("ml"))
+                .body("tags.env", nullValue());
+    }
+
+    private static String createRuntimeWithTags(String clientToken, String tags) {
+        return given().contentType("application/json")
+                .body("""
+                        {
+                          "agentRuntimeName": "replayTagAgent",
+                          "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": "x:latest"}},
+                          "networkConfiguration": {"networkMode": "PUBLIC"},
+                          "roleArn": "arn:aws:iam::000000000000:role/agent",
+                          "clientToken": "%s",
+                          "tags": %s
+                        }""".formatted(clientToken, tags))
+                .when().put("/runtimes/")
+                .then().statusCode(202)
+                .extract().path("agentRuntimeArn");
+    }
+
+    @Test
+    void nonDefaultAccountCanTagItsMemoryAndRejectsForeignIdentity() {
+        String authorization = "AWS4-HMAC-SHA256 Credential=111111111111/20261028/us-east-1/bedrock-agentcore/aws4_request";
+        String arn = given().header("Authorization", authorization).contentType("application/json")
+                .body("{\"name\":\"accountTagMem\",\"eventExpiryDuration\":30}")
+                .when().post("/memories/create").then().statusCode(202).extract().path("memory.arn");
+        try {
+            given().header("Authorization", authorization).contentType("application/json")
+                    .body("{\"tags\":{\"env\":\"dev\"}}")
+                    .when().post("/tags/" + arn).then().statusCode(204);
+            given().header("Authorization", authorization).when().get("/tags/" + arn)
+                    .then().statusCode(200).body("tags.env", equalTo("dev"));
+            given().header("Authorization", authorization).when().delete("/tags/" + arn + "?tagKeys=env")
+                    .then().statusCode(204);
+            given().header("Authorization", authorization).when().get("/tags/" + arn)
+                    .then().statusCode(200).body("tags.env", nullValue());
+
+            for (String foreign : new String[] {arn.replace(":111111111111:", ":222222222222:"),
+                    arn.replace(":us-east-1:", ":eu-west-1:")}) {
+                given().header("Authorization", authorization).when().get("/tags/" + foreign)
+                        .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
+                given().header("Authorization", authorization).contentType("application/json")
+                        .body("{\"tags\":{\"env\":\"stolen\"}}")
+                        .when().post("/tags/" + foreign).then().statusCode(404)
+                        .body("__type", equalTo("ResourceNotFoundException"));
+                given().header("Authorization", authorization).when().delete("/tags/" + foreign + "?tagKeys=env")
+                        .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
+            }
+        } finally {
+            String memoryId = arn.substring(arn.lastIndexOf('/') + 1);
+            given().header("Authorization", authorization).when().delete("/memories/" + memoryId + "/delete")
+                    .then().statusCode(202);
+        }
     }
 
     @Test

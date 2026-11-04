@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
@@ -42,6 +43,7 @@ import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -409,7 +411,8 @@ class Ec2QueryHandlerTest {
         Image image = new Image();
         image.setImageId("ami-0123456789abcdef2");
         image.setBlockDeviceMappings(List.of(deviceMapping("/dev/sda1", "snap-0123456789abcdef3")));
-        when(service.copyImage("us-east-1", "us-west-2", "ami-source", "name", null)).thenReturn(image);
+        when(service.copyImage(eq("us-east-1"), eq("us-west-2"), eq("ami-source"), eq("name"), isNull(), eq(false),
+                anyList())).thenReturn(image);
         MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
         params.putSingle("SourceRegion", "us-west-2");
         params.putSingle("SourceImageId", "ami-source");
@@ -616,6 +619,44 @@ class Ec2QueryHandlerTest {
         return (String) response.getEntity();
     }
 
+    /** A rejected tag specification keeps its error on a dry run: the tags are read before DryRun is answered. */
+    @ParameterizedTest
+    @CsvSource({"CreateVpc,vpc,InvalidParameter", "CreateSubnet,subnet,InvalidParameter",
+            "CreateSecurityGroup,security-group,InvalidParameterValue"})
+    void aDryRunKeepsTheErrorOfAReservedTagKey(String action, String resourceType, String code) {
+        Ec2Service service = mock(Ec2Service.class);
+        MultivaluedMap<String, String> params = createSubnetParams("10.38.1.0/24");
+        params.putSingle("GroupName", "test");
+        params.putSingle("GroupDescription", "test");
+        params.putSingle("DryRun", "true");
+        params.putSingle("TagSpecification.1.ResourceType", resourceType);
+        params.putSingle("TagSpecification.1.Tag.1.Key", "aws:reserved");
+        params.putSingle("TagSpecification.1.Tag.1.Value", "invalid");
+
+        Response response = handler(service).handle(action, params, "us-east-1");
+
+        assertEquals(400, response.getStatus());
+        assertTrue(response.getEntity().toString().contains("<Code>" + code + "</Code>"));
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void aSecurityGroupDryRunWithoutAVpcIdNeedsTheDefaultVpcToExist() {
+        Ec2Service service = mock(Ec2Service.class);
+        when(service.requireSecurityGroupVpc("us-east-1", null)).thenThrow(new AwsException(
+                "InvalidVpcID.NotFound", "The vpc ID 'vpc-default-us-east-1' does not exist", 400));
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("GroupName", "test");
+        params.putSingle("GroupDescription", "test");
+        params.putSingle("DryRun", "true");
+
+        Response response = handler(service).handle("CreateSecurityGroup", params, "us-east-1");
+
+        assertEquals(400, response.getStatus());
+        assertTrue(response.getEntity().toString().contains("<Code>InvalidVpcID.NotFound</Code>"));
+        verify(service, never()).createSecurityGroup(any(), any(), any(), any());
+    }
+
     private Ec2QueryHandler handler(Ec2Service service) {
         return handler(service, new RegionResolver("us-east-1", "000000000000"));
     }
@@ -623,7 +664,7 @@ class Ec2QueryHandlerTest {
     private Ec2QueryHandler handler(Ec2Service service, RegionResolver regionResolver) {
         return new Ec2QueryHandler(
                 service, mock(EmulatorConfig.class), mock(FlowLogService.class),
-                mock(Ec2EbsEncryptionService.class), mock(Ec2SnapshotBlockPublicAccessService.class),
+                mock(Ec2EbsEncryptionService.class), mock(Ec2BlockPublicAccessService.class),
                 mock(Ec2IpamService.class), regionResolver);
     }
 

@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.redshift.RedshiftEventCatalog.EventIn
 import io.github.hectorvent.floci.services.redshift.model.Cluster;
 import io.github.hectorvent.floci.services.redshift.model.ClusterParameterGroup;
 import io.github.hectorvent.floci.services.redshift.model.ClusterSubnetGroup;
+import io.github.hectorvent.floci.services.redshift.model.EventSubscription;
 import io.github.hectorvent.floci.services.redshift.model.Integration;
 import io.github.hectorvent.floci.services.redshift.model.Parameter;
 import io.github.hectorvent.floci.services.redshift.model.RedshiftEvent;
@@ -62,13 +63,15 @@ public class RedshiftQueryHandler {
     private final RegionResolver regionResolver;
     private final RedshiftDynamoDbZeroEtlConsumer zeroEtlConsumer;
     private final IamEnforcementFilter iamEnforcementFilter;
+    private final RedshiftResourcePolicies resourcePolicies;
 
     @Inject
     public RedshiftQueryHandler(RedshiftService service, RedshiftCredentialBroker credentialBroker,
                                 EmulatorConfig config, RedshiftIamDbUserResolver iamDbUserResolver,
                                 RegionResolver regionResolver,
                                 RedshiftDynamoDbZeroEtlConsumer zeroEtlConsumer,
-                                IamEnforcementFilter iamEnforcementFilter) {
+                                IamEnforcementFilter iamEnforcementFilter,
+                                RedshiftResourcePolicies resourcePolicies) {
         this.service = service;
         this.credentialBroker = credentialBroker;
         this.config = config;
@@ -76,12 +79,13 @@ public class RedshiftQueryHandler {
         this.regionResolver = regionResolver;
         this.zeroEtlConsumer = zeroEtlConsumer;
         this.iamEnforcementFilter = iamEnforcementFilter;
+        this.resourcePolicies = resourcePolicies;
     }
 
     RedshiftQueryHandler(RedshiftService service, RedshiftCredentialBroker credentialBroker,
                          EmulatorConfig config, RedshiftIamDbUserResolver iamDbUserResolver,
                          RegionResolver regionResolver) {
-        this(service, credentialBroker, config, iamDbUserResolver, regionResolver, null, null);
+        this(service, credentialBroker, config, iamDbUserResolver, regionResolver, null, null, null);
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params) {
@@ -438,7 +442,7 @@ public class RedshiftQueryHandler {
             }
             String description = params.getFirst("Description");
             List<String> subnetIds = memberList(params, "SubnetIds");
-            ClusterSubnetGroup group = service.createClusterSubnetGroup(name, description, null, subnetIds);
+            ClusterSubnetGroup group = service.createClusterSubnetGroup(name, description, null, subnetIds, parseTags(params));
             String xml = new XmlBuilder()
                     .start("CreateClusterSubnetGroupResponse")
                       .start("CreateClusterSubnetGroupResult")
@@ -518,6 +522,25 @@ public class RedshiftQueryHandler {
                         .elem("RequestId", "test-req-id")
                       .end("ResponseMetadata")
                     .end("DeleteIntegrationResponse")
+                    .build();
+            return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
+        }
+        case "PutResourcePolicy" -> {
+            RedshiftResourcePolicies.ResourcePolicy stored = resourcePolicies.put(
+                    params.getFirst("ResourceArn"), params.getFirst("Policy"));
+            return resourcePolicyResponse("PutResourcePolicy", stored);
+        }
+        case "GetResourcePolicy" -> {
+            return resourcePolicyResponse("GetResourcePolicy", resourcePolicies.get(params.getFirst("ResourceArn")));
+        }
+        case "DeleteResourcePolicy" -> {
+            resourcePolicies.delete(params.getFirst("ResourceArn"));
+            String xml = new XmlBuilder()
+                    .start("DeleteResourcePolicyResponse")
+                      .start("ResponseMetadata")
+                        .elem("RequestId", "test-req-id")
+                      .end("ResponseMetadata")
+                    .end("DeleteResourcePolicyResponse")
                     .build();
             return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
         }
@@ -685,6 +708,57 @@ public class RedshiftQueryHandler {
                         .elem("RequestId", "test-req-id")
                       .end("ResponseMetadata")
                     .end("DescribeEventCategoriesResponse")
+                    .build();
+            return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
+        }
+        case "CreateEventSubscription" -> {
+            EventSubscription subscription = service.createEventSubscription(
+                    params.getFirst("SubscriptionName"), params.getFirst("SnsTopicArn"),
+                    params.getFirst("SourceType"), memberList(params, "SourceIds"),
+                    memberList(params, "EventCategories"), params.getFirst("Severity"),
+                    booleanParam(params, "Enabled"), parseTags(params));
+            return eventSubscriptionResponse(action, subscription);
+        }
+        case "ModifyEventSubscription" -> {
+            EventSubscription subscription = service.modifyEventSubscription(
+                    params.getFirst("SubscriptionName"), params.getFirst("SnsTopicArn"),
+                    params.getFirst("SourceType"), optionalEventList(params, "SourceIds"),
+                    optionalEventList(params, "EventCategories"), params.getFirst("Severity"),
+                    booleanParam(params, "Enabled"));
+            return eventSubscriptionResponse(action, subscription);
+        }
+        case "DeleteEventSubscription" -> {
+            service.deleteEventSubscription(params.getFirst("SubscriptionName"));
+            String xml = new XmlBuilder()
+                    .start("DeleteEventSubscriptionResponse", AwsNamespaces.REDSHIFT)
+                      .start("ResponseMetadata")
+                        .elem("RequestId", "test-req-id")
+                      .end("ResponseMetadata")
+                    .end("DeleteEventSubscriptionResponse")
+                    .build();
+            return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
+        }
+        case "DescribeEventSubscriptions" -> {
+            PaginatedResult<EventSubscription> page = service.describeEventSubscriptions(
+                    params.getFirst("SubscriptionName"), memberList(params, "TagKeys"),
+                    memberList(params, "TagValues"), intParam(params, "MaxRecords"), params.getFirst("Marker"));
+            XmlBuilder xmlBuilder = new XmlBuilder()
+                    .start("DescribeEventSubscriptionsResponse", AwsNamespaces.REDSHIFT)
+                      .start("DescribeEventSubscriptionsResult");
+            if (page.nextToken() != null) {
+                xmlBuilder.elem("Marker", page.nextToken());
+            }
+            xmlBuilder.start("EventSubscriptionsList");
+            for (EventSubscription subscription : page.items()) {
+                xmlBuilder.raw(buildEventSubscriptionXml(subscription));
+            }
+            String xml = xmlBuilder
+                        .end("EventSubscriptionsList")
+                      .end("DescribeEventSubscriptionsResult")
+                      .start("ResponseMetadata")
+                        .elem("RequestId", "test-req-id")
+                      .end("ResponseMetadata")
+                    .end("DescribeEventSubscriptionsResponse")
                     .build();
             return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
         }
@@ -872,6 +946,22 @@ public class RedshiftQueryHandler {
             String clusterIdentifier = requireParam(params, "ClusterIdentifier");
             return loggingStatusResponse(action, service.disableLogging(clusterIdentifier));
         }
+        case "PauseCluster", "ResumeCluster" -> {
+            String clusterIdentifier = requireParam(params, "ClusterIdentifier");
+            Cluster cluster = "PauseCluster".equals(action)
+                    ? service.pauseCluster(clusterIdentifier) : service.resumeCluster(clusterIdentifier);
+            String xml = new XmlBuilder()
+                    .start(action + "Response", AwsNamespaces.REDSHIFT)
+                      .start(action + "Result")
+                        .raw(buildClusterXml(cluster))
+                      .end(action + "Result")
+                      .start("ResponseMetadata")
+                        .elem("RequestId", "test-req-id")
+                      .end("ResponseMetadata")
+                    .end(action + "Response")
+                    .build();
+            return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
+        }
         case "RebootCluster" -> {
             String clusterIdentifier = params.getFirst("ClusterIdentifier");
             if (clusterIdentifier == null || clusterIdentifier.isBlank()) {
@@ -921,6 +1011,23 @@ public class RedshiftQueryHandler {
         }
         default -> throw new AwsException("InvalidAction", "Action " + action + " is not supported", 400);
         }
+    }
+
+    private static Response resourcePolicyResponse(String operation, RedshiftResourcePolicies.ResourcePolicy policy) {
+        String xml = new XmlBuilder()
+                .start(operation + "Response")
+                  .start(operation + "Result")
+                    .start("ResourcePolicy")
+                      .elem("ResourceArn", policy.resourceArn())
+                      .elem("Policy", policy.policy())
+                    .end("ResourcePolicy")
+                  .end(operation + "Result")
+                  .start("ResponseMetadata")
+                    .elem("RequestId", "test-req-id")
+                  .end("ResponseMetadata")
+                .end(operation + "Response")
+                .build();
+        return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
     }
 
     /**
@@ -1158,7 +1265,11 @@ public class RedshiftQueryHandler {
             .elem("ManualSnapshotRetentionPeriod", snapshot.getManualSnapshotRetentionPeriod().toString())
             .elem("Status", snapshot.getStatus())
             .elem("Port", String.valueOf(snapshot.getPort()))
-            .elem("MasterUsername", snapshot.getMasterUsername());
+            .elem("MasterUsername", snapshot.getMasterUsername())
+            .elem("SourceRegion", snapshot.getSourceRegion());
+        if (snapshot.getKmsKeyId() != null) {
+            builder.elem("Encrypted", "true").elem("KmsKeyId", snapshot.getKmsKeyId());
+        }
 
         return builder.end("Snapshot").build();
     }
@@ -1295,11 +1406,65 @@ public class RedshiftQueryHandler {
             .elem("ClusterSubnetGroupName", group.getClusterSubnetGroupName())
             .elem("Description", group.getDescription())
             .elem("VpcId", group.getVpcId())
+            .elem("SubnetGroupStatus", "Complete")
             .start("Subnets");
+        Map<String, String> zones = group.getSubnetZones() == null ? Map.of() : group.getSubnetZones();
         for (String subnetId : group.getSubnetIds()) {
-            builder.start("Subnet").elem("SubnetIdentifier", subnetId).end("Subnet");
+            builder.start("Subnet").elem("SubnetIdentifier", subnetId);
+            if (zones.get(subnetId) != null) {
+                builder.start("SubnetAvailabilityZone").elem("Name", zones.get(subnetId)).end("SubnetAvailabilityZone");
+            }
+            builder.elem("SubnetStatus", "Active").end("Subnet");
         }
-        return builder.end("Subnets").end("ClusterSubnetGroup").build();
+        builder.end("Subnets").start("Tags");
+        for (Map.Entry<String, String> tag : group.getTags().entrySet()) {
+            builder.start("Tag").elem("Key", tag.getKey()).elem("Value", tag.getValue()).end("Tag");
+        }
+        return builder.end("Tags").end("ClusterSubnetGroup").build();
+    }
+
+    private Response eventSubscriptionResponse(String operation, EventSubscription subscription) {
+        String xml = new XmlBuilder()
+                .start(operation + "Response", AwsNamespaces.REDSHIFT)
+                  .start(operation + "Result")
+                    .raw(buildEventSubscriptionXml(subscription))
+                  .end(operation + "Result")
+                  .start("ResponseMetadata")
+                    .elem("RequestId", "test-req-id")
+                  .end("ResponseMetadata")
+                .end(operation + "Response")
+                .build();
+        return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
+    }
+
+    private String buildEventSubscriptionXml(EventSubscription subscription) {
+        XmlBuilder builder = new XmlBuilder()
+                .start("EventSubscription")
+                .elem("Severity", subscription.getSeverity())
+                .elem("CustSubscriptionId", subscription.getCustSubscriptionId());
+        if (subscription.getSourceType() != null) {
+            builder.elem("SourceType", subscription.getSourceType());
+        }
+        builder.elem("SnsTopicArn", subscription.getSnsTopicArn())
+                .start("SourceIdsList");
+        for (String sourceId : subscription.getSourceIdsList()) {
+            builder.elem("SourceId", sourceId);
+        }
+        builder.end("SourceIdsList").start("EventCategoriesList");
+        for (String category : subscription.getEventCategoriesList()) {
+            builder.elem("EventCategory", category);
+        }
+        builder.end("EventCategoriesList")
+                .elem("SubscriptionCreationTime", EVENT_TIMESTAMP.format(subscription.getSubscriptionCreationTime()))
+                .elem("Enabled", String.valueOf(subscription.isEnabled()))
+                .start("Tags");
+        for (Map.Entry<String, String> tag : subscription.getTags().entrySet()) {
+            builder.start("Tag").elem("Key", tag.getKey()).elem("Value", tag.getValue()).end("Tag");
+        }
+        return builder.end("Tags")
+                .elem("Status", subscription.getStatus())
+                .elem("CustomerAwsId", subscription.getCustomerAwsId())
+                .end("EventSubscription").build();
     }
 
     private String buildEventXml(RedshiftEvent event) {
@@ -1317,6 +1482,22 @@ public class RedshiftQueryHandler {
         return builder.end("EventCategories")
                 .elem("Message", event.getMessage())
                 .end("Event").build();
+    }
+
+    private static Boolean booleanParam(MultivaluedMap<String, String> params, String name) {
+        String raw = params.getFirst(name);
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        if (!"true".equalsIgnoreCase(raw) && !"false".equalsIgnoreCase(raw)) {
+            throw new AwsException("InvalidParameterValue", name + " must be true or false.", 400);
+        }
+        return Boolean.valueOf(raw);
+    }
+
+    private static List<String> optionalEventList(MultivaluedMap<String, String> params, String name) {
+        return params.keySet().stream().anyMatch(key -> key.equals(name) || key.startsWith(name + "."))
+                ? memberList(params, name) : null;
     }
 
     /** ISO 8601 as the SDKs send it, with or without seconds, or epoch seconds. */
@@ -1503,6 +1684,8 @@ public class RedshiftQueryHandler {
             case "IamRoles", "AddIamRoles", "RemoveIamRoles" -> "IamRoleArn";
             case "TagKeys" -> "TagKey";
             case "TagValues" -> "TagValue";
+            case "SourceIds" -> "SourceId";
+            case "EventCategories" -> "EventCategory";
             case "ScheduleDefinitions" -> "ScheduleDefinition";
             case "DbGroups" -> "DbGroup";
             default -> null;

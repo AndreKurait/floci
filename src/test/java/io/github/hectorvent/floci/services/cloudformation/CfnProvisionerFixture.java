@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayService;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
+import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.applicationautoscaling.ApplicationAutoScalingService;
 import io.github.hectorvent.floci.services.appsync.AppSyncService;
 import io.github.hectorvent.floci.services.autoscaling.AutoScalingService;
@@ -23,6 +24,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewa
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayUsagePlanCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayV2CfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayV2DomainCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.AppConfigCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AppSyncCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApplicationAutoScalingCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AutoScalingGroupCfnProvisioner;
@@ -43,6 +45,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatc
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchCompositeAlarmCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchDashboardCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoIdentityProviderCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoResourceServerCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoUserPoolGroupCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoUserPoolUserCfnProvisioner;
@@ -53,6 +56,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.DsqlCfnPr
 import io.github.hectorvent.floci.services.cloudformation.provisioners.DynamoDbCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2FlowLogCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2InstanceCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2KeyPairCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2LaunchTemplateCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2NetworkAclCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2NetworkCfnProvisioner;
@@ -70,6 +74,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.ElastiCac
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ElbV2CfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EventsArchiveCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EventsCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.EventsV2CfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.FirehoseCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.GuardDutyMalwareProtectionPlanCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamAccessKeyCfnProvisioner;
@@ -97,6 +102,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.Organizat
 import io.github.hectorvent.floci.services.cloudformation.provisioners.PipesCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.RdsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.RedshiftClusterCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.RedshiftEventSubscriptionCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.RedshiftServerlessCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Route53CfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.S3CfnProvisioner;
@@ -106,6 +112,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.Scheduler
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SecretTargetAttachmentCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SecretsManagerCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SesCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.SesReceiptRuleCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SnsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SqsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmCfnProvisioner;
@@ -136,6 +143,7 @@ import io.github.hectorvent.floci.services.elasticache.ElastiCacheServerlessServ
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
+import io.github.hectorvent.floci.services.eventbridgev2.EventBridgeV2Service;
 import io.github.hectorvent.floci.services.firehose.FirehoseService;
 import io.github.hectorvent.floci.services.guardduty.GuardDutyService;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -159,6 +167,7 @@ import io.github.hectorvent.floci.services.s3vectors.S3VectorsService;
 import io.github.hectorvent.floci.services.scheduler.SchedulerService;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.ses.SesIdentityService;
+import io.github.hectorvent.floci.services.ses.SesReceiptRuleService;
 import io.github.hectorvent.floci.services.ses.SesService;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
@@ -200,10 +209,12 @@ final class CfnProvisionerFixture {
         private S3VectorsService s3VectorsService;
         private SnsService snsService;
         private SesService sesService;
+        private SesReceiptRuleService sesReceiptRuleService;
         private SesIdentityService sesIdentityService;
         private DynamoDbService dynamoDbService;
         private LambdaService lambdaService;
         private AppSyncService appSyncService;
+        private AppConfigService appConfigService;
         private IamService iamService;
         private SsmService ssmService;
         private KmsService kmsService;
@@ -260,6 +271,7 @@ final class CfnProvisionerFixture {
         private RedshiftService redshiftService;
         private RedshiftServerlessService redshiftServerlessService;
         private CloudMapService cloudMapService;
+        private EventBridgeV2Service eventBridgeV2Service;
         private GuardDutyService guardDutyService;
         private BedrockAgentCoreControlService bedrockAgentCoreControlService;
         private BedrockAgentCoreMemoryService bedrockAgentCoreMemoryService;
@@ -325,8 +337,11 @@ final class CfnProvisionerFixture {
             if (sesService != null && sesIdentityService != null) {
                 discovered.add(new SesCfnProvisioner(sesService, sesIdentityService));
             }
+            if (sesReceiptRuleService != null && sesIdentityService != null) {
+                discovered.add(new SesReceiptRuleCfnProvisioner(sesReceiptRuleService, sesIdentityService));
+            }
             if (dynamoDbService != null) {
-                NativeDynamoDbBackend backend = new NativeDynamoDbBackend(null, null, dynamoDbService, null, null, objectMapper);
+                NativeDynamoDbBackend backend = new NativeDynamoDbBackend(null, null, null, dynamoDbService, null, null, objectMapper);
                 discovered.add(new DynamoDbCfnProvisioner(new DynamoDbFacade(backend, backend,
                         new RegionResolver("us-east-1", "000000000000"))));
             }
@@ -344,6 +359,7 @@ final class CfnProvisionerFixture {
             }
             if (cognitoService != null) {
                 discovered.add(new CognitoCfnProvisioner(cognitoService));
+                discovered.add(new CognitoIdentityProviderCfnProvisioner(cognitoService));
                 discovered.add(new CognitoResourceServerCfnProvisioner(cognitoService));
                 discovered.add(new CognitoUserPoolGroupCfnProvisioner(cognitoService));
                 discovered.add(new CognitoUserPoolUserCfnProvisioner(cognitoService));
@@ -416,6 +432,9 @@ final class CfnProvisionerFixture {
             if (appSyncService != null) {
                 discovered.add(new AppSyncCfnProvisioner(appSyncService));
             }
+            if (appConfigService != null) {
+                discovered.add(new AppConfigCfnProvisioner(appConfigService));
+            }
             if (lambdaService != null) {
                 discovered.add(new LambdaAddressingCfnProvisioner(lambdaService));
                 discovered.add(new LambdaEventInvokeConfigCfnProvisioner(lambdaService));
@@ -423,7 +442,7 @@ final class CfnProvisionerFixture {
                 discovered.add(new LambdaEventSourceMappingCfnProvisioner(lambdaService));
             }
             if (flowLogService != null) {
-                discovered.add(new Ec2FlowLogCfnProvisioner(flowLogService));
+                discovered.add(new Ec2FlowLogCfnProvisioner(flowLogService, ec2Service));
             }
             if (iotAuthorizerService != null) {
                 discovered.add(new IotAuthorizerCfnProvisioner(iotAuthorizerService));
@@ -484,6 +503,9 @@ final class CfnProvisionerFixture {
                 discovered.add(new Ec2LaunchTemplateCfnProvisioner(ec2Service));
                 discovered.add(new Ec2NetworkCfnProvisioner(ec2Service));
             }
+            if (ec2Service != null && ssmService != null) {
+                discovered.add(new Ec2KeyPairCfnProvisioner(ec2Service, ssmService));
+            }
             if (route53Service != null) {
                 discovered.add(new Route53CfnProvisioner(route53Service));
             }
@@ -505,12 +527,16 @@ final class CfnProvisionerFixture {
             }
             if (redshiftService != null) {
                 discovered.add(new RedshiftClusterCfnProvisioner(redshiftService));
+                discovered.add(new RedshiftEventSubscriptionCfnProvisioner(redshiftService));
             }
             if (redshiftServerlessService != null) {
                 discovered.add(new RedshiftServerlessCfnProvisioner(redshiftServerlessService));
             }
             if (cloudMapService != null) {
                 discovered.add(new CloudMapCfnProvisioner(cloudMapService));
+            }
+            if (eventBridgeV2Service != null) {
+                discovered.add(new EventsV2CfnProvisioner(eventBridgeV2Service));
             }
             if (guardDutyService != null) {
                 discovered.add(new GuardDutyMalwareProtectionPlanCfnProvisioner(guardDutyService));
@@ -547,6 +573,11 @@ final class CfnProvisionerFixture {
             return this;
         }
 
+        public Builder sesReceiptRules(SesReceiptRuleService v) {
+            this.sesReceiptRuleService = v;
+            return this;
+        }
+
         public Builder dynamoDb(DynamoDbService v) {
             this.dynamoDbService = v;
             return this;
@@ -559,6 +590,11 @@ final class CfnProvisionerFixture {
 
         public Builder appSync(AppSyncService v) {
             this.appSyncService = v;
+            return this;
+        }
+
+        public Builder appConfig(AppConfigService v) {
+            this.appConfigService = v;
             return this;
         }
 
@@ -834,6 +870,11 @@ final class CfnProvisionerFixture {
 
         public Builder cloudMap(CloudMapService v) {
             this.cloudMapService = v;
+            return this;
+        }
+
+        public Builder eventBridgeV2(EventBridgeV2Service v) {
+            this.eventBridgeV2Service = v;
             return this;
         }
 

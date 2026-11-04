@@ -257,6 +257,7 @@ further divergences, both deliberate:
 |--------|-------------|
 | AdminCreateUser | Creates a user and sends the invitation, or with `MessageAction` `RESEND` gives an existing `FORCE_CHANGE_PASSWORD` user a new temporary password and sends the invitation again. See [AdminCreateUser invitations](#admincreateuser-invitations). Creating a user invokes the pre sign-up trigger with triggerSource `PreSignUp_AdminCreateUser`, the request's `ValidationData` and `ClientMetadata`, and `callerContext.clientId` `CLIENT_ID_NOT_APPLICABLE`. A trigger error refuses the user with `UserLambdaValidationException`, and its `autoConfirmUser`, `autoVerifyEmail` and `autoVerifyPhone` are ignored, as on AWS. |
 | AdminGetUser | Returns a user's stored attributes and status, and the MFA settings (`UserMFASettingList`, `PreferredMfaSetting`) once any is turned on. |
+| AdminListUserAuthEvents | Lists a user's recorded sign-in events, newest first, `MaxResults` 0 to 60 (0 or absent means 60) with an opaque `NextToken`. Requires threat protection as AWS does: a pool with `UserPoolTier` `PLUS` and `UserPoolAddOns.AdvancedSecurityMode` `AUDIT` or `ENFORCED`, otherwise `UserPoolAddOnNotEnabledException`. Floci stores `AdvancedSecurityMode` on any pool, and does not reject it on a non-`PLUS` pool at `CreateUserPool` or `UpdateUserPool`; such a pool just has no events. Only sign-ins made while the pool qualifies are recorded, for a user that exists, through `InitiateAuth` or `AdminInitiateAuth` with `USER_PASSWORD_AUTH`, `ADMIN_USER_PASSWORD_AUTH`, `ADMIN_NO_SRP_AUTH` or `USER_SRP_AUTH`. `CUSTOM_AUTH`, `USER_AUTH`, refresh, managed login, federated sign-in and passwordless sign-in record nothing. Every event has `EventType` `SignIn`. A wrong password (or SRP proof) is `Fail` with `Password` `Failure`. A right password that gets tokens at once is `Pass` with `Password` `Success`. A right password followed by a challenge (`NEW_PASSWORD_REQUIRED`, `SMS_MFA`, `EMAIL_OTP`, `SOFTWARE_TOKEN_MFA`, `SELECT_MFA_TYPE`, `MFA_SETUP`) is `InProgress`, and becomes `Pass` when the challenges end in tokens, with `Mfa` `Success` added when an MFA code was verified. A wrong MFA code leaves the event `InProgress`, as does an abandoned challenge. Floci does no risk evaluation and captures no device or location data, so `EventRisk`, `EventContextData` and `EventFeedback` are never returned. `SignUp`, `ForgotPassword`, `PasswordChange` and `ResendCode` events are not recorded. Events are removed with the user (`AdminDeleteUser`, `DeleteUser`) or the pool. |
 | AdminDeleteUser | Deletes a user from a user pool. An API Gateway Cognito authorizer rejects the user's existing tokens afterwards. |
 | AdminSetUserPassword | Sets a user's password and permanent-password status. |
 | AdminUpdateUserAttributes | Updates attributes for a user in a user pool. |
@@ -364,6 +365,10 @@ requires a fresh code in `SOFTWARE_TOKEN_MFA_CODE`. Its `ChallengeParameters` ca
 `USER_ID_FOR_SRP`, the user's actual username rather than an alias (the `sub` in a pool
 with `UsernameAttributes`), to send back as `USERNAME` and to compute `SECRET_HASH` from,
 plus `FRIENDLY_DEVICE_NAME` when `VerifySoftwareToken` was given a `FriendlyDeviceName`.
+As on AWS, a code is accepted for one `SOFTWARE_TOKEN_MFA` challenge only: answering
+another with a code from the same 30-second step, or an earlier one, fails with
+`ExpiredCodeException` (`Your software token has already been used once.`) until the
+authenticator shows its next code. The code given to `VerifySoftwareToken` is not counted.
 Both token-management actions also accept an access token for an already authenticated
 user. Sessions expire with the app client's `AuthSessionValidity` and cannot be replayed
 after completion.
@@ -506,6 +511,15 @@ the list, as on AWS; one that names no challenge Cognito supports fails with
 shortcut is not implemented yet.
 
 Any other `AuthFlow` value is rejected with `InvalidParameterException` and no tokens are issued.
+
+`CUSTOM_AUTH` can start with `CHALLENGE_NAME=SRP_A` and `SRP_A`. Floci seeds the
+DefineAuthChallenge history with `SRP_A=true`, issues a real `PASSWORD_VERIFIER` challenge,
+and verifies the SRP proof before returning to the trigger's custom challenges. Temporary-password
+users complete `NEW_PASSWORD_REQUIRED` within the same custom sequence. Each response must match
+the issued session's client, user and challenge; sessions are consumed once. Plain custom
+challenges remain supported. `RESET_REQUIRED` still requires password recovery first because
+Floci clears the SRP verifier when an administrator resets the password.
+See [AWS's custom SRP sequence](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-challenge.html#user-pool-lambda-challenge-srp-authentication).
 
 The challenge `Session` of a `USER_SRP_AUTH`, `CUSTOM_AUTH` or `USER_AUTH` sign-in is valid for 3 minutes
 from when it was issued, the AWS default for the client's `AuthSessionValidity`. Answering the challenge with

@@ -42,6 +42,7 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
 
     private final StorageBackend<String, V> delegate;
     private final Instance<RequestContext> requestContextInstance;
+    private volatile RequestContext requestContextProxy;
     private final String defaultAccountId;
 
     // Accounts that own keys here, so findAnyAccountEntry does one get per account instead of a scan.
@@ -142,6 +143,16 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     @Override
+    public boolean isEmpty() {
+        // A store nothing has written answers without the key copy below.
+        if (delegate.isEmpty()) {
+            return true;
+        }
+        String prefix = prefix() + "/";
+        return delegate.keys().stream().noneMatch(k -> k.startsWith(prefix));
+    }
+
+    @Override
     public void flush() {
         delegate.flush();
     }
@@ -164,6 +175,11 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     /** Scans all values across every account, without any account prefix filtering. */
     public List<V> scanAllAccounts() {
         return delegate.scan(k -> true);
+    }
+
+    /** Whether no account holds a value. */
+    public boolean isEmptyInAllAccounts() {
+        return delegate.isEmpty();
     }
 
     /** Removes matching values using their actual stored keys, including unprefixed legacy keys. */
@@ -449,6 +465,11 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         delegate.deleteAllAtomically(rawKeys);
     }
 
+    /** Whether the delegate only retains values in memory, without persistence or serialization. */
+    public boolean isInMemory() {
+        return delegate instanceof InMemoryStorage<?, ?>;
+    }
+
     // --- Entry writes, for map-valued stores whose backend persists one entry at a time ---
 
     /** Whether the backend persists one map entry at a time; the entry methods require it. */
@@ -489,6 +510,19 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     public List<V> scanForAccount(String accountId, Predicate<String> keyFilter) {
         String prefix = accountId + "/";
         return delegate.scan(k -> k.startsWith(prefix) && keyFilter.test(k.substring(prefix.length())));
+    }
+
+    /**
+     * Scans with a filter that sees the stored key, {@code accountId + "/" + relativeKey}, so a prefix
+     * test can run without building the relative key. The filter must check the {@code accountId + "/"}
+     * prefix itself to keep the result to one account.
+     */
+    public List<V> scanRaw(Predicate<String> rawKeyFilter) {
+        return delegate.scan(rawKeyFilter);
+    }
+
+    public static String rawKey(String accountId, String key) {
+        return accountId + "/" + key;
     }
 
     /** Returns unprefixed pre-account values that satisfy an ownership predicate. */
@@ -586,10 +620,19 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         return prefix();
     }
 
+    private RequestContext requestContext() {
+        RequestContext proxy = requestContextProxy;
+        if (proxy == null) {
+            proxy = requestContextInstance.get();
+            requestContextProxy = proxy;
+        }
+        return proxy;
+    }
+
     private String prefix() {
         if (requestContextInstance != null) {
             try {
-                String accountId = requestContextInstance.get().getAccountId();
+                String accountId = requestContext().getAccountId();
                 if (accountId != null) {
                     return accountId;
                 }

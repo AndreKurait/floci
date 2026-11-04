@@ -144,11 +144,88 @@ class AppConfigResourceFieldsIntegrationTest {
     }
 
     @Test
-    void profileCreatedWithoutTypeReturnsNoType() {
+    void deploymentReturnsTheStrategySettingsItStartedWith() {
+        String applicationId = createApplication("deployment-strategy-app");
+        String deployments = newEnvironmentDeployments(applicationId, "deployment-strategy-env");
+        String profileId = createProfile(applicationId, "strategy-settings");
+        String strategyId = createGradualStrategy();
+
+        int deploymentNumber = given()
+                .contentType(ContentType.JSON)
+                .body(startDeploymentBody(profileId, strategyId))
+                .when().post(deployments)
+                .then().statusCode(201)
+                .body("DeploymentDurationInMinutes", equalTo(15))
+                .body("FinalBakeTimeInMinutes", equalTo(5))
+                .body("GrowthFactor", equalTo(25.0f))
+                .body("GrowthType", equalTo("LINEAR"))
+                .extract().path("DeploymentNumber");
+
+        given()
+                .when().get(deployments + "/" + deploymentNumber)
+                .then().statusCode(200)
+                .body("DeploymentDurationInMinutes", equalTo(15))
+                .body("FinalBakeTimeInMinutes", equalTo(5))
+                .body("GrowthFactor", equalTo(25.0f))
+                .body("GrowthType", equalTo("LINEAR"));
+    }
+
+    @Test
+    void listDeploymentsStillReportsADeploymentWhoseStrategyWasDeleted() {
+        String applicationId = createApplication("deleted-strategy-app");
+        String deployments = newEnvironmentDeployments(applicationId, "deleted-strategy-env");
+        String profileId = createProfile(applicationId, "deleted-strategy-settings");
+        String strategyId = createGradualStrategy();
+        int deploymentNumber = given()
+                .contentType(ContentType.JSON)
+                .body(startDeploymentBody(profileId, strategyId))
+                .when().post(deployments)
+                .then().statusCode(201)
+                .extract().path("DeploymentNumber");
+
+        given()
+                .when().delete("/deployementstrategies/" + strategyId)
+                .then().statusCode(204);
+
+        given()
+                .when().get(deployments)
+                .then().statusCode(200)
+                .body("Items.size()", equalTo(1))
+                .body("Items[0].DeploymentNumber", equalTo(deploymentNumber))
+                .body("Items[0].ConfigurationName", equalTo("deleted-strategy-settings"))
+                .body("Items[0].DeploymentDurationInMinutes", equalTo(15))
+                .body("Items[0].FinalBakeTimeInMinutes", equalTo(5))
+                .body("Items[0].GrowthFactor", equalTo(25.0f))
+                .body("Items[0].GrowthType", equalTo("LINEAR"));
+        given()
+                .when().get(deployments + "/" + deploymentNumber)
+                .then().statusCode(200)
+                .body("DeploymentStrategyId", equalTo(strategyId));
+    }
+
+    @Test
+    void profileCreatedWithoutTypeDefaultsToFreeform() {
         String applicationId = createApplication("untyped-profile-app");
         String profileId = given()
                 .contentType(ContentType.JSON)
                 .body("{\"Name\":\"untyped\",\"LocationUri\":\"hosted\"}")
+                .when().post("/applications/" + applicationId + "/configurationprofiles")
+                .then().statusCode(201)
+                .body("Type", equalTo("AWS.Freeform"))
+                .extract().path("Id");
+
+        given()
+                .when().get("/applications/" + applicationId + "/configurationprofiles/" + profileId)
+                .then().statusCode(200)
+                .body("Type", equalTo("AWS.Freeform"));
+    }
+
+    @Test
+    void nonHostedProfileWithoutTypeRemainsUntyped() {
+        String applicationId = createApplication("external-profile-app");
+        String profileId = given()
+                .contentType(ContentType.JSON)
+                .body("{\"Name\":\"external\",\"LocationUri\":\"ssm-parameter://configuration\"}")
                 .when().post("/applications/" + applicationId + "/configurationprofiles")
                 .then().statusCode(201)
                 .body("Type", nullValue())
@@ -160,6 +237,23 @@ class AppConfigResourceFieldsIntegrationTest {
                 .body("Type", nullValue());
     }
 
+    @Test
+    void explicitNullTypeUsesOnlyTheHostedDefault() {
+        String applicationId = createApplication("null-type-app");
+        for (String location : List.of("hosted", "ssm-parameter://configuration")) {
+            String profileId = given()
+                    .contentType(ContentType.JSON)
+                    .body("{\"Name\":\"null-type\",\"LocationUri\":\"" + location + "\",\"Type\":null}")
+                    .when().post("/applications/" + applicationId + "/configurationprofiles")
+                    .then().statusCode(201)
+                    .body("Type", "hosted".equals(location) ? equalTo("AWS.Freeform") : nullValue())
+                    .extract().path("Id");
+            given().get("/applications/" + applicationId + "/configurationprofiles/" + profileId)
+                    .then().statusCode(200)
+                    .body("Type", "hosted".equals(location) ? equalTo("AWS.Freeform") : nullValue());
+        }
+    }
+
     private static String createApplication(String name) {
         return given()
                 .contentType(ContentType.JSON)
@@ -167,5 +261,40 @@ class AppConfigResourceFieldsIntegrationTest {
                 .when().post("/applications")
                 .then().statusCode(201)
                 .extract().path("Id");
+    }
+
+    /** Creates an environment and returns the path of its deployments. */
+    private static String newEnvironmentDeployments(String applicationId, String environmentName) {
+        String environmentId = given()
+                .contentType(ContentType.JSON)
+                .body("{\"Name\":\"" + environmentName + "\"}")
+                .when().post("/applications/" + applicationId + "/environments")
+                .then().statusCode(201)
+                .extract().path("Id");
+        return "/applications/" + applicationId + "/environments/" + environmentId + "/deployments";
+    }
+
+    private static String createProfile(String applicationId, String name) {
+        return given()
+                .contentType(ContentType.JSON)
+                .body("{\"Name\":\"" + name + "\",\"LocationUri\":\"hosted\",\"Type\":\"AWS.Freeform\"}")
+                .when().post("/applications/" + applicationId + "/configurationprofiles")
+                .then().statusCode(201)
+                .extract().path("Id");
+    }
+
+    private static String createGradualStrategy() {
+        return given()
+                .contentType(ContentType.JSON)
+                .body("{\"Name\":\"gradual\",\"DeploymentDurationInMinutes\":15,\"FinalBakeTimeInMinutes\":5,"
+                        + "\"GrowthFactor\":25,\"GrowthType\":\"LINEAR\",\"ReplicateTo\":\"NONE\"}")
+                .when().post("/deploymentstrategies")
+                .then().statusCode(201)
+                .extract().path("Id");
+    }
+
+    private static String startDeploymentBody(String profileId, String strategyId) {
+        return "{\"ConfigurationProfileId\":\"" + profileId + "\",\"ConfigurationVersion\":\"1\","
+                + "\"DeploymentStrategyId\":\"" + strategyId + "\"}";
     }
 }

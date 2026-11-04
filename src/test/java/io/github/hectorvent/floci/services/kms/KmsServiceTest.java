@@ -36,6 +36,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -77,6 +79,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+@Execution(ExecutionMode.CONCURRENT)
 class KmsServiceTest {
 
     private static final String REGION = "us-east-1";
@@ -1256,8 +1259,8 @@ class KmsServiceTest {
             PublicKey publicKey = KeyFactory.getInstance("RSA").generatePublic(new X509EncodedKeySpec(
                     Base64.getDecoder().decode(kmsService.getPublicKey(key.getKeyId(), REGION).getPublicKeyEncoded())));
             Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPPadding");
-            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, publicKey, new javax.crypto.spec.OAEPParameterSpec(
-                    "SHA-256", "MGF1", MGF1ParameterSpec.SHA256, javax.crypto.spec.PSource.PSpecified.DEFAULT));
+            cipher.init(Cipher.ENCRYPT_MODE, publicKey, new OAEPParameterSpec(
+                    "SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT));
             byte[] localCiphertext = cipher.doFinal(PLAINTEXT);
 
             KmsService.DecryptResult decrypted = kmsService.decryptAndResolveKey(

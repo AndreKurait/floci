@@ -3,12 +3,14 @@ package io.github.hectorvent.floci.services.redshift;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.redshift.model.Cluster;
 import io.github.hectorvent.floci.services.redshift.model.ClusterParameterGroup;
 import io.github.hectorvent.floci.services.redshift.model.ClusterSubnetGroup;
 import io.github.hectorvent.floci.services.redshift.model.Endpoint;
+import io.github.hectorvent.floci.services.redshift.model.EventSubscription;
 import io.github.hectorvent.floci.services.redshift.model.Parameter;
 import io.github.hectorvent.floci.services.redshift.model.Snapshot;
 import io.github.hectorvent.floci.services.redshift.model.SnapshotCopyGrant;
@@ -32,6 +34,49 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
 class RedshiftQueryHandlerTest {
+
+    @Test
+    void pauseAndResumeRequireClusterIdentifier() {
+        for (String action : List.of("PauseCluster", "ResumeCluster")) {
+            AwsException error = assertThrows(AwsException.class,
+                    () -> handler.handle(action, new MultivaluedHashMap<>()));
+            assertEquals("InvalidParameterValue", error.getErrorCode());
+        }
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void pauseAndResumeUseAwsQueryClusterWrappersAndNamespace() {
+        Cluster cluster = new Cluster();
+        cluster.setClusterIdentifier("warehouse");
+        cluster.setClusterStatus("paused");
+        when(service.pauseCluster("warehouse")).thenReturn(cluster);
+        when(service.resumeCluster("warehouse")).thenReturn(cluster);
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ClusterIdentifier", "warehouse");
+        for (String action : List.of("PauseCluster", "ResumeCluster")) {
+            Response response = handler.handle(action, params);
+            assertEquals(200, response.getStatus());
+            String xml = response.getEntity().toString();
+            assertTrue(xml.contains("<" + action + "Response xmlns=\"" + AwsNamespaces.REDSHIFT + "\">"));
+            assertTrue(xml.contains("<" + action + "Result><Cluster>"));
+            assertTrue(xml.contains("<ClusterIdentifier>warehouse</ClusterIdentifier>"));
+        }
+        verify(service).pauseCluster("warehouse");
+        verify(service).resumeCluster("warehouse");
+    }
+
+    @Test
+    void eventSubscriptionResponsesUseTheRedshiftNamespace() {
+        EventSubscription subscription = new EventSubscription();
+        subscription.setCustSubscriptionId("watcher");
+        subscription.setSubscriptionCreationTime(Instant.parse("2026-10-26T12:00:00Z"));
+        when(service.createEventSubscription(any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(subscription);
+        Response response = handler.handle("CreateEventSubscription", new MultivaluedHashMap<>());
+        assertTrue(response.getEntity().toString().contains(
+                "<CreateEventSubscriptionResponse xmlns=\"" + AwsNamespaces.REDSHIFT + "\">"));
+    }
 
     @Test
     void nonFiniteEventTimestampsReturnAnAwsValidationError() {
@@ -747,14 +792,14 @@ class RedshiftQueryHandlerTest {
         params.putSingle("SubnetIds.SubnetIdentifier.2", "subnet-bbb");
 
         ClusterSubnetGroup group = new ClusterSubnetGroup("test-sng", "desc", null, List.of("subnet-aaa", "subnet-bbb"));
-        when(service.createClusterSubnetGroup(any(), any(), any(), any())).thenReturn(group);
+        when(service.createClusterSubnetGroup(any(), any(), any(), any(), any())).thenReturn(group);
 
         Response response = handler.handle("CreateClusterSubnetGroup", params);
         assertEquals(200, response.getStatus());
 
         @SuppressWarnings("unchecked")
         ArgumentCaptor<List<String>> captor = ArgumentCaptor.forClass(List.class);
-        verify(service).createClusterSubnetGroup(eq("test-sng"), eq("desc"), any(), captor.capture());
+        verify(service).createClusterSubnetGroup(eq("test-sng"), eq("desc"), any(), captor.capture(), any());
         assertEquals(List.of("subnet-aaa", "subnet-bbb"), captor.getValue());
     }
 

@@ -116,6 +116,11 @@ class DynamoDbVectorBilledSizeIntegrationTest {
                 """.formatted(TABLE))
             .statusCode(200)
             .body("ConsumedCapacity[0].CapacityUnits", equalTo(2.0f));
+        ddb("BatchGetItem", """
+                {"RequestItems":{"%s":{"Keys":[{"pk":{"S":"r6"}}],"ConsistentRead":true}},"ReturnConsumedCapacity":"TOTAL"}
+                """.formatted(TABLE))
+            .statusCode(200)
+            .body("ConsumedCapacity[0].CapacityUnits", equalTo(1.0f));
     }
 
     @Test

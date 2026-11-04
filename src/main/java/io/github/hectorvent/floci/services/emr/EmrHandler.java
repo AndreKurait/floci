@@ -462,13 +462,18 @@ public class EmrHandler {
 
     private Response handleModifyInstanceGroups(JsonNode request, String region) {
         List<EmrService.InstanceGroupModification> modifications = new ArrayList<>();
-        for (JsonNode g : request.path("InstanceGroups")) {
-            JsonNode count = g.path("InstanceCount");
-            JsonNode configurations = g.path("Configurations");
-            modifications.add(new EmrService.InstanceGroupModification(
-                    g.path("InstanceGroupId").asText(null),
-                    count.isMissingNode() || count.isNull() ? null : count.asInt(),
-                    configurations.isArray() ? configurations.toString() : null));
+        // Only a list names groups, as the other list members here and the IAM check read one: any other
+        // InstanceGroups names none, which the service refuses.
+        JsonNode groups = request.path("InstanceGroups");
+        if (groups.isArray()) {
+            for (JsonNode g : groups) {
+                JsonNode count = g.path("InstanceCount");
+                JsonNode configurations = g.path("Configurations");
+                modifications.add(new EmrService.InstanceGroupModification(
+                        g.path("InstanceGroupId").asText(null),
+                        count.isMissingNode() || count.isNull() ? null : count.asInt(),
+                        configurations.isArray() ? configurations.toString() : null));
+            }
         }
         service.modifyInstanceGroups(text(request, "ClusterId"), region, modifications);
         return Response.ok(objectMapper.createObjectNode()).build();
@@ -742,7 +747,7 @@ public class EmrHandler {
                                              boolean terminated) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("Id", "ci-" + index + cluster.getId());
-        node.put("Ec2InstanceId", "i-" + String.format("%017d", index));
+        node.put("Ec2InstanceId", EmrService.ec2InstanceId(index));
         node.put("PublicDnsName", AwsEndpoints.ec2PublicDns("203.0.113." + index, cluster.getRegion()));
         String privateIp = "10.0.0." + index;
         node.put("PrivateDnsName", AwsRegions.ec2PrivateIpDnsName(privateIp, cluster.getRegion()));

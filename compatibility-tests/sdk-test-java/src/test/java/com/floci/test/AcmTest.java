@@ -8,11 +8,13 @@ import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.api.parallel.Isolated;
 import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.core.retry.backoff.FixedDelayBackoffStrategy;
 import software.amazon.awssdk.core.waiters.WaiterResponse;
 import software.amazon.awssdk.services.acm.AcmClient;
 import software.amazon.awssdk.services.acm.model.*;
+import software.amazon.awssdk.services.acm.model.Tag;
 
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
@@ -28,6 +30,7 @@ import static org.assertj.core.api.Assertions.*;
 
 @DisplayName("ACM Certificate Manager")
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@Isolated
 class AcmTest {
 
     private static AcmClient acm;
@@ -284,8 +287,8 @@ class AcmTest {
         acm.addTagsToCertificate(b -> b
                 .certificateArn(tagTestCertArn)
                 .tags(
-                        software.amazon.awssdk.services.acm.model.Tag.builder().key("Environment").value("test").build(),
-                        software.amazon.awssdk.services.acm.model.Tag.builder().key("Project").value("floci").build()
+                        Tag.builder().key("Environment").value("test").build(),
+                        Tag.builder().key("Project").value("floci").build()
                 ));
 
         ListTagsForCertificateResponse tagsResp = acm.listTagsForCertificate(b -> b
@@ -306,7 +309,7 @@ class AcmTest {
 
         acm.removeTagsFromCertificate(b -> b
                 .certificateArn(tagTestCertArn)
-                .tags(software.amazon.awssdk.services.acm.model.Tag.builder().key("Project").value("floci").build()));
+                .tags(Tag.builder().key("Project").value("floci").build()));
 
         ListTagsForCertificateResponse tagsResp = acm.listTagsForCertificate(b -> b
                 .certificateArn(tagTestCertArn));

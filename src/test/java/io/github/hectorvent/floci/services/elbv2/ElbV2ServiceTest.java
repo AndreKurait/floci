@@ -104,6 +104,51 @@ class ElbV2ServiceTest {
         stubAlbSubnets(ec2Service);
     }
 
+    @Test
+    void describeListenersRequiresEveryExplicitArn() {
+        String lb = service.createLoadBalancer(REGION, "listener-lookup", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        String removed = service.createListener(REGION, lb, "HTTP", 8080, null,
+                List.of(), List.of(), List.of(), Map.of()).getListenerArn();
+        Listener retained = service.createListener(REGION, lb, "HTTP", 8081, null,
+                List.of(), List.of(), List.of(), Map.of());
+        service.deleteListener(REGION, removed);
+
+        for (List<String> requested : List.of(List.of(removed),
+                List.of(retained.getListenerArn(), removed), List.of(removed, retained.getListenerArn()))) {
+            AwsException error = assertThrows(AwsException.class,
+                    () -> service.describeListeners(REGION, null, requested));
+            assertEquals("ListenerNotFound", error.getErrorCode());
+            assertEquals(400, error.getHttpStatus());
+        }
+        AwsException otherRegion = assertThrows(AwsException.class,
+                () -> service.describeListeners("us-east-1", null, List.of(retained.getListenerArn())));
+        assertEquals("ListenerNotFound", otherRegion.getErrorCode());
+        assertEquals(List.of(retained), service.describeListeners(REGION, lb, List.of()));
+        assertEquals(List.of(retained),
+                service.describeListeners(REGION, null, List.of(retained.getListenerArn())));
+    }
+
+    @Test
+    void describeListenersRejectsADeletedBalancerAndItsListeners() {
+        String lb = service.createLoadBalancer(REGION, "deleted-listeners", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        assertTrue(service.describeListeners(REGION, lb, List.of()).isEmpty());
+        String listener = service.createListener(REGION, lb, "HTTP", 8080, null,
+                List.of(), List.of(), List.of(), Map.of()).getListenerArn();
+        service.deleteLoadBalancer(REGION, lb);
+
+        AwsException missingListener = assertThrows(AwsException.class,
+                () -> service.describeListeners(REGION, null, List.of(listener)));
+        assertEquals("ListenerNotFound", missingListener.getErrorCode());
+        assertEquals(400, missingListener.getHttpStatus());
+        AwsException missingBalancer = assertThrows(AwsException.class,
+                () -> service.describeListeners(REGION, lb, List.of()));
+        assertEquals("LoadBalancerNotFound", missingBalancer.getErrorCode());
+        assertEquals(400, missingBalancer.getHttpStatus());
+        assertTrue(service.describeListeners(REGION, null, List.of()).isEmpty());
+    }
+
     /**
      * Every type takes Subnets or SubnetMappings, so a balancer with neither is refused before a
      * subnet is looked up or anything is stored. The messages are the ones AWS gives an Application
@@ -722,6 +767,28 @@ class ElbV2ServiceTest {
     }
 
     @Test
+    void describeRulesRequiresEveryExplicitArn() {
+        String tgArn = createTargetGroup("rule-lookup-tg");
+        String listener = createListener("rule-lookup-lb", tgArn);
+        Rule retained = service.createRule(REGION, listener, List.of(pathPattern("/a/*")),
+                100, List.of(forwardAction(tgArn)), Map.of());
+        Rule removed = service.createRule(REGION, listener, List.of(pathPattern("/b/*")),
+                110, List.of(forwardAction(tgArn)), Map.of());
+        service.deleteRule(REGION, removed.getRuleArn());
+
+        for (List<String> requested : List.of(List.of(removed.getRuleArn()),
+                List.of(retained.getRuleArn(), removed.getRuleArn()),
+                List.of(removed.getRuleArn(), retained.getRuleArn()))) {
+            AwsException error = assertThrows(AwsException.class,
+                    () -> service.describeRules(REGION, null, requested));
+            assertEquals("RuleNotFound", error.getErrorCode());
+            assertEquals(400, error.getHttpStatus());
+        }
+        assertEquals(List.of(retained), service.describeRules(REGION, null, List.of(retained.getRuleArn())));
+        assertEquals(2, service.describeRules(REGION, listener, List.of()).size());
+    }
+
+    @Test
     void setRulePrioritiesChecksEachListenerOnlyAgainstItsOwnRules() {
         String tgArn = createTargetGroup("sample-tg");
         String firstListener = createListener("first-lb", tgArn);
@@ -911,6 +978,30 @@ class ElbV2ServiceTest {
         ArgumentCaptor<Listener> listenerCaptor = ArgumentCaptor.captor();
         verify(reloadedDataPlane).publishListener(listenerCaptor.capture(), eq(REGION), any(), any(), any(), any());
         assertEquals(listenerArn, listenerCaptor.getValue().getListenerArn());
+    }
+
+    @Test
+    void modifyListenerAttributesValidatesTcpIdleTimeoutRange() {
+        String lb = service.createLoadBalancer(REGION, "nlb-attr", "internal", "network", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getLoadBalancerArn();
+        Listener listener = service.createListener(REGION, lb, "TCP", 9876, null,
+                List.of(), List.of(), List.of(), Map.of());
+        String listenerArn = listener.getListenerArn();
+
+        AwsException tooLow = assertThrows(AwsException.class, () ->
+                service.modifyListenerAttributes(REGION, listenerArn, Map.of("tcp.idle_timeout.seconds", "1")));
+        assertEquals("InvalidConfigurationRequest", tooLow.getErrorCode());
+
+        AwsException tooHigh = assertThrows(AwsException.class, () ->
+                service.modifyListenerAttributes(REGION, listenerArn, Map.of("tcp.idle_timeout.seconds", "6001")));
+        assertEquals("InvalidConfigurationRequest", tooHigh.getErrorCode());
+
+        AwsException nonNumeric = assertThrows(AwsException.class, () ->
+                service.modifyListenerAttributes(REGION, listenerArn, Map.of("tcp.idle_timeout.seconds", "abc")));
+        assertEquals("InvalidConfigurationRequest", nonNumeric.getErrorCode());
+
+        service.modifyListenerAttributes(REGION, listenerArn, Map.of("tcp.idle_timeout.seconds", "120"));
+        assertEquals("120", service.describeListenerAttributes(REGION, listenerArn).get("tcp.idle_timeout.seconds"));
     }
 
     @Test
@@ -1154,6 +1245,52 @@ class ElbV2ServiceTest {
         target.setId(id);
         target.setPort(port);
         return target;
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 0, 1, 121, Integer.MAX_VALUE})
+    void createRejectsInvalidHealthTimeoutBeforePublishing(int timeout) {
+        AwsException error = assertThrows(AwsException.class, () -> service.createTargetGroup(
+                REGION, "invalid-timeout", "HTTP", "HTTP1", 80, "vpc-a", "ip",
+                "HTTP", "traffic-port", true, "/", 30, timeout, 5, 2, "200", "ipv4", Map.of()));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertTrue(error.getMessage().contains("healthCheckTimeoutSeconds"));
+        assertTrue(service.describeTargetGroups(REGION, null, null, null).isEmpty());
+        verifyNoInteractions(healthChecker);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-1, 0, 1, 121, Integer.MAX_VALUE})
+    void modifyRejectsInvalidHealthTimeoutBeforeAnyMutation(int timeout) {
+        String arn = createTargetGroup("timeout-state");
+        AwsException error = assertThrows(AwsException.class, () -> service.modifyTargetGroup(
+                REGION, arn, "HTTPS", "443", false, "/changed", 60, timeout, 3, 4, "204"));
+        assertEquals("ValidationError", error.getErrorCode());
+        TargetGroup group = service.describeTargetGroups(REGION, null, List.of(arn), null).getFirst();
+        assertEquals("HTTP", group.getHealthCheckProtocol());
+        assertEquals("traffic-port", group.getHealthCheckPort());
+        assertTrue(group.getHealthCheckEnabled());
+        assertEquals("/v1/ready", group.getHealthCheckPath());
+        assertEquals(30, group.getHealthCheckIntervalSeconds());
+        assertEquals(5, group.getHealthCheckTimeoutSeconds());
+        assertEquals(5, group.getHealthyThresholdCount());
+        assertEquals(2, group.getUnhealthyThresholdCount());
+        assertEquals("200", group.getMatcher());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {2, 120})
+    void healthTimeoutBoundariesAndOmittedUpdateRemainValid(int timeout) {
+        TargetGroup group = service.createTargetGroup(REGION, "timeout-boundary", "HTTP", "HTTP1", 80,
+                "vpc-a", "ip", "HTTP", "traffic-port", true, "/", 30, timeout, 5, 2,
+                "200", "ipv4", Map.of());
+        assertEquals(timeout, group.getHealthCheckTimeoutSeconds());
+        service.modifyTargetGroup(REGION, group.getTargetGroupArn(), null, null, null,
+                "/changed", null, null, null, null, null);
+        assertEquals(timeout, group.getHealthCheckTimeoutSeconds());
+        service.modifyTargetGroup(REGION, group.getTargetGroupArn(), null, null, null,
+                null, null, timeout == 2 ? 120 : 2, null, null, null);
+        assertEquals(timeout == 2 ? 120 : 2, group.getHealthCheckTimeoutSeconds());
     }
 
     private String createTargetGroup(String name) {

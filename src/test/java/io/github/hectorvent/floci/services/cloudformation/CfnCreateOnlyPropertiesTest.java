@@ -95,6 +95,34 @@ class CfnCreateOnlyPropertiesTest {
     }
 
     @Test
+    void isCreateOnly_appConfigReplacesOnlyOnItsSchemaProperties() {
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::AppConfig::Application", "Name"));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly("AWS::AppConfig::Environment", "ApplicationId"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::AppConfig::Environment", "Name"));
+        assertEquals(Set.of("ApplicationId", "LocationUri", "Type"),
+                CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::ConfigurationProfile"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::AppConfig::ConfigurationProfile", "Name"));
+        assertEquals(Set.of("Name", "ReplicateTo"),
+                CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::DeploymentStrategy"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::AppConfig::DeploymentStrategy", "GrowthFactor"));
+    }
+
+    @Test
+    void eventsV2CreateOnlyPropertiesMatchTheRegistrySchemas() {
+        assertEquals(Set.of("Name"), CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::EventsV2::EventBus"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::EventsV2::EventBus", "Description"));
+        String subscriber = "AWS::EventsV2::Subscriber";
+        assertEquals(Set.of("Name", "EventBusArn", "InvokeConfiguration/TargetArn", "Type", "StartingPosition",
+                        "PointInTimeConfiguration"),
+                CfnCreateOnlyProperties.getCreateOnlyProperties(subscriber));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly(subscriber, "EventBusArn"));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly(subscriber, "Type"));
+        assertTrue(CfnCreateOnlyProperties.isCreateOnly(subscriber, "InvokeConfiguration"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly(subscriber, "SubscriberFilters"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly(subscriber, "RetryPolicy"));
+    }
+
+    @Test
     void isCreateOnly_treatsEmptySchemaListAsAuthoritative() {
         assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::ApiGateway::RestApi", "Name"));
         assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::Cognito::UserPool", "UserPoolName"));

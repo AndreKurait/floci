@@ -20,6 +20,10 @@ AWS::ApiGatewayV2::Integration	ApiGatewayV2CfnProvisioner
 AWS::ApiGatewayV2::Route	ApiGatewayV2CfnProvisioner
 AWS::ApiGatewayV2::Stage	ApiGatewayV2CfnProvisioner
 AWS::ApiGatewayV2::VpcLink	ApiGatewayV2CfnProvisioner
+AWS::AppConfig::Application	AppConfigCfnProvisioner
+AWS::AppConfig::ConfigurationProfile	AppConfigCfnProvisioner
+AWS::AppConfig::DeploymentStrategy	AppConfigCfnProvisioner
+AWS::AppConfig::Environment	AppConfigCfnProvisioner
 AWS::AppSync::ApiKey	AppSyncCfnProvisioner
 AWS::AppSync::DataSource	AppSyncCfnProvisioner
 AWS::AppSync::FunctionConfiguration	AppSyncCfnProvisioner
@@ -62,6 +66,7 @@ AWS::Cognito::UserPool	CognitoCfnProvisioner
 AWS::Cognito::UserPoolClient	CognitoCfnProvisioner
 AWS::Cognito::UserPoolDomain	CognitoCfnProvisioner
 AWS::Cognito::UserPoolGroup	CognitoUserPoolGroupCfnProvisioner
+AWS::Cognito::UserPoolIdentityProvider	CognitoIdentityProviderCfnProvisioner
 AWS::Cognito::UserPoolResourceServer	CognitoResourceServerCfnProvisioner
 AWS::Cognito::UserPoolUser	CognitoUserPoolUserCfnProvisioner
 AWS::Cognito::UserPoolUserToGroupAttachment	CognitoUserPoolUserToGroupAttachmentCfnProvisioner
@@ -73,6 +78,7 @@ AWS::EC2::EIP	Ec2NetworkCfnProvisioner
 AWS::EC2::FlowLog	Ec2FlowLogCfnProvisioner
 AWS::EC2::Instance	Ec2InstanceCfnProvisioner
 AWS::EC2::InternetGateway	Ec2NetworkCfnProvisioner
+AWS::EC2::KeyPair	Ec2KeyPairCfnProvisioner
 AWS::EC2::LaunchTemplate	Ec2LaunchTemplateCfnProvisioner
 AWS::EC2::NatGateway	Ec2NetworkCfnProvisioner
 AWS::EC2::NetworkAcl	Ec2NetworkAclCfnProvisioner
@@ -111,6 +117,8 @@ AWS::Events::Archive	EventsArchiveCfnProvisioner
 AWS::Events::EventBus	EventsCfnProvisioner
 AWS::Events::EventBusPolicy	EventsCfnProvisioner
 AWS::Events::Rule	EventsCfnProvisioner
+AWS::EventsV2::EventBus	EventsV2CfnProvisioner
+AWS::EventsV2::Subscriber	EventsV2CfnProvisioner
 AWS::GuardDuty::MalwareProtectionPlan	GuardDutyMalwareProtectionPlanCfnProvisioner
 AWS::IAM::AccessKey	IamAccessKeyCfnProvisioner
 AWS::IAM::InstanceProfile	IamInstanceProfileCfnProvisioner
@@ -160,6 +168,7 @@ AWS::Redshift::Cluster	RedshiftClusterCfnProvisioner
 AWS::Redshift::ClusterParameterGroup	RedshiftClusterCfnProvisioner
 AWS::Redshift::ClusterSecurityGroup	RedshiftClusterCfnProvisioner
 AWS::Redshift::ClusterSubnetGroup	RedshiftClusterCfnProvisioner
+AWS::Redshift::EventSubscription	RedshiftEventSubscriptionCfnProvisioner
 AWS::RedshiftServerless::Namespace	RedshiftServerlessCfnProvisioner
 AWS::RedshiftServerless::Workgroup	RedshiftServerlessCfnProvisioner
 AWS::Route53::HealthCheck	Route53CfnProvisioner
@@ -171,6 +180,7 @@ AWS::S3::BucketPolicy	S3CfnProvisioner
 AWS::S3Vectors::Index	S3VectorsCfnProvisioner
 AWS::S3Vectors::VectorBucket	S3VectorsCfnProvisioner
 AWS::SES::EmailIdentity	SesCfnProvisioner
+AWS::SES::ReceiptRule	SesReceiptRuleCfnProvisioner
 AWS::SNS::Subscription	SnsCfnProvisioner
 AWS::SNS::Topic	SnsCfnProvisioner
 AWS::SNS::TopicPolicy	SnsCfnProvisioner
