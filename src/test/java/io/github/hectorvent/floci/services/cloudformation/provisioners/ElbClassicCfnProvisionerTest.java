@@ -125,9 +125,10 @@ class ElbClassicCfnProvisionerTest {
     }
 
     @Test
-    void policyBearingListenerFailsBeforeAllocation() {
+    void unsupportedBackendPolicyFailsBeforeAllocation() {
         ObjectNode properties = properties();
-        ((ObjectNode) properties.path("Listeners").get(0)).putArray("PolicyNames").add("tls");
+        properties.putArray("Policies").addObject().put("PolicyName", "backend")
+                .put("PolicyType", "ProxyProtocolPolicyType");
 
         AwsException failure = assertThrows(AwsException.class,
                 () -> provisioner.provision(resource, properties, context(null, null)));

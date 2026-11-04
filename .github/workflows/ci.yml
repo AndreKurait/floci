@@ -41,7 +41,7 @@ env:
   # Hardcoded on purpose: strategy.job-total counts EVERY matrix job, so adding an
   # unrelated matrix entry later would change the modulus and silently leave part
   # of the suite running in no shard. Keep in sync with the matrix below.
-  SHARD_TOTAL: 6
+  SHARD_TOTAL: 8
 
 jobs:
   test:
@@ -62,7 +62,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

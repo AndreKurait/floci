@@ -762,13 +762,17 @@ public class Ec2ContainerManager {
                                              String helperId, boolean enforceSecurityGroups,
                                              boolean hasInstanceProfile, String instanceType, GuestOptions options,
                                              List<PreparedMount> mounts) {
+        List<String> environment = localAwsEnvironment(region, serviceEndpoint, hasInstanceProfile);
+        if (enforceSecurityGroups && config.network().vpcRouting().enabled()
+                && config.network().vpcRouting().publicAwsApi()) {
+            environment.removeIf(value -> value.startsWith("AWS_ENDPOINT_URL="));
+        }
         // Image runtime keeps the image's startup contract; minimal and systemd retain their commands.
         ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image.dockerImage())
                 .withName(containerName)
                 .withEmbeddedDns()
                 .withDockerNetwork(Optional.empty())
-                .withEnv(localAwsEnvironment(region, serviceEndpoint,
-                        hasInstanceProfile))
+                .withEnv(environment)
                 .withEnv("AWS_EC2_INSTANCE_ID", instanceId)
                 .withEnv(options.environment())
                 .withHostDockerInternalOnLinux()

@@ -99,8 +99,14 @@ resource's identity unless replacement is required. Replacement cleanup and
 failed-update restoration preserve the previous resource; an existing
 same-name load balancer is never adopted by an ordinary stack create.
 
-CloudFormation policy properties and listener `PolicyNames` currently fail explicitly
-before allocation; CloudFormation binding to the Classic policy APIs remains unimplemented. Removing
+CloudFormation applies supported `Policies`, their `LoadBalancerPorts`, and
+listener `PolicyNames` through the same Classic APIs. It validates definitions
+before allocation and preserves unchanged policies during unrelated updates.
+Named policy replacement uses a temporary copy while moving listener bindings;
+failed-update snapshots restore policy definitions, bindings and ownership.
+Only policies formerly managed by the template are removed.
+
+Backend authentication and stickiness remain unsupported. Removing
 `SecurityGroups` from an existing template also fails explicitly; specifying
 the desired groups remains supported. Access-log attributes are retained as
 configuration and do not imply that log delivery is implemented.

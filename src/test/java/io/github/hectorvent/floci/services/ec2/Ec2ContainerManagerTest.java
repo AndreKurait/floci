@@ -112,6 +112,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
@@ -1586,6 +1587,27 @@ class Ec2ContainerManagerTest {
         assertTrue(environment.contains("AWS_EC2_METADATA_SERVICE_ENDPOINT=http://169.254.169.254"));
         assertTrue(environment.contains("AWS_ENDPOINT_URL=http://floci:4566"));
         assertFalse(environment.stream().anyMatch(value -> value.startsWith("AWS_ACCESS_KEY_ID=")
+                || value.startsWith("AWS_SECRET_ACCESS_KEY=") || value.startsWith("AWS_SESSION_TOKEN=")));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "true, true, true, false",
+            "false, true, true, true",
+            "true, false, true, true",
+            "true, true, false, true"
+    })
+    void sdkEndpointOverrideRequiresAnUnroutedWorkload(boolean protectedNamespace, boolean routed,
+                                                      boolean publicApis, boolean override) throws Exception {
+        ContainerSpec spec = launchConfiguredGuest(ResolvedAmiImage.minimal("ubuntu:24.04"), Map.of(
+                "FLOCI_NETWORK_VPC_ROUTING_ENABLED", Boolean.toString(routed),
+                "FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API", Boolean.toString(publicApis)),
+                protectedNamespace, true, false);
+
+        assertEquals(override, spec.env().stream().anyMatch(value -> value.startsWith("AWS_ENDPOINT_URL=")));
+        assertTrue(spec.env().contains("AWS_EC2_METADATA_SERVICE_ENDPOINT=http://169.254.169.254"));
+        assertTrue(spec.env().contains("AWS_REGION=us-west-2"));
+        assertFalse(spec.env().stream().anyMatch(value -> value.startsWith("AWS_ACCESS_KEY_ID=")
                 || value.startsWith("AWS_SECRET_ACCESS_KEY=") || value.startsWith("AWS_SESSION_TOKEN=")));
     }
 
@@ -3507,11 +3529,13 @@ class Ec2ContainerManagerTest {
 
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
-        EmulatorConfig.Ec2ServiceConfig ec2 = new SmallRyeConfigBuilder()
+        EmulatorConfig mappedConfig = new SmallRyeConfigBuilder()
                 .withSources(new EnvConfigSource(environment, 300))
                 .withDefaultValue("floci.services.ec2.metadata-helper-image", "example/network-helper:test")
                 .withMapping(EmulatorConfig.class).build()
-                .getConfigMapping(EmulatorConfig.class).services().ec2();
+                .getConfigMapping(EmulatorConfig.class);
+        EmulatorConfig.Ec2ServiceConfig ec2 = mappedConfig.services().ec2();
+        lenient().when(config.network()).thenReturn(mappedConfig.network());
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
         when(services.dockerNetwork()).thenReturn(Optional.empty());
