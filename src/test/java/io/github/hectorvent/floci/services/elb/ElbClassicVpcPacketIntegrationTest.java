@@ -4,6 +4,7 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.BuildImageResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.BuildResponseItem;
 import com.github.dockerjava.api.model.HostConfig;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
@@ -89,18 +90,37 @@ class ElbClassicVpcPacketIntegrationTest {
     @TestHTTPResource URI endpoint;
     @TempDir Path imageContext;
 
-    private final Deque<Executable> cleanup = new ArrayDeque<>();
-    private Ec2Client ec2;
-    private ElasticLoadBalancingClient elb;
-    private IamClient iam;
+    final Deque<Executable> cleanup = new ArrayDeque<>();
+    Ec2Client ec2;
+    ElasticLoadBalancingClient elb;
+    IamClient iam;
 
     @BeforeEach
     void prepare() throws Exception {
         assumeTrue(DockerAvailability.isAvailable(), "Docker is required for protected Classic packets");
         Files.writeString(imageContext.resolve("Dockerfile"),
                 "FROM " + TestImages.BUSYBOX + "\nRUN mkdir -p /var/lib\n");
-        try (BuildImageResultCallback build = docker.buildImageCmd(imageContext.toFile()).withPull(false).start()) {
-            String image = build.awaitImageId(60, TimeUnit.SECONDS);
+        StringBuilder buildOutput = new StringBuilder();
+        BuildImageResultCallback callback = new BuildImageResultCallback() {
+            @Override
+            public void onNext(BuildResponseItem item) {
+                if (item.getStream() != null) {
+                    buildOutput.append(item.getStream());
+                }
+                if (item.getErrorDetail() != null) {
+                    buildOutput.append(item.getErrorDetail());
+                }
+                super.onNext(item);
+            }
+        };
+        try (BuildImageResultCallback build = docker.buildImageCmd(imageContext.toFile()).withPull(false)
+                .exec(callback)) {
+            String image;
+            try {
+                image = build.awaitImageId(60, TimeUnit.SECONDS);
+            } catch (RuntimeException failure) {
+                throw new IllegalStateException("Cannot prepare the native guest fixture:\n" + buildOutput, failure);
+            }
             cleanup.addFirst(() -> docker.removeImageCmd(image).exec());
             when(images.resolveImage("ami-classic-packets")).thenReturn(ResolvedAmiImage.minimal(image));
         }
@@ -240,44 +260,52 @@ class ElbClassicVpcPacketIntegrationTest {
                 filter.name("description").values("Classic ELB " + name))).networkInterfaces().isEmpty());
     }
 
-    private boolean healthy(String name, String instance) {
+    boolean healthy(String name, String instance) {
         return "InService".equals(elb.describeInstanceHealth(request -> request.loadBalancerName(name)
                 .instances(value -> value.instanceId(instance))).instanceStates().getFirst().state());
     }
 
-    private String group(String vpc, String name) {
-        String id = ec2.createSecurityGroup(request -> request.vpcId(vpc).groupName(name).description(name)).groupId();
-        cleanup.addFirst(() -> ec2.deleteSecurityGroup(request -> request.groupId(id)));
+    String group(String vpc, String name) {
+        return group(ec2, vpc, name);
+    }
+
+    String group(Ec2Client client, String vpc, String name) {
+        String id = client.createSecurityGroup(request -> request.vpcId(vpc).groupName(name).description(name)).groupId();
+        cleanup.addFirst(() -> client.deleteSecurityGroup(request -> request.groupId(id)));
         return id;
     }
 
-    private static IpPermission fromGroup(int port, String group) {
+    static IpPermission fromGroup(int port, String group) {
         return IpPermission.builder().ipProtocol("tcp").fromPort(port).toPort(port)
                 .userIdGroupPairs(pair -> pair.groupId(group)).build();
     }
 
-    private String launch(String subnet, String group, String address, String userData) {
-        String id = ec2.runInstances(request -> request.imageId("ami-classic-packets").instanceType("t3.micro")
+    String launch(String subnet, String group, String address, String userData) {
+        return launch(ec2, subnet, group, address, userData);
+    }
+
+    String launch(Ec2Client client, String subnet, String group, String address, String userData) {
+        String id = client.runInstances(request -> request.imageId("ami-classic-packets").instanceType("t3.micro")
                 .subnetId(subnet).securityGroupIds(group).privateIpAddress(address).userData(userData)
                 .minCount(1).maxCount(1)).instances().getFirst().instanceId();
         cleanup.addFirst(() -> {
-            ec2.terminateInstances(request -> request.instanceIds(id));
-            await().atMost(Duration.ofSeconds(60)).until(() -> instanceState(id) == InstanceStateName.TERMINATED);
+            client.terminateInstances(request -> request.instanceIds(id));
+            await().atMost(Duration.ofSeconds(60)).until(() -> instanceState(client, id) == InstanceStateName.TERMINATED);
         });
-        await().atMost(Duration.ofSeconds(60)).until(() -> instanceState(id) == InstanceStateName.RUNNING);
+        await().atMost(Duration.ofSeconds(60)).until(() -> instanceState(client, id) == InstanceStateName.RUNNING);
         return id;
     }
 
-    private InstanceStateName instanceState(String id) {
-        return ec2.describeInstances(request -> request.instanceIds(id)).reservations().getFirst()
+    private InstanceStateName instanceState(Ec2Client client, String id) {
+        return client.describeInstances(request -> request.instanceIds(id)).reservations().getFirst()
                 .instances().getFirst().state().name();
     }
 
-    private Instance localInstance(String id) {
+    Instance localInstance(String id) {
         return instances.describeInstances("us-east-1", List.of(id), Map.of()).getFirst().getInstances().getFirst();
     }
 
-    private InspectContainerResponse namespace(String guest) {
+    InspectContainerResponse namespace(String guest) {
         String mode = docker.inspectContainerCmd(guest).exec().getHostConfig().getNetworkMode();
         assertTrue(mode.startsWith("container:"));
         return docker.inspectContainerCmd(mode.substring("container:".length())).exec();
@@ -299,11 +327,11 @@ class ElbClassicVpcPacketIntegrationTest {
         assertEquals(Integer.toString(requests), fields[1]);
     }
 
-    private ContainerExec.Result exec(String container, String... command) {
+    ContainerExec.Result exec(String container, String... command) {
         return ContainerExec.run(docker, container, command, 10).throwIfTimedOut(container);
     }
 
-    private void removeContainer(String container) {
+    void removeContainer(String container) {
         try {
             docker.removeContainerCmd(container).withForce(true).exec();
         } catch (NotFoundException ignored) {

@@ -19,11 +19,13 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.LocallyBuiltHelperImage;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
+import io.github.hectorvent.floci.services.ec2.net.VpcRoutingManager;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
@@ -58,6 +60,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private final Map<String, Set<String>> pendingHelperCleanup = new HashMap<>();
     private final ConcurrentMap<String, DnsOrigin> dnsOrigins = new ConcurrentHashMap<>();
     private boolean peerPoliciesNeedRefresh;
+    @Inject
+    Instance<VpcRoutingManager> vpcRouting;
     private final SweepWorker dnsOriginObserver = new SweepWorker(
             "protected-namespace-dns", true, 1, false, ignored -> retireDnsOrigins());
 
@@ -293,6 +297,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 new ProtectedEndpoint(endpoint, helperId, Map.copyOf(prefixLists)));
         try {
             reconcileAll();
+            if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
+                vpcRouting.get().register(endpoint, helperId, vpcResolvers());
+            }
             if (previous != null) {
                 removeDnsOrigin(previous);
             }
@@ -314,6 +321,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     }
 
     public synchronized void unregister(String eniId) {
+        if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
+            vpcRouting.get().unregister(eniId);
+        }
         ProtectedEndpoint removed = endpoints.remove(eniId);
         if (removed != null) {
             removeDnsOrigin(removed);

@@ -86,7 +86,7 @@ ambiguous endpoints. Hosts without a current Classic resource binding continue t
 edge's existing routing, including API Gateway and S3 custom domains. Multiple competing weighted
 records, latency/failover records and independent Route53 health checks are not selected.
 
-## Protected private frontends
+## Protected frontends
 
 `FLOCI_SERVICES_ELB_VPC_FRONTENDS=true` enables an experimental packet path for an
 internal Classic load balancer in one IPv4 subnet. It requires real ELB operation,
@@ -105,11 +105,18 @@ firewall.
 This first mode reconstructs the runtime on listener, health-check, backend,
 subnet or group-attachment changes; the private address can change, and clients
 must resolve it again after those updates. Security-group rule edits reconcile
-the existing firewall directly. Internet-facing frontends, multiple subnets,
-IPv6, connection draining and access logging are not supported in this mode.
-It does not qualify public NAT routing or Route53 aliases. Deletion retains the
+the existing firewall directly. Multiple subnets, IPv6, connection draining and
+access logging are not supported in this mode. Route53 aliases need separate
+qualification. Deletion retains the
 interface reservation if retiring its namespace fails, allowing cleanup to be
 retried without reallocating a live address.
+
+With `FLOCI_NETWORK_VPC_ROUTING_ENABLED=true`, this mode also accepts
+internet-facing Classic frontends in one IPv4 subnet. Protected callers use
+native VPC routes and a public NAT gateway; the frontend sees that gateway's
+allocated Elastic IP, and its ingress rules must permit that source.
+Both VPCs need their required internet-gateway routes. See
+[public routing and its limits](../design/vpc-public-routing.md).
 
 ## Behavior Notes
 
@@ -156,7 +163,7 @@ retried without reallocating a live address.
 |---|---|---|
 | `FLOCI_SERVICES_ELB_ENABLED` | `true` | Enable or disable the Classic ELB service |
 | `FLOCI_SERVICES_ELB_MOCK` | `false` | When `true`, never probe: a registered instance is `InService` immediately |
-| `FLOCI_SERVICES_ELB_VPC_FRONTENDS` | `false` | Enable the protected private frontend mode described above |
+| `FLOCI_SERVICES_ELB_VPC_FRONTENDS` | `false` | Enable protected frontends; internet-facing frontends additionally require VPC routing |
 | `FLOCI_SERVICES_ELB_PROXY_IMAGE` | Digest-pinned `haproxy:3.2-alpine` | Listener process used by protected frontends |
 
 ## Examples
