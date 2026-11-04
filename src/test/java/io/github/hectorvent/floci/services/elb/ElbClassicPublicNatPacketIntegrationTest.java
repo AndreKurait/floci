@@ -288,7 +288,7 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
         assertEquals(callerAddress, fields[2], "The frontend must observe the gateway's allocated public address");
     }
 
-    private String networkDiagnostics() {
+    String networkDiagnostics() {
         StringBuilder evidence = new StringBuilder();
         for (Container container : docker.listContainersCmd().withLabelFilter(Map.of(
                 ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config))).exec()) {
