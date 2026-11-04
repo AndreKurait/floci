@@ -1713,11 +1713,12 @@ public class SsmService implements ResourceProvider {
 
     /**
      * Return AWS-owned predefined patch baselines matching the given DescribePatchBaselines filters
-     * (supported keys: OWNER, OPERATING_SYSTEM, NAME_PREFIX). There are no customer-owned baselines.
+     * (supported keys: OWNER, OPERATING_SYSTEM, NAME_PREFIX).
+     * SsmPatchBaselineService owns customer baselines and combines their identities with this catalog.
      */
     public List<PatchBaselineIdentity> describePatchBaselines(Map<String, List<String>> filters) {
         List<String> owners = filters.getOrDefault("OWNER", List.of());
-        // OWNER=Self matches only customer-owned baselines, of which there are none.
+        // This catalog contains only AWS-owned baseline identities.
         if (!owners.isEmpty() && !owners.contains("AWS") && !owners.contains("All")) {
             return List.of();
         }
