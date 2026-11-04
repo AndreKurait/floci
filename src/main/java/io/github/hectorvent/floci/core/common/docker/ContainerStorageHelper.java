@@ -333,6 +333,19 @@ public final class ContainerStorageHelper {
         }
     }
 
+    /** Confirms both stale container names are removed before their owner starts a replacement. */
+    public static void removeStaleContainerStrict(
+            EmulatorConfig config,
+            ContainerLifecycleManager lifecycleManager,
+            String containerName,
+            boolean removeAnonymousVolumes) {
+        lifecycleManager.removeIfExistsStrict(containerName, removeAnonymousVolumes);
+        String legacyName = legacyDockerName(config, containerName);
+        if (!legacyName.equals(containerName)) {
+            lifecycleManager.removeIfExistsStrict(legacyName, removeAnonymousVolumes);
+        }
+    }
+
     /** Mounts a persisted, exact Docker volume name without applying namespace rules again. */
     public static void applyNamedVolume(
             ContainerBuilder.Builder builder,

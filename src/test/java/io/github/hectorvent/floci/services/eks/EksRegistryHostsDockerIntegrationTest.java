@@ -1,12 +1,14 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.exception.NotFoundException;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
+import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
@@ -31,14 +33,19 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPOutputStream;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -76,6 +83,9 @@ class EksRegistryHostsDockerIntegrationTest {
     Ec2Service ec2Service;
 
     @Inject
+    EcrService ecrService;
+
+    @Inject
     EksClusterManager eksClusterManager;
 
     @Inject
@@ -103,7 +113,10 @@ class EksRegistryHostsDockerIntegrationTest {
         // hostname is only reachable at all because of the registry-hosts configuration below.
         String host = "111122223333.dkr.ecr.us-east-1.localhost:" + httpPort;
         String imageRef = host + "/" + repo + ":v1";
+        Set<String> clusterVolumes = new HashSet<>();
 
+        ecrService.createRepository(repo, "111122223333", "MUTABLE", false, "AES256", null, Map.of(), "us-east-1");
+        cleanup.register(() -> ecrService.deleteRepository(repo, "111122223333", true, "us-east-1"));
         pushMinimalImage(host, repo);
 
         given().contentType(JSON)
@@ -111,13 +124,22 @@ class EksRegistryHostsDockerIntegrationTest {
                         + "\"arn:aws:iam::000000000000:role/eks-service-role\"}")
                 .when().post("/clusters")
                 .then().statusCode(200);
-        cleanup.register(() -> eksService.deleteCluster(clusterName));
+        cleanup.register(() -> {
+            if (eksService.listClusters().contains(clusterName)) {
+                eksService.deleteCluster(clusterName);
+            }
+        });
 
         Cluster cluster = eksService.describeCluster(clusterName);
         assertNotNull(cluster.getContainerId(), "Container ID must not be null");
+        clusterVolumes.addAll(containerVolumes(cluster.getContainerId()));
+        assertFalse(clusterVolumes.isEmpty(), "the real k3s container must have storage to retire");
         waitUntilReady(cluster);
         eksClusterManager.finalizeCluster(cluster);
         String containerId = cluster.getContainerId();
+        assertEquals(0, execInContainerWithExitCode(containerId,
+                new String[]{"kubectl", "--request-timeout=2s", "create", "configmap",
+                        "storage-continuity", "--from-literal=value=" + suffix}).exitCode());
 
         // Verify symlink was created before container started
         ContainerExec.Result linkResult = execInContainerWithExitCode(containerId,
@@ -167,7 +189,12 @@ class EksRegistryHostsDockerIntegrationTest {
                         """.formatted(nodegroupName, lt.getLaunchTemplateId()))
                 .when().post("/clusters/" + clusterName + "/node-groups")
                 .then().statusCode(200);
-        cleanup.register(() -> eksService.deleteNodeGroup(clusterName, nodegroupName));
+        cleanup.register(() -> {
+            if (eksService.listClusters().contains(clusterName)
+                    && eksService.listNodeGroups(clusterName).contains(nodegroupName)) {
+                eksService.deleteNodeGroup(clusterName, nodegroupName);
+            }
+        });
 
         // Re-read cluster and container ID: applying the first node group replaces the k3s container
         // to apply node capacity limits, invalidating the previous container ID.
@@ -175,6 +202,7 @@ class EksRegistryHostsDockerIntegrationTest {
         assertNotNull(cluster.getContainerId(), "Container ID must not be null after node group creation");
         waitUntilReady(cluster);
         containerId = cluster.getContainerId();
+        clusterVolumes.addAll(containerVolumes(containerId));
 
         // Verify user data script wrote hosts.toml into k3s certs.d through the symlink
         String hostsToml = execInContainer(containerId, new String[]{"cat",
@@ -223,6 +251,10 @@ class EksRegistryHostsDockerIntegrationTest {
             Thread.sleep(1000);
         }
         assertTrue(ready, "serviceaccount and Ready nodes with renewed Leases must be available within 30 seconds");
+        assertEquals(suffix, execInContainer(containerId,
+                new String[]{"kubectl", "--request-timeout=2s", "get", "configmap",
+                        "storage-continuity", "-o", "jsonpath={.data.value}"}).trim(),
+                "the named data volume must survive capacity replacement and container restart");
 
         String podYaml = """
                 apiVersion: v1
@@ -249,8 +281,32 @@ class EksRegistryHostsDockerIntegrationTest {
             }
             Thread.sleep(2000);
         }
-        assertTrue(running, "registry-hosts-pod must reach Running, pulling its image through the configured host");
+        String diagnostics = "";
+        if (!running) {
+            diagnostics = "\nPod: " + execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "--request-timeout=2s", "get", "pod", "registry-hosts-pod", "-o", "json"})
+                    + "\nEvents: " + execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "--request-timeout=2s", "get", "events",
+                            "--field-selector=involvedObject.name=registry-hosts-pod", "-o", "json"})
+                    + "\nNodes: " + execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "--request-timeout=2s", "get", "nodes", "-o", "json"});
+        }
+        assertTrue(running, "registry-hosts-pod must reach Running, pulling its image through the configured host"
+                + diagnostics);
         execInContainerWithExitCode(containerId, new String[]{"kubectl", "delete", "pod", "registry-hosts-pod", "--now"});
+        eksService.deleteNodeGroup(clusterName, nodegroupName);
+        eksService.deleteCluster(clusterName);
+        for (String volume : clusterVolumes) {
+            assertThrows(NotFoundException.class, () -> dockerClient.inspectVolumeCmd(volume).exec(),
+                    "Deleted cluster retained mounted volume " + volume);
+        }
+    }
+
+    private List<String> containerVolumes(String containerId) {
+        return dockerClient.inspectContainerCmd(containerId).exec().getMounts().stream()
+                .map(mount -> mount.getName())
+                .filter(name -> name != null && !name.isBlank())
+                .toList();
     }
 
     /**
