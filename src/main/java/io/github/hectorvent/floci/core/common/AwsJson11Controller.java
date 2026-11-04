@@ -337,6 +337,8 @@ public class AwsJson11Controller {
                 case "tagging" -> resourceGroupsTaggingJsonHandler.handle(action, request, region);
                 case "codebuild" -> codeBuildJsonHandler.handle(action, request, region, regionResolver.getAccountId());
                 case "codedeploy" -> codeDeployJsonHandler.handle(action, request, region);
+                case "codedeploy-commands", "codedeploy-commands-secure" -> codeDeployJsonHandler.handleAgent(
+                        action, request, region, regionResolver.getAccountId());
                 case "codepipeline" -> codePipelineJsonHandler.handle(
                         action, request, region, regionResolver.getAccountId());
                 case "ec2messages" -> ec2MessagesJsonHandler.handle(action, request, region);

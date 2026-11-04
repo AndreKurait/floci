@@ -71,6 +71,10 @@ services:
     doc: docs/services/ce.md
     sources:
       - { path: services/ce/CostExplorerJsonHandler.java, mode: switch }
+  - service: codedeploy-agent
+    doc: docs/design/codedeploy-agent-runtime.md
+    sources:
+      - { path: services/codedeploy/CodeDeployAgentJsonHandler.java, mode: switch }
   - service: cloudformation
     doc: docs/services/cloudformation.md
     sources:
