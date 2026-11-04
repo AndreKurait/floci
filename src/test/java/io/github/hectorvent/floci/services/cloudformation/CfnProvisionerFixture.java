@@ -135,6 +135,7 @@ import io.github.hectorvent.floci.services.docdb.DocDbService;
 import io.github.hectorvent.floci.services.dsql.DsqlService;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
+import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Reply;
 import io.github.hectorvent.floci.services.dynamodb.backend.NativeDynamoDbBackend;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.FlowLogService;
@@ -183,6 +184,7 @@ import io.github.hectorvent.floci.services.wafv2.WafV2Service;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 import static org.mockito.Mockito.mock;
 
@@ -362,7 +364,13 @@ final class CfnProvisionerFixture {
             if (dynamoDbService != null) {
                 NativeDynamoDbBackend backend = new NativeDynamoDbBackend(null, null, dynamoDbService, null, null, objectMapper);
                 discovered.add(new DynamoDbCfnProvisioner(new DynamoDbFacade(backend, backend,
-                        new RegionResolver("us-east-1", "000000000000"))));
+                        new RegionResolver("us-east-1", "000000000000")), call -> {
+                            if (!"DeleteTable".equals(call.action())) {
+                                throw new AssertionError("Unexpected DynamoDB wire operation: " + call.action());
+                            }
+                            backend.deleteTable(call.scope(), call.body().path("TableName").asText());
+                            return new Reply(200, null, Map.of());
+                        }));
             }
             if (ssmService != null) {
                 discovered.add(new SsmCfnProvisioner(ssmService));
